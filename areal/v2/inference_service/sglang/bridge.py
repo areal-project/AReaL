@@ -59,6 +59,8 @@ class SGLangBridgeBackend:
         }
         if gconfig.stop:
             sampling_params["stop"] = gconfig.stop
+        if gconfig.seed is not None:
+            sampling_params["sampling_seed"] = gconfig.seed
 
         payload: dict[str, Any] = {
             "input_ids": list(req.input_ids),
@@ -125,11 +127,18 @@ class SGLangBridgeBackend:
         output_tokens = [x[1] for x in output_token_logprobs]
         output_logprobs = [x[0] for x in output_token_logprobs]
 
+        # Speculative-decoding acceptance metrics (present only when SGLang is
+        # launched with a speculative_algorithm; None otherwise).
+        spec_accept_rate = meta_info.get("spec_accept_rate")
+        spec_accept_length = meta_info.get("spec_accept_length")
+
         return HttpGenerationResult(
             output_tokens=output_tokens,
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
             routed_experts=routed_experts,
+            spec_accept_rate=spec_accept_rate,
+            spec_accept_length=spec_accept_length,
         )
 
     # -- pause / resume -----------------------------------------------------

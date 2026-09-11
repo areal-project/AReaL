@@ -1,4 +1,5 @@
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
@@ -154,3 +155,29 @@ def test_export_scalar_key_missing_on_this_rank_does_not_crash():
     assert all_reduce_groups == [dp_group, dp_group]
     assert result["loss_scalar"] == 0.0  # guarded 0/0, not NaN
     assert result["loss_scalar__count"] == 0
+
+
+def test_all_reduce_moves_cpu_stat_to_nccl_device_before_reduction():
+    """NCCL reductions must not receive CPU-backed rollout statistics."""
+    tracker = DistributedStatsTracker()
+    group = object()
+    cpu_tensor = MagicMock(spec=torch.Tensor)
+    cpu_tensor.device.type = "cpu"
+    cuda_tensor = MagicMock(spec=torch.Tensor)
+    cuda_tensor.device.type = "cuda"
+    cpu_tensor.to.return_value = cuda_tensor
+    platform = SimpleNamespace(
+        communication_backend="nccl",
+        device_type="cuda",
+    )
+
+    with (
+        patch("areal.utils.stats_tracker.dist.get_backend", return_value="nccl"),
+        patch("areal.utils.stats_tracker.current_platform", platform),
+        patch("areal.utils.stats_tracker.dist.all_reduce") as mock_all_reduce,
+    ):
+        result = tracker._all_reduce(cpu_tensor, group=group)
+
+    assert result is cuda_tensor
+    cpu_tensor.to.assert_called_once_with("cuda")
+    mock_all_reduce.assert_called_once_with(cuda_tensor, group=group)

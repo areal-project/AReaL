@@ -44,6 +44,7 @@ LOGGER_COLORS_EXACT = {
     # Launchers - blue
     "LocalLauncher": "blue",
     "RayLauncher": "blue",
+    "RayBootstrap": "blue",
     "SlurmLauncher": "blue",
     "InfCli": "blue",
     # Workflows - purple
@@ -66,6 +67,7 @@ LOGGER_COLORS_EXACT = {
     "HttpRTensor": "white",
     # Inference wrappers - white
     "SGLangWrapper": "white",
+    "SGLangMTPBridge": "white",
     "VLLMWrapper": "white",
     "RemoteInfEngine": "white",
     "vLLMEngine": "white",
@@ -98,6 +100,7 @@ LOGGER_COLORS_EXACT = {
     "PlatformInit": "light_cyan",
     "CUDAPlatform": "light_cyan",
     "NPUPlatform": "light_cyan",
+    "ROCmPlatform": "light_cyan",
     "UnknownPlatform": "light_cyan",
     # Sandbox backends
     "DaytonaClientManager": "blue",
@@ -129,6 +132,8 @@ LOGGER_COLORS_EXACT = {
     # AWEX weight exchange - cyan (compute backend)
     "AwexColocate": "light_cyan",
     "AwexColocateReader": "light_cyan",
+    "MegatronResidency": "light_cyan",
+    "MOPDTeacherPhase": "light_cyan",
     "AwexSGLangPlugin": "light_cyan",
 }
 

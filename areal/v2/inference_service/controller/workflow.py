@@ -53,6 +53,9 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         export_style: str = "individual",
         timeout: float | None = None,
         group_size: int = 1,
+        serialize_group_samples: bool = False,
+        drop_retry_orphans: bool = False,
+        reward_normalization: bool = False,
     ):
         self.controller = controller
         self.agent = agent
@@ -62,6 +65,9 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.export_style = export_style
         self.timeout = timeout
         self.group_size = group_size
+        self.serialize_group_samples = serialize_group_samples
+        self.drop_retry_orphans = drop_retry_orphans
+        self.reward_normalization = reward_normalization
 
     @async_http_retry
     async def _start_session(
@@ -106,6 +112,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         session_ids: list[str],
         group_id: str | None = None,
         trajectory_id: int | None = None,
+        discard_trajectory: bool = False,
     ) -> dict[str, Any]:
         url = f"{self.gateway_addr}/{_EXPORT_TRAJECTORIES_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
@@ -116,6 +123,9 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "discount": self.discount,
             "style": self.export_style,
             "remove_session": True,
+            "drop_retry_orphans": self.drop_retry_orphans,
+            "reward_normalization": self.reward_normalization,
+            "discard_trajectory": discard_trajectory,
         }
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
@@ -144,12 +154,38 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         group_id, sessions = await self._start_session(
             http_session, str(task_id), group_size=self.group_size
         )
+        execution_mode = "serial" if self.serialize_group_samples else "concurrent"
+        version = self.controller.get_version()
+        logger.info(
+            "V2 rollout group dispatch: task_id=%s group_id=%s version=%s "
+            "group_size=%d mode=%s sessions=%s",
+            task_id,
+            group_id,
+            version,
+            len(sessions),
+            execution_mode,
+            [session_id for session_id, _ in sessions],
+        )
 
         assert self.agent is not None
         http_client = await workflow_context.get_httpx_client()
 
-        async def _run_one(session_id: str, session_api_key: str) -> float | None:
+        async def _run_one(
+            member_index: int,
+            session_id: str,
+            session_api_key: str,
+        ) -> float | None:
             """Run one agent session. Returns reward on success, ``None`` on failure."""
+            logger.debug(
+                "V2 rollout member start: task_id=%s group_id=%s member=%d "
+                "session_id=%s version=%s mode=%s",
+                task_id,
+                group_id,
+                member_index,
+                session_id,
+                version,
+                execution_mode,
+            )
             try:
                 rewards = await self.agent.run(
                     data,
@@ -194,12 +230,36 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                         group_id,
                     )
                 return None
+            finally:
+                logger.debug(
+                    "V2 rollout member finish: task_id=%s group_id=%s member=%d "
+                    "session_id=%s version=%s mode=%s",
+                    task_id,
+                    group_id,
+                    member_index,
+                    session_id,
+                    version,
+                    execution_mode,
+                )
 
-        results = await asyncio.gather(
-            *[_run_one(sid, api_key) for sid, api_key in sessions]
-        )
+        if self.serialize_group_samples:
+            results = []
+            for member_index, (session_id, session_api_key) in enumerate(sessions):
+                results.append(
+                    await _run_one(member_index, session_id, session_api_key)
+                )
+        else:
+            results = await asyncio.gather(
+                *[
+                    _run_one(member_index, session_id, session_api_key)
+                    for member_index, (session_id, session_api_key) in enumerate(
+                        sessions
+                    )
+                ]
+            )
 
         session_ids = [sid for sid, _ in sessions]
+        n_failed = sum(result is None for result in results)
 
         # Always export to trigger session cleanup on the data proxy,
         # even when we intend to discard the trajectories.
@@ -207,11 +267,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             http_session,
             session_ids,
             group_id=group_id,
+            discard_trajectory=n_failed > 0,
         )
-        if not traj:
-            return None
-
-        n_failed = sum(r is None for r in results)
         if n_failed > 0:
             logger.warning(
                 "Abandoning group %s: %d/%d sessions failed",
@@ -219,6 +276,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                 n_failed,
                 len(sessions),
             )
+            return None
+        if not traj:
             return None
 
         tracker = stats_tracker.get(workflow_context.stat_scope())

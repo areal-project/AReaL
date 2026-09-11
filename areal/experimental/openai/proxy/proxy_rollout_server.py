@@ -18,10 +18,6 @@ from anthropic.types.message import Message
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
-from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
-    AnthropicAdapter,
-)
-from litellm.types.utils import ModelResponse as LitellmModelResponse
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses import Response
@@ -29,12 +25,18 @@ from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import BaseModel
 
 from areal.api.cli_args import NameResolveConfig
+from areal.experimental.openai.anthropic import (
+    translate_anthropic_request,
+    translate_anthropic_response,
+    translate_anthropic_stream,
+)
 from areal.experimental.openai.client import ArealOpenAI
+from areal.infra.processor_cache import ProcessorCacheRegistry
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.hf_utils import load_hf_tokenizer
+from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, gethostip
 
@@ -45,17 +47,23 @@ from .server import (
     EXPORT_TRAJECTORIES_PATHNAME,
     GRANT_CAPACITY_PATHNAME,
     RESPONSES_PATHNAME,
+    RL_END_PROCESSOR_CACHE_GROUP_PATHNAME,
     RL_END_SESSION_PATHNAME,
+    RL_FETCH_SHARED_TENSORS_PATHNAME,
     RL_SET_REWARD_PATHNAME,
     RL_START_SESSION_PATHNAME,
     ExportTrajectoriesRequest,
     ExportTrajectoriesResponse,
+    FetchSharedTensorsRequest,
+    FetchSharedTensorsResponse,
+    ProcessorCacheGroupRequest,
     SessionData,
     SetRewardRequest,
     StartSessionRequest,
     StartSessionResponse,
     serialize_interactions,
 )
+from .tensor_reference import GroupTensorStoreRegistry
 
 if TYPE_CHECKING:
     from areal.api import InferenceEngine
@@ -73,6 +81,10 @@ logger = getLogger("ProxyRolloutServer")
 _warn_once_enabled = os.environ.get("AREAL_PROXY_WARN_ONCE", "0") == "1"
 _warned_messages: set[str] = set()
 _warn_lock = threading.Lock()
+
+
+def _deterministic_sampling_seed(session_id: str, request_index: int) -> int:
+    return seeding.derive_deterministic_seed(session_id, request_index)
 
 
 def _warn_once(msg: str) -> None:
@@ -102,6 +114,8 @@ _lock = threading.Lock()
 _capacity = 0
 _last_cleanup_time: float = 0
 _session_timeout_seconds: int = 3600  # Default timeout (overridden by config)
+_processor_cache_registry = ProcessorCacheRegistry()
+_group_tensor_store_registry = GroupTensorStoreRegistry()
 
 # API key authentication
 # Initialized to a random value so pre-configuration requests cannot bypass auth.
@@ -121,10 +135,15 @@ _prefix_matcher = None
 # Server address (set at startup)
 _server_host: str = "0.0.0.0"
 _server_port: int = 8000
+_worker_role: str | None = None
+_worker_index: int | None = None
 
 # Port allocation tracking
 _allocated_ports: set[int] = set()
 _port_alloc_lock = asyncio.Lock()
+
+# Deterministic sampling (set from InferenceEngineConfig at setup time).
+_deterministic_sampling: bool = False
 
 # Server config (needed for name_resolve registration)
 _experiment_name: str | None = None
@@ -133,8 +152,23 @@ _name_resolve_type: str = "nfs"
 _nfs_record_root: str = "/tmp/areal/name_resolve"
 _etcd3_addr: str = "localhost:2379"
 
-# Adapter to convert Anthropic request to OpenAI format
-_adapter = AnthropicAdapter()
+
+def _resolve_worker_index(cli_worker_index: int) -> int:
+    """Resolve identity without clobbering an explicit scheduler value.
+
+    A local launch can inherit ``SLURM_PROCID`` from its parent login shell.
+    Treating that stale value as an unconditional override makes every local
+    proxy identify as rank 0, so exact fork readiness checks reject ranks
+    1..N. Slurm-only launchers still use the environment fallback when they
+    leave ``--worker-index`` at its sentinel value.
+    """
+    worker_index = cli_worker_index
+    if worker_index == -1 and "SLURM_PROCID" in os.environ:
+        worker_index = int(os.environ["SLURM_PROCID"])
+    if worker_index == -1:
+        raise ValueError("Invalid worker index. Not found from SLURM environ or args.")
+    return worker_index
+
 
 # =============================================================================
 # Request Validation
@@ -224,7 +258,12 @@ app = FastAPI()
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "initialized": _engine is not None}
+    return {
+        "status": "ok",
+        "initialized": _engine is not None,
+        "role": _worker_role,
+        "worker_index": _worker_index,
+    }
 
 
 @app.post("/alloc_ports")
@@ -270,18 +309,23 @@ async def alloc_ports(raw_request: Request):
 
 def _setup_openai_client():
     global _openai_client, _session_timeout_seconds, _admin_api_key
-    global _message_preprocessors, _prefix_matcher
+    global _message_preprocessors, _prefix_matcher, _deterministic_sampling
     config = _engine.config
-    tokenizer = load_hf_tokenizer(config.tokenizer_path)
+    _deterministic_sampling = bool(getattr(config, "deterministic_sampling", False))
+    processor, tokenizer = load_hf_processor_and_tokenizer(config.tokenizer_path)
+    if processor is not None and not hasattr(processor, "image_processor"):
+        processor = None
     agent_cfg = config.agent
     _openai_client = ArealOpenAI(
         engine=_engine,
         tokenizer=tokenizer,
+        processor=processor,
         tool_call_parser=agent_cfg.tool_call_parser,
         reasoning_parser=agent_cfg.reasoning_parser,
         engine_max_tokens=agent_cfg.engine_max_tokens,
         chat_template_type=agent_cfg.chat_template_type,
         lora_name=config.lora_name,
+        require_multimodal_processor=True,
     )
     # Set session timeout from config
     _session_timeout_seconds = agent_cfg.session_timeout_seconds
@@ -411,7 +455,14 @@ def _cleanup_stale_sessions():
 
     for session_id in stale_sessions:
         logger.warning(f"Removing stale session: {session_id}")
-        _session_cache.pop(session_id, None)
+        session_data = _session_cache.pop(session_id, None)
+        if session_data is not None:
+            cache_group_id = session_data.take_processor_cache_group_id()
+            if cache_group_id is not None:
+                _processor_cache_registry.release(cache_group_id)
+
+    _processor_cache_registry.discard_stale(_session_timeout_seconds)
+    _group_tensor_store_registry.discard_stale(_session_timeout_seconds)
 
     # Clean up API key mappings for stale sessions
     if stale_sessions:
@@ -440,6 +491,15 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
     """
     global _capacity
     task_id = request.task_id
+
+    if (
+        request.processor_cache_group_id is not None
+        and request.processor_cache_group_size < 2
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="processor_cache_group_size must be at least 2 for grouped caching",
+        )
 
     with _lock:
         # Periodically cleanup stale sessions
@@ -484,10 +544,20 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
             ):
                 session_api_key = secrets.token_urlsafe(32)
 
+        processor_cache = None
+        if request.processor_cache_group_id is not None:
+            processor_cache = _processor_cache_registry.acquire(
+                request.processor_cache_group_id,
+                request.processor_cache_group_size,
+            )
+
         _capacity -= 1
         _session_cache[session_id] = SessionData(
             session_id=session_id,
             prefix_matcher=_prefix_matcher,
+            sampling_seed_identity=task_id,
+            processor_cache=processor_cache,
+            processor_cache_group_id=request.processor_cache_group_id,
         )
         _api_key_to_session[session_api_key] = session_id
         _session_to_api_key[session_id] = session_api_key
@@ -513,7 +583,36 @@ def end_session(session_id: str = Depends(_require_session_key)):
 
     # finish() outside lock to avoid holding lock during potential I/O
     session.finish()
+    cache_group_id = session.take_processor_cache_group_id()
+    if cache_group_id is not None:
+        _processor_cache_registry.release(cache_group_id)
     return {"message": "success", "interaction_count": interaction_count}
+
+
+@app.post(
+    f"/{RL_END_PROCESSOR_CACHE_GROUP_PATHNAME}",
+    dependencies=[Depends(_require_admin_key)],
+)
+def end_processor_cache_group(request: ProcessorCacheGroupRequest):
+    """Discard processor and shared-tensor state after a rollout group finishes."""
+    _processor_cache_registry.discard(request.group_id)
+    _group_tensor_store_registry.discard(request.group_id)
+    return {"message": "success"}
+
+
+@app.post(
+    f"/{RL_FETCH_SHARED_TENSORS_PATHNAME}",
+    dependencies=[Depends(_require_admin_key)],
+)
+def fetch_shared_tensors(
+    request: FetchSharedTensorsRequest,
+) -> FetchSharedTensorsResponse:
+    """Fetch each unique multimodal tensor once for a grouped rollout."""
+    try:
+        tensors = _group_tensor_store_registry.fetch(request.group_id, request.ref_ids)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FetchSharedTensorsResponse(tensors=serialize_value(tensors))
 
 
 @app.post(f"/{RL_SET_REWARD_PATHNAME}")
@@ -574,12 +673,23 @@ async def _call_client_create(
                 status_code=410, detail=f"Session {session_id} already ended or expired"
             )
         session_data = _session_cache[session_id]
+        session_data.update_last_access()
 
-    session_data.update_last_access()
+    request_index = (
+        session_data.next_sampling_request_index() if _deterministic_sampling else None
+    )
 
     sig = inspect.signature(create_fn)
-    areal_client_ignored_args = ["model"] + (extra_ignored_args or [])
-    areal_client_disallowed_args = ["areal_cache"]
+    supports_processor_cache = "processor_cache" in sig.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in sig.parameters.values()
+    )
+    # Keep the request model when the AReaL client supports it. Anthropic's
+    # LiteLLM response adapter uses this field to select the model family;
+    # dropping it leaves the generated ChatCompletion with no usable model
+    # identity and fails with ``Model type must be specified``.
+    areal_client_ignored_args = extra_ignored_args or []
+    areal_client_disallowed_args = ["areal_cache", "processor_cache"]
     areal_client_allowed_args = list(
         k
         for k in sig.parameters.keys()
@@ -621,6 +731,22 @@ async def _call_client_create(
         kwargs["top_p"] = 1.0
         _warn_once("top_p not set in request, defaulting to 1.0")
 
+    if (
+        _deterministic_sampling
+        and kwargs.get("seed") is None
+        and "seed" in areal_client_allowed_args
+    ):
+        assert request_index is not None
+        # The logical identity excludes the physical session collision suffix.
+        # Reserve request indices at ingress so concurrent requests remain
+        # distinct without holding a lock during inference.
+        # TODO(agent): Strict mapping of concurrent sibling requests to seeds
+        # requires a stable caller-provided request identity. Group samples use
+        # separate sessions, so their sample_idx-based identities are stable.
+        kwargs["seed"] = _deterministic_sampling_seed(
+            session_data.sampling_seed_identity, request_index
+        )
+
     # Strip stream from request body to prevent it from bypassing the explicit
     # `stream` parameter.  Without this, a request with {"stream": true} would
     # leak through kwargs and cause the client to return an AsyncGenerator even
@@ -630,7 +756,13 @@ async def _call_client_create(
         kwargs["stream"] = True
 
     try:
-        return await create_fn(areal_cache=session_data.completions, **kwargs)
+        client_kwargs: dict[str, Any] = {
+            "areal_cache": session_data.completions,
+            **kwargs,
+        }
+        if supports_processor_cache:
+            client_kwargs["processor_cache"] = session_data.processor_cache
+        return await create_fn(**client_kwargs)
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
@@ -722,34 +854,12 @@ async def responses(
     )
 
 
-def _flatten_content_lists(messages: list[dict]) -> None:
-    """Flatten Anthropic content block lists to strings in-place."""
-    for msg in messages:
-        if isinstance(msg.get("content"), list):
-            text_parts = []
-            for block in msg["content"]:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    text_parts.append(block)
-            msg["content"] = "\n".join(text_parts)
-
-
 def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) -> dict:
     """Translate an Anthropic Messages API request to OpenAI format."""
-    openai_request = _adapter.translate_completion_input_params(
-        anthropic_request.copy()
+    return translate_anthropic_request(
+        anthropic_request,
+        message_preprocessors=_message_preprocessors,
     )
-    if openai_request is None:
-        raise ValueError("Failed to translate request")
-    openai_request = dict(openai_request)
-
-    if "messages" in openai_request:
-        _flatten_content_lists(openai_request["messages"])
-        for preprocessor in _message_preprocessors:
-            openai_request["messages"] = preprocessor(openai_request["messages"])
-
-    return openai_request
 
 
 async def _safe_stream_wrapper(
@@ -841,11 +951,9 @@ async def anthropic_messages(
             )
 
             # Use LiteLLM's adapter to convert to Anthropic SSE format
-            anthropic_sse_stream = (
-                _adapter.translate_completion_output_params_streaming(
-                    completion_stream=openai_stream,
-                    model=anthropic_request.get("model", "default"),
-                )
+            anthropic_sse_stream = translate_anthropic_stream(
+                openai_stream,
+                model=anthropic_request.get("model", "default"),
             )
 
             # Wrap the stream to handle client disconnection gracefully
@@ -878,21 +986,7 @@ async def anthropic_messages(
 
     # Convert OpenAI response to Anthropic format using LiteLLM's adapter
     try:
-        # Convert ChatCompletion to LitellmModelResponse
-        openai_response_dict = openai_response.model_dump()
-        model_response = LitellmModelResponse(**openai_response_dict)
-        anthropic_response = _adapter.translate_completion_output_params(model_response)
-        if anthropic_response is None:
-            raise ValueError("Failed to translate response")
-
-        # LiteLLM returns Pydantic BaseModel objects in content list,
-        # Convert them to dict.
-        if "content" in anthropic_response and anthropic_response["content"]:
-            anthropic_response["content"] = [
-                block.model_dump() if hasattr(block, "model_dump") else block
-                for block in anthropic_response["content"]
-            ]
-        return Message(**anthropic_response)
+        return translate_anthropic_response(openai_response)
     except Exception as e:
         logger.error(f"Failed to convert OpenAI response to Anthropic format: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to convert response: {e}")
@@ -940,9 +1034,23 @@ async def export_trajectories(
         _session_cache.pop(session_id, None)
         _remove_api_keys_for_session(session_id)
 
-    # Serialize for HTTP transport
-    serialized = serialize_interactions(interactions)
-    return ExportTrajectoriesResponse(interactions=serialized)
+    # Grouped inline/subproc sessions export only multimodal tensor references.
+    # The workflow fetches each unique tensor once through the group endpoint.
+    tensor_reference_group_id = (
+        session_data.processor_cache_group_id
+        if request.supports_shared_tensor_references
+        else None
+    )
+    tensor_store = (
+        _group_tensor_store_registry.get_or_create(tensor_reference_group_id)
+        if tensor_reference_group_id is not None
+        else None
+    )
+    serialized = serialize_interactions(interactions, tensor_store=tensor_store)
+    return ExportTrajectoriesResponse(
+        interactions=serialized,
+        tensor_reference_group_id=tensor_reference_group_id,
+    )
 
 
 # =============================================================================
@@ -1002,7 +1110,7 @@ def main():
     args, _ = parser.parse_known_args()
 
     # Set global server address variables
-    global _server_host, _server_port
+    global _server_host, _server_port, _worker_role, _worker_index
     global \
         _experiment_name, \
         _trial_name, \
@@ -1022,13 +1130,9 @@ def main():
 
     # Get worker identity
     worker_role = args.role
-    worker_index = args.worker_index
-
-    if "SLURM_PROCID" in os.environ:
-        # Overwriting with slurm task id
-        worker_index = int(os.environ["SLURM_PROCID"])
-    if worker_index == -1:
-        raise ValueError("Invalid worker index. Not found from SLURM environ or args.")
+    worker_index = _resolve_worker_index(args.worker_index)
+    _worker_role = worker_role
+    _worker_index = worker_index
     worker_id = f"{worker_role}/{worker_index}"
 
     # Determine port

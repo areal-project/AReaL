@@ -3,7 +3,6 @@
 import json
 import os
 import re
-import shutil
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -26,17 +25,19 @@ from areal.engine.megatron_utils.fp8 import (
 from areal.infra.platforms import current_platform
 from areal.models.mcore.registry import unwrap_to_gpt_model
 from areal.utils import logging
+from areal.utils.hf_utils import (
+    HF_MODEL_ASSET_FILES,
+    copy_hf_model_assets,
+    finalize_hf_export,
+)
 
 logger = logging.getLogger("HFSaver")
+HF_MODEL_CONFIG_FILES = list(HF_MODEL_ASSET_FILES)
 
-HF_MODEL_CONFIG_FILES = [
-    "generation_config.json",
-    "tokenizer_config.json",
-    "vocab.json",
-    "merges.txt",
-    "special_tokens_map.json",
-    "tokenizer.json",
-]
+
+def copy_hf_configs(src_model_dir, dst_model_dir):
+    """Backward-compatible wrapper for copying Hugging Face model assets."""
+    copy_hf_model_assets(src_model_dir, dst_model_dir)
 
 
 def _maybe_convert_from_te_fp8_params(
@@ -114,71 +115,6 @@ def _maybe_convert_to_torch_fp8_params(
     converted_params = [param for _, param in converted_named_params]
 
     return converted_names, converted_params
-
-
-def copy_hf_configs(src_model_dir, dst_model_dir):
-    for file in HF_MODEL_CONFIG_FILES:
-        try:
-            shutil.copy(
-                os.path.join(src_model_dir, file),
-                os.path.join(dst_model_dir, file),
-            )
-            logger.info(f"copied {file} from {src_model_dir} to {dst_model_dir}")
-        except FileNotFoundError:
-            logger.info(f"{file} not exist in {src_model_dir} skipping.")
-    # Copy remote codes and chat template files
-    for file in os.listdir(src_model_dir):
-        copy = False
-        for prefix in ["chat_format", "configuration_", "modeling_", "tokenization_"]:
-            if file.startswith(prefix) and file.endswith(".py"):
-                copy = True
-                break
-        # Chat template files (e.g. chat_template.jinja)
-        if file.startswith("chat_template"):
-            copy = True
-        if copy:
-            shutil.copy(
-                os.path.join(src_model_dir, file),
-                os.path.join(dst_model_dir, file),
-            )
-            logger.info(f"copied {file} from {src_model_dir} to {dst_model_dir}")
-
-
-def _patch_saved_config(base_model_path, saved_path):
-    """Patch saved config.json to preserve model_type and torch_dtype.
-
-    Some HF config classes lack a ``model_type`` class attribute, causing
-    ``save_pretrained()`` to lose the field (``PretrainedConfig.to_dict()``
-    reads the class attribute, not the instance value).  This restores
-    critical fields from the original model's config.json.
-    """
-    orig_config_path = os.path.join(base_model_path, "config.json")
-    saved_config_path = os.path.join(saved_path, "config.json")
-
-    if not os.path.exists(orig_config_path) or not os.path.exists(saved_config_path):
-        return
-
-    with open(orig_config_path) as f:
-        orig_config = json.load(f)
-    with open(saved_config_path) as f:
-        saved_config = json.load(f)
-
-    patched_fields = []
-
-    # Restore model_type if missing or null
-    if not saved_config.get("model_type") and orig_config.get("model_type"):
-        saved_config["model_type"] = orig_config["model_type"]
-        patched_fields.append(f"model_type={orig_config['model_type']}")
-
-    # Restore torch_dtype if missing
-    if "torch_dtype" not in saved_config and "torch_dtype" in orig_config:
-        saved_config["torch_dtype"] = orig_config["torch_dtype"]
-        patched_fields.append(f"torch_dtype={orig_config['torch_dtype']}")
-
-    if patched_fields:
-        with open(saved_config_path, "w") as f:
-            json.dump(saved_config, f, indent=2)
-        logger.info(f"Patched config.json: {', '.join(patched_fields)}")
 
 
 def _bridge_uses_stacked_experts(bridge: Bridge) -> bool:
@@ -840,12 +776,13 @@ def save_weights_to_hf_with_mbridge_fast(
 
     # 7. save metadata
     if dist.get_rank() == 0:
-        bridge.hf_config.save_pretrained(weights_path)
         with open(os.path.join(weights_path, "model.safetensors.index.json"), "w") as f:
             json.dump(bin_index, f, indent=4)
-        if base_model_path is not None:
-            copy_hf_configs(base_model_path, weights_path)
-            _patch_saved_config(base_model_path, weights_path)
+        finalize_hf_export(
+            bridge.hf_config,
+            weights_path,
+            source_model_path=base_model_path,
+        )
 
 
 def save_critic_value_head(models, weights_path):

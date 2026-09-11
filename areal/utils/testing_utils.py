@@ -101,6 +101,9 @@ class _LazyModelPaths(Mapping[str, str]):
     def __iter__(self) -> Iterator[str]:
         return iter(self._paths)
 
+    def __contains__(self, key: object) -> bool:
+        return key in self._paths
+
     def __len__(self) -> int:
         return len(self._paths)
 

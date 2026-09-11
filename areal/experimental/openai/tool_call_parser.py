@@ -258,7 +258,7 @@ def _process_tool_calls_sglang(
     text: str,
     tools: list[Any],
     tool_call_parser: str,
-    reasoning_parser: str,
+    reasoning_parser: str | None,
     finish_reason: str,
     use_responses: bool = False,
 ) -> tuple[
@@ -266,10 +266,18 @@ def _process_tool_calls_sglang(
     str,
     str,
 ]:
-    from sglang.srt.entrypoints.openai.protocol import Function as SglFunction
-    from sglang.srt.entrypoints.openai.protocol import Tool as SglTool
-    from sglang.srt.function_call.function_call_parser import FunctionCallParser
-    from sglang.srt.parser.reasoning_parser import ReasoningParser
+    try:
+        from sglang.srt.entrypoints.openai.protocol import Function as SglFunction
+        from sglang.srt.entrypoints.openai.protocol import Tool as SglTool
+        from sglang.srt.function_call.function_call_parser import (
+            FunctionCallParser,
+        )
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+    except ImportError:
+        # Let the backend dispatcher try vLLM before giving up. Returning raw
+        # text here would make an installed vLLM parser unreachable whenever
+        # SGLang is absent.
+        raise ModuleNotFoundError("SGLang tool-call parser is unavailable") from None
 
     if use_responses:
         tools = [
@@ -289,14 +297,37 @@ def _process_tool_calls_sglang(
             for tool in tools
         ]
 
-    parser_p = FunctionCallParser(tools, tool_call_parser)
-    reasoning_parser_p = ReasoningParser(reasoning_parser)
+    try:
+        parser_p = FunctionCallParser(tools, tool_call_parser)
+    except (KeyError, ValueError) as e:
+        raise ValueError(
+            "Invalid rollout.openai.tool_call_parser="
+            f"{tool_call_parser!r} for the SGLang backend: {e}. Use a parser "
+            "supported by SGLang (for Qwen3-Coder use 'qwen3_coder')."
+        ) from e
 
-    reasoning_text, content_text = _detect_think_and_return_ori_think(
-        text,
-        reasoning_parser_p.detector.think_start_token,
-        reasoning_parser_p.detector.think_end_token,
-    )
+    # An empty reasoning parser is a supported way to disable reasoning
+    # extraction. Tool-call parsing is independent of reasoning parsing and
+    # must still work on the complete model output in that mode.
+    if reasoning_parser:
+        try:
+            reasoning_parser_p = ReasoningParser(reasoning_parser)
+        except (KeyError, ValueError) as e:
+            raise ValueError(
+                "Invalid rollout.openai.reasoning_parser="
+                f"{reasoning_parser!r} while using tool_call_parser="
+                f"{tool_call_parser!r}: {e}. Use a supported SGLang model type "
+                "such as 'qwen3', or leave reasoning_parser empty to disable "
+                "reasoning extraction."
+            ) from e
+
+        reasoning_text, content_text = _detect_think_and_return_ori_think(
+            text,
+            reasoning_parser_p.detector.think_start_token,
+            reasoning_parser_p.detector.think_end_token,
+        )
+    else:
+        reasoning_text, content_text = "", text
 
     if parser_p.has_tool_call(content_text):
         if finish_reason == "stop":
@@ -341,7 +372,7 @@ def _process_tool_calls_vllm(
     text: str,
     tools: list[Any],
     tool_call_parser: str,
-    reasoning_parser: str,
+    reasoning_parser: str | None,
     finish_reason: str,
     use_responses: bool = False,
     tokenizer: Any = None,
@@ -453,7 +484,7 @@ def process_tool_calls(
     text: str,
     tools: list[Any],
     tool_call_parser: str,
-    reasoning_parser: str,
+    reasoning_parser: str | None,
     finish_reason: str,
     use_responses: bool = False,
     tokenizer: Any = None,

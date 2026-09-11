@@ -1003,6 +1003,7 @@ class RayScheduler(Scheduler):
         target_wi: RayWorkerInfo,
         target_role: str,
         command: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> RayWorkerInfo:
         """Fork a single worker asynchronously.
 
@@ -1013,12 +1014,21 @@ class RayScheduler(Scheduler):
         """
         worker_id = f"{role}/{idx}"
         guard_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}"
+        port_cnt = len(target_wi.worker.worker_ports)
+        ports_reserved = False
 
         try:
             # 1. Allocate a port on the target guard
             async with session.post(
                 f"{guard_url}/alloc_ports",
-                json={"count": 1},
+                json={
+                    "count": port_cnt,
+                    "role": role,
+                    "worker_index": idx,
+                    "exclude_ports": [
+                        int(port) for port in target_wi.worker.worker_ports
+                    ],
+                },
             ) as alloc_resp:
                 if alloc_resp.status != 200:
                     error_text = await alloc_resp.text()
@@ -1029,7 +1039,9 @@ class RayScheduler(Scheduler):
                     )
                 alloc_data = await alloc_resp.json()
                 forked_host = alloc_data["host"]
-                forked_port = alloc_data["ports"][0]
+                forked_ports = alloc_data["ports"]
+                forked_port = forked_ports[0]
+                ports_reserved = True
 
             # 2. Build the full raw command
             module_path = command or "areal.infra.rpc.rpc_server"
@@ -1066,6 +1078,7 @@ class RayScheduler(Scheduler):
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "env": env or {},
             }
             async with session.post(
                 f"{guard_url}/fork",
@@ -1111,34 +1124,31 @@ class RayScheduler(Scheduler):
                 f"(pid={forked_pid}) from {target_role}/{idx}"
             )
 
-        except aiohttp.ClientError as e:
-            raise WorkerCreationError(
-                role,
-                f"Failed to fork worker {idx} from {target_role}/{idx}",
-                str(e),
-            ) from e
+        except BaseException as e:
+            if ports_reserved:
+                for endpoint in ("kill_forked_worker", "release_ports"):
+                    try:
+                        async with session.post(
+                            f"{guard_url}/{endpoint}",
+                            json={"role": role, "worker_index": idx},
+                        ):
+                            pass
+                    except Exception:
+                        pass
+            if isinstance(e, aiohttp.ClientError):
+                raise WorkerCreationError(
+                    role,
+                    f"Failed to fork worker {idx} from {target_role}/{idx}",
+                    str(e),
+                ) from e
+            raise
 
         worker = Worker(
             id=worker_id,
             ip=forked_host,
-            worker_ports=[str(forked_port)],
+            worker_ports=list(map(str, forked_ports)),
             engine_ports=[],
         )
-        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
-        if port_cnt > 1:
-            async with session.post(
-                f"http://{format_hostport(forked_host, forked_port)}/alloc_ports",
-                json=dict(count=port_cnt - 1),
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise WorkerCreationError(
-                        role,
-                        f"Fork failed for worker {idx}",
-                        f"HTTP {response.status}: {error_text}",
-                    )
-                new_ports = (await response.json())["ports"]
-                worker.worker_ports += list(map(str, new_ports))
 
         return RayWorkerInfo(
             worker=worker,
@@ -1214,6 +1224,7 @@ class RayScheduler(Scheduler):
         target_role: str,
         target_workers: list[RayWorkerInfo],
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
 
@@ -1231,7 +1242,13 @@ class RayScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    command,
+                    None if env_vars is None else env_vars[idx],
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -1277,8 +1294,14 @@ class RayScheduler(Scheduler):
         )
 
         # Configure forked workers if exp_config is available
-        if self.exp_config is not None:
-            await self._configure_workers(workers)
+        try:
+            if self.exp_config is not None:
+                await self._configure_workers(workers)
+        except BaseException:
+            await self._cleanup_forked_workers_async(role, target_role, workers)
+            self._workers.pop(role, None)
+            self._colocated_roles.pop(role, None)
+            raise
 
         return worker_ids
 
@@ -1287,6 +1310,7 @@ class RayScheduler(Scheduler):
         role: str,
         target_role: str,
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Fork new worker processes from existing workers.
 
@@ -1319,6 +1343,7 @@ class RayScheduler(Scheduler):
                 target_role,
                 target_workers,
                 command,
+                env_vars,
             )
         except Exception:
             # Cleanup on failure
@@ -1549,7 +1574,11 @@ class RayScheduler(Scheduler):
             # Check if fork mode is enabled
             if strategy.fork:
                 # Fork mode: spawn new processes on same nodes via /fork endpoint
-                return self.fork_workers(role, colocate_role)
+                return self.fork_workers(
+                    role,
+                    colocate_role,
+                    env_vars=[scheduling.env_vars for scheduling in schedulings],
+                )
 
             # Reuse existing workers - no new Ray launchers created
             worker_ids = [w.worker.id for w in target_workers]

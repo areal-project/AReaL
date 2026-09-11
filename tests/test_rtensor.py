@@ -5,7 +5,9 @@ import subprocess
 import sys
 import time
 import uuid
+import weakref
 
+import aiohttp
 import orjson
 import pytest
 import requests
@@ -15,10 +17,66 @@ from areal.infra.rpc.rtensor import (
     HttpRTensorBackend,
     RTensor,
     TensorShardInfo,
+    fetch,
 )
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.proc import kill_process_tree
 from areal.utils.network import find_free_ports
+
+
+class _FakeDeleteResponse:
+    content_type = "application/json"
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    async def json(self):
+        return self.payload
+
+
+class _FakeDeleteSession:
+    def __init__(self, responses_or_errors):
+        self.responses_or_errors = list(responses_or_errors)
+        self.requests = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def delete(self, url, *, json, timeout):
+        self.requests.append((url, json, timeout))
+        item = self.responses_or_errors.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return _FakeDeleteResponse(item)
+
+
+class _RecordingRTensorBackend:
+    def __init__(self):
+        self.tensors = {}
+        self.store_calls = []
+        self.fetch_calls = []
+
+    def store(self, tensor):
+        shard_id = f"shard-{len(self.store_calls)}"
+        self.store_calls.append(tensor)
+        self.tensors[shard_id] = tensor
+        return shard_id
+
+    def fetch(self, shards):
+        self.fetch_calls.append(shards)
+        return [self.tensors[shard.shard_id] for shard in shards]
 
 
 @pytest.fixture(scope="module")
@@ -262,6 +320,60 @@ class TestRTensorIntegration:
 
 class TestHttpRTensorBackendBatching:
     """Unit tests for HTTP batch fetching behavior."""
+
+    def test_delete_retries_with_payload_and_returns_storage_stats(self, monkeypatch):
+        async def no_sleep(_delay):
+            return None
+
+        result_payload = {
+            "status": "ok",
+            "cleared_count": 2,
+            "num_tensors": 3,
+            "total_bytes": 128,
+        }
+        session = _FakeDeleteSession(
+            [aiohttp.ClientConnectionError("temporary failure"), result_payload]
+        )
+        backend = HttpRTensorBackend()
+        monkeypatch.setattr(backend, "_create_session", lambda: session)
+        monkeypatch.setattr("areal.infra.utils.http.asyncio.sleep", no_sleep)
+
+        result = asyncio.run(backend.delete("node-a", ["s0", "s1"]))
+
+        assert result == result_payload
+        assert len(session.requests) == 2
+        for url, payload, timeout in session.requests:
+            assert url == "http://node-a/data/clear"
+            assert payload == {"shard_ids": ["s0", "s1"]}
+            assert timeout.total == 10
+
+    def test_delete_raises_after_three_failed_attempts(self, monkeypatch):
+        async def no_sleep(_delay):
+            return None
+
+        session = _FakeDeleteSession(
+            [aiohttp.ClientConnectionError("offline") for _ in range(3)]
+        )
+        backend = HttpRTensorBackend()
+        monkeypatch.setattr(backend, "_create_session", lambda: session)
+        monkeypatch.setattr("areal.infra.utils.http.asyncio.sleep", no_sleep)
+
+        with pytest.raises(RuntimeError, match="Failed after 3 retries"):
+            asyncio.run(backend.delete("node-a", ["s0"]))
+
+        assert len(session.requests) == 3
+
+    @pytest.mark.parametrize(
+        "payload",
+        ["not-a-dict", {"status": "error", "message": "clear failed"}],
+    )
+    def test_delete_rejects_invalid_success_payload(self, monkeypatch, payload):
+        session = _FakeDeleteSession([payload])
+        backend = HttpRTensorBackend()
+        monkeypatch.setattr(backend, "_create_session", lambda: session)
+
+        with pytest.raises(RuntimeError, match="Invalid response"):
+            asyncio.run(backend.delete("node-a", ["s0"]))
 
     def test_fetch_chunks_large_requests(self, monkeypatch):
         """Large same-node fetches are split into bounded batch requests."""
@@ -628,7 +740,8 @@ class TestRTensorMemoryCleanup:
 class TestRemotize:
     """Test remotize method with various input types."""
 
-    def test_remotize_list_of_dicts(self, rpc_server):
+    @pytest.mark.parametrize("preserve_tensor_aliases", [False, True])
+    def test_remotize_list_of_dicts(self, rpc_server, preserve_tensor_aliases):
         """Test remotizing list of dicts with different attention masks."""
         # Create two trajectory dicts with different seqlens
         traj1 = {
@@ -644,7 +757,11 @@ class TestRemotize:
             "logits": torch.randn(3, 5).cpu(),
         }
 
-        result = RTensor.remotize([traj1, traj2], node_addr=rpc_server)
+        result = RTensor.remotize(
+            [traj1, traj2],
+            node_addr=rpc_server,
+            preserve_tensor_aliases=preserve_tensor_aliases,
+        )
 
         assert isinstance(result, list)
         assert len(result) == 2
@@ -657,6 +774,22 @@ class TestRemotize:
         # Verify size matches batch dimension
         assert result[0]["logits"].shape[0] == 2
         assert result[1]["logits"].shape[0] == 3
+
+        for original, remote, seqlen in zip(
+            [traj1, traj2], result, [3, 4], strict=True
+        ):
+            for key in original:
+                # remotize stores locally; to_local fetches from the RPC process.
+                shard_id = remote[key].shard.shard_id
+                response = requests.put(
+                    f"http://{rpc_server}/data/{shard_id}",
+                    data=orjson.dumps(serialize_value(fetch(shard_id))),
+                    timeout=5,
+                )
+                assert response.status_code == 200
+                torch.testing.assert_close(
+                    remote[key].to_local(), original[key][:, :seqlen], rtol=0, atol=0
+                )
 
     def test_remotize_list_of_tensors(self, rpc_server):
         """Test remotizing list of standalone tensors."""
@@ -817,6 +950,158 @@ class TestRemotize:
         # attention_mask should be trimmed to [[1,1,1],[1,1,0]]
         expected_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
         assert torch.equal(localized["attention_mask"], expected_mask)
+
+
+class TestRTensorAliasPreservation:
+    def test_remotize_nested_trajectories_retains_temporary_sources(self, monkeypatch):
+        """Compacted sources stay alive across siblings, only until remotize ends."""
+        from areal.utils import data as data_utils
+
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        split_and_unpad = data_utils.split_and_unpad_tensor
+        source_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+        compaction_calls = 0
+
+        def track_compacted_sources(*args, **kwargs):
+            nonlocal compaction_calls
+            # Check lifetime directly, without relying on allocator-dependent
+            # ID reuse to expose an unrelated shard being returned.
+            assert all(ref() is not None for ref in source_refs)
+            compacted = split_and_unpad(*args, **kwargs)
+            source_refs.extend(weakref.ref(value) for value in compacted[0].values())
+            compaction_calls += 1
+            return compacted
+
+        monkeypatch.setattr(
+            data_utils, "split_and_unpad_tensor", track_compacted_sources
+        )
+        first = {
+            "attention_mask": torch.tensor([[1, 1, 0]]),
+            "input_ids": torch.tensor([[1, 2, 0]]),
+        }
+        second = {
+            "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+            "input_ids": torch.tensor([[99, 98, 97, 0]]),
+        }
+
+        result = RTensor.remotize(
+            [first, {"nested": [second]}],
+            node_addr="node-a",
+            preserve_tensor_aliases=True,
+        )
+
+        assert compaction_calls == 2
+        assert len(source_refs) == 4
+        assert all(ref() is None for ref in source_refs)
+        assert len(backend.store_calls) == 4
+        for original, remote, seqlen in (
+            (first, result[0], 2),
+            (second, result[1]["nested"][0], 3),
+        ):
+            for key in original:
+                torch.testing.assert_close(
+                    backend.tensors[remote[key].shard.shard_id],
+                    original[key][:, :seqlen],
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_remotize_shared_tensor_default_uses_distinct_shards(self, monkeypatch):
+        """Alias preservation should remain opt-in for existing callers."""
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        tensor = torch.arange(6)
+
+        result = RTensor.remotize([tensor, tensor], node_addr="node-a")
+
+        assert result[0].shard.shard_id != result[1].shard.shard_id
+        assert len(backend.store_calls) == 2
+
+    def test_remotize_shared_multimodal_tensors_stores_each_object_once(
+        self, monkeypatch
+    ):
+        """Shared group image tensors should map to one shard per object."""
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+
+        pixel_values = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        image_grid_thw = torch.tensor([[1, 2, 2]])
+        trajectory = {
+            "attention_mask": torch.tensor([[1, 1, 0], [1, 1, 0]]),
+            "multi_modal_input": [
+                {
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                },
+                {
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                },
+            ],
+        }
+
+        result = RTensor.remotize(
+            trajectory,
+            node_addr="node-a",
+            preserve_tensor_aliases=True,
+        )
+
+        first, second = result["multi_modal_input"]
+        assert first["pixel_values"] is second["pixel_values"]
+        assert first["image_grid_thw"] is second["image_grid_thw"]
+        assert len(backend.store_calls) == 3
+
+    def test_remotize_equal_distinct_tensors_uses_distinct_shards(self, monkeypatch):
+        """Equal values should not merge when tensor identities differ."""
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        first = torch.arange(6)
+        second = first.clone()
+
+        result = RTensor.remotize(
+            [first, second],
+            node_addr="node-a",
+            preserve_tensor_aliases=True,
+        )
+
+        assert result[0].shard.shard_id != result[1].shard.shard_id
+        assert len(backend.store_calls) == 2
+
+    def test_localize_repeated_shard_fetches_once_and_restores_aliases(
+        self, monkeypatch
+    ):
+        """Repeated shard references should share one fetch and local tensor."""
+        backend = _RecordingRTensorBackend()
+        backend.tensors["shared-image"] = torch.arange(12).reshape(3, 4)
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        monkeypatch.setattr("areal.infra.rpc.rtensor._fetch_buffer", {})
+
+        def make_remote_tensor():
+            return RTensor(
+                shard=TensorShardInfo(
+                    shard_id="shared-image",
+                    node_addr="node-a",
+                ),
+                data=torch.empty(3, 4, device="meta"),
+            )
+
+        serialized_payload = serialize_value(
+            {
+                "args": [make_remote_tensor()],
+                "kwargs": {"image": make_remote_tensor()},
+            }
+        )
+        payload = deserialize_value(serialized_payload)
+
+        result = RTensor.localize(
+            payload,
+            preserve_tensor_aliases=True,
+        )
+
+        assert len(backend.fetch_calls) == 1
+        assert len(backend.fetch_calls[0]) == 1
+        assert result["args"][0] is result["kwargs"]["image"]
 
 
 class TestFetchBuffer:
@@ -1023,6 +1308,25 @@ class TestFetchBuffer:
         # clear_node evicts from buffer
         asyncio.run(RTensor.clear_node(rpc_server, [shard_id]))
         assert shard_id not in _fetch_buffer
+
+    def test_clear_node_evicts_from_buffer_when_delete_fails(self):
+        """A failed remote delete must not regress local buffer cleanup."""
+        from areal.infra.rpc.rtensor import _fetch_buffer, set_backend
+
+        class _FailingBackend:
+            async def delete(self, _node_addr, _shard_ids):
+                raise RuntimeError("storage node unavailable")
+
+        shard_id = "failed-delete-shard"
+        _fetch_buffer[shard_id] = torch.tensor([1])
+        set_backend(_FailingBackend())
+        try:
+            with pytest.raises(RuntimeError, match="storage node unavailable"):
+                asyncio.run(RTensor.clear_node("node-a", [shard_id]))
+            assert shard_id not in _fetch_buffer
+        finally:
+            set_backend(None)
+            _fetch_buffer.pop(shard_id, None)
 
     def test_clear_fetch_buffer_selective(self):
         """clear_fetch_buffer(sids) pops only the listed entries, misses are no-ops."""

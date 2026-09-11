@@ -19,6 +19,8 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
 from openai.types.chat.chat_completion_chunk import ChoiceDelta
 
+from areal.api import ModelResponse
+from areal.experimental.openai.client import AsyncCompletionsWithReward
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
 
 # ---------------------------------------------------------------------------
@@ -67,6 +69,7 @@ def _reset_server_globals(monkeypatch):
 async def _fake_create(
     *,
     messages=None,
+    model=None,
     stream=None,
     temperature=None,
     top_p=None,
@@ -95,7 +98,7 @@ async def _fake_create(
                     )
                 ],
                 created=0,
-                model="test",
+                model=model,
                 object="chat.completion.chunk",
             )
 
@@ -111,7 +114,7 @@ async def _fake_create(
             )
         ],
         created=0,
-        model="test",
+        model=model,
         object="chat.completion",
     )
 
@@ -173,6 +176,7 @@ class TestChatCompletionsEndpoint:
             # Verify the data payload is a valid ChatCompletionChunk
             chunk = json.loads(events[0].removeprefix("data: "))
             assert chunk["object"] == "chat.completion.chunk"
+            assert chunk["model"] == "test"
             assert chunk["choices"][0]["delta"]["content"] == "hello"
 
     @pytest.mark.asyncio
@@ -201,4 +205,38 @@ class TestChatCompletionsEndpoint:
             assert resp.status_code == 200
             data = resp.json()
             assert data["object"] == "chat.completion"
+            assert data["model"] == "test"
             assert data["choices"][0]["message"]["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_areal_completion_response_uses_request_model():
+    """Both response modes retain the model required by Anthropic adapters."""
+    client = object.__new__(AsyncCompletionsWithReward)
+    model_response = ModelResponse(
+        input_tokens=[1, 2],
+        output_tokens=[3],
+        stop_reason="stop",
+    )
+
+    completion, _ = client._build_chat_completion(
+        completion_id="chatcmpl-test",
+        current_time=0,
+        model="claude-test-model",
+        output_text="hello",
+        tool_calls=None,
+        response=model_response,
+    )
+    stream = client._create_stream(
+        completion_id="chatcmpl-test",
+        current_time=0,
+        model="claude-test-model",
+        output_text="hello",
+        tool_calls=None,
+        response=model_response,
+    )
+    chunks = [chunk async for chunk in stream]
+
+    assert completion.model == "claude-test-model"
+    assert chunks
+    assert all(chunk.model == "claude-test-model" for chunk in chunks)

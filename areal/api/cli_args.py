@@ -2,7 +2,9 @@
 
 import argparse
 import json
+import math
 import os
+import re
 import warnings
 from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
@@ -222,6 +224,14 @@ class GenerationHyperparameters:
             )
         },
     )
+    seed: int | None = field(
+        default=None,
+        metadata={
+            "help": "Per-request sampling seed sent to the inference backend. Leave "
+            "unset for grouped deterministic rollouts so each sample receives a "
+            "stable, distinct derived seed."
+        },
+    )
     lora_name: str = field(
         default="default_lora",
         metadata={"help": "Lora name to be used for this generation."},
@@ -238,9 +248,9 @@ class GenerationHyperparameters:
             "help": (
                 "If True, apply per-prompt reward normalization across the "
                 "n_samples rollouts of the same prompt inside "
-                "GroupedRolloutWorkflow. Only affects InteractionWithTokenLogpReward "
-                "workflows such as SWE agent workflows. Not supported by "
-                "RolloutControllerV2 yet."
+                "grouped rollout workflows. Only affects "
+                "InteractionWithTokenLogpReward workflows such as SWE agent "
+                "workflows."
             )
         },
     )
@@ -962,11 +972,12 @@ class MegatronEngineConfig:
 
     # MoE
     moe_router_dtype: str | None = "fp32"
-    moe_shared_expert_overlap: bool = field(
-        default=False,
+    moe_shared_expert_overlap: bool | None = field(
+        default=None,
         metadata={
             "help": "Enable overlapping between shared expert computations and dispatcher communications. "
-            "Without this, the shared experts execute after the routed experts."
+            "Without this, the shared experts execute after the routed experts. "
+            "None keeps the model bridge's own default."
         },
     )
     moe_enable_deepep: bool = False
@@ -987,13 +998,14 @@ class MegatronEngineConfig:
             "Requires TransformerEngine >= 2.7.0.",
         },
     )
-    moe_router_bias_update_rate: float = field(
-        default=0.0,
+    moe_router_bias_update_rate: float | None = field(
+        default=None,
         metadata={
             "help": "Update rate for auxiliary-loss-free MoE load balancing "
             "(DeepSeek V3 style). Controls how fast expert_bias adjusts. "
-            "Default 0.0 disables bias updates; set a positive value such as "
-            "1e-3 to enable.",
+            "None keeps the model bridge's own default (AReaL bridges "
+            "disable it or derive it from the checkpoint). Set 0.0 to "
+            "disable explicitly; 1e-3 matches DeepSeek V3.",
         },
     )
     moe_z_loss_coeff: float | None = field(
@@ -1096,7 +1108,30 @@ class MegatronEngineConfig:
         },
     )
 
+    enable_mtp_training: bool = field(
+        default=False,
+        metadata={
+            "help": "Train the Multi-Token-Prediction (MTP) head as an auxiliary "
+            "objective (SFT/RL). Requires enable_mtp=True. The MTP loss is fed an "
+            "independent label channel (mtp_kwargs) so the main forward keeps "
+            "labels=None and returns logits; MTP gradients are isolated from the "
+            "backbone (output weight detached, backbone hidden states cut from the "
+            "MTP graph). bridge_type=megatron-bridge only; packed context parallel "
+            "training is supported.",
+        },
+    )
+
+    mtp_loss_scaling_factor: float = field(
+        default=0.1,
+        metadata={
+            "help": "Weight of the auxiliary MTP loss relative to the main loss "
+            "when enable_mtp_training=True (DeepSeek-V3 default: 0.1).",
+        },
+    )
+
     def __post_init__(self) -> None:
+        if self.enable_mtp_training and not self.enable_mtp:
+            raise ValueError("enable_mtp_training requires enable_mtp=True")
         if self.lm_head_loss_chunk_size < 0:
             raise ValueError(
                 "lm_head_loss_chunk_size must be non-negative, got "
@@ -1112,6 +1147,10 @@ class MegatronEngineConfig:
             )
         if self.lm_head_loss_chunk_size > 0 and self.enable_mtp:
             raise ValueError("lm_head_loss_chunk_size does not support enable_mtp=True")
+        if self.lm_head_loss_chunk_size > 0 and self.enable_mtp_training:
+            raise ValueError(
+                "lm_head_loss_chunk_size does not support enable_mtp_training=True"
+            )
 
 
 class SchedulingStrategyType(str, Enum):
@@ -1328,8 +1367,26 @@ class TrainEngineConfig:
         default="xccl",
         metadata={
             "help": "Weight update backend type. 'awex' requires a Megatron actor "
-            "and an SGLang rollout, and targets colocated actor-rollout setups.",
+            "and an SGLang rollout.",
             "choices": ["disk", "xccl", "awex"],
+        },
+    )
+    enable_delta_weight_update: bool = field(
+        default=False,
+        metadata={"help": "Enable sparse delta weight updates for separation AWEX."},
+    )
+    weight_update_delta_method: str = field(
+        default="adamw",
+        metadata={
+            "help": "Change detection method used for delta weight transfer.",
+            "choices": ["adamw"],
+        },
+    )
+    weight_update_anchor_interval: int = field(
+        default=0,
+        metadata={
+            "help": "Force a full sync every N committed deltas. 0 disables "
+            "periodic anchors."
         },
     )
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
@@ -1421,6 +1478,7 @@ class TrainEngineConfig:
             "help": "Timeout (seconds) for initialize() to wait for guards to be ready."
         },
     )
+
     scheduling_strategy: SchedulingStrategy = field(
         default_factory=SchedulingStrategy,
         metadata={
@@ -1451,6 +1509,11 @@ class TrainEngineConfig:
         if self._version not in ("v1", "v2"):
             raise ValueError(
                 f"_version must be either 'v1' or 'v2', got '{self._version}'"
+            )
+        if self.weight_update_mode == "awex" and not self.megatron.wrap_with_ddp:
+            raise ValueError(
+                "weight_update_mode='awex' requires megatron.wrap_with_ddp=true "
+                "because AWEX offloads MCore DDP flat buffers"
             )
 
         # Canonicalize common aliases so getattr(torch, ...) works at runtime.
@@ -1648,7 +1711,11 @@ class PPOActorConfig(TrainEngineConfig):
 
     # Core PPO/GRPO Parameters
     ppo_n_minibatches: int = field(
-        default=4, metadata={"help": "Number of minibatches for each PPO update"}
+        default=4,
+        metadata={
+            "help": "Number of minibatches for each PPO update. Separation DTE "
+            "AdamW delta transfer currently requires 1."
+        },
     )
     eps_clip: float = field(
         default=0.2, metadata={"help": "Clipping factor for policy ratio"}
@@ -1891,6 +1958,13 @@ class PPOActorConfig(TrainEngineConfig):
                 "to a single optimizer step per PPO update."
             )
             self.ppo_n_minibatches = 1
+        if self.enable_delta_weight_update and self.ppo_n_minibatches != 1:
+            raise ValueError(
+                "actor.enable_delta_weight_update=true currently requires "
+                "ppo_n_minibatches=1 because separation AdamW inversion "
+                "supports exactly one optimizer step between weight updates; "
+                f"got ppo_n_minibatches={self.ppo_n_minibatches}"
+            )
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
         if not self.use_decoupled_loss and self.rejection_sampling is not None:
             logger.warning(
@@ -2107,6 +2181,11 @@ class vLLMConfig:
         return vLLMConfig.build_cmd_from_args(args)
 
 
+# Keep this list aligned with SGLang's deterministic inference documentation:
+# https://docs.sglang.ai/advanced_features/deterministic_inference.html
+_SGLANG_DETERMINISTIC_ATTENTION_BACKENDS = frozenset({"flashinfer", "fa3", "triton"})
+
+
 @dataclass
 class SGLangConfig:
     """Configuration for SGLang runtime. Refer to:
@@ -2140,6 +2219,7 @@ class SGLangConfig:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
+    enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
     sampling_backend: str | None = None
     context_length: int | None = 32768
@@ -2162,6 +2242,33 @@ class SGLangConfig:
     max_loaded_loras: int = 8  # override default
     lora_paths: list[str] | None = None  # lora_paths is automatically filled
     lora_backend: str = "triton"
+    # Speculative decoding (MTP / EAGLE / EAGLE3 / NEXTN).
+    # All None by default so get_py_cmd() emits no flag and SGLang runs standard
+    # decoding. Field names mirror SGLang ServerArgs; underscores -> CLI hyphens.
+    speculative_algorithm: str | None = field(
+        default=None,
+        metadata={
+            "help": "Speculative decoding algorithm passed to SGLang. None disables "
+            "spec decode. Use the target model's built-in MTP head via 'NEXTN'/'EAGLE', "
+            "or an external draft model with 'EAGLE'/'EAGLE3' + "
+            "speculative_draft_model_path.",
+            "choices": ["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
+        },
+    )
+    speculative_num_steps: int | None = None
+    speculative_eagle_topk: int | None = None
+    speculative_num_draft_tokens: int | None = None
+    speculative_draft_model_path: str | None = field(
+        default=None,
+        metadata={
+            "help": "Path to an external draft model. Leave None to use the target "
+            "model's own MTP head (training side must set megatron.enable_mtp=True).",
+        },
+    )
+    # Keep a CPU backup of draft weights so the server can start/run before the
+    # MTP/draft weights are synced from training. Required for online MTP training
+    # where draft weights arrive via weight-sync after the server launches.
+    enable_draft_weights_cpu_backup: bool = False
     # logging
     log_level: str = "warning"
     log_level_http: str | None = "warning"
@@ -2223,6 +2330,19 @@ class SGLangConfig:
         node_rank: int = 0,
         pp_size: int = 1,
     ):
+        attention_backend = sglang_config.attention_backend
+        if (
+            sglang_config.enable_deterministic_inference
+            and attention_backend is not None
+            and attention_backend.lower()
+            not in _SGLANG_DETERMINISTIC_ATTENTION_BACKENDS
+        ):
+            logger.warning(
+                "SGLang deterministic inference is only documented for attention "
+                "backends %s; configured attention_backend=%r may be non-deterministic.",
+                sorted(_SGLANG_DETERMINISTIC_ATTENTION_BACKENDS),
+                attention_backend,
+            )
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
         if sglang_config.enable_multithread_load:
@@ -2457,6 +2577,25 @@ class InferenceEngineConfig:
             "help": "Whether to output verbose tracing messages for each generation request."
         },
     )
+    deterministic_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "Use stable request seeds for internal OpenAI-proxy/data-proxy "
+            "sessions, canonical group ordering, and task-ID ordering of completed "
+            "rollout results. Concurrent SGLang generation also requires "
+            "sglang.enable_deterministic_inference. End-to-end determinism is only "
+            "supported with max_head_offpolicyness=0."
+        },
+    )
+    serialize_group_samples: bool = field(
+        default=False,
+        metadata={
+            "help": "Run RolloutControllerV2 samples within each group sequentially "
+            "instead of concurrently. This provides stable within-group member "
+            "submission order at the cost of rollout throughput; it does not "
+            "serialize requests across groups."
+        },
+    )
     check_trajectory_format: bool = field(
         default=False,
         metadata={
@@ -2601,6 +2740,13 @@ class InferenceEngineConfig:
             )
         if not self.admin_api_key or not self.admin_api_key.strip():
             raise ValueError("admin_api_key must not be empty or whitespace-only")
+        if self.deterministic_sampling and self.max_head_offpolicyness > 0:
+            logger.warning(
+                "deterministic_sampling=True with max_head_offpolicyness=%d does "
+                "not guarantee deterministic task-to-weight-version mapping; "
+                "set max_head_offpolicyness=0 for end-to-end determinism.",
+                self.max_head_offpolicyness,
+            )
         if (
             self._version == "v2"
             and self.agent is not None
@@ -2979,6 +3125,42 @@ class ClusterSpecConfig:
         default=8,
         metadata={"help": "Number of GPUs per node (physical)."},
     )
+    ray_port: int = field(
+        default=6379,
+        metadata={
+            "help": "Port of the Ray head (GCS). Used by the in-package Ray "
+            "bootstrap of the Ray launcher when assembling a multi-node "
+            "cluster inside a platform job. Must be between 1 and 65535; "
+            "dynamic port selection with 0 is not supported."
+        },
+    )
+    ray_dashboard_port: int = field(
+        default=8265,
+        metadata={"help": "Port of the Ray dashboard on the head node."},
+    )
+    ray_bootstrap_timeout_seconds: int = field(
+        default=900,
+        metadata={
+            "help": "How long the Ray bootstrap head waits for all "
+            "cluster.n_nodes nodes to join before failing."
+        },
+    )
+
+    @staticmethod
+    def validate_ray_port(ray_port: int) -> None:
+        if (
+            not isinstance(ray_port, int)
+            or isinstance(ray_port, bool)
+            or not 1 <= ray_port <= 65535
+        ):
+            raise ValueError(
+                "cluster.ray_port must be an integer between 1 and 65535; "
+                "0 is unsupported because workers cannot discover a "
+                f"dynamically selected Ray head port. Got {ray_port!r}."
+            )
+
+    def __post_init__(self) -> None:
+        self.validate_ray_port(self.ray_port)
 
 
 @dataclass
@@ -2995,6 +3177,48 @@ class SchedulerConfig:
 
 
 @dataclass
+class DatasetSourceConfig:
+    """One source in a dataset mixture."""
+
+    path: str = field(
+        default=MISSING,
+        metadata={"help": "Local path or HuggingFace name for this dataset source."},
+    )
+    type: str = field(
+        default=MISSING,
+        metadata={"help": "Training data type, for example 'rl'."},
+    )
+    teacher_group: str | None = field(
+        default=None,
+        metadata={"help": "Optional MOPD teacher group applied to this entire source."},
+    )
+    split: str | None = field(
+        default=None,
+        metadata={"help": "Optional split override for this dataset source."},
+    )
+    max_length: int | None = field(
+        default=None,
+        metadata={"help": "Optional maximum sequence length for this source."},
+    )
+    dataset_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"help": "Extra keyword arguments for this source's loader."},
+    )
+
+    def __post_init__(self) -> None:
+        for name in ("path", "type"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip() or value == MISSING:
+                raise ValueError(f"dataset source {name} must be a non-empty string")
+        if self.teacher_group is not None and (
+            not isinstance(self.teacher_group, str) or not self.teacher_group.strip()
+        ):
+            raise ValueError(
+                "dataset source teacher_group must be a non-empty string or null"
+            )
+
+
+@dataclass
 class _DatasetConfig:
     """Configuration for dataset loading and preprocessing."""
 
@@ -3002,15 +3226,33 @@ class _DatasetConfig:
         default="train",
         metadata={"help": "Dataset split to use, e.g., 'train', 'test'."},
     )
-    path: str = field(
-        default=MISSING,
+    path: str | None = field(
+        default=None,
+        metadata={"help": "Path to one dataset. Mutually exclusive with sources."},
+    )
+    type: str | None = field(
+        default=None,
         metadata={
-            "help": "Path to the dataset. Can be a local path or a HuggingFace dataset name."
+            "help": "Training data type for path. Mutually exclusive with sources."
         },
     )
-    type: str = field(
-        default=MISSING,
-        metadata={"help": "Type of training method, e.g., 'sft', 'rl', etc."},
+    sources: list[DatasetSourceConfig] = field(
+        default_factory=list,
+        metadata={
+            "help": "Dataset mixture sources. MOPD requires every source to declare "
+            "a teacher_group."
+        },
+    )
+    mixture_sampling_policy: str = field(
+        default="proportional",
+        metadata={
+            "help": (
+                "How a routed mixture represents sources in one epoch: "
+                "'proportional' preserves source-size proportions; 'uniform' "
+                "balances source counts by deterministically cycling shorter sources."
+            ),
+            "choices": ["proportional", "uniform"],
+        },
     )
     batch_size: int = field(
         default=1, metadata={"help": "Batch size for the dataloader"}
@@ -3066,6 +3308,15 @@ class _DatasetConfig:
             "(e.g. HuggingFace datasets that require downloading and preprocessing)."
         },
     )
+
+    def __post_init__(self) -> None:
+        if self.mixture_sampling_policy not in ("proportional", "uniform"):
+            raise ValueError(
+                "mixture_sampling_policy must be 'proportional' or 'uniform', "
+                f"got {self.mixture_sampling_policy!r}"
+            )
+        if self.sources and (self.path is not None or self.type is not None):
+            raise ValueError("dataset path/type cannot be combined with sources")
 
 
 @dataclass
@@ -3312,6 +3563,184 @@ class TeacherConfig:
 
 
 @dataclass
+class MOPDTeacherSpec:
+    """Checkpoint specification for one MOPD teacher."""
+
+    path: str = field(
+        default=MISSING,
+        metadata={"help": "Local or shared-filesystem teacher checkpoint path."},
+    )
+
+    def __post_init__(self):
+        if not isinstance(self.path, str) or not self.path.strip():
+            raise ValueError("MOPD teacher path must be a non-empty string")
+
+
+@dataclass
+class MOPDTeacherManagerConfig:
+    """Checkpoint provider configuration for phase-scoped MOPD teachers."""
+
+    type: str = field(
+        default="disk",
+        metadata={
+            "help": "Teacher checkpoint provider.",
+            "choices": ["disk", "local_memory"],
+        },
+    )
+    staging_root: str = field(
+        default="/dev/shm/areal-mopd",
+        metadata={"help": "Node-local staging root for local_memory providers."},
+    )
+    min_free_bytes: int | None = field(
+        default=None,
+        metadata={
+            "help": "Optional minimum free space required after staging a checkpoint."
+        },
+    )
+
+    def __post_init__(self):
+        if self.type not in ("disk", "local_memory"):
+            raise ValueError(
+                "mopd.manager.type must be either 'disk' or 'local_memory', "
+                f"got {self.type!r}"
+            )
+        if not isinstance(self.staging_root, str) or not self.staging_root.strip():
+            raise ValueError("mopd.manager.staging_root must be a non-empty string")
+        if self.min_free_bytes is not None and self.min_free_bytes < 0:
+            raise ValueError(
+                "mopd.manager.min_free_bytes must be non-negative or None, "
+                f"got {self.min_free_bytes}"
+            )
+
+
+@dataclass
+class MOPDLossConfig:
+    """Coefficients for joint RL and multi-teacher distillation training."""
+
+    rl_coefficient: float = field(
+        default=0.0,
+        metadata={"help": "Coefficient applied to the RL objective."},
+    )
+    distillation_coefficient: float = field(
+        default=1.0,
+        metadata={"help": "Coefficient applied to the MOPD objective."},
+    )
+    importance_ratio_cap: float = field(
+        default=5.0,
+        metadata={"help": "Positive cap applied to the behavior-policy ratio."},
+    )
+
+    def __post_init__(self):
+        for name in ("rl_coefficient", "distillation_coefficient"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"mopd.loss.{name} must be a finite number")
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"mopd.loss.{name} must be finite and non-negative, got {value}"
+                )
+        if self.rl_coefficient == 0 and self.distillation_coefficient == 0:
+            raise ValueError("MOPD loss coefficients cannot both be zero")
+        if (
+            not isinstance(self.importance_ratio_cap, (int, float))
+            or isinstance(self.importance_ratio_cap, bool)
+            or not math.isfinite(self.importance_ratio_cap)
+            or self.importance_ratio_cap <= 0
+        ):
+            raise ValueError(
+                "mopd.loss.importance_ratio_cap must be finite and positive"
+            )
+
+
+@dataclass
+class MOPDTeacherEngineConfig(TrainEngineConfig):
+    """Forward-only scoring engine configuration used by MOPD teachers."""
+
+    disable_dropout: bool = field(
+        default=True,
+        metadata={"help": "Disable dropout for deterministic teacher scoring."},
+    )
+    optimizer: OptimizerConfig | None = field(
+        default=None,
+        metadata={"help": "MOPD scoring teachers do not construct an optimizer."},
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.optimizer is not None:
+            raise ValueError("MOPDTeacherEngineConfig.optimizer must be null")
+        if not self.disable_dropout:
+            raise ValueError("MOPDTeacherEngineConfig.disable_dropout must be true")
+
+
+@dataclass
+class MOPDConfig:
+    """Configuration for multi-teacher on-policy distillation."""
+
+    teachers: dict[str, MOPDTeacherSpec] = field(default_factory=dict)
+    teacher_groups: dict[str, dict[str, float]] = field(default_factory=dict)
+    teacher_engine: MOPDTeacherEngineConfig = field(
+        default_factory=MOPDTeacherEngineConfig
+    )
+    manager: MOPDTeacherManagerConfig = field(default_factory=MOPDTeacherManagerConfig)
+    loss: MOPDLossConfig = field(default_factory=MOPDLossConfig)
+
+    def __post_init__(self):
+        if not self.teachers:
+            raise ValueError("mopd.teachers must not be empty")
+        if not self.teacher_groups:
+            raise ValueError("mopd.teacher_groups must not be empty")
+
+        for teacher_id, teacher in self.teachers.items():
+            if not isinstance(teacher_id, str) or not teacher_id.strip():
+                raise ValueError("mopd teacher ids must be non-empty strings")
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", teacher_id) is None:
+                raise ValueError(
+                    "mopd teacher ids must be filename-safe and match "
+                    "[A-Za-z0-9][A-Za-z0-9_.-]*"
+                )
+            if not isinstance(teacher, MOPDTeacherSpec):
+                raise ValueError(
+                    f"mopd.teachers[{teacher_id!r}] must be an MOPDTeacherSpec"
+                )
+
+        for teacher_group, weights in self.teacher_groups.items():
+            if not isinstance(teacher_group, str) or not teacher_group.strip():
+                raise ValueError("mopd teacher group ids must be non-empty strings")
+            if not weights:
+                raise ValueError(
+                    f"mopd.teacher_groups[{teacher_group!r}] must not be empty"
+                )
+
+            has_positive_weight = False
+            for teacher_id, weight in weights.items():
+                if teacher_id not in self.teachers:
+                    raise ValueError(
+                        f"mopd.teacher_groups[{teacher_group!r}] references "
+                        f"unknown teacher {teacher_id!r}"
+                    )
+                if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+                    raise ValueError(
+                        f"mopd.teacher_groups[{teacher_group!r}]"
+                        f"[{teacher_id!r}] must be a "
+                        "finite non-negative number"
+                    )
+                if not math.isfinite(weight) or weight < 0:
+                    raise ValueError(
+                        f"mopd.teacher_groups[{teacher_group!r}]"
+                        f"[{teacher_id!r}] must be finite "
+                        f"and non-negative, got {weight}"
+                    )
+                has_positive_weight = has_positive_weight or weight > 0
+
+            if not has_positive_weight:
+                raise ValueError(
+                    f"mopd.teacher_groups[{teacher_group!r}] must contain at least "
+                    "one positive weight"
+                )
+
+
+@dataclass
 class PPOConfig(BaseExperimentConfig):
     """Configuration for Proximal Policy Optimization (PPO) reinforcement learning experiments."""
 
@@ -3339,6 +3768,10 @@ class PPOConfig(BaseExperimentConfig):
             )
         },
     )
+    mopd: MOPDConfig | None = field(
+        default=None,
+        metadata={"help": "Optional multi-teacher on-policy distillation config."},
+    )
     dynamic_bs: bool = field(
         default=False,
         metadata={
@@ -3350,8 +3783,27 @@ class PPOConfig(BaseExperimentConfig):
 
     def __post_init__(self):
         """Validate the eval generation config."""
+        if self.teacher is not None and self.mopd is not None:
+            raise ValueError("teacher and mopd cannot be configured at the same time")
+        if self.mopd is not None:
+            self._validate_mopd_config()
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
+        if self.rollout.deterministic_sampling:
+            for config_name, generation_config in (
+                ("gconfig", self.gconfig),
+                ("eval_gconfig", self.eval_gconfig),
+            ):
+                if (
+                    generation_config.n_samples > 1
+                    and generation_config.seed is not None
+                ):
+                    raise ValueError(
+                        "deterministic_sampling with grouped rollouts cannot use "
+                        f"a shared {config_name}.seed, because every sample would "
+                        "receive the same sampling seed. Set the seed to null to "
+                        "derive stable per-sample seeds, or set n_samples=1."
+                    )
         if self.gconfig.reward_normalization and self.actor.reward_norm is not None:
             raise ValueError(
                 "gconfig.reward_normalization (rollout-time, per-prompt) and "
@@ -3365,6 +3817,112 @@ class PPOConfig(BaseExperimentConfig):
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
         super().__post_init__()
+
+    def _validate_mopd_config(self):
+        """Validate MOPD engine topology before any workers are created."""
+        from areal.api.alloc_mode import ModelAllocation, ParallelStrategy
+
+        assert self.mopd is not None
+        self._validate_mopd_dataset_sources("train_dataset", self.train_dataset)
+        if self.valid_dataset is not None:
+            self._validate_mopd_dataset_sources("valid_dataset", self.valid_dataset)
+        if self.mopd.loss.distillation_coefficient == 0:
+            # A pure-RL MOPD plan only scales the actor objective. It must not
+            # require teacher workers, checkpoint compatibility, or colocated
+            # actor/rollout infrastructure to initialize successfully.
+            return
+        teacher_engine = self.mopd.teacher_engine
+
+        if not self.actor.backend.startswith("megatron:"):
+            raise ValueError("mopd requires a Megatron actor backend")
+        if not teacher_engine.backend.startswith("megatron:"):
+            raise ValueError("mopd.teacher_engine backend must be Megatron")
+        if teacher_engine._version != "v1":
+            raise ValueError("mopd.teacher_engine currently requires _version='v1'")
+        if not self.rollout.backend.startswith("sglang:"):
+            raise ValueError("mopd requires an SGLang rollout backend")
+        if self.actor.weight_update_mode != "awex":
+            raise ValueError("mopd requires actor.weight_update_mode='awex'")
+        if teacher_engine.optimizer is not None:
+            raise ValueError("mopd.teacher_engine.optimizer must be null")
+        if not teacher_engine.disable_dropout:
+            raise ValueError("mopd.teacher_engine.disable_dropout must be true")
+
+        teacher_schedule = teacher_engine.scheduling_strategy
+        if (
+            teacher_schedule.type != SchedulingStrategyType.colocation.value
+            or teacher_schedule.target != "actor"
+            or not teacher_schedule.fork
+        ):
+            raise ValueError(
+                "the current MOPD v1 runtime supports teacher colocation "
+                "target='actor' with fork=true"
+            )
+
+        rollout_schedule = self.rollout.scheduling_strategy
+        if (
+            rollout_schedule.type != SchedulingStrategyType.colocation.value
+            or rollout_schedule.target != "actor"
+            or not rollout_schedule.fork
+        ):
+            raise ValueError(
+                "the current MOPD v1 runtime supports rollout colocation "
+                "target='actor' with fork=true"
+            )
+        actor_worker_ports = self.actor.scheduling_spec[0].port_count
+        if actor_worker_ports < 2:
+            raise ValueError(
+                "the current MOPD v1 runtime requires actor.scheduling_spec[0]."
+                f"port_count >= 2, got {actor_worker_ports}"
+            )
+
+        actor_alloc = ModelAllocation.from_str(self.actor.backend, name="actor")
+        teacher_alloc = ModelAllocation.from_str(
+            teacher_engine.backend, name="mopd_teacher"
+        )
+        if not ParallelStrategy.parallelism_eq(
+            actor_alloc.parallel, teacher_alloc.parallel
+        ):
+            raise ValueError(
+                "mopd teacher and actor must use the same parallel strategy"
+            )
+        if self.mopd.manager.type == "local_memory":
+            if self.scheduler.type != "local":
+                raise ValueError(
+                    "mopd local_memory provider requires scheduler.type='local' "
+                    "so controller and teacher workers share the same host"
+                )
+            if actor_alloc.parallel.world_size > self.cluster.n_gpus_per_node:
+                raise ValueError(
+                    "mopd local_memory provider only supports a single node; use "
+                    "disk for multi-node runs"
+                )
+
+    def _validate_mopd_dataset_sources(
+        self,
+        name: str,
+        dataset_config: TrainDatasetConfig | ValidDatasetConfig,
+    ) -> None:
+        """Require one configured teacher group for every MOPD dataset source."""
+        assert self.mopd is not None
+        if not dataset_config.sources:
+            raise ValueError(f"{name}.sources must not be empty when mopd is enabled")
+        if dataset_config.path is not None or dataset_config.type is not None:
+            raise ValueError(
+                f"{name}.path/type cannot be used with {name}.sources in MOPD"
+            )
+        for index, source in enumerate(dataset_config.sources):
+            teacher_group = source.teacher_group
+            if not isinstance(teacher_group, str) or not teacher_group.strip():
+                raise ValueError(
+                    f"{name}.sources[{index}].teacher_group must be configured "
+                    "when mopd is enabled"
+                )
+            if teacher_group not in self.mopd.teacher_groups:
+                raise ValueError(
+                    f"{name}.sources[{index}].teacher_group references unknown "
+                    f"MOPD teacher group {teacher_group!r}"
+                )
 
 
 @dataclass

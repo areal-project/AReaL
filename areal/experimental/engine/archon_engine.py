@@ -979,6 +979,7 @@ class ArchonEngine(TrainEngine):
         # Extract trie_node for tree training (if present)
         trie_node = inputs.pop("trie_node", None)
         inputs.pop("turn_ids", None)
+        inputs.pop("is_truncated", None)
 
         # Tree training: labels are derived from trie structure, not torch.roll.
         # (Tree input_ids is 1D packed format, so roll would be wrong anyway.)
@@ -1421,6 +1422,9 @@ class ArchonPPOActor(ArchonEngine):
         super().__init__(config)
         self.actor = PPOActor(config, self)
 
+    def configure_mopd_loss(self, config) -> None:
+        self.actor.configure_mopd_loss(config)
+
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:
         return self.actor.compute_logp(*args, **kwargs)
@@ -1428,6 +1432,9 @@ class ArchonPPOActor(ArchonEngine):
     @torch.no_grad()
     def compute_advantages(self, *args, **kwargs) -> list[dict[str, Any]]:
         return self.actor.compute_advantages(*args, **kwargs)
+
+    def prepare_mopd_batch(self, *args, **kwargs) -> list[dict[str, Any]]:
+        return self.actor.prepare_mopd_batch(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
         self.actor.ppo_update(*args, **kwargs)

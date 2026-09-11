@@ -130,6 +130,12 @@ class Saver:
         processor: AutoProcessor | None = None,
         base_model_path: str | None = None,
     ):
+        if (
+            self.config.freq_epochs is None
+            and self.config.freq_steps is None
+            and self.config.freq_secs is None
+        ):
+            return
         if not self.freq_ctl.check(
             epochs=int(step == self.ft_spec.steps_per_epoch - 1), steps=1
         ):
@@ -147,6 +153,20 @@ class Saver:
         if self._should_use_async(engine):
             self._async_save(engine, path, name, tokenizer, processor)
         else:
+            if not base_model_path:
+                # Megatron's HF exporter needs the source directory to retain
+                # remote model code and patch critical config fields. Infer it
+                # here so every periodic trainer save gets the same behavior.
+                engine_config = getattr(engine, "config", None)
+                configured_model_path = getattr(engine_config, "path", None)
+                if configured_model_path and os.path.isdir(configured_model_path):
+                    base_model_path = os.fspath(configured_model_path)
+                elif configured_model_path:
+                    logger.warning(
+                        "Cannot copy source HuggingFace assets for checkpoint save: "
+                        "engine model path is not a local directory: %s",
+                        configured_model_path,
+                    )
             meta = SaveLoadMeta(
                 path=path,
                 weight_format="hf",

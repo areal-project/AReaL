@@ -25,12 +25,16 @@ def _make_actor(
     gae_lambda: float | str = 1.0,
     gae_lambda_kwargs: dict | None = None,
     kl_ctl: float = 0.0,
+    recompute_logprob: bool = False,
+    use_decoupled_loss: bool = False,
 ) -> PPOActor:
     config = PPOActorConfig(
         gae_timestep_unit=gae_timestep_unit,
         gae_lambda=gae_lambda,
         gae_lambda_kwargs=gae_lambda_kwargs or {},
         kl_ctl=kl_ctl,
+        recompute_logprob=recompute_logprob,
+        use_decoupled_loss=use_decoupled_loss,
     )
     actor = PPOActor.__new__(PPOActor)
     actor.config = config
@@ -53,6 +57,34 @@ def _make_actor(
     return actor
 
 
+def test_mopd_preserves_rollout_behavior_logprobs_when_recomputing_proximal():
+    actor = _make_actor(recompute_logprob=True, use_decoupled_loss=False)
+    rollout_logprobs = torch.tensor([[0.0, -1.0, -2.0, -3.0]])
+    prox_logprobs = torch.tensor([[-0.2, -0.3, -0.4, -0.5]])
+    batch = {
+        "input_ids": torch.zeros(1, 4, dtype=torch.long),
+        "loss_mask": torch.tensor([[0, 1, 1, 1]], dtype=torch.float32),
+        "logprobs": rollout_logprobs.clone(),
+        "prox_logp": prox_logprobs.clone(),
+        "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+        "rewards": torch.tensor([1.0]),
+        "mopd_teacher_logp_sum": torch.zeros(1, 4),
+    }
+
+    result = actor._compute_advantages(batch)
+
+    expected_behavior = torch.tensor([[-1.0, -2.0, -3.0, 0.0]])
+    torch.testing.assert_close(
+        result["mopd_behavior_logprobs"], expected_behavior, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        result["logprobs"],
+        prox_logprobs * result["loss_mask"],
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
 def _make_interaction(
     interaction_id: str,
     input_tokens: list[int],
@@ -67,6 +99,7 @@ def _make_interaction(
         output_len=len(output_tokens),
         output_logprobs=[-0.1] * len(output_tokens),
         output_versions=[1] * len(output_tokens),
+        stop_reason="stop",
     )
     return InteractionWithTokenLogpReward(
         model_response=response,
@@ -88,6 +121,7 @@ def test_turn_level_gae_broadcasts_advantage_and_steps_once_per_turn():
         loss_mask=torch.ones_like(rewards),
         turn_ids=torch.tensor([[0, 0, 1, 1]], dtype=torch.int32),
         seq_no_eos_mask=torch.tensor([False]),
+        bootstrap_values=torch.zeros(1),
         discount=1.0,
         gae_lambda=0.5,
     )
@@ -108,6 +142,7 @@ def test_turn_level_gae_skips_gaps_and_uses_first_value_with_bootstrap():
         loss_mask=torch.tensor([[1.0, 1.0, 0.0, 1.0, 1.0]]),
         turn_ids=torch.tensor([[0, 0, -1, 2, 2]], dtype=torch.int64),
         seq_no_eos_mask=torch.tensor([True]),
+        bootstrap_values=values[:, -1],
         discount=0.5,
         gae_lambda=0.25,
     )
@@ -139,6 +174,7 @@ def test_turn_level_gae_applies_one_lambda_per_sample():
         loss_mask=torch.ones_like(rewards),
         turn_ids=torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]], dtype=torch.int32),
         seq_no_eos_mask=torch.tensor([False, False]),
+        bootstrap_values=torch.zeros(2),
         discount=1.0,
         gae_lambda=torch.tensor([0.5, 0.0]),
     )
@@ -183,6 +219,7 @@ def test_token_level_gae_matches_legacy_recurrence():
         values=values,
         loss_mask=loss_mask,
         seq_no_eos_mask=seq_no_eos_mask,
+        bootstrap_values=values[:, -1],
         discount=discount,
         gae_lambda=gae_lambda,
     )
@@ -209,6 +246,7 @@ def test_token_level_gae_applies_one_lambda_per_sample():
         values=torch.zeros_like(rewards),
         loss_mask=loss_mask,
         seq_no_eos_mask=torch.tensor([False, False]),
+        bootstrap_values=torch.zeros(2),
         discount=1.0,
         gae_lambda=torch.tensor([0.5, 0.0]),
     )
@@ -527,6 +565,7 @@ def test_turn_level_gae_rejects_malformed_active_turn_ids(turn_ids, message):
             loss_mask=torch.ones_like(rewards),
             turn_ids=torch.tensor([turn_ids]),
             seq_no_eos_mask=torch.tensor([False]),
+            bootstrap_values=torch.zeros(1),
             discount=1.0,
             gae_lambda=1.0,
         )
@@ -543,6 +582,7 @@ def test_turn_level_gae_rejects_non_integral_ids():
             loss_mask=torch.ones_like(rewards),
             turn_ids=torch.tensor([[0.0, 0.0]]),
             seq_no_eos_mask=torch.tensor([False]),
+            bootstrap_values=torch.zeros(1),
             discount=1.0,
             gae_lambda=1.0,
         )

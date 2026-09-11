@@ -22,6 +22,11 @@ class RolloutWorkflow(ABC):
         ----
         Returning `None` implies that this trajectory is rejected and will not be used for training.
 
+        Tensor trajectories should include an ``is_truncated`` boolean tensor with
+        one value per trajectory when the workflow can determine whether the final
+        model response stopped because it reached a length limit. PPO uses this
+        metadata for reward masking, value bootstrapping, and truncation metrics.
+
         See concrete example implementations under the `areal/workflow` directory.
 
         Parameters

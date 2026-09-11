@@ -4,6 +4,7 @@ from __future__ import annotations  # noqa
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 import torch
 from openai.types.chat import ChatCompletion
@@ -42,7 +43,12 @@ class InteractionWithTokenLogpReward:
     original_reward: float | None = None
     parent: InteractionWithTokenLogpReward | None = None
     chat_template_type: str = "hf"
-    _cache: dict[str, torch.Tensor] | None = None
+    _cache: dict[str, Any] | None = None
+
+    # Multimodal training data prepared from the complete prompt for this turn.
+    prompt_token_ids: list[int] | None = None
+    mm_token_type_ids: list[int] | None = None
+    multi_modal_input: dict[str, torch.Tensor] | None = None
 
     # Fields used for parent-child relationship resolving
     messages: list[dict] = field(default_factory=list)
@@ -141,11 +147,19 @@ class InteractionWithTokenLogpReward:
         parent_len = len(self.parent.messages + self.parent.output_message_list)
         return self.messages[parent_len:]
 
-    def to_tensor_dict(self) -> dict[str, torch.Tensor]:
+    def to_tensor_dict(self) -> dict[str, Any]:
         if self._cache is not None:
             return self._cache
         resp = self.model_response
         assert resp is not None, "Model response is not set."
+        if (
+            self.prompt_token_ids is not None
+            and self.prompt_token_ids != resp.input_tokens
+        ):
+            raise ValueError(
+                "The VLM processor prompt tokens do not match the rollout response "
+                "input tokens. The trajectory cannot be trained safely."
+            )
         self.seq_tokens = seq = resp.input_tokens + resp.output_tokens
         if self.chat_template_type == "concat" and self.parent is not None:
             parent_res = self.parent.to_tensor_dict()
@@ -222,9 +236,60 @@ class InteractionWithTokenLogpReward:
             # reward
             rewards=torch.tensor([float(reward)]),
             original_rewards=torch.tensor([float(original_reward)]),
+            is_truncated=torch.tensor([resp.stop_reason == "length"], dtype=torch.bool),
         )
+        if self.mm_token_type_ids is not None or self.multi_modal_input is not None:
+            mm_token_type_ids = self.mm_token_type_ids or [0] * resp.input_len
+            if len(mm_token_type_ids) != resp.input_len:
+                raise ValueError(
+                    "Multimodal token type IDs do not match the rollout prompt "
+                    f"length: {len(mm_token_type_ids)} != {resp.input_len}."
+                )
+            result["mm_token_type_ids"] = torch.tensor(
+                mm_token_type_ids + [0] * resp.output_len,
+                dtype=torch.long,
+            ).unsqueeze(0)
+            result["multi_modal_input"] = [self.multi_modal_input or {}]
         self._cache = result
         return result
+
+
+def normalize_group_rewards(
+    results: list[dict[str, InteractionWithTokenLogpReward] | None],
+) -> bool:
+    """Normalize one scalar reward per rollout while preserving raw rewards."""
+    if not results:
+        return False
+
+    reward_per_result: list[float | None] = []
+    for result in results:
+        if not result:
+            reward_per_result.append(None)
+            continue
+        last_id = next(reversed(result))
+        reward_per_result.append(result[last_id].reward)
+
+    if any(reward is None for reward in reward_per_result):
+        return False
+
+    rewards = torch.tensor(reward_per_result, dtype=torch.float32)
+    mean = rewards.mean()
+    std = rewards.std(unbiased=False) if rewards.numel() > 1 else torch.tensor(1.0)
+    normalized_rewards = ((rewards - mean) / (std + 1e-8)).tolist()
+
+    for result, normalized_reward in zip(results, normalized_rewards):
+        assert result is not None
+        for interaction in result.values():
+            if interaction.reward is None:
+                continue
+            interaction.original_reward = interaction.reward
+            interaction.reward = normalized_reward
+            if interaction._cache is not None:
+                interaction._cache["rewards"] = torch.tensor([float(normalized_reward)])
+                interaction._cache["original_rewards"] = torch.tensor(
+                    [float(interaction.original_reward)]
+                )
+    return True
 
 
 def concat_string_interactions(

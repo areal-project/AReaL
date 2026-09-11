@@ -18,7 +18,8 @@ from awex.meta.weight_meta import (
 from awex.sharding.param_sharding import ShardingType
 from awex.sharding.rank_info import RankInfo
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_send_ops
-from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder
+from awex.transfer.nccl_stream_batch import NcclColocateStreamBatchTransport
+from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder, slice_tensor
 from awex.util.tensor_util import (
     cuda_ipc_serialize,
     group_tensors_by_shape_and_dtype,
@@ -29,6 +30,12 @@ from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
 )
+from areal.v2.weight_update.awex.delta_config import (
+    DTERuntimeConfig,
+    synchronize_wire_dtypes,
+    validate_dte_world_size,
+)
+from areal.v2.weight_update.awex.delta_detect import AdamWInversionDetector
 from areal.v2.weight_update.nccl_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
@@ -62,6 +69,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
         self._weights_update_group_gloo = None
+        self._world_size: int | None = None
+        self._separation_delta_transport: NcclColocateStreamBatchTransport | None = None
+        self._separation_wire_dtypes: tuple[torch.dtype, ...] | None = None
         self._transfer_rank: int | None = None
         self._offloaded_optimizer_states: dict = {}
         self._offloaded_weights: dict[str, torch.Tensor] = {}
@@ -70,6 +80,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._colocate_admin_api_key: str = "areal-admin-key"
         self._colocate_http_client: httpx.Client | None = None
         self._colocate_timeout_s: float = 120.0
+        self._dte_config = DTERuntimeConfig.from_env()
+        self._delta_tracker = None
+        self._delta_detector = None
 
     @property
     def parallelism_strategy(self) -> dict:
@@ -163,7 +176,11 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
+        if self._dte_config.enabled:
+            validate_dte_world_size(world_size, infer_world_size, train_world_size)
+
         self._transfer_rank = transfer_rank
+        self._world_size = world_size
 
         infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
 
@@ -194,6 +211,11 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             backend="gloo",
             role="training",
         )
+        if self._dte_config.enabled:
+            self._separation_wire_dtypes = synchronize_wire_dtypes(
+                self._transfer_plan,
+                self._weights_update_group_gloo,
+            )
         logger.info(
             "Initialized AWEX weight update groups for pair=%s role=training "
             "rank=%s world_size=%s nccl=awex_%s gloo=awex_%s_gloo",
@@ -205,7 +227,14 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
     def execute_weight_update(self, version: int) -> None:
-        del version
+        if self._dte_config.enabled:
+            self._release_grad_buffers_for_separation_sync()
+            try:
+                self._execute_separation_weight_update(version)
+            finally:
+                self._restore_grad_buffers_after_separation_sync()
+            return
+
         if self._transfer_plan is None:
             raise RuntimeError("Transfer plan is not initialized")
         if self._weights_update_group is None:
@@ -230,6 +259,207 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
         dist.barrier(group=self._weights_update_group_gloo)
 
+    def _release_grad_buffers_for_separation_sync(self) -> None:
+        """Temporarily release Megatron DDP grad buffers during transfer."""
+        model = getattr(self._engine, "model", None)
+        if model is None:
+            return
+        modules = model if isinstance(model, (list, tuple)) else [model]
+        for module in modules:
+            release = getattr(module, "offload_grad_buffers", None)
+            if release is not None:
+                release(synchronize=False, empty_cache=False)
+
+    def _restore_grad_buffers_after_separation_sync(self) -> None:
+        """Restore Megatron DDP grad buffers even when transfer fails."""
+        model = getattr(self._engine, "model", None)
+        if model is None:
+            return
+        modules = model if isinstance(model, (list, tuple)) else [model]
+        for module in modules:
+            restore = getattr(module, "restore_grad_buffers", None)
+            if restore is not None:
+                restore(synchronize=False)
+
+    def _execute_separation_weight_update(self, version: int) -> None:
+        """Send an AdamW-derived sparse update, with a dense fallback."""
+        if self._transfer_plan is None:
+            raise RuntimeError("Transfer plan is not initialized")
+        if self._weights_update_group is None:
+            raise RuntimeError("Weight update group is not initialized")
+        if self._weights_update_group_gloo is None:
+            raise RuntimeError("Gloo weight update group is not initialized")
+        if self._transfer_rank is None or self._world_size is None:
+            raise RuntimeError("Transfer rank/world size is not initialized")
+
+        params = self.get_local_shard_parameters()
+        self._ensure_delta_components()
+        synced_state = self._delta_detector.capture_synced_state(params)
+        masks, local_is_delta = self._delta_prepare_masks(params, version)
+
+        decision = torch.tensor([int(local_is_delta)], dtype=torch.int64)
+        dist.all_reduce(
+            decision, op=dist.ReduceOp.MIN, group=self._weights_update_group_gloo
+        )
+        use_delta = bool(decision.item()) and masks is not None
+
+        if use_delta:
+            self._execute_separation_delta_send(params, masks, version)
+        else:
+            send_ops, _, _ = nccl_build_send_ops(
+                params,
+                self._transfer_plan,
+                self._weights_update_group,
+                copy_rank=self._transfer_rank,
+            )
+            batch_send_recv(
+                send_ops=send_ops,
+                recv_ops=[],
+                blocking=True,
+                use_group=awex_wu_use_group(),
+            )
+
+        # The receiver joins this barrier after applying the payload. Only then
+        # may the sender advance its version/watermark state.
+        dist.barrier(group=self._weights_update_group_gloo)
+        if use_delta:
+            self._delta_tracker.mark_delta_committed(version)
+        self._delta_detector.mark_synced(version, synced_state)
+
+    def _delta_prepare_masks(
+        self,
+        params: dict[str, torch.Tensor],
+        version: int,
+    ) -> tuple[dict[str, torch.Tensor] | None, bool]:
+        reason = self._delta_tracker.full_sync_reason(version)
+        if reason is None and not self._delta_detector.has_synced_watermark():
+            reason = "initial_full"
+        reason = self._sync_full_reason(reason, version)
+
+        masks = None
+        if reason is None:
+            try:
+                masks = self._delta_detector.compute_masks(
+                    list(params), list(params.values()), version
+                )
+            except Exception:
+                logger.exception(
+                    "separation delta v%d: AdamW inversion failed; using full sync",
+                    version,
+                )
+                reason = "adamw_inversion_error"
+            if masks is None and reason is None:
+                reason = "adamw_inversion_infeasible"
+
+        reason = self._sync_full_reason(reason, version)
+        if reason is not None:
+            self._delta_tracker.seed(params.items(), version, store_snapshot=False)
+            logger.info(
+                "separation delta v%d: FULL sync fallback (%s)", version, reason
+            )
+            return None, False
+
+        logger.info(
+            "separation delta v%d: sparse AdamW path (%d params)",
+            version,
+            len(params),
+        )
+        return masks, True
+
+    def _sync_full_reason(self, reason: str | None, version: int) -> str | None:
+        """Promote a rank-local dense fallback to every training rank."""
+        if not dist.is_available() or not dist.is_initialized():
+            return reason
+        try:
+            world_size = dist.get_world_size()
+        except RuntimeError:
+            return reason
+        if world_size <= 1:
+            return reason
+
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        needs_full = torch.tensor(
+            [1 if reason is not None else 0], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(needs_full, op=dist.ReduceOp.MAX)
+        if int(needs_full.item()) == 0:
+            return None
+        if reason is not None:
+            return reason
+        logger.warning("separation delta v%d: peer rank requires a full sync", version)
+        return "peer_rank_fallback"
+
+    def _execute_separation_delta_send(
+        self,
+        params: dict[str, torch.Tensor],
+        masks: dict[str, torch.Tensor],
+        version: int,
+    ) -> None:
+        from dte.core.colocate_protocol import (
+            _filter_plan_by_dtype,
+            _ops_by_recv_dtype,
+            _PlanView,
+            two_round_delta_exchange,
+        )
+        from dte.core.delta_p2p import build_send_payloads_by_op
+
+        assert self._transfer_plan is not None
+        assert self._weights_update_group is not None
+        assert self._transfer_rank is not None
+        assert self._world_size is not None
+        if self._separation_wire_dtypes is None:
+            raise RuntimeError("Separation DTE wire dtypes are not initialized")
+
+        operations = [
+            op for ops in self._transfer_plan.operations.values() for op in ops
+        ]
+        operations_by_dtype = _ops_by_recv_dtype(operations)
+        identity_mapping = {rank: rank for rank in range(self._world_size)}
+        empty_plan = _PlanView({})
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+        if self._separation_delta_transport is None:
+            self._separation_delta_transport = NcclColocateStreamBatchTransport(
+                self._transfer_rank, self._world_size
+            )
+        schedule_fn = (
+            self._separation_delta_transport.execute_recursive_partition_stream_transfer
+        )
+
+        payload_count = 0
+        for dtype in self._separation_wire_dtypes:
+            ops = operations_by_dtype.get(dtype, [])
+            payloads = build_send_payloads_by_op(ops, masks, params)
+            send_plan = _filter_plan_by_dtype(self._transfer_plan, dtype, is_send=True)
+            two_round_delta_exchange(
+                transfer_rank=self._transfer_rank,
+                world_size=self._world_size,
+                send_plan=send_plan,
+                recv_plan=empty_plan,
+                train_to_infer_device_mapping=identity_mapping,
+                weights_update_group=self._weights_update_group,
+                send_payloads_by_op=payloads,
+                recv_params={},
+                value_dtype=dtype,
+                device=device,
+                schedule_fn=schedule_fn,
+                slice_fn=slice_tensor,
+                rank_coordinate=f"train-{self._transfer_rank}",
+                step_id=version,
+            )
+            payload_count += len(payloads)
+
+        logger.info(
+            "separation delta v%d sent %d payload ops across %d dtypes",
+            version,
+            payload_count,
+            len(self._separation_wire_dtypes),
+        )
+
     def batch_isend_irecv(self, **kwargs) -> None:
         if self._weights_update_group_gloo is None:
             raise RuntimeError("Gloo weight update group is not initialized")
@@ -253,6 +483,11 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._weights_update_group_gloo = None
         self._transfer_plan = None
         self._transfer_rank = None
+        self._world_size = None
+        self._separation_delta_transport = None
+        self._separation_wire_dtypes = None
+        self._delta_tracker = None
+        self._delta_detector = None
         if self._colocate_http_client is not None:
             self._colocate_http_client.close()
             self._colocate_http_client = None
@@ -296,7 +531,11 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             cp_mode="ring" if cp_size > 1 else "none",
         )
 
-    def _iter_hf_params(self):
+    def _iter_hf_params(
+        self,
+        theta_by_id: dict[int, torch.Tensor] | None = None,
+        consume_overrides: bool = False,
+    ):
         """Yield (hf_name, tensor) for every parameter on this rank.
 
         Uses get_named_parameters + all_gather_param + convert_to_hf to produce
@@ -315,13 +554,23 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         tie_word_embeddings = getattr(
             self._engine.hf_config, "tie_word_embeddings", False
         )
+        overrides = theta_by_id if theta_by_id is not None else {}
 
         for mcore_name, param in get_named_parameters(
             self._engine.model, num_moe_experts
         ):
+            src = overrides.get(id(param), param)
+            if src is not param:
+                for attr in (
+                    "tensor_model_parallel",
+                    "partition_dim",
+                    "partition_stride",
+                ):
+                    if hasattr(param, attr):
+                        setattr(src, attr, getattr(param, attr))
             gathered = all_gather_param(
                 mcore_name,
-                param,
+                src,
                 fp8_direct_convert=False,
                 quantization_config=None,
                 duplicated_param_names=self._engine._duplicated_param_names,
@@ -338,6 +587,47 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 if tie_word_embeddings and hf_name == "lm_head.weight":
                     continue
                 yield hf_name, tensor.detach()
+            if consume_overrides:
+                overrides.pop(id(param), None)
+
+    def _iter_model_params_for_delta(self):
+        """Yield model tensors in the same order used by the HF converter."""
+        from areal.engine.megatron_utils.megatron import get_named_parameters
+
+        num_moe_experts = getattr(self._engine.tf_config, "num_moe_experts", None)
+        seen: set[int] = set()
+        for _mcore_name, param in get_named_parameters(
+            self._engine.model, num_moe_experts
+        ):
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+            yield param
+
+    def _convert_hf_with_overrides(
+        self, theta_by_id: dict[int, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return dict(self._iter_hf_params(theta_by_id))
+
+    @torch.no_grad()
+    def _iter_hf_with_overrides(self, theta_by_id: dict[int, torch.Tensor]):
+        yield from self._iter_hf_params(theta_by_id, consume_overrides=True)
+
+    def _ensure_delta_components(self) -> None:
+        if self._delta_tracker is None:
+            self._delta_tracker = self._dte_config.create_delta_tracker()
+        if self._delta_detector is None:
+            self._delta_detector = AdamWInversionDetector(self)
+
+    def _get_inner_optimizers(self):
+        optimizer = self._engine.optimizer
+        if optimizer is None:
+            return []
+        if hasattr(optimizer, "chained_optimizers"):
+            return optimizer.chained_optimizers
+        if hasattr(optimizer, "optimizers"):
+            return optimizer.optimizers
+        return [optimizer]
 
     # ── Colocated weight transfer methods ─────────────────────────────────
 

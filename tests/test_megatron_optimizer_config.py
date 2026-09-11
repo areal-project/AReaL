@@ -24,6 +24,108 @@ def _make_test_engine(optimizer_config: OptimizerConfig):
     return engine
 
 
+def test_optimizer_loss_scale_is_wired_to_every_model_config() -> None:
+    engine = megatron_engine_module.MegatronEngine.__new__(
+        megatron_engine_module.MegatronEngine
+    )
+
+    def scale_loss(loss):
+        return loss
+
+    engine.optimizer = SimpleNamespace(scale_loss=scale_loss)
+    config_a = SimpleNamespace(grad_scale_func=None)
+    config_b = SimpleNamespace(grad_scale_func=None)
+    engine.model = [
+        SimpleNamespace(config=config_a),
+        SimpleNamespace(module=SimpleNamespace(config=config_b)),
+        SimpleNamespace(config=config_a),
+    ]
+
+    engine._set_optimizer_grad_scale_func()
+
+    assert config_a.grad_scale_func is scale_loss
+    assert config_b.grad_scale_func is scale_loss
+
+
+def test_optimizer_loss_scale_is_not_wired_without_optimizer() -> None:
+    engine = megatron_engine_module.MegatronEngine.__new__(
+        megatron_engine_module.MegatronEngine
+    )
+    config = SimpleNamespace(grad_scale_func=None)
+    engine.optimizer = None
+    engine.model = [SimpleNamespace(config=config)]
+
+    engine._set_optimizer_grad_scale_func()
+
+    assert config.grad_scale_func is None
+
+
+def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
+    monkeypatch,
+) -> None:
+    class _MicroBatchList:
+        mbs = [{}, {}]
+
+        def __len__(self):
+            return len(self.mbs)
+
+    class _Optimizer:
+        def get_loss_scale(self):
+            raise AssertionError("loss scale must be applied by MCore")
+
+    engine = megatron_engine_module.MegatronEngine.__new__(
+        megatron_engine_module.MegatronEngine
+    )
+    engine._awex_adapter = None
+    engine._weight_residency = None
+    engine.device = torch.device("cpu")
+    engine.optimizer = _Optimizer()
+    engine._ensure_ready = lambda: None
+    engine.optimizer_zero_grad = lambda: None
+    engine._normalize_batch_input = lambda input_: (input_, None)
+    engine._prepare_mb_list = lambda input_: _MicroBatchList()
+    engine.optimizer_step = lambda: {}
+    engine._collect_mtp_loss = lambda num_microbatches: None
+
+    captured = {}
+
+    def capture_loss(*args, loss_multiplier, **kwargs):
+        captured["loss_multiplier"] = loss_multiplier
+        return torch.tensor(0.0)
+
+    engine._compute_logprobs_and_loss = capture_loss
+    engine.forward_backward_batch = (
+        lambda mb_list, process_output, forward_only: process_output(
+            torch.tensor(0.0), {}
+        )
+    )
+
+    monkeypatch.setattr(
+        megatron_engine_module, "tensor_container_to", lambda value, device: value
+    )
+    monkeypatch.setattr(
+        megatron_engine_module, "compute_total_loss_weight", lambda *args, **kwargs: 1
+    )
+    monkeypatch.setattr(
+        megatron_engine_module.mpu,
+        "get_data_parallel_group",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        megatron_engine_module.mpu,
+        "get_data_parallel_world_size",
+        lambda: 3,
+    )
+
+    engine.train_batch(
+        input_={},
+        loss_fn=lambda *args, **kwargs: torch.tensor(0.0),
+        loss_weight_fn=lambda input_: torch.tensor(1),
+    )
+
+    assert captured["loss_multiplier"] == 6
+
+
 def test_precision_aware_optimizer_fields_are_applied_before_validation(
     monkeypatch,
 ) -> None:
@@ -114,6 +216,39 @@ def test_scheduler_uses_fixed_warmup_and_resume_safe_initial_lr(
     assert captured["lr_warmup_steps"] == 3
     assert captured["lr_decay_steps"] == 10
     assert captured["wd_incr_steps"] == 10
+
+
+def test_dte_records_optimizer_step_lr_before_scheduler_advances() -> None:
+    """AdamW inversion must retain the LR consumed by the completed step."""
+    engine = megatron_engine_module.MegatronEngine.__new__(
+        megatron_engine_module.MegatronEngine
+    )
+    param_groups = [{"lr": 3e-6}, {"lr": 4e-6}]
+
+    class _Optimizer:
+        def __init__(self):
+            self.param_groups = param_groups
+
+        def step(self):
+            return True, torch.tensor(1.0), None
+
+    class _Scheduler:
+        def step(self, increment):
+            assert increment == 1
+            param_groups[0]["lr"] = 2e-6
+            param_groups[1]["lr"] = 1e-6
+
+    engine.optimizer = _Optimizer()
+    engine.lr_scheduler = _Scheduler()
+    engine._dte_runtime_config = SimpleNamespace(enabled=True)
+
+    engine.optimizer_step()
+    engine.lr_scheduler_step()
+
+    assert param_groups[0]["lr"] == 2e-6
+    assert param_groups[1]["lr"] == 1e-6
+    assert param_groups[0]["_areal_last_step_lr"] == 3e-6
+    assert param_groups[1]["_areal_last_step_lr"] == 4e-6
 
 
 @pytest.mark.parametrize(

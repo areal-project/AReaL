@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import call, patch
 
 import pytest
 
@@ -10,6 +11,101 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.v2.training_service.worker.config import TrainWorkerConfig
 
 MODULE = "areal.v2.training_service.worker.app"
+
+
+def test_execute_compute_uses_cpu_group_for_streaming_method(monkeypatch):
+    import areal.v2.training_service.worker.app as worker_app
+
+    engine = SimpleNamespace(
+        cpu_staged_rpc_methods=frozenset({"train_batch"}),
+        is_offload=False,
+        cpu_model_parallel_group="cpu_group",
+        context_and_model_parallel_group="accelerator_group",
+        data_parallel_world_size=2,
+        current_data_parallel_head=lambda: 3,
+        train_batch=lambda *args, **kwargs: (args, kwargs),
+    )
+    monkeypatch.setattr(worker_app, "_engine", engine)
+    monkeypatch.setattr(
+        worker_app, "_submit_to_engine_thread", lambda _name, func: func()
+    )
+
+    with (
+        patch(
+            f"{MODULE}.tensor_container_to",
+            side_effect=lambda value, device: value,
+        ) as to,
+        patch(
+            f"{MODULE}.broadcast_tensor_container", side_effect=lambda value, **_: value
+        ) as broadcast,
+    ):
+        worker_app._execute_compute(
+            "train_batch", ["args"], {"key": "value"}, require_broadcast=True
+        )
+
+    assert to.call_args_list == [call(["args"], "cpu"), call({"key": "value"}, "cpu")]
+    assert broadcast.call_args_list == [
+        call(["args"], src_rank=3, group="cpu_group"),
+        call({"key": "value"}, src_rank=3, group="cpu_group"),
+    ]
+
+
+def test_execute_compute_uses_accelerator_group_for_unstaged_method(monkeypatch):
+    import areal.v2.training_service.worker.app as worker_app
+
+    engine = SimpleNamespace(
+        cpu_staged_rpc_methods=frozenset({"train_batch"}),
+        is_offload=False,
+        cpu_model_parallel_group="cpu_group",
+        context_and_model_parallel_group="accelerator_group",
+        data_parallel_world_size=2,
+        current_data_parallel_head=lambda: 1,
+        unlisted_method=lambda *args, **kwargs: (args, kwargs),
+    )
+    monkeypatch.setattr(worker_app, "_engine", engine)
+    monkeypatch.setattr(
+        worker_app, "_submit_to_engine_thread", lambda _name, func: func()
+    )
+
+    with (
+        patch.object(
+            worker_app,
+            "current_platform",
+            SimpleNamespace(current_device=lambda: "cuda:1"),
+        ),
+        patch(
+            f"{MODULE}.tensor_container_to",
+            side_effect=lambda value, device: value,
+        ) as to,
+        patch(
+            f"{MODULE}.broadcast_tensor_container", side_effect=lambda value, **_: value
+        ) as broadcast,
+    ):
+        worker_app._execute_compute("unlisted_method", [], {}, require_broadcast=True)
+
+    assert to.call_args_list == [call([], "cuda:1"), call({}, "cuda:1")]
+    assert all(
+        item.kwargs["group"] == "accelerator_group" for item in broadcast.call_args_list
+    )
+
+
+def test_execute_compute_requires_cpu_group_for_streaming_method(monkeypatch):
+    import areal.v2.training_service.worker.app as worker_app
+
+    engine = SimpleNamespace(
+        cpu_staged_rpc_methods=frozenset({"train_batch"}),
+        cpu_model_parallel_group=None,
+        context_and_model_parallel_group="accelerator_group",
+        data_parallel_world_size=2,
+        current_data_parallel_head=lambda: 0,
+        train_batch=lambda: None,
+    )
+    monkeypatch.setattr(worker_app, "_engine", engine)
+    monkeypatch.setattr(
+        worker_app, "_submit_to_engine_thread", lambda _name, func: func()
+    )
+    with pytest.raises(RuntimeError, match="cpu_model_parallel_group is None"):
+        worker_app._execute_compute("train_batch", [], {}, require_broadcast=True)
 
 
 @pytest.fixture(autouse=True)

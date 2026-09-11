@@ -12,14 +12,19 @@ def _compute_token_level_gae(
     values: torch.Tensor,
     loss_mask: torch.Tensor,
     seq_no_eos_mask: torch.Tensor,
+    bootstrap_values: torch.Tensor,
     discount: float,
     gae_lambda: float | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute GAE with each generated token treated as one timestep."""
+    """Compute GAE with each generated token treated as one timestep.
+
+    ``bootstrap_values`` contains each trajectory's value at its final valid token,
+    independent of the padded batch width.
+    """
     bs, max_seqlen = rewards.shape
     advantages_reversed = [torch.zeros(bs, dtype=torch.float32, device=values.device)]
     lastgaelam = torch.zeros(bs, dtype=torch.float32, device=values.device)
-    nextvalues = values[:, max_seqlen - 1] * seq_no_eos_mask
+    nextvalues = bootstrap_values * seq_no_eos_mask
     discounted_lambda = discount * gae_lambda
     for t in reversed(range(max_seqlen - 1)):
         delta = rewards[:, t] + discount * nextvalues - values[:, t]
@@ -85,10 +90,15 @@ def _compute_turn_level_gae(
     loss_mask: torch.Tensor,
     turn_ids: torch.Tensor,
     seq_no_eos_mask: torch.Tensor,
+    bootstrap_values: torch.Tensor,
     discount: float,
     gae_lambda: float | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute GAE with each generated turn treated as one timestep."""
+    """Compute GAE with each generated turn treated as one timestep.
+
+    ``bootstrap_values`` contains each trajectory's value at its final valid token,
+    independent of the padded batch width.
+    """
     _validate_turn_ids(loss_mask, turn_ids)
     bs, max_seqlen = rewards.shape
     valid_token_mask = loss_mask.bool()
@@ -130,7 +140,7 @@ def _compute_turn_level_gae(
     )
     lastgaelam = torch.zeros(bs, dtype=torch.float32, device=values.device)
     zero_advantages = torch.zeros_like(lastgaelam)
-    nextvalues = values[:, max_seqlen - 1] * seq_no_eos_mask
+    nextvalues = bootstrap_values * seq_no_eos_mask
     discounted_lambda = discount * gae_lambda
     # Advantage calculation normally runs over CPU rollout tensors. Avoid
     # iterating over every token slot there when trajectories contain only a

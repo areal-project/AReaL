@@ -17,6 +17,7 @@ from areal.utils.data import (
     MicroBatchList,
     pad_and_stack_tensors_along_first_dim,
     reorder_list,
+    tensor_container_to,
     unpack_sequence,
 )
 
@@ -24,6 +25,7 @@ __all__ = [
     "compute_total_loss_weight",
     "aggregate_eval_losses",
     "reorder_and_pad_outputs",
+    "stage_batch_for_engine",
 ]
 
 
@@ -31,6 +33,7 @@ def compute_total_loss_weight(
     mb_list: MicroBatchList,
     loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     dp_group: dist.ProcessGroup,
+    device: torch.device | str | int | None = None,
 ) -> torch.Tensor:
     """Compute total loss weight and all_reduce across data parallel group.
 
@@ -45,24 +48,39 @@ def compute_total_loss_weight(
         Function to compute loss weight for each micro-batch.
     dp_group : dist.ProcessGroup
         The data parallel process group for all_reduce.
+    device : torch.device | str | int | None
+        Optional device for the reduced scalar. Megatron uses this to keep
+        microbatches on CPU while reducing the weight through NCCL/HCCL.
 
     Returns
     -------
     torch.Tensor
         The total loss weight (scalar tensor) after all_reduce.
     """
-    total_weight = (
-        torch.stack([loss_weight_fn(mb) for mb in mb_list.mbs])
-        .sum()
-        .detach()
-        .clone()
-        .to(dtype=torch.float32)
-    )
+    total_weight = torch.stack([loss_weight_fn(mb) for mb in mb_list.mbs]).sum()
+    total_weight = total_weight.detach().clone().to(device=device, dtype=torch.float32)
     dist.all_reduce(total_weight, group=dp_group)
     assert total_weight > 0, (
         "Global total loss weight must be positive after all_reduce"
     )
     return total_weight
+
+
+def stage_batch_for_engine(data: dict[str, Any], engine: Any) -> dict[str, Any]:
+    """Move a transient trainer batch to the engine's staging device in-place.
+
+    Megatron streams microbatches from CPU. Replacing the values in the
+    existing dictionary is important for RPC calls: the RPC argument container
+    aliases this dictionary, so a simple local rebind would keep the original
+    full-batch accelerator tensors alive for the duration of training.
+    Other engines retain their existing input placement.
+    """
+    if not getattr(engine, "stream_microbatches_from_cpu", False):
+        return data
+    staged = tensor_container_to(data, "cpu")
+    data.clear()
+    data.update(staged)
+    return data
 
 
 def aggregate_eval_losses(
