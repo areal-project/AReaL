@@ -2219,6 +2219,7 @@ class SGLangConfig:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
+    mm_attention_backend: str | None = None
     enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
     sampling_backend: str | None = None
@@ -2234,6 +2235,9 @@ class SGLangConfig:
     cpu_offload_gb: int = 0
     dtype: str = "bfloat16"
     kv_cache_dtype: str = "auto"
+    mamba_scheduler_strategy: str | None = None
+    mamba_ssm_dtype: str | None = None
+    max_mamba_cache_size: int | None = None
     dp_size: int = 1  # only used for dp attention
     ep_size: int = 1
     # lora
@@ -2274,6 +2278,7 @@ class SGLangConfig:
     log_level_http: str | None = "warning"
     log_requests: bool = False
     log_requests_level: int = 0
+    enable_cache_report: bool = False
     show_time_cost: bool = False
     enable_metrics: bool = True  # Exports Prometheus-like metrics
     # The interval (in decoding iterations) to log throughput

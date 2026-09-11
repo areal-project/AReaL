@@ -9,7 +9,9 @@ from areal.engine.core.model import (
 )
 
 
-@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen3_vl_moe"])
+@pytest.mark.parametrize(
+    "model_type", ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
+)
 def test_qwen3_vl_family_uses_model_thd_with_megatron_bridge(model_type):
     assert supports_model_packed_seq(model_type, "megatron-bridge")
     assert (
@@ -24,8 +26,10 @@ def test_qwen3_vl_family_uses_model_thd_with_megatron_bridge(model_type):
         ("qwen3_vl", "mbridge"),
         ("qwen3_vl_moe", "mbridge"),
         ("qwen2_5_vl", "megatron-bridge"),
-        ("qwen3_5", "megatron-bridge"),
-        ("qwen3_5_moe", "megatron-bridge"),
+        ("qwen3_5", "mbridge"),
+        ("qwen3_5_moe", "mbridge"),
+        ("qwen3_5_text", "megatron-bridge"),
+        ("qwen3_5_moe_text", "megatron-bridge"),
     ],
 )
 def test_models_without_gpu_model_thd_contract_stay_padded(model_type, bridge_type):
@@ -41,4 +45,13 @@ def test_text_models_keep_wrapper_thd(model_type):
     assert (
         resolve_sequence_packing_mode(model_type, "megatron-bridge")
         == SequencePackingMode.WRAPPER_THD
+    )
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+@pytest.mark.parametrize("feature", ["use_chunked_lm_head", "enable_mtp_training"])
+def test_qwen35_padded_loss_features_preserve_existing_layout(model_type, feature):
+    assert (
+        resolve_sequence_packing_mode(model_type, "megatron-bridge", **{feature: True})
+        == SequencePackingMode.PADDED
     )

@@ -954,6 +954,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         temperature: float | None | NotGiven = NOT_GIVEN,
         tool_choice: ChatCompletionToolChoiceOptionParam | NotGiven = NOT_GIVEN,
         tools: Iterable[ChatCompletionToolParam] | NotGiven = NOT_GIVEN,
+        top_k: int | None | NotGiven = NOT_GIVEN,
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
@@ -980,6 +981,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         temperature: float | None | NotGiven = NOT_GIVEN,
         tool_choice: ChatCompletionToolChoiceOptionParam | NotGiven = NOT_GIVEN,
         tools: Iterable[ChatCompletionToolParam] | NotGiven = NOT_GIVEN,
+        top_k: int | None | NotGiven = NOT_GIVEN,
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
@@ -1005,6 +1007,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         temperature: float | None | NotGiven = NOT_GIVEN,
         tool_choice: ChatCompletionToolChoiceOptionParam | NotGiven = NOT_GIVEN,
         tools: Iterable[ChatCompletionToolParam] | NotGiven = NOT_GIVEN,
+        top_k: int | None | NotGiven = NOT_GIVEN,
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
@@ -1161,6 +1164,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             )
 
         top_p_val = 1.0 if is_omitted(top_p) else (top_p or 1.0)
+        top_k_val = int(1e8) if is_omitted(top_k) or top_k is None else int(top_k)
         stop_tokens = None if is_omitted(stop) else stop
 
         # Since the concat logic cannot properly handle stop tokens yet, so we remove stop here.
@@ -1187,6 +1191,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 engine_max_tokens=self.engine_max_tokens,
             ),
             top_p=top_p_val,
+            top_k=top_k_val,
             stop=stop_tokens,
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,

@@ -95,13 +95,21 @@ class SequencePackingMode(str, Enum):
 
 def supports_model_packed_seq(model_type: str, bridge_type: str) -> bool:
     """Whether the bridge model owns BSHD-to-THD packing internally."""
-    return bridge_type == "megatron-bridge" and is_qwen3_vl_model(model_type)
+    return bridge_type == "megatron-bridge" and (
+        is_qwen3_vl_model(model_type) or model_type in ("qwen3_5", "qwen3_5_moe")
+    )
 
 
 def resolve_sequence_packing_mode(
-    model_type: str, bridge_type: str
+    model_type: str,
+    bridge_type: str,
+    *,
+    use_chunked_lm_head: bool = False,
+    enable_mtp_training: bool = False,
 ) -> SequencePackingMode:
     """Select one packing path from the model and bridge contract."""
+    if is_qwen3_5_model(model_type) and (use_chunked_lm_head or enable_mtp_training):
+        return SequencePackingMode.PADDED
     if supports_model_packed_seq(model_type, bridge_type):
         return SequencePackingMode.MODEL_THD
     if is_valid_vision_model(model_type) or is_qwen3_5_model(model_type):

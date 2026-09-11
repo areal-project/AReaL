@@ -134,6 +134,52 @@ _QWEN3_ASSISTANT_END_WITH_GENERATION = (
     '    {%- elif message.role == "tool" %}'
 )
 
+_QWEN35_REASONING_OLD_BLOCK = (
+    "{%- set reasoning_content = '' %}\n"
+    "        {%- if message.reasoning_content is string %}\n"
+    "            {%- set reasoning_content = message.reasoning_content %}\n"
+    "        {%- endif %}\n"
+    "        {%- set reasoning_content = reasoning_content|trim %}"
+)
+_QWEN35_REASONING_NEW_BLOCK = (
+    "{%- set reasoning_content = '' %}\n"
+    "        {%- if message.reasoning_content is string %}\n"
+    "            {%- set reasoning_content = message.reasoning_content %}\n"
+    "        {%- elif content.startswith('<think>') and '</think>' in content %}\n"
+    "            {%- set reasoning_content = content.split('</think>')[0]"
+    ".split('<think>')[-1]|trim %}\n"
+    "            {%- set content = content.split('</think>', 1)[1]"
+    ".lstrip('\\n') %}\n"
+    "        {%- endif %}\n"
+    "        {%- set reasoning_content = reasoning_content|trim %}"
+)
+_QWEN35_RENDER_OLD_BLOCK = (
+    "{%- if preserve_thinking is undefined or preserve_thinking is true or "
+    "loop.index0 > ns.last_query_index %}\n"
+    "            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + "
+    "reasoning_content + '\\n</think>\\n\\n' + content }}\n"
+    "        {%- else %}\n"
+    "            {{- '<|im_start|>' + message.role + '\\n' + content }}\n"
+    "        {%- endif %}"
+)
+_QWEN35_RENDER_NEW_BLOCK = (
+    "{{- '<|im_start|>' + message.role + '\\n' }}\n"
+    "        {%- generation %}\n"
+    "        {{- '<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}"
+)
+
+
+def _is_native_qwen35_template(template: str) -> bool:
+    return all(
+        marker in template
+        for marker in (
+            "message.reasoning_content is string",
+            "preserve_thinking is undefined or preserve_thinking is true",
+            "tool_call.arguments|items",
+        )
+    )
+
+
 _OLD_DETECT = "{%- set reasoning_content = '' %}"
 _NEW_DETECT = (
     "{%- set reasoning_content = '' %}\n"
@@ -248,6 +294,25 @@ def _patch_chat_template_for_training(tokenizer):
     if not template or _TRAINING_PATCH_MARKER in template:
         return
     if "last_query_index" not in template:
+        return
+
+    if _is_native_qwen35_template(template):
+        # Keep the role header outside the loss mask, and track thinking,
+        # content, tool calls and the turn terminator as assistant output.
+        replacements = (
+            (_QWEN35_REASONING_OLD_BLOCK, _QWEN35_REASONING_NEW_BLOCK),
+            (_QWEN35_RENDER_OLD_BLOCK, _QWEN35_RENDER_NEW_BLOCK),
+            (_QWEN3_ASSISTANT_END, _QWEN3_ASSISTANT_END_WITH_GENERATION),
+        )
+        for old, new in replacements:
+            if template.count(old) != 1:
+                raise ValueError(
+                    "Native Qwen3.5 chat template does not match the supported "
+                    "reasoning and generation-mask revision."
+                )
+            template = template.replace(old, new, 1)
+        tokenizer.chat_template = _TRAINING_PATCH_MARKER + template
+        logger.info("Patched native Qwen3.5 reasoning and generation tracking.")
         return
 
     # Bailing V3 adaptive already preserves thinking. Add Transformers'

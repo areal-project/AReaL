@@ -7,6 +7,8 @@ import torch
 
 from areal.api.cli_args import MegatronEngineConfig, PPOActorConfig
 from areal.engine.awex.colocate_reader import (
+    _get_awex_infer_hf_config,
+    _get_router_dtype,
     _PhysicalDeviceMetaServerClient,
 )
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
@@ -50,6 +52,61 @@ def test_event_loop_patch_supports_current_metrics_api():
     assert scheduler._areal_awex_last_decode_stats_ct == 7
     assert scheduler.calls[0][0] is True
     assert scheduler.calls[0][2] == 3
+
+
+def test_native_scheduler_hook_preserves_loops_and_runs_once(monkeypatch):
+    class Scheduler:
+        _engine_paused = False
+
+        def _apply_war_barrier(self):
+            pass
+
+        def event_loop_overlap(self):
+            pass
+
+        def event_loop_normal(self):
+            pass
+
+        def process_input_requests(self, requests):
+            self._engine_paused = requests == ["pause"]
+            return "processed"
+
+    scheduler = Scheduler()
+    native_overlap = scheduler.event_loop_overlap
+    native_normal = scheduler.event_loop_normal
+    plugin = AwexSchedulerPlugin(scheduler)
+    calls = []
+    monkeypatch.setattr(plugin, "process_awex_queue", lambda: calls.append(True))
+    plugin._patch_event_loop()
+    plugin._patch_event_loop()
+    assert scheduler.process_input_requests([]) == "processed"
+    assert calls == []
+    assert scheduler.process_input_requests(["pause"]) == "processed"
+    assert calls == [True]
+    assert scheduler.event_loop_overlap == native_overlap
+    assert scheduler.event_loop_normal == native_normal
+
+
+def test_awex_config_preserves_nested_router_and_vision_metadata(monkeypatch):
+    import areal.engine.awex.colocate_reader as reader
+
+    composite = object()
+
+    def serialize(config):
+        assert config is composite
+        return {
+            "text_config": {"router_dtype": "fp32"},
+            "vision_config": {"hidden_size": 64},
+        }
+
+    monkeypatch.setattr(reader, "simple_hf_config", serialize)
+    config = _get_awex_infer_hf_config(
+        SimpleNamespace(config=object()),
+        SimpleNamespace(model_config=SimpleNamespace(hf_config=composite)),
+    )
+    assert config.vision_config.hidden_size == 64
+    assert _get_router_dtype(config) == "fp32"
+    assert config.architectures == ["SimpleNamespace"]
 
 
 def test_memory_transitions_are_idempotent():

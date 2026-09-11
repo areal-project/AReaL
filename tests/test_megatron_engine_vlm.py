@@ -969,6 +969,74 @@ class TestPrepareMbListRebindCallerSafety:
         assert mb_list.data is not input_
 
 
+class TestModelOwnedThdContextParallel:
+    def test_cp_delegates_partitioning_to_bridge(self, monkeypatch):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        model = MagicMock(return_value=torch.ones(1, 4, 3))
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 2,
+        )
+
+        output = packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {
+                "input_ids": torch.tensor([10, 11, 12, 13, 20, 21, 22, 23]),
+                "cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32),
+                "max_seqlen": 4,
+            },
+            gather_cp_output=False,
+            is_vision_model=True,
+            use_model_packed_seq=True,
+        )
+
+        call = model.call_args.kwargs
+        assert call["input_ids"].tolist() == [
+            [10, 11, 12, 13],
+            [20, 21, 22, 23],
+        ]
+        assert call["attention_mask"].all()
+        assert call["position_ids"] is None
+        assert call["packed_seq_params"].qkv_format == "thd"
+        assert call["packed_seq_params"].cu_seqlens_q.tolist() == [0, 4, 8]
+        assert output.shape == (4, 3)
+
+
+class TestPerTokenLossNormalization:
+    @pytest.mark.parametrize(
+        ("cp_rank", "expected_weight", "expected_numerator"),
+        [(0, 3, 6.0), (1, 2, 4.0)],
+    )
+    def test_splits_full_loss_weight_across_cp_ranks(
+        self, monkeypatch, cp_rank, expected_weight, expected_numerator
+    ):
+        from areal.engine import megatron_engine
+
+        monkeypatch.setattr(
+            megatron_engine.mpu, "get_context_parallel_world_size", lambda: 2
+        )
+        monkeypatch.setattr(
+            megatron_engine.mpu, "get_context_parallel_rank", lambda: cp_rank
+        )
+        engine = object.__new__(megatron_engine.MegatronEngine)
+
+        numerator, local_weight = engine._build_per_token_loss_output(
+            loss=torch.tensor(2.0),
+            loss_weight=torch.tensor(5),
+            loss_multiplier=1.0,
+        )
+
+        assert local_weight.item() == expected_weight
+        assert numerator.item() == expected_numerator
+
+
 class TestVisionModelDetection:
     """Test is_valid_vision_model detection."""
 

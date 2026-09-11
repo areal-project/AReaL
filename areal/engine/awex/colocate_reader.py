@@ -43,7 +43,7 @@ from awex.meta.infer_meta_resolver import InferParamMetaResolver  # noqa: E402
 from awex.meta.meta_resolver import ParamMetaResolver  # noqa: E402
 from awex.reader.nccl_reader import NCCLWorkerWeightsReader  # noqa: E402
 from awex.sharding import get_sharding_strategy_builder  # noqa: E402
-from awex.util.common import simple_hf_config  # noqa: E402
+from awex.util.common import AttrDict, simple_hf_config  # noqa: E402
 
 from areal.utils.logging import getLogger  # noqa: E402
 
@@ -91,6 +91,17 @@ class _PhysicalDeviceMetaServerClient:
         )
 
 
+def _to_awex_attr_dict(value: Any) -> Any:
+    """Restore recursive attribute access missing from AWEX 0.8.1 configs."""
+    if isinstance(value, dict):
+        return AttrDict({key: _to_awex_attr_dict(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return [_to_awex_attr_dict(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_awex_attr_dict(item) for item in value)
+    return value
+
+
 def _get_router_dtype(config):
     """Read router dtype from a flat or multimodal Hugging Face config."""
     router_dtype = getattr(config, "router_dtype", None)
@@ -109,7 +120,7 @@ def _get_awex_infer_hf_config(model, model_runner=None):
     config = getattr(model_config, "hf_config", None)
     if config is None:
         config = model.config
-    serialized_config = simple_hf_config(config)
+    serialized_config = _to_awex_attr_dict(simple_hf_config(config))
     if not getattr(serialized_config, "architectures", None):
         serialized_config.architectures = [type(model).__name__]
     return serialized_config
@@ -445,7 +456,7 @@ class AwexColocateReader:
             # papers over any such mismatch generically, but keep the
             # semantic path whole so new models behave identically to native
             # awex.
-            "router_dtype": _get_router_dtype(self._get_model().config),
+            "router_dtype": _get_router_dtype(awex_hf_config),
         }
         self._infer_conf = infer_conf
 

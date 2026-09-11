@@ -384,7 +384,7 @@ class PPOTrainer:
         )
 
         self.eval_rollout = None
-        if not self._online_mode:
+        if self._should_initialize_eval_rollout():
             self.eval_rollout = self._init_rollout(
                 config.rollout, is_eval=True, lora_path=initial_lora_path
             )
@@ -537,6 +537,10 @@ class PPOTrainer:
         self._config_perf_tracer()
         self._apply_initial_offload_policy()
 
+    def _should_initialize_eval_rollout(self) -> bool:
+        """Return whether this trainer has evaluation data to serve."""
+        return not self._online_mode and self.valid_dataloader is not None
+
     @staticmethod
     def _is_colocation(strategy: SchedulingStrategy | None) -> bool:
         if strategy is None:
@@ -596,7 +600,7 @@ class PPOTrainer:
     def _update_weights_and_publish_version(
         self, meta: WeightUpdateMeta, new_version: int
     ) -> None:
-        """Update weights, publish their version, then restore AWEX rollout."""
+        """Update weights, publish their version, and discard stale AWEX requests."""
         self.actor.update_weights(meta)
 
         self.actor.set_version(new_version)
@@ -610,14 +614,31 @@ class PPOTrainer:
             return
 
         # The AWEX reader flushes all old cache entries while installing the
-        # new weights. Reallocate an empty KV pool only after every actor worker
-        # has returned, then let SGLang serve requests again. This must remain a
-        # controller-side call: invoking rollout RPCs from an actor worker creates
-        # a nested controller call while its update_weights collective is active.
+        # new weights. Discard paused requests before restoring the KV pool so
+        # none can continue with a mixture of old request state and new weights.
         self.rollout.abort_all_requests()
+        if self.eval_rollout is not None:
+            # Validation shares these inference servers and precedes stats export.
+            self._restore_awex_rollout_after_stats()
+
+    def _restore_awex_rollout_after_stats(self) -> None:
+        """Restore AWEX KV memory after GPU-backed training stats are exported."""
+        if not self._is_v1_awex_colocate(self.config):
+            return
+        # Stats reductions still need GPU memory while the KV pool is offloaded.
         self.rollout.onload(tags=["cuda_graph"])
         self.rollout.onload(tags=["kv_cache"])
         call_maybe_async(self.rollout.continue_generation)
+
+    def _export_stats_then_restore_awex_rollout(
+        self, epoch: int, epoch_step: int, global_step: int
+    ) -> None:
+        """Export all step stats before restoring the colocated AWEX KV pool."""
+        self._export_and_commit_stats(
+            epoch=epoch, epoch_step=epoch_step, global_step=global_step
+        )
+        if self.eval_rollout is None:
+            self._restore_awex_rollout_after_stats()
 
     def _offload_rollout(self, is_eval: bool = False):
         rollout = self.rollout if not is_eval else self.eval_rollout
@@ -1094,7 +1115,7 @@ class PPOTrainer:
                 category=Category.INSTR,
                 args={"global_step": global_step},
             ):
-                self._export_and_commit_stats(
+                self._export_stats_then_restore_awex_rollout(
                     epoch=epoch, epoch_step=step, global_step=global_step
                 )
 
