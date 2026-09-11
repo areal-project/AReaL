@@ -23,6 +23,10 @@ class _FakeSaver:
         pass
 
 
+class _FakeDataLoader(list):
+    sampler = None
+
+
 class _FakeLastStepInfo:
     def next(self):
         return SimpleNamespace(global_step=1)
@@ -134,7 +138,7 @@ def _build_supervised_trainer(
     trainer.recover_info = (
         SimpleNamespace(last_step_info=_FakeLastStepInfo()) if recovered else None
     )
-    trainer.train_dataloader = [[{}], [{}]] if recovered else [[{}]]
+    trainer.train_dataloader = _FakeDataLoader([[{}], [{}]] if recovered else [[{}]])
     trainer.saver = _FakeSaver()
     trainer.actor = _FailingUpdateActor(update_method, events)
     trainer._load_bcast_from = lambda data_generator: next(data_generator)
@@ -173,6 +177,7 @@ def _build_ppo_trainer(events: list[tuple], *, recovered: bool = False):
     trainer.critic = None
     trainer.ref = None
     trainer.teacher = None
+    trainer.mopd_execution_plan = None
     trainer._should_offload_rollout = False
     trainer._should_offload_actor = False
     trainer._requires_proxy_workflow = lambda _workflow: False
