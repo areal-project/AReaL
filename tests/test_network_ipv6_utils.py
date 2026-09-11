@@ -1,4 +1,5 @@
 import importlib.util
+import random
 from pathlib import Path
 
 import pytest
@@ -96,3 +97,21 @@ def test_find_free_ports_ignores_out_of_range_excludes():
         count=6, port_range=(10000, 10005), exclude_ports={50000}
     )
     assert len(ports) == 6
+
+
+def test_find_free_ports_seeded_candidates_busy_uses_independent_rng(monkeypatch):
+    """Port allocation must neither replay nor advance the training RNG."""
+    network = _load_network_module()
+    training_rng = random.Random(1)
+    state = training_rng.getstate()
+    occupied = {training_rng.randint(10000, 32767) for _ in range(10)}
+    training_rng.setstate(state)
+    free_port = next(port for port in range(10000, 32768) if port not in occupied)
+    monkeypatch.setattr(network.random, "randint", training_rng.randint)
+    monkeypatch.setattr(
+        network.random.SystemRandom, "randint", lambda self, lo, hi: free_port
+    )
+    monkeypatch.setattr(network, "is_port_free", lambda port: port not in occupied)
+
+    assert network.find_free_ports(1) == [free_port]
+    assert training_rng.getstate() == state
