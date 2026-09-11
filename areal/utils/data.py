@@ -736,6 +736,8 @@ def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
+    *,
+    sync_mbs: bool = True,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -743,6 +745,8 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
+        sync_mbs: Synchronize micro-batch counts across ranks. Engines that pad
+            execution with zero-contribution forwards can disable this.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -787,7 +791,11 @@ def split_padded_tensor_dict_into_mb_list(
             not_to_split[key] = value
 
     # split
-    group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
+    group_indices = (
+        allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
+        if sync_mbs
+        else allocate_balanced_mbs(mb_spec, input_lens)
+    )
     group_indices = [
         seqpack.flat2d(
             [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]

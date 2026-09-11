@@ -738,7 +738,23 @@ class FSDPEngine(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> None:
-        for mb_item in mb_list:
+        mb_items = list(mb_list)
+        n_micro_batches = len(mb_items)
+        if not self.enable_tree_training:
+            counts = torch.tensor(
+                [n_micro_batches, int(not mb_items)], dtype=torch.int64, device="cpu"
+            )
+            dist.all_reduce(counts, op=dist.ReduceOp.MAX, group=self.cpu_group)
+            if counts[1]:
+                raise ValueError("FSDP requires at least one real micro-batch per rank")
+            n_micro_batches = int(counts[0])
+        # Keep real packing and output metadata intact. Short ranks still need
+        # to participate in every FSDP forward/backward collective. Reusing the
+        # shortest valid input also preserves multimodal and SP/TP input layout.
+        dummy_index = min(range(len(mb_items)), key=mb_list.group_lens.__getitem__)
+        for mb_index in range(n_micro_batches):
+            is_dummy = mb_index >= len(mb_items)
+            mb_item = mb_items[dummy_index if is_dummy else mb_index]
             inputs, ctx = self._prepare_mb_inputs(mb_item)
 
             # Lazily create tree attention metadata just before forward.
@@ -764,8 +780,13 @@ class FSDPEngine(TrainEngine):
             for key in tree_attn_keys:
                 del inputs[key]
 
-            ctx_dict = ctx.to_dict()
-            loss = process_output_fn(logits, ctx_dict)
+            if is_dummy:
+                # No output callback: dummy rows must not affect returned
+                # logprobs, loss normalization, or training statistics.
+                loss = None if forward_only else logits.mean() * 0.0
+            else:
+                ctx_dict = ctx.to_dict()
+                loss = process_output_fn(logits, ctx_dict)
 
             if not forward_only and loss is not None:
                 with trace_scope("fsdp_engine.backward"):
@@ -1943,7 +1964,9 @@ class FSDPEngine(TrainEngine):
         else:
             input_ = amend_position_ids(input_)
 
-        mb_list = split_padded_tensor_dict_into_mb_list(input_, self.config.mb_spec)
+        mb_list = split_padded_tensor_dict_into_mb_list(
+            input_, self.config.mb_spec, sync_mbs=False
+        )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         mb_list = pad_mb_list(
             mb_list,
