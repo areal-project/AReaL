@@ -19,16 +19,59 @@ export MODEL_PATH=/shared/path/to/Qwen3-4B-Instruct
 export ARENA_CREDENTIALS_FILE=/shared/private/arena.env
 ```
 
-The private credentials file must export `ARENA_OPENAPI_BASE`, `ARENA_OPENAPI_TOKEN`,
-`ARENA_LLM_API_KEY`, and `SWE_RL_ADMIN_API_KEY`. Load it in the controller environment
-as well. Workers load the same file; credentials are not embedded in worker commands or
-committed YAML. The example assumes a compatible container with Slurm available to the
-controller, shared storage, and network reachability from Arena to rollout proxies. Use
-your site's established Slurm controller submission wrapper to run:
+Keep only credentials and the Arena API base in the private credentials file. It must
+export `ARENA_OPENAPI_BASE`, `ARENA_OPENAPI_TOKEN`, `ARENA_LLM_API_KEY`, and
+`SWE_RL_ADMIN_API_KEY`. Load it in the controller environment as well. Workers load the
+same file; credentials are not embedded in worker commands or committed YAML. The
+example assumes a compatible container with Slurm available to the controller, shared
+storage, and network reachability from Arena to rollout proxies. Use the included
+submission script after setting the site-specific mounts:
 
 ```bash
-python -m examples.swe.train_swe_rl --config examples/swe/arena_grpo.yaml
+# Comma-separated Apptainer binds supplied by your cluster setup.
+# Workers need the shared checkout, model, credentials and output paths.
+export AREAL_WORKER_MOUNTS="$SITE_SHARED_MOUNTS"
+# Controller additionally needs working Slurm commands and authentication.
+export AREAL_CONTROLLER_MOUNTS="$SITE_SHARED_MOUNTS,$SITE_SLURM_MOUNTS"
+export AREAL_CONTAINER_BIN=apptainer  # or singularity, available on compute nodes
+export SBATCH_PARTITION="$SITE_PARTITION"
+export SBATCH_TIMELIMIT=01:00:00      # worker limit
+export ARENA_CONTROLLER_TIME=01:30:00
+export ARENA_STREAM_ID=your-stream
+
+bash examples/swe/submit_arena.sh --check-arena
+bash examples/swe/submit_arena.sh
 ```
+
+The script prints the submitted Slurm job ID. It allocates a **CPU-only controller** (4
+CPUs, 16 GB); config validation and Arena preflight run inside the container before
+AReaL submits any GPU workers. `--check-arena` stops after preflight. Check
+`$AREAL_FILEROOT/submissions/$TRIAL_NAME/controller-<job-id>.log` and `preflight.json`;
+set `TRIAL_NAME` explicitly to identify a run, otherwise a unique name is generated and
+used as the controller job name. Use `squeue` to find the job and its name.
+
+`CONFIG_PATH` defaults to `examples/swe/arena_grpo.yaml`. For multi-stream training:
+
+```bash
+export CONFIG_PATH=examples/swe/arena_multi_stream.yaml
+# Fill in the Stream/Harness/reward entries before submitting.
+bash examples/swe/submit_arena.sh
+```
+
+Use a custom YAML to change the GPU topology or training settings. Both preflight and
+training resolve that same file, including its Hydra defaults. The supplied profile uses
+two GPU nodes; the controller does not reserve those nodes itself. Optional Slurm site
+settings use the usual `SBATCH_ACCOUNT`, `SBATCH_RESERVATION`, and related environment
+variables. The worker scheduler retains its existing default shared-storage bind;
+`AREAL_WORKER_MOUNTS` adds the mounts required by your site.
+
+Keep the checkout and configuration unchanged while the job is queued or running; use a
+dedicated checkout for each revision. Scripts do not copy or snapshot code. All paths
+must be visible at the same locations inside the containers. The credentials file is
+sourced only in the controller container and workers, never printed or embedded in
+generated commands. In the controller, explicit launch paths, Stream ID and API base
+take precedence over older credential files that also contain deployment settings.
+Workers source the file again, so remove unrelated deployment settings from it.
 
 For one Stream, set `ARENA_STREAM_ID`. For multiple Streams, edit the literal
 `econfig.arena_streams` entries in `arena_multi_stream.yaml` and select that config. Pin
