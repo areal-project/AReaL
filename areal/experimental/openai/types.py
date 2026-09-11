@@ -256,8 +256,36 @@ class InteractionWithTokenLogpReward:
 
 def normalize_group_rewards(
     results: list[dict[str, InteractionWithTokenLogpReward] | None],
+    step_reward_normalization: str = "broadcast",
 ) -> bool:
-    """Normalize one scalar reward per rollout while preserving raw rewards."""
+    """Normalize one scalar reward per rollout while preserving raw rewards.
+
+    The group statistics are always computed from the terminal interaction of
+    each rollout, i.e. one scalar per rollout. ``step_reward_normalization``
+    selects how that normalized scalar is written back to a multi-turn rollout:
+
+    ``"broadcast"`` (default)
+        Every interaction of the rollout receives the group-normalized rollout
+        reward. This is the historical behavior and the correct one for
+        outcome-only rollouts, where :meth:`CompletionWithTokenLogpReward.apply_reward_discount`
+        has already propagated the single outcome reward backward, so each
+        interaction's reward is a discounted return rather than an independent
+        step score.
+
+    ``"terminal"``
+        Only the terminal interaction is replaced by the group-normalized
+        reward; earlier interactions keep their own rewards. Use this when
+        intermediate interactions carry genuine step-level rewards that must
+        not be overwritten by the outcome score.
+
+    ``original_reward`` is populated from ``reward`` only when it is still
+    unset, so a raw baseline recorded earlier in the pipeline survives.
+    """
+    if step_reward_normalization not in ("broadcast", "terminal"):
+        raise ValueError(
+            "step_reward_normalization must be 'broadcast' or 'terminal', "
+            f"got {step_reward_normalization!r}"
+        )
     if not results:
         return False
 
@@ -279,13 +307,21 @@ def normalize_group_rewards(
 
     for result, normalized_reward in zip(results, normalized_rewards):
         assert result is not None
-        for interaction in result.values():
+        last_id = next(reversed(result))
+        for cid, interaction in result.items():
             if interaction.reward is None:
                 continue
-            interaction.original_reward = interaction.reward
-            interaction.reward = normalized_reward
+            if interaction.original_reward is None:
+                interaction.original_reward = interaction.reward
+
+            if step_reward_normalization == "broadcast" or cid == last_id:
+                interaction.reward = normalized_reward
+                if interaction._cache is not None:
+                    interaction._cache["rewards"] = torch.tensor(
+                        [float(normalized_reward)]
+                    )
+
             if interaction._cache is not None:
-                interaction._cache["rewards"] = torch.tensor([float(normalized_reward)])
                 interaction._cache["original_rewards"] = torch.tensor(
                     [float(interaction.original_reward)]
                 )
