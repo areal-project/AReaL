@@ -82,6 +82,10 @@ os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "none")
 logger = logging.getLogger("OpenAIClient")
 
 
+class ContextLengthExceededError(ValueError):
+    """Raised before generation when the prompt exhausts the context window."""
+
+
 @dataclass
 class _PreparedPrompt:
     input_ids: list[int]
@@ -1145,7 +1149,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 ):
                     # Remove the interaction from cache on failure
                     del cache[completion_id]
-                raise ValueError(
+                raise ContextLengthExceededError(
                     f"len of prompt tokens {len(prompt_token_ids)} exceeds max_total_tokens {max_total_tokens_final}"
                 )
         if not is_omitted(max_completion_tokens):
@@ -1579,7 +1583,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
                 if interaction is not None and cache is not None and resp_id in cache:
                     # Remove the interaction from cache on failure
                     del cache[resp_id]
-                raise ValueError(
+                raise ContextLengthExceededError(
                     f"len of prompt tokens {len(prompt_token_ids)} exceeds engine_max_tokens {self.engine_max_tokens}"
                 )
         if not is_omitted(max_output_tokens):

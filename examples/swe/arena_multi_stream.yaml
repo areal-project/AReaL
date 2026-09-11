@@ -1,0 +1,20 @@
+defaults:
+- arena_grpo
+- _self_
+econfig:
+  stream_id: ''
+  arena_streams:
+  - name: first
+    stream_id: your-first-stream
+    sampling_weight: 1
+    harness: your-harness@version
+    expected_reward_ref:
+      key: your-reward
+      version: 1.0.0
+  - name: second
+    stream_id: your-second-stream
+    sampling_weight: 1
+    harness: your-harness@version
+    expected_reward_ref:
+      key: your-reward
+      version: 1.0.0

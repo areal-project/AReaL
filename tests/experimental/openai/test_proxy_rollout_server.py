@@ -9,8 +9,13 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from areal.experimental.openai.client import ContextLengthExceededError
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
-from areal.experimental.openai.proxy.server import SessionData
+from areal.experimental.openai.proxy.server import (
+    SessionData,
+    derive_session_gateway_api_key,
+    derive_session_gateway_token,
+)
 from areal.experimental.openai.proxy.tensor_reference import GroupTensorStoreRegistry
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry
@@ -54,6 +59,97 @@ def _admin_headers():
     return {"Authorization": f"Bearer {_ADMIN_KEY}"}
 
 
+class _Request:
+    def __init__(self, headers: dict[str, str]):
+        self.headers = headers
+        self.url = SimpleNamespace(path="/v1/chat/completions")
+
+
+def test_require_session_key_accepts_active_session_key():
+    srv._api_key_to_session["session-key"] = "task-1-0"
+
+    session_id = srv._require_session_key(
+        _Request({"authorization": "Bearer session-key"})
+    )
+
+    assert session_id == "task-1-0"
+
+
+def test_require_session_key_accepts_gateway_capability_for_active_session():
+    srv._session_to_api_key["task-1-0"] = "session-key"
+    gateway_key = derive_session_gateway_api_key(_ADMIN_KEY)
+    session_token = derive_session_gateway_token(_ADMIN_KEY, "task-1-0")
+
+    session_id = srv._require_session_key(
+        _Request(
+            {
+                "authorization": "Bearer arena-gateway-key",
+                "x-api-key": gateway_key,
+                "x-session-id": "task-1-0",
+                "x-session-token": session_token,
+            }
+        )
+    )
+
+    assert session_id == "task-1-0"
+
+
+@pytest.mark.parametrize("session_id", [None, "missing-session"])
+def test_require_session_key_rejects_gateway_without_active_session(session_id):
+    headers = {
+        "authorization": (f"Bearer {derive_session_gateway_api_key(_ADMIN_KEY)}")
+    }
+    if session_id is not None:
+        headers["x-session-id"] = session_id
+        headers["x-session-token"] = derive_session_gateway_token(
+            _ADMIN_KEY, session_id
+        )
+
+    with pytest.raises(srv.HTTPException) as exc_info:
+        srv._require_session_key(_Request(headers))
+
+    assert exc_info.value.status_code == 401
+
+
+def test_require_session_key_rejects_capability_for_another_active_session():
+    srv._session_to_api_key["task-1-0"] = "session-key-1"
+    srv._session_to_api_key["task-2-0"] = "session-key-2"
+
+    with pytest.raises(srv.HTTPException) as exc_info:
+        srv._require_session_key(
+            _Request(
+                {
+                    "x-api-key": derive_session_gateway_api_key(_ADMIN_KEY),
+                    "x-session-id": "task-2-0",
+                    "x-session-token": derive_session_gateway_token(
+                        _ADMIN_KEY, "task-1-0"
+                    ),
+                }
+            )
+        )
+
+    assert exc_info.value.status_code == 401
+
+
+@pytest.mark.parametrize("path", ["/rl/set_reward", "/rl/end_session"])
+def test_gateway_capability_cannot_mutate_session(path):
+    """A public gateway must not assign rewards or close a training session."""
+    srv._session_to_api_key["task-1-0"] = "session-key"
+    request = _Request(
+        {
+            "x-api-key": derive_session_gateway_api_key(_ADMIN_KEY),
+            "x-session-id": "task-1-0",
+            "x-session-token": derive_session_gateway_token(_ADMIN_KEY, "task-1-0"),
+        }
+    )
+    request.url = SimpleNamespace(path=path)
+
+    with pytest.raises(srv.HTTPException) as exc_info:
+        srv._require_session_key(request)
+
+    assert exc_info.value.status_code == 403
+
+
 # ---------------------------------------------------------------------------
 # Tests: health reports forked worker identity
 # ---------------------------------------------------------------------------
@@ -89,6 +185,171 @@ def test_proxy_worker_index_falls_back_to_slurm_env(monkeypatch):
     monkeypatch.setenv("SLURM_PROCID", "5")
 
     assert srv._resolve_worker_index(-1) == 5
+
+
+# ---------------------------------------------------------------------------
+# Tests: message preprocessing
+# ---------------------------------------------------------------------------
+
+
+def test_preprocess_messages_flattens_text_blocks_and_preserves_images(monkeypatch):
+    """OpenAI-routed Claude text blocks should be flattened before inference."""
+
+    class RemoveReminder:
+        def __call__(self, messages):
+            for message in messages:
+                if isinstance(message.get("content"), str):
+                    message["content"] = message["content"].replace(
+                        "reminder", "processed"
+                    )
+            return messages
+
+    monkeypatch.setattr(srv, "_message_preprocessors", [RemoveReminder()])
+    image_content = [
+        {"type": "text", "text": "describe"},
+        {"type": "image_url", "image_url": {"url": "https://example/image.png"}},
+    ]
+    messages = [
+        {"role": "system", "content": image_content},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {
+                    "type": "tool_result",
+                    "content": [{"type": "text", "text": "reminder"}],
+                },
+            ],
+        },
+        {"role": "user", "content": image_content},
+    ]
+
+    result = srv._preprocess_messages(messages)
+
+    assert isinstance(result[0]["content"], str)
+    assert result[1]["content"] == "hello\nprocessed"
+    assert result[2]["content"] == image_content
+
+
+def test_prepare_request_messages_normalizes_tuple_and_system_content(monkeypatch):
+    """Tuple-backed request messages should not bypass system normalization."""
+    monkeypatch.setattr(srv, "_message_preprocessors", [])
+    messages = (
+        {
+            "role": "system",
+            "content": ({"type": "text", "text": "system prompt"},),
+        },
+        {"role": "user", "content": "hello"},
+    )
+
+    result = srv._prepare_request_messages(messages)
+
+    assert isinstance(result, list)
+    assert result[0]["content"] == "system prompt"
+
+
+def test_prepare_request_messages_preserves_generator_after_unsupported_item(
+    monkeypatch,
+):
+    """Unsupported generator items must not leave a partially consumed iterator."""
+    monkeypatch.setattr(srv, "_message_preprocessors", [])
+    unsupported = object()
+
+    def message_generator():
+        yield {"role": "user", "content": "hello"}
+        yield unsupported
+
+    result = srv._prepare_request_messages(message_generator())
+
+    assert isinstance(result, list)
+    assert result == [{"role": "user", "content": "hello"}, unsupported]
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_accepts_image_content_in_tool_message(monkeypatch):
+    """FastAPI must not lazily validate gateway image blocks as text-only."""
+    captured_messages = None
+
+    async def create(
+        *, messages, areal_cache, model="areal", temperature=1.0, top_p=1.0
+    ):
+        nonlocal captured_messages
+        del areal_cache, model, temperature, top_p
+        captured_messages = messages
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    srv._session_cache["image-session"] = SessionData(session_id="image-session")
+    srv._api_key_to_session["image-key"] = "image-session"
+    image_part = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+    }
+
+    async with _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer image-key"},
+            json={
+                "model": "areal",
+                "messages": [
+                    {
+                        "role": "tool",
+                        "tool_call_id": "tool-1",
+                        "content": [image_part],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured_messages[0]["content"] == [image_part]
+
+
+@pytest.mark.asyncio
+async def test_internal_generation_failure_is_reported_when_session_ends(monkeypatch):
+    """A proxy-side 500 must remain distinguishable from model behavior."""
+
+    async def create(
+        *, messages, areal_cache, model="areal", temperature=1.0, top_p=1.0
+    ):
+        del messages, areal_cache, model, temperature, top_p
+        raise RuntimeError("backend unavailable")
+
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    srv._session_cache["failed-session"] = SessionData(session_id="failed-session")
+    srv._api_key_to_session["failed-key"] = "failed-session"
+
+    async with _client() as client:
+        generation = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer failed-key"},
+            json={
+                "model": "areal",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        ended = await client.post(
+            "/rl/end_session",
+            headers={"Authorization": "Bearer failed-key"},
+            json={},
+        )
+
+    assert generation.status_code == 500
+    assert ended.json()["system_error"] is True
+    assert "backend unavailable" in ended.json()["system_error_message"]
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +473,100 @@ class TestEndSessionInteractionCount:
             assert resp_end.status_code == 200
             data = resp_end.json()
             assert data["interaction_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_context_overflow_is_reported_when_session_ends(self, monkeypatch):
+        """A context error should persist on the session for workflow recovery."""
+
+        async def overflow_create(*, areal_cache, **_kwargs):
+            del areal_cache
+            raise ContextLengthExceededError("prompt exceeds context window")
+
+        monkeypatch.setattr(
+            srv,
+            "_openai_client",
+            SimpleNamespace(
+                chat=SimpleNamespace(
+                    completions=SimpleNamespace(create=overflow_create)
+                )
+            ),
+        )
+        monkeypatch.setattr(srv, "_capacity", 1)
+        async with _client() as client:
+            start = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={"task_id": "overflow"},
+            )
+            api_key = start.json()["api_key"]
+            headers = {"Authorization": f"Bearer {api_key}"}
+
+            generation = await client.post(
+                "/chat/completions",
+                headers=headers,
+                json={
+                    "model": "areal",
+                    "messages": [{"role": "user", "content": "long prompt"}],
+                },
+            )
+            ended = await client.post("/rl/end_session", headers=headers, json={})
+
+        assert generation.status_code == 400
+        assert generation.json()["detail"]["type"] == "context_length_exceeded"
+        assert ended.json()["context_overflow"] is True
+        assert ended.json()["context_overflow_message"] == (
+            "prompt exceeds context window"
+        )
+
+    @pytest.mark.asyncio
+    async def test_anthropic_streaming_context_overflow_returns_400(self, monkeypatch):
+        """Anthropic streaming must preserve the structured context error."""
+
+        async def overflow_create(*, areal_cache, **_kwargs):
+            del areal_cache
+            raise ContextLengthExceededError("prompt exceeds context window")
+
+        monkeypatch.setattr(
+            srv,
+            "_openai_client",
+            SimpleNamespace(
+                chat=SimpleNamespace(
+                    completions=SimpleNamespace(create=overflow_create)
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            srv,
+            "_translate_anthropic_to_openai_request",
+            lambda _request: {
+                "model": "areal",
+                "messages": [{"role": "user", "content": "long prompt"}],
+            },
+        )
+        monkeypatch.setattr(srv, "_capacity", 1)
+
+        async with _client() as client:
+            start = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={"task_id": "anthropic-stream-overflow"},
+            )
+            api_key = start.json()["api_key"]
+            response = await client.post(
+                "/v1/messages",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "areal",
+                    "messages": [{"role": "user", "content": "long prompt"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == {
+            "type": "context_length_exceeded",
+            "message": "prompt exceeds context window",
+        }
 
 
 def test_setup_openai_client_loads_and_passes_vlm_processor(monkeypatch):

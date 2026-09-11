@@ -15,7 +15,7 @@ def filter_function(sample):
     if not accept:
         stats_tracker.get("rollout").scalar(rejected_by_failed_or_perfect=1)
         # Distinguish all-correct vs all-wrong
-        all_positive = all(r > 0 for r in rewards)
+        all_positive = all(r >= 1.0 - 1e-3 for r in rewards)
         stats_tracker.get("rollout").scalar(rejected_by_all_correct=int(all_positive))
         stats_tracker.get("rollout").scalar(rejected_by_all_wrong=int(not all_positive))
     else:

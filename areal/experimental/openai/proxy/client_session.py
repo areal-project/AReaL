@@ -110,6 +110,11 @@ class OpenAIProxyClient:
             self._shared_tensor_resolver = SharedTensorResolver()
         self.session_id: str | None = None
         self._session_api_key: str | None = None
+        self.interaction_count = 0
+        self.context_overflow = False
+        self.context_overflow_message = ""
+        self.system_error = False
+        self.system_error_message = ""
 
     @property
     def session_api_key(self) -> str:
@@ -272,11 +277,18 @@ class OpenAIProxyClient:
 
         # Always try to end the session, even on exception
         try:
-            await post_json_with_retry(
+            data = await post_json_with_retry(
                 self._session,
                 url=f"{self.base_url}{RL_END_SESSION_PATHNAME}",
                 headers=self._session_auth_headers(),
             )
+            self.interaction_count = int(data.get("interaction_count", 0))
+            self.context_overflow = bool(data.get("context_overflow", False))
+            self.context_overflow_message = str(
+                data.get("context_overflow_message", "")
+            )
+            self.system_error = bool(data.get("system_error", False))
+            self.system_error_message = str(data.get("system_error_message", ""))
         except Exception as e:
             # Raised errors will be properly handled by OpenAIProxyWorkflow
             logger.warning(f"Failed to end session {self.session_id}: {e}")
