@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
-import torch
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
 
@@ -39,7 +38,70 @@ def _make_dummy_response(input_tokens, output_tokens) -> ModelResponse:
 
 
 class TestNormalizeGroupRewards:
-    def test_multi_turn_preserves_intermediate_step_rewards(self):
+    def test_outcome_only_multi_turn_broadcast_is_default(self):
+        """Default policy reproduces the pre-existing behavior for outcome-only rollouts.
+
+        ``apply_reward_discount`` has already propagated the single outcome
+        reward backward, so every interaction holds a discounted return, not an
+        independent step score. All of them must receive the group-normalized
+        rollout reward, exactly as before.
+        """
+        # Rollout 1: outcome reward 1.0 discounted backward with turn_discount=0.5
+        i1_1 = InteractionWithTokenLogpReward(
+            completion=_make_dummy_completion("r1_t1"),
+            reward=0.5,
+            model_response=_make_dummy_response([1, 2], [3]),
+        )
+        i1_2 = InteractionWithTokenLogpReward(
+            completion=_make_dummy_completion("r1_t2"),
+            reward=1.0,
+            parent=i1_1,
+            model_response=_make_dummy_response([1, 2, 3, 4], [5]),
+        )
+        r1 = {"r1_t1": i1_1, "r1_t2": i1_2}
+
+        # Rollout 2: outcome reward 0.0 discounted backward
+        i2_1 = InteractionWithTokenLogpReward(
+            completion=_make_dummy_completion("r2_t1"),
+            reward=0.0,
+            model_response=_make_dummy_response([1, 2], [3]),
+        )
+        i2_2 = InteractionWithTokenLogpReward(
+            completion=_make_dummy_completion("r2_t2"),
+            reward=0.0,
+            parent=i2_1,
+            model_response=_make_dummy_response([1, 2, 3, 4], [5]),
+        )
+        r2 = {"r2_t1": i2_1, "r2_t2": i2_2}
+
+        for interaction in (i1_1, i1_2, i2_1, i2_2):
+            interaction.to_tensor_dict()
+
+        assert normalize_group_rewards([r1, r2]) is True
+
+        # mean = 0.5, std = 0.5 -> rollout 1 = +1.0, rollout 2 = -1.0,
+        # broadcast to every interaction of the rollout.
+        for interaction in (i1_1, i1_2):
+            assert pytest.approx(interaction.reward) == 1.0
+            assert pytest.approx(float(interaction._cache["rewards"].item())) == 1.0
+        for interaction in (i2_1, i2_2):
+            assert pytest.approx(interaction.reward) == -1.0
+            assert pytest.approx(float(interaction._cache["rewards"].item())) == -1.0
+
+        # Raw rewards are still recorded per interaction.
+        assert pytest.approx(i1_1.original_reward) == 0.5
+        assert pytest.approx(i1_2.original_reward) == 1.0
+
+    def test_invalid_policy_rejected(self):
+        i = InteractionWithTokenLogpReward(
+            completion=_make_dummy_completion("c1"),
+            reward=1.0,
+            model_response=_make_dummy_response([1], [2]),
+        )
+        with pytest.raises(ValueError, match="step_reward_normalization"):
+            normalize_group_rewards([{"c1": i}], step_reward_normalization="nope")
+
+    def test_terminal_policy_preserves_intermediate_step_rewards(self):
         # Rollout 1: Turn 1 (-0.2 step reward), Turn 2 (+1.0 outcome reward)
         i1_1 = InteractionWithTokenLogpReward(
             completion=_make_dummy_completion("r1_t1"),
@@ -74,7 +136,9 @@ class TestNormalizeGroupRewards:
         i2_1.to_tensor_dict()
         i2_2.to_tensor_dict()
 
-        success = normalize_group_rewards([r1, r2])
+        success = normalize_group_rewards(
+            [r1, r2], step_reward_normalization="terminal"
+        )
         assert success is True
 
         # Rollout 1:
@@ -156,5 +220,7 @@ class TestNormalizeGroupRewards:
         assert normalize_group_rewards([]) is False
         assert normalize_group_rewards([None]) is False
         assert normalize_group_rewards([{}]) is False
-        i_no_rew = InteractionWithTokenLogpReward(completion=_make_dummy_completion("c1"))
+        i_no_rew = InteractionWithTokenLogpReward(
+            completion=_make_dummy_completion("c1")
+        )
         assert normalize_group_rewards([{"c1": i_no_rew}]) is False
