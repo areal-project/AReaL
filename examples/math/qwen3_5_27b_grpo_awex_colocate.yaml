@@ -1,5 +1,7 @@
 # Two-node Qwen hybrid-attention smoke run: rollout, PPO, and AWEX updates.
-# MODEL_PATH, FILEROOT and WORKER_IMAGE are deployment-specific inputs.
+# Set MODEL_PATH, FILEROOT, WORKER_IMAGE, WORKER_MOUNTS and AREAL_PROXY_ADMIN_KEY.
+# Tested with Megatron-Core 0.18.2, Megatron Bridge 0.5.1, AWEX 0.8.1,
+# SGLang 0.5.10.post1 and cuDNN 9.25.1.1. Older GDN runtimes do not support CP.
 defaults:
   - gsm8k_grpo_awex_colocate
   - _self_
@@ -62,7 +64,21 @@ rollout:
     type: colocation
     target: actor
     fork: true
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 64
+      image: ${oc.env:WORKER_IMAGE}
+      mount: ${oc.env:WORKER_MOUNTS}
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        PYTORCH_ALLOC_CONF: "expandable_segments:True"
+        TMS_INIT_ENABLE: "0"
+        TMS_INIT_ENABLE_CPU_BACKUP: "0"
   agent:
+    admin_api_key: ${oc.env:AREAL_PROXY_ADMIN_KEY}
     reasoning_parser: qwen3
 
 sglang:
@@ -73,6 +89,7 @@ sglang:
   mem_fraction_static: 0.6
   enable_multimodal: true
   mamba_scheduler_strategy: extra_buffer
+  disable_radix_cache: false
   mamba_ssm_dtype: bfloat16
   max_mamba_cache_size: 16
   enable_cache_report: true
