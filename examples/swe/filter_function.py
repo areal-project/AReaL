@@ -51,10 +51,8 @@ def _has_negative_process_reward(
             raise ValueError("attention_mask must be a local tensor")
         if attention_mask.shape != loss_mask.shape:
             raise ValueError("attention_mask and loss_mask must have matching shapes")
-        from areal.trainer.ppo.actor import _get_truncated_mask
-
-        seqlens = attention_mask.bool().sum(dim=-1)
-        has_eos = ~_get_truncated_mask(sample, seqlens)
+        # A sequence filling the padded width is truncated and has no EOS.
+        has_eos = attention_mask.bool().sum(dim=-1) < attention_mask.shape[-1]
         valid_mask = valid_mask & has_eos.unsqueeze(-1)
     return bool(((token_rewards < 0) & valid_mask).any().item())
 
