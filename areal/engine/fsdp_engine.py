@@ -116,6 +116,7 @@ from areal.utils import (
 )
 from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
 from areal.utils.data import (
+    TRANSPORT_DUMMY_KEY,
     MicroBatchItem,
     MicroBatchList,
     amend_position_ids,
@@ -739,6 +740,23 @@ class FSDPEngine(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> None:
+        # Model configuration is shared by all ranks, including text-only peers.
+        if self.is_vision_model:
+            has_dummy = torch.tensor(
+                any(mb.get(TRANSPORT_DUMMY_KEY) is True for mb in mb_list.mbs),
+                dtype=torch.int32,
+                device="cpu",
+            )
+            dist.all_reduce(has_dummy, op=dist.ReduceOp.MAX, group=self.cpu_group)
+            if has_dummy.item():
+                raise ValueError(
+                    "FSDP transport padding is not supported for vision-language "
+                    "models: text-only dummies can skip sharded vision layers "
+                    "and mismatch collectives. Use batches and microbatch settings "
+                    "that require no transport padding. All training ranks stopped "
+                    "before model execution."
+                )
+
         for mb_item in mb_list:
             inputs, ctx = self._prepare_mb_inputs(mb_item)
 

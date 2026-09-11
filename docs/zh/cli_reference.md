@@ -761,13 +761,16 @@ default to False.
 
 Configuration for cluster specification and distributed computing setup.
 
-| Parameter         | Type                                        | Default             | Description                                                      |
-| ----------------- | ------------------------------------------- | ------------------- | ---------------------------------------------------------------- |
-| `name_resolve`    | [`NameResolveConfig`](section-name-resolve) | *NameResolveConfig* | Name resolving configuration.                                    |
-| `cluster_name`    | string                                      | `"local"`           | Name of the cluster. Used to set specific environs.              |
-| `fileroot`        | string                                      | `"/tmp/areal/"`     | Root for logs and checkpoints. Should be available on all nodes. |
-| `n_nodes`         | integer                                     | `32`                | The size of the cluster. Used to decide slurm hostname suffix.   |
-| `n_gpus_per_node` | integer                                     | `8`                 | Number of GPUs per node (physical).                              |
+| Parameter                       | Type                                        | Default             | Description                                                                                                                                                                                                                   |
+| ------------------------------- | ------------------------------------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name_resolve`                  | [`NameResolveConfig`](section-name-resolve) | *NameResolveConfig* | Name resolving configuration.                                                                                                                                                                                                 |
+| `cluster_name`                  | string                                      | `"local"`           | Name of the cluster. Used to set specific environs.                                                                                                                                                                           |
+| `fileroot`                      | string                                      | `"/tmp/areal/"`     | Root for logs and checkpoints. Should be available on all nodes.                                                                                                                                                              |
+| `n_nodes`                       | integer                                     | `32`                | The size of the cluster. Used to decide slurm hostname suffix.                                                                                                                                                                |
+| `n_gpus_per_node`               | integer                                     | `8`                 | Number of GPUs per node (physical).                                                                                                                                                                                           |
+| `ray_port`                      | integer                                     | `6379`              | Port of the Ray head (GCS). Used by the in-package Ray bootstrap of the Ray launcher when assembling a multi-node cluster inside a platform job. Must be between 1 and 65535; dynamic port selection with 0 is not supported. |
+| `ray_dashboard_port`            | integer                                     | `8265`              | Port of the Ray dashboard on the head node.                                                                                                                                                                                   |
+| `ray_bootstrap_timeout_seconds` | integer                                     | `900`               | How long the Ray bootstrap head waits for all cluster.n_nodes nodes to join before failing.                                                                                                                                   |
 
 (section-name-resolve)=
 
