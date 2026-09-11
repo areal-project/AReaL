@@ -9,6 +9,7 @@ import pickle
 from typing import TYPE_CHECKING, Any
 
 import torch.distributed as dist
+from torch.utils.data import DistributedSampler
 from transformers import PreTrainedTokenizerFast
 
 if TYPE_CHECKING:
@@ -151,6 +152,8 @@ class RecoverInfo:
 
 
 class RecoverHandler:
+    _SAMPLER_EPOCH_KEY = "_areal_distributed_sampler_epoch"
+
     def __init__(self, config: RecoverConfig, ft_spec: FinetuneSpec):
         self.config = config
         self.ft_spec = ft_spec
@@ -309,12 +312,17 @@ class RecoverHandler:
             self._normalize_recover_engines(engine)
         )
         self.last_step_info = step_info
+        dataloader_info = dataloader.state_dict()
+        sampler = getattr(dataloader, "sampler", None)
+        if isinstance(sampler, DistributedSampler):
+            dataloader_info[self._SAMPLER_EPOCH_KEY] = sampler.epoch
+
         recover_info = RecoverInfo(
             last_step_info=self.last_step_info,
             saver_info=saver.state_dict(),
             evaluator_info=evaluator.state_dict(),
             stats_logger_info=stats_logger.state_dict(),
-            dataloader_info=dataloader.state_dict(),
+            dataloader_info=dataloader_info,
             checkpoint_info=self.freq_ctl.state_dict(),
         )
         save_root = Saver.get_save_root(
@@ -462,7 +470,12 @@ class RecoverHandler:
             self.freq_ctl.load_state_dict(recover_info.checkpoint_info)
             evaluator.load_state_dict(recover_info.evaluator_info)
             stats_logger.load_state_dict(recover_info.stats_logger_info)
-            dataloader.load_state_dict(recover_info.dataloader_info)
+            dataloader_info = recover_info.dataloader_info.copy()
+            sampler_epoch = dataloader_info.pop(self._SAMPLER_EPOCH_KEY, None)
+            dataloader.load_state_dict(dataloader_info)
+            sampler = getattr(dataloader, "sampler", None)
+            if sampler_epoch is not None and isinstance(sampler, DistributedSampler):
+                sampler.set_epoch(sampler_epoch)
 
             global_step = recover_info.last_step_info.global_step
             recovery_version = global_step + 1
