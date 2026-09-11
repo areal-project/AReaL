@@ -17,6 +17,43 @@ from areal.utils import logging
 
 logger = logging.getLogger("ToolCallParser")
 
+
+def split_reasoning(
+    text: str,
+    reasoning_parser: str | None,
+    force_reasoning: bool | None = None,
+) -> tuple[str, str]:
+    """Split model reasoning while preserving the generic fallback contract."""
+    if not reasoning_parser or not text:
+        return "", text
+    try:
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+    except ImportError:
+        start, end = "<think>", "</think>"
+        if force_reasoning:
+            if end in text:
+                return text.split(end, 1)
+            return "", text
+        lead = len(text) - len(text.lstrip("\n"))
+        if text[lead:].startswith(start):
+            body = text[lead + len(start) :]
+            if end in body:
+                return body.split(end, 1)
+            return body, ""
+        return "", text
+    parser = ReasoningParser(
+        model_type=reasoning_parser,
+        stream_reasoning=False,
+        force_reasoning=force_reasoning,
+    )
+    start = getattr(parser.detector, "think_start_token", "<think>")
+    lead = len(text) - len(text.lstrip("\n"))
+    if lead and text[lead:].startswith(start):
+        text = text[lead:]
+    reasoning_text, normal_text = parser.parse_non_stream(text)
+    return reasoning_text or "", normal_text or ""
+
+
 _QWEN3_CODER_TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*(?P<body>.*?)\s*</tool_call>",
     re.DOTALL,

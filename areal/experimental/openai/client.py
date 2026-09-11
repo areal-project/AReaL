@@ -57,7 +57,10 @@ from pydantic import BaseModel
 from areal.api import ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai.cache import InteractionCache
-from areal.experimental.openai.tool_call_parser import process_tool_calls
+from areal.experimental.openai.tool_call_parser import (
+    process_tool_calls,
+    split_reasoning,
+)
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCallCache
 from areal.utils import logging
@@ -74,6 +77,18 @@ class _AsyncGenerateEngine(Protocol):
 
 
 TRolloutEngine = TypeVar("TRolloutEngine", bound=_AsyncGenerateEngine)
+
+
+def _force_reasoning_from_chat_template_kwargs(
+    chat_template_kwargs: dict[str, Any] | None,
+) -> bool:
+    """Detect templates that pre-fill an open ``<think>`` tag."""
+    if not chat_template_kwargs:
+        return False
+    if chat_template_kwargs.get("enable_thinking") is not None:
+        return bool(chat_template_kwargs["enable_thinking"])
+    return str(chat_template_kwargs.get("thinking_option", "")).lower() == "on"
+
 
 # reset OpenAI keys when using the wrapped client.
 os.environ["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY", "none")
@@ -1216,6 +1231,13 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         # Call inference engine
         response = await self.engine.agenerate(model_request)
         output_text = self.tokenizer.decode(response.output_tokens_without_stop)
+        reasoning_text, output_text = split_reasoning(
+            output_text,
+            self.reasoning_parser,
+            force_reasoning=_force_reasoning_from_chat_template_kwargs(
+                extra_body.get("chat_template_kwargs")
+            ),
+        )
 
         # Parse tool calls.
         tool_calls = None
@@ -1261,6 +1283,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 completion_id=completion_id,
                 current_time=current_time,
                 model=response_model,
+                reasoning_text=reasoning_text,
                 output_text=output_text,
                 tool_calls=tool_calls,
                 response=response,
@@ -1292,6 +1315,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         output_text: str,
         tool_calls: list | None,
         response: ModelResponse,
+        reasoning_text: str = "",
     ) -> AsyncGenerator[ChatCompletionChunk, None]:
         """Generate streaming ChatCompletionChunk objects.
 
@@ -1320,6 +1344,21 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
 
             # Content chunks - yield the full text as one chunk
             # (In a true streaming implementation, this would be broken into smaller pieces)
+            if reasoning_text:
+                yield ChatCompletionChunk(
+                    id=completion_id,
+                    choices=[
+                        ChunkChoice(
+                            delta=ChoiceDelta(**{"reasoning_content": reasoning_text}),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                    created=current_time,
+                    model=model,
+                    object="chat.completion.chunk",
+                )
+
             if output_text:
                 yield ChatCompletionChunk(
                     id=completion_id,

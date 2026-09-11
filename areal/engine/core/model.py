@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from enum import Enum
-from importlib.metadata import PackageNotFoundError, version
 
 import torch
-from packaging.version import InvalidVersion, Version
 
 VALID_VISION_MODELS = [
     "qwen2_vl",
@@ -97,35 +95,13 @@ class SequencePackingMode(str, Enum):
 
 def supports_model_packed_seq(model_type: str, bridge_type: str) -> bool:
     """Whether the bridge model owns BSHD-to-THD packing internally."""
-    return bridge_type == "megatron-bridge" and (
-        is_qwen3_vl_model(model_type) or model_type in ("qwen3_5", "qwen3_5_moe")
-    )
-
-
-def supports_qwen35_packed_runtime() -> bool:
-    """Conservatively require the validated GDN/Bridge packed runtime pair."""
-    try:
-        return Version(version("megatron-core")) >= Version("0.18.2") and Version(
-            version("megatron-bridge")
-        ) >= Version("0.5.1")
-    except (PackageNotFoundError, InvalidVersion):
-        return False
+    return bridge_type == "megatron-bridge" and is_qwen3_vl_model(model_type)
 
 
 def resolve_sequence_packing_mode(
-    model_type: str,
-    bridge_type: str,
-    *,
-    use_chunked_lm_head: bool = False,
-    enable_mtp_training: bool = False,
+    model_type: str, bridge_type: str
 ) -> SequencePackingMode:
     """Select one packing path from the model and bridge contract."""
-    if is_qwen3_5_model(model_type) and (
-        use_chunked_lm_head
-        or enable_mtp_training
-        or not supports_qwen35_packed_runtime()
-    ):
-        return SequencePackingMode.PADDED
     if supports_model_packed_seq(model_type, bridge_type):
         return SequencePackingMode.MODEL_THD
     if is_valid_vision_model(model_type) or is_qwen3_5_model(model_type):
@@ -136,8 +112,9 @@ def resolve_sequence_packing_mode(
 def requires_padded_seq(model_type: str) -> bool:
     """Whether the model must run the padded (BSHD) forward instead of packed (THD).
 
-    Older GDN/SSM kernels require padded ``[B, S]`` input. The engine overrides
-    this family-level fallback when the runtime supports model-owned THD.
+    GDN/SSM models (currently the Qwen3.5 family) reject packed sequences in their
+    attention/SSM kernels, so they must run on padded ``[B, S]`` input. THD stays
+    the default for every other model.
     """
     return is_qwen3_5_model(model_type)
 

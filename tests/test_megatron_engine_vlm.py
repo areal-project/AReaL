@@ -969,46 +969,6 @@ class TestPrepareMbListRebindCallerSafety:
         assert mb_list.data is not input_
 
 
-class TestModelOwnedThdContextParallel:
-    def test_cp_delegates_partitioning_to_bridge(self, monkeypatch):
-        from areal.engine.megatron_utils import packed_context_parallel
-
-        model = MagicMock(return_value=torch.ones(1, 4, 3))
-        monkeypatch.setattr(
-            packed_context_parallel.mpu,
-            "is_pipeline_last_stage",
-            lambda **_kwargs: True,
-        )
-        monkeypatch.setattr(
-            packed_context_parallel.mpu,
-            "get_context_parallel_world_size",
-            lambda: 2,
-        )
-
-        output = packed_context_parallel.packed_context_parallel_forward(
-            model,
-            {
-                "input_ids": torch.tensor([10, 11, 12, 13, 20, 21, 22, 23]),
-                "cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32),
-                "max_seqlen": 4,
-            },
-            gather_cp_output=False,
-            is_vision_model=True,
-            use_model_packed_seq=True,
-        )
-
-        call = model.call_args.kwargs
-        assert call["input_ids"].tolist() == [
-            [10, 11, 12, 13],
-            [20, 21, 22, 23],
-        ]
-        assert call["attention_mask"].all()
-        assert call["position_ids"] is None
-        assert call["packed_seq_params"].qkv_format == "thd"
-        assert call["packed_seq_params"].cu_seqlens_q.tolist() == [0, 4, 8]
-        assert output.shape == (4, 3)
-
-
 class TestPerTokenLossNormalization:
     @pytest.mark.parametrize(
         ("cp_rank", "expected_weight", "expected_numerator"),

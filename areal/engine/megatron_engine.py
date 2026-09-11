@@ -543,13 +543,7 @@ class MegatronEngine(TrainEngine):
 
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
             self.sequence_packing_mode = resolve_sequence_packing_mode(
-                self.hf_config.model_type,
-                self.bridge_cls,
-                use_chunked_lm_head=(
-                    self.mcore_config.enable_chunked_logits
-                    and self.mcore_config.lm_head_loss_chunk_size > 0
-                ),
-                enable_mtp_training=self.mcore_config.enable_mtp_training,
+                self.hf_config.model_type, self.bridge_cls
             )
             self.use_model_packed_seq = (
                 self.sequence_packing_mode == SequencePackingMode.MODEL_THD
@@ -557,15 +551,9 @@ class MegatronEngine(TrainEngine):
             # ``PADDED`` is the input-routing fallback for every VLM without a
             # model-owned THD contract. ``use_padded_seq`` is narrower: it
             # enables Qwen3.5/GDN-specific dense-mask and LM-head semantics.
-            self.use_padded_seq = (
-                requires_padded_seq(self.hf_config.model_type)
-                and not self.use_model_packed_seq
-            )
+            self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             if self.is_vision_model:
-                if (
-                    self.parallel_strategy.context_parallel_size > 1
-                    and not self.use_model_packed_seq
-                ):
+                if self.parallel_strategy.context_parallel_size > 1:
                     raise NotImplementedError(
                         "Context parallel (CP > 1) is not supported with VLM models. "
                         f"Got context_parallel_size={self.parallel_strategy.context_parallel_size} "
