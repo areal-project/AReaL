@@ -47,11 +47,11 @@ def test_write_targets_supported_engine_exports_file_sd(target_writer, engine):
         ["[::1]:8002"],
     ]
     assert groups[0]["labels"] == {
-        "engine": engine,
-        "metrics_path": "/metrics",
-        "rank": "0",
-        "role": "rollout",
-        "source": "separation",
+        "areal_backend": engine,
+        "areal_metrics_path": "/metrics",
+        "areal_rank": "0",
+        "areal_role": "rollout",
+        "areal_deployment_mode": "separation",
     }
 
 
@@ -62,10 +62,10 @@ def test_write_targets_repeated_role_replaces_only_its_targets(target_writer):
     path = target_writer(hosts=("replacement",), source="provided")
     groups = json.loads(path.read_text())
     assert len(groups) == 2
-    by_role = {group["labels"]["role"]: group for group in groups}
+    by_role = {group["labels"]["areal_role"]: group for group in groups}
     assert by_role["teacher"]["targets"] == ["teacher:8000"]
     assert by_role["rollout"]["targets"] == ["replacement:8000"]
-    assert by_role["rollout"]["labels"]["source"] == "provided"
+    assert by_role["rollout"]["labels"]["areal_deployment_mode"] == "provided"
 
 
 @pytest.mark.parametrize(
@@ -117,4 +117,4 @@ def test_write_targets_concurrent_roles_preserves_all_targets(target_writer):
     with ThreadPoolExecutor(max_workers=len(roles)) as pool:
         paths = list(pool.map(lambda role: target_writer(role=role), roles))
     groups = json.loads(paths[0].read_text())
-    assert sorted(group["labels"]["role"] for group in groups) == roles
+    assert sorted(group["labels"]["areal_role"] for group in groups) == roles

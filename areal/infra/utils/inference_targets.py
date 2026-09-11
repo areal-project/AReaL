@@ -115,12 +115,13 @@ def _build_target_groups(
         target_groups.append(
             {
                 "targets": [format_hostport(info.host, info.port)],
+                # Target labels must not shadow inference-backend metric labels.
                 "labels": {
-                    "engine": engine,
-                    "metrics_path": "/metrics",
-                    "rank": str(rank),
-                    "role": role,
-                    "source": source,
+                    "areal_backend": engine,
+                    "areal_metrics_path": "/metrics",
+                    "areal_rank": str(rank),
+                    "areal_role": role,
+                    "areal_deployment_mode": source,
                 },
             }
         )
@@ -160,9 +161,9 @@ def _merge_inference_target_groups(
         labels = group.get("labels")
         if not isinstance(labels, dict):
             continue
-        if labels.get("engine") != engine:
+        if labels.get("areal_backend") != engine:
             continue
-        existing_role = labels.get("role")
+        existing_role = labels.get("areal_role")
         if not existing_role or existing_role == role:
             continue
         merged_groups.append(group)
