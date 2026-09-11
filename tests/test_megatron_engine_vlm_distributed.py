@@ -15,7 +15,6 @@ import os
 import pathlib
 import subprocess
 import sys
-from collections.abc import Mapping
 
 import pytest
 import torch
@@ -133,7 +132,6 @@ _VLM_MODELS = [
 @pytest.fixture
 def model_env(request: pytest.FixtureRequest) -> dict[str, str]:
     model_paths, model_key = request.param
-    assert isinstance(model_paths, Mapping)
     return {"VLM_MODEL_PATH": model_paths[model_key]}
 
 

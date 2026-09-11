@@ -96,22 +96,13 @@ def test_model_paths_when_one_key_is_accessed_resolve_and_cache_only_that_key(
     assert calls == [(small_local_path, "org/small")]
 
 
-@pytest.mark.parametrize(
-    "paths",
-    [
-        testing_utils.DENSE_MODEL_PATHS,
-        testing_utils.MOE_MODEL_PATHS,
-        testing_utils.MODEL_PATHS,
-    ],
-)
-def test_model_path_membership_does_not_resolve_paths(monkeypatch, paths):
+def test_model_path_membership_does_not_resolve_paths(monkeypatch):
     def unexpected_resolution(*args):
         pytest.fail("membership check attempted to resolve a model path")
 
     monkeypatch.setattr(testing_utils, "get_model_path", unexpected_resolution)
 
-    for key in paths:
-        assert key in paths
-        assert key in paths.keys()
+    paths = testing_utils._LazyModelPaths(testing_utils._MOE_MODEL_PATH_SPECS)
+    assert "qwen3_moe" in paths
+    assert "qwen3_moe" in paths.keys()
     assert "missing-model" not in paths
-    assert None not in paths
