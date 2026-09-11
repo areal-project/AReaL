@@ -59,6 +59,7 @@ LOGGER_COLORS_EXACT = {
     # Stats/Perf - green
     "StatsLogger": "light_green",
     "StatsTracker": "light_green",
+    "InferenceTargets": "light_green",
     "PerfTracer": "light_green",
     # RPC servers - white
     "SyncRPCServer": "white",

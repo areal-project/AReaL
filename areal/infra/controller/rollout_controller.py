@@ -39,6 +39,7 @@ from areal.api.cli_args import (
 from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY, DatasetRoute
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
+from areal.infra.utils.inference_targets import write_inference_targets
 from areal.utils import logging, perf_tracer
 from areal.utils.data import cycle_dataloader
 from areal.utils.dynamic_import import import_from_string
@@ -270,6 +271,17 @@ class RolloutController:
         # Start callback server for weight sync coordination
         self._start_callback_server()
 
+    def _write_inference_targets(self, source: str) -> None:
+        write_inference_targets(
+            inf_engine=self.inf_engine,
+            server_infos=self.server_infos,
+            fileroot=self.config.fileroot,
+            experiment_name=self.config.experiment_name,
+            trial_name=self.config.trial_name,
+            role=self._worker_role,
+            source=source,
+        )
+
     async def _async_initialize(
         self,
         job: Job,
@@ -320,6 +332,9 @@ class RolloutController:
                 len(self.server_infos),
                 len(self.workers),
             )
+            # Evaluation reuses targets already published by the training owner.
+            if self._worker_role != "eval-rollout":
+                await asyncio.to_thread(self._write_inference_targets, "provided")
             tasks = [
                 self.scheduler.async_call_engine(
                     worker_id=worker.id,
@@ -386,6 +401,7 @@ class RolloutController:
                     )
                 )
             self.server_infos = await asyncio.gather(*launch_tasks)
+            await asyncio.to_thread(self._write_inference_targets, "colocation")
             tasks = [
                 self.scheduler.async_call_engine(
                     worker_id=worker.id,
@@ -410,6 +426,7 @@ class RolloutController:
             self.server_infos = await self._collective_rpc_async(
                 "launch_server", server_args=server_args
             )
+            await asyncio.to_thread(self._write_inference_targets, "separation")
             tasks = [
                 self.scheduler.async_call_engine(
                     worker_id=worker.id,
