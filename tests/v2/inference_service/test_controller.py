@@ -881,18 +881,14 @@ class TestInferenceServiceWorkflow:
             result = await workflow.arun_episode(engine=MagicMock(), data={})
 
         assert result is not None
+        # A single request carries every step reward so the data proxy applies
+        # them all before finalizing the trajectory once.
         assert workflow._set_last_reward.await_args_list == [
-            call(
-                context.get_aiohttp_session.return_value,
-                -0.25,
-                "sess-api-key-1",
-                interaction_id="turn-1",
-            ),
             call(
                 context.get_aiohttp_session.return_value,
                 1.0,
                 "sess-api-key-1",
-                interaction_id="turn-2",
+                rewards={"turn-1": -0.25, "turn-2": 1.0},
             ),
         ]
 

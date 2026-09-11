@@ -269,6 +269,54 @@ class TestSessionStore:
         _, interactions = session.export_trajectory(discount=1.0, style="individual")
         assert interactions["fake-id"].reward == 2.0
 
+    def test_set_rewards_applies_every_interaction_before_finalizing(self):
+        # Default timeout: the first reward would otherwise finalize the
+        # trajectory and empty the active cache, so the remaining interactions
+        # could never be rewarded.
+        session = SessionData("task-1")
+
+        from areal.experimental.openai.types import InteractionWithTokenLogpReward
+
+        for interaction_id in ("turn-1", "turn-2"):
+            interaction = InteractionWithTokenLogpReward(
+                messages=[{"role": "user", "content": "hi"}]
+            )
+            interaction.interaction_id = interaction_id
+            interaction.output_message_list = [
+                {"role": "assistant", "content": "hello"}
+            ]
+            session.active_completions[interaction_id] = interaction
+
+        result = session.set_rewards({"turn-1": -0.25, "turn-2": 1.0})
+
+        assert result.ready_transition is True
+        assert result.trajectory_id == 0
+        assert result.interaction_count == 2
+
+        ready = session._ready_trajectories[0]
+        assert ready.completions["turn-1"].reward == -0.25
+        assert ready.completions["turn-2"].reward == 1.0
+
+    def test_sequential_set_reward_cannot_reward_second_interaction(self):
+        session = SessionData("task-1")
+
+        from areal.experimental.openai.types import InteractionWithTokenLogpReward
+
+        for interaction_id in ("turn-1", "turn-2"):
+            interaction = InteractionWithTokenLogpReward(
+                messages=[{"role": "user", "content": "hi"}]
+            )
+            interaction.interaction_id = interaction_id
+            interaction.output_message_list = [
+                {"role": "assistant", "content": "hello"}
+            ]
+            session.active_completions[interaction_id] = interaction
+
+        session.set_reward(interaction_id="turn-1", reward=-0.25)
+
+        with pytest.raises(ValueError, match="No interactions in session"):
+            session.set_reward(interaction_id="turn-2", reward=1.0)
+
     def test_finish_session_not_found(self):
         store = SessionStore()
         session = store.get_session("nonexistent")
