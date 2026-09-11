@@ -83,18 +83,25 @@ train_dataset:
   num_workers: 0
   max_length: 1024
   scheduling_spec:
-    - task_type: worker
-      gpu: 0
-      cpu: 4
-      mem: 16
-      image: ${oc.env:WORKER_IMAGE}
-      mount: ${oc.env:WORKER_MOUNTS}
-      cmd: python3 -m areal.infra.rpc.rpc_server
+    task_type: worker
+    gpu: 0
+    cpu: 4
+    mem: 16
+    image: ${oc.env:WORKER_IMAGE}
+    mount: ${oc.env:WORKER_MOUNTS}
+    cmd: python3 -m areal.infra.rpc.guard
 
 valid_dataset:
   batch_size: 4
   num_workers: 0
-  scheduling_spec: ${train_dataset.scheduling_spec}
+  scheduling_spec:
+    task_type: worker
+    gpu: 0
+    cpu: 4
+    mem: 16
+    image: ${oc.env:WORKER_IMAGE}
+    mount: ${oc.env:WORKER_MOUNTS}
+    cmd: python3 -m areal.infra.rpc.guard
 
 evaluator:
   freq_epochs: null
