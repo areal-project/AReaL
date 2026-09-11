@@ -142,49 +142,35 @@ def load_arena_stream_configs(econfig: Any) -> list[ArenaStreamConfig]:
         )
 
     values: list[Any]
-    if streams_yaml_b64:
-        try:
-            streams_yaml = base64.b64decode(streams_yaml_b64, validate=True).decode(
-                "utf-8"
-            )
-        except (binascii.Error, UnicodeDecodeError) as exc:
-            raise ValueError(
-                "arena_streams_yaml_b64 is not valid base64 UTF-8"
-            ) from exc
+    if streams_yaml_b64 or streams_file:
+        if streams_yaml_b64:
+            source = "Encoded inline Arena Streams YAML"
+            try:
+                streams_yaml = base64.b64decode(streams_yaml_b64, validate=True).decode(
+                    "utf-8"
+                )
+            except (binascii.Error, UnicodeDecodeError) as exc:
+                raise ValueError(
+                    "arena_streams_yaml_b64 is not valid base64 UTF-8"
+                ) from exc
+        else:
+            source = "Arena Streams file"
+            path = Path(streams_file).expanduser()
+            if not path.is_file():
+                raise FileNotFoundError(f"Arena Streams file not found: {path}")
+            streams_yaml = path.read_text(encoding="utf-8")
         payload = yaml.safe_load(streams_yaml)
         if isinstance(payload, Mapping):
             unknown = set(payload) - {"streams"}
             if unknown:
                 raise ValueError(
-                    "Encoded inline Arena Streams YAML has unknown top-level fields: "
-                    f"{sorted(unknown)}"
+                    f"{source} has unknown top-level fields: {sorted(unknown)}"
                 )
             values = payload.get("streams")
         else:
             values = payload
         if not isinstance(values, list) or not values:
-            raise ValueError(
-                "Encoded inline Arena Streams YAML must contain a non-empty "
-                "'streams' list"
-            )
-    elif streams_file:
-        path = Path(streams_file).expanduser()
-        if not path.is_file():
-            raise FileNotFoundError(f"Arena Streams file not found: {path}")
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-        if isinstance(payload, Mapping):
-            unknown = set(payload) - {"streams"}
-            if unknown:
-                raise ValueError(
-                    f"Arena Streams file has unknown top-level fields: {sorted(unknown)}"
-                )
-            values = payload.get("streams")
-        else:
-            values = payload
-        if not isinstance(values, list) or not values:
-            raise ValueError(
-                "Arena Streams file must contain a non-empty 'streams' list"
-            )
+            raise ValueError(f"{source} must contain a non-empty 'streams' list")
     elif inline:
         values = inline
     else:

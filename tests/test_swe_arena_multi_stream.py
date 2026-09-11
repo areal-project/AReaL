@@ -33,40 +33,45 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MULTI_STREAM_CONFIG = REPO_ROOT / "examples/swe/arena_multi_stream.yaml"
 
 
-def test_load_arena_stream_configs_file_parses_reward_specs(tmp_path):
-    """File-backed entries should retain independent reward and routing config."""
-    streams_file = tmp_path / "streams.yaml"
-    streams_file.write_text(
-        """
-streams:
-  - name: astra
-    stream_id: stream-astra
-    sampling_weight: 3
-    harness: claude-code@1.0.0
-    expected_reward_ref:
-      key: astrocode-bench-reward
-      version: 1.0.14
-    reward_threshold: 0.98
-    reward_transform_fn: examples.swe.reward_transforms.astra_partial_reward
-  - name: tbench
-    stream_id: stream-tbench
-    sampling_weight: 1
-    harness: codex@2.0.0
-    expected_reward_ref:
-      key: tb2-reward
-      version: 4.0.0
-""".strip(),
-        encoding="utf-8",
-    )
-
-    streams = load_arena_stream_configs(
+@pytest.mark.parametrize("source", ["file", "base64", "inline"])
+def test_load_arena_stream_configs_preserves_reward_specs(tmp_path, source):
+    """All input transports retain per-stream settings and common task envs."""
+    entries = [
         {
-            "arena_streams_file": str(streams_file),
-            "arena_task_envs": {"COMMON": "1"},
-        }
-    )
+            "name": "astra",
+            "stream_id": "stream-astra",
+            "sampling_weight": 3,
+            "harness": "claude-code@1.0.0",
+            "expected_reward_ref": {
+                "key": "astrocode-bench-reward",
+                "version": "1.0.14",
+            },
+            "reward_threshold": 0.98,
+            "reward_transform_fn": "examples.swe.reward_transforms.astra_partial_reward",
+        },
+        {
+            "name": "tbench",
+            "stream_id": "stream-tbench",
+            "sampling_weight": 1,
+            "harness": "codex@2.0.0",
+            "expected_reward_ref": {"key": "tb2-reward", "version": "4.0.0"},
+        },
+    ]
+    payload = yaml.safe_dump({"streams": entries})
+    config = {"arena_task_envs": {"COMMON": "1"}}
+    if source == "file":
+        path = tmp_path / "streams.yaml"
+        path.write_text(payload, encoding="utf-8")
+        config["arena_streams_file"] = str(path)
+    elif source == "base64":
+        config["arena_streams_yaml_b64"] = base64.b64encode(payload.encode()).decode()
+    else:
+        config["arena_streams"] = entries
+
+    streams = load_arena_stream_configs(config)
 
     assert [stream.name for stream in streams] == ["astra", "tbench"]
+    assert streams[0].sampling_weight == 3.0
     assert streams[0].expected_reward_ref == ArenaRewardRefConfig(
         key="astrocode-bench-reward", version="1.0.14"
     )
@@ -74,28 +79,28 @@ streams:
     assert streams[1].reward_transform_fn == ""
 
 
-def test_load_arena_stream_configs_parses_inline_yaml():
-    """The launcher can inject Stream configuration without a runtime file path."""
-    streams_yaml = """
-streams:
-  - name: astra
-    stream_id: stream-astra
-    sampling_weight: 3
-    harness: claude-code@1.0.0
-    expected_reward_ref:
-      key: astrocode-bench-reward
-      version: 1.0.14
-""".strip()
-    streams = load_arena_stream_configs(
-        {"arena_streams_yaml_b64": base64.b64encode(streams_yaml.encode()).decode()}
-    )
+@pytest.mark.parametrize("source", ["file", "base64"])
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ("streams: []", "non-empty"),
+        ("streams: wrong", "non-empty"),
+        ("unexpected: []", "unknown top-level fields"),
+    ],
+)
+def test_load_arena_stream_configs_rejects_invalid_yaml(
+    tmp_path, source, payload, error
+):
+    """Both YAML transports reject malformed stream containers."""
+    if source == "file":
+        path = tmp_path / "streams.yaml"
+        path.write_text(payload, encoding="utf-8")
+        config = {"arena_streams_file": str(path)}
+    else:
+        config = {"arena_streams_yaml_b64": base64.b64encode(payload.encode()).decode()}
 
-    assert len(streams) == 1
-    assert streams[0].name == "astra"
-    assert streams[0].sampling_weight == 3.0
-    assert streams[0].expected_reward_ref == ArenaRewardRefConfig(
-        key="astrocode-bench-reward", version="1.0.14"
-    )
+    with pytest.raises(ValueError, match=error):
+        load_arena_stream_configs(config)
 
 
 def test_arena_stream_profile_preserves_raw_rewards(monkeypatch):
@@ -266,69 +271,44 @@ def test_build_weighted_arena_rows_uses_attempted_group_weights():
     ]
 
 
-def test_build_weighted_arena_rows_equal_weights_concatenate_without_repeats():
-    """Equal weights should include each source row exactly once."""
+@pytest.mark.parametrize(
+    ("counts", "weights", "size_multiple", "prefix"),
+    [
+        ([4, 1], [1.0, 1.0], 1, ["a", "b"]),
+        ([56, 441, 20], [1.0, 1.0, 1.0], 4, ["a", "b", "c", "a"]),
+        ([2, 3], [2.0, 1.0], 1, ["a", "a", "b"]),
+    ],
+    ids=["unequal-datasets", "unrounded-batch", "weighted"],
+)
+def test_build_weighted_arena_rows_full_union_keeps_each_row_once(
+    counts, weights, size_multiple, prefix
+):
+    """Weights control order; the default epoch never repeats or pads source rows."""
+    names = list("abc"[: len(counts)])
     streams = [
-        ArenaStreamConfig(name="large", stream_id="a", sampling_weight=1.0),
-        ArenaStreamConfig(name="small", stream_id="b", sampling_weight=1.0),
-    ]
-    rows = build_weighted_arena_rows(
-        {
-            "large": [
-                {"arena_stream_name": "large", "data_id": f"a-{index}"}
-                for index in range(4)
-            ],
-            "small": [{"arena_stream_name": "small", "data_id": "b-0"}],
-        },
-        streams,
-    )
-
-    assert len(rows) == 5
-    assert Counter(row["arena_stream_name"] for row in rows) == {
-        "large": 4,
-        "small": 1,
-    }
-    assert Counter(row["data_id"] for row in rows) == {
-        "a-0": 1,
-        "a-1": 1,
-        "a-2": 1,
-        "a-3": 1,
-        "b-0": 1,
-    }
-    assert [row["arena_stream_name"] for row in rows[:2]] == [
-        "large",
-        "small",
-    ]
-
-
-def test_build_weighted_arena_rows_equal_weights_keep_all_unique_ids():
-    streams = [
-        ArenaStreamConfig(name="a", stream_id="a", sampling_weight=1.0),
-        ArenaStreamConfig(name="b", stream_id="b", sampling_weight=1.0),
-        ArenaStreamConfig(name="c", stream_id="c", sampling_weight=1.0),
+        ArenaStreamConfig(name=name, stream_id=name, sampling_weight=weight)
+        for name, weight in zip(names, weights)
     ]
     rows_by_stream = {
-        "a": [
-            {"arena_stream_name": "a", "data_id": f"a-{index}"} for index in range(56)
-        ],
-        "b": [
-            {"arena_stream_name": "b", "data_id": f"b-{index}"} for index in range(441)
-        ],
-        "c": [
-            {"arena_stream_name": "c", "data_id": f"c-{index}"} for index in range(20)
-        ],
+        name: [
+            {"arena_stream_name": name, "data_id": f"{name}-{index}"}
+            for index in range(count)
+        ]
+        for name, count in zip(names, counts)
     }
 
-    rows = build_weighted_arena_rows(rows_by_stream, streams, size_multiple=4)
+    rows = build_weighted_arena_rows(
+        rows_by_stream, streams, size_multiple=size_multiple
+    )
 
-    assert len(rows) == 517
-    assert Counter(row["arena_stream_name"] for row in rows) == {
-        "a": 56,
-        "b": 441,
-        "c": 20,
-    }
-    assert len({row["data_id"] for row in rows}) == 517
-    assert [row["arena_stream_name"] for row in rows[:4]] == ["a", "b", "c", "a"]
+    assert Counter(
+        (row["arena_stream_name"], row["data_id"]) for row in rows
+    ) == Counter(
+        (row["arena_stream_name"], row["data_id"])
+        for source in rows_by_stream.values()
+        for row in source
+    )
+    assert [row["arena_stream_name"] for row in rows[: len(prefix)]] == prefix
 
 
 def test_build_weighted_arena_rows_rejects_oversized_static_epoch():
@@ -349,38 +329,6 @@ def test_build_weighted_arena_rows_rejects_oversized_static_epoch():
             streams,
             epoch_size=6,
         )
-
-
-def test_build_weighted_arena_rows_applies_stream_level_weight():
-    """The full-union default should never repeat rows for a Stream weight."""
-    streams = [
-        ArenaStreamConfig(name="weighted", stream_id="a", sampling_weight=2.0),
-        ArenaStreamConfig(name="plain", stream_id="b", sampling_weight=1.0),
-    ]
-    rows_by_stream = {
-        "weighted": [
-            {"arena_stream_name": "weighted", "data_id": "a-0"},
-            {"arena_stream_name": "weighted", "data_id": "a-1"},
-        ],
-        "plain": [
-            {"arena_stream_name": "plain", "data_id": f"b-{index}"}
-            for index in range(3)
-        ],
-    }
-
-    rows = build_weighted_arena_rows(rows_by_stream, streams)
-
-    assert Counter(row["arena_stream_name"] for row in rows) == {
-        "weighted": 2,
-        "plain": 3,
-    }
-    assert Counter(row["data_id"] for row in rows) == {
-        "a-0": 1,
-        "a-1": 1,
-        "b-0": 1,
-        "b-1": 1,
-        "b-2": 1,
-    }
 
 
 def test_build_weighted_arena_rows_common_weight_scale_is_invariant():
@@ -424,29 +372,6 @@ def test_build_weighted_arena_rows_rejects_mass_overflow():
                 ArenaStreamConfig(name="b", stream_id="b", sampling_weight=1e308),
             ],
         )
-
-
-def test_build_weighted_arena_rows_does_not_pad_default_to_training_batch():
-    streams = [
-        ArenaStreamConfig(name="a", stream_id="a", sampling_weight=1.0),
-        ArenaStreamConfig(name="b", stream_id="b", sampling_weight=1.0),
-        ArenaStreamConfig(name="c", stream_id="c", sampling_weight=1.0),
-    ]
-    rows_by_stream = {
-        "a": [{"arena_stream_name": "a", "data_id": "a-0"}],
-        "b": [{"arena_stream_name": "b", "data_id": f"b-{i}"} for i in range(5)],
-        "c": [{"arena_stream_name": "c", "data_id": "c-0"}],
-    }
-
-    rows = build_weighted_arena_rows(rows_by_stream, streams, size_multiple=4)
-
-    assert len(rows) == 7
-    assert Counter(row["arena_stream_name"] for row in rows) == {
-        "a": 1,
-        "b": 5,
-        "c": 1,
-    }
-    assert len({row["data_id"] for row in rows}) == 7
 
 
 def test_get_arena_mixture_dataset_resolves_and_mixes_streams(monkeypatch):

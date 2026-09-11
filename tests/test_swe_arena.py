@@ -22,6 +22,20 @@ from areal.infra.workflow_context import WorkflowContext
 from areal.utils import stats_tracker
 
 
+class FakeWorkerRuntime:
+    def __init__(self) -> None:
+        self.callbacks = {}
+
+    def register_destroy_callback(self, key, callback) -> None:
+        self.callbacks.setdefault(key, callback)
+
+    def destroy(self) -> None:
+        callbacks = list(self.callbacks.values())
+        self.callbacks.clear()
+        for callback in callbacks:
+            callback()
+
+
 def _reset_stats() -> None:
     stats_tracker.export_all(reset=True)
 
@@ -160,31 +174,10 @@ def test_resolve_llm_protocol_rejects_invalid_override():
         resolve_llm_protocol({}, "invalid")
 
 
-def test_list_streams_transient_timeout_retries(monkeypatch):
-    """Transient read timeouts should be retried before failing discovery."""
-    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
-    attempts = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise httpx.ReadTimeout("transient", request=request)
-        return httpx.Response(200, json={"items": [{"stream_id": "stream-1"}]})
-
-    client = ArenaOpenAPIClient(
-        base_url="https://arena.example",
-        request_retries=1,
-    )
-    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
-        streams = client.list_streams(client=http_client)
-
-    assert streams == [{"stream_id": "stream-1"}]
-    assert attempts == 2
-
-
-def test_list_streams_reuses_owned_client_across_retries(monkeypatch):
-    """Owned sync clients should retain connection pooling between attempts."""
+@pytest.mark.parametrize("failure", ["timeout", "gateway"])
+@pytest.mark.parametrize("owned_client", [False, True])
+def test_list_streams_retries_with_one_client(monkeypatch, failure, owned_client):
+    """Transient failures retry using the supplied client or one owned connection pool."""
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
     real_client = httpx.Client
     attempts = 0
@@ -194,47 +187,27 @@ def test_list_streams_reuses_owned_client_across_retries(monkeypatch):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise httpx.ReadTimeout("transient", request=request)
-        return httpx.Response(200, json={"items": [{"stream_id": "stream-1"}]})
-
-    def create_client(*_args, **kwargs):
-        nonlocal clients_created
-        clients_created += 1
-        kwargs["transport"] = httpx.MockTransport(handler)
-        return real_client(**kwargs)
-
-    monkeypatch.setattr("examples.swe.arena_client.httpx.Client", create_client)
-    client = ArenaOpenAPIClient(
-        base_url="https://arena.example",
-        request_retries=1,
-    )
-
-    assert client.list_streams() == [{"stream_id": "stream-1"}]
-    assert attempts == 2
-    assert clients_created == 1
-
-
-def test_list_streams_transient_gateway_error_retries(monkeypatch):
-    """Transient gateway errors should be retried before parsing the response."""
-    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
-    attempts = 0
-
-    def handler(_: httpx.Request) -> httpx.Response:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
+            if failure == "timeout":
+                raise httpx.ReadTimeout("transient", request=request)
             return httpx.Response(504, text="gateway timeout")
         return httpx.Response(200, json={"items": [{"stream_id": "stream-1"}]})
 
-    client = ArenaOpenAPIClient(
-        base_url="https://arena.example",
-        request_retries=1,
-    )
-    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
-        streams = client.list_streams(client=http_client)
+    def create_client(**kwargs):
+        nonlocal clients_created
+        clients_created += 1
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("examples.swe.arena_client.httpx.Client", create_client)
+    client = ArenaOpenAPIClient(base_url="https://arena.example", request_retries=1)
+    if owned_client:
+        streams = client.list_streams()
+    else:
+        with create_client() as http_client:
+            streams = client.list_streams(client=http_client)
 
     assert streams == [{"stream_id": "stream-1"}]
     assert attempts == 2
+    assert clients_created == 1
 
 
 def test_get_all_dataset_rows_below_api_limit_uses_one_data_page(monkeypatch):
@@ -921,19 +894,6 @@ def test_agent_session_gateway_registration_lives_across_prompt_workflows(monkey
     cleanup_deletions: list[str] = []
     launches: list[tuple[str, str, str]] = []
 
-    class WorkerRuntime:
-        def __init__(self) -> None:
-            self.callbacks = {}
-
-        def register_destroy_callback(self, key, callback) -> None:
-            self.callbacks.setdefault(key, callback)
-
-        def destroy(self) -> None:
-            callbacks = list(self.callbacks.values())
-            self.callbacks.clear()
-            for callback in callbacks:
-                callback()
-
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path.endswith(
             "/openapi/v1/llm/models"
@@ -965,7 +925,7 @@ def test_agent_session_gateway_registration_lives_across_prompt_workflows(monkey
             return httpx.Response(204)
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
-    worker_runtime = WorkerRuntime()
+    worker_runtime = FakeWorkerRuntime()
     monkeypatch.setattr(
         ArenaOpenAPIClient,
         "delete_llm_proxy",
@@ -1029,13 +989,6 @@ def test_agent_session_gateway_restores_gc_route_before_next_task(monkeypatch):
     registrations: list[str] = []
     route_exists = True
 
-    class WorkerRuntime:
-        def __init__(self) -> None:
-            self.callbacks = {}
-
-        def register_destroy_callback(self, key, callback) -> None:
-            self.callbacks.setdefault(key, callback)
-
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal route_exists
         if request.method == "POST" and request.url.path.endswith(
@@ -1074,7 +1027,7 @@ def test_agent_session_gateway_restores_gc_route_before_next_task(monkeypatch):
                     "arena_registration_probe_interval": 0.01,
                 }
             )
-            worker_runtime = WorkerRuntime()
+            worker_runtime = FakeWorkerRuntime()
 
             async def run_one(index: int) -> float:
                 return await workflow.run(
@@ -1111,13 +1064,6 @@ def test_agent_session_gateway_throttles_concurrent_prelaunch_probes(monkeypatch
     _reset_stats()
     registration_count = 0
     probe_count = 0
-
-    class WorkerRuntime:
-        def __init__(self) -> None:
-            self.callbacks = {}
-
-        def register_destroy_callback(self, key, callback) -> None:
-            self.callbacks.setdefault(key, callback)
 
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal registration_count, probe_count
@@ -1156,7 +1102,7 @@ def test_agent_session_gateway_throttles_concurrent_prelaunch_probes(monkeypatch
                     "arena_registration_probe_interval": 1.0,
                 }
             )
-            worker_runtime = WorkerRuntime()
+            worker_runtime = FakeWorkerRuntime()
 
             async def run_one(index: int) -> float:
                 return await workflow.run(
@@ -1190,13 +1136,6 @@ def test_agent_session_gateway_throttles_slow_probe_failures(monkeypatch):
     _reset_stats()
     probe_count = 0
 
-    class WorkerRuntime:
-        def __init__(self) -> None:
-            self.callbacks = {}
-
-        def register_destroy_callback(self, key, callback) -> None:
-            self.callbacks.setdefault(key, callback)
-
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path.endswith(
             "/openapi/v1/llm/models"
@@ -1228,7 +1167,7 @@ def test_agent_session_gateway_throttles_slow_probe_failures(monkeypatch):
                     "arena_registration_probe_interval": 0.05,
                 }
             )
-            worker_runtime = WorkerRuntime()
+            worker_runtime = FakeWorkerRuntime()
 
             async def run_one(index: int) -> float:
                 return await workflow.run(
@@ -1273,13 +1212,6 @@ def test_agent_session_gateway_does_not_launch_known_missing_route(monkeypatch):
     probe_count = 0
     restore_count = 0
 
-    class WorkerRuntime:
-        def __init__(self) -> None:
-            self.callbacks = {}
-
-        def register_destroy_callback(self, key, callback) -> None:
-            self.callbacks.setdefault(key, callback)
-
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal launch_count
         if request.method == "POST" and request.url.path.endswith(
@@ -1313,7 +1245,7 @@ def test_agent_session_gateway_does_not_launch_known_missing_route(monkeypatch):
                     "arena_registration_probe_interval": 60.0,
                 }
             )
-            worker_runtime = WorkerRuntime()
+            worker_runtime = FakeWorkerRuntime()
 
             async def run_one(index: int) -> float:
                 return await workflow.run(
@@ -1378,13 +1310,6 @@ def test_agent_session_gateway_restores_gc_route_while_task_is_queued(monkeypatc
     restored = asyncio.Event()
     route_exists = True
 
-    class WorkerRuntime:
-        def __init__(self) -> None:
-            self.callbacks = {}
-
-        def register_destroy_callback(self, key, callback) -> None:
-            self.callbacks.setdefault(key, callback)
-
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal route_exists
         if request.method == "POST" and request.url.path.endswith(
@@ -1429,7 +1354,7 @@ def test_agent_session_gateway_restores_gc_route_while_task_is_queued(monkeypatc
                 proxy_gateway_api_key="proxy-gateway-key",
                 proxy_session_token="session-token",
                 session_id="proxy-session-1",
-                worker_runtime=WorkerRuntime(),
+                worker_runtime=FakeWorkerRuntime(),
                 arena_http_client=http_client,
             )
 
@@ -1624,24 +1549,10 @@ def test_arena_filter_uses_shaped_original_rewards_before_centering():
     assert filter_function(sample) is True
 
 
-def test_arena_filter_classifies_uniform_partial_rewards_as_all_wrong(monkeypatch):
-    """Uniform partial progress is not a solved group in rejection metrics."""
-    metrics = {}
-    tracker = type(
-        "Tracker",
-        (),
-        {"scalar": lambda _, **values: metrics.update(values)},
-    )()
-    monkeypatch.setattr(stats_tracker, "get", lambda _: tracker)
-
-    assert filter_function({"original_rewards": [0.05, 0.05]}) is False
-    assert metrics["rejected_by_all_correct"] == 0
-    assert metrics["rejected_by_all_wrong"] == 1
-
-
 @pytest.mark.parametrize(
     ("rewards", "expected_all_correct"),
     [
+        ([0.05, 0.05], 0),
         ([0.999, 0.999], 1),
         ([0.9989, 0.9989], 0),
     ],
