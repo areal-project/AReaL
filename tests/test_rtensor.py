@@ -742,6 +742,8 @@ class TestRemotize:
     @pytest.mark.parametrize("preserve_tensor_aliases", [False, True])
     def test_remotize_list_of_dicts(self, rpc_server, preserve_tensor_aliases):
         """Test remotizing list of dicts with different attention masks."""
+        from areal.infra.rpc.rtensor import fetch
+
         # Create two trajectory dicts with different seqlens
         traj1 = {
             "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]]),
@@ -774,12 +776,16 @@ class TestRemotize:
         assert result[0]["logits"].shape[0] == 2
         assert result[1]["logits"].shape[0] == 3
 
+        # remotize stores in this process; the RPC subprocess has no such shards.
         for original, remote, seqlen in zip(
             [traj1, traj2], result, [3, 4], strict=True
         ):
             for key in original:
                 torch.testing.assert_close(
-                    remote[key].to_local(), original[key][:, :seqlen], rtol=0, atol=0
+                    fetch(remote[key].shard.shard_id),
+                    original[key][:, :seqlen],
+                    rtol=0,
+                    atol=0,
                 )
 
     def test_remotize_list_of_tensors(self, rpc_server):

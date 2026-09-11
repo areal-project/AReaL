@@ -106,7 +106,9 @@ from areal.utils.data import (
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.lock import DistributedLock
+from areal.utils.moe_metrics import MoEMetrics
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
+from areal.utils.training_metrics import export_training_metrics, record_training_batch
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -370,6 +372,17 @@ class ArchonEngine(TrainEngine):
         self._materialize_and_load_weights()
         self._create_optimizer(ft_spec)
 
+        from areal.experimental.models.archon.moe import MoE
+
+        self._moe_metrics = MoEMetrics()
+        for part in self.model_parts:
+            layers = []
+            for layer_id, layer in part.layers.items():
+                for module in layer.modules():
+                    if isinstance(module, MoE):
+                        layers.append((str(layer_id), module))
+            self._moe_metrics.attach_buffers(part, layers)
+
         self.runner = create_runner(
             pp_enabled=self.parallel_dims.pp_enabled,
             model_parts=self.model_parts,
@@ -429,6 +442,8 @@ class ArchonEngine(TrainEngine):
 
     def destroy(self):
         """Clean up resources."""
+        if hasattr(self, "_moe_metrics"):
+            self._moe_metrics.close()
         if hasattr(self, "optimizer"):
             del self.optimizer
         if hasattr(self, "model") and self.model is not None:
@@ -530,34 +545,34 @@ class ArchonEngine(TrainEngine):
     ) -> dict[str, float]:
         """Train on a batch of data."""
         assert self._initialized
-        self.optimizer_zero_grad()
-
         input_batched, _ = self._normalize_batch_input(input_)
+        with record_training_batch(self, input_batched, self.model_config):
+            self.optimizer_zero_grad()
 
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+            mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        total_loss_weight = compute_total_loss_weight(
-            mb_list, loss_weight_fn, self.data_parallel_group
-        )
-
-        def process_output(
-            logits: torch.Tensor, ctx_dict: dict[str, Any]
-        ) -> torch.Tensor:
-            ctx = ArchonTrainContext(**ctx_dict)
-            return self._compute_logprobs_and_loss(
-                logits,
-                ctx,
-                loss_fn,
-                loss_weight_fn,
-                total_loss_weight,
-                loss_multiplier=self.data_parallel_world_size,
+            total_loss_weight = compute_total_loss_weight(
+                mb_list, loss_weight_fn, self.data_parallel_group
             )
 
-        self.forward_backward_batch(mb_list, process_output, forward_only=False)
+            def process_output(
+                logits: torch.Tensor, ctx_dict: dict[str, Any]
+            ) -> torch.Tensor:
+                ctx = ArchonTrainContext(**ctx_dict)
+                return self._compute_logprobs_and_loss(
+                    logits,
+                    ctx,
+                    loss_fn,
+                    loss_weight_fn,
+                    total_loss_weight,
+                    loss_multiplier=self.data_parallel_world_size,
+                )
 
-        stats = self.optimizer_step()
-        stats["num_micro_batches"] = len(mb_list.mbs)
-        return stats
+            self.forward_backward_batch(mb_list, process_output, forward_only=False)
+
+            stats = self.optimizer_step()
+            stats["num_micro_batches"] = len(mb_list.mbs)
+            return stats
 
     @torch.no_grad()
     def eval_batch(
@@ -848,6 +863,15 @@ class ArchonEngine(TrainEngine):
             data = stats_tracker.export_all(
                 reduce_group=self.data_parallel_group,
             )
+            data.update(
+                self._moe_metrics.export(
+                    reduce_group=self.parallel_dims.get_group("dp_cp"),
+                    pp_group=self.parallel_dims.get_group("pp")
+                    if self.parallel_dims.pp_enabled
+                    else None,
+                )
+            )
+            data.update(export_training_metrics(self))
         if self.parallel_dims.pp_enabled:
             data_list = [data]
             dist.broadcast_object_list(
