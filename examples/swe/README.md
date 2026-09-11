@@ -1,5 +1,8 @@
 # SWE-bench RL training with AReaL-SWEAgent
 
+For Arena-hosted single- or multi-Stream training, see
+[Arena integration](README_arena.md).
+
 This example runs SWE-bench coding-agent RL (GRPO) in AReaL. The actual agent loop,
 sandboxing and reward computation live in a **separate repository**,
 [AReaL-SWEAgent](https://github.com/areal-project/AReaL-SWEAgent): for each SWE-bench

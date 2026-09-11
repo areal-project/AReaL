@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -19,6 +21,32 @@ if TYPE_CHECKING:
 
 # Session timeout for cleanup (1 hour)
 SESSION_TIMEOUT_SECONDS = 3600
+
+_SESSION_GATEWAY_KEY_CONTEXT = b"areal-session-gateway-key-v1"
+_SESSION_GATEWAY_TOKEN_CONTEXT = b"areal-session-gateway-token-v1:"
+
+
+def derive_session_gateway_api_key(admin_api_key: str) -> str:
+    """Derive a generation-only gateway credential from the admin key."""
+
+    digest = hmac.new(
+        admin_api_key.encode(),
+        _SESSION_GATEWAY_KEY_CONTEXT,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"areal-gateway-{digest}"
+
+
+def derive_session_gateway_token(admin_api_key: str, session_id: str) -> str:
+    """Bind a public-gateway request to exactly one proxy session."""
+
+    gateway_key = derive_session_gateway_api_key(admin_api_key)
+    digest = hmac.new(
+        gateway_key.encode(),
+        _SESSION_GATEWAY_TOKEN_CONTEXT + session_id.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"areal-session-{digest}"
 
 
 # =============================================================================
@@ -116,6 +144,11 @@ class SessionData:
         self._last_access_time = time.time()
         self._end_time = None
         self._lock = threading.Lock()
+        self.stream_completion_aliases: dict[str, str] = {}
+        self.context_overflow = False
+        self.context_overflow_message = ""
+        self.system_error = False
+        self.system_error_message = ""
         self._next_sampling_request_index = 0
         self._processor_cache_released = False
 
@@ -149,6 +182,19 @@ class SessionData:
         self._completed = True
         self._end_time = time.time()
         self._completed_event.set()
+
+    def mark_context_overflow(self, message: str) -> None:
+        """Mark the session as recoverable after a context-length failure."""
+        with self._lock:
+            self.context_overflow = True
+            self.context_overflow_message = message
+
+    def mark_system_error(self, message: str) -> None:
+        """Record an internal proxy failure for downstream rejection policy."""
+        with self._lock:
+            self.system_error = True
+            if not self.system_error_message:
+                self.system_error_message = message
 
     @property
     def is_completed(self) -> bool:
@@ -245,6 +291,7 @@ RL_END_PROCESSOR_CACHE_GROUP_PATHNAME = "rl/end_processor_cache_group"
 RL_FETCH_SHARED_TENSORS_PATHNAME = "rl/fetch_shared_tensors"
 RL_SET_REWARD_PATHNAME = "rl/set_reward"
 CHAT_COMPLETIONS_PATHNAME = "chat/completions"
+OPENAI_CHAT_COMPLETIONS_PATHNAME = "v1/chat/completions"
 RESPONSES_PATHNAME = "responses"
 ANTHROPIC_MESSAGES_PATHNAME = "v1/messages"
 GRANT_CAPACITY_PATHNAME = "grant_capacity"
