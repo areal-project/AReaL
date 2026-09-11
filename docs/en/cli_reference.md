@@ -1151,11 +1151,14 @@ Configuration for multi-teacher on-policy distillation.
 
 Coefficients for joint RL and multi-teacher distillation training.
 
-| Parameter                  | Type  | Default | Description                                        |
-| -------------------------- | ----- | ------- | -------------------------------------------------- |
-| `rl_coefficient`           | float | `0.0`   | Coefficient applied to the RL objective.           |
-| `distillation_coefficient` | float | `1.0`   | Coefficient applied to the MOPD objective.         |
-| `importance_ratio_cap`     | float | `5.0`   | Positive cap applied to the behavior-policy ratio. |
+| Parameter                   | Type          | Default | Description                                                                            |
+| --------------------------- | ------------- | ------- | -------------------------------------------------------------------------------------- |
+| `rl_coefficient`            | float         | `0.0`   | Coefficient applied to the RL objective.                                               |
+| `distillation_coefficient`  | float         | `1.0`   | Coefficient applied to the MOPD objective.                                             |
+| `importance_ratio_cap`      | float         | `5.0`   | Positive cap applied to the behavior-policy ratio.                                     |
+| `score_reward_min`          | float \| None | `None`  | Optional lower bound applied to the MOPD score reward.                                 |
+| `score_reward_max`          | float \| None | `None`  | Optional upper bound applied to the MOPD score reward.                                 |
+| `normalize_teacher_weights` | boolean       | `False` | Normalize teacher log-probabilities by teacher weight sum across heterogeneous routes. |
 
 (section-mopd-teacher-engine)=
 

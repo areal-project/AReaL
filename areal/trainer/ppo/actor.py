@@ -783,16 +783,25 @@ def grpo_loss_fn(
             n_valid_tokens=normalization_mask,
             n_mopd_tokens=normalization_mask,
         )
-        stats_tracker.stat(
-            mopd_loss=mopd_stats["loss_per_token"].float(),
-            mopd_reward=mopd_stats["score_reward"].float(),
-            mopd_importance_weight=mopd_stats["importance_weight"].float(),
-            mopd_teacher_weight_sum=mopd_stats["teacher_weight_sum"].float(),
-            new_logp=logprobs.detach(),
-            old_logp=behavior_logp,
-            entropy=entropy.detach().float(),
-            denominator="n_mopd_tokens",
-        )
+        mopd_stat_kwargs = {
+            "mopd_loss": mopd_stats["loss_per_token"].float(),
+            "mopd_reward": mopd_stats["score_reward"].float(),
+            "mopd_importance_weight": mopd_stats["importance_weight"].float(),
+            "mopd_teacher_weight_sum": mopd_stats["teacher_weight_sum"].float(),
+            "new_logp": logprobs.detach(),
+            "old_logp": behavior_logp,
+            "entropy": entropy.detach().float(),
+            "denominator": "n_mopd_tokens",
+        }
+        if "score_reward_min_clipped" in mopd_stats:
+            mopd_stat_kwargs["mopd_score_reward_min_clipped"] = mopd_stats[
+                "score_reward_min_clipped"
+            ].float()
+        if "score_reward_max_clipped" in mopd_stats:
+            mopd_stat_kwargs["mopd_score_reward_max_clipped"] = mopd_stats[
+                "score_reward_max_clipped"
+            ].float()
+        stats_tracker.stat(**mopd_stat_kwargs)
         return loss
 
     old_logp = input_data["logprobs"]
@@ -946,13 +955,22 @@ def grpo_loss_fn(
     if rkl_stat is not None:
         if mopd_stats:
             stats_tracker.denominator(n_mopd_tokens=mopd_normalization_mask.bool())
-            stats_tracker.stat(
-                mopd_loss=mopd_stats["loss_per_token"].float(),
-                mopd_reward=mopd_stats["score_reward"].float(),
-                mopd_importance_weight=mopd_stats["importance_weight"].float(),
-                mopd_teacher_weight_sum=mopd_stats["teacher_weight_sum"].float(),
-                denominator="n_mopd_tokens",
-            )
+            mopd_stat_kwargs = {
+                "mopd_loss": mopd_stats["loss_per_token"].float(),
+                "mopd_reward": mopd_stats["score_reward"].float(),
+                "mopd_importance_weight": mopd_stats["importance_weight"].float(),
+                "mopd_teacher_weight_sum": mopd_stats["teacher_weight_sum"].float(),
+                "denominator": "n_mopd_tokens",
+            }
+            if "score_reward_min_clipped" in mopd_stats:
+                mopd_stat_kwargs["mopd_score_reward_min_clipped"] = mopd_stats[
+                    "score_reward_min_clipped"
+                ].float()
+            if "score_reward_max_clipped" in mopd_stats:
+                mopd_stat_kwargs["mopd_score_reward_max_clipped"] = mopd_stats[
+                    "score_reward_max_clipped"
+                ].float()
+            stats_tracker.stat(**mopd_stat_kwargs)
         else:
             stats_tracker.stat(
                 rkl_loss=rkl_stat,
