@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import inspect
 import os
 import threading
 from concurrent.futures import ProcessPoolExecutor
@@ -176,6 +177,20 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         async with session.post(url, headers=headers) as resp:
             resp.raise_for_status()
 
+    async def _get_agent_session_metadata(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Collect optional session settings from the agent."""
+        getter = getattr(self.agent, "get_session_metadata", None)
+        if not callable(getter):
+            return {}
+        metadata = getter(data)
+        if inspect.isawaitable(metadata):
+            metadata = await metadata
+        if not isinstance(metadata, dict) or not all(
+            isinstance(key, str) for key in metadata
+        ):
+            raise TypeError("get_session_metadata must return a dict with string keys")
+        return metadata
+
     def _processor_cache_group_id(
         self, context: workflow_context.WorkflowContext
     ) -> str | None:
@@ -275,6 +290,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             processor_cache_group_id=processor_cache_group_id,
             processor_cache_group_size=context.group_size,
             shared_tensor_resolver=self._shared_tensor_resolver,
+            metadata=await self._get_agent_session_metadata(data),
         )
         async with proxy_client:
             # Run the user code.

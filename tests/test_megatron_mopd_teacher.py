@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -311,15 +312,19 @@ def test_awex_controller_discards_unfinished_requests_before_restoring_kv():
     trainer._update_weights_and_publish_version(
         WeightUpdateMeta(type="awex", version=1), 1
     )
+    trainer._export_and_commit_stats = lambda **kwargs: events.append(("stats", None))
+    trainer._export_stats_then_restore_awex_rollout(0, 0, 1)
     trainer._update_weights_and_publish_version(
         WeightUpdateMeta(type="awex", version=2), 2
     )
+    trainer._export_stats_then_restore_awex_rollout(0, 1, 2)
 
     assert events == [
         ("update", 1),
         ("actor_version", 1),
         ("rollout_version", 1),
         ("abort_all", None),
+        ("stats", None),
         ("onload", ["cuda_graph"]),
         ("onload", ["kv_cache"]),
         ("continue", None),
@@ -327,10 +332,32 @@ def test_awex_controller_discards_unfinished_requests_before_restoring_kv():
         ("actor_version", 2),
         ("rollout_version", 2),
         ("abort_all", None),
+        ("stats", None),
         ("onload", ["cuda_graph"]),
         ("onload", ["kv_cache"]),
         ("continue", None),
     ]
+
+
+def test_awex_validation_restores_before_eval_without_duplicate_restore():
+    trainer = object.__new__(PPOTrainer)
+    trainer.config = SimpleNamespace(
+        actor=SimpleNamespace(_version="v1", weight_update_mode="awex")
+    )
+    trainer.actor = Mock()
+    trainer.rollout = Mock()
+    trainer.rollout.continue_generation = AsyncMock()
+    trainer.critic = None
+    trainer.eval_rollout = Mock()
+    trainer._export_and_commit_stats = Mock()
+
+    trainer._update_weights_and_publish_version(
+        WeightUpdateMeta(type="awex", version=1), 1
+    )
+    trainer.rollout.continue_generation.assert_awaited_once()
+    trainer._export_stats_then_restore_awex_rollout(0, 0, 1)
+    trainer.rollout.continue_generation.assert_awaited_once()
+    assert trainer.rollout.onload.call_count == 2
 
 
 def test_awex_controller_does_not_resume_when_discard_fails():

@@ -57,6 +57,34 @@ from areal.utils.offload import get_tms_env_vars
 logger = logging.getLogger("SlurmScheduler")
 
 
+def _resolve_fork_python_executable(spec: SchedulingSpec | None) -> str:
+    """Resolve Python inside the worker that will own a forked process."""
+    if spec is None or not spec.cmd:
+        return sys.executable
+    try:
+        command = shlex.split(spec.cmd)
+    except ValueError:
+        return sys.executable
+    if not command:
+        return sys.executable
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(command[0]).name):
+        try:
+            module_flag = command.index("-m", 1)
+        except ValueError:
+            pass
+        else:
+            if module_flag + 1 < len(command):
+                return command[0]
+    return sys.executable
+
+
+def _resolve_srun_additional_args(spec: SchedulingSpec, scheduler_args: str) -> str:
+    """Prefer an explicit role override while preserving scheduler defaults."""
+    if spec.srun_additional_args != SchedulingSpec().srun_additional_args:
+        return spec.srun_additional_args
+    return scheduler_args
+
+
 @dataclass
 class SlurmWorkerInfo:
     """Slurm worker information."""
@@ -537,7 +565,7 @@ class SlurmScheduler(Scheduler):
             # 2. Build the full raw command
             module_path = command or "areal.infra.rpc.rpc_server"
             raw_cmd = [
-                sys.executable,
+                _resolve_fork_python_executable(target_wi.spec),
                 "-m",
                 module_path,
                 "--host",
@@ -975,9 +1003,10 @@ class SlurmScheduler(Scheduler):
         merged_log = self._merged_log_path()
 
         # Build srun command with streaming log pipeline
-        srun_cmd = (
-            f"srun {self.srun_additional_args} {' '.join(srun_flags)} {final_cmd}"
+        srun_additional_args = _resolve_srun_additional_args(
+            spec, self.srun_additional_args
         )
+        srun_cmd = f"srun {srun_additional_args} {' '.join(srun_flags)} {final_cmd}"
         log_pipeline = build_streaming_log_cmd(srun_cmd, role_log, merged_log, role)
 
         # Complete sbatch script with single srun command

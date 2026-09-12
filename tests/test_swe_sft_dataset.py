@@ -196,6 +196,77 @@ class _JinjaCharTokenizer:
         }
 
 
+_NATIVE_QWEN35_TEMPLATE = r"""
+{%- set ns = namespace(last_query_index=messages|length - 1) %}
+{%- for message in messages %}
+    {%- set content = message.content|trim %}
+    {%- if message.role == "user" %}
+        {{- '<|im_start|>user\n' + content + '<|im_end|>\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- endif %}
+        {%- set reasoning_content = reasoning_content|trim %}
+        {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
+            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- for tool_call in message.tool_calls|default([]) %}
+            {{- '<tool_call>' + tool_call.name }}
+            {%- for key, value in tool_call.arguments|items %}
+                {{- key + '=' + value }}
+            {%- endfor %}
+            {{- '</tool_call>' }}
+        {%- endfor %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {{- '<tool_response>' + content + '</tool_response>' }}
+    {%- endif %}
+{%- endfor %}
+"""
+
+
+@pytest.mark.parametrize("reasoning", ["", "inspect the code"])
+def test_native_qwen35_thinking_and_tool_calls_have_structural_masks(reasoning):
+    tokenizer = _JinjaCharTokenizer(_NATIVE_QWEN35_TEMPLATE)
+    _patch_chat_template_for_training(tokenizer)
+    patched = tokenizer.chat_template
+    _patch_chat_template_for_training(tokenizer)
+    assert tokenizer.chat_template == patched
+    conversation = [
+        {"role": "user", "content": "fix the bug"},
+        {
+            "role": "assistant",
+            "content": f"<think>{reasoning}</think>answer",
+            "tool_calls": [{"name": "read", "arguments": {"path": "main.py"}}],
+        },
+    ]
+    rendered, spans = render_jinja_template(
+        conversations=[conversation],
+        chat_template=patched,
+        return_assistant_tokens_mask=True,
+    )
+    assert rendered[0].count("<think>") == 1
+    assert rendered[0].count("</think>") == 1
+    start, end = spans[0][0]
+    assert rendered[0][start:end] == (
+        f"<think>\n{reasoning}\n</think>\n\nanswer"
+        "<tool_call>readpath=main.py</tool_call><|im_end|>\n"
+    )
+
+
+def test_native_qwen35_unknown_template_revision_fails_closed():
+    tokenizer = _JinjaCharTokenizer(
+        _NATIVE_QWEN35_TEMPLATE.replace(
+            "reasoning_content|trim", "reasoning_content | trim"
+        )
+    )
+    with pytest.raises(ValueError, match="supported reasoning"):
+        _patch_chat_template_for_training(tokenizer)
+
+
 def _legacy_template(family):
     if family == "Qwen3":
         user_render = (

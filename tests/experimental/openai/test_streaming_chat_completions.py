@@ -49,6 +49,50 @@ def _session_headers(api_key: str):
     }
 
 
+@pytest.mark.asyncio
+async def test_areal_stream_emits_reasoning_before_content():
+    client = object.__new__(AsyncCompletionsWithReward)
+    response = ModelResponse(input_tokens=[1], output_tokens=[2], stop_reason="stop")
+    chunks = [
+        chunk
+        async for chunk in client._create_stream(
+            completion_id="chatcmpl-test",
+            current_time=0,
+            model="test-model",
+            reasoning_text="thinking",
+            output_text="answer",
+            tool_calls=None,
+            response=response,
+        )
+    ]
+    deltas = [chunk.choices[0].delta.model_dump(exclude_none=True) for chunk in chunks]
+    assert deltas[1:3] == [
+        {"reasoning_content": "thinking"},
+        {"content": "answer"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_areal_stream_reasoning_only_is_not_empty():
+    client = object.__new__(AsyncCompletionsWithReward)
+    response = ModelResponse(input_tokens=[1], output_tokens=[2], stop_reason="length")
+    chunks = [
+        chunk
+        async for chunk in client._create_stream(
+            completion_id="chatcmpl-test",
+            current_time=0,
+            model="test-model",
+            reasoning_text="unfinished reasoning",
+            output_text="",
+            tool_calls=None,
+            response=response,
+        )
+    ]
+    assert chunks[1].choices[0].delta.model_dump(exclude_none=True) == {
+        "reasoning_content": "unfinished reasoning"
+    }
+
+
 @pytest.fixture(autouse=True)
 def _reset_server_globals(monkeypatch):
     """Reset all module-level globals before each test."""

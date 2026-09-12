@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from pydantic import BaseModel
@@ -98,6 +98,7 @@ class OpenAIProxyClient:
         processor_cache_group_id: str | None = None,
         processor_cache_group_size: int = 1,
         shared_tensor_resolver: SharedTensorResolver | None = None,
+        metadata: dict[str, Any] | None = None,
     ):
         self._session = session
         self.base_url = ensure_end_with_slash(base_url)
@@ -106,6 +107,7 @@ class OpenAIProxyClient:
         self._processor_cache_group_id = processor_cache_group_id
         self._processor_cache_group_size = processor_cache_group_size
         self._shared_tensor_resolver = shared_tensor_resolver
+        self._metadata = metadata
         if processor_cache_group_id is not None and shared_tensor_resolver is None:
             self._shared_tensor_resolver = SharedTensorResolver()
         self.session_id: str | None = None
@@ -249,6 +251,7 @@ class OpenAIProxyClient:
                 task_id=self.task_id,
                 processor_cache_group_id=self._processor_cache_group_id,
                 processor_cache_group_size=self._processor_cache_group_size,
+                metadata=self._metadata,
             ),
             headers=self._admin_auth_headers(),
         )

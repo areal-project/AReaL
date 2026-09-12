@@ -969,6 +969,34 @@ class TestPrepareMbListRebindCallerSafety:
         assert mb_list.data is not input_
 
 
+class TestPerTokenLossNormalization:
+    @pytest.mark.parametrize(
+        ("cp_rank", "expected_weight", "expected_numerator"),
+        [(0, 3, 6.0), (1, 2, 4.0)],
+    )
+    def test_splits_full_loss_weight_across_cp_ranks(
+        self, monkeypatch, cp_rank, expected_weight, expected_numerator
+    ):
+        from areal.engine import megatron_engine
+
+        monkeypatch.setattr(
+            megatron_engine.mpu, "get_context_parallel_world_size", lambda: 2
+        )
+        monkeypatch.setattr(
+            megatron_engine.mpu, "get_context_parallel_rank", lambda: cp_rank
+        )
+        engine = object.__new__(megatron_engine.MegatronEngine)
+
+        numerator, local_weight = engine._build_per_token_loss_output(
+            loss=torch.tensor(2.0),
+            loss_weight=torch.tensor(5),
+            loss_multiplier=1.0,
+        )
+
+        assert local_weight.item() == expected_weight
+        assert numerator.item() == expected_numerator
+
+
 class TestVisionModelDetection:
     """Test is_valid_vision_model detection."""
 

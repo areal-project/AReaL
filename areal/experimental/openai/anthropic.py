@@ -4,10 +4,14 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import AsyncGenerator, Callable, Iterable
 from typing import Any
 
 from anthropic.types.message import Message
+from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (
+    AnthropicStreamWrapper,
+)
 from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
     AnthropicAdapter,
 )
@@ -72,7 +76,10 @@ def translate_anthropic_stream(
     model: str,
 ) -> AsyncGenerator[Any, None]:
     """Translate an OpenAI chat-completion stream to Anthropic SSE events."""
-    return _adapter.translate_completion_output_params_streaming(
+    wrapper = AnthropicStreamWrapper(
         completion_stream=openai_stream,
         model=model,
     )
+    # LiteLLM 1.83.7 stores this mutable queue on the class by default.
+    wrapper.chunk_queue = deque()
+    return wrapper.async_anthropic_sse_wrapper()

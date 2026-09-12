@@ -1,0 +1,127 @@
+# Two-node Qwen hybrid-attention smoke run: rollout, PPO, and AWEX updates.
+# Set MODEL_PATH, FILEROOT, WORKER_IMAGE, WORKER_MOUNTS and AREAL_PROXY_ADMIN_KEY.
+# Tested with Megatron-Core 0.18.2, Megatron Bridge 0.5.1, AWEX 0.8.1,
+# SGLang 0.5.10.post1 and cuDNN 9.25.1.1. Older GDN runtimes do not support CP.
+defaults:
+  - gsm8k_grpo_awex_colocate
+  - _self_
+
+experiment_name: qwen3-5-27b-grpo-awex
+trial_name: smoke
+total_train_steps: 2
+
+cluster:
+  n_nodes: 2
+  n_gpus_per_node: 8
+  fileroot: ${oc.env:FILEROOT}
+  name_resolve:
+    nfs_record_root: ${cluster.fileroot}/name_resolve
+
+scheduler:
+  type: slurm
+
+gconfig:
+  n_samples: 2
+  max_new_tokens: 256
+  max_tokens: 2048
+
+actor:
+  backend: "megatron:d1p2t4c2e1"
+  path: ${oc.env:MODEL_PATH}
+  mb_spec:
+    n_mbs: 4
+    n_mbs_divisor: 2
+    max_tokens_per_mb: 2048
+  optimizer:
+    lr: 1.0e-6
+  megatron:
+    bridge_type: megatron-bridge
+    enable_mtp: false
+    enable_fp32_lm_head: false
+    cross_entropy_loss_fusion: false
+    ddp:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 8
+      mem: 64
+      image: ${oc.env:WORKER_IMAGE}
+      mount: ${oc.env:WORKER_MOUNTS}
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        PYTORCH_ALLOC_CONF: "expandable_segments:True"
+        TMS_INIT_ENABLE: "0"
+        TMS_INIT_ENABLE_CPU_BACKUP: "0"
+
+rollout:
+  backend: "sglang:d8t2p1"
+  max_concurrent_rollouts: 8
+  max_head_offpolicyness: 1
+  scheduling_strategy:
+    type: colocation
+    target: actor
+    fork: true
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 64
+      image: ${oc.env:WORKER_IMAGE}
+      mount: ${oc.env:WORKER_MOUNTS}
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        PYTORCH_ALLOC_CONF: "expandable_segments:True"
+        TMS_INIT_ENABLE: "0"
+        TMS_INIT_ENABLE_CPU_BACKUP: "0"
+  agent:
+    admin_api_key: ${oc.env:AREAL_PROXY_ADMIN_KEY}
+    reasoning_parser: qwen3
+
+sglang:
+  attention_backend: flashinfer
+  mm_attention_backend: flashinfer_cudnn
+  context_length: 2048
+  max_running_requests: 4
+  mem_fraction_static: 0.6
+  enable_multimodal: true
+  mamba_scheduler_strategy: extra_buffer
+  disable_radix_cache: false
+  mamba_ssm_dtype: bfloat16
+  max_mamba_cache_size: 16
+  enable_cache_report: true
+  disable_cuda_graph: true
+
+train_dataset:
+  batch_size: 4
+  num_workers: 0
+  max_length: 1024
+  scheduling_spec:
+    task_type: worker
+    gpu: 0
+    cpu: 4
+    mem: 16
+    image: ${oc.env:WORKER_IMAGE}
+    mount: ${oc.env:WORKER_MOUNTS}
+    cmd: python3 -m areal.infra.rpc.guard
+
+valid_dataset:
+  batch_size: 4
+  num_workers: 0
+  scheduling_spec:
+    task_type: worker
+    gpu: 0
+    cpu: 4
+    mem: 16
+    image: ${oc.env:WORKER_IMAGE}
+    mount: ${oc.env:WORKER_MOUNTS}
+    cmd: python3 -m areal.infra.rpc.guard
+
+evaluator:
+  freq_epochs: null
+
+saver:
+  freq_epochs: null

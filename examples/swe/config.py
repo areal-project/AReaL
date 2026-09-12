@@ -74,7 +74,8 @@ class SweDataConfig:
         metadata={
             "help": "Convert OpenAI JSON-string tool_calls.arguments to dicts "
             "before apply_chat_template for templates that require structured "
-            "arguments. Leave disabled for templates that expect the standard "
+            "arguments, including GLM and native Qwen3.5. Leave disabled for "
+            "templates that expect the standard "
             "OpenAI string form."
         },
     )

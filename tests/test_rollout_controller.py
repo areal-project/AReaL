@@ -22,6 +22,7 @@ from areal.api.cli_args import (
     SGLangConfig,
 )
 from areal.infra import RolloutController
+from areal.infra.controller.rollout_controller import _merge_worker_stats
 from areal.infra.scheduler.local import LocalScheduler
 from areal.utils.hf_utils import load_hf_tokenizer
 
@@ -1340,6 +1341,60 @@ class TestRolloutControllerRunner:
 
 class TestRolloutControllerExportStats:
     """Tests for export_stats method."""
+
+    def test_merge_worker_stats_preserves_reduction_semantics(self):
+        """Worker distributions retain weighted average and extrema semantics."""
+        all_raw_stats = [
+            {
+                "rollout/reward": 0.5,
+                "rollout/reward__count": 2,
+                "rollout/num_turns_count": 2,
+                "rollout/num_turns/avg": 15.0,
+                "rollout/num_turns/min": 10.0,
+                "rollout/num_turns/max": 20.0,
+                "rollout/harness_errors": 3,
+            },
+            {
+                "rollout/reward": 0.8,
+                "rollout/reward__count": 1,
+                "rollout/num_turns_count": 1,
+                "rollout/num_turns/avg": 40.0,
+                "rollout/num_turns/min": 40.0,
+                "rollout/num_turns/max": 40.0,
+                "rollout/harness_errors": 5,
+            },
+        ]
+
+        stats = _merge_worker_stats(all_raw_stats)
+
+        assert stats["rollout/reward"] == pytest.approx(0.6)
+        assert "rollout/reward__count" not in stats
+        assert stats["rollout/num_turns_count"] == 3
+        assert stats["rollout/num_turns/avg"] == pytest.approx(70 / 3)
+        assert stats["rollout/num_turns/min"] == 10.0
+        assert stats["rollout/num_turns/max"] == 40.0
+        assert stats["rollout/harness_errors"] == 8
+
+    def test_merge_worker_stats_ignores_empty_distribution_workers(self):
+        """Workers without a distribution do not change its extrema or average."""
+        all_raw_stats = [
+            {},
+            {
+                "rollout/num_turns_count": 2,
+                "rollout/num_turns/avg": 12.0,
+                "rollout/num_turns/min": 5.0,
+                "rollout/num_turns/max": 19.0,
+            },
+        ]
+
+        stats = _merge_worker_stats(all_raw_stats)
+
+        assert stats == {
+            "rollout/num_turns_count": 2.0,
+            "rollout/num_turns/avg": 12.0,
+            "rollout/num_turns/min": 5.0,
+            "rollout/num_turns/max": 19.0,
+        }
 
     def test_export_stats_aggregates_from_workers(self):
         """Test export_stats correctly aggregates stats from all workers."""

@@ -462,6 +462,25 @@ class AwexSchedulerPlugin:
         scheduler = self._scheduler
         plugin = self
 
+        # Recent SGLang loops own WAR barriers and shutdown handling. Run AWEX
+        # at the native request boundary without replacing those invariants.
+        if callable(getattr(scheduler, "_apply_war_barrier", None)):
+            if getattr(scheduler, "_areal_awex_request_hook", False):
+                return
+            original_process_input_requests = scheduler.process_input_requests
+
+            def _process_input_requests_with_awex(recv_reqs):
+                result = original_process_input_requests(recv_reqs)
+                if getattr(scheduler, "_engine_paused", False):
+                    plugin.process_awex_queue()
+                    time.sleep(plugin._paused_poll_interval_s)
+                return result
+
+            scheduler.process_input_requests = _process_input_requests_with_awex
+            scheduler._areal_awex_request_hook = True
+            logger.info("[AWEX] Preserved native SGLang scheduler loop")
+            return
+
         decode_stats_name = next(
             (
                 name

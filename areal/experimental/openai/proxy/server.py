@@ -33,6 +33,7 @@ class StartSessionRequest(BaseModel):
     api_key: str | None = None  # Reuse a previously-issued key (refresh)
     processor_cache_group_id: str | None = None
     processor_cache_group_size: int = 1
+    metadata: dict[str, Any] | None = None
 
 
 class StartSessionResponse(BaseModel):
@@ -100,11 +101,13 @@ class SessionData:
         sampling_seed_identity: str | None = None,
         processor_cache: ProcessorCallCache | None = None,
         processor_cache_group_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ):
         self.session_id = session_id
         self.sampling_seed_identity = sampling_seed_identity or session_id
         self.processor_cache = processor_cache
         self.processor_cache_group_id = processor_cache_group_id
+        self.metadata = dict(metadata or {})
 
         self._completed = False
         self._completions = InteractionCache(
@@ -125,6 +128,12 @@ class SessionData:
             request_index = self._next_sampling_request_index
             self._next_sampling_request_index += 1
         return request_index
+
+    @property
+    def generation_args(self) -> dict[str, Any]:
+        """Generation defaults for requests that omit the corresponding field."""
+        value = self.metadata.get("generation_args")
+        return value if isinstance(value, dict) else {}
 
     def update_last_access(self):
         """Update the last access time for this session."""

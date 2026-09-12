@@ -558,6 +558,7 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
             sampling_seed_identity=task_id,
             processor_cache=processor_cache,
             processor_cache_group_id=request.processor_cache_group_id,
+            metadata=request.metadata,
         )
         _api_key_to_session[session_api_key] = session_id
         _session_to_api_key[session_id] = session_api_key
@@ -697,6 +698,19 @@ async def _call_client_create(
     )
 
     kwargs = request.model_dump() if isinstance(request, BaseModel) else dict(request)
+    token_limits = {"max_tokens", "max_completion_tokens"}
+    explicit_fields = (
+        request.model_fields_set if isinstance(request, BaseModel) else set(request)
+    )
+    for key, value in session_data.generation_args.items():
+        if key in token_limits:
+            if token_limits & explicit_fields:
+                continue
+            for limit in token_limits:
+                kwargs.pop(limit, None)
+        if isinstance(request, BaseModel) and key not in request.model_fields_set:
+            kwargs.pop(key, None)
+        kwargs.setdefault(key, value)
     dropped_args = []
     for k, v in kwargs.items():
         if k not in areal_client_allowed_args:
@@ -706,7 +720,7 @@ async def _call_client_create(
         del kwargs[k]
 
     def _is_default_value(k: str, v: Any) -> bool:
-        if isinstance(request, BaseModel):
+        if isinstance(request, BaseModel) and k in type(request).model_fields:
             return v == type(request).model_fields[k].default
         return False
 
