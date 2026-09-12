@@ -41,6 +41,7 @@ class InteractionWithTokenLogpReward:
     model_response: ModelResponse | None = None
     reward: float | None = None
     original_reward: float | None = None
+    token_rewards: torch.Tensor | None = None
     parent: InteractionWithTokenLogpReward | None = None
     chat_template_type: str = "hf"
     _cache: dict[str, Any] | None = None
@@ -161,6 +162,18 @@ class InteractionWithTokenLogpReward:
                 "input tokens. The trajectory cannot be trained safely."
             )
         self.seq_tokens = seq = resp.input_tokens + resp.output_tokens
+
+        if self.token_rewards is not None:
+            if self.token_rewards.shape != torch.Size((resp.output_len,)):
+                raise ValueError(
+                    f"token_rewards must be shape ({resp.output_len},), got "
+                    f"{tuple(self.token_rewards.shape)}"
+                )
+            own_token_rewards = self.token_rewards.to(torch.float32).tolist()
+        else:
+            own_token_rewards = [0.0] * resp.output_len
+
+        chain_has_token_rewards = self.token_rewards is not None
         if self.chat_template_type == "concat" and self.parent is not None:
             parent_res = self.parent.to_tensor_dict()
             parent_logprobs = parent_res["logprobs"].squeeze(0).tolist()
@@ -176,6 +189,12 @@ class InteractionWithTokenLogpReward:
             )
             valid_parent_turn_ids = [tid for tid in parent_turn_ids if tid >= 0]
             own_turn_id = max(valid_parent_turn_ids) + 1 if valid_parent_turn_ids else 0
+            parent_token_rewards_tensor = parent_res.get("token_rewards")
+            if parent_token_rewards_tensor is None:
+                parent_token_rewards = [0.0] * parent_len
+            else:
+                parent_token_rewards = parent_token_rewards_tensor.squeeze(0).tolist()
+                chain_has_token_rewards = True
             if resp.input_len > parent_len:
                 logprobs = (
                     parent_logprobs
@@ -197,6 +216,11 @@ class InteractionWithTokenLogpReward:
                     + [-1] * (resp.input_len - parent_len)
                     + [own_turn_id] * resp.output_len
                 )
+                token_rewards = (
+                    parent_token_rewards
+                    + [0.0] * (resp.input_len - parent_len)
+                    + own_token_rewards
+                )
             else:
                 # FIXME: Find out why this happens occasionally
                 api_type = self.api_type
@@ -216,11 +240,13 @@ class InteractionWithTokenLogpReward:
                 loss_mask = [0] * resp.input_len + [1] * resp.output_len
                 versions = [-1] * resp.input_len + resp.output_versions
                 turn_ids = [-1] * resp.input_len + [0] * resp.output_len
+                token_rewards = [0.0] * resp.input_len + own_token_rewards
         else:
             logprobs = [0.0] * resp.input_len + resp.output_logprobs
             loss_mask = [0] * resp.input_len + [1] * resp.output_len
             versions = [-1] * resp.input_len + resp.output_versions
             turn_ids = [-1] * resp.input_len + [0] * resp.output_len
+            token_rewards = [0.0] * resp.input_len + own_token_rewards
         reward = self.reward if self.reward is not None else 0.0
         original_reward = (
             self.original_reward if self.original_reward is not None else reward
@@ -250,6 +276,10 @@ class InteractionWithTokenLogpReward:
                 dtype=torch.long,
             ).unsqueeze(0)
             result["multi_modal_input"] = [self.multi_modal_input or {}]
+        if chain_has_token_rewards:
+            result["token_rewards"] = torch.tensor(
+                token_rewards, dtype=torch.float32
+            ).unsqueeze(0)
         self._cache = result
         return result
 

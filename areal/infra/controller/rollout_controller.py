@@ -52,6 +52,49 @@ from ..workflow_executor import BatchTaskDispatcher, TaskIdGenerator
 logger = logging.getLogger("RolloutController")
 
 
+def _merge_worker_stats(
+    all_raw_stats: list[dict[str, float]],
+) -> dict[str, float]:
+    """Merge independently aggregated stats from rollout workers.
+
+    Scalar means carry a ``__count`` companion. PRM structured count/sum
+    metrics have explicitly known SUM semantics. Other tensor statistics
+    lack reduction metadata in the export, so retain the existing behavior
+    of omitting them rather than guessing their denominator or reduction.
+    """
+    sums = defaultdict(float)
+    scalar_weighted_sums = defaultdict(float)
+    scalar_counts = defaultdict(float)
+
+    for raw_stats in all_raw_stats:
+        for key, value in raw_stats.items():
+            if key.endswith("__count"):
+                continue
+
+            scalar_count_key = f"{key}__count"
+            if scalar_count_key in raw_stats:
+                count = raw_stats[scalar_count_key]
+                scalar_weighted_sums[key] += value * count
+                scalar_counts[key] += count
+                continue
+
+            metric_key = key.removeprefix("rollout/").removeprefix("eval-rollout/")
+            segments = metric_key.split("/")
+            if (
+                len(segments) == 5
+                and segments[0] == "prm_metric"
+                and segments[1] in {"turn", "trajectory"}
+                and segments[-1] in {"count", "sum", "observed_count"}
+            ):
+                sums[key] += value
+
+    merged = dict(sums)
+    for key, weighted_sum in scalar_weighted_sums.items():
+        if scalar_counts[key] > 0:
+            merged[key] = weighted_sum / scalar_counts[key]
+    return merged
+
+
 # NOTE: remote task input has a slightly different
 # type annotation, which disallows workflow object or types
 @dataclass
@@ -1337,23 +1380,11 @@ class RolloutController:
 
     def export_stats(self) -> dict[str, float]:
         all_raw_stats = self._collective_rpc(method="export_stats", http_timeout=60.0)
-        stats = defaultdict(float)
-        counts = defaultdict(int)
-
-        for raw_stats in all_raw_stats:
-            for k, v in raw_stats.items():
-                if k.endswith("__count"):
-                    counts[k] += v
-                else:
-                    stats[k] += v * raw_stats.get(k + "__count", 0)
-
-        # Average non-count stats
-        final_stats = {}
-        for k, v in stats.items():
-            count_key = k + "__count"
-            if count_key in counts and counts[count_key] > 0:
-                final_stats[k] = v / counts[count_key]
-        return final_stats
+        if self._proxy_started and self.proxy_workers:
+            all_raw_stats += self._proxy_collective_rpc(
+                method="export_stats", http_timeout=60.0
+            )
+        return _merge_worker_stats(all_raw_stats)
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
         async def _call():

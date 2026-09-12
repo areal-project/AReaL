@@ -931,7 +931,19 @@ class PPOTrainer:
                     adv_batch = self.actor.prepare_mopd_batch(rollout_batch)
                     self.actor.get_device_stats().log("prepare MOPD batch")
                 else:
-                    adv_batch = self.actor.compute_advantages(rollout_batch)
+                    advantage_kwargs: dict[str, Any] = {}
+                    prm_config = config.rollout.agent.prm
+                    if prm_config.enabled:
+                        shaping = prm_config.advantage_shaping
+                        advantage_kwargs.update(
+                            advantage_shaping_mode=shaping.mode,
+                            gvpo_negative_scale=shaping.negative_scale,
+                            gvpo_zero_penalty=shaping.zero_penalty,
+                            gvpo_zero_eps=shaping.zero_eps,
+                        )
+                    adv_batch = self.actor.compute_advantages(
+                        rollout_batch, **advantage_kwargs
+                    )
                     self.actor.get_device_stats().log("compute advantages")
 
             # Wait for async checkpoint staging to complete before modifying parameters

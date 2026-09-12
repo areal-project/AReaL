@@ -1763,7 +1763,8 @@ class PPOActorConfig(TrainEngineConfig):
     mask_no_eos_with_zero: bool = field(
         default=False,
         metadata={
-            "help": "Mask truncated generations (no EOS token) and exclude from training"
+            "help": "Mask truncated generations (no EOS token) and exclude from "
+            "training. Incompatible with process-weighted PRM advantage shaping."
         },
     )
 
@@ -1802,6 +1803,18 @@ class PPOActorConfig(TrainEngineConfig):
     )
     adv_norm: NormConfig | None = field(
         default=None, metadata={"help": "Normalization configuration for advantages."}
+    )
+    token_rewards_as_adv: bool = field(
+        default=True,
+        metadata={
+            "help": "How per-token process rewards in 'token_rewards' enter the "
+            "objective. True (default): shape advantages after GAE and advantage "
+            "normalization according to rollout.agent.prm.advantage_shaping, "
+            "keeping process rewards out of returns. False: add one uniform "
+            "reward at each turn boundary before GAE, propagating it to preceding "
+            "tokens and critic returns; this mode is incompatible with GVPO and "
+            "process-weighted shaping."
+        },
     )
 
     # KL Control
@@ -2382,6 +2395,110 @@ class SGLangConfig:
 
 
 @dataclass
+class PRMScorerConfig:
+    """Declare one process-reward scorer loaded from a dotted Python path."""
+
+    path: str = field(
+        default="",
+        metadata={
+            "help": "Dotted path to a BaseScorer subclass, for example "
+            "'my_project.scorers.MyScorer'."
+        },
+    )
+    weight: float = field(
+        default=1.0,
+        metadata={
+            "help": "Multiplier applied to this scorer's reward contribution. "
+            "Raw scorer metrics remain unweighted."
+        },
+    )
+    enabled: bool = field(
+        default=True,
+        metadata={"help": "Skip this scorer when false."},
+    )
+    kwargs: dict = field(
+        default_factory=dict,
+        metadata={"help": "Additional keyword arguments for the scorer constructor."},
+    )
+
+
+@dataclass
+class PRMAdvantageShapingConfig:
+    """Control how direct process signals modify outcome advantages."""
+
+    mode: str = field(
+        default="additive",
+        metadata={
+            "help": "Advantage shaping strategy. 'additive' adds process rewards "
+            "after GAE and advantage normalization. 'gvpo' treats negative process "
+            "rewards as failed-token indicators and applies piecewise GVPO shaping. "
+            "'process_weighted' expects process rewards in [0, 1], scales "
+            "non-negative advantages by them, and replaces negative advantages "
+            "with a positive process reward when one is present. It is incompatible "
+            "with actor.mask_no_eos_with_zero=True.",
+            "choices": ["additive", "gvpo", "process_weighted"],
+        },
+    )
+    negative_scale: float = field(
+        default=0.2,
+        metadata={
+            "help": "GVPO multiplier b for failed tokens with negative outcome "
+            "advantage; their result is (1 + b) * advantage."
+        },
+    )
+    zero_penalty: float = field(
+        default=0.4,
+        metadata={
+            "help": "Negative magnitude assigned by GVPO to failed tokens whose "
+            "outcome advantage is approximately zero."
+        },
+    )
+    zero_eps: float = field(
+        default=1e-6,
+        metadata={
+            "help": "Absolute outcome-advantage tolerance for GVPO's zero branch."
+        },
+    )
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"additive", "gvpo", "process_weighted"}:
+            raise ValueError(
+                "PRM advantage shaping mode must be 'additive', 'gvpo', or "
+                f"'process_weighted', got {self.mode!r}"
+            )
+        for name in ("negative_scale", "zero_penalty", "zero_eps"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"PRM advantage shaping {name} must be finite and non-negative, "
+                    f"got {value}"
+                )
+
+
+@dataclass
+class PRMConfig:
+    """Process-reward scoring and advantage shaping for v1 agent rollouts."""
+
+    enabled: bool = field(
+        default=True,
+        metadata={
+            "help": "Enable process rewards when scorers are configured. An empty "
+            "scorer list is always a no-op."
+        },
+    )
+    advantage_shaping: PRMAdvantageShapingConfig = field(
+        default_factory=PRMAdvantageShapingConfig,
+        metadata={
+            "help": "How direct process signals are combined with outcome advantages."
+        },
+    )
+    scorers: list[PRMScorerConfig] = field(
+        default_factory=list,
+        metadata={"help": "Process-reward scorers whose weighted outputs are summed."},
+    )
+
+
+@dataclass
 class AgentConfig:
     """Configuration for agent workflows and the experimental agent service controller.
 
@@ -2455,7 +2572,10 @@ class AgentConfig:
     )
     turn_discount: float = field(
         default=1.0,
-        metadata={"help": "Discount factor for multi-turn reward propagation."},
+        metadata={
+            "help": "Discount factor for reward propagation in 'individual' "
+            "export. Concat leaves keep their own branch-local outcome reward."
+        },
     )
     export_style: str = field(
         default="individual",
@@ -2463,8 +2583,9 @@ class AgentConfig:
             "help": "Export style: 'individual' (all interactions) or 'concat' (leaf nodes only). "
             "The 'individual' style exports each interaction (input-output-reward) step separately, "
             "and treats them as independent samples to train the model. "
-            "The 'concat' style exports only the final concatenated trajectory from the root. "
-            "It is only suitable for linear conversation histories without token mismatching (whether valid depends on the tokenizer).",
+            "The 'concat' style exports every leaf as a full root-to-leaf trajectory, "
+            "so branched histories produce multiple training samples. It requires "
+            "token-compatible parent/child prompts (whether valid depends on the tokenizer).",
             "choices": ["individual", "concat"],
         },
     )
@@ -2519,6 +2640,13 @@ class AgentConfig:
         default=0.0,
         metadata={
             "help": "Timeout in seconds to wait for additional reward updates before finalizing a session."
+        },
+    )
+    prm: PRMConfig = field(
+        default_factory=PRMConfig,
+        metadata={
+            "help": "Process-reward shaping applied by the v1 proxy on concat "
+            "trajectory export, before interactions are serialized."
         },
     )
 
@@ -3816,6 +3944,48 @@ class PPOConfig(BaseExperimentConfig):
         # the engine config. Single source of truth: gconfig.lora_name.
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
+        prm = self.rollout.agent.prm
+        # TODO(agent): Define an explicit scorer contract for converting dense
+        # per-token rewards into whole-turn rewards before supporting folded PRM.
+        # A dense vector may represent either independent token signals or a
+        # normalized turn total, so the actor cannot infer the correct reduction.
+        if prm.enabled and prm.scorers and not self.actor.token_rewards_as_adv:
+            raise ValueError(
+                "rollout.agent.prm scorers currently require "
+                "actor.token_rewards_as_adv=True; folded process rewards are "
+                "not supported yet"
+            )
+        if (
+            prm.enabled
+            and prm.advantage_shaping.mode in {"gvpo", "process_weighted"}
+            and not self.actor.token_rewards_as_adv
+        ):
+            raise ValueError(
+                f"{prm.advantage_shaping.mode!r} advantage shaping requires "
+                "actor.token_rewards_as_adv=True"
+            )
+        if (
+            prm.enabled
+            and prm.advantage_shaping.mode == "process_weighted"
+            and self.actor.mask_no_eos_with_zero
+        ):
+            raise ValueError(
+                "'process_weighted' advantage shaping is incompatible with "
+                "actor.mask_no_eos_with_zero=True"
+            )
+        if prm.enabled and prm.scorers:
+            if self.rollout._version != "v1":
+                raise ValueError(
+                    "rollout.agent.prm currently requires rollout._version='v1'"
+                )
+            if self.rollout.agent.export_style != "concat":
+                raise ValueError(
+                    "rollout.agent.prm currently requires export_style='concat'"
+                )
+            if self.rollout.agent.chat_template_type != "concat":
+                raise ValueError(
+                    "rollout.agent.prm currently requires chat_template_type='concat'"
+                )
         super().__post_init__()
 
     def _validate_mopd_config(self):
