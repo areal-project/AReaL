@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import inspect
 import os
 import threading
 from concurrent.futures import ProcessPoolExecutor
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import aiohttp
 
@@ -22,6 +23,8 @@ from .server import (
     GRANT_CAPACITY_PATHNAME,
     RL_END_PROCESSOR_CACHE_GROUP_PATHNAME,
     ProcessorCacheGroupRequest,
+    derive_session_gateway_api_key,
+    derive_session_gateway_token,
 )
 from .tensor_reference import SharedTensorResolver
 
@@ -31,6 +34,13 @@ if TYPE_CHECKING:
     from .proxy_gateway import CompletedSessionInfo
 
 logger = logging.getLogger("OpenAIProxyWorkflow")
+
+
+AgentFailureDisposition = Literal[
+    "model_failure_zero",
+    "system_failure_reject",
+    "unknown_failure_reject",
+]
 
 
 # Lazy-initialized process pool for running agent tasks
@@ -135,14 +145,33 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         self._shared_tensor_resolver = SharedTensorResolver()
 
     @trace_session("run_agent")
-    async def _run_agent(self, session_api_key: str, data: dict):
+    async def _run_agent(
+        self,
+        session_api_key: str,
+        data: dict,
+        *,
+        session_id: str | None = None,
+        worker_runtime: Any | None = None,
+    ):
         if self.mode == "inline":
             http_client = await workflow_context.get_httpx_client()
             extra_kwargs = {
                 "base_url": self.proxy_addr,
                 "http_client": http_client,
                 "api_key": session_api_key,
+                # The public gateway receives only a generation-scoped key,
+                # never the control-plane admin credential.
+                "proxy_gateway_api_key": derive_session_gateway_api_key(
+                    self._admin_api_key
+                ),
             }
+            if session_id is not None:
+                extra_kwargs["session_id"] = session_id
+                extra_kwargs["proxy_session_token"] = derive_session_gateway_token(
+                    self._admin_api_key, session_id
+                )
+            if worker_runtime is not None:
+                extra_kwargs["worker_runtime"] = worker_runtime
             return await self.agent.run(data, **extra_kwargs)
         if self.mode == "subproc":
             extra_envs = {
@@ -168,6 +197,78 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             }
             return await self.agent.run(data, **extra_kwargs)
         raise ValueError(f"Unsupported mode: {self.mode}")
+
+    def record_group_metrics(
+        self,
+        data: dict[str, Any],
+        rewards: list[float | None],
+        group_size: int,
+    ) -> None:
+        """Delegate optional group-level metric recording to the inline agent."""
+        recorder = getattr(self.agent, "record_group_metrics", None)
+        if callable(recorder):
+            recorder(data, rewards, group_size)
+
+    def record_episode_metrics(
+        self,
+        data: dict[str, Any],
+        reward: float,
+    ) -> None:
+        """Delegate optional episode metrics after interactions are exported."""
+        recorder = getattr(self.agent, "record_episode_metrics", None)
+        if callable(recorder):
+            recorder(data, reward)
+
+    async def _call_agent_hook(self, name: str, *args: Any, **kwargs: Any) -> None:
+        """Call an optional agent lifecycle hook without blocking the event loop."""
+
+        hook = getattr(self.agent, name, None)
+        if not callable(hook):
+            return
+        result = hook(*args, **kwargs)
+        if inspect.isawaitable(result):
+            await result
+
+    def _classify_agent_failure(
+        self,
+        error: Exception,
+        *,
+        context_overflow: bool,
+        interaction_count: int,
+        system_error: bool = False,
+    ) -> AgentFailureDisposition:
+        """Classify whether an agent error is a trainable model failure.
+
+        Existing agents retain the historical behavior: a typed proxy context
+        overflow is recoverable as reward zero. Agents backed by authoritative
+        external graders may provide ``classify_proxy_failure`` to reject system
+        and unknown failures even when an earlier model request overflowed.
+        """
+
+        if system_error:
+            return "system_failure_reject"
+
+        classifier = getattr(self.agent, "classify_proxy_failure", None)
+        if classifier is None:
+            return (
+                "model_failure_zero" if context_overflow else "unknown_failure_reject"
+            )
+        disposition = classifier(
+            error,
+            context_overflow=context_overflow,
+            interaction_count=interaction_count,
+        )
+        valid_dispositions = {
+            "model_failure_zero",
+            "system_failure_reject",
+            "unknown_failure_reject",
+        }
+        if disposition not in valid_dispositions:
+            raise ValueError(
+                "classify_proxy_failure returned an invalid disposition: "
+                f"{disposition!r}"
+            )
+        return disposition
 
     async def _grant_capacity(self, session: aiohttp.ClientSession) -> None:
         """Grant capacity via HTTP."""
@@ -276,27 +377,83 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             processor_cache_group_size=context.group_size,
             shared_tensor_resolver=self._shared_tensor_resolver,
         )
+        agent_error: Exception | None = None
         async with proxy_client:
             # Run the user code.
             try:
-                rewards = await self._run_agent(proxy_client.session_api_key, data)
-            except Exception as exc:
-                logger.warning(
-                    "Agent task failed (%s: %s). This trajectory will be rejected.",
-                    type(exc).__name__,
-                    exc,
-                    exc_info=True,
+                rewards = await self._run_agent(
+                    proxy_client.session_api_key,
+                    data,
+                    session_id=proxy_client.session_id,
+                    worker_runtime=engine,
                 )
-                raise
-
-            # Assign rewards back according to user code output
-            if isinstance(rewards, dict):
-                for completion_id, reward in rewards.items():
-                    await proxy_client.set_reward(completion_id, reward)
-            elif isinstance(rewards, float):
-                await proxy_client.set_last_reward(rewards)
+            except Exception as exc:
+                agent_error = exc
             else:
-                raise ValueError(f"Invalid reward type: {type(rewards)}")
+                # Assign rewards back according to user code output
+                if isinstance(rewards, dict):
+                    for completion_id, reward in rewards.items():
+                        await proxy_client.set_reward(completion_id, reward)
+                elif isinstance(rewards, float):
+                    await proxy_client.set_last_reward(rewards)
+                else:
+                    raise ValueError(f"Invalid reward type: {type(rewards)}")
+
+        failure_disposition: AgentFailureDisposition | None = None
+        if agent_error is not None:
+            failure_disposition = self._classify_agent_failure(
+                agent_error,
+                context_overflow=proxy_client.context_overflow,
+                interaction_count=proxy_client.interaction_count,
+                system_error=proxy_client.system_error,
+            )
+            await self._call_agent_hook(
+                "record_failure_disposition",
+                data,
+                agent_error,
+                failure_disposition,
+            )
+
+        if agent_error is not None and failure_disposition != "model_failure_zero":
+            logger.warning(
+                "Agent task failed with disposition %s (%s: %s). This "
+                "trajectory will be rejected.",
+                failure_disposition,
+                type(agent_error).__name__,
+                agent_error,
+                exc_info=agent_error,
+            )
+            stats_tracker.get(workflow_context.stat_scope()).scalar(
+                context_overflow=float(proxy_client.context_overflow),
+                proxy_system_error=float(proxy_client.system_error),
+            )
+            raise agent_error
+
+        if proxy_client.context_overflow or failure_disposition == "model_failure_zero":
+            logger.warning(
+                "Recovering model failure with reward 0: context_overflow=%s, "
+                "interactions=%d, agent_error=%s",
+                proxy_client.context_overflow,
+                proxy_client.interaction_count,
+                agent_error,
+            )
+            stats_tracker.get(workflow_context.stat_scope()).scalar(
+                context_overflow=float(proxy_client.context_overflow),
+                proxy_system_error=float(proxy_client.system_error),
+            )
+            if proxy_client.interaction_count == 0:
+                await self._call_agent_hook(
+                    "persist_episode_result",
+                    data,
+                    None,
+                )
+                return None
+            await proxy_client.set_last_reward(0.0)
+        else:
+            stats_tracker.get(workflow_context.stat_scope()).scalar(
+                context_overflow=0.0,
+                proxy_system_error=float(proxy_client.system_error),
+            )
 
         # Apply turn-level discount and export interactions
         interactions = await proxy_client.export_interactions(
@@ -305,10 +462,29 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             drop_retry_orphans=self.drop_retry_orphans,
         )
 
+        if not interactions:
+            logger.warning(
+                "Task %s exported no usable interactions; trajectory will be rejected.",
+                task_id,
+            )
+            await self._call_agent_hook(
+                "persist_episode_result",
+                data,
+                None,
+            )
+            return None
+
         # Record stats
-        last_id = list(interactions.keys())[-1] if interactions else None
-        if last_id and interactions:
+        last_id = list(interactions.keys())[-1]
+        if last_id:
             last_reward = interactions[last_id].reward
-            stats_tracker.get(workflow_context.stat_scope()).scalar(reward=last_reward)
+            await self._call_agent_hook(
+                "persist_episode_result",
+                data,
+                last_reward,
+            )
+            tracker = stats_tracker.get(workflow_context.stat_scope())
+            tracker.scalar(reward=last_reward)
+            self.record_episode_metrics(data, last_reward)
 
         return interactions

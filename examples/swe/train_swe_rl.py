@@ -3,12 +3,24 @@
 import json
 import sys
 import warnings
+from collections import Counter
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 from datasets import Dataset
 
-from examples.swe.utils import SWEPPOConfig
+from examples.swe.arena_client import (
+    ArenaAPIError,
+    ArenaOpenAPIClient,
+    infer_llm_protocol_from_harness,
+    resolve_llm_protocol,
+)
+from examples.swe.arena_config import (
+    build_weighted_arena_rows,
+    load_arena_stream_configs,
+)
+from examples.swe.utils import ArenaRewardRefConfig, ArenaStreamConfig, SWEPPOConfig
 
 from areal import PPOTrainer
 from areal.api.cli_args import load_expr_config
@@ -88,6 +100,123 @@ def group_filter(x: dict[str, Any]):
     return x["rewards"].mean() <= 0.95
 
 
+def _stream_reward_ref(stream: dict[str, Any]) -> ArenaRewardRefConfig:
+    value = stream.get("default_reward_ref")
+    if value is None:
+        return ArenaRewardRefConfig()
+    if not isinstance(value, dict):
+        raise ArenaAPIError("Arena Stream default_reward_ref must be an object")
+    key = value.get("key")
+    version = value.get("version")
+    if (
+        not isinstance(key, str)
+        or not key
+        or not isinstance(version, str)
+        or not version
+    ):
+        raise ArenaAPIError(
+            "Arena Stream default_reward_ref requires non-empty key and version"
+        )
+    return ArenaRewardRefConfig(key=key, version=version)
+
+
+def _resolve_arena_stream(
+    client: ArenaOpenAPIClient,
+    configured: ArenaStreamConfig,
+) -> tuple[ArenaStreamConfig, list[dict[str, str]]]:
+    stream = client.resolve_stream(configured.stream_id)
+    resolved_stream_id = stream.get("stream_id")
+    if not isinstance(resolved_stream_id, str) or not resolved_stream_id:
+        raise ArenaAPIError("The selected Arena Stream is missing a valid stream_id")
+    actual_reward_ref = _stream_reward_ref(stream)
+    expected_reward_ref = configured.expected_reward_ref
+    if expected_reward_ref.key and expected_reward_ref != actual_reward_ref:
+        raise ArenaAPIError(
+            f"Arena Stream {configured.name!r} reward_ref drifted: expected "
+            f"{expected_reward_ref.key}@{expected_reward_ref.version}, got "
+            f"{actual_reward_ref.key}@{actual_reward_ref.version}"
+        )
+
+    if configured.llm_protocol:
+        llm_protocol = resolve_llm_protocol(stream, configured.llm_protocol)
+    elif configured.harness:
+        llm_protocol = infer_llm_protocol_from_harness(configured.harness)
+    else:
+        llm_protocol = resolve_llm_protocol(stream)
+
+    resolved = replace(
+        configured,
+        stream_id=resolved_stream_id,
+        llm_protocol=llm_protocol,
+        expected_reward_ref=actual_reward_ref,
+    )
+    rows = client.get_all_dataset_rows(resolved_stream_id, llm_protocol)
+    for row in rows:
+        row.update(
+            {
+                "arena_stream_name": resolved.name,
+                "reward_ref_key": actual_reward_ref.key,
+                "reward_ref_version": actual_reward_ref.version,
+            }
+        )
+    return resolved, rows
+
+
+def get_arena_mixture_dataset(
+    econfig,
+    *,
+    size_multiple: int = 1,
+) -> tuple[Dataset, list[ArenaStreamConfig]]:
+    """Load and deterministically mix prompt rows from configured Arena Streams."""
+    client = ArenaOpenAPIClient(
+        base_url=econfig.arena_base_url,
+        timeout=econfig.arena_request_timeout,
+        request_retries=econfig.arena_request_retries,
+    )
+    configured_streams = load_arena_stream_configs(econfig)
+    resolved_streams: list[ArenaStreamConfig] = []
+    rows_by_stream: dict[str, list[dict[str, str]]] = {}
+    for configured in configured_streams:
+        resolved, rows = _resolve_arena_stream(client, configured)
+        resolved_streams.append(resolved)
+        rows_by_stream[resolved.name] = rows
+
+    rows = build_weighted_arena_rows(
+        rows_by_stream,
+        resolved_streams,
+        epoch_size=int(getattr(econfig, "arena_mixture_epoch_size", 0)),
+        size_multiple=size_multiple,
+    )
+    dataset = Dataset.from_list(rows)
+    counts = Counter(row["arena_stream_name"] for row in rows)
+    logger.info(
+        "Created Arena mixture with %d prompt rows: %s",
+        len(dataset),
+        dict(sorted(counts.items())),
+    )
+    if size_multiple > 1 and len(dataset) % size_multiple:
+        logger.warning(
+            "Arena raw union has %d rows, not divisible by training batch size %d; "
+            "drop_last will omit %d tail rows without repeating source data",
+            len(dataset),
+            size_multiple,
+            len(dataset) % size_multiple,
+        )
+    return dataset, resolved_streams
+
+
+def get_arena_dataset(econfig) -> tuple[Dataset, str]:
+    """Load one Arena Stream while retaining the original public return type."""
+
+    dataset, resolved_streams = get_arena_mixture_dataset(econfig)
+    if len(resolved_streams) != 1:
+        raise ValueError(
+            "get_arena_dataset supports one Stream; use "
+            "get_arena_mixture_dataset for a multi-Stream configuration"
+        )
+    return dataset, resolved_streams[0].stream_id
+
+
 def _install_aweagent_deps_on_ray_nodes(aweagent_root: str):
     """Install AReaL-SWEAgent dependencies on all Ray GPU nodes.
 
@@ -159,36 +288,49 @@ def main(args):
     econfig = config.econfig
 
     # When using Ray scheduler, ensure SWEAgent deps are on all nodes
-    if config.scheduler.type == "ray":
+    if config.scheduler.type == "ray" and econfig.dataset_source == "jsonl":
         import ray
 
         ray.init(address="auto", ignore_reinit_error=True)
         _install_aweagent_deps_on_ray_nodes(_resolve_aweagent_root(econfig))
 
-    # Resolve dataset paths from config
-    train_path = config.train_dataset.path
-    valid_path = config.valid_dataset.path
+    if econfig.dataset_source == "arena":
+        train_dataset, resolved_streams = get_arena_mixture_dataset(
+            econfig, size_multiple=config.train_dataset.batch_size
+        )
+        valid_dataset = train_dataset
+        econfig.arena_streams = resolved_streams
+        econfig.arena_streams_yaml_b64 = ""
+        econfig.arena_streams_file = ""
+        workflow = "examples.swe.arena_agent.ArenaStreamAgentWorkflow"
+    elif econfig.dataset_source == "jsonl":
+        # Resolve dataset paths from config
+        train_path = config.train_dataset.path
+        valid_path = config.valid_dataset.path
 
-    def resolve_path(p: str) -> str:
-        if Path(p).is_absolute() or Path(p).exists():
+        def resolve_path(p: str) -> str:
+            if Path(p).is_absolute() or Path(p).exists():
+                return p
+            if econfig.dataset_path:
+                candidate = Path(econfig.dataset_path) / p
+                if candidate.exists():
+                    return str(candidate)
             return p
-        if econfig.dataset_path:
-            candidate = Path(econfig.dataset_path) / p
-            if candidate.exists():
-                return str(candidate)
-        return p
 
-    train_dataset = get_swe_dataset(
-        dataset_path=resolve_path(train_path),
-        split="train",
-    )
-    valid_dataset = get_swe_dataset(
-        dataset_path=resolve_path(valid_path),
-        split="test",
-    )
+        train_dataset = get_swe_dataset(
+            dataset_path=resolve_path(train_path),
+            split="train",
+        )
+        valid_dataset = get_swe_dataset(
+            dataset_path=resolve_path(valid_path),
+            split="test",
+        )
 
-    # Build workflow kwargs
-    from dataclasses import asdict
+        workflow = "examples.swe.agent.SWEAgentWorkflow"
+    else:
+        raise ValueError(
+            f"Unsupported econfig.dataset_source: {econfig.dataset_source!r}"
+        )
 
     econfig_dict = asdict(econfig)
     workflow_kwargs = dict(
@@ -213,7 +355,7 @@ def main(args):
         valid_dataset=valid_dataset,
     ) as trainer:
         trainer.train(
-            workflow="examples.swe.agent.SWEAgentWorkflow",
+            workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             eval_workflow=None,
             eval_workflow_kwargs=eval_workflow_kwargs,

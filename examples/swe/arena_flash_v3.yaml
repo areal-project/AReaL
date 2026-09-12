@@ -1,0 +1,202 @@
+# Flash V3 multi-stream resource/model settings from swe-dev@5478d6384.
+# Uses main GRPO group handling; see README_arena.md for recipe differences.
+defaults:
+- arena_grpo
+- _self_
+experiment_name: ${oc.env:EXPERIMENT_NAME,"arena-flash-v3"}
+trial_name: ${oc.env:TRIAL_NAME,"flash-v3-128k"}
+total_train_epochs: ${oc.env:TOTAL_TRAIN_EPOCHS,1000}
+total_train_steps: ${oc.env:TOTAL_TRAIN_STEPS,500}
+dynamic_bs: false
+gconfig:
+  min_new_tokens: 0
+  greedy: false
+  top_p: 1.0
+  top_k: 1000000
+  temperature: 1.0
+  n_samples: ${oc.env:N_SAMPLES,12}
+  max_new_tokens: ${oc.env:MAX_NEW_TOKENS,131071}
+  max_tokens: ${oc.env:MAX_TOKENS,131071}
+  reward_normalization: true
+  drop_incomplete_group: true
+eval_gconfig:
+  n_samples: ${gconfig.n_samples}
+  max_new_tokens: ${gconfig.max_new_tokens}
+  max_tokens: ${gconfig.max_tokens}
+  reward_normalization: false
+  drop_incomplete_group: ${gconfig.drop_incomplete_group}
+rollout:
+  backend: ${oc.env:ROLLOUT_BACKEND,"sglang:d16t4p1"}
+  max_concurrent_rollouts: ${oc.env:MAX_CONCURRENT_ROLLOUTS,1500}
+  consumer_batch_size: ${train_dataset.batch_size}
+  scheduling_spec:
+  - task_type: ${actor.scheduling_spec.0.task_type}
+    port_count: ${actor.scheduling_spec.0.port_count}
+    gpu: ${actor.scheduling_spec.0.gpu}
+    cpu: ${actor.scheduling_spec.0.cpu}
+    mem: ${actor.scheduling_spec.0.mem}
+    image: ${oc.env:ROLLOUT_IMAGE}
+    cmd: ${actor.scheduling_spec.0.cmd}
+    env_vars:
+      PYTHONPATH: ${oc.env:AREAL_DIR}:${oc.env:ROLLOUT_RUNTIME_PYTHONPATH,""}:${oc.env:FLASH_LINEAR_ATTENTION_ROOT}:${oc.env:AWEX_ROOT}
+      AWEX_ROOT: ${oc.env:AWEX_ROOT}
+      AWEX_COLOCATE_TIMEOUT_S: ${oc.env:AWEX_COLOCATE_TIMEOUT_S,"7200"}
+      AREAL_AWEX_PROCESS_QUEUE_WHEN_IDLE: '1'
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+      PYTORCH_CUDA_ALLOC_CONF: ''
+    additional_bash_cmds: ${actor.scheduling_spec.0.additional_bash_cmds}
+  scheduling_strategy:
+    type: colocation
+    target: actor
+    fork: true
+  agent:
+    tool_call_parser: ling3
+    reasoning_parser: ling3
+    engine_max_tokens: ${gconfig.max_tokens}
+    message_preprocessors:
+    - examples.swe.preprocessors.StripAnthropicBillingHeader
+    - examples.swe.preprocessors.StripAllSystemReminders
+    - examples.swe.preprocessors.StripAnthropicCacheFields
+    - examples.swe.preprocessors.NormalizeToolCallArguments
+    prefix_matcher: examples.swe.prefix_matchers.swe_prefix_matcher
+    drop_retry_orphans: true
+    session_timeout_seconds: ${oc.env:ARENA_PROXY_IDLE_TIMEOUT,7200}
+  max_head_offpolicyness: 1
+  setup_timeout: 3600
+  request_timeout: ${oc.env:ARENA_TASK_TIMEOUT,20000}
+actor:
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  weight_update_mode: awex
+  eps_clip: 0.2
+  eps_clip_higher: 0.28
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+    lower: 0.5
+  discount: 1.0
+  gae_timestep_unit: turn
+  gae_lambda: areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae
+  gae_lambda_kwargs:
+    alpha: 1.5
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_clip: 5.0
+  reward_norm: null
+  adv_norm:
+    mean_level: null
+    std_level: null
+  backend: ${oc.env:ACTOR_BACKEND,"megatron:(attn:d2p2t2c8|ffn:d4p2e8)"}
+  path: ${oc.env:MODEL_PATH}
+  disable_dropout: true
+  mb_spec:
+    n_mbs: ${oc.env:ACTOR_N_MBS,1}
+    granularity: 1
+    max_tokens_per_mb: ${oc.env:ACTOR_MAX_TOKENS_PER_MB,131072}
+    n_mbs_divisor: ${oc.env:ACTOR_N_MBS_DIVISOR,1}
+  optimizer:
+    type: adam
+    lr: ${oc.env:ACTOR_LR,3.0e-6}
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-08
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps: 5
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: true
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: false
+    enable_fp32_lm_head: true
+    cross_entropy_loss_fusion: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+    moe_router_bias_update_rate: 0.0
+    bridge_type: mbridge
+    virtual_pipeline_parallel_size: 1
+    enable_mtp: false
+  recompute_logprob: false
+  prox_logp_method: reuse_train_logp
+  scheduling_spec:
+  - task_type: worker
+    port_count: 8
+    gpu: 1
+    cpu: 4
+    mem: 64
+    image: ${oc.env:AREAL_IMAGE}
+    cmd: ${oc.env:AREAL_PYTHON} -m areal.infra.rpc.rpc_server
+    env_vars:
+      PYTHONPATH: ${oc.env:AREAL_DIR}:${oc.env:ACTOR_RUNTIME_PYTHONPATH,""}:${oc.env:FLASH_LINEAR_ATTENTION_ROOT}:${oc.env:AWEX_ROOT}
+      AWEX_ROOT: ${oc.env:AWEX_ROOT}
+      AWEX_COLOCATE_TIMEOUT_S: ${oc.env:AWEX_COLOCATE_TIMEOUT_S,"7200"}
+      AREAL_AWEX_PROCESS_QUEUE_WHEN_IDLE: '1'
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+      PYTORCH_CUDA_ALLOC_CONF: ''
+    additional_bash_cmds:
+    - set -a; source "$ARENA_CREDENTIALS_FILE"; set +a
+    - unset ALL_PROXY all_proxy HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+ref:
+  disable_dropout: true
+  mb_spec:
+    n_mbs: ${actor.mb_spec.n_mbs}
+    granularity: ${actor.mb_spec.granularity}
+    max_tokens_per_mb: ${actor.mb_spec.max_tokens_per_mb}
+    n_mbs_divisor: ${actor.mb_spec.n_mbs_divisor}
+econfig:
+  stream_id: ''
+  arena_streams_yaml_b64: ''
+  arena_streams_file: ${oc.env:DATASET_CONFIG}
+  arena_harness: ''
+  arena_llm_protocol: ''
+  arena_reward_threshold: null
+  arena_reward_transform_fn: ''
+  arena_llm_route_mode: ${oc.env:ARENA_LLM_ROUTE_MODE,"session_gateway"}
+  arena_streams: []
+  timeout: ${oc.env:ARENA_TASK_WAIT_TIMEOUT,7200}
+  arena_mixture_epoch_size: ${oc.env:ARENA_MIXTURE_EPOCH_SIZE,0}
+  arena_task_envs:
+    ANTHROPIC_CUSTOM_HEADERS: 'x-keepalive-enable: true'
+    CLAUDE_ENABLE_STREAM_WATCHDOG: '0'
+    CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1'
+sglang:
+  context_length: ${oc.env:CONTEXT_LENGTH,131072}
+  attention_backend: ${oc.env:SGLANG_ATTENTION_BACKEND,fa3}
+  max_prefill_tokens: ${oc.env:SGLANG_MAX_PREFILL_TOKENS,8192}
+  chunked_prefill_size: ${oc.env:SGLANG_CHUNKED_PREFILL_SIZE,8192}
+  max_running_requests: ${oc.env:SGLANG_MAX_RUNNING_REQUESTS,128}
+  mem_fraction_static: ${oc.env:SGLANG_MEM_FRACTION_STATIC,0.65}
+  schedule_policy: fcfs
+  disable_cuda_graph: ${oc.env:SGLANG_DISABLE_CUDA_GRAPH,false}
+  sampling_backend: pytorch
+  enable_memory_saver: true
+  disable_radix_cache: false
+  triton_attention_num_kv_splits: 16
+  disable_custom_all_reduce: true
+train_dataset:
+  batch_size: ${oc.env:TRAIN_BATCH_SIZE,32}
+  shuffle: ${oc.env:ARENA_DATASET_SHUFFLE,true}
+  pin_memory: true
+  num_workers: 0
+  path: arena
+  type: rl
+  max_length: ${sglang.context_length}
+  drop_last: true
+valid_dataset: null
+seed: 42
+enable_offload: false
+cluster:
+  n_nodes: ${oc.env:N_NODES,8}

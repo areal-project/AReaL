@@ -14,6 +14,7 @@ from tensorboardX import SummaryWriter
 from areal.api import FinetuneSpec
 from areal.api.cli_args import BaseExperimentConfig, StatsLoggerConfig
 from areal.utils import logging
+from areal.utils.config_utils import redact_sensitive_config
 from areal.utils.printing import tabulate_stats
 from areal.version import version_info
 
@@ -52,7 +53,7 @@ class StatsLogger:
         if suffix == "timestamp":
             suffix = time.strftime("%Y_%m_%d_%H_%M_%S")
 
-        exp_config_dict = asdict(self.exp_config)
+        exp_config_dict = redact_sensitive_config(asdict(self.exp_config))
         exp_config_dict["version_info"] = {
             "commit_id": version_info.commit,
             "branch": version_info.branch,
