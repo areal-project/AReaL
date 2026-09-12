@@ -27,16 +27,22 @@ SESSION_TIMEOUT_SECONDS = 3600
 
 
 class StartSessionRequest(BaseModel):
-    """Request to start one or more offline RL sessions.
+    """Request to start one or more RL sessions.
 
     When ``group_size`` is greater than 1, the data proxy creates multiple
     sessions atomically. The response always contains a flat ``sessions``
     list — single-session is just ``group_size=1``.
+
+    In online mode, external clients can set ``group_id`` to declare that
+    multiple requests belong to the same GRPO group. This ensures N concurrent
+    requests with the same ``group_id`` are routed to N distinct workers,
+    making advantage normalization mathematically valid.
     """
 
     task_id: str
     api_key: str | None = None  # Reuse a previously-issued key (refresh)
     group_size: int = 1
+    group_id: str | None = None  # Pre-declared group id for online mode grouping
 
 
 class SessionCredentials(BaseModel):
