@@ -108,6 +108,16 @@ __all__ = [
     "geometry3k_reward_fn",
     "clevr_count_70k_reward_fn",
     "if_gap_reward_fn",
+    "FormatRewardConfig",
+    "FormatReward",
+    "LengthPenaltyConfig",
+    "LengthPenalty",
+    "CompositeReward",
+    "extract_boxed_content",
+    "extract_tag_content",
+    "extract_hash_answer",
+    "extract_reasoning_and_answer",
+    "get_deepseek_r1_math_reward",
 ]
 
 
@@ -116,6 +126,16 @@ _LAZY_IMPORTS = {
     "geometry3k_reward_fn": "areal.reward.geometry3k",
     "clevr_count_70k_reward_fn": "areal.reward.clevr_count_70k",
     "if_gap_reward_fn": "areal.reward.if_gap",
+    "FormatRewardConfig": "areal.reward.reasoning",
+    "FormatReward": "areal.reward.reasoning",
+    "LengthPenaltyConfig": "areal.reward.reasoning",
+    "LengthPenalty": "areal.reward.reasoning",
+    "CompositeReward": "areal.reward.reasoning",
+    "extract_boxed_content": "areal.reward.reasoning",
+    "extract_tag_content": "areal.reward.reasoning",
+    "extract_hash_answer": "areal.reward.reasoning",
+    "extract_reasoning_and_answer": "areal.reward.reasoning",
+    "get_deepseek_r1_math_reward": "areal.reward.reasoning",
 }
 
 
