@@ -106,6 +106,7 @@ dependencies = [
     "pebble",
     "timeout-decorator",
     "prettytable",
+    "pymysql",
     "h5py",
     "mathruler==0.1.0",
 
