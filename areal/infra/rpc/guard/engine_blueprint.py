@@ -515,17 +515,25 @@ def call_engine_method():
                     bcast_group, bcast_device = resolve_broadcast_target(
                         engine, current_platform.current_device(), method_name
                     )
+                    # Model capability is identical on every rank; inspecting
+                    # the local payload would disagree on non-source ranks.
+                    preserve_broadcast_aliases = (
+                        preserve_input_tensor_aliases
+                        and getattr(engine, "is_vision_model", False)
+                    )
                     args_bcast = tensor_container_to(args, bcast_device)
                     args_bcast = broadcast_tensor_container(
                         args_bcast,
                         src_rank=engine.current_data_parallel_head(),
                         group=bcast_group,
+                        preserve_tensor_aliases=preserve_broadcast_aliases,
                     )
                     kwargs_bcast = tensor_container_to(kwargs, bcast_device)
                     kwargs_bcast = broadcast_tensor_container(
                         kwargs_bcast,
                         src_rank=engine.current_data_parallel_head(),
                         group=bcast_group,
+                        preserve_tensor_aliases=preserve_broadcast_aliases,
                     )
                     logger.debug("Broadcasting RPC payload done.")
 

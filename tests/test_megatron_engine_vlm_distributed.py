@@ -277,3 +277,15 @@ def test_qwen3vl_moe_dcp_save_load(tmp_path_factory):
         backend="megatron:(attn:d2p1t4|ffn:d1p1t2e4)",
         env_overrides={"VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"]},
     )
+
+
+@pytest.mark.gpu
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+def test_multimodal_memory_isolation_tensor_parallel(tmp_path_factory):
+    """CPU alias transport and lazy vision preparation through real TP training."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("VLM memory isolation requires at least 2 GPUs")
+    output = str(tmp_path_factory.mktemp("vlm_memory") / "result.out")
+    _run_vlm_test("memory_isolation", output, backend="megatron:d1p1t2")
