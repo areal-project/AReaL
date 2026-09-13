@@ -183,3 +183,21 @@ def test_batched_call_pass_meta_provides_traj_group_sizes():
     assert len(out) == 2
     torch.testing.assert_close(out[0]["values"], torch.tensor([[2.0], [3.0]]))
     torch.testing.assert_close(out[1]["values"], torch.tensor([[4.0]]))
+
+
+def test_leave_one_out_singleton_batch_outputs_zero():
+    """A batch-level leave-one-out mean has no peer either, so it is zeroed too."""
+    cfg = NormConfig(
+        mean_level="batch",
+        std_level=None,
+        group_size=1,
+        mean_leave1out=True,
+        std_unbiased=True,
+        eps=1e-5,
+    )
+    norm = Normalization(cfg)
+
+    out = norm(torch.tensor([[5.0]], dtype=torch.float32))
+
+    assert torch.isfinite(out).all()
+    assert out.item() == 0.0
