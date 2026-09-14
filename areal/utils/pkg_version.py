@@ -39,10 +39,7 @@ def is_version_greater_or_equal(package_name: str, target_version: str) -> bool:
     :param target_version: Target version to compare against.
     :return: True if the installed version is greater than or equal to the target version, False otherwise.
     """
-    try:
-        installed_version = get_version(package_name)
-    except PackageNotFoundError:
-        return False
+    installed_version = get_version(package_name)
     return compare_versions(installed_version, target_version) >= 0
 
 
@@ -54,10 +51,7 @@ def is_version_less(package_name: str, target_version: str) -> bool:
     :param target_version: Target version to compare against.
     :return: True if the installed version is less than the target version, False otherwise.
     """
-    try:
-        installed_version = get_version(package_name)
-    except PackageNotFoundError:
-        return False
+    installed_version = get_version(package_name)
     return compare_versions(installed_version, target_version) < 0
 
 
@@ -69,8 +63,5 @@ def is_version_equal(package_name: str, target_version: str) -> bool:
     :param target_version: Target version to compare against.
     :return: True if the installed version is equal to the target version, False otherwise.
     """
-    try:
-        installed_version = get_version(package_name)
-    except PackageNotFoundError:
-        return False
+    installed_version = get_version(package_name)
     return compare_versions(installed_version, target_version) == 0
