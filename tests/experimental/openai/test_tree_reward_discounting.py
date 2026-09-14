@@ -184,7 +184,7 @@ class TestTreeRewardDiscounting:
         # Leaf A1 retains +1.0
         assert pytest.approx(res["a1"].reward) == 1.0
         # Branch A receives 0.0 + 0.8 * 1.0 = +0.8 (NOT corrupted by Branch B's -1.0)
-        assert pytest.approx(res["a fatal" if False else "a"].reward) == 0.8
+        assert pytest.approx(res["a"].reward) == 0.8
 
         # Leaf B1 retains -1.0
         assert pytest.approx(res["b1"].reward) == -1.0
