@@ -1363,7 +1363,14 @@ class RolloutController:
 
     def export_stats(self) -> dict[str, float]:
         all_raw_stats = self._collective_rpc(method="export_stats", http_timeout=60.0)
-        if self._proxy_started and self.proxy_workers:
+        agent_config = self.config.agent
+        if (
+            self._proxy_started
+            and self.proxy_workers
+            and agent_config is not None
+            and agent_config.prm.enabled
+            and any(scorer.enabled for scorer in agent_config.prm.scorers)
+        ):
             all_raw_stats += self._proxy_collective_rpc(
                 method="export_stats", http_timeout=60.0
             )

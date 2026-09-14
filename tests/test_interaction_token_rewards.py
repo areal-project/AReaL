@@ -158,3 +158,40 @@ def test_v1_export_filters_incomplete_interaction():
     exported = cache.export_interactions(style="concat")
 
     assert list(exported) == ["complete"]
+
+
+@pytest.mark.parametrize("parent_reward,child_reward", [(None, 0.5), (0.25, None)])
+def test_concat_with_one_rewarded_turn_zero_fills_other_spans(
+    parent_reward, child_reward
+):
+    """Sparse turn rewards retain their token positions in the full chain."""
+    parent = _interaction("parent", [1], [2])
+    leaf = _interaction("leaf", [1, 2, 3], [4], parent=parent)
+    if parent_reward is not None:
+        parent.token_rewards = torch.tensor([parent_reward])
+    if child_reward is not None:
+        leaf.token_rewards = torch.tensor([child_reward], requires_grad=True)
+
+    result = leaf.to_tensor_dict()["token_rewards"]
+
+    assert not result.requires_grad
+    torch.testing.assert_close(
+        result,
+        torch.tensor([[0.0, parent_reward or 0.0, 0.0, child_reward or 0.0]]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_concat_with_short_child_prompt_masks_parent_rewards():
+    """The invalid-prefix fallback must not copy rewards from its parent."""
+    parent = _interaction("parent", [1, 2], [3])
+    parent.token_rewards = torch.tensor([0.5])
+    leaf = _interaction("leaf", [1, 2], [4], parent=parent)
+
+    torch.testing.assert_close(
+        leaf.to_tensor_dict()["token_rewards"],
+        torch.zeros((1, 3), dtype=torch.float32),
+        rtol=0.0,
+        atol=0.0,
+    )
