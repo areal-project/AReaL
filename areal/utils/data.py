@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
+from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api.cli_args import MicroBatchSpec, NormConfig
@@ -1464,12 +1465,21 @@ def bcast_mb_list(
 def cycle_dataloader(dataloader: StatefulDataLoader, num_cycles: int = -1):
     """Cycle through a dataloader indefinitely."""
     epoch = 0
+    if hasattr(dataloader, "sampler") and isinstance(
+        dataloader.sampler, DistributedSampler
+    ):
+        # Respect an epoch restored by the trainer. Starting from zero here
+        # overwrites the sampler epoch after StatefulDataLoader.load_state_dict
+        # and changes the sample order after recovery.
+        epoch = dataloader.sampler.epoch
+    completed_cycles = 0
     while True:
         if hasattr(dataloader, "sampler") and hasattr(dataloader.sampler, "set_epoch"):
             dataloader.sampler.set_epoch(epoch)
         yield from dataloader
         epoch += 1
-        if num_cycles > 0 and epoch >= num_cycles:
+        completed_cycles += 1
+        if num_cycles > 0 and completed_cycles >= num_cycles:
             break
 
 

@@ -8,6 +8,7 @@ import torch
 from tests.utils import get_model_path
 
 from areal.api import (
+    LocalInfServerInfo,
     ModelRequest,
     ParamSpec,
     WeightUpdateMeta,
@@ -366,6 +367,51 @@ class TestRolloutControllerInitialization:
         )
 
         controller.initialize(role="rollout", server_args={})
+
+        controller.destroy()
+
+    @pytest.mark.parametrize(
+        ("role", "expected_writes"),
+        [
+            ("rollout", 1),
+            ("eval-rollout", 0),
+        ],
+    )
+    def test_initialize_with_provided_eval_servers_skips_duplicate_targets(
+        self, monkeypatch, role, expected_writes
+    ):
+        write_calls = []
+
+        def fake_write_inference_targets(**kwargs):
+            write_calls.append(kwargs)
+
+        monkeypatch.setattr(
+            "areal.infra.controller.rollout_controller.write_inference_targets",
+            fake_write_inference_targets,
+        )
+        config = create_test_config(backend="sglang:d2")
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+        server_infos = [
+            LocalInfServerInfo(host="127.0.0.1", port=8000, process=None),
+            LocalInfServerInfo(host="127.0.0.1", port=8001, process=None),
+        ]
+
+        controller.initialize(
+            role=role,
+            server_args={},
+            server_infos=server_infos,
+        )
+
+        assert controller.server_infos == server_infos
+        assert len(write_calls) == expected_writes
+        if write_calls:
+            assert write_calls[0]["role"] == role
+            assert write_calls[0]["source"] == "provided"
 
         controller.destroy()
 

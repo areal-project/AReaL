@@ -44,6 +44,7 @@ LOGGER_COLORS_EXACT = {
     # Launchers - blue
     "LocalLauncher": "blue",
     "RayLauncher": "blue",
+    "RayBootstrap": "blue",
     "SlurmLauncher": "blue",
     "InfCli": "blue",
     # Workflows - purple
@@ -59,6 +60,7 @@ LOGGER_COLORS_EXACT = {
     # Stats/Perf - green
     "StatsLogger": "light_green",
     "StatsTracker": "light_green",
+    "InferenceTargets": "light_green",
     "PerfTracer": "light_green",
     # RPC servers - white
     "SyncRPCServer": "white",
@@ -99,6 +101,7 @@ LOGGER_COLORS_EXACT = {
     "PlatformInit": "light_cyan",
     "CUDAPlatform": "light_cyan",
     "NPUPlatform": "light_cyan",
+    "ROCmPlatform": "light_cyan",
     "UnknownPlatform": "light_cyan",
     # Sandbox backends
     "DaytonaClientManager": "blue",
@@ -110,6 +113,7 @@ LOGGER_COLORS_EXACT = {
     "OpenAIProxy": "light_purple",
     "ToolCallParser": "light_purple",
     "TokenLogpReward": "light_purple",
+    "PRMRunner": "light_purple",
     "ProxyUtils": "light_purple",
     "AReaL-SWEAgent": "light_purple",
     "SWETrain": "light_green",

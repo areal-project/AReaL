@@ -156,6 +156,7 @@ class OpenAIProxyClient:
         discount: float = 1.0,
         style: str = "individual",
         drop_retry_orphans: bool = False,
+        is_eval: bool = False,
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Export interactions for this session via HTTP.
 
@@ -181,6 +182,8 @@ class OpenAIProxyClient:
             and export. Useful when the upstream Agent SDK times out and
             retries the same request, leaving the proxy with two completions
             for the same input messages.
+        is_eval : bool
+            Route process-reward metrics to the eval-rollout scope.
 
         Returns
         -------
@@ -204,6 +207,7 @@ class OpenAIProxyClient:
             "supports_shared_tensor_references": (
                 self._processor_cache_group_id is not None
             ),
+            "is_eval": is_eval,
         }
         headers = self._admin_auth_headers()
         async with self._session.post(url, json=payload, headers=headers) as resp:

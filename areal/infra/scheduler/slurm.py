@@ -923,24 +923,37 @@ class SlurmScheduler(Scheduler):
 
         bash_cmds = (spec.additional_bash_cmds or []).copy()
 
-        # Set CUDA_VISIBLE_DEVICES based on SLURM_LOCALID before any Python imports.
-        # This MUST happen before Python starts, otherwise CUDA runtime ignores the
-        # env var change once it's initialized.
-        # We use bash commands instead of env_vars_dict because SLURM_LOCALID is only
-        # available at runtime and each task needs a different value.
+        # Slice Slurm's node-local allocation before CUDA is initialized. Rebuilding
+        # device IDs from zero can put separate jobs on the same physical GPU.
+        # Preserve the runtime namespace, including cgroup remapping and UUIDs.
         if total_gpus > 0:
             gpus_per_task = spec.gpu
-            if gpus_per_task == 1:
-                cuda_setup_cmd = (
-                    f"export CUDA_VISIBLE_DEVICES=$((SLURM_LOCALID * {gpus_per_task}))"
-                )
-            else:
-                cuda_setup_cmd = (
-                    f"export CUDA_VISIBLE_DEVICES=$(seq -s, $((SLURM_LOCALID * {gpus_per_task})) "
-                    f"$((SLURM_LOCALID * {gpus_per_task} + {gpus_per_task} - 1)))"
-                )
+            cuda_setup_cmd = (
+                f"areal_device_offset=$((SLURM_LOCALID * {gpus_per_task}));\n"
+                'if [[ -z "${CUDA_VISIBLE_DEVICES-}" && -z "${ASCEND_RT_VISIBLE_DEVICES-}" ]]; then\n'
+                '  echo "Missing Slurm-visible device allocation" >&2; exit 1;\n'
+                "fi;\n"
+                "for areal_device_var in CUDA_VISIBLE_DEVICES ASCEND_RT_VISIBLE_DEVICES; do\n"
+                '  [[ -v "$areal_device_var" ]] || continue;\n'
+                '  areal_visible="${!areal_device_var}";\n'
+                '  [[ -n "$areal_visible" ]] || continue;\n'
+                '  if [[ "$areal_visible" == ,* || '
+                '"$areal_visible" == *, || "$areal_visible" == *,,* || '
+                '",$areal_visible," == *,-1,* ]]; then\n'
+                '    echo "Invalid Slurm-visible device allocation" >&2; exit 1;\n'
+                "  fi;\n"
+                '  IFS=, read -r -a areal_devices <<< "$areal_visible";\n'
+                f"  if (( ${{#areal_devices[@]}} < areal_device_offset + {gpus_per_task} )); then\n"
+                '    echo "Insufficient Slurm-visible devices for worker '
+                '${SLURM_LOCALID}; expected a node-local device allocation" >&2; exit 1;\n'
+                "  fi;\n"
+                '  printf -v "$areal_device_var" "%s" "$(IFS=,; echo '
+                f'"${{areal_devices[*]:areal_device_offset:{gpus_per_task}}}")";\n'
+                '  export "$areal_device_var";\n'
+                "done"
+            )
             # Also set ASCEND_RT_VISIBLE_DEVICES for Ascend NPU compatibility
-            ascend_setup_cmd = "export ASCEND_RT_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+            ascend_setup_cmd = 'export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES-${CUDA_VISIBLE_DEVICES-}}"'
             bash_cmds.insert(0, cuda_setup_cmd)
             bash_cmds.insert(1, ascend_setup_cmd)
 

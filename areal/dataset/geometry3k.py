@@ -8,6 +8,8 @@ from PIL import Image
 from PIL.Image import Image as ImageObject
 from torchvision import transforms
 
+from areal.dataset.tokenization import get_multimodal_sft_loss_mask
+
 
 def pad_to_square(img: Image.Image, fill=(0, 0, 0)) -> Image.Image:
     w, h = img.size
@@ -104,11 +106,12 @@ def get_geometry3k_sft_dataset(
                 "image_grid_thw"
             ].squeeze(0)
         example["multi_modal_input"] = [multi_modal_input]
-        answer_token = tokenizer.encode(example["answer"])
-        loss_mask = [0] * (len(example["input_ids"]) - len(answer_token)) + [1] * len(
-            answer_token
+        example["loss_mask"] = get_multimodal_sft_loss_mask(
+            input_ids=example["input_ids"],
+            prompt=example["problem"],
+            sequence=example["seq"],
+            tokenizer=tokenizer,
         )
-        example["loss_mask"] = loss_mask
         return example
 
     dataset = dataset.map(
