@@ -932,8 +932,9 @@ class PPOTrainer:
                     self.actor.get_device_stats().log("prepare MOPD batch")
                 else:
                     advantage_kwargs: dict[str, Any] = {}
-                    prm_config = config.rollout.agent.prm
-                    if prm_config.enabled:
+                    agent_config = config.rollout.agent
+                    prm_config = agent_config.prm if agent_config is not None else None
+                    if prm_config is not None and prm_config.enabled:
                         shaping = prm_config.advantage_shaping
                         advantage_kwargs.update(
                             advantage_shaping_mode=shaping.mode,

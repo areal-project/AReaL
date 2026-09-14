@@ -147,6 +147,7 @@ def _build_supervised_trainer(
 
 def _build_ppo_trainer(events: list[tuple], *, recovered: bool = False):
     trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer.mopd_execution_plan = None
     trainer.config = SimpleNamespace(
         total_train_epochs=1,
         total_train_steps=None,
