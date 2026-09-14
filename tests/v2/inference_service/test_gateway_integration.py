@@ -12,6 +12,8 @@ The test launches:
 Then exercises the full request path through the gateway.
 """
 
+# Chat requests disable thinking to exercise answer delivery within short token budgets.
+
 from __future__ import annotations
 
 import json
@@ -326,6 +328,7 @@ class TestGatewayChatCompletions:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "What is 2+2?"}],
                     "max_completion_tokens": 32,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
@@ -360,6 +363,7 @@ class TestGatewayChatCompletions:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "What is 3+5?"}],
                     "max_completion_tokens": 64,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {session_api_key}"},
@@ -407,6 +411,7 @@ class TestGatewayChatCompletions:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "Say hello"}],
                     "max_completion_tokens": 32,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                     "stream": True,
                 },
@@ -478,6 +483,7 @@ class TestGatewayChatCompletions:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "What is 3+5?"}],
                     "max_completion_tokens": 64,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {session_api_key}"},
@@ -497,6 +503,7 @@ class TestGatewayChatCompletions:
                         {"role": "user", "content": "Now add 2 to that."},
                     ],
                     "max_completion_tokens": 64,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {session_api_key}"},
@@ -549,6 +556,7 @@ class TestGatewaySessionLifecycle:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "What is 10-3?"}],
                     "max_completion_tokens": 64,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {session_api_key}"},
@@ -628,6 +636,7 @@ class TestGatewaySessionLifecycle:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "hello"}],
                     "max_completion_tokens": 8,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {session_api_key}"},
@@ -737,6 +746,7 @@ class TestGatewayPauseContinue:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "Hello"}],
                     "max_completion_tokens": 8,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
@@ -775,6 +785,9 @@ class TestGatewayPauseContinue:
                             },
                         ],
                         "max_completion_tokens": 256,
+                        "extra_body": {
+                            "chat_template_kwargs": {"enable_thinking": False}
+                        },
                         "temperature": 0.7,
                     },
                     headers={"Authorization": f"Bearer {session_api_key}"},
@@ -921,6 +934,7 @@ class TestGatewayVLLM:
                     "model": "vllm",
                     "messages": [{"role": "user", "content": "What is 2+2?"}],
                     "max_completion_tokens": 32,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
@@ -955,6 +969,7 @@ class TestGatewayVLLM:
                     "model": "vllm",
                     "messages": [{"role": "user", "content": "What is 10-3?"}],
                     "max_completion_tokens": 64,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {session_api_key}"},

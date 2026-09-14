@@ -199,6 +199,18 @@ async def test_create_preserves_reasoning_tools_and_cache(
                 assert not tool_deltas
         else:
             assert result == interaction.completion
+
+        followup = await client.chat.completions.create(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "inspect"},
+                message.model_dump(exclude_none=True),
+                {"role": "user", "content": "continue"},
+            ],
+            max_tokens=32,
+            extra_body={"chat_template_kwargs": {"enable_thinking": force_reasoning}},
+        )
+        assert client.get_interaction(followup.id).parent is interaction
     finally:
         await client.close()
 

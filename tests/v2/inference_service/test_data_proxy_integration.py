@@ -8,6 +8,8 @@ and exercises the /chat/completions endpoint (full session lifecycle) and
 pause/resume behavior.
 """
 
+# Chat requests disable thinking to exercise answer delivery within short token budgets.
+
 from __future__ import annotations
 
 import json
@@ -248,6 +250,7 @@ class TestChatCompletionsIntegration:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "What is 2+2?"}],
                     "max_completion_tokens": 64,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                     "stream": False,
                 },
@@ -319,6 +322,7 @@ class TestChatCompletionsIntegration:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "Say hello"}],
                     "max_completion_tokens": 32,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                     "stream": True,
                 },
@@ -396,6 +400,7 @@ class TestChatCompletionsIntegration:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "What is 3+5?"}],
                     "max_completion_tokens": 64,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {session_api_key}"},
@@ -418,6 +423,7 @@ class TestChatCompletionsIntegration:
                         {"role": "user", "content": "Now add 2 to that result."},
                     ],
                     "max_completion_tokens": 64,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {session_api_key}"},
@@ -473,6 +479,7 @@ class TestChatCompletionsIntegration:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "What is 10-3?"}],
                     "max_completion_tokens": 64,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {session_api_key}"},
@@ -642,6 +649,9 @@ class TestPauseResumeIntegration:
                         "model": "sglang",
                         "messages": [{"role": "user", "content": "Say hi"}],
                         "max_completion_tokens": 16,
+                        "extra_body": {
+                            "chat_template_kwargs": {"enable_thinking": False}
+                        },
                         "temperature": 0.0,
                     },
                     headers={"Authorization": f"Bearer {session_api_key}"},
@@ -700,6 +710,7 @@ class TestPauseResumeIntegration:
                     "model": "sglang",
                     "messages": [{"role": "user", "content": "What is 2+2?"}],
                     "max_completion_tokens": 32,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                 },
                 headers={"Authorization": f"Bearer {session_api_key}"},
@@ -745,6 +756,9 @@ class TestPauseResumeIntegration:
                         "model": "sglang",
                         "messages": [{"role": "user", "content": "Say hello"}],
                         "max_completion_tokens": 16,
+                        "extra_body": {
+                            "chat_template_kwargs": {"enable_thinking": False}
+                        },
                         "temperature": 0.0,
                         "stream": True,
                     },
@@ -839,6 +853,9 @@ class TestConcurrentPauseDuringGeneration:
                             },
                         ],
                         "max_completion_tokens": 256,
+                        "extra_body": {
+                            "chat_template_kwargs": {"enable_thinking": False}
+                        },
                         "temperature": 0.7,
                     },
                     headers={"Authorization": f"Bearer {session_api_key}"},
@@ -910,6 +927,9 @@ class TestConcurrentPauseDuringGeneration:
                             },
                         ],
                         "max_completion_tokens": 256,
+                        "extra_body": {
+                            "chat_template_kwargs": {"enable_thinking": False}
+                        },
                         "temperature": 0.7,
                         "stream": True,
                     },
@@ -994,6 +1014,7 @@ class TestChatCompletionsVLLM:
                     "model": "vllm",
                     "messages": [{"role": "user", "content": "What is 2+2?"}],
                     "max_completion_tokens": 64,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                     "stream": False,
                 },
@@ -1057,6 +1078,7 @@ class TestChatCompletionsVLLM:
                     "model": "vllm",
                     "messages": [{"role": "user", "content": "Say hello"}],
                     "max_completion_tokens": 32,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     "temperature": 0.0,
                     "stream": True,
                 },

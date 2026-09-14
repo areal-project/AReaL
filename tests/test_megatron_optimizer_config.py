@@ -60,8 +60,10 @@ def test_optimizer_loss_scale_is_not_wired_without_optimizer() -> None:
     assert config.grad_scale_func is None
 
 
+@pytest.mark.parametrize("per_token_loss", [False, True])
 def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
     monkeypatch,
+    per_token_loss,
 ) -> None:
     class _MicroBatchList:
         mbs = [{}, {}]
@@ -76,7 +78,10 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
     engine = megatron_engine_module.MegatronEngine.__new__(
         megatron_engine_module.MegatronEngine
     )
-    engine._awex_adapter = None
+    engine._weight_residency = None
+    engine.model = [
+        SimpleNamespace(config=SimpleNamespace(calculate_per_token_loss=per_token_loss))
+    ]
     engine.device = torch.device("cpu")
     engine.optimizer = _Optimizer()
     engine._ensure_ready = lambda: None
@@ -90,6 +95,8 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
 
     def capture_loss(*args, loss_multiplier, **kwargs):
         captured["loss_multiplier"] = loss_multiplier
+        captured["total_loss_weight"] = args[4]
+        captured["per_token_loss"] = kwargs["per_token_loss"]
         return torch.tensor(0.0)
 
     engine._compute_logprobs_and_loss = capture_loss
@@ -122,7 +129,9 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
         loss_weight_fn=lambda input_: torch.tensor(1),
     )
 
-    assert captured["loss_multiplier"] == 6
+    assert captured["loss_multiplier"] == (1.0 if per_token_loss else 6)
+    assert captured["total_loss_weight"] == (None if per_token_loss else 1)
+    assert captured["per_token_loss"] is per_token_loss
 
 
 def test_precision_aware_optimizer_fields_are_applied_before_validation(

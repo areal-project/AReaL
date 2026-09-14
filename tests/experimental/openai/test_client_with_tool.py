@@ -558,17 +558,13 @@ async def test_multi_step_tool_calling_concat_style(openai_client):
     c_a = await openai_client.chat.completions.create(
         messages=msgs_a, tools=tools, tool_choice="auto", max_completion_tokens=8192
     )
-    cleaned_a_content = c_a.choices[0].message.content
     assert c_a.choices[0].message.tool_calls is not None
     assert c_a.choices[0].finish_reason == "tool_calls"
 
+    # Preserve reasoning_content so concat mode can match the cached parent.
     # Leaf A1
     msgs_a1 = msgs_a + [
-        {
-            "role": "assistant",
-            "content": cleaned_a_content,
-            "tool_calls": c_a.choices[0].message.tool_calls,
-        },
+        c_a.choices[0].message.model_dump(exclude_none=True),
         {"role": "tool", "content": "100", "tool_call_id": "mock_id_a1"},
     ]
     c_a1 = await openai_client.chat.completions.create(
@@ -582,17 +578,12 @@ async def test_multi_step_tool_calling_concat_style(openai_client):
     c_b = await openai_client.chat.completions.create(
         messages=msgs_b, tools=tools, tool_choice="auto", max_completion_tokens=8192
     )
-    cleaned_b_content = c_b.choices[0].message.content
     assert c_b.choices[0].message.tool_calls is not None
     assert c_b.choices[0].finish_reason == "tool_calls"
 
     # Leaf B1
     msgs_b1 = msgs_b + [
-        {
-            "role": "assistant",
-            "content": cleaned_b_content,
-            "tool_calls": c_b.choices[0].message.tool_calls,
-        },
+        c_b.choices[0].message.model_dump(exclude_none=True),
         {"role": "tool", "content": "40", "tool_call_id": "mock_id_b1"},
     ]
     c_b1 = await openai_client.chat.completions.create(
