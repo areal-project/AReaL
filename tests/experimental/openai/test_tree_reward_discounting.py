@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
-import torch
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
 
@@ -61,7 +60,10 @@ class TestTreeRewardDiscounting:
         cache_linear.set_reward("c1", 0.1)
 
         # Turn 2
-        m2 = m1 + [{"role": "assistant", "content": "hi"}, {"role": "user", "content": "step 2"}]
+        m2 = m1 + [
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "step 2"},
+        ]
         c2 = _make_dummy_completion("c2")
         i2_t = InteractionWithTokenLogpReward(
             messages=m2,
@@ -79,7 +81,10 @@ class TestTreeRewardDiscounting:
         cache_linear.set_reward("c2", 0.2)
 
         # Turn 3
-        m3 = m2 + [{"role": "assistant", "content": "reply 2"}, {"role": "user", "content": "step 3"}]
+        m3 = m2 + [
+            {"role": "assistant", "content": "reply 2"},
+            {"role": "user", "content": "step 3"},
+        ]
         c3 = _make_dummy_completion("c3")
         i3_t = InteractionWithTokenLogpReward(
             messages=m3,
@@ -97,8 +102,12 @@ class TestTreeRewardDiscounting:
         cache_linear.set_reward("c3", 1.0)
 
         gamma = 0.9
-        res_tree = cache_tree.apply_reward_discount(turn_discount=gamma, discount_mode="tree")
-        res_linear = cache_linear.apply_reward_discount(turn_discount=gamma, discount_mode="linear")
+        res_tree = cache_tree.apply_reward_discount(
+            turn_discount=gamma, discount_mode="tree"
+        )
+        res_linear = cache_linear.apply_reward_discount(
+            turn_discount=gamma, discount_mode="linear"
+        )
 
         # In a linear chain, tree discount is mathematically identical to linear discount
         for cid in ["c1", "c2", "c3"]:
@@ -133,7 +142,10 @@ class TestTreeRewardDiscounting:
         cache.set_reward("root", 0.0)
 
         # Branch A
-        m_a = m_root + [{"role": "assistant", "content": "root"}, {"role": "user", "content": "explore path A"}]
+        m_a = m_root + [
+            {"role": "assistant", "content": "root"},
+            {"role": "user", "content": "explore path A"},
+        ]
         i_a = InteractionWithTokenLogpReward(
             messages=m_a,
             output_message_list=[{"role": "assistant", "content": "a"}],
@@ -143,7 +155,10 @@ class TestTreeRewardDiscounting:
         cache.set_reward("a", 0.0)
 
         # Leaf A1
-        m_a1 = m_a + [{"role": "assistant", "content": "a"}, {"role": "user", "content": "finalize path A"}]
+        m_a1 = m_a + [
+            {"role": "assistant", "content": "a"},
+            {"role": "user", "content": "finalize path A"},
+        ]
         i_a1 = InteractionWithTokenLogpReward(
             messages=m_a1,
             output_message_list=[{"role": "assistant", "content": "a1"}],
@@ -153,7 +168,10 @@ class TestTreeRewardDiscounting:
         cache.set_reward("a1", 1.0)
 
         # Branch B
-        m_b = m_root + [{"role": "assistant", "content": "root"}, {"role": "user", "content": "explore path B"}]
+        m_b = m_root + [
+            {"role": "assistant", "content": "root"},
+            {"role": "user", "content": "explore path B"},
+        ]
         i_b = InteractionWithTokenLogpReward(
             messages=m_b,
             output_message_list=[{"role": "assistant", "content": "b"}],
@@ -163,7 +181,10 @@ class TestTreeRewardDiscounting:
         cache.set_reward("b", 0.0)
 
         # Leaf B1
-        m_b1 = m_b + [{"role": "assistant", "content": "b"}, {"role": "user", "content": "finalize path B"}]
+        m_b1 = m_b + [
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "finalize path B"},
+        ]
         i_b1 = InteractionWithTokenLogpReward(
             messages=m_b1,
             output_message_list=[{"role": "assistant", "content": "b1"}],
@@ -212,7 +233,10 @@ class TestTreeRewardDiscounting:
         assert float(tensor_dict_before["rewards"].item()) == 0.5
         assert float(tensor_dict_before["original_rewards"].item()) == 0.5
 
-        m2 = m1 + [{"role": "assistant", "content": "hi"}, {"role": "user", "content": "step 2"}]
+        m2 = m1 + [
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "step 2"},
+        ]
         resp2 = _make_dummy_response([1, 2, 3, 4, 5, 6], [7, 8])
         i2 = InteractionWithTokenLogpReward(
             messages=m2,
@@ -239,11 +263,17 @@ class TestInteractionTurnIdResolution:
         i1 = InteractionWithTokenLogpReward(messages=m1)
         assert i1.turn_id == 0
 
-        m2 = m1 + [{"role": "assistant", "content": "ans 0"}, {"role": "user", "content": "turn 1"}]
+        m2 = m1 + [
+            {"role": "assistant", "content": "ans 0"},
+            {"role": "user", "content": "turn 1"},
+        ]
         i2 = InteractionWithTokenLogpReward(messages=m2, parent=i1)
         assert i2.turn_id == 1
 
-        m3 = m2 + [{"role": "assistant", "content": "ans 1"}, {"role": "user", "content": "turn 2"}]
+        m3 = m2 + [
+            {"role": "assistant", "content": "ans 1"},
+            {"role": "user", "content": "turn 2"},
+        ]
         i3 = InteractionWithTokenLogpReward(messages=m3, parent=i2)
         assert i3.turn_id == 2
 
@@ -259,7 +289,10 @@ class TestInteractionTurnIdResolution:
         turn_ids_1 = t1["turn_ids"].squeeze(0).tolist()
         assert turn_ids_1 == [-1, -1, 0, 0]
 
-        m2 = m1 + [{"role": "assistant", "content": "ans 0"}, {"role": "user", "content": "turn 1"}]
+        m2 = m1 + [
+            {"role": "assistant", "content": "ans 0"},
+            {"role": "user", "content": "turn 1"},
+        ]
         resp2 = _make_dummy_response([10, 11, 12, 13, 14], [15, 16, 17])
         i2 = InteractionWithTokenLogpReward(
             messages=m2,
