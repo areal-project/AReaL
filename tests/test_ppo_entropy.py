@@ -5,11 +5,9 @@ import torch
 
 from areal.api.cli_args import PPOActorConfig
 from areal.trainer.ppo.actor import grpo_loss_fn
-from areal.utils import stats_tracker
 
 
 def _make_dummy_input():
-    bs, seqlen = 2, 4
     return {
         "logprobs": torch.tensor([[-0.5, -0.6, -0.7, -0.8], [-0.4, -0.3, -0.2, -0.1]]),
         "advantages": torch.tensor([[1.0, 1.0, 1.0, 1.0], [-1.0, -1.0, -1.0, -1.0]]),
@@ -35,7 +33,9 @@ def test_ppo_actor_config_entropy_coeff_validation():
 def test_grpo_loss_fn_entropy_bonus_gradient():
     input_data = _make_dummy_input()
     logprobs = input_data["logprobs"].clone().requires_grad_(True)
-    entropy = torch.tensor([[1.2, 1.5, 1.8, 1.1], [0.9, 1.0, 1.3, 1.4]], requires_grad=True)
+    entropy = torch.tensor(
+        [[1.2, 1.5, 1.8, 1.1], [0.9, 1.0, 1.3, 1.4]], requires_grad=True
+    )
 
     loss_mask = input_data["loss_mask"].bool()
     valid_tokens = loss_mask.sum().item()
@@ -67,7 +67,9 @@ def test_grpo_loss_fn_entropy_bonus_gradient():
 def test_grpo_loss_fn_entropy_zero_is_detached():
     input_data = _make_dummy_input()
     logprobs = input_data["logprobs"].clone().requires_grad_(True)
-    entropy = torch.tensor([[1.2, 1.5, 1.8, 1.1], [0.9, 1.0, 1.3, 1.4]], requires_grad=True)
+    entropy = torch.tensor(
+        [[1.2, 1.5, 1.8, 1.1], [0.9, 1.0, 1.3, 1.4]], requires_grad=True
+    )
 
     loss = grpo_loss_fn(
         logprobs=logprobs,
