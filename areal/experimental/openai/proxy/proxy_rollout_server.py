@@ -1116,10 +1116,8 @@ async def responses(
 
 def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) -> dict:
     """Translate an Anthropic Messages API request to OpenAI format."""
-    return translate_anthropic_request(
-        anthropic_request,
-        message_preprocessors=_message_preprocessors,
-    )
+    # _call_client_create applies preprocessors once for both API formats.
+    return translate_anthropic_request(anthropic_request)
 
 
 async def _safe_stream_wrapper(

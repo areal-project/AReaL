@@ -19,6 +19,7 @@ from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletio
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
 from openai.types.chat.chat_completion_chunk import ChoiceDelta
+from openai.types.completion_usage import CompletionUsage
 from starlette.responses import StreamingResponse
 
 from areal.api import ModelResponse
@@ -123,6 +124,7 @@ async def _fake_create(
         created=0,
         model=model,
         object="chat.completion",
+        usage=CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
     )
 
 
@@ -137,6 +139,56 @@ def _mock_openai_client(monkeypatch):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/messages"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_message_preprocessor_runs_once_per_request(monkeypatch, path, stream):
+    """Non-idempotent preprocessors must not duplicate injected prompt content."""
+    injected_message = {"role": "system", "content": "Injected instruction"}
+    preprocessor = MagicMock(side_effect=lambda messages: [*messages, injected_message])
+    captured_messages = []
+
+    async def create(
+        *, messages, model, stream=False, temperature=None, top_p=None, areal_cache=None
+    ):
+        captured_messages.append(messages)
+        return await _fake_create(
+            messages=messages, model=model, stream=stream, areal_cache=areal_cache
+        )
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = create
+    monkeypatch.setattr(srv, "_openai_client", mock_client)
+    monkeypatch.setattr(srv, "_message_preprocessors", [preprocessor])
+    monkeypatch.setattr(srv, "_capacity", 1)
+
+    async with _client() as client:
+        start = await client.post(
+            "/rl/start_session",
+            headers=_admin_headers(),
+            json={"task_id": "preprocess"},
+        )
+        response = await client.post(
+            path,
+            headers=_session_headers(start.json()["api_key"]),
+            json={
+                "model": "claude-compatible",
+                "max_tokens": 16,
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+                ],
+                "stream": stream,
+            },
+        )
+
+    preprocessor.assert_called_once()
+    assert captured_messages == [
+        [{"role": "user", "content": "hello"}, injected_message]
+    ]
+    assert response.status_code == 200
+    assert "hello" in response.text
 
 
 class TestChatCompletionsEndpoint:
