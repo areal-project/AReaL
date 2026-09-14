@@ -267,7 +267,7 @@ def normalize_group_rewards(
     ``"broadcast"`` (default)
         Every interaction of the rollout receives the group-normalized rollout
         reward. This is the historical behavior and the correct one for
-        outcome-only rollouts, where :meth:`CompletionWithTokenLogpReward.apply_reward_discount`
+        outcome-only rollouts, where :meth:`~areal.experimental.openai.cache.InteractionCache.apply_reward_discount`
         has already propagated the single outcome reward backward, so each
         interaction's reward is a discounted return rather than an independent
         step score.
