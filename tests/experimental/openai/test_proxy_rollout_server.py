@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
-from areal.experimental.openai.proxy.server import SessionData
+from areal.experimental.openai.proxy.server import SessionData, deserialize_interactions
 from areal.experimental.openai.proxy.tensor_reference import GroupTensorStoreRegistry
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry
@@ -93,6 +93,62 @@ def _client():
 
 def _admin_headers():
     return {"Authorization": f"Bearer {_ADMIN_KEY}"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tensor_payload", [False, True])
+async def test_export_restores_session_and_interaction_metadata(
+    monkeypatch, tensor_payload
+):
+    """Session metadata survives the actual HTTP export for both trajectory formats."""
+    monkeypatch.setattr(srv, "_capacity", 1)
+    async with _client() as client:
+        started = await client.post(
+            "/rl/start_session",
+            headers=_admin_headers(),
+            json={
+                "task_id": "metadata-test",
+                "metadata": {"arena_task_id": "arena-a", "label": "session"},
+            },
+        )
+        assert started.status_code == 200
+        session_id = started.json()["session_id"]
+        session = srv._session_cache[session_id]
+        interaction = InteractionWithTokenLogpReward(
+            messages=[{"role": "user", "content": "question"}],
+            output_message_list=[{"role": "assistant", "content": "answer"}],
+            reward=1.0,
+        )
+        # Assignment lets the old code reach the missing serialization path.
+        interaction.metadata = {"label": "interaction"}
+        interaction.interaction_id = "turn"
+        if tensor_payload:
+            interaction._cache = {"input_ids": torch.tensor([[1, 2]])}
+        session.completions["turn"] = interaction
+        session.finish()
+        response = await client.post(
+            "/export_trajectories",
+            headers=_admin_headers(),
+            json={"session_id": session_id, "style": "individual"},
+        )
+
+    assert response.status_code == 200
+    restored = deserialize_interactions(response.json()["interactions"])["turn"]
+    assert restored.metadata == {"arena_task_id": "arena-a", "label": "interaction"}
+    assert session.metadata["label"] == "session"
+    assert restored.has_tensor_data is tensor_payload
+    if tensor_payload:
+        torch.testing.assert_close(
+            restored.to_tensor_dict()["input_ids"],
+            torch.tensor([[1, 2]]),
+            rtol=0,
+            atol=0,
+        )
+    else:
+        assert restored.messages == interaction.messages
+    legacy_payload = response.json()["interactions"]
+    legacy_payload["turn"].pop("metadata", None)
+    assert deserialize_interactions(legacy_payload)["turn"].metadata == {}
 
 
 # ---------------------------------------------------------------------------

@@ -187,7 +187,11 @@ class SessionData:
         if drop_retry_orphans:
             self.completions.drop_retry_orphans()
         self.completions.apply_reward_discount(turn_discount=discount)
-        return self.completions.export_interactions(style=style)
+        interactions = self.completions.export_interactions(style=style)
+        for interaction in interactions.values():
+            # Interaction-specific values override session defaults.
+            interaction.metadata = {**self.metadata, **interaction.metadata}
+        return interactions
 
 
 # =============================================================================
@@ -217,6 +221,7 @@ def serialize_interactions(
                 "reward": interaction.reward,
                 "interaction_id": interaction.interaction_id,
             }
+        result[key]["metadata"] = dict(interaction.metadata)
     if tensor_store is not None:
         result = tensor_store.encode_multimodal_tensors(result)
     return serialize_value(result)
@@ -240,6 +245,7 @@ def deserialize_interactions(
             interaction.output_message_list = item["output_message_list"]
         interaction.reward = item["reward"]
         interaction.interaction_id = item["interaction_id"]
+        interaction.metadata = dict(item.get("metadata") or {})
         result[key] = interaction
     return result
 

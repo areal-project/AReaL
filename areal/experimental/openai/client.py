@@ -908,6 +908,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         output_text: str,
         tool_calls: list | None,
         response: ModelResponse,
+        reasoning_text: str = "",
     ) -> tuple[ChatCompletion, ChatCompletionMessage]:
         """Build ChatCompletion and ChatCompletionMessage objects.
 
@@ -917,6 +918,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             output_text: The generated text output.
             tool_calls: List of tool calls, or None if no tool calls.
             response: The ModelResponse from the inference engine.
+            reasoning_text: Reasoning returned separately from the answer.
 
         Returns:
             A tuple of (ChatCompletion, ChatCompletionMessage).
@@ -926,6 +928,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             role="assistant",
             # For all empty tool calls, set tool_calls=None
             tool_calls=tool_calls or None,
+            **({"reasoning_content": reasoning_text} if reasoning_text else {}),
         )
         chat_completion = ChatCompletion(
             id=completion_id,
@@ -1231,15 +1234,8 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         # Call inference engine
         response = await self.engine.agenerate(model_request)
         output_text = self.tokenizer.decode(response.output_tokens_without_stop)
-        reasoning_text, output_text = split_reasoning(
-            output_text,
-            self.reasoning_parser,
-            force_reasoning=_force_reasoning_from_chat_template_kwargs(
-                extra_body.get("chat_template_kwargs")
-            ),
-        )
-
-        # Parse tool calls.
+        # Parse raw output first: prefilled Qwen thinking may enter a tool call
+        # without emitting </think>. Splitting first would swallow that call.
         tool_calls = None
         try:
             if (is_omitted(tool_choice) or tool_choice != "none") and tools_list:
@@ -1257,6 +1253,14 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 f"{output_text}"
             )
 
+        reasoning_text, output_text = split_reasoning(
+            output_text,
+            self.reasoning_parser,
+            force_reasoning=_force_reasoning_from_chat_template_kwargs(
+                extra_body.get("chat_template_kwargs")
+            ),
+        )
+
         # If streaming is requested, return an async generator
         if is_streaming:
             # Update cache BEFORE returning the generator to ensure the interaction
@@ -1273,6 +1277,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                     output_text=output_text,
                     tool_calls=tool_calls,
                     response=response,
+                    reasoning_text=reasoning_text,
                 )
                 cache[completion_id].completion = chat_completion
                 cache[completion_id].model_response = response
@@ -1297,6 +1302,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             output_text=output_text,
             tool_calls=tool_calls,
             response=response,
+            reasoning_text=reasoning_text,
         )
 
         if cache is not None:

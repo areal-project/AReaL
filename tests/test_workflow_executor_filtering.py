@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import torch
 
-from areal.api import RolloutWorkflow
+from areal.api import ModelResponse, RolloutWorkflow
 from areal.api.cli_args import InferenceEngineConfig
+from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
 from areal.infra.workflow_executor import WorkflowExecutor, _RolloutTaskInput
 
@@ -48,6 +50,40 @@ def _executor():
     )
     executor.logger = MagicMock()
     return executor, manager
+
+
+@pytest.mark.asyncio
+async def test_dump_plain_interaction_accepts_rollout_and_writes_file(tmp_path):
+    """Default interactions must not be rejected merely because dumping is enabled."""
+    interaction = InteractionWithTokenLogpReward(
+        model_response=ModelResponse(
+            input_tokens=[1],
+            output_tokens=[2],
+            output_logprobs=[-0.1],
+            output_versions=[0],
+            stop_reason="stop",
+        ),
+        reward=1.0,
+    )
+    executor, manager = _executor()
+    executor.config.dump_to_file = True
+    executor._get_dump_dir = lambda _is_eval: str(tmp_path)
+    executor._get_tokenizer = lambda: MagicMock(
+        decode=lambda ids, skip_special_tokens=False: str(ids)
+    )
+    task = executor._create_workflow_task(
+        _RolloutTaskInput(
+            task_id=1, data={}, workflow=_TrajectoryWorkflow({"turn": interaction})
+        )
+    )
+
+    result = await task()
+
+    assert result is not None
+    manager.on_rollout_accepted.assert_called_once_with()
+    manager.on_rollout_rejected.assert_not_called()
+    record = json.loads((tmp_path / "0" / "1.jsonl").read_text())
+    assert record["reward"] == 1.0
 
 
 @pytest.mark.asyncio

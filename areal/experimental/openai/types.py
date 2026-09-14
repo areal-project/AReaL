@@ -64,6 +64,9 @@ class InteractionWithTokenLogpReward:
     # Interaction ID cache (used for deserialization)
     _interaction_id: str | None = None
 
+    # Per-interaction dump metadata, kept separate from training tensors.
+    metadata: dict[str, Any] = field(default_factory=dict)
+
     @property
     def has_tensor_data(self) -> bool:
         return self.model_response is not None or self._cache is not None
