@@ -17,6 +17,7 @@ from areal.infra.rpc.rtensor import (
     HttpRTensorBackend,
     RTensor,
     TensorShardInfo,
+    fetch,
 )
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.proc import kill_process_tree
@@ -778,6 +779,14 @@ class TestRemotize:
             [traj1, traj2], result, [3, 4], strict=True
         ):
             for key in original:
+                # remotize stores locally; to_local fetches from the RPC process.
+                shard_id = remote[key].shard.shard_id
+                response = requests.put(
+                    f"http://{rpc_server}/data/{shard_id}",
+                    data=orjson.dumps(serialize_value(fetch(shard_id))),
+                    timeout=5,
+                )
+                assert response.status_code == 200
                 torch.testing.assert_close(
                     remote[key].to_local(), original[key][:, :seqlen], rtol=0, atol=0
                 )
