@@ -17,6 +17,7 @@ from areal.infra.rpc.rtensor import (
     HttpRTensorBackend,
     RTensor,
     TensorShardInfo,
+    fetch,
 )
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.proc import kill_process_tree
@@ -223,7 +224,6 @@ class TestRTensorIntegration:
         assert remotized["score"] == 0.95
 
         # Store tensor on server using the NEW shard_id created by remotize
-        from areal.infra.rpc.rtensor import fetch
 
         actual_shard_id = remotized["logits"].shard.shard_id
         tensor_from_local = fetch(actual_shard_id)
@@ -774,10 +774,30 @@ class TestRemotize:
         assert result[0]["logits"].shape[0] == 2
         assert result[1]["logits"].shape[0] == 3
 
+        # Remotize stores locally; the separate RPC process needs its own copy.
+
+        for remote in result:
+            for tensor in remote.values():
+                shard_id = tensor.shard.shard_id
+                serialized = serialize_value(fetch(shard_id))
+                response = requests.put(
+                    f"http://{rpc_server}/data/{shard_id}",
+                    data=orjson.dumps(serialized),
+                )
+                assert response.status_code == 200
+
         for original, remote, seqlen in zip(
             [traj1, traj2], result, [3, 4], strict=True
         ):
             for key in original:
+                # remotize stores locally; to_local fetches from the RPC process.
+                shard_id = remote[key].shard.shard_id
+                response = requests.put(
+                    f"http://{rpc_server}/data/{shard_id}",
+                    data=orjson.dumps(serialize_value(fetch(shard_id))),
+                    timeout=5,
+                )
+                assert response.status_code == 200
                 torch.testing.assert_close(
                     remote[key].to_local(), original[key][:, :seqlen], rtol=0, atol=0
                 )
@@ -876,7 +896,6 @@ class TestRemotize:
         remotized = RTensor.remotize(original_traj, node_addr=rpc_server)
 
         # Store tensors on server using the NEW shard_ids created by remotize
-        from areal.infra.rpc.rtensor import fetch
 
         for key in ["attention_mask", "logits"]:
             if isinstance(remotized[key], RTensor):
@@ -922,7 +941,6 @@ class TestRemotize:
         assert remotized["logits"].data.shape == torch.Size([2, 3])
 
         # Verify via localize roundtrip
-        from areal.infra.rpc.rtensor import fetch
 
         for key in ["attention_mask", "input_ids", "logits"]:
             actual_shard_id = remotized[key].shard.shard_id

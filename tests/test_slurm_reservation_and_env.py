@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for reservation/exclusive sbatch options and env-var precedence."""
 
+import os
+import shlex
+import subprocess
 from unittest import mock
 
 import pytest
@@ -61,6 +64,81 @@ class TestSchedulingSpecSlurmOptions:
             assert token in script, f"{token!r} missing from sbatch script"
         for token in absent:
             assert token not in script, f"{token!r} unexpectedly in sbatch script"
+
+
+@pytest.mark.parametrize("container_type", ["native", "apptainer"])
+@pytest.mark.parametrize(
+    "device_var", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"]
+)
+@pytest.mark.parametrize(
+    "visible,local_rank,gpus,expected",
+    [
+        ("3", 0, 1, "3"),
+        ("2,5,7,9", 0, 2, "2,5"),
+        ("2,5,7,9", 1, 2, "7,9"),
+        ("0", 0, 1, "0"),
+        ("GPU-abc,MIG-GPU-def/1/0", 1, 1, "MIG-GPU-def/1/0"),
+        (None, 0, 1, None),
+        ("", 0, 1, None),
+        ("-1", 0, 1, None),
+        ("2,,3", 0, 1, None),
+        ("2,", 0, 1, None),
+        ("2", 1, 1, None),
+    ],
+)
+def test_worker_gpu_assignment_preserves_slurm_allocation(
+    container_type, device_var, visible, local_rank, gpus, expected
+):
+    scheduler = object.__new__(SlurmScheduler)
+    scheduler._n_gpus_per_node = 4
+    scheduler.experiment_name = "exp"
+    scheduler.trial_name = "trial"
+    scheduler.fileroot = "/tmp/areal-test"
+    scheduler._slurm_name = lambda role: f"exp-trial-{role}"
+    scheduler.name_resolve_config = NameResolveConfig()
+    scheduler.container_type = container_type
+    scheduler.container_mounts = ""
+    scheduler.srun_additional_args = "--mpi=none"
+    spec = SchedulingSpec(gpu=gpus, cpu=1, mem=1, cmd="true")
+    script = scheduler._generate_sbatch_script(
+        role="actor",
+        replicas=4 // gpus,
+        nodes=1,
+        total_gpus=4,
+        cpus_per_task=1,
+        mem_per_task=1024,
+        schedulings=[spec],
+        nodelist=None,
+        exclude=None,
+    )
+    tokens = shlex.split(script[script.index("stdbuf -oL srun") :])
+    command = tokens[tokens.index("bash") + 2]
+    command = command[: command.rindex("true --experiment-name")]
+    command += f'printf "%s" "${{{device_var}}}"'
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"}
+    }
+    env.update(SLURM_LOCALID=str(local_rank), SLURM_STEP_GPUS="6")
+    other_var = (
+        "ASCEND_RT_VISIBLE_DEVICES"
+        if device_var == "CUDA_VISIBLE_DEVICES"
+        else "CUDA_VISIBLE_DEVICES"
+    )
+    env[other_var] = ""
+    if visible is not None:
+        env[device_var] = visible
+    result = subprocess.run(
+        ["bash", "-c", command], env=env, capture_output=True, text=True
+    )
+    if expected is None:
+        assert result.returncode != 0
+        assert result.stdout == ""
+        assert "Slurm-visible device" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == expected
 
 
 class TestUserEnvPrecedence:

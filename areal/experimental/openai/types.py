@@ -41,6 +41,7 @@ class InteractionWithTokenLogpReward:
     model_response: ModelResponse | None = None
     reward: float | None = None
     original_reward: float | None = None
+    token_rewards: torch.Tensor | None = None
     parent: InteractionWithTokenLogpReward | None = None
     chat_template_type: str = "hf"
     _cache: dict[str, Any] | None = None
@@ -161,6 +162,15 @@ class InteractionWithTokenLogpReward:
                 "input tokens. The trajectory cannot be trained safely."
             )
         self.seq_tokens = seq = resp.input_tokens + resp.output_tokens
+
+        if self.token_rewards is not None:
+            if self.token_rewards.shape != torch.Size((resp.output_len,)):
+                raise ValueError(
+                    f"token_rewards must be shape ({resp.output_len},), got "
+                    f"{tuple(self.token_rewards.shape)}"
+                )
+
+        parent_token_rewards_tensor = None
         if self.chat_template_type == "concat" and self.parent is not None:
             parent_res = self.parent.to_tensor_dict()
             parent_logprobs = parent_res["logprobs"].squeeze(0).tolist()
@@ -176,6 +186,7 @@ class InteractionWithTokenLogpReward:
             )
             valid_parent_turn_ids = [tid for tid in parent_turn_ids if tid >= 0]
             own_turn_id = max(valid_parent_turn_ids) + 1 if valid_parent_turn_ids else 0
+            parent_token_rewards_tensor = parent_res.get("token_rewards")
             if resp.input_len > parent_len:
                 logprobs = (
                     parent_logprobs
@@ -250,6 +261,13 @@ class InteractionWithTokenLogpReward:
                 dtype=torch.long,
             ).unsqueeze(0)
             result["multi_modal_input"] = [self.multi_modal_input or {}]
+        if self.token_rewards is not None or parent_token_rewards_tensor is not None:
+            token_rewards = torch.zeros(len(seq), dtype=torch.float32, device="cpu")
+            if parent_token_rewards_tensor is not None and resp.input_len > parent_len:
+                token_rewards[:parent_len] = parent_token_rewards_tensor.squeeze(0)
+            if self.token_rewards is not None:
+                token_rewards[resp.input_len :] = self.token_rewards.detach()
+            result["token_rewards"] = token_rewards.unsqueeze(0)
         self._cache = result
         return result
 
