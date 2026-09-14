@@ -1,7 +1,8 @@
-# Two-node Qwen hybrid-attention smoke run: rollout, PPO, and AWEX updates.
+# Two-node Qwen hybrid-attention example: rollout, PPO, and AWEX updates.
 # Set MODEL_PATH, FILEROOT, WORKER_IMAGE, WORKER_MOUNTS and AREAL_PROXY_ADMIN_KEY.
-# Tested with Megatron-Core 0.18.2, Megatron Bridge 0.5.1, AWEX 0.8.1,
-# SGLang 0.5.10.post1 and cuDNN 9.25.1.1. Older GDN runtimes do not support CP.
+# Use a worker image with compatible Megatron Bridge, AWEX, and SGLang.
+# Qwen3.5 uses padded input and requires CP=1.
+# This configuration still requires a multi-node smoke test.
 defaults:
   - gsm8k_grpo_awex_colocate
   - _self_
@@ -26,7 +27,7 @@ gconfig:
   max_tokens: 2048
 
 actor:
-  backend: "megatron:d1p2t4c2e1"
+  backend: "megatron:d2p2t4c1e1"
   path: ${oc.env:MODEL_PATH}
   mb_spec:
     n_mbs: 4
