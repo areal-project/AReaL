@@ -1,10 +1,11 @@
 import json
 import os
 import time
+from contextlib import nullcontext
 from importlib.metadata import version as get_version
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, call
 
 import pytest
 import torch
@@ -202,6 +203,61 @@ def test_bailing_v3_bridge_rejects_mtp_construction(monkeypatch):
 
     with pytest.raises(ValueError, match="does not support enable_mtp"):
         engine._build_hf_mcore_bridge()
+
+
+def test_dcp_save_waits_for_async_save_when_requested(tmp_path):
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine._weight_residency = None
+    engine._offload_aware_context = MagicMock(return_value=nullcontext())
+    engine.checkpointer = MagicMock()
+    meta = SaveLoadMeta(
+        path=str(tmp_path / "checkpoint"),
+        weight_format="dcp",
+        with_optim=True,
+        wait_for_async_save=True,
+    )
+
+    engine.save(meta)
+
+    assert engine.checkpointer.method_calls == [
+        call.save_checkpoint(meta.path, with_optimizer=True),
+        call.wait_async_saves(),
+    ]
+
+
+def test_dcp_save_does_not_wait_after_schedule_failure(tmp_path):
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine._weight_residency = None
+    engine._offload_aware_context = MagicMock(return_value=nullcontext())
+    engine.checkpointer = MagicMock()
+    engine.checkpointer.save_checkpoint.side_effect = RuntimeError("save failed")
+    meta = SaveLoadMeta(
+        path=str(tmp_path / "checkpoint"),
+        weight_format="dcp",
+        with_optim=True,
+        wait_for_async_save=True,
+    )
+
+    with pytest.raises(RuntimeError, match="save failed"):
+        engine.save(meta)
+
+    engine.checkpointer.wait_async_saves.assert_not_called()
+
+
+def test_dcp_save_does_not_wait_when_not_requested(tmp_path):
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine._weight_residency = None
+    engine._offload_aware_context = MagicMock(return_value=nullcontext())
+    engine.checkpointer = MagicMock()
+    meta = SaveLoadMeta(
+        path=str(tmp_path / "checkpoint"),
+        weight_format="dcp",
+        with_optim=True,
+    )
+
+    engine.save(meta)
+
+    engine.checkpointer.wait_async_saves.assert_not_called()
 
 
 # Cannot use a "module" scope since process groups can only be initialized once.

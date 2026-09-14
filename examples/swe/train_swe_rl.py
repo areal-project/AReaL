@@ -68,6 +68,13 @@ def get_swe_dataset(
         while len(dataset_items) < min_items:
             dataset_items.extend(original_items)
 
+    # ``Dataset.from_list`` infers its columns from the first record only, so
+    # fields that appear exclusively in later heterogeneous records would be
+    # silently dropped. Materialize the union schema before Arrow conversion to
+    # preserve every field across records with different shapes.
+    all_keys = sorted(set().union(*(item.keys() for item in dataset_items)))
+    dataset_items = [{key: item.get(key) for key in all_keys} for item in dataset_items]
+
     dataset = Dataset.from_list(dataset_items)
     logger.info(
         f"Created SWE dataset with {len(dataset)} items "

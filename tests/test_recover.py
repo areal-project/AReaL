@@ -3,12 +3,14 @@
 import dataclasses
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from areal.api.cli_args import RecoverConfig
 from areal.api.io_struct import FinetuneSpec, StepInfo
+from areal.utils import checkpoint_pointer
 from areal.utils.recover import (
     RecoverHandler,
     check_if_auto_recover,
@@ -237,6 +239,211 @@ class TestRecoverHandler:
     def _make_gateway_controller() -> GatewayTrainController:
         return GatewayTrainController.__new__(GatewayTrainController)
 
+    @staticmethod
+    def _dump_dependencies():
+        saver = Mock()
+        saver.state_dict.return_value = {}
+        evaluator = Mock()
+        evaluator.state_dict.return_value = {}
+        stats_logger = Mock()
+        stats_logger.state_dict.return_value = {}
+        dataloader = Mock()
+        dataloader.state_dict.return_value = {}
+        dataloader.sampler = None
+        return saver, evaluator, stats_logger, dataloader
+
+    @staticmethod
+    def _step_info(handler: RecoverHandler, global_step: int = 3) -> StepInfo:
+        return StepInfo(
+            epoch=0,
+            epoch_step=global_step,
+            global_step=global_step,
+            steps_per_epoch=handler.ft_spec.steps_per_epoch,
+        )
+
+    def test_dump_sync_engine_publishes_generation(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        engine = Mock()
+        engine.config = SimpleNamespace(
+            backend="fsdp:d1", megatron=SimpleNamespace(async_save=False)
+        )
+
+        handler.dump(
+            engine,
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert checkpoint_pointer.read_latest(save_root).global_step == 3
+        meta = engine.save.call_args.args[0]
+        assert meta.path == checkpoint_pointer.payload_dir(
+            checkpoint_pointer.generation_dir(save_root, 3), "default"
+        )
+        assert meta.checkpoint_pointer_path is None
+
+    def test_dump_async_megatron_defers_pointer_to_finalize(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        engine = Mock()
+        engine.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+
+        handler.dump(
+            engine,
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert checkpoint_pointer.read_latest(save_root) is None
+        meta = engine.save.call_args.args[0]
+        assert meta.wait_for_async_save is False
+        assert meta.checkpoint_pointer_path == checkpoint_pointer.latest_path(save_root)
+
+        checkpoint_pointer.publish_latest(save_root, meta.checkpoint_pointer_value)
+        assert checkpoint_pointer.read_latest(save_root).global_step == 3
+
+    def test_dump_multiple_async_engines_waits_before_deferred_publication(
+        self, tmp_path
+    ):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        save_order = []
+        actor = Mock()
+        actor.save.side_effect = lambda _meta: save_order.append("default")
+        actor.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+        critic = Mock()
+        critic.save.side_effect = lambda _meta: save_order.append("critic")
+        critic.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+
+        handler.dump(
+            {"default": actor, "critic": critic},
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert checkpoint_pointer.read_latest(save_root) is None
+        assert save_order == ["default", "critic"]
+
+        actor_meta = actor.save.call_args.args[0]
+        assert actor_meta.wait_for_async_save is True
+        assert actor_meta.checkpoint_pointer_path is None
+
+        critic_meta = critic.save.call_args.args[0]
+        assert critic_meta.wait_for_async_save is False
+        assert critic_meta.checkpoint_pointer_path == checkpoint_pointer.latest_path(
+            save_root
+        )
+
+        checkpoint_pointer.publish_latest(
+            save_root, critic_meta.checkpoint_pointer_value
+        )
+        assert checkpoint_pointer.read_latest(save_root).global_step == 3
+
+    def test_dump_mixed_engines_saves_async_publisher_last(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        save_order = []
+        actor = Mock()
+        actor.save.side_effect = lambda _meta: save_order.append("default")
+        actor.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+        critic = Mock()
+        critic.save.side_effect = lambda _meta: save_order.append("critic")
+        critic.config = SimpleNamespace(
+            backend="fsdp:d1", megatron=SimpleNamespace(async_save=False)
+        )
+
+        handler.dump(
+            {"default": actor, "critic": critic},
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert save_order == ["critic", "default"]
+        assert critic.save.call_args.args[0].checkpoint_pointer_path is None
+        assert actor.save.call_args.args[
+            0
+        ].checkpoint_pointer_path == checkpoint_pointer.latest_path(save_root)
+        assert checkpoint_pointer.read_latest(save_root) is None
+
+    def test_dump_multiple_engines_keeps_latest_when_publisher_save_fails(
+        self, tmp_path
+    ):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        actor = Mock()
+        actor.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+        critic = Mock()
+        critic.save.side_effect = RuntimeError("critic save failed")
+        critic.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        _, previous = checkpoint_pointer.prepare_generation(
+            save_root, 2, ["default", "critic"]
+        )
+        checkpoint_pointer.publish_latest(save_root, previous.to_json())
+
+        with pytest.raises(RuntimeError, match="critic save failed"):
+            handler.dump(
+                {"default": actor, "critic": critic},
+                self._step_info(handler),
+                *self._dump_dependencies(),
+            )
+
+        assert actor.save.call_args.args[0].wait_for_async_save is True
+        assert checkpoint_pointer.read_latest(save_root).global_step == 2
+
+    def test_dump_spmd_mode_preserves_legacy_layout(self, tmp_path, monkeypatch):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        monkeypatch.setenv("AREAL_SPMD_MODE", "1")
+        engine = Mock()
+        engine.config = SimpleNamespace(
+            backend="fsdp:d1", megatron=SimpleNamespace(async_save=False)
+        )
+
+        handler.dump(
+            engine,
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        meta = engine.save.call_args.args[0]
+        assert meta.path == Saver.get_recover_checkpoint_path(
+            "test_exp", "test_trial", str(tmp_path), name="default"
+        )
+        assert os.path.isdir(
+            os.path.join(save_root, checkpoint_pointer.LEGACY_MANIFEST_DIRNAME)
+        )
+        assert checkpoint_pointer.read_latest(save_root) is None
+
     @pytest.mark.parametrize("mode", ["on", "auto"])
     def test_load_rejects_gateway_train_controller(self, mode):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -286,10 +493,22 @@ class TestRecoverHandler:
             handler = self._make_handler(tmpdir, "auto", no_save_optim=no_save_optim)
             engine = Mock()
 
-            handler._save_checkpoint(engine)
+            handler._save_checkpoint(engine, path=os.path.join(tmpdir, "checkpoint"))
 
             meta = engine.save.call_args[0][0]
             assert meta.with_optim is (not no_save_optim)
+
+    def test_save_checkpoint_passes_wait_for_async_save(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "auto")
+        engine = Mock()
+
+        handler._save_checkpoint(
+            engine,
+            path=str(tmp_path / "checkpoint"),
+            wait_for_async_save=True,
+        )
+
+        assert engine.save.call_args.args[0].wait_for_async_save is True
 
     @pytest.mark.parametrize("no_load_optim", [False, True])
     def test_load_checkpoint_passes_with_optim_from_config(self, no_load_optim):
@@ -306,10 +525,38 @@ class TestRecoverHandler:
                 exist_ok=True,
             )
 
-            handler._load_checkpoint(engine)
+            handler._load_checkpoint(
+                engine,
+                path=Saver.get_recover_checkpoint_path(
+                    "test_exp", "test_trial", tmpdir, name="default"
+                ),
+            )
 
             meta = engine.load.call_args[0][0]
             assert meta.with_optim is (not no_load_optim)
+
+
+class TestPPORecoverEngines:
+    def test_actor_only_returns_default_engine(self):
+        from areal.trainer.rl_trainer import PPOTrainer
+
+        trainer = PPOTrainer.__new__(PPOTrainer)
+        trainer.actor = Mock()
+        trainer.critic = None
+
+        assert trainer._recover_engines() == {"default": trainer.actor}
+
+    def test_critic_is_included_with_stable_name(self):
+        from areal.trainer.rl_trainer import PPOTrainer
+
+        trainer = PPOTrainer.__new__(PPOTrainer)
+        trainer.actor = Mock()
+        trainer.critic = Mock()
+
+        assert trainer._recover_engines() == {
+            "default": trainer.actor,
+            "critic": trainer.critic,
+        }
 
 
 class TestAwexColocateGate:

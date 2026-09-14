@@ -6,6 +6,7 @@ import os
 from typing import TYPE_CHECKING
 
 import torch.distributed as dist
+from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api import FinetuneSpec, Scheduler, StepInfo
@@ -42,7 +43,7 @@ from areal.utils.environ import (
 from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.perf_tracer import Category
-from areal.utils.recover import RecoverHandler
+from areal.utils.recover import RecoverHandler, RecoverInfo
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 
@@ -54,6 +55,14 @@ if TYPE_CHECKING:
     from areal.trainer.sft.lm_engine import LMController
 
 logger = logging.getLogger("SFTTrainer")
+
+
+def _restore_sampler_epoch_for_recovery(
+    dataloader: StatefulDataLoader, recover_info: RecoverInfo | None
+) -> None:
+    """Restore the epoch whose iterator state was saved in the checkpoint."""
+    if recover_info is not None and isinstance(dataloader.sampler, DistributedSampler):
+        dataloader.sampler.set_epoch(recover_info.last_step_info.epoch)
 
 
 class SFTTrainer:
@@ -170,6 +179,10 @@ class SFTTrainer:
         max_steps = total_epochs * steps_per_epoch
 
         global_step = 0
+        _restore_sampler_epoch_for_recovery(
+            self.train_dataloader,
+            self.recover_info,
+        )
         data_generator = cycle_dataloader(self.train_dataloader)
         if self.recover_info is None and self._evaluate_before_train():
             self._export_and_commit_stats(
