@@ -264,6 +264,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 discount=self.discount,
                 style=self.export_style,
                 drop_retry_orphans=self.drop_retry_orphans,
+                is_eval=workflow_context.get().is_eval,
             )
 
             # Return None if no interactions (empty session — user never sent chat/completions)
@@ -319,7 +320,14 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             discount=self.discount,
             style=self.export_style,
             drop_retry_orphans=self.drop_retry_orphans,
+            is_eval=workflow_context.get().is_eval,
         )
+
+        if not interactions:
+            logger.warning(
+                "Proxy export returned no interactions; rejecting trajectory"
+            )
+            return None
 
         # Record stats
         last_id = list(interactions.keys())[-1] if interactions else None

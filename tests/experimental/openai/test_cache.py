@@ -147,6 +147,26 @@ def test_export_with_reward_discount(mock_interaction):
     assert ordered_cache["1"].reward == pytest.approx(8.1)
 
 
+def test_concat_reward_discount_does_not_mix_sibling_outcomes(mock_interaction):
+    """Concat leaves retain branch-local rewards regardless of insertion order."""
+    root = mock_interaction(id="root", reward=0.25)
+    leaf_a = mock_interaction(id="leaf-a", reward=1.0)
+    leaf_b = mock_interaction(id="leaf-b", reward=2.0)
+    leaf_a.parent = root
+    leaf_b.parent = root
+    cache = InteractionCache.from_dict(
+        {"root": root, "leaf-a": leaf_a, "leaf-b": leaf_b}
+    )
+
+    exported = cache.export_interactions(style="concat", reward_discount=0.5)
+
+    assert list(exported) == ["leaf-a", "leaf-b"]
+    assert root.reward == pytest.approx(0.25)
+    assert leaf_a.reward == pytest.approx(1.0)
+    assert leaf_b.reward == pytest.approx(2.0)
+    assert cache._apply_reward_discount_called is False
+
+
 def test_export_triggers_reward_discount_once(mock_interaction):
     cache = InteractionCache()
     cache["1"] = mock_interaction(id="1", reward=10.0)

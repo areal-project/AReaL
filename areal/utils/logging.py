@@ -113,6 +113,7 @@ LOGGER_COLORS_EXACT = {
     "OpenAIProxy": "light_purple",
     "ToolCallParser": "light_purple",
     "TokenLogpReward": "light_purple",
+    "PRMRunner": "light_purple",
     "ProxyUtils": "light_purple",
     "AReaL-SWEAgent": "light_purple",
     "SWETrain": "light_green",

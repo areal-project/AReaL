@@ -57,11 +57,10 @@ def _merge_worker_stats(
 ) -> dict[str, float]:
     """Merge independently aggregated stats from rollout workers.
 
-    ``DistributedStatsTracker`` exports scalar means with a ``__count``
-    companion and tensor distributions as ``/avg``, ``/min``, and ``/max``
-    keys alongside their ``<base>_count`` denominator.  Preserve those
-    reduction semantics when combining workers instead of treating every key
-    without ``__count`` as a sum.
+    Scalar means carry a ``__count`` companion. Distributions using the
+    ``<base>_count`` convention retain weighted averages and extrema. PRM
+    count/sum metrics have explicit SUM semantics; omit other tensor metrics
+    whose reduction or denominator cannot be determined from the export.
     """
     sums = defaultdict(float)
     scalar_weighted_sums = defaultdict(float)
@@ -106,8 +105,20 @@ def _merge_worker_stats(
                     )
                 continue
 
-            # SUM-typed metrics, including distribution denominator counts.
-            sums[key] += value
+            metric_key = key.removeprefix("rollout/").removeprefix("eval-rollout/")
+            segments = metric_key.split("/")
+            is_prm_sum = (
+                len(segments) == 5
+                and segments[0] == "prm_metric"
+                and segments[1] in {"turn", "trajectory"}
+                and segments[-1] in {"count", "sum", "observed_count"}
+            )
+            is_distribution_count = key.endswith("_count") and any(
+                f"{key.removesuffix('_count')}/{reduction}" in raw_stats
+                for reduction in ("avg", "min", "max")
+            )
+            if is_prm_sum or is_distribution_count:
+                sums[key] += value
 
     merged = dict(sums)
     for key, weighted_sum in scalar_weighted_sums.items():
@@ -1406,6 +1417,17 @@ class RolloutController:
 
     def export_stats(self) -> dict[str, float]:
         all_raw_stats = self._collective_rpc(method="export_stats", http_timeout=60.0)
+        agent_config = self.config.agent
+        if (
+            self._proxy_started
+            and self.proxy_workers
+            and agent_config is not None
+            and agent_config.prm.enabled
+            and any(scorer.enabled for scorer in agent_config.prm.scorers)
+        ):
+            all_raw_stats += self._proxy_collective_rpc(
+                method="export_stats", http_timeout=60.0
+            )
         return _merge_worker_stats(all_raw_stats)
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:

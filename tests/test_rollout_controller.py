@@ -1352,7 +1352,7 @@ class TestRolloutControllerExportStats:
                 "rollout/num_turns/avg": 15.0,
                 "rollout/num_turns/min": 10.0,
                 "rollout/num_turns/max": 20.0,
-                "rollout/harness_errors": 3,
+                "rollout/prm_metric/turn/scorer/accepted/count": 3,
             },
             {
                 "rollout/reward": 0.8,
@@ -1361,7 +1361,7 @@ class TestRolloutControllerExportStats:
                 "rollout/num_turns/avg": 40.0,
                 "rollout/num_turns/min": 40.0,
                 "rollout/num_turns/max": 40.0,
-                "rollout/harness_errors": 5,
+                "rollout/prm_metric/turn/scorer/accepted/count": 5,
             },
         ]
 
@@ -1373,7 +1373,7 @@ class TestRolloutControllerExportStats:
         assert stats["rollout/num_turns/avg"] == pytest.approx(70 / 3)
         assert stats["rollout/num_turns/min"] == 10.0
         assert stats["rollout/num_turns/max"] == 40.0
-        assert stats["rollout/harness_errors"] == 8
+        assert stats["rollout/prm_metric/turn/scorer/accepted/count"] == 8
 
     def test_merge_worker_stats_ignores_empty_distribution_workers(self):
         """Workers without a distribution do not change its extrema or average."""
