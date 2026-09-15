@@ -172,8 +172,19 @@ def create_engine_module(
         def handler():
             data = request.get_json(silent=True)
             raw_args, raw_kwargs = parse_args_kwargs(data)
-            args = RTensor.localize(raw_args)
-            kwargs = RTensor.localize(raw_kwargs)
+            engine = require_engine()
+            # Match v1's CPU-staged Megatron path: resolve each image shard once
+            # and retain shared tensors until logical microbatch reconstruction.
+            preserve_tensor_aliases = method_name in getattr(
+                engine, "cpu_staged_rpc_methods", ()
+            )
+            if preserve_tensor_aliases:
+                args, kwargs = RTensor.localize(
+                    (raw_args, raw_kwargs), preserve_tensor_aliases=True
+                )
+            else:
+                args = RTensor.localize(raw_args)
+                kwargs = RTensor.localize(raw_kwargs)
             result = execute_compute(
                 method_name,
                 args,

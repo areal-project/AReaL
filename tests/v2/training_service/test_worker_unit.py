@@ -197,6 +197,65 @@ def test_compute_endpoint_only_stores_collectable_results(
     )
 
 
+@pytest.mark.parametrize("cpu_staged", [True, False])
+def test_compute_endpoint_fetches_shared_images_once_only_for_cpu_staging(
+    client, monkeypatch, cpu_staged
+):
+    """Megatron preserves wire aliases; unstaged engines retain legacy behavior."""
+    import torch
+
+    import areal.v2.training_service.worker.app as worker_app
+    from areal.infra.rpc import rtensor
+
+    image = torch.ones((4, 3), dtype=torch.float32)
+    remote = RTensor(
+        shard=rtensor.TensorShardInfo(shard_id="image", node_addr="test.invalid"),
+        data=torch.empty_like(image, device="meta"),
+    )
+    backend = MagicMock()
+    backend.fetch.side_effect = lambda shards: [image.clone() for _ in shards]
+    monkeypatch.setattr(rtensor, "get_backend", lambda: backend)
+    monkeypatch.setattr(rtensor, "_fetch_buffer", {})
+    captured = {}
+
+    def train_batch(batch):
+        captured["images"] = [
+            item["pixel_values"] for item in batch["multi_modal_input"]
+        ]
+
+    engine = SimpleNamespace(
+        cpu_staged_rpc_methods={"train_batch"} if cpu_staged else set(),
+        cpu_model_parallel_group="cpu-group",
+        context_and_model_parallel_group="other-group",
+        data_parallel_world_size=1,
+        current_data_parallel_head=lambda: 0,
+        train_batch=train_batch,
+    )
+    monkeypatch.setattr(worker_app, "_engine", engine)
+    monkeypatch.setattr(worker_app, "_submit_to_engine_thread", lambda _name, fn: fn())
+    monkeypatch.setattr(
+        worker_app, "current_platform", SimpleNamespace(current_device=lambda: "cpu")
+    )
+    monkeypatch.setattr(
+        worker_app, "broadcast_tensor_container", lambda value, **_: value
+    )
+    payload = {
+        "multi_modal_input": [{"pixel_values": remote}, {"pixel_values": remote}]
+    }
+
+    response = client.post(
+        "/train_batch", json={"args": serialize_value([payload]), "kwargs": {}}
+    )
+
+    assert response.status_code == 200, response.get_json()
+    backend.fetch.assert_called_once()
+    assert len(backend.fetch.call_args.args[0]) == (1 if cpu_staged else 2)
+    first, second = captured["images"]
+    assert (first is second) == cpu_staged
+    torch.testing.assert_close(first, image, rtol=0, atol=0)
+    torch.testing.assert_close(second, image, rtol=0, atol=0)
+
+
 class TestWorkerEngineCreation:
     def test_create_engine_requires_engine_class(self, client):
         resp = client.post(

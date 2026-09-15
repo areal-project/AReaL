@@ -945,11 +945,56 @@ class PPOActorControllerV2(GatewayTrainController):
         return self._gateway_post_result("/ppo/actor/compute_logp", payload)
 
     def compute_advantages(self, *args, **kwargs):
+        multi_modal_payloads = []
+        if (
+            self.train_alloc.backend == "megatron"
+            and args
+            and isinstance(args[0], list)
+            and all(isinstance(item, dict) for item in args[0])
+        ):
+            data = args[0]
+            multi_modal_payloads = [
+                {key: value for key, value in item.items() if is_multi_modal_key(key)}
+                for item in data
+            ]
+            if any(multi_modal_payloads):
+                # Match v1: advantage computation never consumes vision data.
+                # Keep the original references here, avoiding a worker round
+                # trip and replication when the batched result is split.
+                args = (
+                    [
+                        {
+                            key: value
+                            for key, value in item.items()
+                            if not is_multi_modal_key(key)
+                        }
+                        for item in data
+                    ],
+                    *args[1:],
+                )
         payload = {
             "args": serialize_value(list(args)),
             "kwargs": serialize_value(kwargs),
         }
-        return self._gateway_post_result("/ppo/actor/compute_advantages", payload)
+        results = self._gateway_post_result("/ppo/actor/compute_advantages", payload)
+        if any(multi_modal_payloads):
+            if not isinstance(results, list) or len(results) != len(
+                multi_modal_payloads
+            ):
+                raise RuntimeError(
+                    "Megatron compute_advantages returned an invalid trajectory batch: "
+                    f"expected {len(multi_modal_payloads)} items, got "
+                    f"{type(results).__name__} of length "
+                    f"{len(results) if isinstance(results, list) else 'unknown'}"
+                )
+            for result, mm_payload in zip(results, multi_modal_payloads, strict=True):
+                if not isinstance(result, dict):
+                    raise RuntimeError(
+                        "Megatron compute_advantages returned a non-dict trajectory: "
+                        f"{type(result).__name__}"
+                    )
+                result.update(mm_payload)
+        return results
 
     def ppo_update(self, *args, **kwargs) -> None:
         payload = {
