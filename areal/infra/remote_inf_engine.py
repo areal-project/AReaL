@@ -101,6 +101,9 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             processor_cache=shared_processor_cache,
         )
 
+        completed_results: list[Any] = [None] * self.group_size
+        group_error: Exception | None = None
+
         async def run_sample(sample_idx: int) -> tuple[int, Any]:
             workflow_context.set(
                 WorkflowContext(
@@ -112,6 +115,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                 )
             )
             result = await self.workflow.arun_episode(engine, data)
+            completed_results[sample_idx] = result
             return sample_idx, result
 
         group_tasks = [
@@ -120,12 +124,14 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         ]
         try:
             indexed_results = await asyncio.gather(*group_tasks)
-        except BaseException:
+        except BaseException as exc:
             # gather does not cancel siblings when a child fails or is cancelled.
             for task in group_tasks:
                 if not task.done():
                     task.cancel()
-            raise
+            if not isinstance(exc, Exception):
+                raise
+            group_error = exc
         finally:
             try:
                 # Drain cancellation handlers before releasing shared resources.
@@ -143,16 +149,33 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                             type(exc).__name__,
                             exc,
                         )
-        indexed_results.sort(key=lambda item: item[0])
-        sample_indices = [sample_idx for sample_idx, _ in indexed_results]
-        if sample_indices != list(range(self.group_size)):
-            raise RuntimeError(
-                "Grouped rollout returned invalid sample indices: "
-                f"expected {list(range(self.group_size))}, got {sample_indices}"
-            )
-        results = [result for _, result in indexed_results]
-
+        if group_error is None:
+            indexed_results.sort(key=lambda item: item[0])
+            sample_indices = [sample_idx for sample_idx, _ in indexed_results]
+            if sample_indices != list(range(self.group_size)):
+                raise RuntimeError(
+                    "Grouped rollout returned invalid sample indices: "
+                    f"expected {list(range(self.group_size))}, got {sample_indices}"
+                )
+        results = [result if result else None for result in completed_results]
         valid_results = [r for r in results if r is not None]
+        interaction_group = not valid_results or all(
+            isinstance(result, dict)
+            and all(
+                isinstance(v, InteractionWithTokenLogpReward) for v in result.values()
+            )
+            for result in valid_results
+        )
+        if interaction_group:
+            record_group_metrics = getattr(self.workflow, "record_group_metrics", None)
+            if callable(record_group_metrics):
+                rewards = [
+                    result[next(reversed(result))].reward if result else None
+                    for result in results
+                ]
+                record_group_metrics(data, rewards, self.group_size)
+        if group_error is not None:
+            raise group_error
 
         # All results None -> return None
         if not valid_results:
@@ -481,6 +504,8 @@ class RemoteInfEngine(InferenceEngine):
 
         self._workflow_executor: WorkflowExecutor | None = None
         self._initialized = False
+        self._destroy_callbacks: dict[str, Callable[[], None]] = {}
+        self._destroy_callbacks_lock = Lock()
         self._proxy_gateway_addr: str | None = None
         self.local_server_processes: list[LocalInfServerInfo] = []
 
@@ -613,10 +638,38 @@ class RemoteInfEngine(InferenceEngine):
     def destroy(self):
         """Destroy the engine and clean up resources."""
         self._initialized = False
-        if self._workflow_executor is not None:
-            self._workflow_executor.destroy()
-        if len(self.local_server_processes) > 0:
-            self.teardown_server()
+        try:
+            if self._workflow_executor is not None:
+                self._workflow_executor.destroy()
+        finally:
+            self._run_destroy_callbacks()
+            if len(self.local_server_processes) > 0:
+                self.teardown_server()
+
+    def register_destroy_callback(self, key: str, callback: Callable[[], None]) -> None:
+        """Register one idempotent worker-lifetime cleanup callback.
+
+        Agent workflows are reconstructed for every submitted prompt, while a
+        ``RemoteInfEngine`` instance lives for the whole rollout worker. This
+        hook lets agents retain bounded worker-scoped resources without leaking
+        them when the worker is destroyed.
+        """
+
+        if not key:
+            raise ValueError("destroy callback key must not be empty")
+        with self._destroy_callbacks_lock:
+            self._destroy_callbacks.setdefault(key, callback)
+
+    def _run_destroy_callbacks(self) -> None:
+        with self._destroy_callbacks_lock:
+            callbacks = list(self._destroy_callbacks.items())
+            self._destroy_callbacks.clear()
+        for key, callback in reversed(callbacks):
+            try:
+                callback()
+            except Exception:
+                callback_logger = getattr(self, "logger", logger)
+                callback_logger.exception("Destroy callback %s failed", key)
 
     @property
     def workflow_executor(self) -> WorkflowExecutor:

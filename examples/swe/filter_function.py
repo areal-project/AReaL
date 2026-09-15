@@ -70,7 +70,9 @@ def filter_function(sample):
     # Use original_rewards if available for filtering and statistics
     rewards = _get_rewards(sample)
     accept = bool((rewards != rewards[0]).any().item())
-    _record_filter_result(accept=accept, all_correct=bool((rewards > 0).all().item()))
+    _record_filter_result(
+        accept=accept, all_correct=bool((rewards >= 1.0 - 1e-3).all().item())
+    )
 
     return accept
 

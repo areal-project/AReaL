@@ -204,3 +204,44 @@ async def test_group_failure_cancels_siblings_before_finalizing(failure):
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_group_metrics_include_failed_slots_before_propagating_error():
+    """Completed rewards survive a sibling error in attempted-group metrics."""
+    completed = asyncio.Event()
+    metrics = []
+
+    class Workflow(RolloutWorkflow):
+        async def arun_episode(self, engine, data):
+            if workflow_context.get().sample_idx == 0:
+                completed.set()
+                return {"completion": _interaction(0.75)}
+            await completed.wait()
+            raise ValueError("failed slot")
+
+        def record_group_metrics(self, data, rewards, group_size):
+            metrics.append((rewards, group_size))
+
+    workflow = GroupedRolloutWorkflow(Workflow(), group_size=2, logger=_Logger())
+    with pytest.raises(ValueError, match="failed slot"):
+        await workflow.arun_episode(engine=None, data={})
+
+    assert metrics == [([0.75, None], 2)]
+
+
+@pytest.mark.asyncio
+async def test_group_metrics_observe_rewards_before_normalization():
+    """Per-Stream pass rates must use terminal rewards, not normalized values."""
+    metrics = []
+    agent = _ListWorkflow([{"first": _interaction(0.0)}, {"second": _interaction(1.0)}])
+    agent.record_group_metrics = lambda data, rewards, size: metrics.append(rewards)
+    workflow = GroupedRolloutWorkflow(
+        agent, group_size=2, logger=_Logger(), reward_normalization=True
+    )
+
+    result = await workflow.arun_episode(engine=None, data={})
+
+    assert metrics == [[0.0, 1.0]]
+    assert result["first"].reward == pytest.approx(-1.0)
+    assert result["second"].reward == pytest.approx(1.0)

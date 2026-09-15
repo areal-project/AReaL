@@ -1,4 +1,4 @@
-"""Tests for streaming and non-streaming behaviour of the ``/chat/completions`` endpoint.
+"""Tests for streaming and non-streaming chat-completions behaviour.
 
 The proxy rollout server's ``chat_completions`` handler must correctly return a
 ``StreamingResponse`` (SSE) when ``stream=True`` is requested, and a plain JSON
@@ -9,6 +9,7 @@ Ref: https://github.com/areal-project/AReaL/issues/1046
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import threading
@@ -20,10 +21,13 @@ from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletio
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
 from openai.types.chat.chat_completion_chunk import ChoiceDelta
+from openai.types.completion_usage import CompletionUsage
+from starlette.responses import StreamingResponse
 
 from areal.api import ModelResponse
 from areal.experimental.openai.client import ArealOpenAI, AsyncCompletionsWithReward
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
+from areal.experimental.openai.types import InteractionWithTokenLogpReward
 
 # ---------------------------------------------------------------------------
 # Helpers (same pattern as test_proxy_rollout_server.py)
@@ -296,6 +300,10 @@ async def _fake_create(
     ``inspect.signature``-based filtering of request-body fields.
     """
     if stream:
+        if areal_cache is not None:
+            areal_cache["chatcmpl-test"] = InteractionWithTokenLogpReward(
+                messages=list(messages or [])
+            )
 
         async def _gen():
             yield ChatCompletionChunk(
@@ -326,6 +334,7 @@ async def _fake_create(
         created=0,
         model=model,
         object="chat.completion",
+        usage=CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
     )
 
 
@@ -342,12 +351,63 @@ def _mock_openai_client(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/messages"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_message_preprocessor_runs_once_per_request(monkeypatch, path, stream):
+    """Non-idempotent preprocessors must not duplicate injected prompt content."""
+    injected_message = {"role": "system", "content": "Injected instruction"}
+    preprocessor = MagicMock(side_effect=lambda messages: [*messages, injected_message])
+    captured_messages = []
+
+    async def create(
+        *, messages, model, stream=False, temperature=None, top_p=None, areal_cache=None
+    ):
+        captured_messages.append(messages)
+        return await _fake_create(
+            messages=messages, model=model, stream=stream, areal_cache=areal_cache
+        )
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = create
+    monkeypatch.setattr(srv, "_openai_client", mock_client)
+    monkeypatch.setattr(srv, "_message_preprocessors", [preprocessor])
+    monkeypatch.setattr(srv, "_capacity", 1)
+
+    async with _client() as client:
+        start = await client.post(
+            "/rl/start_session",
+            headers=_admin_headers(),
+            json={"task_id": "preprocess"},
+        )
+        response = await client.post(
+            path,
+            headers=_session_headers(start.json()["api_key"]),
+            json={
+                "model": "claude-compatible",
+                "max_tokens": 16,
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+                ],
+                "stream": stream,
+            },
+        )
+
+    preprocessor.assert_called_once()
+    assert captured_messages == [
+        [{"role": "user", "content": "hello"}, injected_message]
+    ]
+    assert response.status_code == 200
+    assert "hello" in response.text
+
+
 class TestChatCompletionsEndpoint:
-    """Verify streaming and non-streaming responses from ``/chat/completions``."""
+    """Verify both supported chat-completions paths."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["/chat/completions", "/v1/chat/completions"])
     async def test_streaming_returns_sse_response(
-        self, monkeypatch, _mock_openai_client
+        self, monkeypatch, _mock_openai_client, path
     ):
         """``stream=True`` returns an SSE stream (``text/event-stream``)."""
         monkeypatch.setattr(srv, "_capacity", 1)
@@ -362,7 +422,7 @@ class TestChatCompletionsEndpoint:
             api_key = resp.json()["api_key"]
 
             resp = await client.post(
-                "/chat/completions",
+                path,
                 headers=_session_headers(api_key),
                 json={
                     "messages": [{"role": "user", "content": "hi"}],
@@ -380,17 +440,93 @@ class TestChatCompletionsEndpoint:
                 for line in resp.text.strip().split("\n\n")
                 if line.startswith("data: ")
             ]
-            assert len(events) >= 2  # at least one chunk + [DONE]
+            assert len(events) >= 3  # prelude + generated chunk + [DONE]
             assert events[-1] == "data: [DONE]"
 
-            # Verify the data payload is a valid ChatCompletionChunk
-            chunk = json.loads(events[0].removeprefix("data: "))
-            assert chunk["object"] == "chat.completion.chunk"
-            assert chunk["model"] == "test"
-            assert chunk["choices"][0]["delta"]["content"] == "hello"
+            chunks = [json.loads(event.removeprefix("data: ")) for event in events[:-1]]
+            assert chunks[0]["object"] == "chat.completion.chunk"
+            assert chunks[0]["model"] == "test"
+            assert chunks[0]["choices"][0]["delta"] == {
+                "role": "assistant",
+                "content": "",
+            }
+            assert chunks[1]["choices"][0]["delta"]["content"] == "hello"
+            assert {chunk["id"] for chunk in chunks} == {chunks[0]["id"]}
+            assert chunks[0]["id"] != "chatcmpl-test"
+
+            resp = await client.post(
+                "/rl/set_reward",
+                headers=_session_headers(api_key),
+                json={"interaction_id": chunks[0]["id"], "reward": 0.75},
+            )
+            assert resp.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_non_streaming_returns_json(self, monkeypatch, _mock_openai_client):
+    async def test_streaming_starts_and_heartbeats_before_generation_finishes(
+        self, monkeypatch, _mock_openai_client
+    ):
+        """The proxy must not wait for simulated streaming generation to finish."""
+        generation_started = asyncio.Event()
+        release_generation = asyncio.Event()
+
+        async def slow_create(
+            *,
+            messages=None,
+            model=None,
+            stream=None,
+            temperature=None,
+            top_p=None,
+            areal_cache=None,
+            **kwargs,
+        ):
+            generation_started.set()
+            await release_generation.wait()
+            return await _fake_create(
+                messages=messages,
+                model=model,
+                stream=stream,
+                temperature=temperature,
+                top_p=top_p,
+                areal_cache=areal_cache,
+                **kwargs,
+            )
+
+        srv._openai_client.chat.completions.create = slow_create
+        monkeypatch.setattr(srv, "_STREAM_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+        srv._session_cache["slow-session"] = srv.SessionData(session_id="slow-session")
+
+        response = await asyncio.wait_for(
+            srv.chat_completions(
+                {
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "model": "test",
+                    "stream": True,
+                },
+                session_id="slow-session",
+            ),
+            timeout=0.1,
+        )
+
+        assert isinstance(response, StreamingResponse)
+        iterator = response.body_iterator
+        first = await asyncio.wait_for(anext(iterator), timeout=0.1)
+        prelude = json.loads(first.removeprefix("data: "))
+        assert prelude["choices"][0]["delta"]["content"] == ""
+
+        next_event = asyncio.create_task(anext(iterator))
+        await asyncio.wait_for(generation_started.wait(), timeout=0.1)
+        heartbeat = await asyncio.wait_for(next_event, timeout=0.1)
+        assert heartbeat == ": ping\n\n"
+
+        release_generation.set()
+        remaining = [chunk async for chunk in iterator]
+        assert remaining[-1] == "data: [DONE]\n\n"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["/chat/completions", "/v1/chat/completions"])
+    async def test_non_streaming_returns_json(
+        self, monkeypatch, _mock_openai_client, path
+    ):
         """Without ``stream``, returns a JSON ``ChatCompletion``."""
         monkeypatch.setattr(srv, "_capacity", 1)
 
@@ -404,7 +540,7 @@ class TestChatCompletionsEndpoint:
             api_key = resp.json()["api_key"]
 
             resp = await client.post(
-                "/chat/completions",
+                path,
                 headers=_session_headers(api_key),
                 json={
                     "messages": [{"role": "user", "content": "hi"}],
