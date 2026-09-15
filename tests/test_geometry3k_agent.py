@@ -37,27 +37,28 @@ def test_geometry3k_reward_combines_accuracy_and_format_scores(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("prompt", "completion", "format_score"),
+    ("prompt", "think_prefilled", "completion", "format_score"),
     [
-        ("<|im_start|>assistant\n", "<think>reason</think>\\boxed{42}", 1.0),
-        ("<|im_start|>assistant\n<think>\n", "reason</think>\\boxed{42}", 1.0),
-        ("<|im_start|>assistant\n", "reason</think>\\boxed{42}", 0.0),
+        ("Assistant: ", False, "<think>reason</think>\\boxed{42}", 1.0),
+        ("Assistant: <think>\n", True, "reason</think>\\boxed{42}", 1.0),
+        ("Assistant: ", False, "reason</think>\\boxed{42}", 0.0),
         (
-            "<|im_start|>assistant\n<think>\n",
+            "Assistant: <think>\n",
+            True,
             "<think>reason</think>\\boxed{42}",
             0.0,
         ),
         (
-            "<|im_start|>user\nUse <think>...</think>.\n<|im_end|>\n"
-            "<|im_start|>assistant\n",
+            "User: Use <think>...</think>.\nAssistant: ",
+            False,
             "reason</think>\\boxed{42}",
             0.0,
         ),
-        ("<|im_start|>user\n<think>\n", "reason</think>\\boxed{42}", 0.0),
-        ("<|im_start|>assistant\n<think>\n", "reason\\boxed{42}", 0.0),
-        ("<|im_start|>assistant\n<think>\n", "reason</think>42", 0.0),
-        ("<|im_start|>assistant\n<think>\n", "\\boxed{42}</think>", 0.0),
-        ("", "<think>reason</think>\\boxed{42}", 1.0),
+        ("User: <think>\n", False, "reason</think>\\boxed{42}", 0.0),
+        ("Assistant: <think>\n", True, "reason\\boxed{42}", 0.0),
+        ("Assistant: <think>\n", True, "reason</think>42", 0.0),
+        ("Assistant: <think>\n", True, "\\boxed{42}</think>", 0.0),
+        ("", False, "<think>reason</think>\\boxed{42}", 1.0),
     ],
 )
 @pytest.mark.parametrize("accuracy", [0.0, 1.0])
@@ -67,7 +68,7 @@ def test_geometry3k_reward_combines_accuracy_and_format_scores(monkeypatch):
     ids=["agent", "vision_rlvr"],
 )
 def test_geometry3k_reward_accounts_for_assistant_prefill_only(
-    monkeypatch, prompt, completion, format_score, accuracy, reward_fn
+    monkeypatch, prompt, think_prefilled, completion, format_score, accuracy, reward_fn
 ):
     """Prefill affects format scoring, never the accuracy grader's input."""
     seen = []
@@ -84,6 +85,7 @@ def test_geometry3k_reward_accounts_for_assistant_prefill_only(
         prompt=prompt,
         prompt_ids=[1],
         completion_ids=[2],
+        think_prefilled=think_prefilled,
     )
 
     assert reward == pytest.approx(0.9 * accuracy + 0.1 * format_score)
@@ -95,11 +97,12 @@ def test_geometry3k_rlvr_reward_preserves_positional_signature(monkeypatch):
     monkeypatch.setattr(geometry3k_agent, "acc_reward", lambda *_: 1.0)
 
     reward = geometry3k_grpo.geometry3k_reward_fn(
-        "<|im_start|>assistant\n<think>\n",
+        "Assistant: <think>\n",
         "reason</think>\\boxed{42}",
         [1],
         [2],
         "42",
+        think_prefilled=True,
     )
 
     assert reward == pytest.approx(1.0)
@@ -183,7 +186,7 @@ async def test_geometry3k_agent_run_uses_proxy_client_and_returns_reward(
     """The standalone agent should use proxy credentials and return final reward."""
     captured = {}
     fake_http_client = object()
-    prompt = "<|im_start|>assistant\n" + ("<think>\n" if prefilled else "")
+    prompt = "Assistant: " + ("<think>\n" if prefilled else "")
     output = ("" if prefilled else "<think>") + "reason</think>\\boxed{42}"
 
     async def fake_create(**kwargs):
@@ -212,6 +215,7 @@ async def test_geometry3k_agent_run_uses_proxy_client_and_returns_reward(
         {
             "answer": "42",
             "messages": prompt,
+            "think_prefilled": prefilled,
             "images": [_png_bytes()],
             "messages_chat": [
                 {

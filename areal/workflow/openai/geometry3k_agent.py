@@ -31,15 +31,10 @@ def acc_reward(predict_str: str, ground_truth: str) -> float:
 
 
 def geometry3k_reward_fn(
-    completions: str, answer: str, prompt: str = "", **_: Any
+    completions: str, answer: str, *, think_prefilled: bool = False, **_: Any
 ) -> float:
     """Score format across the assistant prefill/completion boundary only."""
-    format_input = completions
-    _, assistant_boundary, assistant_prefix = prompt.rpartition(
-        "<|im_start|>assistant\n"
-    )
-    if assistant_boundary and assistant_prefix.strip() == "<think>":
-        format_input = assistant_prefix + completions
+    format_input = "<think>\n" + completions if think_prefilled else completions
     format_reward_val = format_reward(format_input)
     acc_reward_val = acc_reward(completions, answer)
     format_score = 0.1
@@ -145,8 +140,7 @@ class Geometry3KAgent:
         return await self._reward_fn(
             completions=output,
             answer=data["answer"],
-            # The default Geometry3K recipe renders this with the same tokenizer
-            # and default template kwargs as the proxy. Custom request template
-            # overrides must also be reflected in this rendered prompt.
-            prompt=data.get("messages", ""),
+            # Derived when the dataset applies the chat template. Custom request
+            # template overrides must be reflected in that rendering as well.
+            think_prefilled=data.get("think_prefilled", False),
         )
