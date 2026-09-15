@@ -180,6 +180,16 @@ def create_engine_module(
                 kwargs,
                 require_broadcast=True,
             )
+            engine = require_engine()
+            if (
+                isinstance(engine, TrainEngine)
+                and engine.initialized
+                and not engine.is_data_parallel_head()
+            ):
+                # DispatchRequest only collects DP-head results. Storing the
+                # others would leak shards whose IDs never reach clear_batches.
+                # Keep all ranks in the computation and skip only result storage.
+                return None
             return RTensor.remotize(result, node_addr=get_node_addr())
 
         ep_name = (

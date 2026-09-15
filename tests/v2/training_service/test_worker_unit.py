@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from areal.api import TrainEngine
+from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.v2.training_service.worker.config import TrainWorkerConfig
 
@@ -147,6 +149,52 @@ def client():
         )
     )
     return app.test_client()
+
+
+@pytest.mark.parametrize(
+    "initialized,is_head,should_store",
+    [(True, False, False), (True, True, True), (False, False, True)],
+)
+@pytest.mark.parametrize(
+    "endpoint,method_name",
+    [
+        ("/train_batch", "train_batch"),
+        ("/ppo/actor/compute_advantages", "compute_advantages"),
+        ("/ppo/actor/update", "ppo_update"),
+    ],
+)
+def test_compute_endpoint_only_stores_collectable_results(
+    client, monkeypatch, initialized, is_head, should_store, endpoint, method_name
+):
+    """Non-head ranks participate in compute without leaking discarded shards."""
+    import areal.v2.training_service.worker.app as worker_app
+
+    engine = MagicMock(spec=TrainEngine)
+    engine.initialized = initialized
+    engine.is_data_parallel_head.return_value = is_head
+    engine.cpu_staged_rpc_methods = ()
+    engine.context_and_model_parallel_group = None
+    engine.data_parallel_world_size = 1
+    compute = MagicMock(return_value={"value": 1})
+    setattr(engine, method_name, compute)
+    monkeypatch.setattr(worker_app, "_engine", engine)
+    monkeypatch.setattr(worker_app, "_submit_to_engine_thread", lambda _name, fn: fn())
+    monkeypatch.setattr(
+        worker_app, "current_platform", SimpleNamespace(current_device=lambda: "cpu")
+    )
+    store = MagicMock(side_effect=lambda result, **_: result)
+    monkeypatch.setattr(RTensor, "remotize", store)
+
+    response = client.post(endpoint, json={"args": [], "kwargs": {}})
+
+    assert response.status_code == 200
+    compute.assert_called_once_with()
+    if not initialized:
+        engine.is_data_parallel_head.assert_not_called()
+    assert store.call_count == int(should_store)
+    assert deserialize_value(response.get_json()["result"]) == (
+        {"value": 1} if should_store else None
+    )
 
 
 class TestWorkerEngineCreation:
