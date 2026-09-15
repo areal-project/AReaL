@@ -8,5 +8,6 @@ trap 'rm -rf "$test_tmp"' EXIT
 "${PYTHON:-python}" -m pytest -q --basetemp="$test_tmp" \
   tests/test_broadcast_tensor_container.py \
   tests/infra/rpc/test_engine_validation.py \
+  tests/v2/training_service/test_worker_unit.py \
   tests/test_megatron_engine_vlm.py \
   tests/test_microbatch_streaming.py

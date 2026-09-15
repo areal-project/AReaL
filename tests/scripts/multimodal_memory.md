@@ -19,10 +19,22 @@ real samples when testing a supported pipeline layout. GPU equivalence and memor
 reduction still require a target hardware run; the CPU checks establish data-path
 contracts only.
 
-The broadcast opt-in is restricted to CPU-staged vision engines. Its source rank further
-requires nonempty tensors below `multi_modal_input*`; receivers follow the source
-metadata. Text-only payloads retain the old metadata sequence and per-reference buffers.
-Only multimodal calls add an internal mode marker. Lazy vision preparation affects only
-microbatches with multimodal tensors; ordinary text, empty-image VLM batches, and
-top-level-only vision inputs retain the old path. Batch partitioning and loss
-normalization are unchanged.
+The broadcast opt-in is wired into both v1 RPC and v2 training workers and is restricted
+to CPU-staged vision engines. Its source rank further requires nonempty tensors below
+`multi_modal_input*`; receivers follow the source metadata. Text-only payloads retain
+the old metadata sequence and per-reference buffers. Only multimodal calls add an
+internal mode marker. Lazy vision preparation affects only microbatches with multimodal
+tensors; ordinary text, empty-image VLM batches, and top-level-only vision inputs retain
+the old path. Batch partitioning and loss normalization are unchanged.
+
+The minimal script includes v2 worker gating tests as well as the shared real CPU/Gloo
+broadcast tests. The GPU runner exercises the shared Megatron engine, not a full v2
+controller/gateway service deployment. These v2 checks are prepared but have not been
+run.
+
+For repeated images originating from separate v2 rollout sessions, use #1711 to retain
+their shared references through export, worker localization, and advantage computation.
+Broadcast reuse requires shared tensor objects at the DP head; it does not deduplicate
+distinct objects by image content. When trajectory dumping is enabled, #1709 keeps image
+references from being materialized by the dump path. Lazy Megatron image assembly is
+shared by v1 and v2 and does not require repeated images to reduce eager CPU buffers.
