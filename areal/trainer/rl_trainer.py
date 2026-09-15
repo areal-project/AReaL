@@ -1817,7 +1817,11 @@ class PPOTrainer:
                         drop_incomplete_group=False,
                     )
                     cnt += 1
-            self.eval_rollout.wait(cnt, timeout=None)
+            if cnt:
+                results = self.eval_rollout.wait(cnt, timeout=None)
+                if is_single_controller():
+                    # Evaluation has no training step to release the rollout RTensors.
+                    self.actor.clear_batches(results)
 
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
