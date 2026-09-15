@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
+from examples.vlm import geometry3k_grpo
+
 from areal.workflow.openai import geometry3k_agent
 
 
@@ -32,6 +34,90 @@ def test_geometry3k_reward_combines_accuracy_and_format_scores(monkeypatch):
     )
 
     assert reward == pytest.approx(0.55)
+
+
+@pytest.mark.parametrize(
+    ("prompt", "completion", "format_score"),
+    [
+        ("<|im_start|>assistant\n", "<think>reason</think>\\boxed{42}", 1.0),
+        ("<|im_start|>assistant\n<think>\n", "reason</think>\\boxed{42}", 1.0),
+        ("<|im_start|>assistant\n", "reason</think>\\boxed{42}", 0.0),
+        (
+            "<|im_start|>assistant\n<think>\n",
+            "<think>reason</think>\\boxed{42}",
+            0.0,
+        ),
+        (
+            "<|im_start|>user\nUse <think>...</think>.\n<|im_end|>\n"
+            "<|im_start|>assistant\n",
+            "reason</think>\\boxed{42}",
+            0.0,
+        ),
+        ("<|im_start|>user\n<think>\n", "reason</think>\\boxed{42}", 0.0),
+        ("<|im_start|>assistant\n<think>\n", "reason\\boxed{42}", 0.0),
+        ("<|im_start|>assistant\n<think>\n", "reason</think>42", 0.0),
+        ("<|im_start|>assistant\n<think>\n", "\\boxed{42}</think>", 0.0),
+        ("", "<think>reason</think>\\boxed{42}", 1.0),
+    ],
+)
+@pytest.mark.parametrize("accuracy", [0.0, 1.0])
+@pytest.mark.parametrize(
+    "reward_fn",
+    [geometry3k_agent.geometry3k_reward_fn, geometry3k_grpo.geometry3k_reward_fn],
+    ids=["agent", "vision_rlvr"],
+)
+def test_geometry3k_reward_accounts_for_assistant_prefill_only(
+    monkeypatch, prompt, completion, format_score, accuracy, reward_fn
+):
+    """Prefill affects format scoring, never the accuracy grader's input."""
+    seen = []
+
+    def fake_acc_reward(text, answer):
+        seen.append((text, answer))
+        return accuracy
+
+    monkeypatch.setattr(geometry3k_agent, "acc_reward", fake_acc_reward)
+
+    reward = reward_fn(
+        completions=completion,
+        answer="42",
+        prompt=prompt,
+        prompt_ids=[1],
+        completion_ids=[2],
+    )
+
+    assert reward == pytest.approx(0.9 * accuracy + 0.1 * format_score)
+    assert seen == [(completion, "42")]
+
+
+def test_geometry3k_rlvr_reward_preserves_positional_signature(monkeypatch):
+    """Existing positional calls and helper imports remain supported."""
+    monkeypatch.setattr(geometry3k_agent, "acc_reward", lambda *_: 1.0)
+
+    reward = geometry3k_grpo.geometry3k_reward_fn(
+        "<|im_start|>assistant\n<think>\n",
+        "reason</think>\\boxed{42}",
+        [1],
+        [2],
+        "42",
+    )
+
+    assert reward == pytest.approx(1.0)
+    assert geometry3k_grpo.format_reward is geometry3k_agent.format_reward
+
+
+@pytest.mark.parametrize(
+    "completion",
+    [
+        "<think><think>reason</think>\\boxed{42}",
+        "<think><think>reason</think></think>\\boxed{42}",
+        "<think>reason</think></think>\\boxed{42}",
+        "<think>reason</think><think>again</think>\\boxed{42}",
+    ],
+)
+def test_format_reward_rejects_duplicate_or_nested_thinking_tags(completion):
+    """Only a single ordered pair of thinking tags may earn format reward."""
+    assert geometry3k_agent.format_reward(completion) == 0.0
 
 
 def test_build_agent_input_preserves_text_and_embeds_image():
@@ -90,15 +176,20 @@ def test_build_agent_input_rejects_image_placeholder_mismatch(images, content, m
 
 
 @pytest.mark.asyncio
-async def test_geometry3k_agent_run_uses_proxy_client_and_returns_reward(monkeypatch):
+@pytest.mark.parametrize("prefilled", [False, True])
+async def test_geometry3k_agent_run_uses_proxy_client_and_returns_reward(
+    monkeypatch, prefilled
+):
     """The standalone agent should use proxy credentials and return final reward."""
     captured = {}
     fake_http_client = object()
+    prompt = "<|im_start|>assistant\n" + ("<think>\n" if prefilled else "")
+    output = ("" if prefilled else "<think>") + "reason</think>\\boxed{42}"
 
     async def fake_create(**kwargs):
         captured["request"] = kwargs
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="final answer"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=output))]
         )
 
     fake_client = SimpleNamespace(
@@ -111,7 +202,6 @@ async def test_geometry3k_agent_run_uses_proxy_client_and_returns_reward(monkeyp
 
     monkeypatch.setattr(geometry3k_agent, "AsyncOpenAI", fake_openai_client)
     monkeypatch.setattr(geometry3k_agent, "acc_reward", lambda *_: 1.0)
-    monkeypatch.setattr(geometry3k_agent, "format_reward", lambda *_: 1.0)
 
     agent = geometry3k_agent.Geometry3KAgent(
         temperature=0.8,
@@ -121,6 +211,7 @@ async def test_geometry3k_agent_run_uses_proxy_client_and_returns_reward(monkeyp
     reward = await agent.run(
         {
             "answer": "42",
+            "messages": prompt,
             "images": [_png_bytes()],
             "messages_chat": [
                 {
