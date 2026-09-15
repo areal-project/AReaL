@@ -178,13 +178,25 @@ def get_geometry3k_rl_dataset(
             }
         ]
 
+        prompt_without_generation = processor.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=False, tokenize=False
+        )
         messages = processor.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False
+        )
+        # Inspect only the suffix added by the template, not user content or
+        # model-specific role separators. Non-prefix templates are ambiguous;
+        # do not infer a prefill from their full rendered prompt.
+        generation_prompt = (
+            messages[len(prompt_without_generation) :]
+            if messages.startswith(prompt_without_generation)
+            else ""
         )
         return {
             "messages": messages,
             "messages_chat": messages_chat,
             "images": processed_images,
+            "think_prefilled": generation_prompt.rstrip().endswith("<think>"),
         }
 
     dataset = dataset.map(process).remove_columns(["problem"])
