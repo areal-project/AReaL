@@ -240,14 +240,9 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                         exc,
                         exc_info=True,
                     )
-                try:
-                    await self._set_last_reward(http_session, 0.0, session_api_key)
-                except Exception:
-                    logger.warning(
-                        "Failed to set reward for session %s in group %s",
-                        session_id,
-                        group_id,
-                    )
+                # Failed groups are discarded below, so a fallback reward is
+                # unnecessary and can trigger another round of HTTP retries.
+                # Discard export still handles session cleanup.
                 return None
             finally:
                 logger.debug(
