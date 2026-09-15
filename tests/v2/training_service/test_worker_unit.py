@@ -13,7 +13,11 @@ from areal.v2.training_service.worker.config import TrainWorkerConfig
 MODULE = "areal.v2.training_service.worker.app"
 
 
-def test_execute_compute_uses_cpu_group_for_streaming_method(monkeypatch):
+@pytest.mark.parametrize("is_vision_model", [None, False, True])
+def test_execute_compute_uses_cpu_group_for_streaming_method(
+    monkeypatch, is_vision_model
+):
+    """Only vision-capable CPU-staged engines opt into alias broadcasts."""
     import areal.v2.training_service.worker.app as worker_app
 
     engine = SimpleNamespace(
@@ -25,6 +29,8 @@ def test_execute_compute_uses_cpu_group_for_streaming_method(monkeypatch):
         current_data_parallel_head=lambda: 3,
         train_batch=lambda *args, **kwargs: (args, kwargs),
     )
+    if is_vision_model is not None:
+        engine.is_vision_model = is_vision_model
     monkeypatch.setattr(worker_app, "_engine", engine)
     monkeypatch.setattr(
         worker_app, "_submit_to_engine_thread", lambda _name, func: func()
@@ -45,12 +51,23 @@ def test_execute_compute_uses_cpu_group_for_streaming_method(monkeypatch):
 
     assert to.call_args_list == [call(["args"], "cpu"), call({"key": "value"}, "cpu")]
     assert broadcast.call_args_list == [
-        call(["args"], src_rank=3, group="cpu_group"),
-        call({"key": "value"}, src_rank=3, group="cpu_group"),
+        call(
+            ["args"],
+            src_rank=3,
+            group="cpu_group",
+            preserve_tensor_aliases=is_vision_model is True,
+        ),
+        call(
+            {"key": "value"},
+            src_rank=3,
+            group="cpu_group",
+            preserve_tensor_aliases=is_vision_model is True,
+        ),
     ]
 
 
 def test_execute_compute_uses_accelerator_group_for_unstaged_method(monkeypatch):
+    """Vision capability alone must not enable the CPU-only alias protocol."""
     import areal.v2.training_service.worker.app as worker_app
 
     engine = SimpleNamespace(
@@ -60,6 +77,7 @@ def test_execute_compute_uses_accelerator_group_for_unstaged_method(monkeypatch)
         context_and_model_parallel_group="accelerator_group",
         data_parallel_world_size=2,
         current_data_parallel_head=lambda: 1,
+        is_vision_model=True,
         unlisted_method=lambda *args, **kwargs: (args, kwargs),
     )
     monkeypatch.setattr(worker_app, "_engine", engine)
@@ -86,6 +104,10 @@ def test_execute_compute_uses_accelerator_group_for_unstaged_method(monkeypatch)
     assert to.call_args_list == [call([], "cuda:1"), call({}, "cuda:1")]
     assert all(
         item.kwargs["group"] == "accelerator_group" for item in broadcast.call_args_list
+    )
+    assert all(
+        item.kwargs["preserve_tensor_aliases"] is False
+        for item in broadcast.call_args_list
     )
 
 
