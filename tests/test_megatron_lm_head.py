@@ -388,6 +388,7 @@ def test_lm_head_output_and_gradients_match_reference(
         None,
         0,
         None,
+        gtp_remat_size=1,
     )
     if fp32_output:
         expected_output = torch.mm(
