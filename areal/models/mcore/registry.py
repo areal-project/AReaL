@@ -16,6 +16,7 @@ from transformers import AutoConfig, PretrainedConfig
 
 from areal.api.cli_args import MegatronEngineConfig
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
+from areal.engine.megatron_utils.mtp_only import freeze_non_mtp_parameters
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
@@ -406,6 +407,14 @@ def make_mcore_model(
     is_critic: bool = False,
     use_lora: bool = False,
 ) -> list[GPTModel | DDP]:
+    if mcore_config is not None and mcore_config.mtp_only:
+        if bridge_type != "megatron-bridge" or bridge is None:
+            raise ValueError("mtp_only requires a megatron-bridge model")
+        if use_lora or is_critic:
+            raise ValueError("mtp_only does not support LoRA or critic models")
+        if mpu.get_pipeline_model_parallel_world_size() != 1:
+            raise ValueError("mtp_only requires training pipeline parallel size 1")
+
     if bridge is not None and bridge_type == "mbridge":
         models = bridge.get_model(
             # TODO: Add DDP options when supporting training
@@ -515,6 +524,16 @@ def make_mcore_model(
             set_deterministic_algorithms(provider, prebuild=True)
 
         provider.finalize()
+
+        if mcore_config.mtp_only:
+            if getattr(provider, "moe_router_enable_expert_bias", False):
+                raise ValueError(
+                    "mtp_only does not support MoE router expert-bias updates"
+                )
+            # Preserve existing Bridge hooks and freeze before DDP allocates
+            # buffers. Do not disable autograd: the main loss still triggers
+            # Megatron-Core's auxiliary MTP loss through MTPLossAutoScaler.
+            provider.register_pre_wrap_hook(freeze_non_mtp_parameters)
 
         ddp_config = MCoreDDPConfig(**dataclasses.asdict(mcore_config.ddp))
         if use_lora:

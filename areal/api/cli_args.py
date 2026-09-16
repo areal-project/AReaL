@@ -1127,6 +1127,17 @@ class MegatronEngineConfig:
         },
     )
 
+    mtp_only: bool = field(
+        default=False,
+        metadata={
+            "help": "Freeze all non-MTP parameters before DDP/optimizer construction. "
+            "Requires enable_mtp_training=True, bridge_type='megatron-bridge', "
+            "and training PP=1. Shared embeddings and output weights stay frozen. "
+            "Not supported with LoRA, critic models, or FSDP wrappers. The main "
+            "loss path is retained to trigger the auxiliary MTP backward.",
+        },
+    )
+
     mtp_loss_scaling_factor: float = field(
         default=0.1,
         metadata={
@@ -1138,6 +1149,20 @@ class MegatronEngineConfig:
     def __post_init__(self) -> None:
         if self.enable_mtp_training and not self.enable_mtp:
             raise ValueError("enable_mtp_training requires enable_mtp=True")
+        if self.mtp_only:
+            if not self.enable_mtp_training:
+                raise ValueError("mtp_only requires enable_mtp_training=True")
+            if self.bridge_type != "megatron-bridge":
+                raise ValueError("mtp_only requires bridge_type='megatron-bridge'")
+            if (
+                not math.isfinite(self.mtp_loss_scaling_factor)
+                or self.mtp_loss_scaling_factor <= 0
+            ):
+                raise ValueError(
+                    "mtp_only requires a finite, positive mtp_loss_scaling_factor"
+                )
+            if self.use_custom_fsdp or self.use_torch_fsdp2:
+                raise ValueError("mtp_only does not support FSDP wrappers")
         if self.lm_head_loss_chunk_size < 0:
             raise ValueError(
                 "lm_head_loss_chunk_size must be non-negative, got "
