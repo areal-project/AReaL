@@ -229,3 +229,113 @@ def test_registry_mtp_only_unsupported_mode_raises(monkeypatch, options) -> None
             bridge_type="megatron-bridge",
             **options,
         )
+
+
+@pytest.mark.parametrize("keyword_input", [False, True])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_mtp_full_recompute_matches_direct_gradients(
+    monkeypatch, keyword_input: bool, wrapped: bool
+) -> None:
+    """Run MCore's actual MTP forward and checkpoint autograd on CPU."""
+    from contextlib import nullcontext
+
+    mtp_module = pytest.importorskip("megatron.core.transformer.multi_token_prediction")
+    from megatron.core.tensor_parallel import random as mcore_random
+
+    # Only CUDA RNG bookkeeping is replaced; checkpoint forward/backward is real.
+    monkeypatch.setattr(mcore_random, "_get_all_rng_states", lambda: ())
+    monkeypatch.setattr(mcore_random, "_set_all_rng_states", lambda *args: None)
+    monkeypatch.setattr(mcore_random, "_fork_rng", nullcontext)
+
+    class MTPLayer(mtp_module.MultiTokenPredictionLayer):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = SimpleNamespace(
+                recompute_granularity="full",
+                recompute_method="uniform",
+                recompute_num_layers=1,
+                fp8=None,
+                distribute_saved_activations=False,
+            )
+            self.projection = nn.Linear(8, 4)
+
+        def _get_embeddings(
+            self, input_ids, position_ids, embedding, hidden_states, packed_seq_params
+        ):
+            return input_ids, position_ids, embedding(input_ids), hidden_states
+
+        def _proj_and_transformer_layer(
+            self, hidden_states, decoder_input, *args, **kwargs
+        ):
+            return self.projection(torch.cat((hidden_states, decoder_input), dim=-1))
+
+    torch.manual_seed(19)
+    model = _Model()
+    model.mtp = MTPLayer()
+    root = nn.ModuleDict({"language_model": model}) if wrapped else model
+    freeze_non_mtp_parameters([root])
+    reference = copy.deepcopy(model)
+    reference.mtp.config.recompute_granularity = None
+    ids, labels = torch.tensor([1, 2, 3]), torch.tensor([3, 4, 5])
+    before = {name: p.detach().clone() for name, p in model.named_parameters()}
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=0.01
+    )
+    for current in (model, reference):
+        hidden = current.backbone(current.embedding(ids))
+        if keyword_input:
+            output, _, _ = current.mtp(
+                input_ids=ids,
+                position_ids=ids,
+                hidden_states=hidden,
+                attention_mask=None,
+                embedding=current.embedding,
+            )
+        else:
+            output, _, _ = current.mtp(
+                ids, ids, hidden, None, embedding=current.embedding
+            )
+        assert not hidden.requires_grad
+        F.cross_entropy(current.output_layer(output), labels).backward()
+    for (name, parameter), (_, ref_parameter) in zip(
+        model.named_parameters(), reference.named_parameters()
+    ):
+        if name.startswith("mtp."):
+            assert parameter.grad is not None
+            assert parameter.grad.norm() > 0
+            torch.testing.assert_close(
+                parameter.grad, ref_parameter.grad, rtol=1e-6, atol=1e-7
+            )
+        else:
+            assert parameter.grad is None
+    optimizer.step()
+    for name, parameter in model.named_parameters():
+        if name.startswith("mtp."):
+            assert not torch.equal(parameter, before[name])
+        else:
+            torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
+
+
+def test_mtp_input_hook_preserves_autograd_and_no_grad() -> None:
+    """The hook is idempotent and preserves existing graphs and inference inputs."""
+
+    class MTP(nn.Linear):
+        def forward(self, input_ids, position_ids, hidden_states):
+            self.seen_hidden = hidden_states
+            return super().forward(hidden_states)
+
+    model = _Model()
+    model.mtp = MTP(4, 4)
+    freeze_non_mtp_parameters([model])
+    freeze_non_mtp_parameters([model])
+    assert len(model.mtp._forward_pre_hooks) == 1
+    leaf = torch.randn(3, 4, requires_grad=True)
+    hidden = leaf * 2
+    model.mtp(None, None, hidden).sum().backward()
+    assert model.mtp.seen_hidden is hidden
+    assert leaf.grad is not None
+    frozen_hidden = torch.randn(3, 4)
+    with torch.no_grad():
+        output = model.mtp(None, None, frozen_hidden)
+    assert model.mtp.seen_hidden is frozen_hidden
+    assert not output.requires_grad
