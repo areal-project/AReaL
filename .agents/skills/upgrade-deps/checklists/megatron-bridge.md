@@ -4,7 +4,9 @@ github: NVIDIA-NeMo/Megatron-Bridge
 branch_template: v${VERSION}
 upstream_paths:
   - megatron/bridge/__init__.py
-  - megatron/bridge/auto_bridge.py
+  - megatron/bridge/models/conversion/auto_bridge.py
+  - megatron/bridge/models/conversion/param_mapping.py
+  - megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
   - megatron/bridge/peft/lora.py
 ---
 
@@ -19,13 +21,21 @@ upstream_paths:
 
 ### Secondary (model / infra layer)
 
-_None._
+| File                                        | Imports / Usage                                                   |
+| ------------------------------------------- | ----------------------------------------------------------------- |
+| `areal/models/mcore/vocab_parallel_head.py` | `AutoMapping.register_module_type` for dynamic LM-head subclasses |
 
 ### Tertiary (tests, config)
 
-| File                             | Imports / Usage                                                                   |
-| -------------------------------- | --------------------------------------------------------------------------------- |
-| `areal/tools/validation_base.py` | `"megatron-bridge"` → `"megatron.bridge"` in `PACKAGE_IMPORT_MAP` (metadata only) |
+| File                                          | Imports / Usage                                                                   |
+| --------------------------------------------- | --------------------------------------------------------------------------------- |
+| `areal/tools/validation_base.py`              | `"megatron-bridge"` → `"megatron.bridge"` in `PACKAGE_IMPORT_MAP` (metadata only) |
+| `areal/tools/validate_docker_installation.py` | Megatron Bridge package validation metadata                                       |
+| `tests/test_bailing_v3_nccl.py`               | Conditional Bridge availability and real conversion integration                   |
+| `tests/test_megatron_bridge_deterministic.py` | Bridge provider determinism integration                                           |
+| `tests/test_megatron_engine.py`               | Megatron engine integration through Bridge-backed paths                           |
+| `tests/test_megatron_transport.py`            | Conditional import of Bridge-backed Megatron engine                               |
+| `tests/test_megatron_lm_head.py`              | `AutoMapping` registry assertion for promoted LM-head subclasses                  |
 
 ______________________________________________________________________
 
@@ -38,7 +48,7 @@ signatures on returned objects**, and **moved/renamed modules**.
 
 ### 1. `megatron.bridge.AutoBridge.from_hf_pretrained`
 
-**Source:** `megatron/bridge/auto_bridge.py`
+**Source:** `megatron/bridge/models/conversion/auto_bridge.py`
 
 Called in `areal/engine/megatron_engine.py` (line 430):
 
@@ -59,7 +69,7 @@ ______________________________________________________________________
 
 ### 2. `megatron.bridge.AutoBridge.save_hf_pretrained`
 
-**Source:** `megatron/bridge/auto_bridge.py`
+**Source:** `megatron/bridge/models/conversion/auto_bridge.py`
 
 Called in `areal/engine/megatron_engine.py` (line 1561):
 
@@ -74,7 +84,7 @@ ______________________________________________________________________
 
 ### 3. `megatron.bridge.AutoBridge.load_hf_weights`
 
-**Source:** `megatron/bridge/auto_bridge.py`
+**Source:** `megatron/bridge/models/conversion/auto_bridge.py`
 
 Called in `areal/engine/megatron_engine.py` (line 1595):
 
@@ -89,7 +99,7 @@ ______________________________________________________________________
 
 ### 4. `megatron.bridge.AutoBridge.save_hf_adapter`
 
-**Source:** `megatron/bridge/auto_bridge.py`
+**Source:** `megatron/bridge/models/conversion/auto_bridge.py`
 
 Called in `areal/engine/megatron_engine.py` (lines 1554-1559) via the monkey-patched
 method on the bridge instance:
@@ -121,7 +131,7 @@ ______________________________________________________________________
 
 ### 5. `megatron.bridge.AutoBridge.export_adapter_weights`
 
-**Source:** `megatron/bridge/auto_bridge.py`
+**Source:** `megatron/bridge/models/conversion/auto_bridge.py`
 
 Called inside the monkey-patched `save_hf_adapter` in
 `areal/engine/megatron_utils/megatron_lora.py` (lines 237-240):
@@ -178,6 +188,47 @@ Verify the return type — it returns a modified model (or list of model chunks)
 then wrapped in `_MegatronModelList`. Confirm `set_params_to_save(model)` still exists
 and marks LoRA parameters for checkpoint saving. Check if `training=True` is still the
 correct keyword to enable grad on LoRA parameters.
+
+______________________________________________________________________
+
+### 8. Qwen3-VL model forward contract
+
+**Source:** `megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py`
+
+Called through `packed_context_parallel_forward` in
+`areal/engine/megatron_utils/packed_context_parallel.py`:
+
+```python
+output = model(
+    input_ids=input_ids,
+    attention_mask=attention_mask,
+    position_ids=position_ids,
+    packed_seq_params=packed_seq_params,
+    loss_mask=mtp_loss_mask,
+)
+```
+
+**Check:** Verify `Qwen3VLModel.forward` and its `Qwen3VLGPTModel` decoder accept
+`loss_mask`, preserve `labels=None` logits output, and pass layout-aligned `input_ids`
+to MCore's native MTP path. Confirm the upstream shadow embedding exposes
+`word_embeddings`; AReaL no longer patches either class.
+
+______________________________________________________________________
+
+### 9. `AutoMapping.register_module_type`
+
+**Source:** `megatron/bridge/models/conversion/param_mapping.py`
+
+Called after dynamically promoting an MCore output layer in
+`areal/models/mcore/vocab_parallel_head.py`:
+
+```python
+AutoMapping.register_module_type(output_layer.__class__.__name__, "column")
+```
+
+**Check:** Confirm the import path, classmethod signature, accepted mapping type
+(`"column"`), and registry lifetime. This mapping must allow Bridge to export dynamic
+AReAL LM-head subclasses without replacing their parameters or hooks.
 
 ______________________________________________________________________
 
