@@ -138,9 +138,14 @@ def _make_solid_color_png_b64(width: int, height: int, color: tuple) -> str:
 
 
 def _do_vlm_chat_session(
-    ctrl, task_id: str, messages: list, *, max_tokens: int = 64
+    ctrl,
+    task_id: str,
+    messages: list,
+    *,
+    max_tokens: int = 64,
+    export_trajectory: bool = False,
 ) -> dict:
-    """start_session → chat/completions → end_session."""
+    """Run a rewarded gateway session, optionally exporting its training data."""
     gw = ctrl._gateway_addr
     admin = "test-admin"
 
@@ -151,6 +156,7 @@ def _do_vlm_chat_session(
         timeout=30.0,
     )
     assert resp.status_code == 201, resp.text
+    session_id = resp.json()["sessions"][0]["session_id"]
     session_api_key = resp.json()["sessions"][0]["session_api_key"]
 
     resp = httpx.post(
@@ -180,6 +186,8 @@ def _do_vlm_chat_session(
     )
     assert resp.status_code == 200, resp.text
 
+    if export_trajectory:
+        return _export_trajectory_with_retry(gw, admin, session_id, discount=1.0)
     return completion
 
 
@@ -594,9 +602,14 @@ def gateway_controller_full_init_vlm(request, vlm_model_path, tmp_path_factory):
         tmp_path_factory, f"gateway_controller_full_init_vlm_{backend}"
     )
     ctrl = RolloutControllerV2(config=config, scheduler=local_scheduler)
+    server_args = _server_args_for_backend(backend, vlm_model_path, mem=0.25)
+    if backend == "sglang":
+        # Native /v1/chat/completions needs the server tokenizer. The gateway
+        # trajectory path continues to use token-input /generate as before.
+        server_args["skip_tokenizer_init"] = False
     ctrl.initialize(
         role=f"rollout-vlm-{backend}",
-        server_args=_server_args_for_backend(backend, vlm_model_path, mem=0.25),
+        server_args=server_args,
         wait=True,
     )
 
@@ -1195,65 +1208,99 @@ class TestControllerOnlineWorkflow:
 
 
 # =============================================================================
-# VLM image input tests (parametrized: SGLang + vLLM)
+# Native VLM inference and gateway training trajectories are separate contracts.
 # =============================================================================
+
+
+def _vlm_image_messages(image_count: int) -> list[dict]:
+    content = [{"type": "text", "text": "Describe these images briefly."}]
+    for color in [(255, 0, 0), (0, 0, 255)][:image_count]:
+        img = _make_solid_color_png_b64(64, 64, color)
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img}"},
+            }
+        )
+    return [{"role": "user", "content": content}]
 
 
 @pytest.mark.slow
 @pytest.mark.ci
 @pytest.mark.skipif(not has_gpu(), reason="GPU required")
-class TestControllerVLMImage:
-    """VLM image chat tests via real Qwen3-VL-2B-Instruct inference.
+class TestControllerVLMInference:
+    """Native backend inference, not gateway trajectory export, on both backends."""
 
-    Image trajectories require SGLang; text-only requests cover both SGLang
-    and vLLM through ``gateway_controller_full_init_vlm``.
-    """
-
-    def test_single_image_chat(self, gateway_controller_full_init_vlm):
-        if gateway_controller_full_init_vlm.config.backend.startswith("vllm:"):
-            pytest.skip("Multimodal agent trajectories currently require SGLang")
-        img = _make_solid_color_png_b64(64, 64, (255, 0, 0))
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Describe this image briefly."},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{img}"},
-                    },
-                ],
-            }
-        ]
-        _do_vlm_chat_session(gateway_controller_full_init_vlm, "vlm-1img", messages)
-
-    def test_multiple_images_chat(self, gateway_controller_full_init_vlm):
-        if gateway_controller_full_init_vlm.config.backend.startswith("vllm:"):
-            pytest.skip("Multimodal agent trajectories currently require SGLang")
-        red = _make_solid_color_png_b64(32, 32, (255, 0, 0))
-        blue = _make_solid_color_png_b64(32, 32, (0, 0, 255))
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Describe these two images."},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{red}"},
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{blue}"},
-                    },
-                ],
-            }
-        ]
-        _do_vlm_chat_session(
-            gateway_controller_full_init_vlm,
-            "vlm-2img",
-            messages,
-            max_tokens=128,
+    @pytest.mark.parametrize("image_count", [1, 2], ids=["single-image", "multi-image"])
+    def test_image_chat(self, gateway_controller_full_init_vlm, image_count):
+        ctrl = gateway_controller_full_init_vlm
+        response = httpx.post(
+            f"{ctrl.inference_worker_urls[0]}/v1/chat/completions",
+            json={
+                "model": ctrl.config.model,
+                "messages": _vlm_image_messages(image_count),
+                "max_tokens": 128,
+                "temperature": 0.0,
+                "stream": False,
+            },
+            timeout=120.0,
         )
+        assert response.status_code == 200, response.text
+        completion = response.json()
+        assert completion["object"] == "chat.completion"
+        assert len(completion["choices"]) == 1
+        assert completion["choices"][0]["message"]["content"]
+        assert completion["usage"]["completion_tokens"] > 0
+
+
+@pytest.mark.slow
+@pytest.mark.ci
+@pytest.mark.sglang
+@pytest.mark.skipif(not has_gpu(), reason="GPU required")
+@pytest.mark.parametrize("gateway_controller_full_init_vlm", ["sglang"], indirect=True)
+class TestControllerVLMTrainingTrajectory:
+    """Gateway/Data Proxy image export; this does not execute an actor update."""
+
+    @pytest.mark.parametrize("image_count", [1, 2], ids=["single-image", "multi-image"])
+    def test_image_trajectory_exports_training_tensors(
+        self, gateway_controller_full_init_vlm, image_count
+    ):
+        from areal.infra.rpc.rtensor import RTensor
+        from areal.infra.rpc.serialization import deserialize_value
+
+        exported = _do_vlm_chat_session(
+            gateway_controller_full_init_vlm,
+            f"vlm-training-{image_count}",
+            _vlm_image_messages(image_count),
+            max_tokens=128,
+            export_trajectory=True,
+        )
+        trajectory = RTensor.localize(deserialize_value(exported["traj"]))
+        input_ids = trajectory["input_ids"]
+        assert input_ids.ndim == 2 and input_ids.shape[0] == 1
+        for key in ("attention_mask", "loss_mask", "logprobs", "mm_token_type_ids"):
+            assert trajectory[key].shape == input_ids.shape
+        assert trajectory["loss_mask"].sum() > 0
+        # Processors without token type IDs legitimately export all zeros.
+        assert torch.all(
+            trajectory["mm_token_type_ids"][trajectory["loss_mask"].bool()] == 0
+        )
+
+        images = trajectory["multi_modal_input"]
+        assert len(images) == 1
+        pixels = images[0]["pixel_values"]
+        grid = images[0]["image_grid_thw"]
+        assert torch.is_tensor(pixels) and not pixels.is_meta
+        assert pixels.ndim == 2 and pixels.numel() > 0
+        assert grid.shape == torch.Size([image_count, 3])
+        assert pixels.shape[0] == int(grid.prod(dim=-1).sum())
+
+
+@pytest.mark.slow
+@pytest.mark.ci
+@pytest.mark.skipif(not has_gpu(), reason="GPU required")
+class TestControllerVLMTextSession:
+    """Text-only gateway sessions remain supported on both backends."""
 
     def test_text_only_on_vlm(self, gateway_controller_full_init_vlm):
         messages = [{"role": "user", "content": "What is 2+2? Answer briefly."}]
