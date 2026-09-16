@@ -216,14 +216,14 @@ When `group_size > 1`, the workflow is wrapped in `GroupedRolloutWorkflow`:
    usable rollouts after the group passes the minimum-size filter.
    `drop_incomplete_group=True` still requires every original slot to succeed. A
    surviving rollout with a missing row reward causes the group to be dropped.
-1. `min_usable_group_size` defaults to `1`. The v1 RL trainer sets it to `2` when reward
-   or advantage normalization uses group statistics, because that statistic needs at
-   least two observations; a singleton target group (`n_samples: 1`) is complete by
-   definition and keeps the minimum of `1`. Setting `actor.min_usable_group_size`
-   replaces this derived value; explicit values below `2` are rejected while group
-   statistics are in use. Groups below the minimum return `None`; the asynchronous
-   collector then takes another ready prompt group. Batch-relative PPO and REINFORCE
-   retain a usable singleton.
+1. `min_usable_group_size` defaults to `1`. The RL trainer sets it to `2` when reward or
+   advantage normalization uses group statistics, because that statistic needs at least
+   two observations; a singleton target group (`n_samples: 1`) is complete by definition
+   and keeps the minimum of `1`. Setting `actor.min_usable_group_size` replaces this
+   derived value; explicit values below `2` are rejected while group statistics are in
+   use. Groups below the minimum return `None`; the asynchronous collector then takes
+   another ready prompt group. Batch-relative PPO and REINFORCE retain a usable
+   singleton.
 1. Each v1 `arun_episode` call is one logical rollout. Context compaction and
    `agent.export_style: individual` can export multiple rows without aborting the group.
    The collector records contiguous row counts and optional reward references in
