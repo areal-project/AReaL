@@ -21,6 +21,7 @@ supported-markers = [
 [manifest]
 overrides = [
     { name = "causal-conv1d", marker = "sys_platform == 'never'" },
+    { name = "fast-hadamard-transform", marker = "sys_platform == 'never'" },
     { name = "flash-attn-4", specifier = ">=4.0.0b4" },
     { name = "flashinfer-cubin", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.6.6" },
     { name = "flashinfer-python", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.6.6" },
@@ -1912,17 +1913,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/f0/da/0a12e324567a06874
 wheels = [
     { url = "https://files.pythonhosted.org/packages/07/9d/790e25dcba0b299f9a756ae2dcc52a705be07bd1c3fd54267ade0521bea6/expression-5.7.0-py3-none-any.whl", hash = "sha256:d8d903cb9ddcb252dbd64612e329bd86f09d770c7812eaf8f9cc0b9f8e6480bd", size = 79404, upload-time = "2026-08-15T17:14:55.354Z" },
 ]
-
-[[package]]
-name = "fast-hadamard-transform"
-version = "1.1.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "ninja", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "packaging", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "torch", version = "2.10.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/81/dc/7afa54b951cac690742247d153e2e992e30677b944d7330bb7280903fb11/fast_hadamard_transform-1.1.0.tar.gz", hash = "sha256:7c03daf825dc74c7200605a5b758f2d5a3bc47ef3b817bf02e97b24076a83906", size = 7545, upload-time = "2026-03-10T09:23:56.028Z" }
 
 [[package]]
 name = "fastapi"
@@ -4081,7 +4071,6 @@ dependencies = [
     { name = "datasets", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "diffusers", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "einops", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "fast-hadamard-transform", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "flash-linear-attention", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "flashinfer-cubin", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "flashinfer-python", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },

@@ -249,6 +249,9 @@ override-dependencies = [
     "nv-grouped-gemm; sys_platform == 'never'",
     "mamba-ssm; sys_platform == 'never'",
     "causal-conv1d; sys_platform == 'never'",
+    # Megatron-Bridge only uses this CUDA extension for GLM-5/DeepSeek-V4 DSA,
+    # which AReaL does not currently expose. It requires nvcc at install time.
+    "fast-hadamard-transform; sys_platform == 'never'",
     # nvidia-resiliency-ext 0.6.0 only ships manylinux_2_39 wheels; exclude so
     # older host kernels can still install megatron-core.
     "nvidia-resiliency-ext; sys_platform == 'never'",
