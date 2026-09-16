@@ -132,6 +132,10 @@ def test_text_forward_keeps_original_microbatch_staging(
     )
     engine = module.MegatronEngine.__new__(module.MegatronEngine)
     engine._ensure_ready = lambda: None
+    engine.tf_config = SimpleNamespace(num_moe_experts=None)
+    engine.mcore_config = SimpleNamespace(enable_mtp_training=False)
+    engine.process_group_initialized = True
+    engine._cpu_group = object()
     engine.is_vision_model = is_vision_model
     engine.enable_tree_training = False
     engine.device = "cpu"
@@ -150,12 +154,19 @@ def test_text_forward_keeps_original_microbatch_staging(
 
     monkeypatch.setattr(module, "get_forward_backward_func", lambda: schedule)
     monkeypatch.setattr(MicroBatchItem, "to", to)
+    # Transport validation has separate distributed coverage; this test stops
+    # at microbatch staging without initializing a process group.
+    validate = MagicMock()
+    monkeypatch.setattr(module, "validate_transport_padding", validate)
     lazy = MagicMock(side_effect=AssertionError("text path entered vision preparation"))
     monkeypatch.setattr(module, "prepare_vision_microbatch", lazy)
 
     with pytest.raises(StagingReached):
         engine.forward_backward_batch(batch, lambda *args: None, forward_only=True)
 
+    validate.assert_called_once_with(
+        batch, has_internal_objectives=False, cpu_group=engine.cpu_group
+    )
     lazy.assert_not_called()
     assert staged[0].orig_mb is row
     assert staged[0].padded_mb is batch.padded_mbs[0]
