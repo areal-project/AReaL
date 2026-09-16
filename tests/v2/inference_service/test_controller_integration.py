@@ -143,9 +143,8 @@ def _do_vlm_chat_session(
     messages: list,
     *,
     max_tokens: int = 64,
-    export_trajectory: bool = False,
 ) -> dict:
-    """Run a rewarded gateway session, optionally exporting its training data."""
+    """Run a rewarded gateway session and return its chat completion."""
     gw = ctrl._gateway_addr
     admin = "test-admin"
 
@@ -156,7 +155,6 @@ def _do_vlm_chat_session(
         timeout=30.0,
     )
     assert resp.status_code == 201, resp.text
-    session_id = resp.json()["sessions"][0]["session_id"]
     session_api_key = resp.json()["sessions"][0]["session_api_key"]
 
     resp = httpx.post(
@@ -186,8 +184,6 @@ def _do_vlm_chat_session(
     )
     assert resp.status_code == 200, resp.text
 
-    if export_trajectory:
-        return _export_trajectory_with_retry(gw, admin, session_id, discount=1.0)
     return completion
 
 
@@ -604,8 +600,8 @@ def gateway_controller_full_init_vlm(request, vlm_model_path, tmp_path_factory):
     ctrl = RolloutControllerV2(config=config, scheduler=local_scheduler)
     server_args = _server_args_for_backend(backend, vlm_model_path, mem=0.25)
     if backend == "sglang":
-        # Native /v1/chat/completions needs the server tokenizer. The gateway
-        # trajectory path continues to use token-input /generate as before.
+        # Native /v1/chat/completions needs the server tokenizer. This fixture
+        # covers native image inference and text-only gateway sessions only.
         server_args["skip_tokenizer_init"] = False
     ctrl.initialize(
         role=f"rollout-vlm-{backend}",
@@ -1208,7 +1204,7 @@ class TestControllerOnlineWorkflow:
 
 
 # =============================================================================
-# Native VLM inference and gateway training trajectories are separate contracts.
+# Native VLM inference and text-only gateway sessions.
 # =============================================================================
 
 
@@ -1251,49 +1247,6 @@ class TestControllerVLMInference:
         assert len(completion["choices"]) == 1
         assert completion["choices"][0]["message"]["content"]
         assert completion["usage"]["completion_tokens"] > 0
-
-
-@pytest.mark.slow
-@pytest.mark.ci
-@pytest.mark.sglang
-@pytest.mark.skipif(not has_gpu(), reason="GPU required")
-@pytest.mark.parametrize("gateway_controller_full_init_vlm", ["sglang"], indirect=True)
-class TestControllerVLMTrainingTrajectory:
-    """Gateway/Data Proxy image export; this does not execute an actor update."""
-
-    @pytest.mark.parametrize("image_count", [1, 2], ids=["single-image", "multi-image"])
-    def test_image_trajectory_exports_training_tensors(
-        self, gateway_controller_full_init_vlm, image_count
-    ):
-        from areal.infra.rpc.rtensor import RTensor
-        from areal.infra.rpc.serialization import deserialize_value
-
-        exported = _do_vlm_chat_session(
-            gateway_controller_full_init_vlm,
-            f"vlm-training-{image_count}",
-            _vlm_image_messages(image_count),
-            max_tokens=128,
-            export_trajectory=True,
-        )
-        trajectory = RTensor.localize(deserialize_value(exported["traj"]))
-        input_ids = trajectory["input_ids"]
-        assert input_ids.ndim == 2 and input_ids.shape[0] == 1
-        for key in ("attention_mask", "loss_mask", "logprobs", "mm_token_type_ids"):
-            assert trajectory[key].shape == input_ids.shape
-        assert trajectory["loss_mask"].sum() > 0
-        # Processors without token type IDs legitimately export all zeros.
-        assert torch.all(
-            trajectory["mm_token_type_ids"][trajectory["loss_mask"].bool()] == 0
-        )
-
-        images = trajectory["multi_modal_input"]
-        assert len(images) == 1
-        pixels = images[0]["pixel_values"]
-        grid = images[0]["image_grid_thw"]
-        assert torch.is_tensor(pixels) and not pixels.is_meta
-        assert pixels.ndim == 2 and pixels.numel() > 0
-        assert grid.shape == torch.Size([image_count, 3])
-        assert pixels.shape[0] == int(grid.prod(dim=-1).sum())
 
 
 @pytest.mark.slow
