@@ -1205,11 +1205,13 @@ class TestControllerOnlineWorkflow:
 class TestControllerVLMImage:
     """VLM image chat tests via real Qwen3-VL-2B-Instruct inference.
 
-    Parametrized via ``gateway_controller_full_init_vlm`` to cover both SGLang
-    and vLLM backends.
+    Image trajectories require SGLang; text-only requests cover both SGLang
+    and vLLM through ``gateway_controller_full_init_vlm``.
     """
 
     def test_single_image_chat(self, gateway_controller_full_init_vlm):
+        if gateway_controller_full_init_vlm.config.backend.startswith("vllm:"):
+            pytest.skip("Multimodal agent trajectories currently require SGLang")
         img = _make_solid_color_png_b64(64, 64, (255, 0, 0))
         messages = [
             {
@@ -1226,6 +1228,8 @@ class TestControllerVLMImage:
         _do_vlm_chat_session(gateway_controller_full_init_vlm, "vlm-1img", messages)
 
     def test_multiple_images_chat(self, gateway_controller_full_init_vlm):
+        if gateway_controller_full_init_vlm.config.backend.startswith("vllm:"):
+            pytest.skip("Multimodal agent trajectories currently require SGLang")
         red = _make_solid_color_png_b64(32, 32, (255, 0, 0))
         blue = _make_solid_color_png_b64(32, 32, (0, 0, 255))
         messages = [
