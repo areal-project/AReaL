@@ -173,7 +173,7 @@ class TestControllerWorkflowResolution:
         assert isinstance(resolved.agent, MockAgent)
         assert resolved.drop_retry_orphans is True
 
-    def test_resolve_workflow_forwards_reward_normalization(self):
+    def test_resolve_workflow_forwards_group_policy(self):
         controller = RolloutControllerV2(
             config=InferenceEngineConfig(
                 backend="sglang:d1",
@@ -191,11 +191,15 @@ class TestControllerWorkflowResolution:
             MockAgent,
             group_size=2,
             reward_normalization=True,
+            drop_incomplete_group=True,
+            min_usable_group_size=2,
         )
 
         assert isinstance(resolved, InferenceServiceWorkflow)
         assert resolved.group_size == 2
         assert resolved.reward_normalization is True
+        assert resolved.drop_incomplete_group is True
+        assert resolved.min_usable_group_size == 2
 
     def test_resolve_should_accept_fn_none(self):
         assert RolloutControllerV2._resolve_should_accept_fn(None) is None
@@ -625,6 +629,8 @@ class TestInferenceServiceWorkflow:
         *,
         serialize_group_samples: bool,
         failing_member: int | None = None,
+        drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ):
         active = 0
         max_active = 0
@@ -661,6 +667,8 @@ class TestInferenceServiceWorkflow:
             admin_api_key="test-key",
             group_size=4,
             serialize_group_samples=serialize_group_samples,
+            drop_incomplete_group=drop_incomplete_group,
+            min_usable_group_size=min_usable_group_size,
         )
         sessions = [(f"task-42-{i}", f"session-key-{i}") for i in range(4)]
         workflow._start_session = AsyncMock(return_value=("grp-test-42", sessions))
@@ -687,11 +695,29 @@ class TestInferenceServiceWorkflow:
 
             result = await workflow.arun_episode(engine=MagicMock(), data={})
 
+        successful_session_ids = [
+            session_id
+            for index, (session_id, _) in enumerate(sessions)
+            if index != failing_member
+        ]
+        discard_group = (failing_member is not None and drop_incomplete_group) or len(
+            successful_session_ids
+        ) < min_usable_group_size
+        export_kwargs = {
+            "group_id": "grp-test-42",
+            "discard_trajectory": discard_group,
+        }
+        if not discard_group:
+            export_kwargs.update(
+                export_session_ids=successful_session_ids,
+                min_usable_group_size=(
+                    len(sessions) if drop_incomplete_group else min_usable_group_size
+                ),
+            )
         workflow._export_interactions.assert_awaited_once_with(
             mock_http_session,
             [session_id for session_id, _ in sessions],
-            group_id="grp-test-42",
-            discard_trajectory=failing_member is not None,
+            **export_kwargs,
         )
         return result, max_active, start_order, tracker, workflow
 
@@ -995,11 +1021,28 @@ class TestInferenceServiceWorkflow:
         ]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("serialize_group_samples", [False, True])
-    async def test_offline_group_failure_skips_fallback_reward_and_exports_discard(
-        self, serialize_group_samples
+    @pytest.mark.parametrize(
+        (
+            "serialize_group_samples",
+            "drop_incomplete_group",
+            "min_usable_group_size",
+            "is_trainable",
+        ),
+        [
+            (False, False, 1, True),
+            (True, False, 1, True),
+            (True, True, 1, False),
+            (True, False, 4, False),
+        ],
+    )
+    async def test_offline_group_failure_respects_policy_without_fallback_reward(
+        self,
+        serialize_group_samples,
+        drop_incomplete_group,
+        min_usable_group_size,
+        is_trainable,
     ):
-        """Only successful members write rewards; any failure discards the group."""
+        """Failed members skip fallback rewards and follow the group policy."""
         (
             result,
             max_active,
@@ -1009,9 +1052,11 @@ class TestInferenceServiceWorkflow:
         ) = await self._run_offline_group(
             serialize_group_samples=serialize_group_samples,
             failing_member=1,
+            drop_incomplete_group=drop_incomplete_group,
+            min_usable_group_size=min_usable_group_size,
         )
 
-        assert result is None
+        assert (result is not None) is is_trainable
         assert max_active == (1 if serialize_group_samples else 4)
         assert start_order == [0, 1, 2, 3]
         assert workflow._set_last_reward.await_count == 3
@@ -1019,7 +1064,11 @@ class TestInferenceServiceWorkflow:
             (args.args[1], args.args[2])
             for args in workflow._set_last_reward.await_args_list
         } == {(0.0, "session-key-0"), (2.0, "session-key-2"), (3.0, "session-key-3")}
-        assert tracker.scalar.call_count == 0
+        assert tracker.scalar.call_args_list == (
+            [call(reward=0.0), call(reward=2.0), call(reward=3.0)]
+            if is_trainable
+            else []
+        )
 
 
 # =============================================================================
