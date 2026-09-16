@@ -249,12 +249,18 @@ async def test_discard_unrewarded_group_removes_sessions_and_cache(proxy):
 
 
 @pytest.mark.asyncio
-async def test_text_group_does_not_call_processor_or_add_image_fields(proxy):
+async def test_text_group_does_not_call_processor_or_add_image_tensors(proxy):
     """Text requests retain independent samples and bypass the processor."""
     trajectory = await _export(proxy, await _run_group(proxy, [None, None]))
     proxy.processor.assert_not_called()
-    assert "multi_modal_input" not in trajectory
+    # A loaded processor adds empty multimodal metadata even for text-only
+    # samples; this must not contain image tensors or invoke the processor.
+    assert trajectory["multi_modal_input"] == [{}, {}]
     assert trajectory["input_ids"].shape == torch.Size([2, 4])
+    token_types = rtensor.RTensor.localize(trajectory["mm_token_type_ids"])
+    torch.testing.assert_close(
+        token_types, torch.zeros((2, 4), dtype=torch.long), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("cleanup", ["remove", "stale"])
