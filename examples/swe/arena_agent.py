@@ -37,6 +37,19 @@ from areal.utils.dynamic_import import import_from_string
 logger = logging.getLogger("ArenaStreamAgent")
 
 _ARENA_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
+_GAMEAGENT_OUTCOME_CODE_PATTERN = re.compile(
+    r"(?:^|\s)GAMEAGENT_OUTCOME_CODE=([A-Z][A-Z0-9_]{0,127})(?:\s|$)"
+)
+_GAMEAGENT_OUTCOME_CODE_VALUE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+_GAMEAGENT_MODEL_FAILURE_CODES = frozenset(
+    {
+        "AGENT_MAX_TURNS_EXCEEDED",
+        "AGENT_RUN_TIMEOUT",
+        "AUTONOMOUS_INCOMPLETE_NO_SHIP",
+        "LLM_RESPONSE_FAILED",
+        "LLM_RESPONSE_TIMEOUT",
+    }
+)
 _WORKER_GATEWAY_REGISTRY_ATTR = "_arena_session_gateway_registry_v1"
 _WORKER_GATEWAY_CLEANUP_KEY = "arena-session-gateway-registrations"
 
@@ -548,12 +561,37 @@ class ArenaStreamAgentWorkflow:
             }
         )
 
+    @staticmethod
+    def _gameagent_outcome_code(raw: Any) -> str | None:
+        """Read an explicit GameAgent outcome, preferring structured fields."""
+        if not isinstance(raw, dict):
+            return None
+        outcome = raw.get("outcome")
+        if isinstance(outcome, dict):
+            code = outcome.get("code")
+            if isinstance(
+                code, str
+            ) and _GAMEAGENT_OUTCOME_CODE_VALUE_PATTERN.fullmatch(code):
+                return code
+        code = raw.get("outcome_code")
+        if isinstance(code, str) and _GAMEAGENT_OUTCOME_CODE_VALUE_PATTERN.fullmatch(
+            code
+        ):
+            return code
+        detail = raw.get("error")
+        if not isinstance(detail, str):
+            return None
+        marker = _GAMEAGENT_OUTCOME_CODE_PATTERN.search(detail)
+        return marker.group(1) if marker is not None else None
+
     @classmethod
     def _is_model_attributed_harness_failure(cls, error: ArenaTaskFailedError) -> bool:
-        """Recognize the Harness' explicit Claude agent-phase failure envelope."""
+        """Recognize explicit, allowlisted Harness model-failure outcomes."""
 
         result = error.result
         raw = result.raw if result is not None else None
+        if cls._gameagent_outcome_code(raw) in _GAMEAGENT_MODEL_FAILURE_CODES:
+            return True
         if not isinstance(raw, dict):
             return False
         detail = raw.get("error")
@@ -573,13 +611,12 @@ class ArenaStreamAgentWorkflow:
         context_overflow: bool,
         interaction_count: int,
     ) -> str:
-        """Classify Arena failures without parsing grader-owned ``raw`` text.
+        """Keep attributed model failures without accepting arbitrary errors.
 
-        A typed local context overflow or the Harness' explicit Claude
-        agent-phase error envelope attributes the failure to the model-facing
-        agent lifecycle. Everything ambiguous is rejected until Arena exposes
-        versioned failure attribution and semantic codes in its stable result
-        envelope.
+        Explicit GameAgent outcomes, local context overflow, and the legacy
+        Claude agent-phase envelope may identify a model failure. A GameAgent
+        log marker is supported for Harnesses without structured outcome fields.
+        Unknown outcomes and system failures retain their rejection behavior.
         """
 
         if not isinstance(error, ArenaTaskFailedError):

@@ -251,6 +251,64 @@ async def test_context_overflow_recovers_existing_interactions_with_zero_reward(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["AGENT_MAX_TURNS_EXCEEDED", "UNKNOWN_FAILURE"])
+async def test_gameagent_outcome_drives_real_workflow_export(monkeypatch, code):
+    """Exercise the real classifier through reward assignment and tensor export."""
+    from examples.swe.arena_agent import ArenaStreamAgentWorkflow
+    from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
+
+    error = ArenaTaskFailedError(
+        task_id="task-1",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task-1",
+            status="HARNESS_FAILED",
+            score=0.0,
+            raw={"error": f"GAMEAGENT_OUTCOME_CODE={code}"},
+        ),
+    )
+
+    class Agent(_RecordingFailingAgent):
+        classify_proxy_failure = staticmethod(
+            ArenaStreamAgentWorkflow.classify_proxy_failure
+        )
+
+        async def run(self, data, **kwargs):
+            raise error
+
+    client = _FakeProxyClient()
+    client.context_overflow = False
+    client.interaction.model_response = ModelResponse(
+        input_tokens=[1], output_tokens=[2], output_logprobs=[-0.2], output_versions=[0]
+    )
+    monkeypatch.setattr(workflow_module, "OpenAIProxyClient", lambda *a, **kw: client)
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    agent = Agent()
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
+    monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
+    workflow_context.set(WorkflowContext(task_id=1))
+    try:
+        if code == "UNKNOWN_FAILURE":
+            with pytest.raises(ArenaTaskFailedError):
+                await workflow.arun_episode(engine=None, data={})
+            assert client.last_reward is None
+            assert agent.persisted_rewards == []
+        else:
+            result = await workflow.arun_episode(engine=None, data={})
+            assert result == {"completion-1": client.interaction}
+            assert client.last_reward == 0.0
+            assert agent.persisted_rewards == [({}, 0.0)]
+            tensors = concat_tensor_interactions(result)
+            assert tensors["rewards"].tolist() == [0.0]
+            assert tensors["loss_mask"].sum().item() == 1
+    finally:
+        workflow_context.set(WorkflowContext())
+        stats_tracker.export_all(reset=True)
+
+
+@pytest.mark.asyncio
 async def test_context_overflow_overrides_successful_agent_reward_with_zero(
     monkeypatch,
 ):
