@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 from areal.utils.hf_utils import apply_chat_template as _apply_chat_template
+
+if TYPE_CHECKING:
+    from transformers import ProcessorMixin
 
 
 class TokenizerProxy:
     """Wraps HuggingFace tokenizer with async-safe methods for the data proxy."""
 
     def __init__(self, tokenizer_path: str):
-        from areal.utils.hf_utils import load_hf_tokenizer
+        from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 
-        self._tok = load_hf_tokenizer(tokenizer_path)
+        processor, self._tok = load_hf_processor_and_tokenizer(tokenizer_path)
+        self._processor: ProcessorMixin | None = None
+        if processor is not None and hasattr(processor, "image_processor"):
+            self._processor = processor
 
     async def tokenize(self, text: str) -> list[int]:
         """Tokenize string -> token IDs. Runs in executor (non-blocking)."""
@@ -46,3 +53,7 @@ class TokenizerProxy:
     @property
     def pad_token_id(self) -> int:
         return self._tok.pad_token_id or self._tok.eos_token_id
+
+    @property
+    def processor(self) -> ProcessorMixin | None:
+        return self._processor

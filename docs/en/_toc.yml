@@ -38,6 +38,7 @@ parts:
     - file: algorithms/grpo_series
     - file: algorithms/m2po
     - file: algorithms/prox_approx
+    - file: algorithms/prm
   - caption: Reference
     chapters:
     - file: reference/checkpointing

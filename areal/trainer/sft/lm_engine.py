@@ -5,6 +5,7 @@ from typing import Any
 import torch
 
 from areal.api import TrainEngine
+from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.utils import stats_tracker
@@ -27,6 +28,7 @@ class LMEngine:
     def _train_lm(self, data: dict[str, Any]) -> None:
         self.engine.train()
         data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
+        stage_batch_for_engine(data, self.engine)
         stats = self.engine.train_batch(
             input_=data,
             loss_fn=compute_packed_sft_loss,
@@ -42,6 +44,7 @@ class LMEngine:
     def _evaluate_lm(self, data: dict[str, Any]) -> None:
         self.engine.eval()
         data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
+        stage_batch_for_engine(data, self.engine)
         self.engine.eval_batch(
             input_=data,
             loss_fn=compute_packed_sft_loss,

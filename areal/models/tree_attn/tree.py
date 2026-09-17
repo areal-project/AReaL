@@ -18,6 +18,7 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask
 
 from areal.api.cli_args import MicroBatchSpec
+from areal.infra.platforms import current_platform
 from areal.models.tree_attn.constants import BLOCK_SIZE, USE_TRITON_TREE_ATTN
 from areal.models.tree_attn.module_fsdp import create_block_mask_from_dense
 from areal.models.tree_attn.triton_kernel import (
@@ -26,10 +27,22 @@ from areal.models.tree_attn.triton_kernel import (
     precompute_tree_attention_data,
 )
 from areal.utils import logging, stats_tracker
-from areal.utils.data import MicroBatchList
+from areal.utils.data import TRANSPORT_DUMMY_KEY, MicroBatchList
 from areal.utils.perf_tracer import trace_perf, trace_scope
 
 logger = logging.getLogger("TreeAttentionCore")
+
+
+def _tree_count_collective_device(dp_group: dist.ProcessGroup) -> torch.device:
+    """Select a device compatible with the tree DP collective backend."""
+    backend = str(dist.get_backend(dp_group)).lower()
+    if backend in {"nccl", "hccl"}:
+        return torch.device(
+            current_platform.device_type, current_platform.current_device()
+        )
+    if backend == "gloo":
+        return torch.device("cpu")
+    raise ValueError(f"Unsupported tree count collective backend: {backend}")
 
 
 # =============================================================================
@@ -352,21 +365,15 @@ def build_packed_tree_batch(
     # Synchronize number of trees across dp_group.
     if dist.is_initialized():
         num_trees = len(tries)
-        input_template: torch.Tensor = data["input_ids"]
-
-        # All-gather tree counts from all ranks
-        local_count = torch.tensor(
-            [num_trees], dtype=torch.int64, device=input_template.device
+        # Tree construction may run on CPU, but dp_group normally uses the
+        # accelerator backend. Communicate only this scalar on that backend.
+        max_count = torch.tensor(
+            num_trees,
+            dtype=torch.int64,
+            device=_tree_count_collective_device(dp_group),
         )
-        world_size = dist.get_world_size(dp_group)
-        all_counts = [
-            torch.zeros(1, dtype=torch.int64, device=input_template.device)
-            for _ in range(world_size)
-        ]
-        dist.all_gather(all_counts, local_count, group=dp_group)
-
-        # Find the maximum tree count across all ranks
-        max_num_trees = max(c.item() for c in all_counts)
+        dist.all_reduce(max_count, op=dist.ReduceOp.MAX, group=dp_group)
+        max_num_trees = int(max_count.item())
 
         # If this rank has fewer trees, append dummy trees
         if num_trees < max_num_trees:
@@ -404,6 +411,7 @@ def build_packed_tree_batch(
 
     # Build packed outputs for each tree
     mbs: list[dict[str, Any]] = []
+    padded_mbs: list[dict[str, Any]] = []
     padding_lengths: list[int] = []
     padded_to_lengths: list[int] = []
 
@@ -448,13 +456,17 @@ def build_packed_tree_batch(
                 non_packable_keys,
             )
 
-        mb = {
+        padded_mb = {
             "input_ids": input_ids,
             "position_ids": position_ids,
             "trie_node": trie,
             **extra_data,
         }
+        mb = dict(padded_mb)
+        if not trie.all_sequence_ids:
+            mb[TRANSPORT_DUMMY_KEY] = True
         mbs.append(mb)
+        padded_mbs.append(padded_mb)
         padding_lengths.append(padded_size - num_tokens)
         padded_to_lengths.append(padded_size)
 
@@ -465,7 +477,7 @@ def build_packed_tree_batch(
         mb_spec=mb_spec,
         mbs=mbs,
         group_lens=[num for num in num_tokens_list],
-        padded_mbs=mbs,
+        padded_mbs=padded_mbs,
         padding_lengths=padding_lengths,
         padded_to_lengths=padded_to_lengths,
         _max_seqlen=max(padded_to_lengths),

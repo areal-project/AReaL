@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from pydantic import BaseModel
@@ -17,18 +17,22 @@ from tenacity import (
     wait_exponential,
 )
 
+from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.http import ensure_end_with_slash
 from areal.utils.logging import getLogger
 
 from .server import (
     EXPORT_TRAJECTORIES_PATHNAME,
     RL_END_SESSION_PATHNAME,
+    RL_FETCH_SHARED_TENSORS_PATHNAME,
     RL_SET_REWARD_PATHNAME,
     RL_START_SESSION_PATHNAME,
+    FetchSharedTensorsRequest,
     SetRewardRequest,
     StartSessionRequest,
     deserialize_interactions,
 )
+from .tensor_reference import SharedTensorResolver
 
 if TYPE_CHECKING:
     from ..types import InteractionWithTokenLogpReward
@@ -58,6 +62,12 @@ class OpenAIProxyClient:
         Unique identifier for this task
     admin_api_key : str
         Admin API key for management operations
+    processor_cache_group_id : str | None
+        Shared processor-cache identity for grouped rollout sessions.
+    processor_cache_group_size : int
+        Expected number of sessions sharing the processor cache.
+    shared_tensor_resolver : SharedTensorResolver | None
+        Group-local resolver used to fetch each referenced image tensor once.
 
     Example
     -------
@@ -85,13 +95,28 @@ class OpenAIProxyClient:
         base_url: str,
         task_id: str,
         admin_api_key: str,
+        processor_cache_group_id: str | None = None,
+        processor_cache_group_size: int = 1,
+        shared_tensor_resolver: SharedTensorResolver | None = None,
+        metadata: dict[str, Any] | None = None,
     ):
         self._session = session
         self.base_url = ensure_end_with_slash(base_url)
         self.task_id = task_id
         self._admin_api_key = admin_api_key
+        self._processor_cache_group_id = processor_cache_group_id
+        self._processor_cache_group_size = processor_cache_group_size
+        self._shared_tensor_resolver = shared_tensor_resolver
+        self._metadata = metadata
+        if processor_cache_group_id is not None and shared_tensor_resolver is None:
+            self._shared_tensor_resolver = SharedTensorResolver()
         self.session_id: str | None = None
         self._session_api_key: str | None = None
+        self.interaction_count = 0
+        self.context_overflow = False
+        self.context_overflow_message = ""
+        self.system_error = False
+        self.system_error_message = ""
 
     @property
     def session_api_key(self) -> str:
@@ -137,6 +162,8 @@ class OpenAIProxyClient:
         self,
         discount: float = 1.0,
         style: str = "individual",
+        drop_retry_orphans: bool = False,
+        is_eval: bool = False,
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Export interactions for this session via HTTP.
 
@@ -156,6 +183,14 @@ class OpenAIProxyClient:
             Discount factor for reward propagation
         style : str
             Export style ("individual" or "merged")
+        drop_retry_orphans : bool
+            If True, instruct the server to drop completions that look like
+            orphaned outputs from agent-side retries before reward discounting
+            and export. Useful when the upstream Agent SDK times out and
+            retries the same request, leaving the proxy with two completions
+            for the same input messages.
+        is_eval : bool
+            Route process-reward metrics to the eval-rollout scope.
 
         Returns
         -------
@@ -175,19 +210,58 @@ class OpenAIProxyClient:
             "session_id": self.session_id,
             "discount": discount,
             "style": style,
+            "drop_retry_orphans": drop_retry_orphans,
+            "supports_shared_tensor_references": (
+                self._processor_cache_group_id is not None
+            ),
+            "is_eval": is_eval,
         }
         headers = self._admin_auth_headers()
         async with self._session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             data = await resp.json()
-            return deserialize_interactions(data["interactions"])
+
+        serialized_interactions = data["interactions"]
+        tensor_group_id = data.get("tensor_reference_group_id")
+        if tensor_group_id is not None:
+            if self._shared_tensor_resolver is None:
+                raise RuntimeError(
+                    "Proxy returned shared tensor references without a resolver"
+                )
+
+            async def fetch_shared_tensors(ref_ids: list[str]):
+                fetch_payload = FetchSharedTensorsRequest(
+                    group_id=tensor_group_id,
+                    ref_ids=ref_ids,
+                )
+                async with self._session.post(
+                    f"{self.base_url}{RL_FETCH_SHARED_TENSORS_PATHNAME}",
+                    json=fetch_payload.model_dump(),
+                    headers=headers,
+                ) as response:
+                    response.raise_for_status()
+                    response_data = await response.json()
+                return deserialize_value(response_data["tensors"])
+
+            serialized_interactions = await self._shared_tensor_resolver.resolve(
+                serialized_interactions,
+                group_id=tensor_group_id,
+                fetch=fetch_shared_tensors,
+            )
+
+        return deserialize_interactions(serialized_interactions)
 
     async def __aenter__(self) -> OpenAIProxyClient:
         """Start the RL session via HTTP request."""
         data = await _start_session(
             self._session,
             url=f"{self.base_url}{RL_START_SESSION_PATHNAME}",
-            payload=StartSessionRequest(task_id=self.task_id),
+            payload=StartSessionRequest(
+                task_id=self.task_id,
+                processor_cache_group_id=self._processor_cache_group_id,
+                processor_cache_group_size=self._processor_cache_group_size,
+                metadata=self._metadata,
+            ),
             headers=self._admin_auth_headers(),
         )
         self.session_id = data["session_id"]
@@ -210,11 +284,18 @@ class OpenAIProxyClient:
 
         # Always try to end the session, even on exception
         try:
-            await post_json_with_retry(
+            data = await post_json_with_retry(
                 self._session,
                 url=f"{self.base_url}{RL_END_SESSION_PATHNAME}",
                 headers=self._session_auth_headers(),
             )
+            self.interaction_count = int(data.get("interaction_count", 0))
+            self.context_overflow = bool(data.get("context_overflow", False))
+            self.context_overflow_message = str(
+                data.get("context_overflow_message", "")
+            )
+            self.system_error = bool(data.get("system_error", False))
+            self.system_error_message = str(data.get("system_error_message", ""))
         except Exception as e:
             # Raised errors will be properly handled by OpenAIProxyWorkflow
             logger.warning(f"Failed to end session {self.session_id}: {e}")

@@ -5,10 +5,7 @@
 <p align="center">
 | <a href="https://arxiv.org/pdf/2505.24298"><b>Paper</b></a> | <a href="https://areal-project.github.io/AReaL/"><b>Documentation</b></a> | <a href="https://areal-project.github.io/AReaL/zh/"><b>中文文档</b></a> | <a href="https://deepwiki.com/areal-project/AReaL"><b>Ask DeepWiki</b></a> | <a href="https://huggingface.co/collections/inclusionAI/"><b>🤗 Models & Data</b></a> |
 <a href="./assets/figures/wechat_qrcode.png" target="_blank"><img src="./assets/figures/wechat_icon.png" width="20" style="vertical-align: middle;"> <b>WeChat (微信) Group</b></a> |
-  <a href="https://gitcgr.com/areal-project/AReaL">
-    <img src="https://gitcgr.com/badge/areal-project/AReaL.svg" alt="gitcgr" />
   <a href="https://www.bestpractices.dev/projects/12770"><img src="https://www.bestpractices.dev/projects/12770/badge"></a>
-  </a>
 </p>
 
 <img align="right" alt="ReaL" src="/assets/figures/logo.png" width="20%">
@@ -31,8 +28,8 @@ cost-effective** for a broad community of developers and researchers.
 
 - ⚡ **Flexibility**: Seamless customization for
   [agentic RL](https://areal-project.github.io/AReaL/en/tutorial/agentic_rl.html) and
-  [online RL training](https://www.inclusion-ai.org/AReaL/en/tutorial/online_proxy.html)
-  for **black-box agent applications** by simply replacing the `base_url`.
+  [online RL training](https://areal-ai.io/en/tutorial/online_proxy.html) for
+  **black-box agent applications** by simply replacing the `base_url`.
 - 📈 **Scalability**: **Stable** fully asynchronous RL training with **industry-leading
   speed**.
 - ✨ **Cutting-Edge Performance**: State-of-the-art [math](/blog/AReaL_v0_2.md),
@@ -41,11 +38,22 @@ cost-effective** for a broad community of developers and researchers.
 
 ## 📰 News
 
+**\[2026/07/01\]** 🎉 We release **AReaL 2.0**, a major architectural milestone. This
+release refactors AReaL into a **microservice architecture** with independent
+[training](./areal/v2/training_service/), [inference](./areal/v2/inference_service/),
+[agent](./areal/v2/agent_service/), and [weight-update](./areal/v2/weight_update/)
+services, and ships the [Hermes online RL loop](./examples/hermes) and
+[end-to-end SWE RL training examples](./examples/swe). Check out our
+[technical report](https://arxiv.org/abs/2607.01120).
+
 **\[2026/06/17\]** 🔬 Introducing **KPop** — bidirectional binary KL divergence token
 masking. Configured via `rejection_sampling.metric=binary_kl`. Also adding an
 [IcePop config](examples/math/gsm8k_icepop.yaml) (importance-ratio-based token masking).
 Check out [gsm8k_kpop.yaml](examples/math/gsm8k_kpop.yaml) and
 [gsm8k_icepop.yaml](examples/math/gsm8k_icepop.yaml) to get started!
+
+<details>
+<summary><b>📋 Previous Releases</b></summary>
 
 **\[2026/04/23\]** 🚀 We’re excited to release our integration with
 [Scaffoldings](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding)
@@ -68,9 +76,6 @@ participate! See [Community](./assets/community/README.md) for more details.
 **\[2026/03/02\]** We provide [a complete example](./examples/openclaw/) to train your
 own 🦞 OpenClaw agent by simply replacing the `base_url` and `api_key` with AReaL's RL
 service - no complicated dependencies, no code changes, works with any agentic runtime!
-
-<details>
-<summary><b>📋 Previous Releases</b></summary>
 
 **\[2026/02/06\]** We are delighted to introduce **AReaL-SEA**, a self-evolving data
 synthesis engine. Combined with RL training on AReaL, the 235B MoE model surpasses GPT 5
@@ -102,7 +107,7 @@ AReaL designed specifically for AI researchers and rapid prototyping. AReaL-lite
 features an **algorithm-first** API design that prioritizes ease of use and algorithm
 development, while natively supporting **fully asynchronous agentic RL**. With 80% fewer
 lines of code, AReaL-lite maintains 90% of AReaL's performance and core functionality.
-Check out [our AReaL-lite design documentation](/areal/README.md) and
+Check out [our documentation](https://areal-project.github.io/AReaL/en/intro.html) and
 [the quickstart guide](https://areal-project.github.io/AReaL/en/tutorial/quickstart.html)
 to begin your journey with **AReaL-lite**!
 
@@ -172,14 +177,16 @@ For comprehensive setup instructions, see
 
 ### Agentic RL
 
-| Task                                                     | Description                                                            | Performance                                                                  |
-| -------------------------------------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| **[General Agent](examples/agent_workflow/)**            | General agentic training with any agentic frameworks                   | [Guide](docs/tutorial/agentic_rl.md)                                         |
-| **[Tau2 Customer Service](examples/tau2/)**              | Customer service agent on Tau2-Bench (retail, airline, telecom)        | [Paper](https://arxiv.org/abs/2601.22607)                                    |
-| **[Search Agent](examples/search_agent/)**               | End-to-end search agent with Tongyi-DeepResearch workflow              | [Training Curve](examples/search_agent/tongyi_deepresearch/reward_curve.png) |
-| **[Tool-Integrated Reasoning](examples/tir/)**           | Multi-turn tool calling during reasoning (Python executor, calculator) | [Training Curve](examples/tir/figures/task_reward.png)                       |
-| **[OpenAI Agents Integration](examples/openai_agents/)** | Integration with OpenAI Agents SDK for agentic workflows               | -                                                                            |
-| **[CAMEL-AI Integration](examples/camel/)**              | Integration with CAMEL-AI framework for agentic RL                     | -                                                                            |
+| Task                                                     | Description                                                               | Performance                                                                  |
+| -------------------------------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| **[General Agent](examples/agent_workflow/)**            | General agentic training with any agentic frameworks                      | [Guide](docs/en/tutorial/agentic_rl.md)                                      |
+| **[Hermes Online RL](examples/hermes/)**                 | End-to-end Online RL loop with Hermes agent under AReaL 2.0               | [Guide](examples/hermes/README.md)                                           |
+| **[Coding Agent RL](examples/swe/)**                     | End-to-end coding-agent RL training with AReaL-SWEAgent/Claude Code Agent | [Guide](examples/swe/README.md)                                              |
+| **[Tau2 Customer Service](examples/tau2/)**              | Customer service agent on Tau2-Bench (retail, airline, telecom)           | [Paper](https://arxiv.org/abs/2601.22607)                                    |
+| **[Search Agent](examples/search_agent/)**               | End-to-end search agent with Tongyi-DeepResearch workflow                 | [Training Curve](examples/search_agent/tongyi_deepresearch/reward_curve.png) |
+| **[Tool-Integrated Reasoning](examples/tir/)**           | Multi-turn tool calling during reasoning (Python executor, calculator)    | [Training Curve](examples/tir/figures/task_reward.png)                       |
+| **[OpenAI Agents Integration](examples/openai_agents/)** | Integration with OpenAI Agents SDK for agentic workflows                  | -                                                                            |
+| **[CAMEL-AI Integration](examples/camel/)**              | Integration with CAMEL-AI framework for agentic RL                        | -                                                                            |
 
 ### Vision-Language Models
 
@@ -200,26 +207,26 @@ For comprehensive setup instructions, see
 ### 🧠 Algorithms
 
 All RL algorithms support both asynchronous and synchronous versions by setting
-`max_head_offpolicyness=0`. See [Asynchronous RL Guide](docs/algorithms/async.md).
+`max_head_offpolicyness=0`. See [Asynchronous RL Guide](docs/en/algorithms/async.md).
 
-| Algorithm                | Documentation                                 | Paper                                          | Configuration                                                     |
-| ------------------------ | --------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------- |
-| **GRPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2402.03300)   | [🔗 GSM8K Example](examples/math/gsm8k_grpo.yaml)                 |
-| **GSPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2507.18071)   | [🔗 GSM8K Example](examples/math/gsm8k_gspo.yaml)                 |
-| **PPO**                  | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2203.02155)   | [🔗 GSM8K Example](examples/math/gsm8k_ppo.yaml)                  |
-| **DAPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2503.14476)   | [🔗 GSM8K Example](examples/math/gsm8k_dapo_dynamic_bs.yaml)      |
-| **LitePPO**              | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2508.08221)   | [🔗 GSM8K Example](examples/math/gsm8k_liteppo.yaml)              |
-| **Dr.GRPO**              | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2503.20783)   | [🔗 GSM8K Example](examples/math/gsm8k_drgrpo.yaml)               |
-| **REINFORCE++**          | -                                             | [📄 Paper](https://arxiv.org/pdf/2501.03262)   | [🔗 GSM8K Example](examples/math/gsm8k_reinforce.yaml)            |
-| **RLOO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2402.14740v1) | [🔗 GSM8K Example](examples/math/gsm8k_rloo.yaml)                 |
-| **SAPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2511.20347)   | [🔗 GSM8K Example](examples/math/gsm8k_sapo.yaml)                 |
-| **IcePop**               | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Blog](https://ringtech.notion.site/icepop) | [🔗 GSM8K Example](examples/math/gsm8k_icepop.yaml)               |
-| **KPop**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Blog](https://ringtech.notion.site/kpop)   | [🔗 GSM8K Example](examples/math/gsm8k_kpop.yaml)                 |
-| **M2PO**                 | [📖 Docs](docs/algorithms/m2po.md)            | [📄 Paper](https://arxiv.org/abs/2510.01161)   | [🔗 GSM8K Example](examples/math/gsm8k_m2po.yaml)                 |
-| **DPO**                  | [📖 Docs](docs/en/algorithms/dpo.md)          | [📄 Paper](https://arxiv.org/abs/2305.18290)   | [🔗 HH-RLHF Example](examples/alignment/hhrlhf_dpo.yaml)          |
-| **RLHF Reward Modeling** | -                                             | -                                              | [🔗 RLHF Example](examples/alignment/hhrlhf_rw.yaml)              |
-| **SFT**                  | -                                             | -                                              | [🔗 GSM8K Example](examples/math/gsm8k_sft.py)                    |
-| **Distillation**         | [📖 Docs](docs/en/algorithms/distillation.md) | [📄 Paper](https://arxiv.org/pdf/2506.02208)   | [🔗 GSM8K Example](examples/distillation/gsm8k_grpo_distill.yaml) |
+| Algorithm                | Documentation                                 | Paper                                          | Configuration                                                                      |
+| ------------------------ | --------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------------- |
+| **GRPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2402.03300)   | [🔗 GSM8K Example](examples/math/gsm8k_grpo.yaml)                                  |
+| **GSPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2507.18071)   | [🔗 GSM8K Example](examples/math/gsm8k_gspo.yaml)                                  |
+| **PPO**                  | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2203.02155)   | [🔗 GSM8K Example](examples/math/gsm8k_ppo.yaml)                                   |
+| **DAPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2503.14476)   | [🔗 GSM8K Example](examples/math/gsm8k_dapo_dynamic_bs.yaml)                       |
+| **LitePPO**              | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2508.08221)   | [🔗 GSM8K Example](examples/math/gsm8k_liteppo.yaml)                               |
+| **Dr.GRPO**              | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2503.20783)   | [🔗 GSM8K Example](examples/math/gsm8k_drgrpo.yaml)                                |
+| **REINFORCE++**          | -                                             | [📄 Paper](https://arxiv.org/pdf/2501.03262)   | [🔗 GSM8K Example](examples/math/gsm8k_reinforce.yaml)                             |
+| **RLOO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2402.14740v1) | [🔗 GSM8K Example](examples/math/gsm8k_rloo.yaml)                                  |
+| **SAPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2511.20347)   | [🔗 GSM8K Example](examples/math/gsm8k_sapo.yaml)                                  |
+| **IcePop**               | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Blog](https://ringtech.notion.site/icepop) | [🔗 GSM8K Example](examples/math/gsm8k_icepop.yaml)                                |
+| **KPop**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Blog](https://ringtech.notion.site/kpop)   | [🔗 GSM8K Example](examples/math/gsm8k_kpop.yaml)                                  |
+| **M2PO**                 | [📖 Docs](docs/en/algorithms/m2po.md)         | [📄 Paper](https://arxiv.org/abs/2510.01161)   | [🔗 GSM8K Example](examples/math/gsm8k_m2po.yaml)                                  |
+| **DPO**                  | [📖 Docs](docs/en/algorithms/dpo.md)          | [📄 Paper](https://arxiv.org/abs/2305.18290)   | [🔗 HH-RLHF Example](examples/alignment/hhrlhf_dpo.yaml)                           |
+| **RLHF Reward Modeling** | -                                             | -                                              | [🔗 RLHF Example](examples/alignment/hhrlhf_rw.yaml)                               |
+| **SFT**                  | -                                             | -                                              | [🔗 GSM8K Example](examples/math/gsm8k_sft.py)                                     |
+| **Distillation**         | [📖 Docs](docs/en/algorithms/distillation.md) | [📄 Paper](https://arxiv.org/pdf/2506.02208)   | [🔗 GSM8K Example](examples/distillation/gsm8k_grpo_distill_mode_trainEngine.yaml) |
 
 ### Models
 
@@ -227,13 +234,17 @@ All RL algorithms support both asynchronous and synchronous versions by setting
 | -------------------------- | -------- | ------------ | -------------- | -------------------------------------------------------- |
 | **Qwen2/3**                | ✅       | ✅           | ✅             | -                                                        |
 | **Qwen3-MoE**              | ✅       | ✅           | ✅             | -                                                        |
-| **Qwen2.5-VL**             | ❌       | ✅           | ❌             | Vision-language model                                    |
-| **Qwen3-VL**               | ❌       | ✅           | ❌             | Vision-language model                                    |
+| **Qwen3.5**                | ✅       | ✅           | ❌             | Vision-language model                                    |
+| **Qwen3.5-MoE**            | ✅       | ✅           | ❌             | Vision-language model                                    |
+| **Bailing V3**             | ✅       | ❌           | ❌             | -                                                        |
+| **Qwen2.5-VL**             | ✅       | ✅           | ❌             | Vision-language model                                    |
+| **Qwen3-VL**               | ✅       | ✅           | ❌             | Vision-language model                                    |
 | **Gemma 3**                | ❌       | ✅           | ❌             | Vision-language model                                    |
 | **Other Hugging Face LLM** | ❌       | ✅           | ❌             | Compatibility depending on the version of `transformers` |
 
-Check the [AI Coding Assistant Guide](docs/reference/ai_assisted_dev.md) and
-[Archon Reference](docs/tutorial/archon.md) for how to integrate new models into AReaL.
+Check the [AI Coding Assistant Guide](docs/en/reference/ai_assisted_dev.md) and
+[Archon Reference](docs/en/tutorial/archon.md) for how to integrate new models into
+AReaL.
 
 ### Training Backends
 
@@ -256,6 +267,7 @@ Check the [AI Coding Assistant Guide](docs/reference/ai_assisted_dev.md) and
 
 - [Installation](docs/en/tutorial/installation.md)
 - [Quickstart](docs/en/tutorial/quickstart.md)
+- [AReaL CLI Guide](docs/en/best_practices/cli_guide.md)
 - [Agentic RL](docs/en/tutorial/agentic_rl.md)
 - [Evaluation](docs/en/tutorial/eval.md)
 - [Large MoE with Megatron](docs/en/tutorial/megatron.md)
@@ -333,7 +345,8 @@ git push
 ## 🗺️ Future Roadmap
 
 - **[Full Roadmap](ROADMAP.md)**
-- **[2026 Q1 Roadmap](https://github.com/areal-project/AReaL/issues/907)**
+- **[2026 H2 Roadmap](https://github.com/areal-project/AReaL/issues/1381)**
+- **[2026 Q2 Roadmap](https://github.com/areal-project/AReaL/issues/1302)**
 
 AReaL is under active development with planned minor releases weekly and major releases
 monthly. We warmly welcome community engagement and contributions. We are also

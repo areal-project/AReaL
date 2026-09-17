@@ -357,6 +357,7 @@ class TestVLLMBridgeBackendVisionMessages:
             n_samples=1,
             max_new_tokens=10,
             max_tokens=32768,
+            seed=12345,
         )
         vision_msgs = [
             [
@@ -383,6 +384,7 @@ class TestVLLMBridgeBackendVisionMessages:
         http_req = backend.build_generation_request(req, with_lora=False, version=0)
 
         assert http_req.endpoint == "/v1/chat/completions"
+        assert http_req.payload["seed"] == 12345
         msg_content = http_req.payload["messages"][0]["content"]
         image_part = msg_content[1]
         assert image_part["type"] == "image_url"

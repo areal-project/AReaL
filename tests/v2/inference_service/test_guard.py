@@ -20,7 +20,11 @@ GUARD_APP = "areal.infra.rpc.guard.app"
 
 @pytest.fixture(autouse=True)
 def _reset_guard_globals():
+    for lock_file in guard_module._state.port_lock_files.values():
+        lock_file.close()
     guard_module._state.allocated_ports = set()
+    guard_module._state.owned_ports = {}
+    guard_module._state.port_lock_files = {}
     guard_module._state.forked_children = []
     guard_module._state.forked_children_map = {}
     guard_module._state.server_host = "10.0.0.1"
@@ -28,7 +32,11 @@ def _reset_guard_globals():
     guard_module._state.trial_name = "test-trial"
     guard_module._state.fileroot = None
     yield
+    for lock_file in guard_module._state.port_lock_files.values():
+        lock_file.close()
     guard_module._state.allocated_ports = set()
+    guard_module._state.owned_ports = {}
+    guard_module._state.port_lock_files = {}
     guard_module._state.forked_children = []
     guard_module._state.forked_children_map = {}
 
@@ -129,6 +137,7 @@ class TestFork:
     def test_fork_raw_cmd_passes_command_as_is(self, mock_run, client):
         mock_proc = _make_mock_process(pid=55)
         mock_run.return_value = mock_proc
+        guard_module._state.owned_ports[("sglang", 0)] = {8001}
 
         raw = [
             "python",
@@ -156,6 +165,7 @@ class TestFork:
     def test_fork_tracks_child(self, mock_run, client):
         mock_proc = _make_mock_process(pid=42)
         mock_run.return_value = mock_proc
+        guard_module._state.owned_ports[("test", 0)] = {8001}
 
         client.post(
             "/fork",
@@ -173,6 +183,7 @@ class TestFork:
     @patch(f"{GUARD_APP}.run_with_streaming_logs")
     def test_fork_with_env_overrides(self, mock_run, client):
         mock_run.return_value = _make_mock_process()
+        guard_module._state.owned_ports[("test", 0)] = {8001}
 
         resp = client.post(
             "/fork",

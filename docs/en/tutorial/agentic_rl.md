@@ -43,9 +43,9 @@ We demonstrate several concrete examples below. More examples can be found in th
 [`workflow/` directory](https://github.com/areal-project/AReaL/tree/main/areal/workflow).
 
 > **Scheduler Compatibility**: Agent workflows with the proxy approach are supported on
-> `local` and `slurm` schedulers only. The `ray` scheduler is not supported because
-> Ray's actor-based programming model is inherently incompatible with HTTP proxy servers
-> that require persistent connections between workers.
+> the `local`, `slurm`, and `ray` schedulers. Under `ray`, each proxy server runs as an
+> HTTP worker subprocess launched next to its rollout worker, the same as under `local`
+> and `slurm`.
 
 ## Examples
 
@@ -294,6 +294,12 @@ class CamelRLVRWorkflow(RolloutWorkflow):
         # Export interactions with token-level data
         return client.export_interactions(style="individual")
 ```
+
+> **Note**: `style="individual"` exports several samples per episode. On grouped
+> rollouts (`n_samples >= 2`) this is incompatible with group-relative normalization
+> (`mean_level: group` / `std_level: group`) and raises a non-retryable
+> `WorkflowContractError`; use `style="concat"` or batch-level normalization there. See
+> the [grouped-rollout contract](../reference/rollout_workflow.md#grouped-rollout).
 
 **Key points:**
 

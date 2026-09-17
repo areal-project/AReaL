@@ -1,6 +1,9 @@
-"""Tests for WorkflowExecutor._split_trajectory_for_dump and _compute_output_versions."""
+"""Tests for WorkflowExecutor trajectory dump helpers."""
+
+import json
 
 import pytest
+import torch
 
 from areal.infra.workflow_executor import WorkflowExecutor
 
@@ -117,3 +120,78 @@ class TestComputeOutputVersions:
         assert head == 5
         assert tail == 6
         assert rle == [[5, 2], [6, 2]]
+
+
+class TestDumpTrajectory:
+    @pytest.mark.asyncio
+    async def test_writes_ordered_sample_metadata_and_promotes_join_keys(
+        self, tmp_path
+    ):
+        executor = WorkflowExecutor.__new__(WorkflowExecutor)
+        executor._get_dump_dir = lambda _is_eval: str(tmp_path)
+        executor._get_tokenizer = _FakeTokenizer
+        traj = {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "rewards": torch.tensor([1.0, 0.0]),
+            "loss_mask": torch.tensor([[0, 1, 1], [0, 1, 1]]),
+            "attention_mask": torch.ones((2, 3), dtype=torch.bool),
+            "versions": torch.tensor([[-1, 4, 4], [-1, 5, 5]]),
+        }
+        metadata = [
+            {
+                "session_id": "268-1",
+                "arena_task_id": "arena-a",
+                "arena_status": "DONE",
+            },
+            {
+                "session_id": "268-2",
+                "arena_task_id": "arena-b",
+                "arena_status": "HARNESS_FAILED",
+                "harness_outcome_code": "AUTONOMOUS_INCOMPLETE_NO_SHIP",
+            },
+        ]
+
+        success, reason = await executor._dump_trajectory(
+            traj,
+            task_id=268,
+            is_eval=False,
+            sample_metadata=metadata,
+        )
+
+        assert success, reason
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "5" / "268.jsonl").read_text().splitlines()
+        ]
+        assert [record["sample_idx"] for record in records] == [0, 1]
+        assert [record["session_id"] for record in records] == ["268-1", "268-2"]
+        assert records[0]["arena_task_id"] == "arena-a"
+        assert records[1]["arena_task_id"] == "arena-b"
+        assert records[1]["harness_outcome_code"] == ("AUTONOMOUS_INCOMPLETE_NO_SHIP")
+        assert records[1]["metadata"] == metadata[1]
+        assert "metadata" not in traj
+
+    @pytest.mark.asyncio
+    async def test_rejects_mismatched_sample_metadata_count(self, tmp_path):
+        executor = WorkflowExecutor.__new__(WorkflowExecutor)
+        executor._get_dump_dir = lambda _is_eval: str(tmp_path)
+        executor._get_tokenizer = _FakeTokenizer
+        traj = {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "rewards": torch.tensor([1.0, 0.0]),
+            "loss_mask": torch.tensor([[0, 1, 1], [0, 1, 1]]),
+            "attention_mask": torch.ones((2, 3), dtype=torch.bool),
+            "versions": torch.tensor([[-1, 4, 4], [-1, 5, 5]]),
+        }
+
+        success, reason = await executor._dump_trajectory(
+            traj,
+            task_id=268,
+            is_eval=False,
+            sample_metadata=[{"session_id": "268-1"}],
+        )
+
+        assert not success
+        assert reason == (
+            "sample metadata count does not match trajectory batch size: 1 != 2"
+        )

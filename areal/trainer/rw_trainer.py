@@ -27,6 +27,7 @@ from areal.infra.data_service import DataController
 from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
+from areal.utils.cleanup import run_batch_cleanups
 from areal.utils.data import (
     broadcast_tensor_container,
     cycle_dataloader,
@@ -192,6 +193,12 @@ class RWTrainer:
 
         global_step = 0
         data_generator = cycle_dataloader(self.train_dataloader)
+        if self.recover_info is None and self._evaluate_before_train():
+            self._export_and_commit_stats(
+                epoch=-1,
+                epoch_step=-1,
+                global_step=-1,
+            )
         for global_step in range(start_step, max_steps):
             if (
                 config.total_train_steps is not None
@@ -293,9 +300,12 @@ class RWTrainer:
                 # SPMD mode never populates ``_fetch_buffer`` (no RTensor
                 # round-trip), so the fan-out is single-controller only.
                 if is_single_controller():
-                    self.actor.clear_batches(batch)
+                    cleanups = [("actor", lambda: self.actor.clear_batches(batch))]
                     if self.data_controller is not None:
-                        self.data_controller.clear_batches()
+                        cleanups.append(
+                            ("data", lambda: self.data_controller.clear_batches())
+                        )
+                    run_batch_cleanups(cleanups)
 
             with perf_tracer.trace_scope(
                 "train.log_stats",
@@ -449,6 +459,27 @@ class RWTrainer:
 
         dist.barrier(group=self.actor.cpu_group)
         current_platform.synchronize()
+
+    def _evaluate_before_train(self) -> bool:
+        if self.valid_dataloader is None:
+            return self.evaluator.evaluate_before_train(None)
+
+        def evaluate_fn() -> None:
+            with (
+                stats_tracker.record_timing("eval"),
+                perf_tracer.trace_scope(
+                    "train.eval",
+                    category=Category.COMPUTE,
+                    args={"global_step": -1},
+                ),
+            ):
+                self._evaluate_fn()
+
+        evaluated = self.evaluator.evaluate_before_train(evaluate_fn)
+        if evaluated:
+            dist.barrier(group=self.actor.cpu_group)
+            current_platform.synchronize()
+        return evaluated
 
     def _evaluate(
         self,

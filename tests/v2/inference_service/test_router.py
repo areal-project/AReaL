@@ -425,6 +425,105 @@ class TestRouterEndpoints:
 
         assert addr1 == addr2
 
+    @pytest.mark.asyncio
+    async def test_route_model_preserves_model_address_order(self, client):
+        """Model routing follows logical DP order, not registration arrival order."""
+        for worker_addr in [WORKER_2, WORKER_1]:
+            resp = await client.post(
+                "/register",
+                json={"worker_addr": worker_addr},
+                headers=admin_headers(),
+            )
+            assert resp.status_code == 200
+
+        register_model = await client.post(
+            "/register_model",
+            json={
+                "model": "test-model",
+                "data_proxy_addrs": [WORKER_1, WORKER_2],
+            },
+            headers=admin_headers(),
+        )
+        assert register_model.status_code == 200
+
+        routed = []
+        for _ in range(2):
+            resp = await client.post(
+                "/route",
+                json={"model": "test-model"},
+                headers=admin_headers(),
+            )
+            assert resp.status_code == 200
+            routed.append(resp.json()["worker_addr"])
+
+        assert routed == [WORKER_1, WORKER_2]
+
+    @pytest.mark.asyncio
+    async def test_route_admin_key_uses_model_order_before_sticky_pin(self, client):
+        """The admin session pins the first logical model worker it selects."""
+        for worker_addr in [WORKER_2, WORKER_1]:
+            resp = await client.post(
+                "/register",
+                json={"worker_addr": worker_addr},
+                headers=admin_headers(),
+            )
+            assert resp.status_code == 200
+
+        register_model = await client.post(
+            "/register_model",
+            json={
+                "model": "test-model",
+                "data_proxy_addrs": [WORKER_1, WORKER_2],
+            },
+            headers=admin_headers(),
+        )
+        assert register_model.status_code == 200
+
+        routed = []
+        for _ in range(2):
+            resp = await client.post(
+                "/route",
+                json={"api_key": ADMIN_KEY, "path": "/rl/start_session"},
+                headers=admin_headers(),
+            )
+            assert resp.status_code == 200
+            routed.append(resp.json()["worker_addr"])
+
+        assert routed == [WORKER_1, WORKER_1]
+
+    @pytest.mark.asyncio
+    async def test_route_model_deduplicates_model_addresses(self, client):
+        """Duplicate model addresses do not change round-robin weighting."""
+        for worker_addr in [WORKER_1, WORKER_2]:
+            resp = await client.post(
+                "/register",
+                json={"worker_addr": worker_addr},
+                headers=admin_headers(),
+            )
+            assert resp.status_code == 200
+
+        register_model = await client.post(
+            "/register_model",
+            json={
+                "model": "test-model",
+                "data_proxy_addrs": [WORKER_1, WORKER_1, WORKER_2],
+            },
+            headers=admin_headers(),
+        )
+        assert register_model.status_code == 200
+
+        routed = []
+        for _ in range(3):
+            resp = await client.post(
+                "/route",
+                json={"model": "test-model"},
+                headers=admin_headers(),
+            )
+            assert resp.status_code == 200
+            routed.append(resp.json()["worker_addr"])
+
+        assert routed == [WORKER_1, WORKER_2, WORKER_1]
+
     # ----- /route — session key -----
 
     @pytest.mark.asyncio

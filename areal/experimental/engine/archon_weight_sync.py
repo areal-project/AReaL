@@ -66,10 +66,12 @@ def init_weight_update_group(
 ) -> None:
     """Initialize the weight update process group for XCCL synchronization.
 
-    When the inference engine (sglang) uses pipeline parallelism (gen_pp_size > 1),
+    When the SGLang inference engine uses pipeline parallelism (gen_pp_size > 1),
     creates per-PP-rank NCCL groups so that each sglang PP stage receives only
-    the parameters it owns. When gen_pp_size == 1, falls back to the original
-    single-group path.
+    the parameters it owns; this requires train_pp_size == gen_pp_size. In all
+    other cases -- gen_pp_size == 1, or vLLM with any gen_pp_size -- falls back
+    to the single-group path, which spans all inference workers and supports
+    differing training/inference PP sizes.
     """
     assert meta.type == "xccl"
 
@@ -78,13 +80,19 @@ def init_weight_update_group(
     os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
 
     gen_pp_size = meta.gen_allocation.parallel.pp_size if meta.gen_allocation else 1
+    gen_backend = meta.gen_allocation.backend if meta.gen_allocation else None
     logger.debug(
         f"[ArchonWeightSync] init_weight_update_group called: "
-        f"gen_pp_size={gen_pp_size}, is_pp_head={engine.is_pipeline_parallel_head()}, "
+        f"gen_pp_size={gen_pp_size}, gen_backend={gen_backend}, "
+        f"is_pp_head={engine.is_pipeline_parallel_head()}, "
         f"group_name={state.group_name}"
     )
 
-    if gen_pp_size > 1:
+    # The per-PP-rank path is specific to SGLang, whose rollout-side request
+    # forms one NCCL group per PP stage and therefore requires
+    # train_pp_size == gen_pp_size. vLLM joins a single flat group spanning all
+    # inference workers, so it supports differing training/inference PP sizes.
+    if gen_backend == "sglang" and gen_pp_size > 1:
         _init_per_pp_weight_update_groups(state, meta, engine, gen_pp_size)
     else:
         _init_single_weight_update_group(state, meta, engine)

@@ -17,7 +17,7 @@ import httpx
 import numpy as np
 
 from areal.api.io_struct import HttpRequest
-from areal.utils import logging
+from areal.utils import logging, stats_tracker
 from areal.v2.inference_service.backend import InfBridgeBackend
 
 if TYPE_CHECKING:
@@ -231,6 +231,18 @@ class InfBridge:
                     final_routed_experts = np.concatenate(
                         [final_routed_experts, result.routed_experts], axis=0
                     )
+
+            # Record speculative-decoding acceptance metrics from SGLang
+            # meta_info. Recorded per generation segment (partial rollout may
+            # issue multiple /generate calls); exported as a segment-level mean.
+            if result.spec_accept_rate is not None:
+                stats_tracker.get("rollout").scalar(
+                    spec_accept_rate=result.spec_accept_rate
+                )
+            if result.spec_accept_length is not None:
+                stats_tracker.get("rollout").scalar(
+                    spec_accept_length=result.spec_accept_length
+                )
 
             if stop_reason in ("stop", "tool_calls", "length"):
                 break

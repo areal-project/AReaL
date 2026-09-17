@@ -59,6 +59,8 @@ class SGLangBridgeBackend:
         }
         if gconfig.stop:
             sampling_params["stop"] = gconfig.stop
+        if gconfig.seed is not None:
+            sampling_params["sampling_seed"] = gconfig.seed
 
         payload: dict[str, Any] = {
             "input_ids": list(req.input_ids),
@@ -94,6 +96,7 @@ class SGLangBridgeBackend:
         meta_info = response["meta_info"]
         finish_reason = meta_info["finish_reason"]
         stop_reason: str = finish_reason["type"]
+        stop_message: str = finish_reason.get("message", "")
 
         # Routed experts (MoE)
         routed_experts: np.ndarray | None = None
@@ -107,16 +110,35 @@ class SGLangBridgeBackend:
                 dtype=np.int32,
             ).reshape(num_sgl_token, -1)
 
-        # Handle abort-before-prefill: no output tokens
-        output_token_logprobs = meta_info.get("output_token_logprobs", [])
+        if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
+            return HttpGenerationResult(
+                output_tokens=[],
+                output_logprobs=[],
+                stop_reason=stop_reason,
+                routed_experts=routed_experts,
+            )
+
+        if "output_token_logprobs" not in meta_info:
+            raise ValueError(
+                "Malformed SGLang response: output_token_logprobs is missing "
+                "from meta_info."
+            )
+        output_token_logprobs = meta_info["output_token_logprobs"]
         output_tokens = [x[1] for x in output_token_logprobs]
         output_logprobs = [x[0] for x in output_token_logprobs]
+
+        # Speculative-decoding acceptance metrics (present only when SGLang is
+        # launched with a speculative_algorithm; None otherwise).
+        spec_accept_rate = meta_info.get("spec_accept_rate")
+        spec_accept_length = meta_info.get("spec_accept_length")
 
         return HttpGenerationResult(
             output_tokens=output_tokens,
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
             routed_experts=routed_experts,
+            spec_accept_rate=spec_accept_rate,
+            spec_accept_length=spec_accept_length,
         )
 
     # -- pause / resume -----------------------------------------------------

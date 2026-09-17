@@ -8,7 +8,7 @@ description = "AReaL: A Large-Scale Asynchronous Reinforcement Learning System"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11,<3.13"
-version = "2.0.0"
+version = "2.1.0"
 authors = [
     {name = "AReaL Team"},
 ]
@@ -93,7 +93,6 @@ dependencies = [
     "nvidia-ml-py; sys_platform == 'linux'",
     "ninja",
     "numba",
-    "blosc",
     "pybind11>=2.10.0",
     "networkx==3.3",
     "aiofiles",
@@ -121,7 +120,7 @@ dependencies = [
     # Distributed computing
     "ray[default]",
     "redis",
-    "awex==0.7.0",
+    "awex==0.8.1",
 
     # Web frameworks
     "fastapi>=0.115.12",

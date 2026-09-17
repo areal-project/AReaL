@@ -12,6 +12,7 @@ from areal.api.io_struct import (
     detect_image_mime,
     get_versioned_lora_name,
 )
+from areal.utils.vllm_response import parse_vllm_generation_response
 
 if TYPE_CHECKING:
     from areal.api.io_struct import ModelRequest
@@ -52,6 +53,8 @@ class VLLMBridgeBackend:
             "use_beam_search": gconfig.use_beam_search,
             "stream": False,
         }
+        if gconfig.seed is not None:
+            payload["seed"] = gconfig.seed
 
         if with_lora:
             lora_name = gconfig.lora_name
@@ -90,33 +93,7 @@ class VLLMBridgeBackend:
         response: dict[str, Any],
     ) -> HttpGenerationResult:
         """Parse vLLM JSON into :class:`HttpGenerationResult`."""
-        meta_info = response["choices"][0]
-        stop_reason = meta_info["finish_reason"]
-
-        if "tokens" in meta_info["logprobs"]:
-            output_tokens = [
-                int(token.split(":")[1]) for token in meta_info["logprobs"]["tokens"]
-            ]
-            output_logprobs = meta_info["logprobs"]["token_logprobs"]
-        elif "content" in meta_info["logprobs"]:
-            outputs = meta_info["logprobs"]["content"]
-            output_tokens = [int(token["token"].split(":")[1]) for token in outputs]
-            output_logprobs = [token["logprob"] for token in outputs]
-        else:
-            raise ValueError("Unexpected vLLM response format.")
-
-        if stop_reason == "abort" and len(output_tokens) == 0:
-            return HttpGenerationResult(
-                output_tokens=[],
-                output_logprobs=[],
-                stop_reason=stop_reason,
-            )
-
-        return HttpGenerationResult(
-            output_tokens=output_tokens,
-            output_logprobs=output_logprobs,
-            stop_reason=stop_reason,
-        )
+        return parse_vllm_generation_response(response)
 
     def get_pause_request(self) -> HttpRequest:
         return HttpRequest(endpoint="/areal_pause_generation", payload={})

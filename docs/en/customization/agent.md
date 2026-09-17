@@ -5,8 +5,7 @@ framework (OpenAI Agents SDK, LangChain, CAMEL-AI, etc.) with minimal integratio
 
 **Notes**:
 
-1. Agent workflows are supported on `local` and `slurm` schedulers only. The `ray`
-   scheduler is incompatible with the HTTP proxy architecture.
+1. Agent workflows are supported on the `local`, `slurm`, and `ray` schedulers.
 
 1. For internal architecture details, see the
    [Agent Workflow Reference](../reference/agent_workflow.md).

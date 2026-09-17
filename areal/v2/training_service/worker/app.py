@@ -115,23 +115,44 @@ def _execute_compute(
     def execute():
         nonlocal args, kwargs
         if require_broadcast:
-            group = engine.context_and_model_parallel_group
-            if group is None:
-                if engine.data_parallel_world_size > 1:
+            cpu_staged_methods = getattr(engine, "cpu_staged_rpc_methods", ())
+            if method_name in cpu_staged_methods:
+                group = engine.cpu_model_parallel_group
+                broadcast_device = "cpu"
+                if group is None:
+                    raise RuntimeError(
+                        "Broadcast required for CPU-staged endpoint, but "
+                        "engine.cpu_model_parallel_group is None"
+                    )
+            else:
+                group = engine.context_and_model_parallel_group
+                broadcast_device = current_platform.current_device()
+                if group is None and engine.data_parallel_world_size > 1:
                     raise RuntimeError(
                         "Broadcast required for endpoint, but "
                         "engine.context_and_model_parallel_group is None"
                     )
-            else:
+
+            if group is not None:
+                # Match v1: opt in by engine capability on every rank. The
+                # broadcast source selects the alias protocol only for VLM data.
+                preserve_broadcast_aliases = (
+                    method_name in cpu_staged_methods
+                    and getattr(engine, "is_vision_model", False)
+                )
+                args = tensor_container_to(args, broadcast_device)
+                kwargs = tensor_container_to(kwargs, broadcast_device)
                 args = broadcast_tensor_container(
-                    tensor_container_to(args, current_platform.current_device()),
+                    args,
                     src_rank=engine.current_data_parallel_head(),
                     group=group,
+                    preserve_tensor_aliases=preserve_broadcast_aliases,
                 )
                 kwargs = broadcast_tensor_container(
-                    tensor_container_to(kwargs, current_platform.current_device()),
+                    kwargs,
                     src_rank=engine.current_data_parallel_head(),
                     group=group,
+                    preserve_tensor_aliases=preserve_broadcast_aliases,
                 )
         return method(*args, **kwargs)
 

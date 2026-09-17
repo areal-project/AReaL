@@ -136,13 +136,21 @@ def init_weights_update_group(
 
 
 def setup_batch_isend_irecv(
-    process_group, rank, world_size, tensor_size=10 * 10, dtype=torch.float32
+    process_group,
+    rank,
+    world_size,
+    tensor_size=10 * 10,
+    dtype=torch.float32,
+    barrier_group=None,
 ):
     """
     Perform a simple communication using batch_isend_irecv to avoid the hang for later sub-ranks.
 
     Args:
     process_group (ProcessGroup): The process group to work on.
+    barrier_group (ProcessGroup | None): Optional sidecar group for the final
+        control-plane barrier. When omitted, use process_group for backward
+        compatibility.
     tensor_size (int): Size of the tensor to send/receive.
     dtype (torch.dtype): Data type of the tensor.
     """
@@ -201,7 +209,14 @@ def setup_batch_isend_irecv(
 
     # Synchronize
     current_platform.synchronize()
-    dist.barrier(group=process_group, device_ids=[current_platform.current_device()])
+    if barrier_group is None:
+        logger.info("Setup batch isend irecv final barrier on weight update group")
+        dist.barrier(
+            group=process_group, device_ids=[current_platform.current_device()]
+        )
+    else:
+        logger.info("Setup batch isend irecv final barrier on sidecar group")
+        dist.barrier(group=barrier_group)
 
     logger.info(
         f"Simple communication completed for process group of size {world_size}"

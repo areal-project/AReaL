@@ -88,6 +88,18 @@ def _get_device_count_safely() -> int | None:
     except (OSError, ValueError):
         return None
 
+    # ROCm exposes /dev/kfd plus /dev/dri/renderD*,
+    # and /dev/dri routinely holds far more entries than there are GPUs, so it
+    # cannot be counted the same way.
+    try:
+        count = current_platform.device_count()
+    except Exception as e:
+        logger.warning(f"Could not get device count from platform: {e}")
+        return None
+    # Keep returning None when there is no accelerator, so callers preserve
+    # their existing CPU-only behavior.
+    return count if count > 0 else None
+
 
 class LocalScheduler(Scheduler):
     """Local scheduler that manages worker subprocesses on a single GPU node.
@@ -309,6 +321,7 @@ class LocalScheduler(Scheduler):
         target_wi: WorkerInfo,
         target_role: str,
         command: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> WorkerInfo:
         """Fork a single worker asynchronously.
 
@@ -319,12 +332,19 @@ class LocalScheduler(Scheduler):
         """
         worker_id = f"{role}/{idx}"
         guard_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}"
+        port_cnt = len(target_wi.worker.worker_ports)
+        ports_reserved = False
 
         try:
             # 1. Allocate a port on the target guard
             async with session.post(
                 f"{guard_url}/alloc_ports",
-                json={"count": 1},
+                json={
+                    "count": port_cnt,
+                    "role": role,
+                    "worker_index": idx,
+                    "exclude_ports": list(self._allocated_ports),
+                },
             ) as alloc_resp:
                 if alloc_resp.status != 200:
                     error_text = await alloc_resp.text()
@@ -335,7 +355,10 @@ class LocalScheduler(Scheduler):
                     )
                 alloc_data = await alloc_resp.json()
                 forked_host = alloc_data["host"]
-                forked_port = alloc_data["ports"][0]
+                forked_ports = alloc_data["ports"]
+                forked_port = forked_ports[0]
+                ports_reserved = True
+                self._allocated_ports.update(forked_ports)
 
             # 2. Build the full raw command
             module_path = command or "areal.infra.rpc.rpc_server"
@@ -372,6 +395,7 @@ class LocalScheduler(Scheduler):
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "env": env or {},
             }
             async with session.post(
                 f"{guard_url}/fork",
@@ -418,22 +442,32 @@ class LocalScheduler(Scheduler):
                 f"(pid={forked_pid}) from {target_role}/{idx}"
             )
 
-        except aiohttp.ClientError as e:
-            raise WorkerCreationError(
-                role,
-                f"Failed to fork worker {idx} from {target_role}/{idx}",
-                str(e),
-            ) from e
+        except BaseException as e:
+            if ports_reserved:
+                for endpoint in ("kill_forked_worker", "release_ports"):
+                    try:
+                        async with session.post(
+                            f"{guard_url}/{endpoint}",
+                            json={"role": role, "worker_index": idx},
+                        ):
+                            pass
+                    except Exception:
+                        pass
+                self._release_ports([int(port) for port in forked_ports])
+            if isinstance(e, aiohttp.ClientError):
+                raise WorkerCreationError(
+                    role,
+                    f"Failed to fork worker {idx} from {target_role}/{idx}",
+                    str(e),
+                ) from e
+            raise
 
         worker = Worker(
             id=worker_id,
             ip=forked_host,
-            worker_ports=[str(forked_port)],
+            worker_ports=list(map(str, forked_ports)),
             engine_ports=[],
         )
-        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
-        if port_cnt > 1:
-            worker.worker_ports += self._allocate_ports(port_cnt - 1)
 
         return WorkerInfo(
             worker=worker,
@@ -442,7 +476,7 @@ class LocalScheduler(Scheduler):
             gpu_devices=target_wi.gpu_devices,  # Inherited from target
             created_at=time.time(),
             log_file=str(self.log_dir / f"{role}.log"),
-            env_vars=target_wi.env_vars.copy(),  # Inherited from target
+            env_vars={**target_wi.env_vars, **(env or {})},
         )
 
     async def _kill_forked_worker(
@@ -504,6 +538,8 @@ class LocalScheduler(Scheduler):
                         )
                     )
             await asyncio.gather(*tasks, return_exceptions=True)
+        for worker_info in workers:
+            self._release_ports([int(port) for port in worker_info.worker.worker_ports])
 
     async def _create_forked_workers_async(
         self,
@@ -511,6 +547,7 @@ class LocalScheduler(Scheduler):
         target_role: str,
         target_workers: list[WorkerInfo],
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
 
@@ -528,7 +565,13 @@ class LocalScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    command,
+                    None if env_vars is None else env_vars[idx],
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -574,9 +617,15 @@ class LocalScheduler(Scheduler):
         )
 
         # Configure forked workers if exp_config is available
-        if self.exp_config is not None:
-            for worker_rank, worker_info in enumerate(workers):
-                self._configure_worker(worker_info, worker_rank)
+        try:
+            if self.exp_config is not None:
+                for worker_rank, worker_info in enumerate(workers):
+                    self._configure_worker(worker_info, worker_rank)
+        except BaseException:
+            await self._cleanup_forked_workers_async(role, target_role, workers)
+            self._workers.pop(role, None)
+            self._colocated_roles.pop(role, None)
+            raise
 
         return worker_ids
 
@@ -585,6 +634,7 @@ class LocalScheduler(Scheduler):
         role: str,
         target_role: str,
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Fork new worker processes from existing workers.
 
@@ -617,6 +667,7 @@ class LocalScheduler(Scheduler):
                 target_role,
                 target_workers,
                 command,
+                env_vars,
             )
         except Exception:
             # Cleanup on failure
@@ -701,7 +752,11 @@ class LocalScheduler(Scheduler):
             # Check if fork mode is enabled
             if strategy.fork:
                 # Fork mode: spawn new processes on same GPUs via /fork endpoint
-                worker_ids = self.fork_workers(role, colocate_role)
+                worker_ids = self.fork_workers(
+                    role,
+                    colocate_role,
+                    env_vars=[scheduling.env_vars for scheduling in schedulings],
+                )
             else:
                 # Reuse existing workers - no new processes spawned
                 worker_ids = [w.worker.id for w in target_workers]
@@ -940,6 +995,7 @@ class LocalScheduler(Scheduler):
         """
         # Handle colocated/forked roles
         if role in self._colocated_roles:
+            target_role = self._colocated_roles[role]
             # Forked roles have their own workers in _workers
             if role not in self._workers:
                 # Colocated roles delegate to target role's workers
@@ -1111,15 +1167,22 @@ class LocalScheduler(Scheduler):
 
         # Handle colocated/forked role
         if role in self._colocated_roles:
+            target_role = self._colocated_roles[role]
             # Forked roles have their own workers that need port cleanup
             if role in self._workers:
                 logger.info(f"Removing forked role '{role}' (managed by parent worker)")
                 workers = self._workers[role]
                 if reverse_order:
                     workers = list(reversed(workers))
-                self._cleanup_workers(
-                    workers
-                )  # Release ports, but process=None skips kill
+                try:
+                    run_async_task(
+                        self._cleanup_forked_workers_async,
+                        role,
+                        target_role,
+                        workers,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup forked role '{role}': {e}")
                 del self._workers[role]
             else:
                 # Colocated roles don't have their own workers

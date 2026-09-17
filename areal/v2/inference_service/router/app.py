@@ -318,8 +318,12 @@ def create_app(config: RouterConfig) -> FastAPI:
         def _filter_by_model(workers: list, addrs: list[str] | None) -> list:
             if addrs is None:
                 return workers
-            addr_set = set(addrs)
-            return [w for w in workers if w.worker_addr in addr_set]
+            workers_by_addr = {w.worker_addr: w for w in workers}
+            return [
+                workers_by_addr[addr]
+                for addr in dict.fromkeys(addrs)
+                if addr in workers_by_addr
+            ]
 
         # Step B: session_id lookup
         if body.session_id is not None:

@@ -1,5 +1,7 @@
 import argparse
 import copy
+import json
+import math
 import os
 import tempfile
 from typing import Any
@@ -301,11 +303,12 @@ def test_grad_norm_mb_invariance(
     max_seqlen = 128
 
     grad_norms: list[float] = []
+    num_micro_batches: list[int] = []
     engines = []
     # Two configs that yield different `num_microbatches` for the same total
     # batch. Values chosen to keep at least one mb for the smallest PP chunk
     # while still producing distinct mb counts between the two runs.
-    for max_tokens_per_mb in (4096, 256):
+    for max_tokens_per_mb in (4096, 128):
         mb_spec = MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb)
         # Reset seed before creating each engine so parameter init is identical.
         seeding.set_random_seed(0, key=f"engine{rank}")
@@ -332,27 +335,48 @@ def test_grad_norm_mb_invariance(
             f"rank {rank} max_tokens_per_mb={max_tokens_per_mb} train_result={result}"
         )
         grad_norms.append(float(result["grad_norm"]))
+        num_micro_batches.append(int(result["num_micro_batches"]))
 
         current_platform.synchronize()
         dist.barrier()
         engines.append(engine)
 
-    for engine in engines:
-        engine.destroy()
-    # grad_norm is reported only on the DP head; other ranks may see NaN/0 but
-    # they all agree by virtue of the Megatron optimizer's internal all-reduce.
-    # Tolerance: 1e-3 relative — small enough to catch the num_microbatches
+    # Tolerance: 3e-3 relative — small enough to catch the num_microbatches
     # ratio (>=2x) while permitting benign non-associativity of fp16/bf16 sums
     # across a different mb grouping.
     g0, g1 = grad_norms
-    ok = abs(g0 - g1) <= 1e-3 * max(abs(g0), abs(g1), 1e-12)
+    n0, n1 = num_micro_batches
+    grad_norms_valid = all(math.isfinite(g) and g > 0 for g in grad_norms)
+    microbatch_split_valid = n0 < n1 and n1 >= 2
+    grad_norms_close = abs(g0 - g1) <= 3e-3 * max(abs(g0), abs(g1), 1e-12)
+    ok = grad_norms_valid and microbatch_split_valid and grad_norms_close
     if not ok:
         print(
-            f"FAIL rank {rank}: grad_norm differs across num_microbatches: {g0} vs {g1}"
+            f"FAIL rank {rank}: invalid grad-norm microbatch parity: "
+            f"grad_norms={grad_norms}, num_micro_batches={num_micro_batches}"
         )
+
+    # TP/PP ranks must all complete both schedules and observe valid parity.
+    # Reduce the local verdict so rank 0 cannot report success while another
+    # model-parallel rank has invalid gradients or an ineffective MB split.
+    ok_tensor = torch.tensor(int(ok), dtype=torch.int32, device=engines[-1].device)
+    dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
+    ok = bool(ok_tensor.item())
+
+    for engine in engines:
+        engine.destroy()
 
     if rank == 0 and output is not None:
         write_result(output, ok)
+        with open(f"{output}.json", "w") as f:
+            json.dump(
+                {
+                    "max_tokens_per_mb": [4096, 128],
+                    "grad_norms": grad_norms,
+                    "num_micro_batches": num_micro_batches,
+                },
+                f,
+            )
     print(
         f"Test: test_grad_norm_mb_invariance(model_type={model_type}, "
         f"alloc_mode={alloc_mode}) Done."

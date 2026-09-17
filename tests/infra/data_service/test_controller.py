@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from areal.api.cli_args import (
@@ -199,6 +201,10 @@ class TestDataControllerRegisterDataset:
                 dataset_path="dummy",
                 dataset_type="rl",
                 drop_last=True,
+                dataset_kwargs={
+                    "custom_option": "kept",
+                    "_areal_cache_attempt_id": "spoofed",
+                },
             )
 
         assert mock_run.called
@@ -207,6 +213,14 @@ class TestDataControllerRegisterDataset:
         assert result["total_samples"] == 32
         assert result["num_workers"] == 4
         assert controller._datasets["ds-key"]["dataset_id"] == "test-ds"
+        sent_payload = mock_run.call_args.args[3]
+        sent_kwargs = sent_payload["dataset_kwargs"]
+        assert sent_kwargs["custom_option"] == "kept"
+        assert sent_kwargs["_areal_cache_attempt_id"] != "spoofed"
+        assert (
+            uuid.UUID(sent_kwargs["_areal_cache_attempt_id"]).hex
+            == sent_kwargs["_areal_cache_attempt_id"]
+        )
 
     def test_register_stores_drop_last_flag(self):
         controller = DataController(DataServiceConfig(), MagicMock())
@@ -239,3 +253,59 @@ class TestDataControllerRegisterDataset:
 
         assert "key-1" not in controller._datasets
         assert "key-2" in controller._datasets
+
+
+class _FakeClearResponse:
+    def __init__(self, error=None):
+        self.error = error
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def raise_for_status(self):
+        if self.error is not None:
+            raise self.error
+
+
+class _FakeClearSession:
+    def __init__(self):
+        self.urls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def delete(self, url, *, timeout):
+        self.urls.append(url)
+        error = RuntimeError("clear failed") if "bad-worker" in url else None
+        return _FakeClearResponse(error)
+
+
+class TestDataControllerClearBatches:
+    def test_worker_failure_warns_without_stopping_other_clears(self):
+        controller = DataController(DataServiceConfig(), MagicMock())
+        controller._worker_addrs = ["http://good-worker", "http://bad-worker"]
+        session = _FakeClearSession()
+
+        with (
+            patch(
+                "areal.infra.data_service.controller.controller.aiohttp.ClientSession",
+                return_value=session,
+            ),
+            patch(
+                "areal.infra.data_service.controller.controller.logger.warning"
+            ) as mock_warning,
+        ):
+            asyncio.run(controller._async_clear_batches())
+
+        assert session.urls == [
+            "http://good-worker/data/clear",
+            "http://bad-worker/data/clear",
+        ]
+        mock_warning.assert_called_once()
+        assert "http://bad-worker" in str(mock_warning.call_args)

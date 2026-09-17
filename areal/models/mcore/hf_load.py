@@ -269,6 +269,34 @@ def _slice_generic_weight(
         ]
 
 
+def _merge_kda_fused_weight(
+    hf_weights_safe_slice: list,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor:
+    """Merge Bailing v3 KDA fused components into a single mcore tensor.
+
+    KDA stores ``in_proj.weight`` as ``[q | k | v | f | g]`` and
+    ``conv1d.weight`` as ``[q | k | v]``. Each HF component is TP-sharded on dim 0
+    before concatenation.
+    """
+    comps = []
+    for x in hf_weights_safe_slice:
+        shape = _get_shape(x)
+        if shape[0] % tp_size != 0:
+            raise ValueError(
+                f"KDA fused component dim0={shape[0]} is not divisible by TP {tp_size}."
+            )
+        comps.append(x[_get_tp_slice(shape, dim=0, tp_rank=tp_rank, tp_size=tp_size)])
+    return torch.cat(comps, dim=0).contiguous()
+
+
+def _is_bailing_v3_config(hf_config) -> bool:
+    """Return whether an HF config selects the Bailing V3 architecture."""
+    architectures = getattr(hf_config, "architectures", None) or ()
+    return "BailingMoeV3ForCausalLM" in architectures
+
+
 def _convert_vision_qkv_hf_to_mcore(
     hf_config,
     mcore_weights_name: str,
@@ -440,6 +468,11 @@ def _weight_to_mcore_tp(
             )
         else:
             res = _slice_moe_expert_weight(hf_weights_safe_slice, tp_rank, tp_size)
+    elif _is_bailing_v3_config(hf_config) and (
+        "self_attention.in_proj.weight" in mcore_weights_name
+        or "self_attention.conv1d.weight" in mcore_weights_name
+    ):
+        res = _merge_kda_fused_weight(hf_weights_safe_slice, tp_rank, tp_size)
     else:
         res = _slice_generic_weight(
             mcore_param_shape, hf_weights_safe_slice, tp_rank, tp_size
@@ -534,6 +567,14 @@ def _load_weight_with_bridge_worker(
         if is_te_fp8_param and enable_fp8_param and hf_has_fp8 and not hf_all_fp8:
             raise RuntimeError("Expected all inputs to be FP8 for TE FP8 parameter")
 
+        target_dtype = bridge.dtype
+        if param.dtype == torch.float32 and (
+            "mlp.router.expert_bias" in local_name
+            or "self_attention.dt_bias" in local_name
+            or "self_attention.A_log" in local_name
+        ):
+            target_dtype = torch.float32
+
         param_to_load = _weight_to_mcore_tp(
             hf_config=bridge.hf_config,
             mcore_weights_name=local_name,
@@ -541,7 +582,7 @@ def _load_weight_with_bridge_worker(
             hf_weights_safe_slice=hf_weights_safe_slice,
             tp_rank=tp_rank,
             tp_size=tp_size,
-            dtype=bridge.dtype
+            dtype=target_dtype
             if not (is_te_fp8_param and hf_has_fp8 and hf_all_fp8)
             else None,
         )

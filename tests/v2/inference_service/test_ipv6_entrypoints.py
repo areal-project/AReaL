@@ -20,10 +20,13 @@ def test_data_proxy_main_formats_ipv6_serving_addr():
         set_reward_finish_timeout=0.0,
         admin_api_key="admin-key",
         callback_server_addr="http://[::1]:19000",
+        deterministic_sampling=False,
         tool_call_parser="qwen",
         reasoning_parser="qwen3",
         engine_max_tokens=None,
         chat_template_type="hf",
+        message_preprocessor=[],
+        prefix_matcher=None,
     )
 
     with (
@@ -41,6 +44,9 @@ def test_data_proxy_main_formats_ipv6_serving_addr():
 
     config = mock_create_app.call_args.args[0]
     assert config.serving_addr == "[::1]:8082"
+    assert config.deterministic_sampling is False
+    assert config.message_preprocessors == ()
+    assert config.prefix_matcher is None
     mock_run.assert_called_once()
 
 

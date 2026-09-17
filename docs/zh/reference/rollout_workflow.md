@@ -196,12 +196,45 @@ rollout:
 1. 根据类型合并结果：
    - **张量字典**：沿批次维度连接
    - **InteractionWithTokenLogpReward 字典**：合并为单个字典
-1. 如果某些运行返回 `None`（拒绝），仅保留有效结果
-1. 如果所有运行都返回 `None`，则整个分组结果为 `None`
+1. 每个 slot 可用时返回正常结果类型，不可用时返回 `None`。`None` 有意保持不透明；原因分类与重试策略仍由 producer 负责。
+1. 包装器只等待最初提交的 slots，既不会重试不可用 slot，也不会复制可用结果。
+1. 可用 slots 会各保留一次并连接；实际数量会在 reward 和 advantage normalization 中继续作为 prompt-group 边界。
+1. 设置 `reward_normalization=True` 时，group 通过最小大小检查后，只对可用 rollout 的 interaction rewards
+   进行归一化。`drop_incomplete_group=True` 仍要求所有原始 slot 成功；若保留的 rollout 缺少某一行的 reward，整个
+   group 会被丢弃。
+1. `min_usable_group_size` 默认为 `1`。仅当 v1 RL trainer 的 reward 或 advantage normalization
+   使用 group statistics（该统计量至少需要两个观测值）时，才会将其设为 `2`；singleton 目标 group
+   （`n_samples: 1`）本身即是完整的，因此下限保持为 `1`。设置 `actor.min_usable_group_size` 可覆盖该推导值；使用 group
+   statistics 时，低于 `2` 的显式值会被拒绝。低于下限的 group 返回 `None`，异步 collector 随后会接收另一个已就绪的 prompt
+   group。采用 batch-relative PPO 或 REINFORCE 时则会保留可用的 singleton。
+1. v1 每次 `arun_episode` 调用对应一个逻辑 rollout。上下文压缩或 `agent.export_style: individual`
+   可以导出多行，group 不会因此中止。Collector 在轨迹的 `rollout_group` 字段中保存 `RolloutGroup`，记录每个 rollout
+   的连续行数和可选 reward 参考值。Batch 合并将其移入 `TrajBatchMeta`，拆分时再恢复。可用 group 大小按逻辑 rollout
+   计数，`n_samples: 1` 也遵循该规则。
+1. Group 和 batch reward normalization 都对每个逻辑 rollout 使用一个参考值。若同一 rollout 各行 reward
+   不同，workflow 必须在张量字典中或导出的 `InteractionWithTokenLogpReward` 上 提供有限标量
+   `rollout_reward`；同一 rollout 中所有显式参考值必须一致。省略时，只能从相等的 行 reward 取得参考值。每一行保留自己的
+   reward，并使用相同的平移和缩放；leave-one-out 基线排除整个逻辑 rollout。当算出的参考值标准差不大于 normalization epsilon
+   时，保留平移并使用除数 `1`。内置 v1 agent workflow 为 `individual` 导出显式提供最终 reward 作为参考值，同时保留各行折扣后的
+   reward 和已提供的参考值。自定义 workflow 必须为不同行 reward 声明自己的参考值，不会自动猜测最终值、总和或均值。
+1. 内置按行长度计算的 overlong penalty 不改变显式参考值；actor 的 reward bias、scaling 和 clipping 同时作用于行
+   reward 与参考值。未提供显式参考值时，施加长度惩罚后的行 reward 仍须相等。Advantage normalization 保持现有 masked token
+   统计及按 token 的 leave-one-out 行为，逻辑计数仅用于 singleton 回退。GAE 仍分别在各行上计算。
+
+PPO 系列 actor loss 默认仍按全局 token 加权。因此，有更多有效 response tokens 的 partial group 会比更小或更短的
+group 获得更高 loss weight。这是保持向后兼容的现有 estimator，并不表示各 prompt 隐式等权。
+
+Grouped rollout 会导出 `target_slot_count`、`usable_slot_count`、
+`trainable_slot_count`、`fully_masked_group`、`singleton_slot_group`、
+`pre_filter_usable_slot_yield` 和 `pre_filter_trainable_slot_yield`。这些指标统计最初的 rollout
+调用；`should_accept_fn` 运行后的最终 accepted 和 rejected 数量仍由 collector metrics 提供。PPO 训练会另外报告物理
+usable group size 与有效 token 的 loss-weight 分布，其中包括按 size 区分的 `group_loss_weight_size_<N>`
+指标。
 
 ### 输出形状
 
-当 `group_size=4` 且工作流返回 `[1, seq_len]` 张量时，分组输出的形状为 `[4, seq_len]`（4 个样本连接）。
+当 `group_size=4`、工作流返回 `[1, seq_len]` 张量且 4 个 slot 均可用时，分组输出的形状为
+`[4, seq_len]`。如果接受的是不完整 group，则第一维是实际可用的 slot 数量。
 
 ### 实现
 
@@ -216,9 +249,9 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
               for _ in range(self.group_size)]
         )
 
-        # 过滤 None 结果
+        # 正常结果表示可用，None 表示不可用
         valid_results = [r for r in results if r is not None]
-        if not valid_results:
+        if len(valid_results) < self.min_usable_group_size:
             return None
 
         # 根据结果类型合并

@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 
@@ -71,6 +72,35 @@ def test_qwen3_grad_norm_mb_invariance(tmp_path_factory):
         test_type="grad_norm_mb_invariance",
         output=str(output),
     )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+def test_qwen3_tp1pp1_vs_tp2pp2_grad_norm_mb_invariance(tmp_path_factory):
+    """Check streamed-MB parity within and across TP/PP topologies."""
+    if current_platform.device_count() < 4:
+        pytest.skip("TP2/PP2 grad-norm parity requires 4 GPUs to run")
+
+    results = {}
+    output_dir = tmp_path_factory.mktemp("test_output")
+    for topology, backend in (
+        ("tp1pp1", "megatron:d1p1t1"),
+        ("tp2pp2", "megatron:d1p2t2"),
+    ):
+        output = output_dir / f"qwen3_{topology}_grad_norm_mb_invariance.out"
+        _run_test_with_torchrun(
+            "qwen3",
+            backend,
+            test_type="grad_norm_mb_invariance",
+            output=str(output),
+        )
+        with open(f"{output}.json") as f:
+            results[topology] = json.load(f)
+
+    for config_idx in range(2):
+        assert results["tp2pp2"]["grad_norms"][config_idx] == pytest.approx(
+            results["tp1pp1"]["grad_norms"][config_idx], rel=1e-2, abs=1e-6
+        )
 
 
 @pytest.mark.multi_gpu

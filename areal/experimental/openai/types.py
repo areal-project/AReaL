@@ -4,6 +4,7 @@ from __future__ import annotations  # noqa
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 import torch
 from openai.types.chat import ChatCompletion
@@ -11,6 +12,7 @@ from openai.types.responses.response import Response
 from openai.types.responses.response_input_param import ResponseInputParam
 
 from areal.api import ModelResponse
+from areal.utils.data import RolloutGroup, concat_padded_tensors, get_batch_size
 from areal.utils import logging
 
 logger = logging.getLogger("TokenLogpReward")
@@ -39,9 +41,16 @@ class InteractionWithTokenLogpReward:
     # Common
     model_response: ModelResponse | None = None
     reward: float | None = None
+    original_reward: float | None = None
+    token_rewards: torch.Tensor | None = None
     parent: InteractionWithTokenLogpReward | None = None
     chat_template_type: str = "hf"
-    _cache: dict[str, torch.Tensor] | None = None
+    _cache: dict[str, Any] | None = None
+
+    # Multimodal training data prepared from the complete prompt for this turn.
+    prompt_token_ids: list[int] | None = None
+    mm_token_type_ids: list[int] | None = None
+    multi_modal_input: dict[str, torch.Tensor] | None = None
 
     # Fields used for parent-child relationship resolving
     messages: list[dict] = field(default_factory=list)
@@ -54,8 +63,16 @@ class InteractionWithTokenLogpReward:
     response: Response | None = None
     input_data: str | ResponseInputParam = field(default_factory=lambda: "")
 
+    # One explicit normalization reference per logical rollout, when row scores differ.
+    rollout_reward: float | None = None
+    # Assigned by GroupedRolloutWorkflow before merging independently sampled slots.
+    rollout_index: int | None = None
+
     # Interaction ID cache (used for deserialization)
     _interaction_id: str | None = None
+
+    # Per-interaction dump metadata, kept separate from training tensors.
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_tensor_data(self) -> bool:
@@ -140,19 +157,45 @@ class InteractionWithTokenLogpReward:
         parent_len = len(self.parent.messages + self.parent.output_message_list)
         return self.messages[parent_len:]
 
-    def to_tensor_dict(self) -> dict[str, torch.Tensor]:
+    def to_tensor_dict(self) -> dict[str, Any]:
         if self._cache is not None:
             return self._cache
         resp = self.model_response
         assert resp is not None, "Model response is not set."
+        if (
+            self.prompt_token_ids is not None
+            and self.prompt_token_ids != resp.input_tokens
+        ):
+            raise ValueError(
+                "The VLM processor prompt tokens do not match the rollout response "
+                "input tokens. The trajectory cannot be trained safely."
+            )
         self.seq_tokens = seq = resp.input_tokens + resp.output_tokens
+
+        if self.token_rewards is not None:
+            if self.token_rewards.shape != torch.Size((resp.output_len,)):
+                raise ValueError(
+                    f"token_rewards must be shape ({resp.output_len},), got "
+                    f"{tuple(self.token_rewards.shape)}"
+                )
+
+        parent_token_rewards_tensor = None
         if self.chat_template_type == "concat" and self.parent is not None:
             parent_res = self.parent.to_tensor_dict()
             parent_logprobs = parent_res["logprobs"].squeeze(0).tolist()
             parent_loss_mask = parent_res["loss_mask"].squeeze(0).tolist()
             parent_versions = parent_res["versions"].squeeze(0).tolist()
+            parent_turn_ids = parent_res["turn_ids"].squeeze(0).tolist()
             parent_len = len(parent_logprobs)
-            assert parent_len == len(parent_loss_mask) == len(parent_versions)
+            assert (
+                parent_len
+                == len(parent_loss_mask)
+                == len(parent_versions)
+                == len(parent_turn_ids)
+            )
+            valid_parent_turn_ids = [tid for tid in parent_turn_ids if tid >= 0]
+            own_turn_id = max(valid_parent_turn_ids) + 1 if valid_parent_turn_ids else 0
+            parent_token_rewards_tensor = parent_res.get("token_rewards")
             if resp.input_len > parent_len:
                 logprobs = (
                     parent_logprobs
@@ -168,6 +211,11 @@ class InteractionWithTokenLogpReward:
                     parent_versions
                     + [-1] * (resp.input_len - parent_len)
                     + resp.output_versions
+                )
+                turn_ids = (
+                    parent_turn_ids
+                    + [-1] * (resp.input_len - parent_len)
+                    + [own_turn_id] * resp.output_len
                 )
             else:
                 # FIXME: Find out why this happens occasionally
@@ -187,23 +235,179 @@ class InteractionWithTokenLogpReward:
                 logprobs = [0.0] * resp.input_len + resp.output_logprobs
                 loss_mask = [0] * resp.input_len + [1] * resp.output_len
                 versions = [-1] * resp.input_len + resp.output_versions
+                turn_ids = [-1] * resp.input_len + [0] * resp.output_len
         else:
             logprobs = [0.0] * resp.input_len + resp.output_logprobs
             loss_mask = [0] * resp.input_len + [1] * resp.output_len
             versions = [-1] * resp.input_len + resp.output_versions
+            turn_ids = [-1] * resp.input_len + [0] * resp.output_len
         reward = self.reward if self.reward is not None else 0.0
+        original_reward = (
+            self.original_reward if self.original_reward is not None else reward
+        )
         result = dict(
             # unsqueeze to add an additional batch dimension
             input_ids=torch.tensor(seq).unsqueeze(0),
             loss_mask=torch.tensor(loss_mask).unsqueeze(0),
             logprobs=torch.tensor(logprobs).unsqueeze(0),
             versions=torch.tensor(versions).unsqueeze(0),
+            turn_ids=torch.tensor(turn_ids, dtype=torch.int32).unsqueeze(0),
             attention_mask=torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             # reward
             rewards=torch.tensor([float(reward)]),
+            original_rewards=torch.tensor([float(original_reward)]),
+            is_truncated=torch.tensor([resp.stop_reason == "length"], dtype=torch.bool),
         )
+        if self.mm_token_type_ids is not None or self.multi_modal_input is not None:
+            mm_token_type_ids = self.mm_token_type_ids or [0] * resp.input_len
+            if len(mm_token_type_ids) != resp.input_len:
+                raise ValueError(
+                    "Multimodal token type IDs do not match the rollout prompt "
+                    f"length: {len(mm_token_type_ids)} != {resp.input_len}."
+                )
+            result["mm_token_type_ids"] = torch.tensor(
+                mm_token_type_ids + [0] * resp.output_len,
+                dtype=torch.long,
+            ).unsqueeze(0)
+            result["multi_modal_input"] = [self.multi_modal_input or {}]
+        if self.token_rewards is not None or parent_token_rewards_tensor is not None:
+            token_rewards = torch.zeros(len(seq), dtype=torch.float32, device="cpu")
+            if parent_token_rewards_tensor is not None and resp.input_len > parent_len:
+                token_rewards[:parent_len] = parent_token_rewards_tensor.squeeze(0)
+            if self.token_rewards is not None:
+                token_rewards[resp.input_len :] = self.token_rewards.detach()
+            result["token_rewards"] = token_rewards.unsqueeze(0)
         self._cache = result
         return result
+
+
+def _interaction_rollout_reward(
+    interactions: list[InteractionWithTokenLogpReward],
+) -> float | None:
+    references = {
+        v.rollout_reward for v in interactions if v.rollout_reward is not None
+    }
+    if len(references) > 1:
+        raise ValueError("Interactions in one rollout must share rollout_reward")
+    reference = next(iter(references), None)
+    RolloutGroup((len(interactions),), (reference,))
+    return reference
+
+
+def concat_tensor_interactions(
+    interactions: dict[str, InteractionWithTokenLogpReward],
+) -> dict[str, Any]:
+    """Export tensor rows while retaining the wrapper's logical membership."""
+    batches = []
+    counts: list[int] = []
+    rewards: list[float | None] = []
+    members: dict[int, list[InteractionWithTokenLogpReward]] = {}
+    for interaction in interactions.values():
+        index = (
+            interaction.rollout_index if interaction.rollout_index is not None else 0
+        )
+        members.setdefault(index, []).append(interaction)
+    for member in members.values():
+        tensors = [v.to_tensor_dict() for v in member]
+        batches.extend(tensors)
+        counts.append(sum(get_batch_size(t) for t in tensors))
+        rewards.append(_interaction_rollout_reward(member))
+    result = concat_padded_tensors(batches)
+    result["rollout_group"] = RolloutGroup(tuple(counts), tuple(rewards))
+    return result
+
+
+def normalize_group_rewards(
+    results: list[dict[str, InteractionWithTokenLogpReward] | None],
+) -> bool:
+    """Normalize one scalar reward per rollout while preserving raw rewards."""
+    if not results:
+        return False
+
+    reward_per_result: list[float | None] = []
+    for result in results:
+        if not result:
+            reward_per_result.append(None)
+            continue
+        last_id = next(reversed(result))
+        reward_per_result.append(result[last_id].reward)
+
+    if any(reward is None for reward in reward_per_result):
+        return False
+
+    rewards = torch.tensor(reward_per_result, dtype=torch.float32)
+    mean = rewards.mean()
+    std = rewards.std(unbiased=False) if rewards.numel() > 1 else torch.tensor(1.0)
+    normalized_rewards = ((rewards - mean) / (std + 1e-8)).tolist()
+
+    for result, normalized_reward in zip(results, normalized_rewards):
+        assert result is not None
+        for interaction in result.values():
+            if interaction.reward is None:
+                continue
+            interaction.original_reward = interaction.reward
+            interaction.reward = normalized_reward
+            if interaction._cache is not None:
+                interaction._cache["rewards"] = torch.tensor([float(normalized_reward)])
+                interaction._cache["original_rewards"] = torch.tensor(
+                    [float(interaction.original_reward)]
+                )
+    return True
+
+
+def normalize_logical_rollout_rewards(
+    results: list[dict[str, InteractionWithTokenLogpReward] | None],
+) -> bool:
+    """Normalize row rewards against one explicit or equal-row rollout reference."""
+    if not results or any(not result for result in results):
+        return False
+    references: list[float] = []
+    for result in results:
+        assert result is not None
+        interactions = list(result.values())
+        reference = _interaction_rollout_reward(interactions)
+        if any(v.reward is None for v in interactions):
+            return False
+        if reference is None:
+            row_rewards = {v.reward for v in interactions}
+            if len(row_rewards) != 1:
+                raise ValueError(
+                    "Split rollout row rewards differ; supply an explicit "
+                    "rollout_reward for reward normalization."
+                )
+            reference = interactions[0].reward
+            for interaction in interactions:
+                if interaction._cache is not None:
+                    torch._assert_async(
+                        torch.all(interaction._cache["rewards"] == reference),
+                        "Split rollout row rewards differ; supply an explicit "
+                        "rollout_reward for reward normalization.",
+                    )
+        references.append(reference)
+
+    rewards = torch.tensor(references, dtype=torch.float32)
+    mean = rewards.mean()
+    std = (
+        rewards.std(unbiased=False) if len(references) > 1 else rewards.new_tensor(1.0)
+    )
+    scale = torch.where(std <= 1e-8, 1.0, std + 1e-8)
+    row_rewards = torch.tensor(
+        [v.reward for result in results for v in result.values()], dtype=torch.float32
+    )
+    normalized_rows = iter(((row_rewards - mean) / scale).tolist())
+    normalized_references = ((rewards - mean) / scale).tolist()
+    for result, reference in zip(results, normalized_references):
+        assert result is not None
+        for interaction in result.values():
+            interaction.original_reward = interaction.reward
+            interaction.reward = next(normalized_rows)
+            interaction.rollout_reward = reference
+            if interaction._cache is not None:
+                # Cached exports can contain more than one physical row.
+                cache = interaction._cache
+                cache["original_rewards"] = cache["rewards"].clone()
+                cache["rewards"] = (cache["rewards"].float() - mean) / scale
+    return True
 
 
 def concat_string_interactions(

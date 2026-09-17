@@ -1,13 +1,22 @@
 """Tests for the recovery configuration and functionality."""
 
+import dataclasses
+import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from areal.api.cli_args import RecoverConfig
 from areal.api.io_struct import FinetuneSpec, StepInfo
-from areal.utils.recover import RecoverHandler, check_if_auto_recover, check_if_recover
+from areal.utils import checkpoint_pointer
+from areal.utils.recover import (
+    RecoverHandler,
+    check_if_auto_recover,
+    check_if_recover,
+)
+from areal.utils.saver import Saver
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
@@ -25,6 +34,41 @@ class TestRecoverConfig:
         )
         assert config.mode == "disabled"
         assert config.retries == 3
+
+    def test_optimizer_state_is_saved_and_loaded_by_default(self):
+        """Test that recovery round-trips optimizer state unless opted out.
+
+        Megatron's optimizer save used to fail under megatron-core >=0.16 --
+        the default fully_sharded_model_space sharding emits flattened_range,
+        which ShardedTensor.validate_metadata_integrity() rejects. The
+        stop-gap was to flip these flags on. The checkpointer now requests
+        dp_reshardable sharding instead, so recovery keeps Adam moments and
+        these must stay off by default: resuming with reset moments at full
+        learning rate destabilizes training.
+        """
+        config = RecoverConfig(
+            experiment_name="test_exp",
+            trial_name="test_trial",
+            fileroot="/tmp",
+        )
+        assert config.no_save_optim is False
+        assert config.no_load_optim is False
+
+    @pytest.mark.parametrize("field_name", ["no_save_optim", "no_load_optim"])
+    def test_optim_flag_help_does_not_claim_megatron_requirement(self, field_name):
+        """Test that the optim-skip flags are not documented as required.
+
+        The old help text called no_save_optim "required" for Megatron with a
+        distributed optimizer. That workaround is obsolete, and following it
+        silently discards Adam moments across recovery.
+        """
+        help_text = next(
+            f.metadata["help"]
+            for f in dataclasses.fields(RecoverConfig)
+            if f.name == field_name
+        )
+        assert "flattened_range" not in help_text
+        assert "required" not in help_text.lower()
 
     @pytest.mark.parametrize("mode", ["on", "off", "auto", "disabled"])
     def test_valid_modes(self, mode):
@@ -176,12 +220,13 @@ class TestModeEquivalence:
 
 class TestRecoverHandler:
     @staticmethod
-    def _make_handler(tmpdir: str, mode: str) -> RecoverHandler:
+    def _make_handler(tmpdir: str, mode: str, **config_kwargs) -> RecoverHandler:
         config = RecoverConfig(
             experiment_name="test_exp",
             trial_name="test_trial",
             fileroot=tmpdir,
             mode=mode,
+            **config_kwargs,
         )
         ft_spec = FinetuneSpec(
             total_train_epochs=1,
@@ -193,6 +238,211 @@ class TestRecoverHandler:
     @staticmethod
     def _make_gateway_controller() -> GatewayTrainController:
         return GatewayTrainController.__new__(GatewayTrainController)
+
+    @staticmethod
+    def _dump_dependencies():
+        saver = Mock()
+        saver.state_dict.return_value = {}
+        evaluator = Mock()
+        evaluator.state_dict.return_value = {}
+        stats_logger = Mock()
+        stats_logger.state_dict.return_value = {}
+        dataloader = Mock()
+        dataloader.state_dict.return_value = {}
+        dataloader.sampler = None
+        return saver, evaluator, stats_logger, dataloader
+
+    @staticmethod
+    def _step_info(handler: RecoverHandler, global_step: int = 3) -> StepInfo:
+        return StepInfo(
+            epoch=0,
+            epoch_step=global_step,
+            global_step=global_step,
+            steps_per_epoch=handler.ft_spec.steps_per_epoch,
+        )
+
+    def test_dump_sync_engine_publishes_generation(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        engine = Mock()
+        engine.config = SimpleNamespace(
+            backend="fsdp:d1", megatron=SimpleNamespace(async_save=False)
+        )
+
+        handler.dump(
+            engine,
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert checkpoint_pointer.read_latest(save_root).global_step == 3
+        meta = engine.save.call_args.args[0]
+        assert meta.path == checkpoint_pointer.payload_dir(
+            checkpoint_pointer.generation_dir(save_root, 3), "default"
+        )
+        assert meta.checkpoint_pointer_path is None
+
+    def test_dump_async_megatron_defers_pointer_to_finalize(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        engine = Mock()
+        engine.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+
+        handler.dump(
+            engine,
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert checkpoint_pointer.read_latest(save_root) is None
+        meta = engine.save.call_args.args[0]
+        assert meta.wait_for_async_save is False
+        assert meta.checkpoint_pointer_path == checkpoint_pointer.latest_path(save_root)
+
+        checkpoint_pointer.publish_latest(save_root, meta.checkpoint_pointer_value)
+        assert checkpoint_pointer.read_latest(save_root).global_step == 3
+
+    def test_dump_multiple_async_engines_waits_before_deferred_publication(
+        self, tmp_path
+    ):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        save_order = []
+        actor = Mock()
+        actor.save.side_effect = lambda _meta: save_order.append("default")
+        actor.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+        critic = Mock()
+        critic.save.side_effect = lambda _meta: save_order.append("critic")
+        critic.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+
+        handler.dump(
+            {"default": actor, "critic": critic},
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert checkpoint_pointer.read_latest(save_root) is None
+        assert save_order == ["default", "critic"]
+
+        actor_meta = actor.save.call_args.args[0]
+        assert actor_meta.wait_for_async_save is True
+        assert actor_meta.checkpoint_pointer_path is None
+
+        critic_meta = critic.save.call_args.args[0]
+        assert critic_meta.wait_for_async_save is False
+        assert critic_meta.checkpoint_pointer_path == checkpoint_pointer.latest_path(
+            save_root
+        )
+
+        checkpoint_pointer.publish_latest(
+            save_root, critic_meta.checkpoint_pointer_value
+        )
+        assert checkpoint_pointer.read_latest(save_root).global_step == 3
+
+    def test_dump_mixed_engines_saves_async_publisher_last(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        save_order = []
+        actor = Mock()
+        actor.save.side_effect = lambda _meta: save_order.append("default")
+        actor.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+        critic = Mock()
+        critic.save.side_effect = lambda _meta: save_order.append("critic")
+        critic.config = SimpleNamespace(
+            backend="fsdp:d1", megatron=SimpleNamespace(async_save=False)
+        )
+
+        handler.dump(
+            {"default": actor, "critic": critic},
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert save_order == ["critic", "default"]
+        assert critic.save.call_args.args[0].checkpoint_pointer_path is None
+        assert actor.save.call_args.args[
+            0
+        ].checkpoint_pointer_path == checkpoint_pointer.latest_path(save_root)
+        assert checkpoint_pointer.read_latest(save_root) is None
+
+    def test_dump_multiple_engines_keeps_latest_when_publisher_save_fails(
+        self, tmp_path
+    ):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        actor = Mock()
+        actor.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+        critic = Mock()
+        critic.save.side_effect = RuntimeError("critic save failed")
+        critic.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        _, previous = checkpoint_pointer.prepare_generation(
+            save_root, 2, ["default", "critic"]
+        )
+        checkpoint_pointer.publish_latest(save_root, previous.to_json())
+
+        with pytest.raises(RuntimeError, match="critic save failed"):
+            handler.dump(
+                {"default": actor, "critic": critic},
+                self._step_info(handler),
+                *self._dump_dependencies(),
+            )
+
+        assert actor.save.call_args.args[0].wait_for_async_save is True
+        assert checkpoint_pointer.read_latest(save_root).global_step == 2
+
+    def test_dump_spmd_mode_preserves_legacy_layout(self, tmp_path, monkeypatch):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        monkeypatch.setenv("AREAL_SPMD_MODE", "1")
+        engine = Mock()
+        engine.config = SimpleNamespace(
+            backend="fsdp:d1", megatron=SimpleNamespace(async_save=False)
+        )
+
+        handler.dump(
+            engine,
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        meta = engine.save.call_args.args[0]
+        assert meta.path == Saver.get_recover_checkpoint_path(
+            "test_exp", "test_trial", str(tmp_path), name="default"
+        )
+        assert os.path.isdir(
+            os.path.join(save_root, checkpoint_pointer.LEGACY_MANIFEST_DIRNAME)
+        )
+        assert checkpoint_pointer.read_latest(save_root) is None
 
     @pytest.mark.parametrize("mode", ["on", "auto"])
     def test_load_rejects_gateway_train_controller(self, mode):
@@ -234,3 +484,148 @@ class TestRecoverHandler:
 
             assert "GatewayTrainController" in str(exc_info.value)
             assert "recover.mode" in str(exc_info.value)
+
+    @pytest.mark.parametrize("no_save_optim", [False, True])
+    def test_save_checkpoint_passes_with_optim_from_config(self, no_save_optim):
+        """Test that _save_checkpoint asks the engine for optimizer state
+        exactly when no_save_optim is off."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler = self._make_handler(tmpdir, "auto", no_save_optim=no_save_optim)
+            engine = Mock()
+
+            handler._save_checkpoint(engine, path=os.path.join(tmpdir, "checkpoint"))
+
+            meta = engine.save.call_args[0][0]
+            assert meta.with_optim is (not no_save_optim)
+
+    def test_save_checkpoint_passes_wait_for_async_save(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "auto")
+        engine = Mock()
+
+        handler._save_checkpoint(
+            engine,
+            path=str(tmp_path / "checkpoint"),
+            wait_for_async_save=True,
+        )
+
+        assert engine.save.call_args.args[0].wait_for_async_save is True
+
+    @pytest.mark.parametrize("no_load_optim", [False, True])
+    def test_load_checkpoint_passes_with_optim_from_config(self, no_load_optim):
+        """Test that _load_checkpoint asks the engine for optimizer state
+        exactly when no_load_optim is off."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler = self._make_handler(tmpdir, "auto", no_load_optim=no_load_optim)
+            engine = Mock()
+            # _load_checkpoint requires the checkpoint dir to exist.
+            os.makedirs(
+                Saver.get_recover_checkpoint_path(
+                    "test_exp", "test_trial", tmpdir, name="default"
+                ),
+                exist_ok=True,
+            )
+
+            handler._load_checkpoint(
+                engine,
+                path=Saver.get_recover_checkpoint_path(
+                    "test_exp", "test_trial", tmpdir, name="default"
+                ),
+            )
+
+            meta = engine.load.call_args[0][0]
+            assert meta.with_optim is (not no_load_optim)
+
+
+class TestPPORecoverEngines:
+    def test_actor_only_returns_default_engine(self):
+        from areal.trainer.rl_trainer import PPOTrainer
+
+        trainer = PPOTrainer.__new__(PPOTrainer)
+        trainer.actor = Mock()
+        trainer.critic = None
+
+        assert trainer._recover_engines() == {"default": trainer.actor}
+
+    def test_critic_is_included_with_stable_name(self):
+        from areal.trainer.rl_trainer import PPOTrainer
+
+        trainer = PPOTrainer.__new__(PPOTrainer)
+        trainer.actor = Mock()
+        trainer.critic = Mock()
+
+        assert trainer._recover_engines() == {
+            "default": trainer.actor,
+            "critic": trainer.critic,
+        }
+
+
+class TestAwexColocateGate:
+    """The AWEX pre-transfer sequence must run only for colocated rollouts."""
+
+    @staticmethod
+    def _awex_meta():
+        return Mock(type="awex")
+
+    def test_awex_transport_without_colocation_is_not_colocate(self):
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
+            inference_engine=Mock(),
+            weight_update_meta=self._awex_meta(),
+            colocated_rollout=False,
+        )
+
+    def test_awex_transport_with_colocation_is_colocate(self):
+        assert RecoverHandler._should_run_awex_colocate_transfer(
+            inference_engine=Mock(),
+            weight_update_meta=self._awex_meta(),
+            colocated_rollout=True,
+        )
+
+    @pytest.mark.parametrize("meta_type", ["disk", "xccl"])
+    def test_non_awex_transport_is_never_colocate(self, meta_type):
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
+            inference_engine=Mock(),
+            weight_update_meta=Mock(type=meta_type),
+            colocated_rollout=True,
+        )
+
+    def test_missing_inference_engine_is_not_colocate(self):
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
+            inference_engine=None,
+            weight_update_meta=self._awex_meta(),
+            colocated_rollout=True,
+        )
+
+    def test_meta_without_type_attribute_is_not_colocate(self):
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
+            inference_engine=Mock(),
+            weight_update_meta=None,
+            colocated_rollout=True,
+        )
+
+
+class TestColocateRolloutProtocol:
+    """Engines lacking the colocate protocol must fail before any side effect."""
+
+    def test_engine_with_full_protocol_is_accepted(self):
+        engine = Mock(spec=["pause_generation_sync", "offload"])
+        engine.offload = lambda tags=None: None
+
+        RecoverHandler._require_colocate_rollout_protocol(engine)
+
+    def test_engine_without_pause_generation_sync_is_rejected(self):
+        engine = Mock(spec=["offload"])
+        engine.offload = lambda tags=None: None
+
+        with pytest.raises(NotImplementedError) as exc_info:
+            RecoverHandler._require_colocate_rollout_protocol(engine)
+
+        assert "pause_generation_sync" in str(exc_info.value)
+
+    def test_engine_with_untagged_offload_is_rejected(self):
+        engine = Mock(spec=["pause_generation_sync", "offload"])
+        engine.offload = lambda: None
+
+        with pytest.raises(NotImplementedError) as exc_info:
+            RecoverHandler._require_colocate_rollout_protocol(engine)
+
+        assert "tags" in str(exc_info.value)

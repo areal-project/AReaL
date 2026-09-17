@@ -158,7 +158,7 @@ class AsyncRewardWrapper:
                     f"{'Returning 0.' if is_last else 'Retrying...'}"
                 )
                 if is_last:
-                    return 0
+                    return 0.0
             except BrokenProcessPool:
                 logger.warning(
                     f"ProcessPoolExecutor broken (attempt {attempt + 1}/{self.max_retries + 1}). "
@@ -180,4 +180,4 @@ class AsyncRewardWrapper:
                 if is_last:
                     raise
 
-        return 0
+        return 0.0

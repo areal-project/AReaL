@@ -9,7 +9,8 @@
 1. 首先阅读 [`RolloutWorkflow` 参考](../reference/rollout_workflow.md)，因为代理工作流建立在
    `RolloutWorkflow` 之上。
 
-1. **调度器兼容性**：代理工作流仅在 `local` 和 `slurm` 调度器上受支持。`ray` 调度器与 HTTP 代理架构不兼容。
+1. **调度器兼容性**：代理工作流在 `local`、`slurm` 和 `ray` 调度器上均受支持。代理服务器以 fork 出的 HTTP worker 进程形式，与其
+   rollout worker 部署在同一节点。
 
 ## 概述
 
@@ -539,6 +540,10 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
 | ------------ | ------------------------------------------------------------------- |
 | `individual` | 将所有交互作为单独条目返回。轨迹可能共享前缀。                      |
 | `concat`     | 构建对话树，仅返回叶子节点。仅对具有匹配 token 序列的线性对话有效。 |
+
+`individual` 每个 episode 会导出多个样本；在分组 rollout（`n_samples >= 2`）下，这与 group-relative
+normalization 不兼容，会抛出不可重试的 `WorkflowContractError`。参见
+[分组 rollout 契约](rollout_workflow.md#%E5%88%86%E7%BB%84-rollout)。
 
 ## 公共 API
 

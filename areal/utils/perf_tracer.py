@@ -24,6 +24,7 @@ from torch import profiler
 
 from areal.api.cli_args import PerfTracerConfig, SessionTracerConfig
 from areal.utils import logging
+from areal.utils.environ import rank_in_env_filter
 
 logger = logging.getLogger("PerfTracer")
 
@@ -1305,7 +1306,9 @@ class PerfTracer:
         if rank < 0:
             raise ValueError("rank must be a non-negative integer")
         self._config = config
-        self._enabled = config.enabled
+        self._enabled = config.enabled and rank_in_env_filter(
+            "AREAL_PERF_TRACER_RANKS", rank
+        )
         self._rank = rank
         self._role = role
         self._events: list[dict[str, Any]] = []
@@ -1656,7 +1659,9 @@ class PerfTracer:
             self._thread_meta_emitted = set()
             self._process_meta_emitted = set()
             self._origin_ns = time.perf_counter_ns()
-            self._enabled = self._config.enabled
+            self._enabled = self._config.enabled and rank_in_env_filter(
+                "AREAL_PERF_TRACER_RANKS", self._rank
+            )
             self._save_interval = _normalize_save_interval(self._config)
 
     # ------------------------------------------------------------------

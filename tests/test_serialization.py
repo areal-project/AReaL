@@ -5,7 +5,6 @@ from io import BytesIO
 
 import numpy as np
 import pytest
-import ray
 import torch
 from PIL import Image
 from transformers import AutoTokenizer
@@ -13,6 +12,7 @@ from transformers import AutoTokenizer
 from tests.utils import get_model_path
 
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
+from areal.infra.workflow_executor import WorkflowContractFailure
 
 
 @dataclass
@@ -118,6 +118,14 @@ class TestSerializationRoundTrip:
         assert deserialized.value == original.value
         assert torch.equal(deserialized.tensor, original.tensor)
 
+    def test_workflow_contract_failure(self):
+        """Workflow contract failures retain their terminal error identity."""
+        original = WorkflowContractFailure(message="invalid group shape")
+
+        deserialized = deserialize_value(serialize_value(original))
+
+        assert deserialized == original
+
     def test_tokenizer(self):
         """Test Hugging Face tokenizer serialization."""
         original = AutoTokenizer.from_pretrained(
@@ -176,20 +184,6 @@ class TestSerializationRoundTrip:
         assert deserialized["dataclass"].name == "nested"
         assert torch.equal(deserialized["list"][0], payload["list"][0])
         assert deserialized["meta"]["text"] == "value"
-
-    @pytest.mark.skip("skipping the ray test unless skip mark is commented out")
-    def test_ray_object_ref_roundtrip(self):
-        """Ray ObjectRef handles should round-trip through RPC serialization."""
-        ray.init(local_mode=True, ignore_reinit_error=True)
-        try:
-            original = ray.put({"value": 123})
-            serialized = serialize_value({"ref": original})
-            assert serialized["ref"]["type"] == "ray_object_ref"
-
-            deserialized = deserialize_value(serialized)
-            assert ray.get(deserialized["ref"]) == {"value": 123}
-        finally:
-            ray.shutdown()
 
     @pytest.mark.skipif(
         not hasattr(torch, "cuda") or not torch.cuda.is_available(),

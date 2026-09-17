@@ -2126,7 +2126,7 @@ class TestForkColocationBehavior:
 
         alloc_resp = requests.post(
             f"http://{host}:{port}/alloc_ports",
-            json={"count": 1},
+            json={"count": 1, "role": "ref", "worker_index": 0},
             timeout=10,
         )
         assert alloc_resp.status_code == 200
@@ -2190,7 +2190,7 @@ class TestForkColocationBehavior:
 
         alloc_resp = requests.post(
             f"http://{host}:{port}/alloc_ports",
-            json={"count": 1},
+            json={"count": 1, "role": "ref", "worker_index": 0},
             timeout=10,
         )
         assert alloc_resp.status_code == 200

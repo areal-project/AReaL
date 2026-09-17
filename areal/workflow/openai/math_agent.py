@@ -27,8 +27,12 @@ def math_reward_fn(completions: str, answer: str) -> float:
 class MathAgent:
     def __init__(self, **kwargs):
         self.kwargs = kwargs.copy()
-        self.kwargs.pop("max_tokens", None)
+        max_new_tokens = self.kwargs.pop("max_new_tokens", None)
         self.kwargs.pop("max_turns", None)
+        if max_new_tokens is not None and "max_tokens" not in self.kwargs:
+            self.kwargs["max_tokens"] = max_new_tokens
+        else:
+            self.kwargs.pop("max_tokens", None)
         self._reward_fn = AsyncRewardWrapper(math_reward_fn)
 
     async def run(self, data: dict, **extra_kwargs):
@@ -38,8 +42,11 @@ class MathAgent:
         client = AsyncOpenAI(
             base_url=base_url, api_key=api_key, http_client=http_client, max_retries=0
         )
+        messages = data.get("messages_chat") or data["messages"]
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
         comp: ChatCompletion = await client.chat.completions.create(
-            messages=data["messages"], model="default", **self.kwargs
+            messages=messages, model="default", **self.kwargs
         )
 
         return await self._reward_fn(
@@ -51,14 +58,22 @@ class MultiTurnMathAgent:
     def __init__(self, max_turns: int = 8, **kwargs):
         self.max_turns = max_turns
         self.kwargs = kwargs.copy()
-        self.kwargs.pop("max_tokens", None)
+        max_new_tokens = self.kwargs.pop("max_new_tokens", None)
+        if max_new_tokens is not None and "max_tokens" not in self.kwargs:
+            self.kwargs["max_tokens"] = max_new_tokens
+        else:
+            self.kwargs.pop("max_tokens", None)
         self._reward_fn = AsyncRewardWrapper(math_reward_fn)
 
     async def run(self, data: dict, **extra_kwargs):
         http_client = extra_kwargs.get("http_client", None)
         base_url = extra_kwargs.get("base_url", None) or os.getenv("OPENAI_BASE_URL")
         api_key = extra_kwargs.get("api_key", None) or os.getenv("OPENAI_API_KEY")
-        messages = data["messages"].copy()
+        messages = list(data.get("messages_chat") or data["messages"])
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        else:
+            messages = [m for m in messages]
         rewards = {}
         client = AsyncOpenAI(
             base_url=base_url, api_key=api_key, http_client=http_client, max_retries=0

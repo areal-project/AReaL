@@ -504,6 +504,12 @@ def ppo_actor_loss_fn(
     # which always uses the original loss_mask from input_data. Without this,
     # mask mode would inflate per-token gradients by N_original / N_kept.
     loss_mask_count = loss_mask.count_nonzero() or 1
+    # Pre-filter mask kept for ratio/clip statistics: rejection sampling below
+    # narrows loss_mask for the loss, but stats stay on the original mask so
+    # importance_weight/avg reads 1.0 under proximal reuse instead of
+    # 1 - filtered_fraction. Gradients are unaffected: the final loss still
+    # zeroes filtered tokens through the narrowed mask.
+    stat_loss_mask = loss_mask
 
     # === Apply rejection sampling (replaces old compute_behave_imp_weight) ===
     if rejection_sampling is not None:
@@ -529,7 +535,7 @@ def ppo_actor_loss_fn(
         )
     elif importance_sampling_level == "token":
         # Standard PPO: per-token ratio
-        ratio = torch.where(loss_mask, torch.exp(logprobs - proximal_logprobs), 0)
+        ratio = torch.where(stat_loss_mask, torch.exp(logprobs - proximal_logprobs), 0)
     else:
         raise ValueError(
             f"Invalid importance_sampling_level: {importance_sampling_level}. "
@@ -563,14 +569,21 @@ def ppo_actor_loss_fn(
 
     logging_loss = pg_loss.detach()
     pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
-    clip_mask.logical_and_(loss_mask)
-    dual_clip_mask.logical_and_(loss_mask)
+    clip_mask.logical_and_(stat_loss_mask)
+    dual_clip_mask.logical_and_(stat_loss_mask)
+    # One host sync per microbatch: the count feeds three derived stats.
+    n_stat_total = stat_loss_mask.numel()
+    n_stat_valid = stat_loss_mask.count_nonzero().item()
     stat = dict(
         loss=logging_loss,
         importance_weight=ratio.detach(),
         approx_kl=(logprobs - proximal_logprobs).detach(),
         clip_mask=clip_mask,
         dual_clip_mask=dual_clip_mask,
+        n_total_tokens=float(n_stat_total),
+        n_valid_tokens=float(n_stat_valid),
+        n_masked_tokens=float(n_stat_total - n_stat_valid),
+        masked_token_ratio=1.0 - n_stat_valid / max(n_stat_total, 1),
     )
 
     if rejection_sampling is not None:

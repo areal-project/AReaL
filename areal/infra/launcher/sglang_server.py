@@ -203,7 +203,15 @@ class SGLangServerWrapper:
         self._monitor_server_processes(server_addresses)
 
     def launch_one_server(self, cmd, host_ip, server_port, node_rank):
-        server_process = launch_server_cmd(cmd)
+        custom_env = None
+        awex_meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
+        if awex_meta_addr:
+            custom_env = {"AWEX_META_SERVER_ADDR": awex_meta_addr}
+            cmd = [
+                "areal.engine.awex.sglang_plugin" if c == "sglang.launch_server" else c
+                for c in cmd
+            ]
+        server_process = launch_server_cmd(cmd, custom_env=custom_env)
         wait_for_server(f"http://{format_hostport(host_ip, server_port)}")
         if node_rank == 0:
             name = names.gen_servers(self.experiment_name, self.trial_name)

@@ -31,7 +31,8 @@ from areal.api.cli_args import (
     TrainEngineConfig,
 )
 from areal.engine import MegatronEngine
-from areal.utils.data import broadcast_tensor_container
+from areal.engine.core.model import SequencePackingMode
+from areal.utils.data import broadcast_tensor_container, tensor_container_to
 from areal.utils.testing_utils import DENSE_MODEL_PATHS
 
 VLM_MODEL_PATH = os.environ.get("VLM_MODEL_PATH", DENSE_MODEL_PATHS["qwen2_5_vl"])
@@ -85,6 +86,54 @@ def mock_vlm_input(engine: "MegatronEngine") -> dict[str, Any]:
         "attention_mask": attention_mask,
         "multi_modal_input": [
             {"pixel_values": pixel_values, "image_grid_thw": image_grid_thw}
+        ],
+    }
+
+
+def mock_text_only_vlm_input(engine: "MegatronEngine") -> dict[str, Any]:
+    """Create a variable-length text-only batch for a VLM model."""
+    device = engine.device
+    seq_lens = torch.tensor([32, 20], dtype=torch.long, device=device)
+    input_ids = torch.randint(0, 1000, (2, 32), dtype=torch.long, device=device)
+    attention_mask = torch.arange(32, device=device)[None, :] < seq_lens[:, None]
+    input_ids.masked_fill_(~attention_mask, 0)
+    return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
+def mock_mixed_vlm_input(engine: "MegatronEngine") -> dict[str, Any]:
+    """Create a variable-length image-text plus text-only batch."""
+    vc = engine.hf_config.vision_config
+    patch_size = getattr(vc, "patch_size", 16)
+    temporal_patch_size = getattr(vc, "temporal_patch_size", 2)
+    spatial_merge_size = getattr(vc, "spatial_merge_size", 2)
+    in_channels = getattr(vc, "in_channels", 3)
+    image_token_id = engine.hf_config.image_token_id
+    device = engine.device
+
+    grid_t, grid_h, grid_w = 1, 4, 4
+    total_patches = grid_t * grid_h * grid_w
+    num_image_tokens = (
+        grid_t * (grid_h // spatial_merge_size) * (grid_w // spatial_merge_size)
+    )
+    seq_lens = torch.tensor([24, 16], dtype=torch.long, device=device)
+    input_ids = torch.randint(0, 1000, (2, 24), dtype=torch.long, device=device)
+    input_ids[0, 8 : 8 + num_image_tokens] = image_token_id
+    attention_mask = torch.arange(24, device=device)[None, :] < seq_lens[:, None]
+    input_ids.masked_fill_(~attention_mask, 0)
+
+    patch_dim = in_channels * temporal_patch_size * patch_size * patch_size
+    pixel_values = torch.randn(
+        total_patches, patch_dim, dtype=torch.float32, device=device
+    )
+    image_grid_thw = torch.tensor(
+        [[grid_t, grid_h, grid_w]], dtype=torch.long, device=device
+    )
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "multi_modal_input": [
+            {"pixel_values": pixel_values, "image_grid_thw": image_grid_thw},
+            {},
         ],
     }
 
@@ -161,6 +210,12 @@ def test_vlm_forward(backend: str, output: str | None = None):
     # No DDP grad buffer — forward is inference-only. Saves ~2× model bytes
     # per rank and avoids NCCL OOMs at the GPU-memory boundary on 30B+ MoE.
     engine = make_vlm_engine(backend, init_optimizer=False, wrap_with_ddp=False)
+    if os.environ.get("AREAL_TEST_EXPECT_MODEL_THD") == "1":
+        assert engine.hf_config.model_type == "qwen3_vl_moe"
+        assert engine.bridge_cls == "megatron-bridge"
+        assert engine.sequence_packing_mode == SequencePackingMode.MODEL_THD
+        assert engine.use_model_packed_seq
+        assert not engine.use_padded_seq
     bcasted_input = _make_input(engine)
 
     engine.eval()
@@ -171,6 +226,75 @@ def test_vlm_forward(backend: str, output: str | None = None):
     if rank == 0 and output is not None:
         write_result(output, "Passed")
     print(f"rank {rank}: test_vlm_forward({backend}) Done.")
+
+
+def test_vlm_thd_bshd_parity(backend: str, output: str | None = None):
+    """Compare model-owned THD and padded BSHD forward outputs."""
+    rank = int(os.environ["RANK"])
+    torch.manual_seed(1234)
+    engine = make_vlm_engine(backend, init_optimizer=False, wrap_with_ddp=False)
+
+    assert engine.hf_config.model_type == "qwen3_vl"
+    assert engine.bridge_cls == "megatron-bridge"
+    assert engine.use_model_packed_seq
+    engine.eval()
+
+    parity_results = []
+    try:
+        cases = [
+            (
+                "text_only",
+                broadcast_tensor_container(
+                    mock_text_only_vlm_input(engine),
+                    src_rank=engine.current_data_parallel_head(),
+                    group=engine.context_and_model_parallel_group,
+                ),
+            ),
+            (
+                "mixed_image_text",
+                broadcast_tensor_container(
+                    mock_mixed_vlm_input(engine),
+                    src_rank=engine.current_data_parallel_head(),
+                    group=engine.context_and_model_parallel_group,
+                ),
+            ),
+        ]
+        bshd_outputs = []
+        engine.use_model_packed_seq = False
+        with torch.no_grad():
+            for _, bcasted_input in cases:
+                bshd_outputs.append(engine.forward(bcasted_input))
+
+        engine.use_model_packed_seq = True
+        for (case_name, bcasted_input), bshd_output in zip(
+            cases, bshd_outputs, strict=True
+        ):
+            with torch.no_grad():
+                thd_output = engine.forward(bcasted_input)
+
+            assert bshd_output.shape == thd_output.shape
+            valid_mask = bcasted_input["attention_mask"].bool()
+            assert valid_mask.shape == thd_output.shape
+            thd_output = thd_output[valid_mask]
+            bshd_output = bshd_output[valid_mask]
+            diff = (thd_output - bshd_output).abs()
+            max_abs = diff.max().item()
+            mean_abs = diff.mean().item()
+            parity_results.append((case_name, max_abs, mean_abs))
+            if rank == 0:
+                print(
+                    f"[thd-bshd] {case_name}: max_abs={max_abs:.6e} "
+                    f"mean_abs={mean_abs:.6e}"
+                )
+    finally:
+        _cleanup(engine)
+
+    for case_name, max_abs, mean_abs in parity_results:
+        assert max_abs <= 1.5e-1, f"{case_name} max_abs={max_abs:.6e}"
+        assert mean_abs <= 3.5e-2, f"{case_name} mean_abs={mean_abs:.6e}"
+    if rank == 0 and output is not None:
+        write_result(output, "Passed")
+    print(f"rank {rank}: test_vlm_thd_bshd_parity({backend}) Done.")
 
 
 def test_vlm_save_load(backend: str, save_dir: str, output: str | None = None):
@@ -304,6 +428,57 @@ def test_vlm_train(backend: str, output: str | None = None):
     print(f"rank {rank}: test_vlm_train({backend}) Done.")
 
 
+def test_vlm_memory_isolation(backend: str, output: str | None = None):
+    """Exercise CPU alias broadcast, repeated VLM forward, text, and an update."""
+    rank = int(os.environ["RANK"])
+    engine = make_vlm_engine(backend, init_optimizer=True)
+    num_rows = max(2, 2 * engine.parallel_strategy.pipeline_parallel_size)
+    source = None
+    if rank == engine.current_data_parallel_head():
+        source = tensor_container_to(mock_vlm_input(engine), "cpu")
+        source["input_ids"] = source["input_ids"].repeat(num_rows, 1)
+        source["attention_mask"] = source["attention_mask"].repeat(num_rows, 1)
+        source["multi_modal_input"] *= num_rows
+    data = broadcast_tensor_container(
+        source,
+        src_rank=engine.current_data_parallel_head(),
+        group=engine.cpu_model_parallel_group,
+        preserve_tensor_aliases=True,
+    )
+    images = data["multi_modal_input"]
+    assert images[0]["pixel_values"] is images[1]["pixel_values"]
+    engine.eval()
+    before = engine.forward(data)
+    repeated = engine.forward(data)
+    torch.testing.assert_close(before, repeated, rtol=1e-5, atol=1e-5)
+    assert images[0]["pixel_values"].device.type == "cpu"
+    assert data["multi_modal_input"] is images
+
+    text = None
+    if rank == engine.current_data_parallel_head():
+        text = tensor_container_to(mock_text_only_vlm_input(engine), "cpu")
+        text = {key: value.repeat(num_rows // 2, 1) for key, value in text.items()}
+    text = broadcast_tensor_container(
+        text,
+        src_rank=engine.current_data_parallel_head(),
+        group=engine.cpu_model_parallel_group,
+        preserve_tensor_aliases=True,
+    )
+    text_result = engine.forward(text)
+    assert text_result.shape == text["input_ids"].shape
+    engine.train()
+    result = engine.train_batch(
+        input_=data,
+        loss_fn=lambda logprobs, entropy, input_data, **kwargs: logprobs.mean(),
+        loss_weight_fn=lambda x: torch.tensor(1.0, device=engine.device),
+    )
+    assert torch.isfinite(torch.tensor(result["grad_norm"]))
+    assert images[0]["pixel_values"].device.type == "cpu"
+    _cleanup(engine)
+    if rank == 0 and output is not None:
+        write_result(output, "Passed")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", type=str, default="megatron:d1p1t2")
@@ -312,7 +487,15 @@ def main():
     parser.add_argument(
         "--test_type",
         type=str,
-        choices=["init", "forward", "save_load", "dcp_save_load", "train"],
+        choices=[
+            "init",
+            "forward",
+            "thd_bshd_parity",
+            "save_load",
+            "dcp_save_load",
+            "train",
+            "memory_isolation",
+        ],
         default="train",
     )
     args = parser.parse_args()
@@ -321,6 +504,8 @@ def main():
         test_vlm_init(args.backend, output=args.output)
     elif args.test_type == "forward":
         test_vlm_forward(args.backend, output=args.output)
+    elif args.test_type == "thd_bshd_parity":
+        test_vlm_thd_bshd_parity(args.backend, output=args.output)
     elif args.test_type == "save_load":
         assert args.save_dir is not None, "--save_dir required for save_load test"
         test_vlm_save_load(args.backend, args.save_dir, output=args.output)
@@ -328,6 +513,8 @@ def main():
         test_vlm_dcp_save_load(args.backend, output=args.output)
     elif args.test_type == "train":
         test_vlm_train(args.backend, output=args.output)
+    elif args.test_type == "memory_isolation":
+        test_vlm_memory_isolation(args.backend, output=args.output)
     else:
         raise NotImplementedError(f"Unknown test type: {args.test_type}")
 

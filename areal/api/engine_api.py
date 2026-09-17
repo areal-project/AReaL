@@ -200,6 +200,9 @@ class TrainEngine(abc.ABC):
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Submit a batch of requests and wait for results.
 
@@ -219,12 +222,16 @@ class TrainEngine(abc.ABC):
         group_size : int, optional
             Number of times to run the workflow per input and concatenate results.
             Default is 1 (no grouping).
+        min_usable_group_size : int, optional
+            Estimator-owned minimum number of usable logical rollout slots. Must be
+            between 1 and ``group_size``. Default is 1.
 
         Returns
         -------
         list[dict[str, Any]]
             A list of trajectory dictionaries, one per accepted rollout result.
-            Each trajectory contains tensors with shape [group_size, seqlen, ...].
+            Each trajectory contains tensors whose leading dimension is the number
+            of usable slots, between ``min_usable_group_size`` and ``group_size``.
         """
         raise NotImplementedError()
 
@@ -237,6 +244,9 @@ class TrainEngine(abc.ABC):
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Prepare a batch of data for training from a dataloader.
 
@@ -257,6 +267,9 @@ class TrainEngine(abc.ABC):
             If True, enables dynamic batch sizing. The method will stop collecting
             when (accepted + rejected) >= batch_size, returning only accepted results.
             This results in variable-sized batches of valid data. Default is False.
+        min_usable_group_size : int, optional
+            Estimator-owned minimum number of usable logical rollout slots. Must be
+            between 1 and ``group_size``. Default is 1.
 
         Returns
         -------
@@ -735,6 +748,9 @@ class InferenceEngine(abc.ABC):
         group_size: int = 1,
         task_id: int | None = None,
         is_eval: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -767,6 +783,9 @@ class InferenceEngine(abc.ABC):
         is_eval : bool, optional
             Whether this is an evaluation workflow. Affects variables like trajectory dump path
             and statistics keys. By default False.
+        min_usable_group_size : int, optional
+            Estimator-owned minimum number of usable logical rollout slots. Must be
+            between 1 and ``group_size``. Default is 1.
 
         Returns
         -------
@@ -838,6 +857,9 @@ class InferenceEngine(abc.ABC):
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Submit a batch of requests to the inference engine and wait for the results.
 
@@ -865,6 +887,9 @@ class InferenceEngine(abc.ABC):
         group_size : int, optional
             Number of times to run the workflow per input and concatenate results.
             Default is 1 (no grouping).
+        min_usable_group_size : int, optional
+            Estimator-owned minimum number of usable logical rollout slots. Must be
+            between 1 and ``group_size``. Default is 1.
 
         Returns
         -------
@@ -883,6 +908,9 @@ class InferenceEngine(abc.ABC):
         should_accept_fn: Callable | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready with controlled staleness.
 
@@ -892,9 +920,10 @@ class InferenceEngine(abc.ABC):
 
             This method caches an internal data generator on the first call.
             The ``dataloader``, ``workflow``, ``workflow_kwargs``, ``group_size``,
-            and ``should_accept_fn`` parameters are captured at the first invocation
-            and reused in all subsequent calls. Passing different arguments in
-            later calls will **not** take effect.
+            ``reward_normalization``, ``drop_incomplete_group``,
+            ``min_usable_group_size``, and ``should_accept_fn`` parameters are captured
+            at the first invocation and reused in all subsequent calls. Passing
+            different arguments in later calls will **not** take effect.
 
             If you need to switch configurations mid-training, consider:
 
@@ -926,6 +955,9 @@ class InferenceEngine(abc.ABC):
             If True, enables dynamic batch sizing. The method will stop collecting
             when (accepted + rejected) >= batch_size, returning only accepted results.
             This results in variable-sized batches of valid data. Default is False.
+        min_usable_group_size : int, optional
+            Estimator-owned minimum number of usable logical rollout slots. Must be
+            between 1 and ``group_size``. Default is 1.
 
         Returns
         -------

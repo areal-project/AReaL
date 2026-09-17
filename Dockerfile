@@ -247,14 +247,15 @@ COPY --from=builder /opt/.venv /opt/.venv
 
 # Install Node.js via fnm and Claude Code
 ENV FNM_DIR=/root/.fnm
-ENV NODE_VERSION=24.13.0
+ENV NODE_VERSION=24.15.0
+ENV NPM_VERSION=12.0.2
 ENV PATH="$FNM_DIR/aliases/default/bin:/root/.local/bin:$PATH"
 RUN set -ex \
     && curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir "$FNM_DIR" --skip-shell \
     && eval "$($FNM_DIR/fnm env --shell bash)" \
     && $FNM_DIR/fnm install $NODE_VERSION \
     && $FNM_DIR/fnm default $NODE_VERSION \
-    && npm install -g npm@latest \
+    && npm install -g "npm@$NPM_VERSION" \
     && npm install -g @openai/codex @google/gemini-cli openclaw@latest \
     && curl -fsSL https://claude.ai/install.sh | bash \
     && curl -fsSL https://opencode.ai/install | bash \

@@ -13,6 +13,10 @@ from megatron.core.transformer.transformer_layer import get_transformer_layer_of
 from torch import Tensor
 from torch.nn.parameter import Parameter
 
+from areal.engine.megatron_utils.bailing_v3 import (
+    is_bailing_v3,
+    validate_bailing_v3_weight_update,
+)
 from areal.engine.megatron_utils.fp8 import (
     FP8BlockwiseTensorHelper,
     convert_fp8_helper_to_pytorch_fp8,
@@ -1268,6 +1272,7 @@ def convert_to_hf(
     quantization_config: dict[str, int | str | list[str]] | None = None,
     fp8_direct_convert: bool = False,
     hf_config=None,
+    bridge=None,
 ):
     """Convert Megatron parameter to HuggingFace format, optionally with FP8 quantization.
 
@@ -1285,11 +1290,35 @@ def convert_to_hf(
             If False, dequantize TE FP8 to bf16 first, then quantize to PyTorch FP8.
         hf_config: Optional HuggingFace PretrainedConfig. Required for VLM models
             that need vision_config for weight conversion (e.g., vision QKV reordering).
+        bridge: Existing BailingV3Bridge instance, required for Bailing V3 to reuse
+            its per-tensor HF name mapping and KDA TP de-interleaving.
 
     Returns:
         List of (name, tensor) tuples in HuggingFace format. For FP8 quantization,
         returns both quantized weight and scale tensors.
     """
+    if is_bailing_v3(hf_config) or model_name == "bailing_moe_v3":
+        validate_bailing_v3_weight_update(
+            hf_config,
+            use_lora=model_name.endswith("_lora"),
+            quantization_config=quantization_config,
+            fp8_direct_convert=fp8_direct_convert,
+        )
+        if bridge is None:
+            raise ValueError("BailingMoeV3 HF conversion requires its model bridge.")
+        if "_extra_state" in name:
+            return []
+        while name.startswith("module."):
+            name = name.removeprefix("module.")
+        # The regular gather already merges GLU gate/up partitions. KDA fused
+        # weights still have rank-major layout (partition_stride=1), which the
+        # existing bridge de-interleaves before returning full HF components.
+        hf_names, hf_tensors = bridge._weight_to_hf_format(name, param)
+        return [
+            (hf_name, tensor.contiguous())
+            for hf_name, tensor in zip(hf_names, hf_tensors, strict=True)
+        ]
+
     for key, conversion_fn in _CONVERSION_FN_REGISTRY.items():
         if key in model_name:
             # Pass hf_config to converters that accept it (e.g., VLM models)

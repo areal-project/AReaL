@@ -28,8 +28,8 @@ AReaL 通过提供以下功能来解决这些限制：
 我们在下面演示了几个具体示例。更多示例可以在
 [`workflow/` 目录](https://github.com/areal-project/AReaL/tree/main/areal/workflow)中找到。
 
-> **调度器兼容性**：使用代理方法的智能体工作流仅在 `local` 和 `slurm` 调度器上受支持。`ray` 调度器不支持，因为 Ray 的基于 actor
-> 的编程模型与需要 worker 之间持久连接的 HTTP 代理服务器本质上不兼容。
+> **调度器兼容性**：使用代理方法的智能体工作流在 `local`、`slurm` 和 `ray` 调度器上均受支持。在 `ray` 下，每个代理服务器会作为 HTTP
+> worker 子进程在其 rollout worker 旁启动，行为与 `local` 和 `slurm` 一致。
 
 ## 示例
 
@@ -270,6 +270,11 @@ class CamelRLVRWorkflow(RolloutWorkflow):
         # 导出带有 token 级别数据的交互
         return client.export_interactions(style="individual")
 ```
+
+> **注意**：`style="individual"` 每个 episode 会导出多个样本。在分组 rollout （`n_samples >= 2`）下，这与
+> group-relative normalization（`mean_level: group` / `std_level: group`）不兼容，会抛出不可重试的
+> `WorkflowContractError`；此时请改用 `style="concat"` 或 batch 级别的 normalization。参见
+> [分组 rollout 契约](../reference/rollout_workflow.md#%E5%88%86%E7%BB%84-rollout)。
 
 **关键点：**
 

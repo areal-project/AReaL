@@ -3,17 +3,75 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+import torch
 
+from areal.api import ModelResponse
+from areal.experimental.openai.cache import InteractionCache
+from areal.experimental.openai.client import ContextLengthExceededError
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
-from areal.experimental.openai.proxy.server import SessionData
+from areal.experimental.openai.proxy.server import (
+    SessionData,
+    derive_session_gateway_api_key,
+    derive_session_gateway_token,
+    deserialize_interactions,
+)
+from areal.experimental.openai.proxy.tensor_reference import GroupTensorStoreRegistry
+from areal.experimental.openai.types import InteractionWithTokenLogpReward
+from areal.infra.processor_cache import ProcessorCacheRegistry
+from areal.infra.rpc.serialization import deserialize_value
+from areal.reward.prm import BaseScorer, PRMConfig, PRMRunner
+from areal.utils import stats_tracker
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 _ADMIN_KEY = "test-admin-key"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_model", [False, True])
+@pytest.mark.parametrize(
+    "explicit_limit", [None, "max_tokens", "max_completion_tokens"]
+)
+async def test_session_generation_defaults_respect_explicit_limits(
+    monkeypatch, use_model, explicit_limit
+):
+    from pydantic import BaseModel
+
+    class Request(BaseModel):
+        max_tokens: int | None = None
+        max_completion_tokens: int | None = None
+        temperature: float = 1.0
+
+    monkeypatch.setattr(srv, "_openai_client", object())
+    srv._session_cache["session"] = SessionData(
+        session_id="session",
+        metadata={"generation_args": {"max_tokens": 128, "temperature": 0.6}},
+    )
+    payload = {explicit_limit: 32} if explicit_limit else {}
+    request = Request(**payload) if use_model else payload
+
+    async def create_fn(
+        max_tokens=None,
+        max_completion_tokens=None,
+        temperature=None,
+        top_p=None,
+        areal_cache=None,
+        processor_cache=None,
+    ):
+        return max_tokens, max_completion_tokens, temperature
+
+    result = await srv._call_client_create(create_fn, request, "session")
+    assert result == (
+        (32 if explicit_limit == "max_tokens" else None) if explicit_limit else 128,
+        32 if explicit_limit == "max_completion_tokens" else None,
+        0.6,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -26,6 +84,12 @@ def _reset_server_globals(monkeypatch):
     monkeypatch.setattr(srv, "_admin_api_key", _ADMIN_KEY)
     monkeypatch.setattr(srv, "_lock", threading.Lock())
     monkeypatch.setattr(srv, "_last_cleanup_time", 0.0)
+    monkeypatch.setattr(srv, "_worker_role", None)
+    monkeypatch.setattr(srv, "_worker_index", None)
+    monkeypatch.setattr(srv, "_engine", None)
+    monkeypatch.setattr(srv, "_openai_client", None)
+    monkeypatch.setattr(srv, "_processor_cache_registry", ProcessorCacheRegistry())
+    monkeypatch.setattr(srv, "_group_tensor_store_registry", GroupTensorStoreRegistry())
 
 
 httpx = pytest.importorskip("httpx")
@@ -39,6 +103,355 @@ def _client():
 
 def _admin_headers():
     return {"Authorization": f"Bearer {_ADMIN_KEY}"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tensor_payload", [False, True])
+async def test_export_restores_session_and_interaction_metadata(
+    monkeypatch, tensor_payload
+):
+    """Session metadata survives the actual HTTP export for both trajectory formats."""
+    monkeypatch.setattr(srv, "_capacity", 1)
+    async with _client() as client:
+        started = await client.post(
+            "/rl/start_session",
+            headers=_admin_headers(),
+            json={
+                "task_id": "metadata-test",
+                "metadata": {"arena_task_id": "arena-a", "label": "session"},
+            },
+        )
+        assert started.status_code == 200
+        session_id = started.json()["session_id"]
+        session = srv._session_cache[session_id]
+        interaction = InteractionWithTokenLogpReward(
+            messages=[{"role": "user", "content": "question"}],
+            output_message_list=[{"role": "assistant", "content": "answer"}],
+            reward=1.0,
+        )
+        # Assignment lets the old code reach the missing serialization path.
+        interaction.metadata = {"label": "interaction"}
+        interaction.interaction_id = "turn"
+        if tensor_payload:
+            interaction._cache = {"input_ids": torch.tensor([[1, 2]])}
+        session.completions["turn"] = interaction
+        session.finish()
+        response = await client.post(
+            "/export_trajectories",
+            headers=_admin_headers(),
+            json={"session_id": session_id, "style": "individual"},
+        )
+
+    assert response.status_code == 200
+    restored = deserialize_interactions(response.json()["interactions"])["turn"]
+    assert restored.metadata == {"arena_task_id": "arena-a", "label": "interaction"}
+    assert session.metadata["label"] == "session"
+    assert restored.has_tensor_data is tensor_payload
+    if tensor_payload:
+        torch.testing.assert_close(
+            restored.to_tensor_dict()["input_ids"],
+            torch.tensor([[1, 2]]),
+            rtol=0,
+            atol=0,
+        )
+    else:
+        assert restored.messages == interaction.messages
+    legacy_payload = response.json()["interactions"]
+    legacy_payload["turn"].pop("metadata", None)
+    assert deserialize_interactions(legacy_payload)["turn"].metadata == {}
+
+
+class _Request:
+    def __init__(self, headers: dict[str, str]):
+        self.headers = headers
+        self.url = SimpleNamespace(path="/v1/chat/completions")
+
+
+def test_require_session_key_accepts_active_session_key():
+    srv._api_key_to_session["session-key"] = "task-1-0"
+
+    session_id = srv._require_session_key(
+        _Request({"authorization": "Bearer session-key"})
+    )
+
+    assert session_id == "task-1-0"
+
+
+def test_require_session_key_accepts_gateway_capability_for_active_session():
+    srv._session_to_api_key["task-1-0"] = "session-key"
+    gateway_key = derive_session_gateway_api_key(_ADMIN_KEY)
+    session_token = derive_session_gateway_token(_ADMIN_KEY, "task-1-0")
+
+    session_id = srv._require_session_key(
+        _Request(
+            {
+                "authorization": "Bearer arena-gateway-key",
+                "x-api-key": gateway_key,
+                "x-session-id": "task-1-0",
+                "x-session-token": session_token,
+            }
+        )
+    )
+
+    assert session_id == "task-1-0"
+
+
+@pytest.mark.parametrize("session_id", [None, "missing-session"])
+def test_require_session_key_rejects_gateway_without_active_session(session_id):
+    headers = {
+        "authorization": (f"Bearer {derive_session_gateway_api_key(_ADMIN_KEY)}")
+    }
+    if session_id is not None:
+        headers["x-session-id"] = session_id
+        headers["x-session-token"] = derive_session_gateway_token(
+            _ADMIN_KEY, session_id
+        )
+
+    with pytest.raises(srv.HTTPException) as exc_info:
+        srv._require_session_key(_Request(headers))
+
+    assert exc_info.value.status_code == 401
+
+
+def test_require_session_key_rejects_capability_for_another_active_session():
+    srv._session_to_api_key["task-1-0"] = "session-key-1"
+    srv._session_to_api_key["task-2-0"] = "session-key-2"
+
+    with pytest.raises(srv.HTTPException) as exc_info:
+        srv._require_session_key(
+            _Request(
+                {
+                    "x-api-key": derive_session_gateway_api_key(_ADMIN_KEY),
+                    "x-session-id": "task-2-0",
+                    "x-session-token": derive_session_gateway_token(
+                        _ADMIN_KEY, "task-1-0"
+                    ),
+                }
+            )
+        )
+
+    assert exc_info.value.status_code == 401
+
+
+@pytest.mark.parametrize("path", ["/rl/set_reward", "/rl/end_session"])
+def test_gateway_capability_cannot_mutate_session(path):
+    """A public gateway must not assign rewards or close a training session."""
+    srv._session_to_api_key["task-1-0"] = "session-key"
+    request = _Request(
+        {
+            "x-api-key": derive_session_gateway_api_key(_ADMIN_KEY),
+            "x-session-id": "task-1-0",
+            "x-session-token": derive_session_gateway_token(_ADMIN_KEY, "task-1-0"),
+        }
+    )
+    request.url = SimpleNamespace(path=path)
+
+    with pytest.raises(srv.HTTPException) as exc_info:
+        srv._require_session_key(request)
+
+    assert exc_info.value.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Tests: health reports forked worker identity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_health_with_worker_identity_returns_exact_role_and_index(monkeypatch):
+    """Health identifies the forked worker that owns the listening port."""
+    monkeypatch.setattr(srv, "_worker_role", "proxy-rollout")
+    monkeypatch.setattr(srv, "_worker_index", 7)
+
+    async with _client() as client:
+        response = await client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "initialized": False,
+        "role": "proxy-rollout",
+        "worker_index": 7,
+    }
+
+
+def test_explicit_proxy_worker_index_wins_over_stale_slurm_env(monkeypatch):
+    """A local proxy keeps the identity supplied by its scheduler."""
+    monkeypatch.setenv("SLURM_PROCID", "0")
+
+    assert srv._resolve_worker_index(7) == 7
+
+
+def test_proxy_worker_index_falls_back_to_slurm_env(monkeypatch):
+    """A Slurm proxy can still obtain its identity from the task environment."""
+    monkeypatch.setenv("SLURM_PROCID", "5")
+
+    assert srv._resolve_worker_index(-1) == 5
+
+
+# ---------------------------------------------------------------------------
+# Tests: message preprocessing
+# ---------------------------------------------------------------------------
+
+
+def test_preprocess_messages_flattens_text_blocks_and_preserves_images(monkeypatch):
+    """OpenAI-routed Claude text blocks should be flattened before inference."""
+
+    class RemoveReminder:
+        def __call__(self, messages):
+            for message in messages:
+                if isinstance(message.get("content"), str):
+                    message["content"] = message["content"].replace(
+                        "reminder", "processed"
+                    )
+            return messages
+
+    monkeypatch.setattr(srv, "_message_preprocessors", [RemoveReminder()])
+    image_content = [
+        {"type": "text", "text": "describe"},
+        {"type": "image_url", "image_url": {"url": "https://example/image.png"}},
+    ]
+    messages = [
+        {"role": "system", "content": image_content},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {
+                    "type": "tool_result",
+                    "content": [{"type": "text", "text": "reminder"}],
+                },
+            ],
+        },
+        {"role": "user", "content": image_content},
+    ]
+
+    result = srv._preprocess_messages(messages)
+
+    assert isinstance(result[0]["content"], str)
+    assert result[1]["content"] == "hello\nprocessed"
+    assert result[2]["content"] == image_content
+
+
+def test_prepare_request_messages_normalizes_tuple_and_system_content(monkeypatch):
+    """Tuple-backed request messages should not bypass system normalization."""
+    monkeypatch.setattr(srv, "_message_preprocessors", [])
+    messages = (
+        {
+            "role": "system",
+            "content": ({"type": "text", "text": "system prompt"},),
+        },
+        {"role": "user", "content": "hello"},
+    )
+
+    result = srv._prepare_request_messages(messages)
+
+    assert isinstance(result, list)
+    assert result[0]["content"] == "system prompt"
+
+
+def test_prepare_request_messages_preserves_generator_after_unsupported_item(
+    monkeypatch,
+):
+    """Unsupported generator items must not leave a partially consumed iterator."""
+    monkeypatch.setattr(srv, "_message_preprocessors", [])
+    unsupported = object()
+
+    def message_generator():
+        yield {"role": "user", "content": "hello"}
+        yield unsupported
+
+    result = srv._prepare_request_messages(message_generator())
+
+    assert isinstance(result, list)
+    assert result == [{"role": "user", "content": "hello"}, unsupported]
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_accepts_image_content_in_tool_message(monkeypatch):
+    """FastAPI must not lazily validate gateway image blocks as text-only."""
+    captured_messages = None
+
+    async def create(
+        *, messages, areal_cache, model="areal", temperature=1.0, top_p=1.0
+    ):
+        nonlocal captured_messages
+        del areal_cache, model, temperature, top_p
+        captured_messages = messages
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    srv._session_cache["image-session"] = SessionData(session_id="image-session")
+    srv._api_key_to_session["image-key"] = "image-session"
+    image_part = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+    }
+
+    async with _client() as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer image-key"},
+            json={
+                "model": "areal",
+                "messages": [
+                    {
+                        "role": "tool",
+                        "tool_call_id": "tool-1",
+                        "content": [image_part],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured_messages[0]["content"] == [image_part]
+
+
+@pytest.mark.asyncio
+async def test_internal_generation_failure_is_reported_when_session_ends(monkeypatch):
+    """A proxy-side 500 must remain distinguishable from model behavior."""
+
+    async def create(
+        *, messages, areal_cache, model="areal", temperature=1.0, top_p=1.0
+    ):
+        del messages, areal_cache, model, temperature, top_p
+        raise RuntimeError("backend unavailable")
+
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    srv._session_cache["failed-session"] = SessionData(session_id="failed-session")
+    srv._api_key_to_session["failed-key"] = "failed-session"
+
+    async with _client() as client:
+        generation = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer failed-key"},
+            json={
+                "model": "areal",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        ended = await client.post(
+            "/rl/end_session",
+            headers={"Authorization": "Bearer failed-key"},
+            json={},
+        )
+
+    assert generation.status_code == 500
+    assert ended.json()["system_error"] is True
+    assert "backend unavailable" in ended.json()["system_error_message"]
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +576,310 @@ class TestEndSessionInteractionCount:
             data = resp_end.json()
             assert data["interaction_count"] == 0
 
+    @pytest.mark.asyncio
+    async def test_context_overflow_is_reported_when_session_ends(self, monkeypatch):
+        """A context error should persist on the session for workflow recovery."""
+
+        async def overflow_create(*, areal_cache, **_kwargs):
+            del areal_cache
+            raise ContextLengthExceededError("prompt exceeds context window")
+
+        monkeypatch.setattr(
+            srv,
+            "_openai_client",
+            SimpleNamespace(
+                chat=SimpleNamespace(
+                    completions=SimpleNamespace(create=overflow_create)
+                )
+            ),
+        )
+        monkeypatch.setattr(srv, "_capacity", 1)
+        async with _client() as client:
+            start = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={"task_id": "overflow"},
+            )
+            api_key = start.json()["api_key"]
+            headers = {"Authorization": f"Bearer {api_key}"}
+
+            generation = await client.post(
+                "/chat/completions",
+                headers=headers,
+                json={
+                    "model": "areal",
+                    "messages": [{"role": "user", "content": "long prompt"}],
+                },
+            )
+            ended = await client.post("/rl/end_session", headers=headers, json={})
+
+        assert generation.status_code == 400
+        assert generation.json()["detail"]["type"] == "context_length_exceeded"
+        assert ended.json()["context_overflow"] is True
+        assert ended.json()["context_overflow_message"] == (
+            "prompt exceeds context window"
+        )
+
+    @pytest.mark.asyncio
+    async def test_anthropic_streaming_context_overflow_returns_400(self, monkeypatch):
+        """Anthropic streaming must preserve the structured context error."""
+
+        async def overflow_create(*, areal_cache, **_kwargs):
+            del areal_cache
+            raise ContextLengthExceededError("prompt exceeds context window")
+
+        monkeypatch.setattr(
+            srv,
+            "_openai_client",
+            SimpleNamespace(
+                chat=SimpleNamespace(
+                    completions=SimpleNamespace(create=overflow_create)
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            srv,
+            "_translate_anthropic_to_openai_request",
+            lambda _request: {
+                "model": "areal",
+                "messages": [{"role": "user", "content": "long prompt"}],
+            },
+        )
+        monkeypatch.setattr(srv, "_capacity", 1)
+
+        async with _client() as client:
+            start = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={"task_id": "anthropic-stream-overflow"},
+            )
+            api_key = start.json()["api_key"]
+            response = await client.post(
+                "/v1/messages",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "areal",
+                    "messages": [{"role": "user", "content": "long prompt"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == {
+            "type": "context_length_exceeded",
+            "message": "prompt exceeds context window",
+        }
+
+
+def test_setup_openai_client_loads_and_passes_vlm_processor(monkeypatch):
+    """The v1 proxy should reuse the model processor for trajectory export."""
+    processor = SimpleNamespace(image_processor=object())
+    tokenizer = object()
+    agent_config = SimpleNamespace(
+        tool_call_parser="qwen25",
+        reasoning_parser="qwen3",
+        engine_max_tokens=4096,
+        chat_template_type="concat",
+        session_timeout_seconds=60,
+        admin_api_key="test-admin-key",
+        message_preprocessors=[],
+        prefix_matcher=None,
+        prm=PRMConfig(),
+    )
+    engine_config = SimpleNamespace(
+        tokenizer_path="test-vlm",
+        agent=agent_config,
+        lora_name="",
+    )
+    monkeypatch.setattr(srv, "_engine", SimpleNamespace(config=engine_config))
+    monkeypatch.setattr(
+        srv,
+        "load_hf_processor_and_tokenizer",
+        lambda _path: (processor, tokenizer),
+    )
+    client_cls = MagicMock()
+    monkeypatch.setattr(srv, "ArealOpenAI", client_cls)
+    monkeypatch.setattr(srv, "validate_admin_api_key", lambda *_args, **_kwargs: None)
+
+    srv._setup_openai_client()
+
+    assert client_cls.call_args.kwargs["processor"] is processor
+    assert client_cls.call_args.kwargs["tokenizer"] is tokenizer
+
+
+def _prm_interaction(
+    interaction_id: str,
+    input_tokens: list[int],
+    output_tokens: list[int],
+    messages: list[dict],
+    *,
+    parent: InteractionWithTokenLogpReward | None = None,
+) -> InteractionWithTokenLogpReward:
+    interaction = InteractionWithTokenLogpReward(
+        model_response=ModelResponse(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            output_logprobs=[0.0] * len(output_tokens),
+            output_versions=[0] * len(output_tokens),
+        ),
+        reward=0.0,
+        parent=parent,
+        chat_template_type="concat",
+        messages=messages,
+        output_message_list=[
+            {"role": "assistant", "content": f"output-{interaction_id}"}
+        ],
+    )
+    interaction._interaction_id = interaction_id
+    return interaction
+
+
+def test_concat_session_export_keeps_sibling_outcomes_independent():
+    """The real session export path must not discount across sibling leaves."""
+    root = _prm_interaction("root", [1], [2], [{"role": "user", "content": "task"}])
+    leaf_a = _prm_interaction(
+        "leaf-a", [1, 2, 3], [4], [{"role": "tool", "content": "branch-a"}], parent=root
+    )
+    leaf_b = _prm_interaction(
+        "leaf-b", [1, 2, 5], [6], [{"role": "tool", "content": "branch-b"}], parent=root
+    )
+    root.reward = 0.25
+    leaf_a.reward = 1.0
+    leaf_b.reward = 2.0
+    session = SessionData(session_id="branch-outcomes")
+    session._completions = InteractionCache.from_dict(
+        {"root": root, "leaf-a": leaf_a, "leaf-b": leaf_b},
+        session_id=session.session_id,
+    )
+
+    exported = session.export_interactions(discount=0.5, style="concat")
+
+    assert list(exported) == ["leaf-a", "leaf-b"]
+    assert exported["leaf-a"].reward == pytest.approx(1.0)
+    assert exported["leaf-b"].reward == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_prm_scores_shared_ancestors_independently_per_branch():
+    """Each exported leaf must carry rewards derived from its own later context."""
+
+    class _BranchScorer(BaseScorer):
+        name = "branch"
+
+        async def evaluate(self, interaction, ctx):
+            messages = ctx["messages"]
+            branch = next(
+                message["content"]
+                for message in messages
+                if message.get("role") == "tool"
+            )
+            scale = 1.0 if branch == "branch-a" else 2.0
+            return scale if interaction.interaction_id == "root" else scale * 10
+
+    root = _prm_interaction(
+        "root",
+        [1],
+        [2],
+        [{"role": "user", "content": "task"}],
+    )
+    leaf_a = _prm_interaction(
+        "leaf-a",
+        [1, 2, 3],
+        [4],
+        [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "root-output"},
+            {"role": "tool", "content": "branch-a"},
+        ],
+        parent=root,
+    )
+    leaf_b = _prm_interaction(
+        "leaf-b",
+        [1, 2, 5],
+        [6],
+        [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "root-output"},
+            {"role": "tool", "content": "branch-b"},
+        ],
+        parent=root,
+    )
+    runner = PRMRunner(PRMConfig(scorers=[_BranchScorer()]))
+    stats_tracker.export_all(reduce_group=None)
+
+    scored = await srv._score_prm_branches(
+        {"leaf-a": leaf_a, "leaf-b": leaf_b},
+        runner,
+        session_id="branch-session",
+        is_eval=False,
+    )
+
+    assert list(scored) == ["leaf-a", "leaf-b"]
+    assert scored["leaf-a"].parent is not scored["leaf-b"].parent
+    assert root.token_rewards is None
+    assert leaf_a.token_rewards is None
+    assert leaf_b.token_rewards is None
+    torch.testing.assert_close(
+        scored["leaf-a"].to_tensor_dict()["token_rewards"].squeeze(0),
+        torch.tensor([0.0, 1.0, 0.0, 10.0]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        scored["leaf-b"].to_tensor_dict()["token_rewards"].squeeze(0),
+        torch.tensor([0.0, 2.0, 0.0, 20.0]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    metrics = stats_tracker.export_all(reduce_group=None)
+    assert metrics["rollout/prm_turn_reward/branch"] == pytest.approx(8.25)
+    assert metrics["rollout/prm_trajectory_reward/branch"] == pytest.approx(16.5)
+
+
+@pytest.mark.asyncio
+async def test_prm_branch_failure_does_not_publish_partial_metrics():
+    class _FailSecondBranchScorer(BaseScorer):
+        name = "branch_failure"
+
+        async def evaluate(self, interaction, ctx):
+            if any(
+                message.get("content") == "branch-b"
+                for message in ctx["messages"]
+                if isinstance(message, dict)
+            ):
+                raise RuntimeError("second branch failed")
+            return 1.0
+
+    root = _prm_interaction("root", [1], [2], [{"role": "user", "content": "task"}])
+    leaf_a = _prm_interaction(
+        "leaf-a",
+        [1, 2, 3],
+        [4],
+        [{"role": "tool", "content": "branch-a"}],
+        parent=root,
+    )
+    leaf_b = _prm_interaction(
+        "leaf-b",
+        [1, 2, 5],
+        [6],
+        [{"role": "tool", "content": "branch-b"}],
+        parent=root,
+    )
+    runner = PRMRunner(PRMConfig(scorers=[_FailSecondBranchScorer()]))
+    stats_tracker.export_all(reduce_group=None)
+
+    with pytest.raises(RuntimeError, match="second branch failed"):
+        await srv._score_prm_branches(
+            {"leaf-a": leaf_a, "leaf-b": leaf_b},
+            runner,
+            session_id="failing-branch-session",
+            is_eval=False,
+        )
+
+    metrics = stats_tracker.export_all(reduce_group=None)
+    assert "rollout/prm_turn_reward/branch_failure" not in metrics
+    assert "rollout/prm_trajectory_reward/branch_failure" not in metrics
+
 
 # ---------------------------------------------------------------------------
 # Tests: export_trajectories (requires session_id + admin auth)
@@ -205,6 +922,108 @@ class TestExportTrajectories:
             )
             assert resp_export.status_code == 200
             assert "interactions" in resp_export.json()
+
+    @pytest.mark.asyncio
+    async def test_group_exports_share_multimodal_tensor_reference(self):
+        """Two grouped sessions should export refs and fetch one tensor payload."""
+        group_id = "train:task-1"
+        pixel_values = torch.arange(12).reshape(1, 3, 2, 2)
+
+        for sample_idx in range(2):
+            session_id = f"task-1:{sample_idx}-0"
+            session = SessionData(
+                session_id=session_id,
+                processor_cache_group_id=group_id,
+            )
+            interaction = InteractionWithTokenLogpReward()
+            interaction.interaction_id = f"interaction-{sample_idx}"
+            interaction.messages = [{"role": "user", "content": "question"}]
+            interaction.output_message_list = [
+                {"role": "assistant", "content": "answer"}
+            ]
+            interaction.reward = 1.0
+            interaction._cache = {
+                "input_ids": torch.tensor([[sample_idx, 2]]),
+                "multi_modal_input": [{"pixel_values": pixel_values}],
+            }
+            session.completions[interaction.interaction_id] = interaction
+            session.finish()
+            srv._session_cache[session_id] = session
+
+        async with _client() as client:
+            responses = []
+            for sample_idx in range(2):
+                response = await client.post(
+                    "/export_trajectories",
+                    headers=_admin_headers(),
+                    json={
+                        "session_id": f"task-1:{sample_idx}-0",
+                        "supports_shared_tensor_references": True,
+                    },
+                )
+                assert response.status_code == 200
+                responses.append(response.json())
+
+            first_item = next(iter(responses[0]["interactions"].values()))
+            second_item = next(iter(responses[1]["interactions"].values()))
+            first_ref = first_item["tensor_dict"]["multi_modal_input"][0][
+                "pixel_values"
+            ]
+            second_ref = second_item["tensor_dict"]["multi_modal_input"][0][
+                "pixel_values"
+            ]
+            assert first_ref == second_ref
+            assert responses[0]["tensor_reference_group_id"] == group_id
+            assert "data" not in first_ref
+
+            fetch_response = await client.post(
+                "/rl/fetch_shared_tensors",
+                headers=_admin_headers(),
+                json={"group_id": group_id, "ref_ids": [first_ref["ref_id"]]},
+            )
+
+        assert fetch_response.status_code == 200
+        fetched = deserialize_value(fetch_response.json()["tensors"])
+        assert list(fetched) == [first_ref["ref_id"]]
+        torch.testing.assert_close(
+            fetched[first_ref["ref_id"]], pixel_values, rtol=0, atol=0
+        )
+
+    @pytest.mark.asyncio
+    async def test_group_export_without_reference_capability_keeps_inline_tensor(self):
+        """Legacy clients should continue receiving inline multimodal tensors."""
+        pixel_values = torch.arange(4)
+        session = SessionData(
+            session_id="legacy-session",
+            processor_cache_group_id="train:legacy-task",
+        )
+        interaction = InteractionWithTokenLogpReward()
+        interaction.interaction_id = "legacy-interaction"
+        interaction.messages = [{"role": "user", "content": "question"}]
+        interaction.output_message_list = [{"role": "assistant", "content": "answer"}]
+        interaction.reward = 1.0
+        interaction._cache = {
+            "input_ids": torch.tensor([[1, 2]]),
+            "multi_modal_input": [{"pixel_values": pixel_values}],
+        }
+        session.completions[interaction.interaction_id] = interaction
+        session.finish()
+        srv._session_cache[session.session_id] = session
+
+        async with _client() as client:
+            response = await client.post(
+                "/export_trajectories",
+                headers=_admin_headers(),
+                json={"session_id": session.session_id},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        item = next(iter(data["interactions"].values()))
+        serialized_image = item["tensor_dict"]["multi_modal_input"][0]["pixel_values"]
+        assert serialized_image["type"] == "tensor"
+        assert serialized_image["data"] is not None
+        assert data["tensor_reference_group_id"] is None
 
     @pytest.mark.asyncio
     async def test_export_rejects_non_admin_key(self, monkeypatch):

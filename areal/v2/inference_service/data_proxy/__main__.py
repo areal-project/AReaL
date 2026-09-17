@@ -58,6 +58,11 @@ def main():
         default="",
     )
     parser.add_argument(
+        "--deterministic-sampling",
+        action="store_true",
+        help="Derive stable per-session request seeds.",
+    )
+    parser.add_argument(
         "--tool-call-parser",
         default="qwen",
     )
@@ -74,6 +79,15 @@ def main():
         "--chat-template-type",
         default="hf",
         choices=("hf", "concat"),
+    )
+    parser.add_argument(
+        "--message-preprocessor",
+        action="append",
+        default=[],
+    )
+    parser.add_argument(
+        "--prefix-matcher",
+        default=None,
     )
     args, _ = parser.parse_known_args()
 
@@ -97,11 +111,14 @@ def main():
         set_reward_finish_timeout=args.set_reward_finish_timeout,
         admin_api_key=args.admin_api_key,
         callback_server_addr=args.callback_server_addr,
+        deterministic_sampling=args.deterministic_sampling,
         serving_addr=format_hostport(serving_host, args.port),
         tool_call_parser=args.tool_call_parser,
         reasoning_parser=args.reasoning_parser,
         engine_max_tokens=args.engine_max_tokens,
         chat_template_type=args.chat_template_type,
+        message_preprocessors=tuple(args.message_preprocessor),
+        prefix_matcher=args.prefix_matcher,
     )
     suppress_http_loggers()
     app = create_app(config)
