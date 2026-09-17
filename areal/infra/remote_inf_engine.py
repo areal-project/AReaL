@@ -779,9 +779,7 @@ class RemoteInfEngine(InferenceEngine):
 
         if cross_tokenizer and self._teacher_tokenizer is None:
             if not self.config.tokenizer_path:
-                self._teacher_tokenizer = load_hf_tokenizer(
-                    self.config.teacher.path
-                )
+                self._teacher_tokenizer = load_hf_tokenizer(self.config.teacher.path)
             else:
                 self._teacher_tokenizer = load_hf_tokenizer(self.config.tokenizer_path)
         for traj in data:
