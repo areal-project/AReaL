@@ -543,8 +543,14 @@ class RemoteInfEngine(InferenceEngine):
                     student_tokenizer_path
                 )
             student_tokenizer = self._student_tokenizers[student_tokenizer_path]
+
         if cross_tokenizer and self._teacher_tokenizer is None:
-            self._teacher_tokenizer = load_hf_tokenizer(self.config.tokenizer_path)
+            if not self.config.tokenizer_path:
+                self._teacher_tokenizer = load_hf_tokenizer(
+                    self.config.teacher.path
+                )
+            else:
+                self._teacher_tokenizer = load_hf_tokenizer(self.config.tokenizer_path)
         for traj in data:
             input_ids = traj["input_ids"]
             loss_mask = traj["loss_mask"]
@@ -625,7 +631,28 @@ class RemoteInfEngine(InferenceEngine):
                         self._teacher_tokenizer,
                         student_logps,
                     )
-                out[i, write_idx] = token_logps_tensor
+                prediction_idx = write_idx - 1
+
+                if torch.any(prediction_idx < 0):
+                    raise ValueError(
+                        "Invalid loss mask: response token has no preceding "
+                        f"prediction position: {write_idx.tolist()}"
+                    )
+
+                if token_logps_tensor.numel() != prediction_idx.numel():
+                    raise ValueError(
+                        "Number of teacher logprobs does not match the number of "
+                        f"prediction positions: {token_logps_tensor.numel()} vs "
+                        f"{prediction_idx.numel()}"
+                    )
+
+                if torch.any(prediction_idx >= out.shape[1]):
+                    raise ValueError(
+                        "Prediction position is outside output tensor: "
+                        f"{prediction_idx.tolist()}, sequence length={out.shape[1]}"
+                    )
+
+                out[i, prediction_idx] = token_logps_tensor
             results.append(out)
         return results
 
