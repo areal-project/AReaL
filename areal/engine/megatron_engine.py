@@ -67,6 +67,7 @@ from areal.engine.core.model import (
     lang_config,
     requires_padded_seq,
     resolve_sequence_packing_mode,
+    supports_gdn_packed_seq,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.bailing_v3 import (
@@ -560,7 +561,9 @@ class MegatronEngine(TrainEngine):
             # enables Qwen3.5/GDN-specific dense-mask and LM-head semantics.
             self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             if self.is_vision_model:
-                if self.parallel_strategy.context_parallel_size > 1:
+                if self.parallel_strategy.context_parallel_size > 1 and not (
+                    self.use_model_packed_seq and supports_gdn_packed_seq()
+                ):
                     raise NotImplementedError(
                         "Context parallel (CP > 1) is not supported with VLM models. "
                         f"Got context_parallel_size={self.parallel_strategy.context_parallel_size} "
@@ -1236,7 +1239,13 @@ class MegatronEngine(TrainEngine):
                 param_group["_areal_last_step_lr"] = float(param_group["lr"])
         with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
-        current_lr = self.optimizer.param_groups[0]["lr"]
+        # MTP-only pipeline stages without an MTP block have no parameter
+        # groups. Their stub optimizer must still step for global grad stats.
+        current_lr = (
+            self.optimizer.param_groups[0]["lr"]
+            if self.optimizer.param_groups
+            else self.lr_scheduler.get_lr({})
+        )
 
         return dict(
             update_successful=float(update_successful),

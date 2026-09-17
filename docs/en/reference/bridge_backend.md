@@ -68,9 +68,20 @@ update while every non-MTP parameter stays unchanged, then measure draft accepta
 throughput on held-out requests. SFT loss alone does not establish speculative-decoding
 speedup.
 
-This mode currently requires training `PP=1`, one MTP prediction layer, and the
-`megatron-bridge` backend. LoRA, critic models, FSDP wrappers, and MoE router
-expert-bias updates are unsupported. Existing MTP restrictions on CP and chunked LM-head
-loss still apply; in particular, Qwen3.5 padded/VLM paths require `CP=1`. Full backbone
-forward computation is still required. Setting `mtp_only: false` retains the default
-joint-training behavior.
+This mode requires one MTP prediction layer and the `megatron-bridge` backend. Pipeline
+stages before the MTP stage remain fully frozen but still participate in the pipeline
+schedule and global optimizer statistics. LoRA, critic models, FSDP wrappers, and MoE
+router expert-bias updates are unsupported. Chunked LM-head loss remains unsupported
+with MTP training. Full backbone forward computation is still required. Setting
+`mtp_only: false` retains the default joint-training behavior.
+
+Qwen hybrid GDN models using the `qwen3_5` architecture require Megatron-Core >=0.18.2
+and Megatron-Bridge >=0.5.1 for packed THD and context parallelism. With these versions,
+AReaL aligns MTP labels and response masks with each packed sequence's CP partition.
+Older runtimes retain the padded path and require `CP=1`. The default dependency pins
+are not upgraded automatically. Use a compatible runtime for THD/CP; a recipe alone does
+not enable these capabilities on older versions. For dense Qwen models, EP is 1.
+
+The compatibility shim for MTP full recomputation accepts a missing padding mask on
+affected Megatron-Core versions. It explicitly rejects a nonempty padding mask if that
+upstream checkpoint implementation cannot forward it.

@@ -1132,7 +1132,8 @@ class MegatronEngineConfig:
         metadata={
             "help": "Freeze all non-MTP parameters before DDP/optimizer construction. "
             "Requires enable_mtp_training=True, bridge_type='megatron-bridge', "
-            "and training PP=1. Shared embeddings and output weights stay frozen. "
+            "and one native MTP layer. Pipeline stages without MTP stay frozen. "
+            "Shared embeddings and output weights stay frozen. "
             "Not supported with LoRA, critic models, or FSDP wrappers. The main "
             "loss path is retained to trigger the auxiliary MTP backward.",
         },

@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from enum import Enum
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
+from packaging.version import Version
 
 VALID_VISION_MODELS = [
     "qwen2_vl",
@@ -93,9 +95,22 @@ class SequencePackingMode(str, Enum):
     PADDED = "padded"
 
 
+def supports_gdn_packed_seq() -> bool:
+    """Require the released GDN THD/CP kernel and matching Qwen bridge."""
+    try:
+        return Version(version("megatron-core")) >= Version("0.18.2") and Version(
+            version("megatron-bridge")
+        ) >= Version("0.5.1")
+    except PackageNotFoundError:
+        return False
+
+
 def supports_model_packed_seq(model_type: str, bridge_type: str) -> bool:
     """Whether the bridge model owns BSHD-to-THD packing internally."""
-    return bridge_type == "megatron-bridge" and is_qwen3_vl_model(model_type)
+    return bridge_type == "megatron-bridge" and (
+        is_qwen3_vl_model(model_type)
+        or (model_type in ("qwen3_5", "qwen3_5_moe") and supports_gdn_packed_seq())
+    )
 
 
 def resolve_sequence_packing_mode(
@@ -104,7 +119,7 @@ def resolve_sequence_packing_mode(
     """Select one packing path from the model and bridge contract."""
     if supports_model_packed_seq(model_type, bridge_type):
         return SequencePackingMode.MODEL_THD
-    if is_valid_vision_model(model_type) or is_qwen3_5_model(model_type):
+    if is_valid_vision_model(model_type) or requires_padded_seq(model_type):
         return SequencePackingMode.PADDED
     return SequencePackingMode.WRAPPER_THD
 
@@ -112,11 +127,10 @@ def resolve_sequence_packing_mode(
 def requires_padded_seq(model_type: str) -> bool:
     """Whether the model must run the padded (BSHD) forward instead of packed (THD).
 
-    GDN/SSM models (currently the Qwen3.5 family) reject packed sequences in their
-    attention/SSM kernels, so they must run on padded ``[B, S]`` input. THD stays
-    the default for every other model.
+    Older GDN kernels reject packed sequences. Keep their padded fallback;
+    newer kernels and bridges support THD for the Qwen3.5 architecture family.
     """
-    return is_qwen3_5_model(model_type)
+    return is_qwen3_5_model(model_type) and not supports_gdn_packed_seq()
 
 
 # Copied from trl

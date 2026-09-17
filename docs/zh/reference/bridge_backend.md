@@ -59,6 +59,13 @@ actor:
 恢复接受率时，建议使用冻结的目标模型在代表性请求上生成的 assistant 续写，沿用 SFT 的回答 mask。 验证 MTP 参数更新且所有非 MTP
 参数不变后，再在留出请求上测试接受率和吞吐；SFT loss 下降不等于推测解码一定加速。
 
-当前要求训练 `PP=1`、单层 MTP 和 `megatron-bridge` 后端。不支持 LoRA、critic、FSDP 包装及 MoE router
-expert-bias 更新。现有 MTP 对 CP 和分块 LM-head loss 的限制仍适用；特别是 Qwen3.5 的 padded/VLM 路径要求
-`CP=1`。训练仍需要完整的主干前向计算。设置 `mtp_only: false` 则保留默认的联合训练行为。
+当前要求单层 MTP 和 `megatron-bridge` 后端。MTP 之前的流水线阶段保持完全冻结，但仍参与流水线调度和优化器全局统计。 不支持
+LoRA、critic、FSDP 包装及 MoE router expert-bias 更新。MTP 训练仍不支持分块 LM-head loss。
+训练需要完整的主干前向计算。设置 `mtp_only: false` 则保留默认的联合训练行为。
+
+使用 `qwen3_5` 架构的 Qwen GDN 混合模型，需要 Megatron-Core >=0.18.2 和 Megatron-Bridge >=0.5.1 才能使用
+packed THD 与 CP。 在这些版本上，AReaL 将 MTP 标签和回答 mask 与每条 packed 序列的 CP 分片对齐。 旧版运行时保留 padded
+路径并要求 `CP=1`。仓库默认依赖版本不会自动升级；仅更换配置不能让旧版本支持 THD/CP。 Dense Qwen 的 EP 为 1。
+
+针对部分 Megatron-Core 版本的 MTP 完整重计算兼容补丁支持缺省 padding mask； 如果上游 checkpoint 实现无法传递非空 padding
+mask，则显式报错，不会静默丢弃 mask。

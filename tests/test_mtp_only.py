@@ -106,6 +106,89 @@ def test_freeze_missing_mtp_raises_without_mutation() -> None:
     assert all(p.requires_grad for p in model.parameters())
 
 
+def test_freeze_pipeline_stage_without_mtp_freezes_all_parameters() -> None:
+    """An explicitly validated earlier PP stage needs no trainable weights."""
+    model = nn.ModuleDict({"backbone": nn.Linear(4, 4)})
+    models = [model]
+    assert freeze_non_mtp_parameters(models, allow_missing_mtp=True) is models
+    assert all(not p.requires_grad for p in model.parameters())
+
+
+@pytest.mark.parametrize("has_parameters", [False, True])
+def test_optimizer_step_empty_stage_preserves_step_and_scheduled_lr(
+    has_parameters: bool,
+) -> None:
+    """Frozen PP ranks must participate in optimizer collectives every step."""
+    from unittest.mock import Mock
+
+    pytest.importorskip("megatron.core")
+    from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+
+    from areal.engine.megatron_engine import MegatronEngine
+
+    optimizer = SimpleNamespace(
+        param_groups=[{}] if has_parameters else [],
+        step=Mock(return_value=(True, 0.25, None)),
+    )
+    scheduler = OptimizerParamScheduler(
+        optimizer=optimizer,
+        init_lr=0.0,
+        max_lr=0.01,
+        min_lr=0.001,
+        lr_warmup_steps=2,
+        lr_decay_steps=10,
+        lr_decay_style="linear",
+        start_wd=0.0,
+        end_wd=0.0,
+        wd_incr_steps=10,
+        wd_incr_style="constant",
+    )
+    engine = SimpleNamespace(
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        _dte_runtime_config=SimpleNamespace(enabled=False),
+    )
+    for step in range(5):
+        if step:
+            scheduler.step(1)
+        metrics = MegatronEngine.optimizer_step(engine)
+        assert metrics == {
+            "update_successful": 1.0,
+            "grad_norm": 0.25,
+            "lr": scheduler.get_lr({}),
+        }
+        assert optimizer.step.call_count == step + 1
+
+
+@pytest.mark.parametrize("first_stage", [False, True])
+@pytest.mark.parametrize("deallocate", [False, True])
+def test_frozen_pipeline_backward_preserves_activation_gradients(
+    first_stage: bool, deallocate: bool
+) -> None:
+    """Use the real PP backward, including pseudo-deallocated output tensors."""
+    schedules = pytest.importorskip("megatron.core.pipeline_parallel.schedules")
+    layer = nn.Linear(4, 4).requires_grad_(False)
+    inputs = torch.randn(3, 4, requires_grad=not first_stage)
+    output = layer(inputs)
+    output_grad = torch.randn_like(output)
+    expected = output_grad @ layer.weight
+    if deallocate:
+        schedules.deallocate_output_tensor(output, True)
+    input_grad = schedules.backward_step(
+        None if first_stage else inputs,
+        output,
+        output_grad,
+        SimpleNamespace(
+            timers=None, grad_scale_func=None, deallocate_pipeline_outputs=deallocate
+        ),
+    )
+    if first_stage:
+        assert input_grad is None
+    else:
+        torch.testing.assert_close(input_grad, expected, rtol=1e-6, atol=1e-7)
+    assert all(p.grad is None for p in layer.parameters())
+
+
 def test_mcore_auxiliary_backward_with_frozen_main_matches_direct_loss() -> None:
     """Use MCore's real autograd carrier, including a frozen output projection."""
     mtp_module = pytest.importorskip("megatron.core.transformer.multi_token_prediction")
@@ -142,14 +225,18 @@ def test_mcore_auxiliary_backward_with_frozen_main_matches_direct_loss() -> None
 
 @pytest.mark.parametrize("mtp_only", [False, True])
 @pytest.mark.parametrize("expert_bias", [False, True])
+@pytest.mark.parametrize("stage", ["single", "first", "last", "missing_last"])
+@pytest.mark.parametrize("fused_loss", [False, True])
 def test_registry_freezes_before_distributed_wrap(
-    monkeypatch, mtp_only: bool, expert_bias: bool
+    monkeypatch, mtp_only: bool, expert_bias: bool, stage: str, fused_loss: bool
 ) -> None:
     """Exercise registry wiring and preserve hooks installed by the provider."""
     pytest.importorskip("megatron.core")
     from areal.models.mcore import registry
 
     model = _Model()
+    if stage in ("first", "missing_last"):
+        del model.mtp
     events = []
 
     def existing_hook(models):
@@ -159,13 +246,15 @@ def test_registry_freezes_before_distributed_wrap(
 
     class Provider:
         mtp_num_layers = 1
+        pipeline_model_parallel_layout = None
+        cross_entropy_loss_fusion = not fused_loss
         moe_router_enable_expert_bias = expert_bias
 
         def __init__(self):
             self.hooks = [existing_hook]
 
         def finalize(self):
-            pass
+            assert self.cross_entropy_loss_fusion is fused_loss
 
         def register_pre_wrap_hook(self, hook):
             self.hooks.append(hook)
@@ -176,7 +265,8 @@ def test_registry_freezes_before_distributed_wrap(
                 models = hook(models)
             events.append("wrap")
             assert model.backbone.weight.requires_grad is not mtp_only
-            assert model.mtp.weight.requires_grad
+            if hasattr(model, "mtp"):
+                assert model.mtp.weight.requires_grad
             return models
 
     provider = Provider()
@@ -189,11 +279,26 @@ def test_registry_freezes_before_distributed_wrap(
         "get_expert_tensor_parallel_world_size",
     ):
         monkeypatch.setattr(registry.mpu, getter, lambda: 1)
+    monkeypatch.setattr(
+        registry.mpu,
+        "get_pipeline_model_parallel_world_size",
+        lambda: 1 if stage == "single" else 2,
+    )
+    monkeypatch.setattr(
+        registry.mpu,
+        "is_pipeline_last_stage",
+        lambda **kwargs: stage != "first",
+    )
+    monkeypatch.setattr(
+        registry.mpu,
+        "get_pipeline_model_parallel_rank",
+        lambda: 0 if stage in ("single", "first") else 1,
+    )
     monkeypatch.setattr(registry, "_configure_actor_output_layers", lambda *args: None)
     arguments = dict(
         hf_config=SimpleNamespace(),
         tf_config=SimpleNamespace(params_dtype=torch.float32, fp16=False, bf16=False),
-        mcore_config=_config(mtp_only=mtp_only),
+        mcore_config=_config(mtp_only=mtp_only, cross_entropy_loss_fusion=fused_loss),
         bridge=bridge,
         bridge_type="megatron-bridge",
     )
@@ -202,14 +307,17 @@ def test_registry_freezes_before_distributed_wrap(
             registry.make_mcore_model(**arguments)
         assert events == []
         return
+    if mtp_only and stage == "missing_last":
+        with pytest.raises(ValueError, match="no MTP-specific parameters"):
+            registry.make_mcore_model(**arguments)
+        assert events == ["existing"]
+        return
     models = registry.make_mcore_model(**arguments)
     assert models == [model]
     assert events == ["existing", "wrap"]
 
 
-@pytest.mark.parametrize(
-    "options", [{"use_lora": True}, {"is_critic": True}, {"pp": 2}]
-)
+@pytest.mark.parametrize("options", [{"use_lora": True}, {"is_critic": True}])
 def test_registry_mtp_only_unsupported_mode_raises(monkeypatch, options) -> None:
     """Fail before constructing models for unsupported training modes."""
     pytest.importorskip("megatron.core")
@@ -242,6 +350,12 @@ def test_mtp_full_recompute_matches_direct_gradients(
     mtp_module = pytest.importorskip("megatron.core.transformer.multi_token_prediction")
     from megatron.core.tensor_parallel import random as mcore_random
 
+    from areal.engine.megatron_utils.megatron_bridge_patches import (
+        _patch_mtp_checkpoint_padding_mask,
+    )
+
+    _patch_mtp_checkpoint_padding_mask()
+
     # Only CUDA RNG bookkeeping is replaced; checkpoint forward/backward is real.
     monkeypatch.setattr(mcore_random, "_get_all_rng_states", lambda: ())
     monkeypatch.setattr(mcore_random, "_set_all_rng_states", lambda *args: None)
@@ -255,14 +369,24 @@ def test_mtp_full_recompute_matches_direct_gradients(
                 recompute_method="uniform",
                 recompute_num_layers=1,
                 fp8=None,
+                fp4=None,
                 distribute_saved_activations=False,
             )
             self.projection = nn.Linear(8, 4)
 
         def _get_embeddings(
-            self, input_ids, position_ids, embedding, hidden_states, packed_seq_params
+            self,
+            input_ids,
+            position_ids,
+            embedding,
+            hidden_states,
+            packed_seq_params,
+            **kwargs,
         ):
-            return input_ids, position_ids, embedding(input_ids), hidden_states
+            layout = (input_ids, position_ids)
+            if "padding_mask" in kwargs:
+                layout += (kwargs["padding_mask"],)
+            return (*layout, embedding(input_ids), hidden_states)
 
         def _proj_and_transformer_layer(
             self, hidden_states, decoder_input, *args, **kwargs
@@ -284,17 +408,15 @@ def test_mtp_full_recompute_matches_direct_gradients(
     for current in (model, reference):
         hidden = current.backbone(current.embedding(ids))
         if keyword_input:
-            output, _, _ = current.mtp(
+            output = current.mtp(
                 input_ids=ids,
                 position_ids=ids,
                 hidden_states=hidden,
                 attention_mask=None,
                 embedding=current.embedding,
-            )
+            )[0]
         else:
-            output, _, _ = current.mtp(
-                ids, ids, hidden, None, embedding=current.embedding
-            )
+            output = current.mtp(ids, ids, hidden, None, embedding=current.embedding)[0]
         assert not hidden.requires_grad
         F.cross_entropy(current.output_layer(output), labels).backward()
     for (name, parameter), (_, ref_parameter) in zip(
@@ -339,3 +461,43 @@ def test_mtp_input_hook_preserves_autograd_and_no_grad() -> None:
         output = model.mtp(None, None, frozen_hidden)
     assert model.mtp.seen_hidden is frozen_hidden
     assert not output.requires_grad
+
+
+def test_mtp_checkpoint_compatibility_preserves_masks_or_rejects_them(monkeypatch):
+    """The compatibility shim must never silently discard a real padding mask."""
+    mtp = pytest.importorskip("megatron.core.transformer.multi_token_prediction")
+    from areal.engine.megatron_utils.megatron_bridge_patches import (
+        _patch_mtp_checkpoint_padding_mask,
+    )
+
+    def forward(self, hidden_states, padding_mask=None):
+        return hidden_states
+
+    def old_checkpoint(self, hidden_states):
+        return hidden_states.square()
+
+    monkeypatch.setattr(mtp.MultiTokenPredictionLayer, "forward", forward)
+    monkeypatch.setattr(
+        mtp.MultiTokenPredictionLayer, "_checkpointed_forward", old_checkpoint
+    )
+    _patch_mtp_checkpoint_padding_mask()
+    patched = mtp.MultiTokenPredictionLayer._checkpointed_forward
+    _patch_mtp_checkpoint_padding_mask()
+    assert mtp.MultiTokenPredictionLayer._checkpointed_forward is patched
+    hidden = torch.randn(3, 4, requires_grad=True)
+    patched(None, hidden, padding_mask=None).sum().backward()
+    torch.testing.assert_close(hidden.grad, 2 * hidden, rtol=0, atol=0)
+    mask = torch.ones(3, 4, dtype=torch.bool)
+    with pytest.raises(NotImplementedError, match="MTP padding mask"):
+        patched(None, hidden, padding_mask=mask)
+
+    def fixed_checkpoint(self, hidden_states, padding_mask=None):
+        assert padding_mask is mask
+        return hidden_states
+
+    monkeypatch.setattr(
+        mtp.MultiTokenPredictionLayer, "_checkpointed_forward", fixed_checkpoint
+    )
+    _patch_mtp_checkpoint_padding_mask()
+    assert mtp.MultiTokenPredictionLayer._checkpointed_forward is fixed_checkpoint
+    assert fixed_checkpoint(None, hidden, padding_mask=mask) is hidden
