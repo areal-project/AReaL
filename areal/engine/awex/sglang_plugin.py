@@ -30,6 +30,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
@@ -64,7 +65,54 @@ from areal.utils.environ import (  # noqa: E402
 from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexSGLangPlugin")
-SUPPORTED_SGLANG_VERSIONS = ("0.5.9", "0.5.10.post1")
+SUPPORTED_SGLANG_VERSIONS = ("0.5.9", "0.5.10.post1", "0.5.18.dev10+g85b539146")
+
+
+@contextmanager
+def _retract_memory_idle(scheduler: Any, owner: Any):
+    """Ignore only parked requests while retaining the native execution checks."""
+    original_idle = getattr(scheduler, "is_fully_idle", None)
+    if (
+        not callable(original_idle)
+        or not getattr(scheduler, "_engine_paused", False)
+        or original_idle()
+        or not hasattr(scheduler, "waiting_queue")
+    ):
+        yield
+        return
+
+    def drained_idle(*args, **kwargs):
+        # This scope runs synchronously on the scheduler thread. Do not weaken
+        # checks for running/overlap/chunked/grammar/disaggregation work.
+        waiting = scheduler.waiting_queue
+        scheduler.waiting_queue = []
+        try:
+            return original_idle(*args, **kwargs)
+        finally:
+            scheduler.waiting_queue = waiting
+
+    if not drained_idle():
+        yield
+        return
+    targets = [scheduler] if owner is scheduler else [scheduler, owner]
+    saved = [
+        (
+            target,
+            getattr(target, "is_fully_idle"),
+            not hasattr(target, "__dict__") or "is_fully_idle" in vars(target),
+        )
+        for target in targets
+    ]
+    try:
+        for target in targets:
+            target.is_fully_idle = drained_idle
+        yield
+    finally:
+        for target, previous, existed in reversed(saved):
+            if existed:
+                target.is_fully_idle = previous
+            else:
+                del target.is_fully_idle
 
 
 def assert_supported_sglang_version() -> None:
@@ -282,19 +330,20 @@ class AwexSchedulerPlugin:
         return self._receiver
 
     def _patch_memory_transitions(self) -> None:
-        """Make AWEX release/resume requests idempotent across retries."""
+        """Make explicitly tagged AWEX memory requests idempotent across retries."""
         scheduler = self._scheduler
         if getattr(scheduler, "_areal_awex_memory_transitions_patched", False):
             return
-        original_release = getattr(scheduler, "release_memory_occupation", None)
-        original_resume = getattr(scheduler, "resume_memory_occupation", None)
+        owner = getattr(scheduler, "weight_updater", None) or scheduler
+        original_release = getattr(owner, "release_memory_occupation", None)
+        original_resume = getattr(owner, "resume_memory_occupation", None)
         if original_release is None or original_resume is None:
             return
 
         def _filtered_request(request: Any, *, release: bool) -> Any | None:
             tags = getattr(request, "tags", None)
-            offload_tags = getattr(scheduler, "offload_tags", None)
-            if tags is None or offload_tags is None:
+            offload_tags = getattr(owner, "offload_tags", None)
+            if not tags or offload_tags is None:
                 return request
             effective_tags = [
                 tag
@@ -317,17 +366,47 @@ class AwexSchedulerPlugin:
         def _release(request: Any, *args: Any, **kwargs: Any) -> Any:
             filtered = _filtered_request(request, release=True)
             if filtered is None:
-                return None
-            return original_release(filtered, *args, **kwargs)
+                from sglang.srt.managers.io_struct import (
+                    ReleaseMemoryOccupationReqOutput,
+                )
+
+                return ReleaseMemoryOccupationReqOutput()
+            with _retract_memory_idle(scheduler, owner):
+                return original_release(filtered, *args, **kwargs)
 
         def _resume(request: Any, *args: Any, **kwargs: Any) -> Any:
             filtered = _filtered_request(request, release=False)
             if filtered is None:
-                return None
+                from sglang.srt.managers.io_struct import (
+                    ResumeMemoryOccupationReqOutput,
+                )
+
+                return ResumeMemoryOccupationReqOutput()
             return original_resume(filtered, *args, **kwargs)
 
         scheduler.release_memory_occupation = _release
         scheduler.resume_memory_occupation = _resume
+        original_flush = getattr(scheduler, "flush_cache", None)
+        if callable(original_flush):
+
+            def _flush(*args, **kwargs):
+                with _retract_memory_idle(scheduler, owner):
+                    return original_flush(*args, **kwargs)
+
+            scheduler.flush_cache = _flush
+            if owner is not scheduler and hasattr(owner, "flush_cache"):
+                owner.flush_cache = _flush
+        # Dispatchers cache bound methods before plugin binding.
+        mapping = getattr(
+            getattr(scheduler, "_request_dispatcher", None), "_mapping", {}
+        )
+        for request_type, callback in list(mapping.items()):
+            if callback == original_release:
+                mapping[request_type] = _release
+            elif callback == original_resume:
+                mapping[request_type] = _resume
+            elif original_flush is not None and callback == original_flush:
+                mapping[request_type] = scheduler.flush_cache
         scheduler._areal_awex_memory_transitions_patched = True
 
     def awex_init_receiver(self, **kwargs: Any) -> None:
