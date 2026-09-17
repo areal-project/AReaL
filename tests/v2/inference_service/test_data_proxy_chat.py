@@ -1185,41 +1185,62 @@ async def test_export_trajectories_normalizes_rewards_within_group(
 
 
 @pytest.mark.asyncio
-async def test_export_trajectories_drops_incomplete_normalization_group(
+async def test_export_trajectories_normalizes_selected_sessions_and_cleans_group(
     client, monkeypatch
 ):
+    import torch
+
+    from areal.infra.rpc.serialization import deserialize_value
+
     monkeypatch.setattr(
         "areal.v2.inference_service.data_proxy.app.RTensor.remotize",
         lambda obj, node_addr: obj,
     )
     start = await client.post(
         "/rl/start_session",
-        json={"task_id": "incomplete-group"},
+        json={"task_id": "incomplete-group", "group_size": 3},
         headers=admin_headers(),
     )
-    session = start.json()["sessions"][0]
-    await client.post(
-        "/chat/completions",
-        json={"model": "sglang", "messages": [{"role": "user", "content": "q"}]},
-        headers=session_headers(session["session_api_key"]),
-    )
-    await client.post(
-        "/rl/set_reward",
-        json={"reward": 1.0},
-        headers=session_headers(session["session_api_key"]),
-    )
+    sessions = start.json()["sessions"]
+    for session, reward in zip(sessions[:2], (1.0, 3.0)):
+        await client.post(
+            "/chat/completions",
+            json={
+                "model": "sglang",
+                "messages": [{"role": "user", "content": "q"}],
+            },
+            headers=session_headers(session["session_api_key"]),
+        )
+        await client.post(
+            "/rl/set_reward",
+            json={"reward": reward},
+            headers=session_headers(session["session_api_key"]),
+        )
 
     export_response = await client.post(
         "/export_trajectories",
         json={
-            "session_ids": [session["session_id"], "missing-session"],
+            "session_ids": [session["session_id"] for session in sessions],
+            "export_session_ids": [session["session_id"] for session in sessions],
+            "min_usable_group_size": 2,
             "reward_normalization": True,
         },
         headers=admin_headers(),
     )
 
     assert export_response.status_code == 200
-    assert export_response.json()["traj"] == {}
+    trajectory = deserialize_value(export_response.json()["traj"])
+    torch.testing.assert_close(
+        trajectory["rewards"].flatten(), torch.tensor([-1.0, 1.0])
+    )
+    assert trajectory["rollout_group"].validate_rows(2).row_counts == (1, 1)
+    for session in sessions:
+        response = await client.post(
+            "/rl/set_reward",
+            json={"reward": 0.0},
+            headers=session_headers(session["session_api_key"]),
+        )
+        assert response.status_code == 401
 
 
 # =============================================================================

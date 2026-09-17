@@ -29,6 +29,7 @@ from areal.experimental.openai.client import ArealOpenAI
 from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
     concat_string_interactions,
+    concat_tensor_interactions,
     normalize_group_rewards,
 )
 from areal.infra.rpc.guard.data_blueprint import (
@@ -38,7 +39,6 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import serialize_value
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
-from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.seeding import derive_deterministic_seed
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
@@ -872,12 +872,27 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 status_code=400,
                 detail="session_ids must be a non-empty list",
             )
+        export_session_ids = (
+            body.session_ids
+            if body.export_session_ids is None
+            else body.export_session_ids
+        )
+        if body.min_usable_group_size < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="min_usable_group_size must be positive",
+            )
+        if not set(export_session_ids).issubset(body.session_ids):
+            raise HTTPException(
+                status_code=400,
+                detail="export_session_ids must be a subset of session_ids",
+            )
 
         grouped_interactions: list[
             dict[str, InteractionWithTokenLogpReward] | None
         ] = []
 
-        for sid in body.session_ids:
+        for sid in export_session_ids:
             session = store.get_session(sid)
             if session is None:
                 grouped_interactions.append(None)
@@ -895,9 +910,22 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 grouped_interactions.append(None)
                 continue
 
+        usable_interactions = [
+            interactions for interactions in grouped_interactions if interactions
+        ]
         if body.discard_trajectory:
             grouped_interactions = []
+        elif len(usable_interactions) < body.min_usable_group_size:
+            logger.warning(
+                "Trajectory export dropped a group with %d usable sessions; "
+                "minimum is %d",
+                len(usable_interactions),
+                body.min_usable_group_size,
+            )
+            grouped_interactions = []
         elif body.reward_normalization and len(body.session_ids) > 1:
+            if body.export_session_ids is not None:
+                grouped_interactions = usable_interactions
             if not normalize_group_rewards(grouped_interactions):
                 logger.warning(
                     "Reward normalization dropped an incomplete group (%d sessions)",
@@ -906,12 +934,19 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 grouped_interactions = []
 
         merged: dict[str, InteractionWithTokenLogpReward] = {}
-        for interactions in grouped_interactions:
-            if interactions is not None:
-                merged.update(interactions)
+        for rollout_index, interactions in enumerate(
+            interactions for interactions in grouped_interactions if interactions
+        ):
+            last_interaction = interactions[next(reversed(interactions))]
+            for interaction in interactions.values():
+                interaction.rollout_index = rollout_index
+                interaction.rollout_reward = last_interaction.reward
+            merged.update(interactions)
 
-        if all(v.has_tensor_data for v in merged.values()):
-            traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
+        if not merged:
+            traj = {}
+        elif all(v.has_tensor_data for v in merged.values()):
+            traj = concat_tensor_interactions(merged)
             traj = _remotize_trajectory(traj, node_addr=config.serving_addr)
         else:
             traj = concat_string_interactions(merged)

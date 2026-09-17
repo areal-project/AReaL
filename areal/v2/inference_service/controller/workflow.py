@@ -56,6 +56,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         serialize_group_samples: bool = False,
         drop_retry_orphans: bool = False,
         reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ):
         self.controller = controller
         self.agent = agent
@@ -68,6 +70,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.serialize_group_samples = serialize_group_samples
         self.drop_retry_orphans = drop_retry_orphans
         self.reward_normalization = reward_normalization
+        self.drop_incomplete_group = drop_incomplete_group
+        self.min_usable_group_size = min_usable_group_size
 
     @async_http_retry
     async def _start_session(
@@ -124,6 +128,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         group_id: str | None = None,
         trajectory_id: int | None = None,
         discard_trajectory: bool = False,
+        export_session_ids: list[str] | None = None,
+        min_usable_group_size: int = 1,
     ) -> dict[str, Any]:
         url = f"{self.gateway_addr}/{_EXPORT_TRAJECTORIES_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
@@ -137,7 +143,10 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "drop_retry_orphans": self.drop_retry_orphans,
             "reward_normalization": self.reward_normalization,
             "discard_trajectory": discard_trajectory,
+            "min_usable_group_size": min_usable_group_size,
         }
+        if export_session_ids is not None:
+            payload["export_session_ids"] = export_session_ids
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             data = await resp.json()
@@ -240,9 +249,9 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                         exc,
                         exc_info=True,
                     )
-                # Failed groups are discarded below, so a fallback reward is
-                # unnecessary and can trigger another round of HTTP retries.
-                # Discard export still handles session cleanup.
+                # Failed members are excluded from training below, so a fallback
+                # reward is unnecessary and can trigger another round of HTTP
+                # retries. Group export still handles session cleanup.
                 return None
             finally:
                 logger.debug(
@@ -273,30 +282,59 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             )
 
         session_ids = [sid for sid, _ in sessions]
-        n_failed = sum(result is None for result in results)
+        successful_session_ids = [
+            session_id
+            for session_id, result in zip(session_ids, results)
+            if result is not None
+        ]
+        n_succeeded = len(successful_session_ids)
+        n_failed = len(sessions) - n_succeeded
+        discard_group = n_failed > 0 and self.drop_incomplete_group
+        discard_group = discard_group or n_succeeded < self.min_usable_group_size
 
         # Always export to trigger session cleanup on the data proxy,
         # even when we intend to discard the trajectories.
+        export_kwargs: dict[str, Any] = {
+            "group_id": group_id,
+            "discard_trajectory": discard_group,
+        }
+        if not discard_group and len(sessions) > 1:
+            export_kwargs["export_session_ids"] = successful_session_ids
+            export_kwargs["min_usable_group_size"] = (
+                len(sessions)
+                if self.drop_incomplete_group
+                else self.min_usable_group_size
+            )
         traj = await self._export_interactions(
             http_session,
             session_ids,
-            group_id=group_id,
-            discard_trajectory=n_failed > 0,
+            **export_kwargs,
         )
-        if n_failed > 0:
+        if discard_group:
             logger.warning(
-                "Abandoning group %s: %d/%d sessions failed",
+                "Abandoning group %s: %d/%d sessions succeeded "
+                "(drop_incomplete_group=%s, min_usable_group_size=%d)",
                 group_id,
-                n_failed,
+                n_succeeded,
                 len(sessions),
+                self.drop_incomplete_group,
+                self.min_usable_group_size,
             )
             return None
+        if n_failed > 0:
+            logger.warning(
+                "Using partial group %s: %d/%d sessions succeeded",
+                group_id,
+                n_succeeded,
+                len(sessions),
+            )
         if not traj:
             return None
 
         tracker = stats_tracker.get(workflow_context.stat_scope())
         for r in results:
-            tracker.scalar(reward=r)
+            if r is not None:
+                tracker.scalar(reward=r)
 
         return traj
 
