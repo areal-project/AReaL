@@ -900,6 +900,30 @@ async def _call_client_create(
             raise HTTPException(status_code=500, detail=message) from e
         kwargs["messages"] = prepared_messages
 
+    defaults = dict(
+        getattr(_engine.config.agent, "chat_template_kwargs", {}) if _engine else {}
+    )
+    extra_body = dict(kwargs.get("extra_body") or {})
+    session_template = session_data.metadata.get("chat_template_kwargs") or {}
+    request_template = {
+        **session_template,
+        **(extra_body.get("chat_template_kwargs") or {}),
+        **(kwargs.pop("chat_template_kwargs", None) or {}),
+    }
+    thinking_keys = ("thinking_option", "enable_thinking", "thinking")
+    session_thinking = {k: v for k, v in session_template.items() if k in thinking_keys}
+    if session_thinking:
+        for key in thinking_keys:
+            request_template.pop(key, None)
+        request_template.update(session_thinking)
+    if any(key in request_template for key in thinking_keys):
+        for key in thinking_keys:
+            defaults.pop(key, None)
+    template_kwargs = {**defaults, **request_template}
+    if template_kwargs:
+        extra_body["chat_template_kwargs"] = template_kwargs
+        kwargs["extra_body"] = extra_body
+
     dropped_args = []
     for k, v in kwargs.items():
         if k not in areal_client_allowed_args:
