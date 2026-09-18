@@ -275,11 +275,17 @@ def _order_trajectory_items(
 class PRMRunner:
     """Run configured scorers and commit token rewards atomically per scorer."""
 
+    supports_scorer_config_validation = True
+
     def __init__(self, config: PRMConfig):
         self.config = config
         self._scorers = (
             [_resolve_scorer(spec) for spec in config.scorers] if config.enabled else []
         )
+        for scorer in self._scorers:
+            validate = getattr(scorer, "validate_prm_config", None)
+            if validate is not None:
+                validate(config, training_enabled=config.enabled and scorer.enabled)
         self._observation_schemas: dict[
             str,
             dict[
