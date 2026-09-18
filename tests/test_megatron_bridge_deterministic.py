@@ -1,6 +1,7 @@
 """Tests for Megatron-Bridge deterministic provider configuration."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -68,6 +69,7 @@ def _make_provider(attention_backend) -> _FakeProvider:
         cross_entropy_loss_fusion=True,
         bias_dropout_fusion=True,
         mtp_num_layers=None,
+        gradient_accumulation_fusion=False,
     )
 
 
@@ -132,6 +134,26 @@ def test_megatron_bridge_provider_preserves_defaults_when_disabled():
         attention_backend,
         True,
         True,
+    )
+
+
+@pytest.mark.parametrize("fusion_enabled", [False, True])
+@pytest.mark.parametrize("extension_available", [False, True])
+def test_megatron_bridge_fusion_requires_native_output_extension(
+    monkeypatch, fusion_enabled, extension_available
+):
+    """Provider fusion must support the native output head before construction."""
+    provider = _make_provider(attention_backend=object())
+    provider.gradient_accumulation_fusion = fusion_enabled
+    extension = (
+        ModuleType("fused_weight_gradient_mlp_cuda") if extension_available else None
+    )
+    monkeypatch.setitem(sys.modules, "fused_weight_gradient_mlp_cuda", extension)
+
+    _run_until_provider_finalize(provider, deterministic=False)
+
+    assert provider.gradient_accumulation_fusion == (
+        fusion_enabled and extension_available
     )
 
 
