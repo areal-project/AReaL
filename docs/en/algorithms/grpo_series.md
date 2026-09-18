@@ -77,6 +77,27 @@ Note: Use `+` prefix when adding keys not present in the original YAML.
 All configurations are defined in `areal/api/cli_args.py` under `PPOActorConfig` and
 `NormConfig`. See [CLI configurations](../cli_reference.md) for full details.
 
+### Policy-gradient Loss Aggregation (`actor.loss_aggregation`)
+
+`token_mean` averages valid tokens, `seq_mean` averages per-response token means,
+`prompt_mean` averages per-prompt token means, and `constant` divides the token-loss
+sum by the active response count times `actor.loss_aggregation_divisor`.
+
+For `prompt_mean`, each physical prompt group stays in one optimizer step, but
+its responses may span engine microbatches. Before splitting, the actor assigns
+weight $1/D_g$ to every original valid token in group $g$, where $D_g$ is that
+group's valid-token count. These token weights follow slicing and packing. Each
+microbatch returns its weighted loss divided by its token-weight sum, and the
+engine uses the same sum to combine microbatches across gradient accumulation and
+data-parallel ranks. Empty groups contribute zero weight. Later loss filtering
+changes the numerator while retaining these original denominator weights.
+
+The outer PPO schedule adapts to the available prompt groups on each rank and uses
+transport-only microbatches where needed. With the default packing granularity of
+one, `max_tokens_per_mb` needs to fit individual responses. Larger granularity
+values still bundle adjacent responses, but packing is independent of prompt-group
+boundaries.
+
 ### Reward and Advantage Normalization (`actor.reward_norm` and `actor.adv_norm`)
 
 The `NormConfig` dataclass controls how rewards and advantages are normalized:

@@ -2106,6 +2106,8 @@ class FSDPEngine(TrainEngine):
 
         inputs.pop("turn_ids", None)
         inputs.pop("is_truncated", None)
+        inputs.pop("group_sizes", None)
+        inputs.pop("prompt_token_weights", None)
 
         ctx = FSDPTrainContext(
             model_inputs=inputs,

@@ -15,6 +15,10 @@ import torch
 
 from areal.api.cli_args import PPOActorConfig, RejectionSamplingConfig
 from areal.utils.functional import cispo_loss_fn
+from areal.utils.functional.loss_aggregation import (
+    make_policy_gradient_reduction,
+    prepare_prompt_token_weights,
+)
 
 # (eps_clip, eps_clip_higher): a PPO-like band that clips most tokens, and the
 # wide MiniMax-M1 band [0, 5] that clips none of the fixture ratios.
@@ -155,6 +159,47 @@ def test_cispo_decoupled_applies_behave_imp_weight():
     assert old_leaf.grad is None
 
 
+def test_cispo_respects_sequence_loss_aggregation():
+    logprobs = torch.tensor([[-2.0, -2.0], [-4.0, -1.0]], requires_grad=True)
+    proximal = logprobs.detach()
+    advantages = torch.ones_like(logprobs)
+    loss_mask = torch.tensor([[1, 1], [1, 0]], dtype=torch.bool)
+
+    loss, _ = cispo_loss_fn(
+        logprobs=logprobs,
+        proximal_logprobs=proximal,
+        advantages=advantages,
+        eps_clip=1.0,
+        eps_clip_higher=4.0,
+        loss_mask=loss_mask,
+        pg_reduction=make_policy_gradient_reduction(mode="seq_mean"),
+    )
+
+    torch.testing.assert_close(loss, torch.tensor(3.0), rtol=0, atol=0)
+
+
+def test_cispo_prompt_mean_uses_full_group_token_weights():
+    logprobs = torch.tensor(
+        [[-2.0, -2.0], [-2.0, -2.0], [-10.0, -10.0]], requires_grad=True
+    )
+    proximal = logprobs.detach()
+    advantages = torch.ones_like(logprobs)
+    loss_mask = torch.ones_like(logprobs, dtype=torch.bool)
+
+    loss, _ = cispo_loss_fn(
+        logprobs=logprobs,
+        proximal_logprobs=proximal,
+        advantages=advantages,
+        eps_clip=1.0,
+        eps_clip_higher=4.0,
+        loss_mask=loss_mask,
+        pg_reduction=make_policy_gradient_reduction(mode="prompt_mean"),
+        prompt_token_weights=prepare_prompt_token_weights(loss_mask, [2, 1]),
+    )
+
+    torch.testing.assert_close(loss, torch.tensor(6.0), rtol=0, atol=0)
+
+
 def test_cispo_config_validation():
     # Requires a positive upper clip.
     with pytest.raises(ValueError, match="eps_clip_higher"):
@@ -169,5 +214,10 @@ def test_cispo_config_validation():
             eps_clip_higher=4.0,
             importance_sampling_level="sequence",
         )
-    # Valid configuration does not raise.
+    # Valid configurations do not raise.
+    PPOActorConfig(
+        use_cispo_loss=True,
+        eps_clip_higher=4.0,
+        loss_aggregation="seq_mean",
+    )
     PPOActorConfig(use_cispo_loss=True, eps_clip=1.0, eps_clip_higher=4.0)

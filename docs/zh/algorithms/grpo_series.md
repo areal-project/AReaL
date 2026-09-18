@@ -71,6 +71,21 @@ python3 examples/math/gsm8k_rl.py \
 所有配置都定义在 `areal/api/cli_args.py` 中的 `PPOActorConfig` 和 `NormConfig` 下。详见
 [CLI配置](../cli_reference.md)。
 
+### 策略梯度损失聚合（`actor.loss_aggregation`）
+
+`token_mean` 对有效 token 求平均，`seq_mean` 对每条响应的 token 均值求平均，
+`prompt_mean` 对每个提示组的 token 均值求平均，`constant` 则将 token 损失总和除以有效响应数与
+`actor.loss_aggregation_divisor` 的乘积。
+
+对于 `prompt_mean`，同一物理提示组保留在同一个优化器步骤内，但组内响应可以分布在多个引擎微批次中。
+拆分前，actor 为组 $g$ 中每个原始有效 token 分配权重 $1/D_g$，其中 $D_g$ 是该组的有效 token 数。
+这些权重随张量切分和打包。每个微批次以 token 权重之和归一化加权损失，引擎再使用相同的权重之和，
+跨梯度累积和数据并行 rank 合并结果。空组的权重为零。后续损失过滤只改变分子，保留原始分母权重。
+
+外层 PPO 调度根据各 rank 可用的提示组数量调整，并在需要时使用仅参与通信的微批次。
+默认打包粒度为一时，`max_tokens_per_mb` 只需容纳单条响应。更大的粒度仍会将相邻响应合并打包，
+但打包边界不再受提示组边界限制。
+
 ### 奖励和优势归一化（`actor.reward_norm` 和 `actor.adv_norm`）
 
 `NormConfig` 数据类控制奖励和优势的归一化方式：

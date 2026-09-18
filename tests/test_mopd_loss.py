@@ -5,14 +5,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from areal.api.cli_args import MOPDLossConfig, RejectionSamplingConfig
+from areal.api.cli_args import MOPDLossConfig, PPOActorConfig, RejectionSamplingConfig
 from areal.trainer.mopd.loss import compose_mopd_loss, mopd_loss_fn
 from areal.trainer.ppo.actor import PPOActor, grpo_loss_fn
+from areal.utils.functional.loss_aggregation import make_policy_gradient_reduction
 
 
 def test_actor_binds_one_mopd_loss_config():
     actor = object.__new__(PPOActor)
     actor._mopd_loss_config = None
+    actor.config = PPOActorConfig()
     config = MOPDLossConfig(importance_ratio_cap=1.5)
 
     actor.configure_mopd_loss(config)
@@ -342,7 +344,8 @@ def test_grpo_loss_fn_composes_materialized_mopd_targets():
     assert "mopd_loss" in mopd_stat_call.kwargs
 
 
-def test_grpo_loss_fn_scales_pure_rl_without_teacher_targets():
+@pytest.mark.parametrize("mode", ["token_mean", "seq_mean", "prompt_mean", "constant"])
+def test_grpo_loss_fn_scales_pure_rl_without_teacher_targets(mode):
     """A disabled distillation objective neither requires targets nor drops RL scale."""
     logprobs = torch.tensor([[-0.3, -0.4]], dtype=torch.float64, requires_grad=True)
     input_data = {
@@ -350,6 +353,7 @@ def test_grpo_loss_fn_scales_pure_rl_without_teacher_targets():
         "prox_logp": torch.tensor([[-0.5, -0.5]], dtype=torch.float64),
         "advantages": torch.ones_like(logprobs),
         "loss_mask": torch.ones_like(logprobs, dtype=torch.bool),
+        "prompt_token_weights": torch.full_like(logprobs, 0.5),
     }
     kwargs = dict(
         logprobs=logprobs,
@@ -358,6 +362,9 @@ def test_grpo_loss_fn_scales_pure_rl_without_teacher_targets():
         eps_clip=0.2,
         eps_clip_higher=None,
         c_clip=None,
+        pg_reduction=make_policy_gradient_reduction(
+            mode=mode, divisor=4.0 if mode == "constant" else None
+        ),
     )
 
     with patch("areal.trainer.ppo.actor.stats_tracker", MagicMock()):
@@ -410,7 +417,7 @@ def test_mopd_loss_respects_m2po_filtered_mask():
     )
     assert torch.equal(
         denominator_call.kwargs["n_mopd_tokens"],
-        torch.tensor([[False, True]]),
+        response_mask,
     )
     mopd_stat_call = next(
         call
@@ -485,3 +492,185 @@ def test_mopd_loss_respects_behavioral_rejection_without_renormalizing(
         if "n_mopd_tokens" in call.kwargs
     )
     assert torch.equal(denominator_call.kwargs["n_mopd_tokens"], response_mask)
+
+
+@pytest.mark.parametrize("mode", ["seq_mean", "prompt_mean", "constant"])
+@pytest.mark.parametrize("rl_coefficient", [0.0, 1.0])
+def test_mopd_rejects_non_token_aggregation_before_training(mode, rl_coefficient):
+    actor = object.__new__(PPOActor)
+    actor.config = PPOActorConfig(
+        loss_aggregation=mode,
+        loss_aggregation_divisor=4.0 if mode == "constant" else None,
+    )
+    actor._mopd_loss_config = None
+    config = MOPDLossConfig(rl_coefficient=rl_coefficient)
+
+    with pytest.raises(ValueError, match="only supported with"):
+        actor.configure_mopd_loss(config)
+    assert actor._mopd_loss_config is None
+
+    # A materialized batch must still be guarded if configuration was bound
+    # before the aggregation configuration changed.
+    actor._mopd_loss_config = config
+    with pytest.raises(ValueError, match="only supported with"):
+        actor._ppo_update({})
+
+
+@pytest.mark.parametrize("rl_coefficient", [0.0, 0.5])
+def test_mopd_m2_filtering_preserves_loss_and_gradient_across_microbatches(
+    rl_coefficient,
+):
+    logprobs = torch.tensor(
+        [[-0.2, -0.4], [-0.1, -0.3]], dtype=torch.float64, requires_grad=True
+    )
+    original_mask = torch.ones_like(logprobs, dtype=torch.bool)
+    data = {
+        "logprobs": torch.zeros_like(logprobs),
+        "prox_logp": torch.zeros_like(logprobs),
+        "advantages": torch.ones_like(logprobs),
+        "loss_mask": original_mask,
+        "mopd_teacher_logp_sum": torch.full_like(logprobs, -1.0),
+        "mopd_teacher_weight_sum": torch.ones_like(logprobs),
+        "mopd_behavior_logprobs": torch.zeros_like(logprobs),
+    }
+    reduction = make_policy_gradient_reduction()
+
+    # Isolate reduction from M2's own microbatch-dependent threshold selection.
+    def filter_tokens(old_logp, prox_logp, mask, threshold):
+        return mask & (prox_logp == 0)
+
+    def evaluate(rows):
+        current_logprobs = logprobs[rows]
+        inputs = {key: value[rows] for key, value in data.items()}
+        with (
+            patch("areal.trainer.ppo.actor.stats_tracker"),
+            patch(
+                "areal.trainer.ppo.actor._apply_m2po_masking", side_effect=filter_tokens
+            ),
+        ):
+            return grpo_loss_fn(
+                logprobs=current_logprobs,
+                entropy=torch.zeros_like(current_logprobs),
+                input_data=inputs,
+                eps_clip=0.2,
+                eps_clip_higher=None,
+                c_clip=None,
+                m2_threshold=0.1,
+                mopd_loss_config=MOPDLossConfig(rl_coefficient=rl_coefficient),
+            )
+
+    # One response loses every token, the other keeps one: uneven retention
+    # reveals any post-filter denominator paired with a pre-filter engine weight.
+    data["prox_logp"] = torch.tensor([[0.0, 1.0], [1.0, 1.0]], dtype=torch.float64)
+    full_loss = evaluate(slice(None))
+    weights = [reduction.normalizer(row) for row in original_mask]
+    split_loss = sum(evaluate(slice(i, i + 1)) * weights[i] for i in range(2)) / sum(
+        weights
+    )
+    full_grad = torch.autograd.grad(full_loss, logprobs, retain_graph=True)[0]
+    split_grad = torch.autograd.grad(split_loss, logprobs)[0]
+
+    torch.testing.assert_close(split_loss, full_loss, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(split_grad, full_grad, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("rl_loss_weight", [0.0, 0.5])
+@pytest.mark.parametrize("reject_stale_tokens", [False, True])
+def test_single_teacher_m2_filtering_preserves_loss_and_gradient_across_microbatches(
+    rl_loss_weight, reject_stale_tokens
+):
+    """Legacy KD keeps its numerator mask and the original engine denominator."""
+    logprobs = torch.tensor(
+        [[-0.2, -0.4, -0.1], [-0.3, -0.5, -0.6]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    original_mask = torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.bool)
+    teacher_logp = torch.full_like(logprobs, -1.0)
+    proximal_logp = torch.tensor([[2.0, 0.0, 1.0], [1.0, 1.0, 1.0]])
+    data = {
+        "logprobs": torch.zeros_like(logprobs),
+        "prox_logp": proximal_logp,
+        "advantages": torch.ones_like(logprobs),
+        "loss_mask": original_mask,
+        "teacher_logp": teacher_logp,
+    }
+    distill_loss_weight = 0.7
+    reduction = make_policy_gradient_reduction()
+
+    # Fix M2's selection so only aggregation varies with microbatch partitioning.
+    def filter_tokens(old_logp, prox_logp, mask, threshold):
+        return mask & (prox_logp != 1)
+
+    def evaluate(rows):
+        current_logprobs = logprobs[rows]
+        inputs = {key: value[rows] for key, value in data.items()}
+        inputs.update(
+            rl_loss_weight=rl_loss_weight, distill_loss_weight=distill_loss_weight
+        )
+        with (
+            patch("areal.trainer.ppo.actor.stats_tracker"),
+            patch(
+                "areal.trainer.ppo.actor._apply_m2po_masking", side_effect=filter_tokens
+            ),
+        ):
+            return grpo_loss_fn(
+                logprobs=current_logprobs,
+                entropy=torch.zeros_like(current_logprobs),
+                input_data=inputs,
+                eps_clip=0.2,
+                eps_clip_higher=None,
+                c_clip=None,
+                m2_threshold=0.1,
+                rejection_sampling=(
+                    RejectionSamplingConfig(
+                        level="token", action="mask", metric="ratio", upper=5.0
+                    )
+                    if reject_stale_tokens
+                    else None
+                ),
+            )
+
+    # Both legacy KD branches retain the stale first token after RL rejection.
+    teacher_mask = torch.tensor([[1, 1, 0], [0, 0, 0]], dtype=torch.bool)
+    rl_mask = teacher_mask.clone()
+    if reject_stale_tokens:
+        rl_mask[0, 0] = False
+    n_tokens = original_mask.count_nonzero()
+    detached_logprobs = logprobs.detach()
+    if rl_loss_weight == 0:
+        teacher_terms = detached_logprobs.exp() * (detached_logprobs - teacher_logp)
+        expected_loss = (
+            distill_loss_weight * (teacher_terms * teacher_mask).sum() / n_tokens
+        )
+        # The legacy pure-KD surrogate detaches the score reward.
+        expected_gradient = (
+            distill_loss_weight * teacher_terms * teacher_mask / n_tokens
+        )
+    else:
+        # Surviving rejection-weighted tokens have proximal and behavior logp 0;
+        # without rejection, PPO uses its proximal ratio. Neither case clips.
+        ratio = (detached_logprobs - proximal_logp).exp()
+        rl_terms = -ratio * rl_mask
+        expected_loss = (
+            rl_loss_weight * rl_terms.sum()
+            + distill_loss_weight
+            * ((detached_logprobs - teacher_logp) * teacher_mask).sum()
+        ) / n_tokens
+        expected_gradient = (
+            rl_loss_weight * rl_terms
+            + distill_loss_weight * teacher_mask.to(logprobs.dtype)
+        ) / n_tokens
+
+    full_loss = evaluate(slice(None))
+    weights = [reduction.normalizer(row) for row in original_mask]
+    split_loss = sum(evaluate(slice(i, i + 1)) * weights[i] for i in range(2)) / sum(
+        weights
+    )
+    full_gradient = torch.autograd.grad(full_loss, logprobs, retain_graph=True)[0]
+    split_gradient = torch.autograd.grad(split_loss, logprobs)[0]
+
+    torch.testing.assert_close(full_loss, expected_loss, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(full_gradient, expected_gradient, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(split_loss, full_loss, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(split_gradient, full_gradient, rtol=1e-12, atol=1e-12)
