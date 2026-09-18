@@ -825,6 +825,75 @@ def test_arena_failure_classifier_keeps_explicit_claude_agent_phase_failure():
     assert disposition == "model_failure_zero"
 
 
+@pytest.mark.parametrize(
+    "code,encoding,interaction_count",
+    [
+        ("AGENT_MAX_TURNS_EXCEEDED", "outcome", 2),
+        ("AGENT_RUN_TIMEOUT", "outcome_code", 2),
+        ("AUTONOMOUS_INCOMPLETE_NO_SHIP", "error", 2),
+        ("LLM_RESPONSE_FAILED", "outcome", 2),
+        ("LLM_RESPONSE_TIMEOUT", "outcome_code", 2),
+        ("LLM_RESPONSE_FAILED", "outcome", 0),
+    ],
+)
+def test_gameagent_failure_with_interactions_keeps_zero_reward(
+    code, encoding, interaction_count
+):
+    """Only attributed failures with existing interactions are recoverable."""
+    raw = {
+        "outcome": {"code": code},
+        "outcome_code": code,
+        "error": f"harness failed\nGAMEAGENT_OUTCOME_CODE={code}\n",
+    }
+    error = ArenaTaskFailedError(
+        task_id="task-1",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task-1",
+            status="HARNESS_FAILED",
+            score=0.0,
+            raw={encoding: raw[encoding]},
+        ),
+    )
+
+    disposition = ArenaStreamAgentWorkflow.classify_proxy_failure(
+        error, context_overflow=False, interaction_count=interaction_count
+    )
+
+    assert disposition == (
+        "model_failure_zero" if interaction_count else "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"outcome_code": "UNKNOWN_FAILURE"},
+        {"error": "XGAMEAGENT_OUTCOME_CODE=AGENT_MAX_TURNS_EXCEEDED"},
+        {"error": "GAMEAGENT_OUTCOME_CODE=AGENT_MAX_TURNS_EXCEEDED-invalid"},
+        {
+            "outcome": {"code": "SYSTEM_FAILURE"},
+            "error": "GAMEAGENT_OUTCOME_CODE=AGENT_MAX_TURNS_EXCEEDED",
+        },
+    ],
+)
+def test_gameagent_unknown_or_malformed_outcome_is_rejected(raw):
+    """Malformed markers and unknown authoritative codes must not become zeros."""
+    error = ArenaTaskFailedError(
+        task_id="task-1",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task-1", status="HARNESS_FAILED", score=0.0, raw=raw
+        ),
+    )
+
+    disposition = ArenaStreamAgentWorkflow.classify_proxy_failure(
+        error, context_overflow=False, interaction_count=2
+    )
+
+    assert disposition == "unknown_failure_reject"
+
+
 def test_arena_failure_classifier_rejects_ambiguous_harness_failure_raw():
     """Unattributed Harness text must not silently become training data."""
     error = ArenaTaskFailedError(
