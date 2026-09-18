@@ -181,6 +181,7 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
                                         run_id,
                                         evt.get("name", ""),
                                         evt.get("args", ""),
+                                        call_id=evt.get("call_id"),
                                     )
                                 )
                             )

@@ -195,13 +195,14 @@ class OpenResponsesBridge(AgentBridge):
             )
         for evt in result.get("events", []):
             if evt.get("type") == "tool_call":
-                output_items.append(
-                    {
-                        "type": "function_call",
-                        "name": evt.get("name", ""),
-                        "arguments": evt.get("args", ""),
-                    }
-                )
+                item = {
+                    "type": "function_call",
+                    "name": evt.get("name", ""),
+                    "arguments": evt.get("args", ""),
+                }
+                if evt.get("call_id") is not None:
+                    item["call_id"] = evt["call_id"]
+                output_items.append(item)
         return output_items
 
     @staticmethod
