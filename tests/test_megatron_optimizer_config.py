@@ -126,6 +126,50 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
     assert captured["loss_multiplier"] == 6
 
 
+def test_collect_mtp_loss_uses_mcore_metrics_tracker(monkeypatch) -> None:
+    from megatron.core.transformer.multi_token_prediction import (
+        MTPLossLoggingHelper,
+    )
+
+    engine = megatron_engine_module.MegatronEngine.__new__(
+        megatron_engine_module.MegatronEngine
+    )
+    engine.mcore_config = SimpleNamespace(enable_mtp_training=True)
+
+    reduced = False
+    cleaned = False
+
+    def reduce_metrics() -> None:
+        nonlocal reduced
+        reduced = True
+
+    def clean_metrics() -> None:
+        nonlocal cleaned
+        cleaned = True
+
+    monkeypatch.setattr(
+        MTPLossLoggingHelper,
+        "tracker",
+        {"loss_values": torch.tensor([2.0, 4.0])},
+    )
+    monkeypatch.setattr(
+        MTPLossLoggingHelper,
+        "reduce_metrics_in_tracker",
+        reduce_metrics,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        MTPLossLoggingHelper,
+        "clean_metrics_in_tracker",
+        clean_metrics,
+        raising=False,
+    )
+
+    assert engine._collect_mtp_loss(num_microbatches=2) == 3.0
+    assert reduced
+    assert cleaned
+
+
 def test_precision_aware_optimizer_fields_are_applied_before_validation(
     monkeypatch,
 ) -> None:

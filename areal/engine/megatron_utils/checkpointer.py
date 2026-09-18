@@ -396,7 +396,7 @@ class MegatronCheckpointManager:
             # megatron-core v0.14+ removed flattened_range support (Megatron-LM
             # PR #2126), but the sharded_state_dict default
             # (fully_sharded_model_space) still emits it, so saving optimizer
-            # state fails on the pinned 0.17.0. dp_reshardable is upstream's
+            # state fails on the pinned 0.19.0. dp_reshardable is upstream's
             # current default. Trade-off: the optimizer state (not the model
             # weights) becomes reshardable only along DP -- load hard-asserts
             # the same bucket layout (per_bucket_numel_unpadded), so save and

@@ -543,8 +543,10 @@ class TestPackedContextParallelForward:
         assert output.shape == (5, 4)
 
     @pytest.mark.parametrize("cp_size", [2, 4])
-    def test_packed_mtp_uses_input_ids_cp_zigzag_layout(self, monkeypatch, cp_size):
-        """Packed MTP labels and masks must follow input_ids on every CP rank."""
+    def test_packed_mtp_mask_uses_input_ids_cp_zigzag_layout(
+        self, monkeypatch, cp_size
+    ):
+        """Packed MTP masks must follow input_ids on every CP rank."""
         from areal.engine.megatron_utils import packed_context_parallel
 
         seq_lengths = [4 * cp_size, 2 * cp_size]
@@ -552,7 +554,6 @@ class TestPackedContextParallelForward:
             [0, seq_lengths[0], sum(seq_lengths)], dtype=torch.int32
         )
         input_ids = torch.arange(sum(seq_lengths), dtype=torch.long)
-        labels = input_ids + 100
         loss_mask = input_ids.remainder(3).ne(0)
 
         monkeypatch.setattr(
@@ -603,10 +604,7 @@ class TestPackedContextParallelForward:
                     "input_ids": input_ids,
                     "cu_seqlens": cu_seqlens,
                     "max_seqlen": max(seq_lengths),
-                    "mtp_kwargs": {
-                        "mtp_labels": labels,
-                        "mtp_loss_mask": loss_mask,
-                    },
+                    "mtp_loss_mask": loss_mask,
                 },
                 gather_cp_output=False,
             )
@@ -616,17 +614,12 @@ class TestPackedContextParallelForward:
                 call["input_ids"].squeeze(0), expected_ids, rtol=0, atol=0
             )
             torch.testing.assert_close(
-                call["mtp_kwargs"]["mtp_labels"].squeeze(0),
-                expected_ids + 100,
-                rtol=0,
-                atol=0,
-            )
-            torch.testing.assert_close(
-                call["mtp_kwargs"]["mtp_loss_mask"].squeeze(0),
+                call["loss_mask"].squeeze(0),
                 expected_ids.remainder(3).ne(0),
                 rtol=0,
                 atol=0,
             )
+            assert "mtp_kwargs" not in call
             assert output.shape == (expected_ids.numel(), 4)
 
     def test_qwen35_multimodal_mtp_uses_padded_labels_and_mask(self, monkeypatch):
@@ -648,10 +641,7 @@ class TestPackedContextParallelForward:
                 "cu_seqlens": torch.tensor([0, 3, 5], dtype=torch.int32),
                 "max_seqlen": 3,
                 "pixel_values": torch.ones(1, 4),
-                "mtp_kwargs": {
-                    "mtp_labels": torch.tensor([10, 11, 12, 20, 21]),
-                    "mtp_loss_mask": torch.tensor([False, True, True, False, True]),
-                },
+                "mtp_loss_mask": torch.tensor([False, True, True, False, True]),
             },
             is_vision_model=True,
             use_padded_seq=True,
@@ -659,143 +649,14 @@ class TestPackedContextParallelForward:
 
         call = model.call_args.kwargs
         assert call["input_ids"].tolist() == [[10, 11, 12], [20, 21, 0]]
-        assert call["mtp_kwargs"]["mtp_labels"].tolist() == [
-            [10, 11, 12],
-            [20, 21, 0],
-        ]
-        assert call["mtp_kwargs"]["mtp_loss_mask"].tolist() == [
+        assert call["loss_mask"].tolist() == [
             [False, True, True],
             [False, True, False],
         ]
+        assert "mtp_kwargs" not in call
         assert call["attention_mask"] is None
         assert call["pixel_values"].shape == (1, 4)
         assert output.shape == (5, 4)
-
-    def test_mtp_roll_aligns_labels_with_next_token_mask(self):
-        """Pre-roll only raw labels; the trainer mask is already next-token aligned."""
-        from areal.engine.megatron_utils.megatron_bridge_patches import (
-            _roll_mtp_labels,
-        )
-
-        def roll_tensor(tensor, *, shifts, dims, **_kwargs):
-            rolled = torch.roll(tensor, shifts=shifts, dims=dims)
-            rolled.select(dims, shifts).fill_(0)
-            return rolled, rolled.sum()
-
-        labels = torch.tensor([[10, 11, 12], [20, 21, 0]])
-        # This is the mask received from the trainer after its next-token shift.
-        loss_mask = torch.tensor([[True, True, False], [True, False, False]])
-
-        rolled_labels = _roll_mtp_labels(
-            labels,
-            roll_tensor,
-        )
-
-        torch.testing.assert_close(
-            rolled_labels,
-            torch.tensor([[11, 12, 0], [21, 0, 0]]),
-            rtol=0,
-            atol=0,
-        )
-        # MCore performs one more roll for MTP layer 0. The resulting t+2
-        # target/mask must stay within each row; the two-token second sample has
-        # no valid t+2 target and is therefore fully masked.
-        layer0_labels, _ = roll_tensor(
-            rolled_labels,
-            shifts=-1,
-            dims=-1,
-        )
-        layer0_mask, _ = roll_tensor(
-            loss_mask,
-            shifts=-1,
-            dims=-1,
-        )
-        torch.testing.assert_close(
-            layer0_labels,
-            torch.tensor([[12, 0, 0], [0, 0, 0]]),
-            rtol=0,
-            atol=0,
-        )
-        torch.testing.assert_close(
-            layer0_mask,
-            torch.tensor([[True, False, False], [False, False, False]]),
-            rtol=0,
-            atol=0,
-        )
-
-    @pytest.mark.parametrize("tied", [False, True])
-    def test_mtp_detaches_effective_output_weight(self, tied):
-        """MTP must not update either a shared embedding or an untied LM head."""
-        from areal.engine.megatron_utils.megatron_bridge_patches import (
-            _detach_mtp_output_weight,
-        )
-
-        class OutputLayer:
-            def __init__(self, weight):
-                self.weight = weight
-
-            def __call__(self, hidden_states, *, weight=None):
-                if weight is None:
-                    weight = self.weight
-                return torch.nn.functional.linear(hidden_states, weight)
-
-        internal_weight = torch.nn.Parameter(torch.randn(5, 3))
-        shared_weight = torch.nn.Parameter(torch.randn(5, 3)) if tied else None
-        effective_weight = shared_weight if tied else internal_weight
-        output_layer = OutputLayer(internal_weight)
-
-        detached_weight = _detach_mtp_output_weight(output_layer, shared_weight)
-        assert detached_weight.data_ptr() == effective_weight.data_ptr()
-        assert not detached_weight.requires_grad
-
-        hidden_states = torch.randn(2, 3, requires_grad=True)
-        output_layer(hidden_states, weight=detached_weight).sum().backward()
-        assert hidden_states.grad is not None
-        assert effective_weight.grad is None
-
-    def test_mtp_output_weight_is_required_for_gradient_isolation(self):
-        from areal.engine.megatron_utils.megatron_bridge_patches import (
-            _detach_mtp_output_weight,
-        )
-
-        output_layer = MagicMock(weight=None)
-        with pytest.raises(RuntimeError, match="MTP gradient isolation requires"):
-            _detach_mtp_output_weight(output_layer, None)
-
-    def test_mtp_forward_wrapper_restores_input_ids_for_multimodal_decoder(self):
-        """A decoder_input-based VLM forward must still give token IDs to MTP."""
-        from areal.engine.megatron_utils.megatron_bridge_patches import (
-            _MTP_TRAIN_LABELS,
-            _MTP_TRAIN_LOSS_MASK,
-            _wrap_forward_for_mtp_kwargs,
-        )
-
-        class Decoder:
-            def forward(self, **kwargs):
-                return (
-                    kwargs["input_ids"],
-                    _MTP_TRAIN_LABELS.get(),
-                    _MTP_TRAIN_LOSS_MASK.get(),
-                )
-
-        _wrap_forward_for_mtp_kwargs(Decoder)
-        labels = torch.tensor([[10, 11, 12], [20, 21, 0]])
-        loss_mask = torch.tensor([[False, True, True], [False, True, False]])
-
-        seen_input_ids, seen_labels, seen_mask = Decoder().forward(
-            input_ids=None,
-            decoder_input=torch.ones(3, 2, 4),
-            mtp_kwargs={
-                "mtp_labels": labels,
-                "mtp_loss_mask": loss_mask,
-            },
-        )
-
-        assert seen_input_ids is labels
-        assert seen_labels is labels
-        assert seen_mask is loss_mask
-        assert _MTP_TRAIN_LABELS.get() is None
-        assert _MTP_TRAIN_LOSS_MASK.get() is None
 
     def test_model_thd_passes_padded_inputs_and_packed_metadata(self, monkeypatch):
         from areal.engine.megatron_utils import packed_context_parallel
