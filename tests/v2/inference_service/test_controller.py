@@ -173,6 +173,38 @@ class TestControllerWorkflowResolution:
         assert isinstance(resolved.agent, MockAgent)
         assert resolved.drop_retry_orphans is True
 
+    @pytest.mark.parametrize("prm_enabled", [False, True])
+    def test_online_workflow_uses_configured_prm_export_settings(self, prm_enabled):
+        """Completed online trajectories use concat for PRM; disabled defaults stay unchanged."""
+        from areal.api.cli_args import PRMConfig, PRMScorerConfig
+
+        controller = RolloutControllerV2(
+            config=InferenceEngineConfig(
+                backend="sglang:d1",
+                _version="v2",
+                agent=AgentConfig(
+                    agent_cls_path="areal.experimental.openai.proxy.online_agent._OnlineAgent",
+                    chat_template_type="concat",
+                    export_style="concat",
+                    turn_discount=0.75,
+                    prm=PRMConfig(
+                        enabled=prm_enabled,
+                        scorers=[PRMScorerConfig(path="unused.Scorer")],
+                    ),
+                ),
+            ),
+            scheduler=_make_scheduler(),
+        )
+        resolved = controller._resolve_workflow(None)
+        assert resolved.export_style == ("concat" if prm_enabled else "individual")
+        assert resolved.discount == (0.75 if prm_enabled else 1.0)
+
+        overridden = controller._resolve_workflow(
+            None, workflow_kwargs={"export_style": "concat", "discount": 0.5}
+        )
+        assert overridden.export_style == "concat"
+        assert overridden.discount == 0.5
+
     def test_resolve_workflow_forwards_reward_normalization(self):
         controller = RolloutControllerV2(
             config=InferenceEngineConfig(
@@ -428,11 +460,15 @@ class TestRolloutControllerV2Construction:
         controller.save_perf_tracer()
 
     @pytest.mark.parametrize("deterministic_sampling", [False, True])
+    @pytest.mark.parametrize("prm_enabled", [False, True])
     @pytest.mark.asyncio
     async def test_async_initialize_passes_config_to_data_proxy(
-        self, deterministic_sampling
+        self, deterministic_sampling, prm_enabled
     ):
-        from areal.api.cli_args import SchedulingSpec
+        import json
+        from dataclasses import asdict
+
+        from areal.api.cli_args import PRMConfig, PRMScorerConfig, SchedulingSpec
         from areal.api.io_struct import LocalInfServerInfo
 
         worker = MagicMock()
@@ -455,6 +491,17 @@ class TestRolloutControllerV2Construction:
                     "examples.swe.preprocessors.StripAllSystemReminders",
                 ],
                 prefix_matcher="examples.swe.prefix_matchers.swe_prefix_matcher",
+                chat_template_type="concat",
+                prm=PRMConfig(
+                    enabled=prm_enabled,
+                    scorers=[
+                        PRMScorerConfig(
+                            path="examples.prm.scorers.LengthBudgetScorer",
+                            weight=0.5,
+                            kwargs={"max_output_tokens": 32},
+                        )
+                    ],
+                ),
             ),
             scheduling_spec=(
                 SchedulingSpec(
@@ -505,6 +552,10 @@ class TestRolloutControllerV2Construction:
         assert data_proxy_cmd[matcher + 1] == (
             "examples.swe.prefix_matchers.swe_prefix_matcher"
         )
+        assert ("--prm-config" in data_proxy_cmd) is prm_enabled
+        if prm_enabled:
+            encoded = data_proxy_cmd[data_proxy_cmd.index("--prm-config") + 1]
+            assert json.loads(encoded) == asdict(cfg.agent.prm)
 
 
 class TestOnlineCallbackFlow:

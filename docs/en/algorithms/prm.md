@@ -1,9 +1,9 @@
 # Process Rewards
 
 Process rewards attach a training signal to each generated turn, in addition to
-the trajectory's outcome reward. The v1 OpenAI proxy scores complete trajectories
-before exporting them to PPO/GRPO. Scorers are supplied as Python classes; no
-external judge service is required by AReaL itself.
+the trajectory's outcome reward. The v1 OpenAI proxy and v2 inference data proxy
+score complete trajectories before exporting them to PPO/GRPO. Scorers are supplied
+as Python classes; no external judge service is required by AReaL itself.
 
 ## Configuration
 
@@ -29,8 +29,11 @@ actor:
 ```
 
 An empty scorer list or `enabled: false` disables proxy scoring. Scorers currently
-require v1 rollout, concat export, concat chat templates, and direct process
-advantages. Individual export and the v2 agent service are not supported.
+require concat export, concat chat templates, token-backed interactions, and direct
+process advantages. To use the v2 inference service, set `rollout._version: v2`
+with the same scorer configuration. Individual export and string-only external
+model responses are not supported. This integration scores completed training
+trajectories, not the optional Agent Service's reconstructed chat history.
 
 ## Scorer Contract
 
@@ -91,6 +94,32 @@ Metrics include `prm_turn_reward/<scorer>`, `prm_trajectory_reward/<scorer>` and
 unweighted; reward metrics include scorer weights. Worker means and rates are
 weighted by observation counts, while counts and sums are added. Evaluation uses
 the `eval-rollout` namespace.
+
+### v2 Export And Metric Transport
+
+The v2 controller forwards the existing `PRMConfig` to each inference data proxy.
+Scoring runs after ready trajectories are collected and before v2's existing
+group outcome-reward normalization. Independent sessions are scored concurrently,
+with branches within a session scored in order. Process token rewards are not
+group-normalized. No online per-step scoring or new advantage formula is introduced.
+
+A missing or failed PRM-scored session rejects the entire requested group, even
+when outcome-reward normalization is disabled. An explicit discard request skips
+scoring. Sessions are cleaned up on success, scoring failure, and cancellation
+when `remove_session` is true. This does not add partial-group acceptance.
+
+The export response carries `prm_stats` containing the existing typed turn results
+and per-branch scorer totals. The workflow records them through the same metric
+recorders as v1, outside the HTTP retry boundary. Means and rates therefore retain
+their observation counts; concurrent exports do not drain a shared server-side
+statistics buffer. Each successfully scored session contributes observations even
+if another member rejects the group. These are scoring metrics, not counts of
+samples eventually used by the optimizer. Failed sessions publish no partial
+branch observations. Requests without PRM retain the original response shape.
+
+Export consumes a ready trajectory once. Retrying an already consumed trajectory
+does not run its scorer again. As with existing v2 export, a lost response is not
+replayed: this is not an exactly-once delivery guarantee for trajectories or metrics.
 
 For grouped rollout filtering, `examples.swe.filter_function` provides
 `filter_mixed_or_penalized_all_wrong`: it retains mixed-outcome groups and
