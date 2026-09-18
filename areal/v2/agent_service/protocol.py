@@ -304,13 +304,22 @@ def make_delta_event(run_id: str, delta: str) -> EventFrame:
     )
 
 
-def make_tool_call_event(run_id: str, tool_name: str, tool_args: str) -> EventFrame:
+def make_tool_call_event(
+    run_id: str,
+    tool_name: str,
+    tool_args: str,
+    *,
+    call_id: str | None = None,
+) -> EventFrame:
     """Create a tool call streaming event."""
+    tool_call = {"name": tool_name, "args": tool_args}
+    if call_id is not None:
+        tool_call["callId"] = call_id
     return EventFrame(
         event="agent",
         payload={
             "runId": run_id,
-            "toolCall": {"name": tool_name, "args": tool_args},
+            "toolCall": tool_call,
         },
     )
 
