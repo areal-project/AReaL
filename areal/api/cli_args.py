@@ -1164,6 +1164,39 @@ class MegatronEngineConfig:
                 )
             if self.use_custom_fsdp or self.use_torch_fsdp2:
                 raise ValueError("mtp_only does not support FSDP wrappers")
+            # Check the actual runtime: package metadata alone cannot establish
+            # which cuDNN shared library PyTorch loads.
+            from importlib.metadata import PackageNotFoundError
+
+            import torch
+
+            for package, minimum in (
+                ("megatron-core", "0.18.2"),
+                ("megatron-bridge", "0.5.1"),
+            ):
+                try:
+                    installed = pkg_version.get_version(package)
+                except PackageNotFoundError as exc:
+                    raise ValueError(
+                        f"mtp_only requires {package}>={minimum}; package not installed"
+                    ) from exc
+                if pkg_version.compare_versions(installed, minimum) < 0:
+                    raise ValueError(
+                        f"mtp_only requires {package}>={minimum}; found {installed}"
+                    )
+            try:
+                cudnn_version = torch.backends.cudnn.version()
+            except RuntimeError as exc:
+                raise ValueError(
+                    "mtp_only requires loaded cuDNN>=9.19.0; "
+                    "PyTorch could not load cuDNN"
+                ) from exc
+            if cudnn_version is None or cudnn_version < 91900:
+                raise ValueError(
+                    "mtp_only requires loaded cuDNN>=9.19.0 (91900); "
+                    f"torch.backends.cudnn.version() returned {cudnn_version}. "
+                    "Ensure PyTorch loads the upgraded cuDNN shared libraries."
+                )
         if self.lm_head_loss_chunk_size < 0:
             raise ValueError(
                 "lm_head_loss_chunk_size must be non-negative, got "

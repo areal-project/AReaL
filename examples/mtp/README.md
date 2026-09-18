@@ -4,6 +4,11 @@
 embedding, and output head. The model directory must contain the native MTP weights and
 matching configuration. The dense Qwen model uses EP=1.
 
+MTP-only configuration validation requires loaded cuDNN >=9.19.0, Megatron-Core
+
+> =0.18.2, and Megatron-Bridge >=0.5.1. It rejects missing or older runtimes before
+> model initialization, including an older cuDNN library loaded by PyTorch.
+
 Requirements for Qwen GDN packed THD and CP: Megatron-Core >=0.18.2 and Megatron-Bridge
 \>=0.5.1, with their compatible CUDA/Transformer Engine/Transformers runtime. Repository
 default dependency pins are older; do not use them for this THD recipe. Supply model and

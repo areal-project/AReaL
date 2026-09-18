@@ -12,6 +12,21 @@ from areal.api.cli_args import MegatronEngineConfig
 from areal.engine.megatron_utils.mtp_only import freeze_non_mtp_parameters
 
 
+@pytest.fixture(autouse=True)
+def supported_mtp_runtime(monkeypatch):
+    from areal.utils import pkg_version
+
+    original = pkg_version.get_version
+    versions = {"megatron-core": "0.18.2", "megatron-bridge": "0.5.1"}
+    monkeypatch.setattr(
+        pkg_version,
+        "get_version",
+        lambda name: versions[name] if name in versions else original(name),
+    )
+    monkeypatch.setattr(torch.backends.cudnn, "version", lambda: 91900)
+    return versions
+
+
 def _config(**kwargs) -> MegatronEngineConfig:
     options = dict(
         bridge_type="megatron-bridge",
@@ -501,3 +516,71 @@ def test_mtp_checkpoint_compatibility_preserves_masks_or_rejects_them(monkeypatc
     _patch_mtp_checkpoint_padding_mask()
     assert mtp.MultiTokenPredictionLayer._checkpointed_forward is fixed_checkpoint
     assert fixed_checkpoint(None, hidden, padding_mask=mask) is hidden
+
+
+@pytest.mark.parametrize(
+    "package, version",
+    [
+        ("megatron-core", "0.18.1"),
+        ("megatron-core", "0.18.2rc1"),
+        ("megatron-bridge", "0.5.0"),
+        ("megatron-bridge", "0.5.1rc1"),
+    ],
+)
+def test_mtp_only_old_package_raises(supported_mtp_runtime, package, version):
+    supported_mtp_runtime[package] = version
+    with pytest.raises(ValueError, match=package):
+        _config()
+
+
+@pytest.mark.parametrize("package", ["megatron-core", "megatron-bridge"])
+def test_mtp_only_missing_package_raises(monkeypatch, package):
+    from importlib.metadata import PackageNotFoundError
+
+    from areal.utils import pkg_version
+
+    original = pkg_version.get_version
+
+    def version(name):
+        if name == package:
+            raise PackageNotFoundError(name)
+        return original(name)
+
+    monkeypatch.setattr(pkg_version, "get_version", version)
+    with pytest.raises(ValueError, match=f"{package}.*not installed"):
+        _config()
+
+
+@pytest.mark.parametrize("version", [None, 91600, 91899])
+def test_mtp_only_old_or_missing_loaded_cudnn_raises(monkeypatch, version):
+    monkeypatch.setattr(torch.backends.cudnn, "version", lambda: version)
+    with pytest.raises(ValueError, match="loaded cuDNN>=9.19.0"):
+        _config()
+
+
+def test_mtp_only_cudnn_load_failure_raises(monkeypatch):
+    def unavailable():
+        raise RuntimeError("incompatible shared libraries")
+
+    monkeypatch.setattr(torch.backends.cudnn, "version", unavailable)
+    with pytest.raises(ValueError, match="PyTorch could not load cuDNN"):
+        _config()
+
+
+@pytest.mark.parametrize("version", [91900, 92000])
+def test_mtp_only_supported_runtime_passes(monkeypatch, supported_mtp_runtime, version):
+    supported_mtp_runtime["megatron-core"] = "0.18.2+vendor.1"
+    supported_mtp_runtime["megatron-bridge"] = "0.6.0"
+    monkeypatch.setattr(torch.backends.cudnn, "version", lambda: version)
+    assert _config().mtp_only
+
+
+def test_joint_training_does_not_query_mtp_runtime(monkeypatch):
+    from areal.utils import pkg_version
+
+    def unexpected(*args):
+        pytest.fail("Joint training must not query MTP-only runtime requirements")
+
+    monkeypatch.setattr(pkg_version, "get_version", unexpected)
+    monkeypatch.setattr(torch.backends.cudnn, "version", unexpected)
+    assert not _config(mtp_only=False).mtp_only
