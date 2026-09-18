@@ -5,8 +5,8 @@ from unittest.mock import MagicMock, call
 import pytest
 import torch
 
-from areal.v2.weight_update import nccl_group
-from areal.v2.weight_update.awex import fsdp_adapter, megatron_adapter, sglang_adapter
+from areal.engine.awex.adapters import fsdp_adapter, megatron_adapter, sglang_adapter
+from areal.engine.awex.transport import nccl_group
 
 
 def test_setup_batch_isend_irecv_uses_sidecar_for_final_barrier(monkeypatch):
@@ -247,10 +247,12 @@ def test_awex_adapters_use_sidecar_for_setup_barrier(adapter_cls, module, monkey
         ),
     ],
 )
+@pytest.mark.parametrize("use_group", [False, True])
 def test_awex_adapters_use_sidecar_for_completion_barrier(
-    adapter_cls, module, build_ops_name, monkeypatch
+    adapter_cls, module, build_ops_name, use_group, monkeypatch
 ):
-    """Payload ops stay on NCCL while the completion barrier uses Gloo."""
+    """Payload transfer completes before the Gloo completion barrier."""
+    monkeypatch.setenv("DTE_DELTA_TRANSFER", "0")
     adapter = adapter_cls(MagicMock())
     payload_group = MagicMock(name="nccl_group")
     sidecar_group = MagicMock(name="gloo_group")
@@ -259,19 +261,33 @@ def test_awex_adapters_use_sidecar_for_completion_barrier(
     adapter._weights_update_group_gloo = sidecar_group
     adapter._transfer_rank = 0
     adapter.get_local_shard_parameters = MagicMock(return_value={})
-    monkeypatch.setattr(module, build_ops_name, lambda *args, **kwargs: ([], [], None))
-    monkeypatch.setattr(module, "batch_send_recv", MagicMock())
-    barrier = MagicMock()
+    ops = [MagicMock(name="payload_op")]
+    monkeypatch.setattr(module, build_ops_name, lambda *args, **kwargs: (ops, [], None))
+    monkeypatch.setattr(module, "awex_wu_use_group", lambda: use_group)
+    events = []
+    transfer = MagicMock(side_effect=lambda **kwargs: events.append("transfer"))
+    monkeypatch.setattr(module, "batch_send_recv", transfer)
+    if module is sglang_adapter:
+        monkeypatch.setattr(module, "current_platform", MagicMock())
+    barrier = MagicMock(side_effect=lambda **kwargs: events.append("barrier"))
     distributed = getattr(module, "dist", module.torch.distributed)
     monkeypatch.setattr(distributed, "barrier", barrier)
 
     adapter.execute_weight_update(version=1)
 
+    transfer.assert_called_once_with(
+        send_ops=ops if build_ops_name == "nccl_build_send_ops" else [],
+        recv_ops=ops if build_ops_name == "nccl_build_recv_ops" else [],
+        blocking=True,
+        use_group=use_group,
+    )
     barrier.assert_called_once_with(group=sidecar_group)
+    assert events == ["transfer", "barrier"]
 
 
 def test_sglang_synchronizes_weight_copies_before_gloo_barrier(monkeypatch):
     """The success barrier runs only after inference weights reach the device."""
+    monkeypatch.setenv("DTE_DELTA_TRANSFER", "0")
     adapter = sglang_adapter.AwexSGLangAdapter(MagicMock())
     adapter._transfer_plan = MagicMock()
     adapter._weights_update_group = MagicMock(name="nccl_group")
@@ -282,13 +298,16 @@ def test_sglang_synchronizes_weight_copies_before_gloo_barrier(monkeypatch):
     events = []
     original = MagicMock()
     contiguous = MagicMock()
+    recv_ops = [MagicMock(name="recv_op")]
     original.copy_.side_effect = lambda value: events.append("copy")
     monkeypatch.setattr(
         sglang_adapter,
         "nccl_build_recv_ops",
-        lambda *args, **kwargs: ([], [(original, contiguous)], None),
+        lambda *args, **kwargs: (recv_ops, [(original, contiguous)], None),
     )
-    monkeypatch.setattr(sglang_adapter, "batch_send_recv", MagicMock())
+    monkeypatch.setattr(sglang_adapter, "awex_wu_use_group", lambda: True)
+    transfer = MagicMock(side_effect=lambda **kwargs: events.append("transfer"))
+    monkeypatch.setattr(sglang_adapter, "batch_send_recv", transfer)
     platform = MagicMock()
     platform.synchronize.side_effect = lambda: events.append("synchronize")
     monkeypatch.setattr(sglang_adapter, "current_platform", platform, raising=False)
@@ -300,8 +319,11 @@ def test_sglang_synchronizes_weight_copies_before_gloo_barrier(monkeypatch):
 
     adapter.execute_weight_update(version=1)
 
+    transfer.assert_called_once_with(
+        send_ops=[], recv_ops=recv_ops, blocking=True, use_group=True
+    )
     original.copy_.assert_called_once_with(contiguous)
-    assert events == ["copy", "synchronize", "barrier"]
+    assert events == ["transfer", "copy", "synchronize", "barrier"]
 
 
 @pytest.mark.parametrize(

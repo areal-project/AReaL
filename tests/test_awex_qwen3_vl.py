@@ -18,8 +18,8 @@ from awex.models.registry import (  # noqa: E402
 )
 from awex.sharding.param_sharding import ShardingType  # noqa: E402
 
-from areal.engine.awex.colocate_reader import (  # noqa: E402
-    _get_awex_infer_hf_config,
+from areal.engine.awex.adapters.sglang_adapter import (  # noqa: E402
+    _get_legacy_awex_hf_config,
     _get_router_dtype,
 )
 
@@ -134,7 +134,7 @@ def test_colocate_reader_serializes_complete_vl_config():
     model = Qwen3VLForConditionalGeneration()
     model.config = config
 
-    awex_config = _get_awex_infer_hf_config(model)
+    awex_config = _get_legacy_awex_hf_config(model)
 
     assert awex_config.architectures == ["Qwen3VLForConditionalGeneration"]
     assert awex_config.model_type == "qwen3_vl"
@@ -151,7 +151,7 @@ def test_colocate_reader_fills_missing_runtime_architecture():
     model = Qwen3VLForConditionalGeneration()
     model.config = config
 
-    awex_config = _get_awex_infer_hf_config(model)
+    awex_config = _get_legacy_awex_hf_config(model)
 
     assert awex_config.architectures == ["Qwen3VLForConditionalGeneration"]
     assert awex_config.text_config["num_hidden_layers"] == 28
@@ -169,7 +169,7 @@ def test_colocate_reader_uses_composite_config_for_vl_moe():
     model.config = config.text_config
     model_runner = SimpleNamespace(model_config=SimpleNamespace(hf_config=config))
 
-    awex_config = _get_awex_infer_hf_config(model, model_runner)
+    awex_config = _get_legacy_awex_hf_config(model, model_runner)
 
     assert awex_config.architectures == ["Qwen3VLMoeForConditionalGeneration"]
     assert awex_config.text_config["num_hidden_layers"] == 28

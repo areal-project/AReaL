@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AdamW inversion detector for AWEX separation delta weight transfer.
+"""Megatron AdamW inversion detector for AWEX separation delta weight transfer.
 
 The detector answers one question each weight-update step: which bf16 elements
 of the converted HF payload changed since the previous version? It returns
