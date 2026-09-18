@@ -4,15 +4,16 @@ import dataclasses
 import os
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
 from areal.api.cli_args import RecoverConfig
-from areal.api.io_struct import FinetuneSpec, StepInfo
+from areal.api.io_struct import FinetuneSpec, StepInfo, WeightUpdateMeta
 from areal.utils import checkpoint_pointer
 from areal.utils.recover import (
     RecoverHandler,
+    RecoverInfo,
     check_if_auto_recover,
     check_if_recover,
 )
@@ -557,6 +558,141 @@ class TestPPORecoverEngines:
             "default": trainer.actor,
             "critic": trainer.critic,
         }
+
+
+class TestAwexRecoverRestore:
+    @staticmethod
+    def prepare(tmp_path, monkeypatch, async_continue=True):
+        handler = TestRecoverHandler._make_handler(str(tmp_path), "on")
+        info = RecoverInfo(
+            last_step_info=StepInfo(
+                epoch=0, epoch_step=17, global_step=17, steps_per_epoch=34
+            ),
+            saver_info={},
+            evaluator_info={},
+            stats_logger_info={},
+            dataloader_info={},
+            checkpoint_info={},
+        )
+        monkeypatch.setattr(RecoverInfo, "load", lambda _: info)
+        monkeypatch.setattr(
+            checkpoint_pointer,
+            "resolve_checkpoint",
+            lambda *_: SimpleNamespace(
+                manifest="manifest",
+                label="generation17",
+                payloads={"default": "payload"},
+                transactional=True,
+            ),
+        )
+        events = Mock()
+        handler.freq_ctl = Mock()
+        monkeypatch.setattr(handler, "_load_checkpoint", events.load)
+        actor = events.actor
+        inference = events.inference
+        inference.offload = lambda tags=None: events.offload(tags=tags)
+        inference.attach_mock(
+            AsyncMock() if async_continue else Mock(), "continue_generation"
+        )
+        dataloader = Mock(sampler=None)
+        return (
+            handler,
+            actor,
+            inference,
+            (Mock(), Mock(), Mock(), dataloader),
+            events,
+            info,
+        )
+
+    @pytest.mark.parametrize("async_continue", [False, True])
+    def test_load_colocated_awex_restores_before_admission(
+        self, tmp_path, monkeypatch, async_continue
+    ):
+        handler, actor, inference, dependencies, events, info = self.prepare(
+            tmp_path, monkeypatch, async_continue
+        )
+        result = handler.load(
+            actor,
+            *dependencies,
+            inference_engine=inference,
+            weight_update_meta=WeightUpdateMeta(type="awex"),
+            colocated_rollout=True,
+        )
+        assert result is info
+        assert events.mock_calls == [
+            call.actor.connect_engine(
+                inference, actor.update_weights.call_args.args[0]
+            ),
+            call.inference.pause(),
+            call.inference.pause_generation_sync(),
+            call.offload(tags=["kv_cache"]),
+            call.offload(tags=["weights"]),
+            call.load(actor, path="payload", name="default"),
+            call.actor.update_weights(actor.update_weights.call_args.args[0]),
+            call.actor.set_version(18),
+            call.inference.set_version(18),
+            call.inference.abort_all_requests(),
+            call.inference.onload(tags=["kv_cache"]),
+            call.inference.continue_generation(),
+            call.inference.resume(),
+        ]
+        if async_continue:
+            inference.continue_generation.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "failing_method",
+        [
+            "load",
+            "update_weights",
+            "abort_all_requests",
+            "onload",
+            "continue_generation",
+        ],
+    )
+    def test_load_colocated_restore_failure_keeps_admission_paused(
+        self, tmp_path, monkeypatch, failing_method
+    ):
+        handler, actor, inference, dependencies, events, _ = self.prepare(
+            tmp_path, monkeypatch
+        )
+        method = (
+            events.load
+            if failing_method == "load"
+            else getattr(
+                actor if failing_method == "update_weights" else inference,
+                failing_method,
+            )
+        )
+        method.side_effect = RuntimeError("restore failed")
+        with pytest.raises(RuntimeError, match="restore failed"):
+            handler.load(
+                actor,
+                *dependencies,
+                inference_engine=inference,
+                weight_update_meta=WeightUpdateMeta(type="awex"),
+                colocated_rollout=True,
+            )
+        inference.resume.assert_not_called()
+
+    @pytest.mark.parametrize("transport", ["awex", "disk"])
+    def test_load_separated_update_failure_retains_resume(
+        self, tmp_path, monkeypatch, transport
+    ):
+        handler, actor, inference, dependencies, events, _ = self.prepare(
+            tmp_path, monkeypatch
+        )
+        actor.update_weights.side_effect = RuntimeError("transfer failed")
+        with pytest.raises(RuntimeError, match="transfer failed"):
+            handler.load(
+                actor,
+                *dependencies,
+                inference_engine=inference,
+                weight_update_meta=WeightUpdateMeta(type=transport),
+                colocated_rollout=False,
+            )
+        inference.resume.assert_called_once_with()
+        events.offload.assert_not_called()
+        inference.onload.assert_not_called()
 
 
 class TestAwexColocateGate:
