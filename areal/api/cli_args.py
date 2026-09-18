@@ -2542,7 +2542,7 @@ class PRMAdvantageShapingConfig:
 
 @dataclass
 class PRMConfig:
-    """Process-reward scoring and advantage shaping for v1 agent rollouts."""
+    """Process-reward scoring and advantage shaping for agent rollouts."""
 
     enabled: bool = field(
         default=True,
@@ -2710,7 +2710,7 @@ class AgentConfig:
     prm: PRMConfig = field(
         default_factory=PRMConfig,
         metadata={
-            "help": "Process-reward shaping applied by the v1 proxy on concat "
+            "help": "Process-reward shaping applied by the v1 or v2 proxy on concat "
             "trajectory export, before interactions are serialized."
         },
     )
@@ -4039,9 +4039,9 @@ class PPOConfig(BaseExperimentConfig):
                 "actor.mask_no_eos_with_zero=True"
             )
         if prm.enabled and prm.scorers:
-            if self.rollout._version != "v1":
+            if self.rollout._version not in {"v1", "v2"}:
                 raise ValueError(
-                    "rollout.agent.prm currently requires rollout._version='v1'"
+                    "rollout.agent.prm requires rollout._version='v1' or 'v2'"
                 )
             if self.rollout.agent.export_style != "concat":
                 raise ValueError(

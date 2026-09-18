@@ -19,9 +19,10 @@ def _config_with_prm() -> PPOConfig:
     return config
 
 
-def test_prm_accepts_v1_concat_agent_config():
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_prm_accepts_concat_agent_config(version):
     config = _config_with_prm()
-    config.rollout._version = "v1"
+    config.rollout._version = version
     config.rollout.agent.export_style = "concat"
     config.rollout.agent.chat_template_type = "concat"
 
@@ -43,7 +44,7 @@ def test_prm_rejects_folded_process_rewards_until_semantics_are_defined():
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("version", "v2", "rollout._version='v1'"),
+        ("version", "v3", "rollout._version='v1' or 'v2'"),
         ("export_style", "individual", "export_style='concat'"),
         ("chat_template_type", "hf", "chat_template_type='concat'"),
     ],

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import os
 import sys
 import threading
@@ -489,6 +490,8 @@ class RolloutControllerV2:
                 "--prefix-matcher",
                 agent_cfg.prefix_matcher,
             ]
+        if agent_cfg.prm.enabled and agent_cfg.prm.scorers:
+            data_proxy_base_cmd += ["--prm-config", json.dumps(asdict(agent_cfg.prm))]
 
         async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str]:
             if self.external_mode:
@@ -1789,6 +1792,11 @@ class RolloutControllerV2:
             online_kwargs.setdefault(
                 "drop_retry_orphans", self._agent_config.drop_retry_orphans
             )
+            if self._agent_config.prm.enabled and self._agent_config.prm.scorers:
+                online_kwargs.setdefault(
+                    "export_style", self._agent_config.export_style
+                )
+                online_kwargs.setdefault("discount", self._agent_config.turn_discount)
             return InferenceServiceWorkflow(
                 controller=self,
                 agent=None,

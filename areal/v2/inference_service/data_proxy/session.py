@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from areal.experimental.openai.cache import InteractionCache, PrefixMatcher
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry, ProcessorCallCache
+from areal.reward.prm.export import PRMExportStats
 
 # Session timeout for cleanup (1 hour)
 SESSION_TIMEOUT_SECONDS = 3600
@@ -81,12 +82,14 @@ class ExportTrajectoriesRequest(BaseModel):
     drop_retry_orphans: bool = False
     reward_normalization: bool = False
     discard_trajectory: bool = False
+    is_eval: bool = False
 
 
 class ExportTrajectoriesResponse(BaseModel):
     """Response containing merged serialized interactions."""
 
     traj: dict[str, Any]
+    prm_stats: PRMExportStats | None = None
 
 
 @dataclass(frozen=True)
@@ -533,8 +536,17 @@ class SessionStore:
         with self._lock:
             return self._sessions.get(session_id)
 
-    def remove_session(self, session_id: str) -> None:
+    def remove_session(
+        self, session_id: str, *, expected_session: SessionData | None = None
+    ) -> None:
         with self._lock:
+            # Scoring awaits external code. Another exporter may remove this
+            # session and a new request may reuse its ID while we are waiting.
+            if (
+                expected_session is not None
+                and self._sessions.get(session_id) is not expected_session
+            ):
+                return
             self._remove_session_locked(session_id)
 
     def _remove_session_locked(self, session_id: str) -> None:
