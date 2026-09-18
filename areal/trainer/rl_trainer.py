@@ -1107,7 +1107,12 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                self.actor.ppo_update(adv_batch)
+                update_kwargs = (
+                    {"max_token_staleness": config.rollout.max_head_offpolicyness}
+                    if config.rollout.max_concurrent_samples is not None
+                    else {}
+                )
+                self.actor.ppo_update(adv_batch, **update_kwargs)
                 self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("ppo update")
 
@@ -1132,7 +1137,7 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    self.critic.ppo_update(adv_batch)
+                    self.critic.ppo_update(adv_batch, **update_kwargs)
                     self.critic.step_lr_scheduler()
                     self.critic.get_device_stats().log("ppo critic update")
                 if self._should_offload_critic:

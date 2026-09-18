@@ -30,6 +30,7 @@ from .async_task_runner import (
     TimedResult,
 )
 from .staleness_manager import StalenessManager
+from .sample_capacity import SampleCapacity
 from areal.infra import workflow_context
 from .workflow_context import WorkflowContext
 from areal.experimental.openai.types import (
@@ -241,6 +242,11 @@ class _RolloutTaskInput:
     workflow: RolloutWorkflow
     should_accept_fn: Callable[[dict[str, Any]], bool] | None = None
     is_eval: bool = False
+    externally_admitted: bool = False
+
+    @property
+    def group_size(self) -> int:
+        return getattr(self.workflow, "group_size", 1)
 
 
 @dataclass(frozen=True)
@@ -355,6 +361,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         enable_tracing: bool = False,
         terminal_error_fn: Callable[[TResult], Exception | None] | None = None,
         deterministic_order: bool = False,
+        max_concurrent_samples: int | None = None,
     ):
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
@@ -365,6 +372,12 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self.enable_tracing = enable_tracing
         self.terminal_error_fn = terminal_error_fn
         self.deterministic_order = deterministic_order
+        self.sample_capacity = (
+            SampleCapacity(max_concurrent_samples)
+            if max_concurrent_samples is not None
+            else None
+        )
+        self._progress_callbacks: dict[int, tuple[str, str]] = {}
         self.logger: Logger
 
         # Unbounded deques for producer/consumer pattern
@@ -405,11 +418,103 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 ) from self._thread_exception
 
     def _has_runner_capacity(self) -> bool:
+        if self.runner.paused.is_set():
+            return False
+        if self.runner.get_input_queue_size() >= self.runner.max_queue_size:
+            return False
+        head = self._pending_inputs[0] if self._pending_inputs else None
+        if (
+            not (
+                self.sample_capacity is not None
+                and head is not None
+                and getattr(head, "externally_admitted", False)
+            )
+            and self.staleness_manager.get_capacity(
+                include_concurrency=self.sample_capacity is None
+            )
+            <= 0
+        ):
+            return False
         return (
-            not self.runner.paused.is_set()
-            and self.staleness_manager.get_capacity() > 0
-            and self.runner.get_input_queue_size() < self.runner.max_queue_size
+            self.sample_capacity is None
+            or head is None
+            or self.sample_capacity.can_reserve(getattr(head, "group_size", 1))
         )
+
+    def get_capacity(self, group_size: int = 1) -> int:
+        """Return available whole-group slots for the requested group size."""
+        if group_size < 1:
+            raise ValueError("group_size must be positive")
+        with self._input_cv:
+            capacity = self.staleness_manager.get_capacity(
+                include_concurrency=self.sample_capacity is None
+            )
+            if self.sample_capacity is not None:
+                capacity = min(
+                    capacity,
+                    (self.sample_capacity.limit - self.sample_capacity.running)
+                    // group_size,
+                )
+            return capacity
+
+    def sample_stats(self) -> dict[str, float]:
+        """Snapshot live sample occupancy, including remote timeout reservations."""
+        with self._input_cv:
+            if self.sample_capacity is None:
+                return {}
+            reservations = self.sample_capacity.reservations.values()
+            return {
+                "rollout/sample_inflight": float(self.sample_capacity.running),
+                "rollout/sample_capacity": float(self.sample_capacity.limit),
+                "rollout/partial_groups": float(
+                    sum(
+                        0 < len(item.completed) < item.group_size
+                        for item in reservations
+                    )
+                ),
+            }
+
+    def get_sample_attempt(self, task_id: int) -> str | None:
+        with self._input_cv:
+            if self.sample_capacity is None:
+                return None
+            reservation = self.sample_capacity.reservations.get(task_id)
+            return reservation.attempt_id if reservation else None
+
+    def register_progress_callback(
+        self, task_id: int, attempt_id: str, callback_addr: str
+    ) -> None:
+        self._progress_callbacks[task_id] = (attempt_id, callback_addr)
+
+    def sample_completed(self, task_id: int, attempt_id: str, sample_idx: int) -> bool:
+        with self._input_cv:
+            if self.sample_capacity is None or not self.sample_capacity.complete(
+                task_id, attempt_id, sample_idx
+            ):
+                return False
+            self._input_cv.notify_all()
+        callback = self._progress_callbacks.get(task_id)
+        if callback is not None:
+            remote_attempt, addr = callback
+            self._post_callback(
+                addr,
+                {
+                    "task_id": task_id,
+                    "attempt_id": remote_attempt,
+                    "sample_idx": sample_idx,
+                },
+            )
+        return True
+
+    def samples_finished(self, task_id: int, attempt_id: str) -> bool:
+        """Confirm termination; never call merely because an RPC timed out."""
+        with self._input_cv:
+            if self.sample_capacity is None or not self.sample_capacity.finish(
+                task_id, attempt_id
+            ):
+                return False
+            self._input_cv.notify_all()
+            return True
 
     def register_callback(self, task_id: int, callback_addr: str):
         """Register a callback address for a task."""
@@ -418,20 +523,27 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
     def cancel_callback(self, task_id: int):
         """Remove a registered callback for a task (e.g., on timeout)."""
         self._task_callbacks.pop(task_id, None)
+        self._progress_callbacks.pop(task_id, None)
 
     def _send_callback(self, addr: str, task_id: int, result: TResult):
         """Send task result to callback address (fire-and-forget)."""
 
+        payload = {"task_id": task_id}
+        progress = self._progress_callbacks.pop(task_id, None)
+        if progress is not None:
+            payload["attempt_id"] = progress[0]
+        self._post_callback(addr, payload)
+
+    def _post_callback(self, addr: str, payload: dict[str, Any]) -> None:
         def post():
-            try:
-                resp = requests.post(
-                    addr,
-                    json={"task_id": task_id},
-                    timeout=30,
-                )
-                resp.raise_for_status()
-            except requests.RequestException as e:
-                self.logger.error(f"Callback to {addr} failed: {e}")
+            for attempt in range(3):
+                try:
+                    resp = requests.post(addr, json=payload, timeout=30)
+                    resp.raise_for_status()
+                    return
+                except requests.RequestException as exc:
+                    if attempt == 2:
+                        self.logger.error("Callback to %s failed: %s", addr, exc)
 
         get_executor().submit(post)
 
@@ -449,11 +561,18 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 task_fn = self.task_factory(task_input)
                 try:
                     self.runner.submit(task_fn, task_id=task_input.task_id)
-                    self.staleness_manager.on_rollout_submitted()
                     if self.enable_tracing:
                         self.logger.info(f"Submit rollout. {self._rollout_stats()}")
                 except TaskQueueFullError:
                     with self._input_cv:
+                        if self.sample_capacity is not None:
+                            reservation = self.sample_capacity.reservations[
+                                task_input.task_id
+                            ]
+                            self.sample_capacity.finish(
+                                task_input.task_id, reservation.attempt_id
+                            )
+                        self.staleness_manager.on_rollout_submission_rolled_back()
                         self._pending_inputs.appendleft(task_input)
                         self._input_cv.wait_for(
                             lambda: (
@@ -516,13 +635,16 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         with self._input_cv:
             while not self._shutdown_event.is_set():
                 self._check_thread_exception()
-                # There is capacity and pending inputs
-                if (
-                    not self.runner.paused.is_set()
-                    and self.staleness_manager.get_capacity() > 0
-                    and self._pending_inputs
-                ):
-                    return self._pending_inputs.popleft()
+                if self._pending_inputs and self._has_runner_capacity():
+                    task_input = self._pending_inputs.popleft()
+                    if self.sample_capacity is not None:
+                        self.sample_capacity.reserve(
+                            task_input.task_id, getattr(task_input, "group_size", 1)
+                        )
+                    # Account before runner.submit: a fast coroutine may finish
+                    # as soon as it is submitted to the background event loop.
+                    self.staleness_manager.on_rollout_submitted()
+                    return task_input
                 self._input_cv.wait()
 
         return None
@@ -562,6 +684,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
         # Clear pending callbacks to prevent memory leak
         self._task_callbacks.clear()
+        self._progress_callbacks.clear()
 
         # Shutdown the async task runner
         self.runner.destroy()
@@ -613,6 +736,10 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             Task input to be processed.
         """
         self._check_thread_exception()
+        if self.sample_capacity is not None:
+            group_size = getattr(task_input, "group_size", 1)
+            if not 1 <= group_size <= self.sample_capacity.limit:
+                raise ValueError("group_size must fit within max_concurrent_samples")
         with self._input_cv:
             self._pending_inputs.append(task_input)
             self.staleness_manager.on_rollout_enqueued()
@@ -1195,6 +1322,7 @@ class WorkflowExecutor:
             logger = logging.getLogger(name)
         self.logger = logger
 
+        dp_world_size = train_data_parallel_size or 1
         # Initialize staleness manager if not provided
         if self._staleness_manager is None:
             if train_data_parallel_size is not None:
@@ -1215,6 +1343,13 @@ class WorkflowExecutor:
                 max_staleness=self.config.max_head_offpolicyness,
             )
 
+        max_samples = getattr(self.config, "max_concurrent_samples", None)
+        if max_samples is not None:
+            max_samples = max_samples // dp_world_size
+            if max_samples < 1:
+                raise ValueError(
+                    "max_concurrent_samples must cover all data parallel ranks"
+                )
         # Create and initialize the dispatcher
         qsize = self.config.queue_size or self.max_concurrent_rollouts * 16
         self._dispatcher = BatchTaskDispatcher[_RolloutTaskInput, WorkflowTaskResult](
@@ -1224,6 +1359,7 @@ class WorkflowExecutor:
             enable_tracing=self.config.enable_rollout_tracing,
             terminal_error_fn=get_workflow_result_error,
             deterministic_order=getattr(self.config, "deterministic_sampling", False),
+            max_concurrent_samples=max_samples,
         )
 
         # Initialize the dispatcher's async task runner
@@ -1244,7 +1380,7 @@ class WorkflowExecutor:
         if tracer is not None:
             tracer.flush(force=True)
 
-    def get_capacity(self):
+    def get_capacity(self, group_size: int = 1):
         """Get current available capacity for new rollouts.
 
         Returns
@@ -1252,7 +1388,7 @@ class WorkflowExecutor:
         int
             Number of new rollout slots available based on staleness constraints.
         """
-        return self.staleness_manager.get_capacity()
+        return self.dispatcher.get_capacity(group_size)
 
     def _rollout_stats(self) -> str:
         stats = self.staleness_manager.get_stats()
@@ -1316,6 +1452,12 @@ class WorkflowExecutor:
             filtering/validation.
         """
 
+        attempt_id = (
+            self._dispatcher.get_sample_attempt(pending_task.task_id)
+            if self._dispatcher is not None
+            else None
+        )
+
         async def _execute_workflow() -> WorkflowTaskResult | None:
             """Execute workflow.arun_episode and apply AReaL-specific logic."""
             task_id = pending_task.task_id
@@ -1325,7 +1467,18 @@ class WorkflowExecutor:
 
             # Set workflow execution context
             workflow_context.set(
-                WorkflowContext(is_eval=pending_task.is_eval, task_id=task_id)
+                WorkflowContext(
+                    is_eval=pending_task.is_eval,
+                    task_id=task_id,
+                    group_size=pending_task.group_size,
+                    sample_completion_callback=(
+                        lambda index: self.dispatcher.sample_completed(
+                            task_id, attempt_id, index
+                        )
+                    )
+                    if attempt_id is not None
+                    else None,
+                )
             )
 
             manager = self.staleness_manager
@@ -1334,6 +1487,7 @@ class WorkflowExecutor:
             should_accept_fn = pending_task.should_accept_fn
             should_accept: bool | None = None
             reason: str | None = None
+            accounted = False
 
             try:
                 workflow_data = pending_task.data
@@ -1431,6 +1585,7 @@ class WorkflowExecutor:
 
                 if should_accept_traj:
                     manager.on_rollout_accepted()
+                    accounted = True
                     stats_tracker.get("rollout").scalar(accepted=1)
                     trace_session_event(
                         "mark_finalized",
@@ -1445,6 +1600,7 @@ class WorkflowExecutor:
                     return _RolloutResult(task_id=task_id, trajectory=traj)
 
                 manager.on_rollout_rejected()
+                accounted = True
                 stats_tracker.get("rollout").scalar(rejected=1)
                 trace_session_event(
                     "mark_finalized",
@@ -1459,6 +1615,10 @@ class WorkflowExecutor:
                 await self._clear_rejected_trajectory(traj)
                 return None
 
+            except asyncio.CancelledError:
+                if not accounted:
+                    manager.on_rollout_rejected()
+                raise
             except WorkflowContractError as exc:
                 manager.on_rollout_rejected()
                 stats_tracker.get("rollout").scalar(rejected=1)
@@ -1489,6 +1649,10 @@ class WorkflowExecutor:
                 await self._clear_rejected_trajectory(traj)
                 return None
 
+            finally:
+                if attempt_id is not None:
+                    self.dispatcher.samples_finished(task_id, attempt_id)
+
         return _execute_workflow
 
     def submit(
@@ -1498,6 +1662,7 @@ class WorkflowExecutor:
         should_accept_fn: Callable[[dict[str, Any]], bool] = None,
         task_id: int | None = None,
         is_eval: bool = False,
+        externally_admitted: bool = False,
     ) -> int:
         """Submit a rollout request to the workflow executor.
 
@@ -1515,6 +1680,7 @@ class WorkflowExecutor:
             should_accept_fn=should_accept_fn,
             task_id=task_id,
             is_eval=is_eval,
+            externally_admitted=externally_admitted,
         )
 
         # Delegate to dispatcher

@@ -2748,6 +2748,17 @@ class InferenceEngineConfig:
             "the inference engine. Defaults to consumer_batch_size."
         },
     )
+    max_concurrent_samples: int | None = field(
+        default=None,
+        metadata={
+            "help": "Positive limit on concurrent complete rollout/agent episodes. "
+            "Enables sample-level refill and replaces the max_concurrent_rollouts "
+            "group concurrency limit; None preserves group-level admission. "
+            "Each entire prompt group must fit. Staleness and consumer_batch_size "
+            "remain in prompt-group units. Direct distributed executors divide "
+            "this limit by training data-parallel size."
+        },
+    )
     queue_size: None | int = field(
         default=None,
         metadata={"help": "Input/Output queue size for async rollout."},
@@ -2921,7 +2932,14 @@ class InferenceEngineConfig:
     )
 
     def __post_init__(self):
-        """Validate scheduling_spec length."""
+        """Validate rollout admission and scheduling configuration."""
+        if self.max_concurrent_samples is not None and (
+            type(self.max_concurrent_samples) is not int
+            or self.max_concurrent_samples < 1
+        ):
+            raise ValueError(
+                "max_concurrent_samples must be a positive integer or None"
+            )
         if len(self.scheduling_spec) not in (1, 2):
             raise ValueError(
                 f"scheduling_spec must contain 1 or 2 SchedulingSpec, "

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 
@@ -47,6 +48,7 @@ class WorkflowContext:
     sample_idx: int | None = None
     group_size: int = 1
     processor_cache: ProcessorCallCache | None = None
+    sample_completion_callback: Callable[[int], None] | None = None
 
 
 _current_context: ContextVar[WorkflowContext] = ContextVar(
@@ -62,6 +64,19 @@ def set(ctx: WorkflowContext) -> None:
 def get() -> WorkflowContext:
     """Get the current workflow context."""
     return _current_context.get()
+
+
+def report_sample_completed(sample_idx: int | None = None) -> None:
+    """Report a complete episode, including rejected episodes, to its dispatcher.
+
+    This is not a notification for individual LLM requests. Call only after the
+    episode and its cancellation handlers have stopped using execution resources.
+    The callback captures the task and attempt identity and must be non-blocking.
+    """
+    ctx = get()
+    index = ctx.sample_idx if sample_idx is None else sample_idx
+    if ctx.sample_completion_callback is not None and index is not None:
+        ctx.sample_completion_callback(index)
 
 
 def stat_scope() -> str:

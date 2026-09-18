@@ -349,6 +349,7 @@ class RolloutController:
             enable_tracing=self.config.enable_rollout_tracing,
             terminal_error_fn=get_workflow_result_error,
             deterministic_order=getattr(self.config, "deterministic_sampling", False),
+            max_concurrent_samples=getattr(self.config, "max_concurrent_samples", None),
         )
         # Initialize the dispatcher's async task runner
         self._dispatcher.initialize(logger=logger)
@@ -865,11 +866,26 @@ class RolloutController:
             self.offload(tags=tags)
             return jsonify({"status": "ok"})
 
+        @app.route("/callback/rollout_progress", methods=["POST"])
+        def rollout_progress():
+            payload = request.get_json() or {}
+            self.dispatcher.sample_completed(
+                payload.get("task_id"),
+                payload.get("attempt_id"),
+                payload.get("sample_idx"),
+            )
+            return jsonify({"status": "ok"})
+
         @app.route("/callback/rollout_complete", methods=["POST"])
         def rollout_complete():
             payload = request.get_json() or {}
             task_id = payload.get("task_id")
             try:
+                if self.dispatcher.sample_capacity is not None:
+                    if not self.dispatcher.samples_finished(
+                        task_id, payload.get("attempt_id")
+                    ):
+                        return jsonify({"status": "ignored"})
                 self._resolve_task_future(task_id)
                 return jsonify({"status": "ok"})
             except Exception as e:
@@ -944,7 +960,12 @@ class RolloutController:
         with self._futures_lock:
             future = self._pending_futures.pop(task_id, None)
         if future:
-            future.get_loop().call_soon_threadsafe(future.set_result, None)
+
+            def resolve():
+                if not future.done():
+                    future.set_result(None)
+
+            future.get_loop().call_soon_threadsafe(resolve)
 
     def _collective_rpc(self, method: str, *args, **kwargs) -> list[Any]:
         return run_async_task(self._collective_rpc_async, method, *args, **kwargs)
@@ -1076,6 +1097,16 @@ class RolloutController:
                 proxy_addr = pending_task.proxy_addr
                 if self._proxy_started and proxy_addr is None:
                     proxy_addr = self.get_proxy_addr(rank)
+                attempt_id = self.dispatcher.get_sample_attempt(task_id)
+                progress_kwargs = {}
+                if attempt_id is not None:
+                    progress_kwargs = {
+                        # A lost submit response does not prove the worker stopped.
+                        # Retrying a non-idempotent submit could run the group twice.
+                        "max_retries": 1,
+                        "sample_attempt_id": attempt_id,
+                        "sample_progress_addr": f"http://{self.callback_addr}/callback/rollout_progress",
+                    }
                 engine_task_id = await self.scheduler.async_call_engine(
                     worker.id,
                     "submit",
@@ -1093,6 +1124,7 @@ class RolloutController:
                     proxy_addr=proxy_addr,
                     reward_normalization=pending_task.reward_normalization,
                     drop_incomplete_group=pending_task.drop_incomplete_group,
+                    **progress_kwargs,
                 )
 
                 assert task_id == engine_task_id, (task_id, engine_task_id)
@@ -1147,8 +1179,8 @@ class RolloutController:
 
         return _submit_then_wait
 
-    def get_capacity(self):
-        return self.staleness_manager.get_capacity()
+    def get_capacity(self, group_size: int = 1):
+        return self.dispatcher.get_capacity(group_size)
 
     def submit(
         self,
@@ -1455,7 +1487,9 @@ class RolloutController:
             all_raw_stats += self._proxy_collective_rpc(
                 method="export_stats", http_timeout=60.0
             )
-        return _merge_worker_stats(all_raw_stats)
+        result = _merge_worker_stats(all_raw_stats)
+        result.update(self.dispatcher.sample_stats())
+        return result
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
         async def _call():

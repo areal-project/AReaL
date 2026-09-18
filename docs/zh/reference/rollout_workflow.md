@@ -99,6 +99,45 @@ async def arun_episode(self, engine, data):
     scope = workflow_context.stat_scope()
 ```
 
+## 样本级补位
+
+将 `rollout.max_concurrent_samples` 设置为正整数，即可按完整 rollout episode 限制并发。例如上限为 48、group size
+为 12 时，先启动四个 prompt 组；每组各完成三条后，释放的 12 个位置即可启动第五组，无须等待旧组全部结束。 这里的 sample 指完整 rollout 或
+agent episode，不是一次 LLM 请求或一行训练张量。下一组必须能整体放入空余额度，组大小超过上限会报错。
+
+启用后，准入使用样本上限替代 `max_concurrent_rollouts` 的组并发上限；未设置时保持原有组级准入。 `consumer_batch_size` 和
+accepted/running 计数仍使用 prompt 组单位，`max_head_offpolicyness` 仍控制基于版本的准入预算。 sample
+完成不会释放该组的 staleness 预算。暂停和 runner 队列限制仍然生效。直接运行的分布式 executor 会按训练 DP 规模拆分样本上限，v1、v2
+controller 则执行全局限制。
+
+仅靠准入预算不能限制不断被后续组超越的慢组年龄。开启该设置后，`PPOTrainer` 还会屏蔽 actor 和 critic 中满足
+`current_version - token_version > max_head_offpolicyness` 的 loss target。等于上限时保留：例如当前版本为
+3、上限为 2，则屏蔽版本 0 的 token，保留版本 1 的 token。原本有效的训练 token 缺少版本、版本未知或来自未来版本时会报错。 自定义训练循环需要自行向
+`ppo_update` 传入 `max_token_staleness=rollout.max_head_offpolicyness`。
+
+该策略过滤 token 的目标函数贡献，不丢弃整组，也不保证交付轨迹全部新鲜。完整组仍参与 reward 基线和 advantage 计算；之后再应用 mask，并按保留的
+token 计算 loss 权重和序列级重要性比率。旧 token 仍可作为上下文，模型辅助 loss 不受该策略过滤。 一个优化器 minibatch 在所有 DP rank
+上都无有效 target 时，各 rank 统一跳过该次优化器更新；仅本地为空而其他 rank 仍有有效 target 时必须继续参与。即使所有优化器 minibatch
+都被跳过，外层训练迭代、学习率调度和发布版本仍继续推进。 actor/critic 指标中的 `stale_token_fraction`
+记录屏蔽比例，`stale_empty_minibatch` 记录被跳过的优化器 minibatch。
+
+该行为参考 [DeepSeek-V4.1 第 5.2.2 节](https://arxiv.org/html/2609.19969v1#S5.SS2.SSS2) 的过旧
+token loss mask 原则。这里的整数版本阈值是 AReaL 的策略，不是 DeepSeek 公开的具体阈值。论文中的按数据集控制并发、过滤早期短样本是独立机制。
+冻结权重的吞吐实验不能验证启用该过滤后的有效训练 token 吞吐或训练质量。
+
+Grouped workflow 保留 gather、组内排序、过滤和 reward normalization。返回 `None` 会释放样本额度，但不产生有效训练数据。
+v2 离线 agent 在每条完整 episode 结束后上报进度；串行组也按整组预留，尚未执行的成员继续占用预留额度。 v2 在线 workflow 在交付的
+workflow 完成后释放预留额度。
+
+worker 的进度通知携带 task、执行 attempt 和 sample index，重复或过期通知不会重复释放额度。 该模式不自动重试远端
+submit，因为响应丢失时任务可能已在 worker 上执行。远端超时只结束等待，不会取消 worker
+或释放未确认停止的额度；迟到的进度通知或整组完成确认仍可释放额度。如果 worker 永久失联，应重启 rollout
+运行时，而不能假定其执行已经停止。组内失败会等待其他成员的取消清理结束，再释放对应预留额度。
+
+controller 的 `export_stats()` 新增实时指标 `rollout/sample_inflight`、`rollout/sample_capacity`
+和 `rollout/partial_groups`。半成品组指至少完成一条且仍有成员未完成的组。直接运行的 executor 可通过
+`dispatcher.sample_stats()` 获取同样的快照。
+
 ## 轨迹转储
 
 当 `InferenceEngineConfig.dump_to_file=True` 时，轨迹自动保存到磁盘用于调试和分析。

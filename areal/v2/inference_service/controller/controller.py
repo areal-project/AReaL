@@ -1197,10 +1197,10 @@ class RolloutControllerV2:
 
     # -- Capacity ----------------------------------------------------------
 
-    def get_capacity(self) -> int:
+    def get_capacity(self, group_size: int = 1) -> int:
         if self.staleness_manager is None:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
-        return self.staleness_manager.get_capacity()
+        return self._workflow_executor.dispatcher.get_capacity(group_size)
 
     # -- Submit / Wait / Batch ---------------------------------------------
 
@@ -1628,7 +1628,10 @@ class RolloutControllerV2:
 
     def export_stats(self) -> dict[str, float]:
         """Export and reset statistics recorded by the local workflow executor."""
-        return stats_tracker.export_all()
+        result = stats_tracker.export_all()
+        if self._workflow_executor is not None:
+            result.update(self._workflow_executor.dispatcher.sample_stats())
+        return result
 
     def config_perf_tracer(self, config: Any = None, role: str = "") -> None:
         """No-op — gateway does not have per-worker perf tracing."""

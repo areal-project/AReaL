@@ -245,6 +245,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                 # Discard export still handles session cleanup.
                 return None
             finally:
+                workflow_context.report_sample_completed(member_index)
                 logger.debug(
                     "V2 rollout member finish: task_id=%s group_id=%s member=%d "
                     "session_id=%s version=%s mode=%s",
@@ -263,14 +264,17 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                     await _run_one(member_index, session_id, session_api_key)
                 )
         else:
-            results = await asyncio.gather(
-                *[
-                    _run_one(member_index, session_id, session_api_key)
-                    for member_index, (session_id, session_api_key) in enumerate(
-                        sessions
-                    )
-                ]
-            )
+            tasks = [
+                asyncio.create_task(_run_one(member_index, session_id, session_api_key))
+                for member_index, (session_id, session_api_key) in enumerate(sessions)
+            ]
+            try:
+                results = await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         session_ids = [sid for sid, _ in sessions]
         n_failed = sum(result is None for result in results)

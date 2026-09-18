@@ -19,6 +19,10 @@ from areal.trainer.ppo.gae import (
     _compute_turn_level_gae,
 )
 from areal.trainer.ppo.lambda_fn import resolve_gae_lambda_fn
+from areal.trainer.ppo.staleness import (
+    apply_staleness_mask,
+    has_global_trainable_tokens,
+)
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
@@ -659,13 +663,34 @@ class PPOActor:
 
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
-    def ppo_update(self, data: list[dict[str, Any]]) -> None:
-        batched_call(self._ppo_update, data, unpack=False, pass_meta=True)
+    def ppo_update(
+        self, data: list[dict[str, Any]], *, max_token_staleness: int | None = None
+    ) -> None:
+        batched_call(
+            functools.partial(
+                self._ppo_update, max_token_staleness=max_token_staleness
+            ),
+            data,
+            unpack=False,
+            pass_meta=True,
+        )
 
     def _ppo_update(
-        self, data: dict[str, Any], meta: TrajBatchMeta | None = None
+        self,
+        data: dict[str, Any],
+        meta: TrajBatchMeta | None = None,
+        *,
+        max_token_staleness: int | None = None,
     ) -> None:
         attn_mask = data["attention_mask"]
+        structural_loss_mask = data["loss_mask"]
+        current_version = self.engine.get_version()
+        if max_token_staleness is not None:
+            apply_staleness_mask(
+                data,
+                current_version=current_version,
+                max_staleness=max_token_staleness,
+            )
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
         seqlens = attn_mask.sum(-1)
@@ -723,7 +748,7 @@ class PPOActor:
                 denominator="n_valid_tokens",
             )
 
-        prompt_lens = _infer_prompt_lens(data["attention_mask"], data["loss_mask"])
+        prompt_lens = _infer_prompt_lens(data["attention_mask"], structural_loss_mask)
         seq_truncated_mask = _get_truncated_mask(data, seqlens)
         seq_stats = dict(
             no_eos_ratios=seq_truncated_mask.float(),
@@ -794,10 +819,14 @@ class PPOActor:
         )
 
         with stats_tracker.scope("update"):
-            # Get current version for proximal approximation metrics
-            current_version = self.engine.get_version()
-
             for mb in mb_inputs:
+                if max_token_staleness is not None:
+                    trainable = has_global_trainable_tokens(
+                        mb, self.engine.data_parallel_group
+                    )
+                    stats_tracker.scalar(stale_empty_minibatch=int(not trainable))
+                    if not trainable:
+                        continue
                 train_stat = self.engine.train_batch(
                     mb,
                     loss_fn=functools.partial(
@@ -816,6 +845,7 @@ class PPOActor:
                         use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
                         mopd_loss_config=self._mopd_loss_config,
+                        sanitize_masked_tokens=max_token_staleness is not None,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
@@ -1026,10 +1056,20 @@ def grpo_loss_fn(
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
+    sanitize_masked_tokens: bool = False,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
     loss_mask = input_data["loss_mask"].bool()
+    if sanitize_masked_tokens:
+        # Mask before exp/ratios: masking an overflowing result afterwards can
+        # still produce 0 * inf in backward for an excluded old token.
+        logprobs = logprobs.masked_fill(~loss_mask, 0)
+        entropy = entropy.masked_fill(~loss_mask, 0)
+        input_data = dict(input_data)
+        for key in ("logprobs", "prox_logp", "teacher_logp", "advantages"):
+            if input_data.get(key) is not None:
+                input_data[key] = input_data[key].masked_fill(~loss_mask, 0)
     if mopd_loss_config is not None and mopd_loss_config.rl_coefficient == 0:
         teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
         teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")

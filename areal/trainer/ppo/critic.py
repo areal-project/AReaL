@@ -10,6 +10,10 @@ from areal.api.cli_args import PPOCriticConfig
 from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
+from areal.trainer.ppo.staleness import (
+    apply_staleness_mask,
+    has_global_trainable_tokens,
+)
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import stats_tracker
 from areal.utils.data import (
@@ -43,10 +47,26 @@ class PPOCritic:
 
     @trace_perf("ppo_critic.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_critic")
-    def ppo_update(self, data: list[dict[str, Any]]) -> None:
-        batched_call(self._ppo_update, data, unpack=False)
+    def ppo_update(
+        self, data: list[dict[str, Any]], *, max_token_staleness: int | None = None
+    ) -> None:
+        batched_call(
+            functools.partial(
+                self._ppo_update, max_token_staleness=max_token_staleness
+            ),
+            data,
+            unpack=False,
+        )
 
-    def _ppo_update(self, data: dict[str, Any]) -> None:
+    def _ppo_update(
+        self, data: dict[str, Any], *, max_token_staleness: int | None = None
+    ) -> None:
+        if max_token_staleness is not None:
+            apply_staleness_mask(
+                data,
+                current_version=self.engine.get_version(),
+                max_staleness=max_token_staleness,
+            )
         ########## Logging code starts ##########
         scalars = dict(
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
@@ -75,11 +95,19 @@ class PPOCritic:
             group=self.engine.data_parallel_group,
         )
         for mb in mb_inputs:
+            if max_token_staleness is not None:
+                trainable = has_global_trainable_tokens(
+                    mb, self.engine.data_parallel_group
+                )
+                stats_tracker.scalar(stale_empty_minibatch=int(not trainable))
+                if not trainable:
+                    continue
             train_stat = self.engine.train_batch(
                 mb,
                 loss_fn=functools.partial(
                     ppo_loss_fn,
                     eps_clip=self.config.eps_clip,
+                    sanitize_masked_tokens=max_token_staleness is not None,
                 ),
                 loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
             )
@@ -118,6 +146,7 @@ def ppo_loss_fn(
     value: torch.Tensor,
     input_data: dict,
     eps_clip: float,
+    sanitize_masked_tokens: bool = False,
 ):
     """Loss function for critic step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -125,6 +154,10 @@ def ppo_loss_fn(
     old_value = input_data["values"].float()
     target_value = input_data["returns"].float()
     loss_mask = input_data["loss_mask"].bool()
+    if sanitize_masked_tokens:
+        value = value.masked_fill(~loss_mask, 0)
+        old_value = old_value.masked_fill(~loss_mask, 0)
+        target_value = target_value.masked_fill(~loss_mask, 0)
 
     loss, stat = ppo_critic_loss_fn(
         value=value,

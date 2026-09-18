@@ -104,6 +104,69 @@ async def arun_episode(self, engine, data):
     scope = workflow_context.stat_scope()
 ```
 
+## Sample-level refill
+
+Set `rollout.max_concurrent_samples` to a positive integer to bound concurrent complete
+rollout episodes. For example, `max_concurrent_samples: 48` and group size 12 initially
+admit four prompt groups. If each group finishes three episodes, the 12 released slots
+admit a fifth group before any of the original groups finishes. A sample means one
+complete rollout or agent episode, not one LLM request or tensor row. The whole next
+group must fit; an oversized group raises `ValueError`.
+
+The setting replaces the `max_concurrent_rollouts` group concurrency limit for
+admission. Leaving it unset preserves group-level admission. `consumer_batch_size` and
+accepted/running counters remain in prompt-group units; `max_head_offpolicyness` still
+controls the version-based admission budget. A free sample slot does not release a
+group's staleness budget. Pause and runner queue limits still apply. Direct distributed
+executors divide the sample limit by the training data-parallel size; v1 and v2
+controllers enforce a global limit.
+
+The admission budget alone does not bound the age of a slow group that later groups keep
+overtaking. When this setting is enabled, `PPOTrainer` also masks actor and critic loss
+targets whose `current_version - token_version > max_head_offpolicyness`. Equality is
+allowed; for example, at version 3 with a limit of 2, version-0 targets are masked while
+version-1 targets remain eligible. Missing, unknown, or future versions on otherwise
+trainable tokens are errors. Custom training loops must pass
+`max_token_staleness=rollout.max_head_offpolicyness` to `ppo_update` themselves.
+
+This is token-level objective filtering, not whole-group deletion or a promise that
+every delivered trajectory is fresh. Complete groups still determine reward baselines
+and advantages; masking happens afterwards, before optimizer minibatch packing.
+Sequence-level importance ratios use the retained targets, and loss weights count those
+same targets. Old tokens remain available as context; model auxiliary losses are not
+filtered by this policy. All DP ranks skip a globally empty optimizer minibatch,
+including its optimizer update; a locally empty rank still participates when other ranks
+have valid targets. The outer training iteration, LR schedule and published version
+continue to advance even if all optimizer minibatches are skipped.
+`stale_token_fraction` reports the masked fraction and `stale_empty_minibatch` reports
+skipped optimizer minibatches under the actor/critic metric scopes.
+
+This follows the token-loss masking principle described in
+[DeepSeek-V4.1 section 5.2.2](https://arxiv.org/html/2609.19969v1#S5.SS2.SSS2). The
+integer version threshold here is an AReaL policy, not a published DeepSeek threshold.
+Dataset concurrency controls and early-short-sample filtering from that report are
+separate mechanisms. Throughput measurements with frozen weights cannot validate the
+retained training-token throughput or quality under this filter.
+
+Grouped workflows keep their gather, sample ordering, filtering and reward
+normalization. Returning `None` releases the sample slot without creating training data.
+v2 offline agents report each completed episode, including when group samples run
+serially; not-yet-started serial members retain their reservations. Online v2 workflows
+release their reservation when the delivered workflow completes.
+
+Worker progress identifies the task, execution attempt and sample index. Duplicate and
+stale-attempt notifications cannot release capacity twice. Remote submission is not
+retried automatically in this mode: a lost response may hide a running group. A remote
+timeout does not cancel the worker or free its unconfirmed slots. Late progress and
+confirmed group completion can still free those slots; if the worker is lost
+permanently, restart the rollout runtime rather than assuming its work has stopped.
+Group failure drains sibling cancellation handlers before releasing their reservations.
+
+Controller `export_stats()` includes live gauges `rollout/sample_inflight`,
+`rollout/sample_capacity` and `rollout/partial_groups`. Partial groups have at least one
+finished member and at least one unfinished member. Local executors expose the same
+snapshot through `dispatcher.sample_stats()`.
+
 ## Trajectory Dumping
 
 When `InferenceEngineConfig.dump_to_file=True`, trajectories are automatically saved to

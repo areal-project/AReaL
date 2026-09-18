@@ -76,7 +76,7 @@ class StalenessManager:
         """
         return (self.max_staleness + 1) * self.consumer_batch_size
 
-    def get_capacity(self) -> int:
+    def get_capacity(self, *, include_concurrency: bool = True) -> int:
         """Calculate available capacity for new rollouts.
 
         Considers both concurrency limits and staleness constraints.
@@ -109,7 +109,11 @@ class StalenessManager:
             staleness_capacity = (ofp + current_version + 1) * consumer_bs - sample_cnt
 
             # Return the minimum of both constraints
-            capacity = min(concurrency_capacity, staleness_capacity)
+            capacity = (
+                min(concurrency_capacity, staleness_capacity)
+                if include_concurrency
+                else staleness_capacity
+            )
             return capacity
 
     def on_version_recovered(self, version: int) -> None:
@@ -146,6 +150,12 @@ class StalenessManager:
         with self.lock:
             self.rollout_stat.enqueued -= 1
             self.rollout_stat.running += 1
+
+    def on_rollout_submission_rolled_back(self) -> None:
+        """Undo a reservation when the runner did not enqueue the task."""
+        with self.lock:
+            self.rollout_stat.enqueued += 1
+            self.rollout_stat.running -= 1
 
     def on_rollout_accepted(self) -> None:
         """Callback when a rollout completes successfully and is accepted.

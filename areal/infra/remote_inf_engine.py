@@ -117,6 +117,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             task_id=parent.task_id,
             group_size=self.group_size,
             processor_cache=shared_processor_cache,
+            sample_completion_callback=parent.sample_completion_callback,
         )
 
         completed_results: list[Any] = [None] * self.group_size
@@ -130,6 +131,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                     sample_idx=sample_idx,
                     group_size=group_context.group_size,
                     processor_cache=shared_processor_cache,
+                    sample_completion_callback=parent.sample_completion_callback,
                 )
             )
             result = await self.workflow.arun_episode(engine, data)
@@ -140,6 +142,12 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             asyncio.create_task(run_sample(sample_idx))
             for sample_idx in range(self.group_size)
         ]
+        for sample_idx, sample_task in enumerate(group_tasks):
+            sample_task.add_done_callback(
+                lambda task, index=sample_idx: workflow_context.report_sample_completed(
+                    index
+                )
+            )
         try:
             indexed_results = await asyncio.gather(*group_tasks)
         except BaseException as exc:
@@ -1366,6 +1374,8 @@ class RemoteInfEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        sample_progress_addr: str | None = None,
+        sample_attempt_id: str | None = None,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -1394,34 +1404,53 @@ class RemoteInfEngine(InferenceEngine):
             HTTP address of the proxy server for AgentWorkflow. If provided,
             AgentWorkflow will use this proxy instead of a local one.
         """
-        if workflow is None and (
-            self.config.agent is None or self.config.agent.mode != "online"
-        ):
-            raise ValueError(
-                "workflow must be specified for submit (unless mode='online')"
+        try:
+            if workflow is None and (
+                self.config.agent is None or self.config.agent.mode != "online"
+            ):
+                raise ValueError(
+                    "workflow must be specified for submit (unless mode='online')"
+                )
+            # Resolve workflow to a RolloutWorkflow instance
+            resolved_workflow = self._resolve_workflow(
+                workflow,
+                workflow_kwargs,
+                group_size,
+                min_usable_group_size=min_usable_group_size,
+                proxy_addr=proxy_addr,
+                reward_normalization=reward_normalization,
+                drop_incomplete_group=drop_incomplete_group,
             )
-        if callback_addr:
-            self.workflow_executor.dispatcher.register_callback(task_id, callback_addr)
+            resolved_should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
 
-        # Resolve workflow to a RolloutWorkflow instance
-        resolved_workflow = self._resolve_workflow(
-            workflow,
-            workflow_kwargs,
-            group_size,
-            min_usable_group_size=min_usable_group_size,
-            proxy_addr=proxy_addr,
-            reward_normalization=reward_normalization,
-            drop_incomplete_group=drop_incomplete_group,
-        )
-        resolved_should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
-
-        return self.workflow_executor.submit(
-            data,
-            workflow=resolved_workflow,
-            should_accept_fn=resolved_should_accept_fn,
-            task_id=task_id,
-            is_eval=is_eval,
-        )
+            if task_id is None:
+                task_id = self.workflow_executor._task_id_generator.next()
+            if callback_addr:
+                self.workflow_executor.dispatcher.register_callback(
+                    task_id, callback_addr
+                )
+            if sample_progress_addr is not None and sample_attempt_id is not None:
+                self.workflow_executor.dispatcher.register_progress_callback(
+                    task_id, sample_attempt_id, sample_progress_addr
+                )
+            return self.workflow_executor.submit(
+                data,
+                workflow=resolved_workflow,
+                should_accept_fn=resolved_should_accept_fn,
+                task_id=task_id,
+                is_eval=is_eval,
+                externally_admitted=sample_attempt_id is not None,
+            )
+        except Exception:
+            # No workflow was enqueued when synchronous resolution/admission
+            # fails. Confirm this attempt stopped, even if the submit RPC fails.
+            if sample_attempt_id is not None and callback_addr is not None:
+                self.workflow_executor.dispatcher.cancel_callback(task_id)
+                self.workflow_executor.dispatcher._post_callback(
+                    callback_addr,
+                    {"task_id": task_id, "attempt_id": sample_attempt_id},
+                )
+            raise
 
     def wait(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
