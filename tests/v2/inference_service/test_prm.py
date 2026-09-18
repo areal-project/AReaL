@@ -530,6 +530,126 @@ async def test_persistent_session_scores_each_ready_trajectory_only_once(proxy_f
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("next_ready", [False, True])
+@pytest.mark.parametrize("first_result", ["success", "failure", "cancelled"])
+async def test_online_scoring_preserves_next_hitl_trajectory(
+    proxy_factory, next_ready, first_result
+):
+    """Finishing an export cannot delete concurrent work in a persistent session."""
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Scorer(_RewardScorer):
+        async def evaluate(self, interaction, ctx):
+            if interaction.interaction_id == "first":
+                entered.set()
+                await release.wait()
+                if first_result == "failure":
+                    return None
+            return await super().evaluate(interaction, ctx)
+
+    client, store = proxy_factory([Scorer()])
+    session = store.get_or_create_hitl_session()
+    session.active_completions["first"] = _interaction("first")
+    session.set_reward("first", 1.0)
+    controller = MagicMock()
+    controller.wait_for_online_trajectory = AsyncMock(
+        side_effect=[
+            {"session_id": session.session_id, "trajectory_id": index}
+            for index in (0, 1)
+        ]
+    )
+    workflow = InferenceServiceWorkflow(controller=controller, export_style="concat")
+
+    async def request_export(http_session, payload):
+        response = await client.post(
+            "/export_trajectories", headers=_HEADERS, json=payload
+        )
+        response.raise_for_status()
+        return response.json()
+
+    workflow._request_export = AsyncMock(side_effect=request_export)
+    async with client:
+        pending = asyncio.create_task(workflow._run_online(MagicMock()))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            session.active_completions["second"] = _interaction("second")
+            if next_ready:
+                session.set_reward("second", 2.0)
+            if first_result == "cancelled":
+                pending.cancel()
+        finally:
+            release.set()
+        if first_result == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        else:
+            first = await asyncio.wait_for(pending, timeout=2)
+            assert bool(first) is (first_result == "success")
+
+        assert store.get_session(session.session_id) is session
+        if not next_ready:
+            session.set_reward("second", 2.0)
+        second = await workflow._run_online(MagicMock())
+        torch.testing.assert_close(
+            second["rewards"], torch.tensor([2.0]), rtol=0, atol=0
+        )
+    assert not session.has_ready_trajectories
+    assert store.session_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hitl", [False, True])
+@pytest.mark.parametrize("prm_enabled", [False, True])
+async def test_online_export_retains_only_persistent_sessions(
+    proxy_factory, hitl, prm_enabled
+):
+    """HITL IDs keep advancing; ordinary session keys remain refreshable."""
+    client, store = proxy_factory([_RewardScorer()], enabled=prm_enabled)
+    if hitl:
+        session = store.get_or_create_hitl_session()
+        sid, api_key = session.session_id, None
+    else:
+        sid, api_key = store.start_session("online")
+        session = store.get_session(sid)
+    controller = MagicMock()
+    controller.wait_for_online_trajectory = AsyncMock()
+    workflow = InferenceServiceWorkflow(controller=controller, export_style="concat")
+
+    async def request_export(http_session, payload):
+        response = await client.post(
+            "/export_trajectories", headers=_HEADERS, json=payload
+        )
+        response.raise_for_status()
+        return response.json()
+
+    workflow._request_export = AsyncMock(side_effect=request_export)
+    async with client:
+        for index in range(2):
+            turn = _interaction(f"turn-{index}")
+            session.active_completions[turn.interaction_id] = turn
+            reward = session.set_reward(turn.interaction_id, float(index + 1))
+            assert reward.trajectory_id == (index if hitl else 0)
+            controller.wait_for_online_trajectory.return_value = {
+                "session_id": sid,
+                "trajectory_id": reward.trajectory_id,
+            }
+            trajectory = await workflow._run_online(MagicMock())
+            torch.testing.assert_close(
+                trajectory["rewards"], torch.tensor([float(index + 1)]), rtol=0, atol=0
+            )
+            if hitl:
+                assert store.get_session(sid) is session
+            else:
+                assert store.get_session(sid) is None
+                assert store.get_session_by_api_key(api_key) is None
+                if index == 0:
+                    sid, refreshed_key = store.start_session("online", api_key=api_key)
+                    assert refreshed_key == api_key
+                    session = store.get_session(sid)
+    assert store.session_count == int(hitl)
+
+
+@pytest.mark.asyncio
 async def test_missing_member_rejects_prm_group_without_normalization(proxy_factory):
     """PRM cannot silently shrink a group when one requested session is unavailable."""
     client, store = proxy_factory([_RewardScorer()])

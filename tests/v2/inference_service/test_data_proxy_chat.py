@@ -156,6 +156,15 @@ def admin_headers():
     return {"Authorization": f"Bearer {ADMIN_KEY}"}
 
 
+@pytest.fixture
+def inline_export_tensors(monkeypatch):
+    """Exercise export serialization without starting a remote tensor server."""
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app.RTensor.remotize",
+        lambda obj, node_addr: obj,
+    )
+
+
 def session_headers(api_key: str):
     return {"Authorization": f"Bearer {api_key}"}
 
@@ -1501,9 +1510,14 @@ async def test_online_set_reward_duplicate_is_idempotent(client):
     assert second.json()["ready_transition"] is False
 
 
-@pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
 @pytest.mark.asyncio
-async def test_online_export_latest_ready_without_trajectory_id(client):
+async def test_online_export_latest_ready_without_trajectory_id(
+    client, inline_export_tensors
+):
+    import torch
+
+    from areal.infra.rpc.serialization import deserialize_value
+
     token = ADMIN_KEY
 
     await client.post(
@@ -1543,13 +1557,21 @@ async def test_online_export_latest_ready_without_trajectory_id(client):
         headers=admin_headers(),
     )
     assert export_resp.status_code == 200
-    interactions = export_resp.json()["interactions"]
-    assert list(interactions) == ["chatcmpl-test1"]
+    trajectory = deserialize_value(export_resp.json()["traj"])
+    torch.testing.assert_close(
+        trajectory["rewards"], torch.tensor([2.0]), rtol=0, atol=0
+    )
+    assert trajectory["input_ids"].shape == (1, 6)
+    health = await client.get("/health")
+    assert health.json()["sessions"] == 0
 
 
-@pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
 @pytest.mark.asyncio
-async def test_online_export_explicit_trajectory_id(client):
+async def test_online_export_explicit_trajectory_id(client, inline_export_tensors):
+    import torch
+
+    from areal.infra.rpc.serialization import deserialize_value
+
     token = ADMIN_KEY
 
     await client.post(
@@ -1594,12 +1616,28 @@ async def test_online_export_explicit_trajectory_id(client):
         headers=admin_headers(),
     )
     assert export_resp.status_code == 200
-    interactions = export_resp.json()["interactions"]
-    assert list(interactions) == ["chatcmpl-test0"]
+    trajectory = deserialize_value(export_resp.json()["traj"])
+    torch.testing.assert_close(
+        trajectory["rewards"], torch.tensor([1.0]), rtol=0, atol=0
+    )
 
     health = await client.get("/health")
     assert health.status_code == 200
     assert health.json()["sessions"] == 1
+
+    # Exporting one ready trajectory must not consume the other one.
+    second_export = await client.post(
+        "/export_trajectories",
+        json={"session_ids": ["__hitl__"], "trajectory_id": 1},
+        headers=admin_headers(),
+    )
+    assert second_export.status_code == 200
+    trajectory = deserialize_value(second_export.json()["traj"])
+    torch.testing.assert_close(
+        trajectory["rewards"], torch.tensor([2.0]), rtol=0, atol=0
+    )
+    health = await client.get("/health")
+    assert health.json()["sessions"] == 0
 
 
 # =============================================================================
@@ -1634,10 +1672,13 @@ async def test_health_sessions_count_after_start(client):
 # =============================================================================
 
 
-@pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
 @pytest.mark.asyncio
-async def test_full_session_lifecycle(client, mock_areal_client):
+async def test_full_session_lifecycle(client, inline_export_tensors):
     """Test the complete flow: start → chat → set_reward → export."""
+    import torch
+
+    from areal.infra.rpc.serialization import deserialize_value
+
     # 1. Start session
     resp = await client.post(
         "/rl/start_session",
@@ -1678,4 +1719,19 @@ async def test_full_session_lifecycle(client, mock_areal_client):
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert "interactions" in data
+    assert set(data) == {"traj"}
+    trajectory = deserialize_value(data["traj"])
+    torch.testing.assert_close(
+        trajectory["input_ids"],
+        torch.tensor([[100, 200, 300, 1234, 5678, 2]]),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        trajectory["loss_mask"], torch.tensor([[0, 0, 0, 1, 1, 1]]), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        trajectory["rewards"], torch.tensor([1.0]), rtol=0, atol=0
+    )
+    health = await client.get("/health")
+    assert health.json()["sessions"] == 0

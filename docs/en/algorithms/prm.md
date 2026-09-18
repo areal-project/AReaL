@@ -107,6 +107,10 @@ A missing or failed PRM-scored session rejects the entire requested group, even
 when outcome-reward normalization is disabled. An explicit discard request skips
 scoring. Sessions are cleaned up on success, scoring failure, and cancellation
 when `remove_session` is true. This does not add partial-group acceptance.
+The online workflow retains the persistent HITL session (`__hitl__`) and consumes
+only the selected ready trajectory, so new interactions and subsequent ready
+trajectories survive an in-flight export. Ordinary session-key exports still
+remove their session.
 
 The export response carries `prm_stats` containing the existing typed turn results
 and per-branch scorer totals. The workflow records them through the same metric

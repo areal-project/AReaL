@@ -37,6 +37,7 @@ parts:
     - file: algorithms/dpo
     - file: algorithms/grpo_series
     - file: algorithms/m2po
+    - file: algorithms/prm
     - file: algorithms/prox_approx
   - caption: 参考
     chapters:

@@ -123,6 +123,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         group_id: str | None = None,
         trajectory_id: int | None = None,
         discard_trajectory: bool = False,
+        remove_session: bool = True,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "session_ids": session_ids,
@@ -130,7 +131,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "trajectory_id": trajectory_id,
             "discount": self.discount,
             "style": self.export_style,
-            "remove_session": True,
+            "remove_session": remove_session,
             "drop_retry_orphans": self.drop_retry_orphans,
             "reward_normalization": self.reward_normalization,
             "discard_trajectory": discard_trajectory,
@@ -326,10 +327,15 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         if not export_request:
             return None
 
+        session_id = export_request["session_id"]
         traj = await self._export_interactions(
             http_session,
-            [export_request["session_id"]],
+            [session_id],
             trajectory_id=export_request["trajectory_id"],
+            # The persistent HITL session may receive its next trajectory while
+            # this export awaits scoring. Ordinary session-key exports still end
+            # their session so that the key can be refreshed.
+            remove_session=session_id != "__hitl__",
         )
         if not traj:
             return None

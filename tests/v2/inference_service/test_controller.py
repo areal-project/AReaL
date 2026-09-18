@@ -790,13 +790,20 @@ class TestInferenceServiceWorkflow:
         assert result == {}
         assert session.post.call_args.kwargs["json"]["reward_normalization"] is True
 
-    @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
-    async def test_online_mode_waits_on_controller(self):
-        mock_interaction = MagicMock(reward=1.0)
+    @pytest.mark.parametrize("session_id", ["sess-1", "__hitl__"])
+    async def test_online_mode_waits_on_controller(self, session_id):
+        import torch
+
+        from areal.infra.rpc.serialization import serialize_value
+
+        trajectory = {
+            "input_ids": torch.tensor([[1, 2]]),
+            "rewards": torch.tensor([1.0]),
+        }
         controller = MagicMock()
         controller.wait_for_online_trajectory = AsyncMock(
-            return_value={"session_id": "sess-1", "trajectory_id": 7}
+            return_value={"session_id": session_id, "trajectory_id": 7}
         )
 
         workflow = InferenceServiceWorkflow(
@@ -814,18 +821,12 @@ class TestInferenceServiceWorkflow:
             patch(
                 "areal.v2.inference_service.controller.workflow.stats_tracker"
             ) as mock_st,
-            patch(
-                "areal.v2.inference_service.controller.workflow.deserialize_interactions"
-            ) as mock_deserialize,
         ):
-            mock_deserialize.return_value = {"chatcmpl-1": mock_interaction}
-
-            # _run_online uses ``async with http_session.post(...)`` directly,
-            # so the mock must support the async context-manager protocol.
+            # Keep the real export deserializer; only mock the HTTP transport.
             mock_response = MagicMock()
             mock_response.raise_for_status = MagicMock()
             mock_response.json = AsyncMock(
-                return_value={"interactions": {"chatcmpl-1": {}}}
+                return_value={"traj": serialize_value(trajectory)}
             )
 
             mock_cm = MagicMock()
@@ -836,16 +837,23 @@ class TestInferenceServiceWorkflow:
             mock_http_session.post = MagicMock(return_value=mock_cm)
 
             mock_wf_ctx.get_aiohttp_session = AsyncMock(return_value=mock_http_session)
+            mock_wf_ctx.get.return_value.is_eval = False
             mock_wf_ctx.stat_scope.return_value = "rollout"
             mock_st.get.return_value = MagicMock()
 
             result = await workflow.arun_episode(engine=MagicMock(), data={})
 
         assert result is not None
-        assert "chatcmpl-1" in result
+        for key, expected in trajectory.items():
+            torch.testing.assert_close(result[key], expected, rtol=0, atol=0)
         controller.wait_for_online_trajectory.assert_awaited_once_with(timeout=3.0)
         mock_http_session.post.assert_called_once()
-        mock_deserialize.assert_called_once_with({"chatcmpl-1": {}})
+        payload = mock_http_session.post.call_args.kwargs["json"]
+        assert payload["session_ids"] == [session_id]
+        assert payload["trajectory_id"] == 7
+        assert payload["is_eval"] is False
+        assert payload["remove_session"] is (session_id != "__hitl__")
+        mock_st.get.return_value.scalar.assert_called_once_with(reward=1.0)
 
     @pytest.mark.asyncio
     async def test_offline_mode_runs_agent(self):
