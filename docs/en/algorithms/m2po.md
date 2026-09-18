@@ -45,6 +45,19 @@ For more details:
 
 ## Example Usage
 
+### Microbatch accumulation
+
+The implementation selects the M2PO mask once per optimizer minibatch, before the
+engine splits it into microbatches. Engine weights use the retained token count,
+preserving the current unsplit implementation's normalization by retained tokens
+(`K`). This differs from the original-token denominator (`N`) in the equation above.
+
+This path currently requires data parallel size 1 and cached proximal
+log-probabilities (`actor.prox_logp_method: recompute` or `metrics`). Other data
+parallel sizes and proximal approximation modes raise an error before training.
+Tensor, pipeline, and sequence parallelism are separate from this data parallel
+size restriction.
+
 We recommend changing the parameters in the configuration file
 (`examples/math/gsm8k_m2po.yaml`).
 

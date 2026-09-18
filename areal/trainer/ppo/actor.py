@@ -5,6 +5,7 @@ import math
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from areal.api import TrainEngine
 from areal.api.cli_args import MOPDLossConfig, PPOActorConfig, RejectionSamplingConfig
@@ -665,6 +666,13 @@ class PPOActor:
     def _ppo_update(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
     ) -> None:
+        if self.m2_threshold is not None:
+            dp_size = (
+                dist.get_world_size(self.engine.data_parallel_group)
+                if dist.is_initialized()
+                else 1
+            )
+            _validate_m2po_batch(data, self.config.prox_logp_method, dp_size)
         attn_mask = data["attention_mask"]
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
@@ -798,6 +806,10 @@ class PPOActor:
             current_version = self.engine.get_version()
 
             for mb in mb_inputs:
+                loss_mask_key = "loss_mask"
+                if self.m2_threshold is not None:
+                    _prepare_m2po_minibatch(mb, self.m2_threshold)
+                    loss_mask_key = "m2_loss_mask"
                 train_stat = self.engine.train_batch(
                     mb,
                     loss_fn=functools.partial(
@@ -817,7 +829,7 @@ class PPOActor:
                         use_decoupled_loss=self.config.use_decoupled_loss,
                         mopd_loss_config=self._mopd_loss_config,
                     ),
-                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                    loss_weight_fn=lambda x: x[loss_mask_key].count_nonzero(),
                 )
                 stats_tracker.scalar(**train_stat)
 
@@ -1053,7 +1065,11 @@ def grpo_loss_fn(
             )
             if m2_threshold is not None:
                 loss_mask = _apply_m2po_masking(
-                    input_data["logprobs"], prox_logp, loss_mask, m2_threshold
+                    input_data["logprobs"],
+                    prox_logp,
+                    loss_mask,
+                    m2_threshold,
+                    precomputed_mask=input_data.get("m2_loss_mask"),
                 )
                 normalization_mask = loss_mask
             if rejection_sampling is not None:
@@ -1112,7 +1128,13 @@ def grpo_loss_fn(
 
     # Apply M2PO masking if threshold is set
     if m2_threshold is not None:
-        loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
+        loss_mask = _apply_m2po_masking(
+            old_logp,
+            prox_logp,
+            loss_mask,
+            m2_threshold,
+            precomputed_mask=input_data.get("m2_loss_mask"),
+        )
 
     # Use CISPO, SAPO, or PPO loss
     if use_cispo_loss:
@@ -1513,11 +1535,51 @@ def _resolve_proximal_logp(
     return prox_logp
 
 
+def _validate_m2po_batch(
+    data: dict[str, Any], prox_logp_method: str, dp_size: int
+) -> None:
+    """Reject unsupported selection scopes before any optimizer step."""
+    if dp_size != 1:
+        raise ValueError(
+            "Optimizer-minibatch M2PO selection currently requires data parallel "
+            "size 1; selection across data-parallel ranks is not implemented."
+        )
+    if prox_logp_method not in (
+        PROX_LOGP_METHOD_RECOMPUTE,
+        PROX_LOGP_METHOD_METRICS,
+    ):
+        raise ValueError(
+            "Optimizer-minibatch M2PO selection requires cached proximal "
+            "log-probabilities (prox_logp_method='recompute' or 'metrics')."
+        )
+    prox_logp = data.get("prox_logp")
+    if not isinstance(prox_logp, torch.Tensor):
+        raise ValueError("Optimizer-minibatch M2PO selection requires prox_logp.")
+    for key in ("logprobs", "loss_mask"):
+        if data[key].shape != prox_logp.shape or data[key].device != prox_logp.device:
+            raise ValueError(
+                f"M2PO prox_logp and {key} must have matching shape and device."
+            )
+    torch._assert_async(
+        torch.isfinite(prox_logp).all(), "M2PO prox_logp must be finite."
+    )
+
+
+@torch.no_grad()
+def _prepare_m2po_minibatch(data: dict[str, Any], m2_threshold: float) -> None:
+    # Keep the original loss_mask for other consumers, including Megatron MTP.
+    # This token-shaped field follows the engine's usual split/pack/pad path.
+    data["m2_loss_mask"] = _apply_m2po_masking(
+        data["logprobs"], data["prox_logp"], data["loss_mask"].bool(), m2_threshold
+    ).detach()
+
+
 def _apply_m2po_masking(
     old_logp: torch.Tensor,
     prox_logp: torch.Tensor,
     loss_mask: torch.Tensor,
     m2_threshold: float,
+    precomputed_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Apply M2PO (Second-Momentum PPO) masking to filter high-variance tokens.
@@ -1530,10 +1592,23 @@ def _apply_m2po_masking(
         prox_logp: Proximal policy log-probabilities.
         loss_mask: Original loss mask [batch, seq_len].
         m2_threshold: Threshold for second-momentum filtering.
+        precomputed_mask: Optimizer-minibatch selection carried through the engine.
 
     Returns:
         Updated loss mask with M2PO filtering applied.
     """
+    if precomputed_mask is not None:
+        if (
+            precomputed_mask.shape != loss_mask.shape
+            or precomputed_mask.dtype != torch.bool
+        ):
+            raise ValueError("M2PO mask must be boolean and match the token loss mask.")
+        torch._assert_async(
+            (~precomputed_mask | loss_mask).all(),
+            "M2PO mask must be a subset of the original loss mask.",
+        )
+        return precomputed_mask
+
     delta = old_logp - prox_logp
     m2 = delta * delta
     mask_flat = loss_mask.view(-1)
