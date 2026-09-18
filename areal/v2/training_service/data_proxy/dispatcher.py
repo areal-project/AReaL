@@ -129,7 +129,10 @@ class Dispatcher:
         validated: list[_WorkerResponse] = []
         for i, result in enumerate(raw):
             if isinstance(result, BaseException):
-                raise RuntimeError(f"Worker {addrs[i]} failed: {result}")
+                raise RuntimeError(
+                    f"Worker {addrs[i]} failed: {type(result).__name__}: {result} "
+                    f"(request_timeout={self._request_timeout}s)"
+                ) from result
             _raise_for_worker(result)
             validated.append(result)
         return validated

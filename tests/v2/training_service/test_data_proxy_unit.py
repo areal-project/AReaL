@@ -53,6 +53,24 @@ class _NoOpSession:
         pass
 
 
+@pytest.mark.asyncio
+async def test_dispatch_timeout_includes_exception_type_and_limit():
+    """Timeouts with an empty string representation must remain actionable."""
+    dispatcher = Dispatcher(
+        topology=WorkerTopology(), request_timeout=42.0, _session=_NoOpSession()
+    )
+    error = TimeoutError()
+
+    async def timeout():
+        raise error
+
+    with pytest.raises(
+        RuntimeError, match=r"TimeoutError: .*request_timeout=42.0s"
+    ) as exc_info:
+        await dispatcher._gather_validated([timeout()], ["http://worker"])
+    assert exc_info.value.__cause__ is error
+
+
 class _CapturingSession:
     def __init__(self, *, post_handler=None):
         self.captured_payloads: list[dict[str, Any]] = []
