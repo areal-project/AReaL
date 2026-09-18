@@ -1608,3 +1608,39 @@ class TestRolloutControllerCollectiveRPC:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [0, 10])
+async def test_proxy_start_inherits_current_weight_version(version):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    controller = object.__new__(RolloutController)
+    worker = SimpleNamespace(id="proxy-rollout/0", ip="127.0.0.1", worker_ports=[8000])
+    controller._worker_role = "rollout"
+    controller.inf_engine = MockInferenceEngine
+    controller.config = create_test_config()
+    controller.server_infos = [SimpleNamespace(host="127.0.0.1", port=9000)]
+    controller.proxy_addrs = []
+    controller.scheduler = Mock()
+    controller.scheduler.fork_workers.return_value = [worker.id]
+    controller.scheduler.get_workers.return_value = [worker]
+    controller.scheduler.create_engine = AsyncMock()
+    controller.scheduler.async_call_engine = AsyncMock()
+    controller.get_version = Mock(return_value=version)
+
+    async def verify_version_after_initialize(method, **kwargs):
+        controller.scheduler.async_call_engine.assert_awaited_once()
+        assert (
+            controller.scheduler.async_call_engine.await_args.kwargs["method"]
+            == "initialize"
+        )
+        assert method == "set_version"
+        assert kwargs["version"] == version
+
+    controller._proxy_collective_rpc_async = AsyncMock(
+        side_effect=verify_version_after_initialize
+    )
+    await controller._async_start_proxy()
+    controller._proxy_collective_rpc_async.assert_awaited_once()

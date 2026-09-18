@@ -1,0 +1,22 @@
+# Qwen3.8 Flash Next math SFT smoke: same Megatron/PLE path, short records.
+defaults:
+  - sft_qwen38_flash_next
+  - _self_
+
+experiment_name: ${oc.env:EXPERIMENT_NAME,"qwen38-flash-next-math-sft"}
+trial_name: ${oc.env:TRIAL_NAME,"first-step-math"}
+total_train_steps: ${oc.env:TOTAL_TRAIN_STEPS,1}
+
+train_dataset:
+  batch_size: ${oc.env:SFT_BATCH_SIZE,8}
+  shuffle: false
+  pin_memory: true
+  num_workers: 2
+  path: ${oc.env:MATH_DATASET}
+  type: sft
+  max_length: ${oc.env:MAX_LENGTH,4096}
+
+valid_dataset: null
+
+saver:
+  freq_steps: 1

@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from numbers import Real
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
@@ -80,6 +80,11 @@ def _is_retryable_status(status_code: int) -> bool:
 def _is_retryable_response(response: httpx.Response) -> bool:
     if _is_retryable_status(response.status_code):
         return True
+    if response.status_code == 302:
+        # Spanner renders an upstream 502 as a redirect to an HTML waiting page.
+        # Retry the original request within its existing budget, never the redirect.
+        location = response.headers.get("location", "")
+        return parse_qs(urlsplit(location).query).get("fromspanner") == ["apigwmoe_502"]
     if response.status_code != 403:
         return False
     return "spanner-http-ant-group-watch-all" in response.text[:1000]
@@ -319,6 +324,29 @@ class ArenaOpenAPIClient:
             api_token=api_token,
         )
         self.llm_api_key = llm_api_key or os.getenv("ARENA_LLM_API_KEY", "")
+        self.llm_base_url = (
+            os.getenv("ARENA_LLM_BASE_URL", "") or f"{self.base_url}/api"
+        ).rstrip("/")
+        try:
+            target = urlsplit(self.llm_base_url)
+            valid_target = (
+                target.scheme in {"http", "https"}
+                and bool(target.hostname)
+                and target.username is None
+                and target.password is None
+                and not target.query
+                and not target.fragment
+                and not any(char.isspace() for char in self.llm_base_url)
+            )
+            # Accessing port validates its syntax and range.
+            target.port
+        except ValueError:
+            valid_target = False
+        if not valid_target:
+            raise ValueError(
+                "Arena LLM base URL must be an absolute HTTP(S) URL without "
+                "credentials, query or fragment; check ARENA_LLM_BASE_URL"
+            )
         self.timeout = timeout
         self.poll_interval = poll_interval
         self.request_retries = request_retries
@@ -658,7 +686,7 @@ class ArenaOpenAPIClient:
                 "LLM registration response returned an unexpected model_name: "
                 f"{registered_model_id!r}"
             )
-        return f"{self.base_url}/api", registered_model_id
+        return self.llm_base_url, registered_model_id
 
     async def register_llm_proxy_async(
         self,

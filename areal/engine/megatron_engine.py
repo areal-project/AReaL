@@ -19,8 +19,6 @@ from typing import TYPE_CHECKING, Any
 import mbridge
 import torch
 import torch.distributed as dist
-from megatron.bridge import AutoBridge as MegatronBridgeAutoBridge
-from megatron.bridge.peft.lora import LoRA as MegatronBridgeLoRA
 from megatron.core import parallel_state as mpu
 from megatron.core import tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -68,7 +66,6 @@ from areal.engine.core.model import (
     requires_padded_seq,
     resolve_sequence_packing_mode,
 )
-from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.bailing_v3 import (
     BailingV3MlaWeightPairs,
     is_bailing_v3,
@@ -105,6 +102,10 @@ from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
 from areal.models.mcore.hf_save import (
     save_critic_value_head,
     save_weights_to_hf_with_mbridge_fast,
+)
+from areal.models.mcore.mcore_bridge_adapter import MCoreBridgeAdapter
+from areal.models.mcore.mcore_bridge_checkpoint import (
+    finalize_mcore_bridge_checkpoint,
 )
 from areal.models.mcore.registry import (
     make_hf_and_mcore_config,
@@ -161,6 +162,8 @@ from areal.utils.seeding import get_seed
 from areal.v2.weight_update.awex.delta_config import DTERuntimeConfig
 
 if TYPE_CHECKING:
+    from megatron.bridge.peft.lora import LoRA as MegatronBridgeLoRA
+
     from areal.api import Scheduler
     from areal.api.cli_args import (
         DPOEngineConfig,
@@ -458,6 +461,13 @@ class MegatronEngine(TrainEngine):
         )
 
     def _apply_megatron_bridge_lora(self) -> None:
+        from megatron.bridge.peft.lora import LoRA as MegatronBridgeLoRA
+
+        from areal.engine.megatron_utils.megatron_lora import (
+            apply_megatron_bridge_lora_patch,
+        )
+
+        apply_megatron_bridge_lora_patch()
         assert self.model is not None, "Model must be initialized before applying LoRA."
         assert self.bridge_cls == "megatron-bridge"
 
@@ -563,9 +573,13 @@ class MegatronEngine(TrainEngine):
             # enables Qwen3.5/GDN-specific dense-mask and LM-head semantics.
             self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             if self.is_vision_model:
-                if self.parallel_strategy.context_parallel_size > 1:
+                if (
+                    self.parallel_strategy.context_parallel_size > 1
+                    and self.sequence_packing_mode == SequencePackingMode.PADDED
+                ):
                     raise NotImplementedError(
-                        "Context parallel (CP > 1) is not supported with VLM models. "
+                        "Context parallel (CP > 1) requires a VLM with a "
+                        "model-owned or wrapper-owned THD contract. "
                         f"Got context_parallel_size={self.parallel_strategy.context_parallel_size} "
                         f"for model_type={self.hf_config.model_type}."
                     )
@@ -598,7 +612,7 @@ class MegatronEngine(TrainEngine):
             # dispatch in _update_weights_from_distributed silently falls back).
             if self.mcore_config.use_bridge_for_update_weights:
                 fallback_reasons = []
-                if self.bridge_cls != "megatron-bridge":
+                if self.bridge_cls not in ("megatron-bridge", "mcore-bridge"):
                     fallback_reasons.append(f"bridge_type={self.bridge_cls!r}")
                 if self.quantization_config:
                     fallback_reasons.append("FP8/quantized training")
@@ -877,6 +891,12 @@ class MegatronEngine(TrainEngine):
             )
 
         elif self.bridge_cls == "megatron-bridge":
+            from megatron.bridge import AutoBridge as MegatronBridgeAutoBridge
+
+            from areal.engine.megatron_utils import (
+                megatron_bridge_patches,  # noqa: F401
+            )
+
             if self.enable_tree_training:
                 raise NotImplementedError(
                     "Tree training is not supported with bridge_type='megatron-bridge'."
@@ -888,6 +908,51 @@ class MegatronEngine(TrainEngine):
             )
             self.logger.info(
                 "Using megatron-bridge to create models and hf model save/load in MegatronEngine."
+            )
+
+        elif self.bridge_cls == "mcore-bridge":
+            if self.enable_tree_training:
+                raise NotImplementedError(
+                    "Tree training is not supported with bridge_type='mcore-bridge'."
+                )
+            transformer_config_overrides = {
+                "moe_token_dispatcher_type": self.mcore_config.moe_token_dispatcher_type,
+                "moe_permute_fusion": self.mcore_config.moe_permute_fusion,
+                "moe_router_fusion": self.mcore_config.moe_router_fusion,
+                "cross_entropy_loss_fusion": self.mcore_config.cross_entropy_loss_fusion,
+            }
+            for name in (
+                "moe_shared_expert_overlap",
+                "moe_router_bias_update_rate",
+                "moe_router_dtype",
+                "moe_z_loss_coeff",
+            ):
+                value = getattr(self.mcore_config, name)
+                if value is not None:
+                    transformer_config_overrides[name] = value
+            if self.mcore_config.moe_enable_deepep:
+                transformer_config_overrides["moe_enable_deepep"] = True
+            self.bridge = MCoreBridgeAdapter(
+                self.config.path,
+                dtype=self.dtype,
+                tensor_model_parallel_size=self.parallel_strategy.tensor_parallel_size,
+                pipeline_model_parallel_size=self.parallel_strategy.pipeline_parallel_size,
+                context_parallel_size=self.parallel_strategy.context_parallel_size,
+                expert_model_parallel_size=self.parallel_strategy.expert_parallel_size,
+                expert_tensor_parallel_size=self.parallel_strategy.expert_tensor_parallel_size,
+                virtual_pipeline_model_parallel_size=self.parallel_strategy.virtual_pipeline_parallel_size,
+                gradient_checkpointing=self.config.gradient_checkpointing,
+                recompute_granularity=self.mcore_config.recompute_granularity,
+                recompute_method=self.mcore_config.recompute_method,
+                recompute_num_layers=self.mcore_config.recompute_num_layers,
+                distribute_saved_activations=self.mcore_config.distribute_saved_activations,
+                recompute_modules=self.mcore_config.recompute_modules,
+                language_model_only=self.mcore_config.language_model_only,
+                transformer_config_overrides=transformer_config_overrides,
+                freeze_ple_table=self.mcore_config.freeze_ple_table,
+            )
+            self.logger.info(
+                "Using ModelScope mcore-bridge to create models and HF weight IO in MegatronEngine."
             )
 
         else:
@@ -995,6 +1060,25 @@ class MegatronEngine(TrainEngine):
         return self
 
     def connect_engine(self, engine: InferenceEngine, meta: WeightUpdateMeta):
+        if self.bridge_cls == "mcore-bridge":
+            if meta.type == "awex":
+                if self.hf_config.architectures != ["Qwen4ExpForConditionalGeneration"]:
+                    raise NotImplementedError(
+                        "mcore-bridge AWEX requires the explicit Qwen4Exp adapter."
+                    )
+                from areal.models.mcore.qwen4_exp_awex_binding import (
+                    load_actor_frozen_contract,
+                )
+
+                load_actor_frozen_contract(self)
+            if (
+                meta.type == "xccl"
+                and not self.mcore_config.use_bridge_for_update_weights
+            ):
+                raise ValueError(
+                    "mcore-bridge with weight_update_mode='xccl' requires "
+                    "megatron.use_bridge_for_update_weights=True."
+                )
         if self.rollout_engine is not None and self.rollout_engine != engine:
             self.logger.warning(
                 f"Connected rollout engine changed from {self.rollout_engine} to {engine}."
@@ -1028,6 +1112,7 @@ class MegatronEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.rollout_batch(
@@ -1037,6 +1122,7 @@ class MegatronEngine(TrainEngine):
             group_size=group_size,
             min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
 
@@ -1051,6 +1137,7 @@ class MegatronEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
@@ -1062,6 +1149,7 @@ class MegatronEngine(TrainEngine):
             min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
 
@@ -1381,6 +1469,14 @@ class MegatronEngine(TrainEngine):
                     self.dtype,
                 ),
                 return_hidden_states=use_chunked_lm_head,
+                use_wrapper_packed_seq=(
+                    self.bridge_cls == "mcore-bridge"
+                    and self.sequence_packing_mode == SequencePackingMode.WRAPPER_THD
+                ),
+                language_model_only=(
+                    self.bridge_cls == "mcore-bridge"
+                    and self.mcore_config.language_model_only
+                ),
             )
 
             if use_chunked_lm_head:
@@ -2123,7 +2219,28 @@ class MegatronEngine(TrainEngine):
             exp_avg_sq_dtype=getattr(torch, self.mcore_config.exp_avg_sq_dtype),
         )
 
-        self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
+        if (
+            self.bridge_cls == "mcore-bridge"
+            and self.hf_config.model_type == "qwen4_exp"
+        ):
+            from areal.models.mcore.mcore_bridge_adapter import (
+                qwen4_exp_optimizer_overrides,
+            )
+
+            self.optimizer = get_megatron_optimizer(
+                mcore_opt_config,
+                self.model,
+                config_overrides=qwen4_exp_optimizer_overrides(mcore_opt_config),
+            )
+        else:
+            self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
+
+        if mcore_opt_config.optimizer_cpu_offload:
+            from areal.engine.megatron_utils.hybrid_optimizer import (
+                install_hybrid_optimizer_checkpoint_compat,
+            )
+
+            install_hybrid_optimizer_checkpoint_compat(self.optimizer)
 
         lr_scheduler = OptimizerParamScheduler(
             self.optimizer,
@@ -2622,13 +2739,11 @@ class MegatronEngine(TrainEngine):
 
         dist.barrier(group=self.cpu_group)
 
-        # Bridge delegation: when bridge_type=megatron-bridge and the user opts in,
-        # stream HF tensors directly from bridge.export_hf_weights. Falls back to
-        # the hand-rolled registry path for FP8 (quant_mapping in megatron-bridge
-        # is amax-style, not TE blockwise) and for LoRA (separate adapter export
-        # path not yet wired here).
+        # Bridge delegation: when a bridge backend and the user opts in, stream
+        # HF tensors directly from its export method. Falls back to the hand-rolled
+        # registry path for FP8 and LoRA, whose conversion contracts differ.
         use_bridge = (
-            self.bridge_cls == "megatron-bridge"
+            self.bridge_cls in ("megatron-bridge", "mcore-bridge")
             and self.mcore_config.use_bridge_for_update_weights
             and not self.quantization_config
             and not self.config.use_lora
@@ -2734,7 +2849,7 @@ class MegatronEngine(TrainEngine):
             cpu=False,
             show_progress=False,
         ):
-            if not self.is_pipeline_parallel_head():
+            if not self.is_pipeline_parallel_head() or hf_tensor is None:
                 continue
             size = hf_tensor.numel() * hf_tensor.element_size()
             if bucket_size + size > weight_chunked_mem_size:
@@ -2809,6 +2924,25 @@ class MegatronEngine(TrainEngine):
                     source_path=base_model_path,
                     strict=not self._mtp_head_dropped,
                 )
+        elif self.bridge_cls == "mcore-bridge":
+            if self.config.is_critic:
+                raise ValueError(
+                    "Saving critic model is not supported with mcore-bridge."
+                )
+            self.bridge.save_weights(self.model, path, cpu_group=self.cpu_group)
+            finalize_mcore_bridge_checkpoint(
+                self.bridge.model_path,
+                path,
+                hf_config=self.hf_config,
+                language_model_only=self.mcore_config.language_model_only,
+                mtp_enabled=self.mcore_config.enable_mtp,
+                cpu_group=self.cpu_group,
+                tokenizer=tokenizer,
+                processor=processor,
+            )
+            current_platform.synchronize()
+            dist.barrier(group=self.cpu_group)
+            return
         else:
             if self.mcore_config.use_mbridge_save:
                 source_config = (
@@ -2967,6 +3101,13 @@ class MegatronEngine(TrainEngine):
             # to GPU model params is unaffected (handled by .copy_()).
             with torch.device("cpu"):
                 self.bridge.load_hf_weights(self.model, hf_path=path)
+        elif self.bridge_cls == "mcore-bridge":
+            if self.config.is_critic:
+                raise ValueError(
+                    "Loading critic model is not supported with mcore-bridge."
+                )
+            with torch.device("cpu"):
+                self.bridge.load_weights(self.model, path)
         else:
             load_weights_from_hf_with_mbridge_fast(
                 bridge=self.bridge,
@@ -3013,8 +3154,29 @@ class MegatronEngine(TrainEngine):
             # the original dense batch avoids retaining a third CPU copy.
             mb_list.data = {}
             return mb_list
-        # Amend position ids (skip for VLM — model computes mRoPE internally)
-        if not self.is_vision_model:
+        if (
+            self.bridge_cls == "mcore-bridge"
+            and self.hf_config.model_type == "qwen4_exp"
+        ):
+            from areal.engine.megatron_utils.qwen4_exp_mrope import (
+                prepare_qwen4_exp_mrope_inputs,
+            )
+
+            input_ = prepare_qwen4_exp_mrope_inputs(
+                input_,
+                hf_config=self.hf_config,
+                processor=self.processor,
+                language_model_only=self.mcore_config.language_model_only,
+            )
+            if (
+                input_.get("position_ids") is not None
+                and input_["position_ids"].ndim == 3
+                and self.tf_config.position_embedding_type != "mrope"
+            ):
+                raise ValueError(
+                    "Qwen4Exp vision inputs require mrope in the Megatron model config."
+                )
+        elif not self.is_vision_model:
             input_ = amend_position_ids(input_)
         # Split the input into micro-batches
         # NOTE: Here we use 2*pp_size in forward to align logprob precision

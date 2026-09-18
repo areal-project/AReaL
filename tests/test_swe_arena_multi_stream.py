@@ -1238,3 +1238,12 @@ def test_failed_task_retains_raw_in_typed_error(monkeypatch):
 
     assert exc_info.value.result is not None
     assert exc_info.value.result.raw == {"error": "grader failed", "arca": {}}
+
+
+def test_swe_identity_reward_preserves_partial_scores_and_rejects_invalid_values():
+    from examples.swe.reward_transforms import identity_reward
+
+    assert identity_reward(0.4, {}, reward_threshold=0.98) == 0.4
+    for value in (float("nan"), float("inf"), -0.1, 1.1):
+        with pytest.raises(ValueError, match="within"):
+            identity_reward(value, {})

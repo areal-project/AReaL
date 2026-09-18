@@ -8,7 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -339,25 +338,89 @@ def test_awex_controller_discards_unfinished_requests_before_restoring_kv():
     ]
 
 
-def test_awex_validation_restores_before_eval_without_duplicate_restore():
+def test_awex_eval_restores_servers_before_eval_and_commits_all_stats(monkeypatch):
+    events = []
+
+    def export(name):
+        events.append(name)
+        return {name: 1.0}
+
     trainer = object.__new__(PPOTrainer)
     trainer.config = SimpleNamespace(
         actor=SimpleNamespace(_version="v1", weight_update_mode="awex")
     )
-    trainer.actor = Mock()
-    trainer.rollout = Mock()
-    trainer.rollout.continue_generation = AsyncMock()
-    trainer.critic = None
-    trainer.eval_rollout = Mock()
-    trainer._export_and_commit_stats = Mock()
-
-    trainer._update_weights_and_publish_version(
-        WeightUpdateMeta(type="awex", version=1), 1
+    trainer.actor = SimpleNamespace(export_stats=lambda: export("actor"))
+    trainer.rollout = SimpleNamespace(
+        export_stats=lambda: export("train_rollout"),
+        onload=lambda tags: events.append("onload_" + tags[0]),
+        continue_generation=lambda: events.append("continue"),
     )
-    trainer.rollout.continue_generation.assert_awaited_once()
-    trainer._export_stats_then_restore_awex_rollout(0, 0, 1)
-    trainer.rollout.continue_generation.assert_awaited_once()
-    assert trainer.rollout.onload.call_count == 2
+    trainer.eval_rollout = SimpleNamespace(export_stats=lambda: export("eval_rollout"))
+    commits = []
+    trainer.stats_logger = SimpleNamespace(commit=lambda *args: commits.append(args))
+    monkeypatch.setattr("areal.trainer.rl_trainer.is_single_controller", lambda: True)
+    monkeypatch.setattr(
+        "areal.trainer.rl_trainer.stats_tracker.export_all",
+        lambda: {"timeperf/eval": 2.0, "timeperf/clear_batches": 3.0},
+    )
+
+    stats = trainer._prepare_awex_evaluation()
+    assert events == [
+        "actor",
+        "train_rollout",
+        "onload_cuda_graph",
+        "onload_kv_cache",
+        "continue",
+    ]
+    events.append("evaluate")
+    trainer._export_stats_then_restore_awex_rollout(0, 9, 9, prepared_stats=stats)
+
+    assert events == [
+        "actor",
+        "train_rollout",
+        "onload_cuda_graph",
+        "onload_kv_cache",
+        "continue",
+        "evaluate",
+        "eval_rollout",
+    ]
+    assert commits == [
+        (
+            0,
+            9,
+            9,
+            {
+                "actor": 1.0,
+                "train_rollout": 1.0,
+                "eval_rollout": 1.0,
+                "timeperf/eval": 2.0,
+                "timeperf/clear_batches": 3.0,
+            },
+        )
+    ]
+
+
+def test_awex_eval_failed_stats_export_keeps_servers_paused():
+    trainer = object.__new__(PPOTrainer)
+    trainer.config = SimpleNamespace(
+        actor=SimpleNamespace(_version="v1", weight_update_mode="awex")
+    )
+
+    def fail():
+        raise RuntimeError("stats reduction failed")
+
+    trainer.actor = SimpleNamespace(export_stats=fail)
+    trainer.rollout = SimpleNamespace()
+    with pytest.raises(RuntimeError, match="stats reduction failed"):
+        trainer._prepare_awex_evaluation()
+
+
+def test_non_awex_eval_does_not_export_or_restore_early():
+    trainer = object.__new__(PPOTrainer)
+    trainer.config = SimpleNamespace(
+        actor=SimpleNamespace(_version="v1", weight_update_mode="disk")
+    )
+    assert trainer._prepare_awex_evaluation() is None
 
 
 def test_awex_controller_does_not_resume_when_discard_fails():
@@ -538,3 +601,11 @@ def test_teacher_residency_adapter_releases_and_restores_cuda_flat_buffer(mode):
         f"CUDA residency worker failed\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     )
     assert f"Passed mode={mode}" in result.stdout
+
+
+def test_v2_awex_eval_does_not_use_v1_early_restore():
+    trainer = object.__new__(PPOTrainer)
+    trainer.config = SimpleNamespace(
+        actor=SimpleNamespace(_version="v2", weight_update_mode="awex")
+    )
+    assert trainer._prepare_awex_evaluation() is None

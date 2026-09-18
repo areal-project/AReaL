@@ -701,9 +701,6 @@ class PPOTrainer:
         # new weights. Discard paused requests before restoring the KV pool so
         # none can continue with a mixture of old request state and new weights.
         self.rollout.abort_all_requests()
-        if self.eval_rollout is not None:
-            # Validation shares these inference servers and precedes stats export.
-            self._restore_awex_rollout_after_stats()
 
     def _restore_awex_rollout_after_stats(self) -> None:
         """Restore AWEX KV memory after GPU-backed training stats are exported."""
@@ -714,10 +711,31 @@ class PPOTrainer:
         self.rollout.onload(tags=["kv_cache"])
         call_maybe_async(self.rollout.continue_generation)
 
+    def _prepare_awex_evaluation(self) -> dict[str, Any] | None:
+        """Reduce GPU training stats before restoring shared evaluation servers."""
+        if not self._is_v1_awex_colocate(self.config):
+            return None
+        stats = self.actor.export_stats()
+        stats.update(self.rollout.export_stats())
+        self._restore_awex_rollout_after_stats()
+        return stats
+
     def _export_stats_then_restore_awex_rollout(
-        self, epoch: int, epoch_step: int, global_step: int
+        self,
+        epoch: int,
+        epoch_step: int,
+        global_step: int,
+        prepared_stats: dict[str, Any] | None = None,
     ) -> None:
-        """Export all step stats before restoring the colocated AWEX KV pool."""
+        """Commit prepared evaluation stats, or export then restore AWEX KV."""
+        if prepared_stats is not None:
+            if self.eval_rollout is not None:
+                prepared_stats.update(self.eval_rollout.export_stats())
+            # Eval and clear-batch timings were recorded after the early actor
+            # export. Drain only local CPU statistics, not another GPU RPC.
+            prepared_stats.update(stats_tracker.export_all())
+            self._commit_stats(epoch, epoch_step, global_step, prepared_stats)
+            return
         self._export_and_commit_stats(
             epoch=epoch, epoch_step=epoch_step, global_step=global_step
         )
@@ -832,6 +850,14 @@ class PPOTrainer:
                 "The v2 rollout path does not support actor.min_usable_group_size "
                 "yet; unset it or use a v1 rollout backend."
             )
+        if (
+            not is_v1_rollout
+            and config.gconfig.reward_normalization
+            and not config.gconfig.reward_normalization_use_std
+        ):
+            raise ValueError(
+                "Mean-only rollout reward normalization requires a v1 rollout backend."
+            )
         min_usable_group_size = (
             config.actor.resolve_min_usable_group_size(config.gconfig.n_samples)
             if is_v1_rollout
@@ -923,6 +949,9 @@ class PPOTrainer:
                     drop_incomplete_group=config.gconfig.drop_incomplete_group,
                 )
                 if is_v1_rollout:
+                    prepare_kwargs["reward_normalization_use_std"] = (
+                        config.gconfig.reward_normalization_use_std
+                    )
                     prepare_kwargs["min_usable_group_size"] = min_usable_group_size
                 rollout_batch = _collect_trainable_rollout_batch(
                     functools.partial(
@@ -1184,26 +1213,6 @@ class PPOTrainer:
             if self._should_offload_actor:
                 self._offload_model(self.actor, role="actor")
 
-            if self._should_offload_rollout:
-                self._onload_rollout(is_eval=True)
-            with (
-                stats_tracker.record_timing("eval"),
-                perf_tracer.trace_scope(
-                    "train.eval",
-                    category=Category.COMPUTE,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._evaluate(
-                    eval_workflow=eval_workflow,
-                    eval_workflow_kwargs=eval_workflow_kwargs,
-                    epoch=epoch,
-                    epoch_step=step,
-                    global_step=global_step,
-                )
-            if self._should_offload_rollout:
-                self._offload_rollout(is_eval=True)
-
             with (
                 stats_tracker.record_timing("clear_batches"),
                 perf_tracer.trace_scope(
@@ -1245,13 +1254,39 @@ class PPOTrainer:
                         )
                     run_batch_cleanups(cleanups)
 
+            # Evaluation shares the paused AWEX inference servers. Reduce GPU
+            # stats before restoring their KV pool, but commit only after eval.
+            prepared_stats = self._prepare_awex_evaluation()
+            if self._should_offload_rollout:
+                self._onload_rollout(is_eval=True)
+            with (
+                stats_tracker.record_timing("eval"),
+                perf_tracer.trace_scope(
+                    "train.eval",
+                    category=Category.COMPUTE,
+                    args={"global_step": global_step},
+                ),
+            ):
+                self._evaluate(
+                    eval_workflow=eval_workflow,
+                    eval_workflow_kwargs=eval_workflow_kwargs,
+                    epoch=epoch,
+                    epoch_step=step,
+                    global_step=global_step,
+                )
+            if self._should_offload_rollout:
+                self._offload_rollout(is_eval=True)
+
             with perf_tracer.trace_scope(
                 "train.log_stats",
                 category=Category.INSTR,
                 args={"global_step": global_step},
             ):
                 self._export_stats_then_restore_awex_rollout(
-                    epoch=epoch, epoch_step=step, global_step=global_step
+                    epoch=epoch,
+                    epoch_step=step,
+                    global_step=global_step,
+                    prepared_stats=prepared_stats,
                 )
 
             # Resume rollout only when another train step will consume it.
@@ -1899,6 +1934,11 @@ class PPOTrainer:
         stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
+        self._commit_stats(epoch, epoch_step, global_step, stats)
+
+    def _commit_stats(
+        self, epoch: int, epoch_step: int, global_step: int, stats: dict[str, Any]
+    ) -> None:
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
         if not is_single_controller():

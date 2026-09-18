@@ -203,6 +203,7 @@ class TrainEngine(abc.ABC):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         """Submit a batch of requests and wait for results.
 
@@ -247,6 +248,7 @@ class TrainEngine(abc.ABC):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         """Prepare a batch of data for training from a dataloader.
 
@@ -751,6 +753,7 @@ class InferenceEngine(abc.ABC):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -860,6 +863,7 @@ class InferenceEngine(abc.ABC):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         """Submit a batch of requests to the inference engine and wait for the results.
 
@@ -911,6 +915,7 @@ class InferenceEngine(abc.ABC):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready with controlled staleness.
 

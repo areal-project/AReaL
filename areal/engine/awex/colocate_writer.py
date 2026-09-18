@@ -129,10 +129,11 @@ class AwexWeightPublisher:
         # Keep the writer/reader/plugin on one env-controlled timeout to avoid
         # split-brain diagnostics.
         self._timeout_s = awex_colocate_timeout_s() if timeout_s is None else timeout_s
+        from areal.models.mcore.qwen4_exp_awex_binding import build_awex_train_info
+
+        train_info = build_awex_train_info(self._engine, dist.get_world_size())
         if dist.get_rank() == 0:
-            self._meta_server_client.put_object(
-                "awex_train_info", {"train_world_size": dist.get_world_size()}
-            )
+            self._meta_server_client.put_object("awex_train_info", train_info)
             logger.info(
                 "Registered awex_train_info (train_world_size=%d) with MetaServer",
                 dist.get_world_size(),
@@ -149,19 +150,25 @@ class AwexWeightPublisher:
         addr = meta_server_addr or os.environ.get("AWEX_META_SERVER_ADDR", "")
         if not addr or (dist.is_initialized() and dist.get_rank() != 0):
             return
+        from areal.models.mcore.qwen4_exp_awex_binding import build_awex_train_info
+
         try:
             from awex.meta.meta_server import MetaServerClient
 
             host, port = addr.rsplit(":", 1)
             client = MetaServerClient(host, int(port))
             world = dist.get_world_size() if dist.is_initialized() else 1
-            client.put_object("awex_train_info", {"train_world_size": world})
+            client.put_object(
+                "awex_train_info", build_awex_train_info(self._engine, world)
+            )
             logger.info(
                 "Eager-published awex_train_info (train_world_size=%d) to %s",
                 world,
                 addr,
             )
         except Exception as exc:
+            if os.environ.get("QWEN_AWEX_FROZEN_CONTRACT"):
+                raise
             logger.warning("Eager publish awex_train_info failed: %s", exc)
 
     def _lazy_initialize(self) -> None:
@@ -211,6 +218,26 @@ class AwexWeightPublisher:
             "infer_conf", timeout=self._timeout_s
         )
         logger.info("Got infer_conf from MetaServer: %s", infer_conf)
+
+        if isinstance(infer_conf.get("hf_config"), dict):
+            from types import SimpleNamespace
+
+            infer_conf["hf_config"] = SimpleNamespace(**infer_conf["hf_config"])
+
+        if self._engine.hf_config.architectures == ["Qwen4ExpForConditionalGeneration"]:
+            from areal.models.mcore.qwen4_exp_awex import register_qwen4_exp_awex
+            from areal.models.mcore.qwen4_exp_awex_binding import (
+                McoreFrozenBinder,
+                load_actor_frozen_contract,
+            )
+
+            contract = load_actor_frozen_contract(self._engine)
+            if infer_conf.get("qwen4_exp_frozen_contract") != contract.to_dict():
+                raise ValueError(
+                    "Inference did not confirm the training frozen contract"
+                )
+            self._qwen4_frozen_binder = McoreFrozenBinder(self._engine, contract)
+            register_qwen4_exp_awex(mcore_binder=self._qwen4_frozen_binder)
 
         meta_resolver = McoreParamMetaResolver(shim, self._engine.hf_config, infer_conf)
         parameters_meta = meta_resolver.get_parameters_meta()
@@ -485,6 +512,15 @@ class AwexWeightPublisher:
         model = self._engine.model
         if not isinstance(model, (list, tuple)):
             model = [model]
+
+        if self._engine.hf_config.architectures == ["Qwen4ExpForConditionalGeneration"]:
+            if getattr(self, "_qwen4_frozen_binder", None) is None:
+                raise RuntimeError(
+                    "Qwen4Exp weight conversion has no validated binding"
+                )
+            # Recovery can replace Parameters. Validate live objects before the
+            # native writer detaches them or performs any tensor collectives.
+            self._weight_converter.refresh_frozen_contract()
 
         converted = {}
         for vp_stage, m in enumerate(model):

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
@@ -399,6 +400,51 @@ async def test_message_preprocessor_runs_once_per_request(monkeypatch, path, str
     ]
     assert response.status_code == 200
     assert "hello" in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enable_thinking", [True, False])
+async def test_sdk_template_options_reach_internal_client(monkeypatch, enable_thinking):
+    captured = []
+
+    async def create(
+        *,
+        messages,
+        model,
+        extra_body=None,
+        temperature=None,
+        top_p=None,
+        areal_cache=None,
+    ):
+        captured.append(extra_body)
+        return await _fake_create(
+            messages=messages, model=model, areal_cache=areal_cache
+        )
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = create
+    monkeypatch.setattr(srv, "_openai_client", mock_client)
+    monkeypatch.setattr(srv, "_capacity", 1)
+    options = {"enable_thinking": enable_thinking, "reasoning_effort": "medium"}
+
+    async with _client() as client:
+        start = await client.post(
+            "/rl/start_session", headers=_admin_headers(), json={"task_id": "template"}
+        )
+        sdk = AsyncOpenAI(
+            base_url="http://testserver/v1",
+            api_key=start.json()["api_key"],
+            http_client=client,
+            max_retries=0,
+        )
+        response = await sdk.chat.completions.create(
+            model="default",
+            messages=[{"role": "user", "content": "hello"}],
+            extra_body={"chat_template_kwargs": options},
+        )
+
+    assert response.choices[0].message.content == "hello"
+    assert captured == [{"chat_template_kwargs": options}]
 
 
 class TestChatCompletionsEndpoint:

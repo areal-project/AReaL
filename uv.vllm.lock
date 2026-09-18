@@ -455,6 +455,7 @@ cuda = [
     { name = "flash-linear-attention", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "kernels", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "mbridge", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "mcore-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-modelopt", extra = ["hf"], marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -469,6 +470,7 @@ cuda-train = [
     { name = "flash-linear-attention", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "kernels", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "mbridge", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "mcore-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-modelopt", extra = ["hf"], marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -480,6 +482,7 @@ kernels = [
 ]
 megatron = [
     { name = "mbridge", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "mcore-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
@@ -554,6 +557,7 @@ requires-dist = [
     { name = "mathruler", specifier = "==0.1.0" },
     { name = "matplotlib" },
     { name = "mbridge", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/ISEEKYAN/mbridge.git?rev=310e8fb" },
+    { name = "mcore-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/dingzhiqiang/mcore-bridge.git?rev=4964a6fdcb3db9bb6bfa35c577e9ca6f917e6775" },
     { name = "megatron-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.4.0" },
     { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.17.0" },
     { name = "mistral-common", specifier = ">=1.11.1" },
@@ -3564,6 +3568,19 @@ version = "0.15.1"
 source = { git = "https://github.com/ISEEKYAN/mbridge.git?rev=310e8fb#310e8fb35ccf4fcd4419d32973e563a6d43ee5fb" }
 
 [[package]]
+name = "mcore-bridge"
+version = "1.7.0.dev0"
+source = { git = "https://github.com/dingzhiqiang/mcore-bridge.git?rev=4964a6fdcb3db9bb6bfa35c577e9ca6f917e6775#4964a6fdcb3db9bb6bfa35c577e9ca6f917e6775" }
+dependencies = [
+    { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "modelscope", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "peft", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "safetensors", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "tqdm", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "transformers", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+
+[[package]]
 name = "mcp"
 version = "1.26.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3847,6 +3864,40 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c6/3d/cf5c6029648cb0a116f7b5c2f74aa155ab0c6dd723a1f204a6d7ff354526/model_hosting_container_standards-0.1.14.tar.gz", hash = "sha256:b6cf4c46d88ce6acd6e543a578bb88ffd55d1179a7c09c22e61ae1d8a567c564", size = 90386, upload-time = "2026-03-18T21:25:14.513Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/48/94/052452842d39c562237a70345c57ec213a9db22bd25bba998fd2b32d70a7/model_hosting_container_standards-0.1.14-py3-none-any.whl", hash = "sha256:d678be6745899b8ba1e8246c96b101e7802a6a4ea3fb5d90ae8d6eb4204e84c6", size = 121406, upload-time = "2026-03-18T21:25:12.932Z" },
+]
+
+[[package]]
+name = "modelscope"
+version = "1.40.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "filelock", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "modelscope-hub", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "packaging", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "requests", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "setuptools", version = "80.10.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "tqdm", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "urllib3", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cd/ed/727e9a3b1ded5f394b7e8a90d6cd4a723276086c643e20f68af808bee8c5/modelscope-1.40.0.tar.gz", hash = "sha256:ed2a3882bdd2aa652f1ec692cee8e999ba7809a371a0b863f33649bb2f2de6ef", size = 4547751, upload-time = "2026-09-09T02:18:02.662Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b9/40/43b0230d70496ce933e526ef30ee515cc4126e1ac6661f4aecb8a2b5a0fb/modelscope-1.40.0-py3-none-any.whl", hash = "sha256:2b1d7076bc7eac19f8ac32d4467d021649e374c968f3a42cc36c699da5aae075", size = 6038122, upload-time = "2026-09-09T02:17:58.937Z" },
+]
+
+[[package]]
+name = "modelscope-hub"
+version = "0.4.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography", version = "46.0.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "filelock", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "requests", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "tqdm", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "urllib3", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a6/75/a02e33323cff141d460f9fb4e3a67831f33b2cf74aa4620698ba80c87dbe/modelscope_hub-0.4.2.tar.gz", hash = "sha256:f8547b21891a18a4a4eddd085b7f0aa5fc40a1d5abcbff964fdd3165e866f7de", size = 235250, upload-time = "2026-09-10T02:59:13.429Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/65/72/5171ac3f735c718e8481dd6c5f0304ee85027013b312d96e8f547f6f3d08/modelscope_hub-0.4.2-py3-none-any.whl", hash = "sha256:ddf47b859ae812738850f53c3cc7a935df5cf5ee58c4678cf4fbeefe3d203f43", size = 201255, upload-time = "2026-09-10T02:59:12.035Z" },
 ]
 
 [[package]]

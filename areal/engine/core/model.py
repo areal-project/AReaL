@@ -11,6 +11,7 @@ VALID_VISION_MODELS = [
     "qwen3_vl_moe",
     "qwen3_5",
     "qwen3_5_moe",
+    "qwen4_exp",
     "gemma3",
 ]
 # This registry is used to check if a model is a vision model that we have checked it works with AReaL.
@@ -68,6 +69,7 @@ VALID_MOE_MODELS = [
     "qwen3_vl_moe",
     "qwen3_5_moe",
     "qwen3_5_moe_text",
+    "qwen4_exp",
     "bailing_moe_v2",
     "bailing_moe_linear",
     "bailing_hybrid",
@@ -102,6 +104,8 @@ def resolve_sequence_packing_mode(
     model_type: str, bridge_type: str
 ) -> SequencePackingMode:
     """Select one packing path from the model and bridge contract."""
+    if bridge_type == "mcore-bridge" and model_type == "qwen4_exp":
+        return SequencePackingMode.WRAPPER_THD
     if supports_model_packed_seq(model_type, bridge_type):
         return SequencePackingMode.MODEL_THD
     if is_valid_vision_model(model_type) or is_qwen3_5_model(model_type):

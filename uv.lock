@@ -407,6 +407,7 @@ cuda = [
     { name = "flash-linear-attention", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "kernels", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "mbridge", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "mcore-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-cudnn-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -422,6 +423,7 @@ cuda-train = [
     { name = "flash-linear-attention", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "kernels", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "mbridge", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "mcore-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-modelopt", extra = ["hf"], marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -433,6 +435,7 @@ kernels = [
 ]
 megatron = [
     { name = "mbridge", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "mcore-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
@@ -508,6 +511,7 @@ requires-dist = [
     { name = "mathruler", specifier = "==0.1.0" },
     { name = "matplotlib" },
     { name = "mbridge", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/ISEEKYAN/mbridge.git?rev=310e8fb" },
+    { name = "mcore-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/dingzhiqiang/mcore-bridge.git?rev=4964a6fdcb3db9bb6bfa35c577e9ca6f917e6775" },
     { name = "megatron-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.4.0" },
     { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.17.0" },
     { name = "mistral-common", specifier = ">=1.11.1" },
@@ -3144,6 +3148,19 @@ wheels = [
 name = "mbridge"
 version = "0.15.1"
 source = { git = "https://github.com/ISEEKYAN/mbridge.git?rev=310e8fb#310e8fb35ccf4fcd4419d32973e563a6d43ee5fb" }
+
+[[package]]
+name = "mcore-bridge"
+version = "1.7.0.dev0"
+source = { git = "https://github.com/dingzhiqiang/mcore-bridge.git?rev=4964a6fdcb3db9bb6bfa35c577e9ca6f917e6775#4964a6fdcb3db9bb6bfa35c577e9ca6f917e6775" }
+dependencies = [
+    { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "modelscope", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "peft", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "safetensors", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "tqdm", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "transformers", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
 
 [[package]]
 name = "mcp"

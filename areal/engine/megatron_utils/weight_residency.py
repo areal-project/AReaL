@@ -30,6 +30,8 @@ class MegatronWeightResidency:
     def __init__(self, engine: MegatronEngine) -> None:
         self._engine = engine
         self._released_tags: set[str] = set()
+        self._offloaded_optimizer_params: list[tuple[torch.Tensor, torch.device]] = []
+        self._offloaded_optimizer_states: list[tuple[dict, str, torch.device]] = []
 
     @property
     def released_tags(self) -> frozenset[str]:
@@ -213,6 +215,13 @@ class MegatronWeightResidency:
         optimizer = self._engine.optimizer
         if optimizer is None:
             return
+        # Default path aligns with Asystem HybridEngine
+        # (megatron_util.offload_megatron_optimizer): swap .data / state-dict
+        # references to CPU, never resize_ storages, then purge TE's global
+        # _dummy_wgrads cache and synchronize. Megatron HybridDeviceOptimizer's
+        # offload_to_cpu/restore_from_cpu is kept only as an opt-in fallback —
+        # its internal pointer bookkeeping is hard to validate and HybridEngine
+        # deliberately avoids it.
         if os.environ.get("AWEX_OPT_OFFLOAD_VIA_HDO", "").strip() == "1" and hasattr(
             optimizer, "offload_to_cpu"
         ):
@@ -226,17 +235,21 @@ class MegatronWeightResidency:
 
         count = 0
         for opt in inner_optimizers:
+            # Offload FP32 main parameter copies (shard_fp32_from_float16_groups)
             if hasattr(opt, "shard_fp32_from_float16_groups"):
                 for group in opt.shard_fp32_from_float16_groups:
                     if isinstance(group, list):
-                        for tensor in group:
-                            if tensor is not None and tensor.data.is_cuda:
-                                tensor.data = tensor.data.to("cpu", non_blocking=True)
+                        for t in group:
+                            if t is not None and t.data.is_cuda:
+                                self._offloaded_optimizer_params.append((t, t.device))
+                                t.data = t.data.to("cpu", non_blocking=True)
                                 count += 1
                     elif group is not None and group.data.is_cuda:
+                        self._offloaded_optimizer_params.append((group, group.device))
                         group.data = group.data.to("cpu", non_blocking=True)
                         count += 1
 
+            # Offload Adam states (exp_avg, exp_avg_sq)
             base_opt = getattr(opt, "optimizer", opt)
             if not hasattr(base_opt, "state") or base_opt.state is None:
                 continue
@@ -247,15 +260,21 @@ class MegatronWeightResidency:
                         and isinstance(state[key], torch.Tensor)
                         and state[key].is_cuda
                     ):
+                        self._offloaded_optimizer_states.append(
+                            (state, key, state[key].device)
+                        )
                         state[key] = state[key].to("cpu", non_blocking=True)
                         count += 1
 
+        # HybridEngine's targeted fix: transformer_engine caches dummy wgrad
+        # tensors in a module-global dict; without purging it the GPU memory
+        # is never actually freed and stale references survive the offload.
         try:
             from transformer_engine.pytorch.module.base import _dummy_wgrads
 
             purged = len(_dummy_wgrads)
-            for key in list(_dummy_wgrads):
-                del _dummy_wgrads[key]
+            for k in list(_dummy_wgrads):
+                del _dummy_wgrads[k]
             if purged:
                 logger.info("Purged %d TE _dummy_wgrads cache entries", purged)
         except ImportError:
@@ -274,38 +293,19 @@ class MegatronWeightResidency:
             logger.info("Reloaded optimizer via restore_from_cpu()")
             return
 
-        inner_optimizers = self._get_inner_optimizers()
-        if not inner_optimizers:
-            return
-
-        device = self._engine.device
+        # Restore only tensors moved by this adapter. HybridDeviceOptimizer
+        # also owns native CPU parameters and moments, which must stay on CPU.
         count = 0
-        for opt in inner_optimizers:
-            if hasattr(opt, "shard_fp32_from_float16_groups"):
-                for group in opt.shard_fp32_from_float16_groups:
-                    if isinstance(group, list):
-                        for tensor in group:
-                            if tensor is not None and not tensor.data.is_cuda:
-                                tensor.data = tensor.data.to(device, non_blocking=True)
-                                count += 1
-                    elif group is not None and not group.data.is_cuda:
-                        group.data = group.data.to(device, non_blocking=True)
-                        count += 1
-
-            base_opt = getattr(opt, "optimizer", opt)
-            if not hasattr(base_opt, "state") or base_opt.state is None:
-                continue
-            for state in base_opt.state.values():
-                for key in ("exp_avg", "exp_avg_sq"):
-                    if (
-                        key in state
-                        and isinstance(state[key], torch.Tensor)
-                        and not state[key].is_cuda
-                    ):
-                        state[key] = state[key].to(device, non_blocking=True)
-                        count += 1
+        for param, device in self._offloaded_optimizer_params:
+            param.data = param.data.to(device, non_blocking=True)
+            count += 1
+        for state, key, device in self._offloaded_optimizer_states:
+            state[key] = state[key].to(device, non_blocking=True)
+            count += 1
         torch.cuda.synchronize()
-        logger.info("Reloaded %d optimizer state tensors to GPU", count)
+        self._offloaded_optimizer_params.clear()
+        self._offloaded_optimizer_states.clear()
+        logger.info("Reloaded %d optimizer state tensors to original devices", count)
 
 
 __all__ = ["MegatronWeightResidency"]

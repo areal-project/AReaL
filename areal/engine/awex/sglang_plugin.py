@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
+from areal.engine.awex.metadata import serialize_metadata_gc
 
 # Must run before importing SGLang. Its scheduler may import Megatron while
 # initializing the model, and Megatron otherwise switches torch-memory-saver
@@ -65,7 +66,12 @@ from areal.utils.environ import (  # noqa: E402
 from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexSGLangPlugin")
-SUPPORTED_SGLANG_VERSIONS = ("0.5.9", "0.5.10.post1", "0.5.18.dev10+g85b539146")
+SUPPORTED_SGLANG_VERSIONS = (
+    "0.5.9",
+    "0.5.10.post1",
+    "0.5.18.dev10+g85b539146",
+    "0.5.19.dev125+g119b5ffe4",
+)
 
 
 @contextmanager
@@ -229,6 +235,7 @@ class AwexSchedulerPlugin:
         self._scheduler = scheduler
         self._receiver = None
         self._bg_thread: threading.Thread | None = None
+        self._initialization_error: Exception | None = None
         self._weight_queue: queue.Queue = queue.Queue()
         self._version = 0
         self._paused_poll_interval_s = max(
@@ -427,6 +434,12 @@ class AwexSchedulerPlugin:
     def awex_get_parallelism(self) -> dict:
         return self._require_receiver().get_parallelism()
 
+    def _raise_initialization_error(self) -> None:
+        if self._initialization_error is not None:
+            raise RuntimeError(
+                "AWEX receiver initialization failed"
+            ) from self._initialization_error
+
     # ── Main loop hook: process queued weight updates ─────────────────
 
     def process_awex_queue(self, extra_ready: bool = True) -> None:
@@ -456,6 +469,8 @@ class AwexSchedulerPlugin:
         """
         import torch
         import torch.distributed
+
+        self._raise_initialization_error()
 
         tp_cpu_group = self._scheduler.tp_cpu_group
         tp_size = self._int_attr(self._scheduler, "tp_size", 1)
@@ -549,6 +564,7 @@ class AwexSchedulerPlugin:
             original_process_input_requests = scheduler.process_input_requests
 
             def _process_input_requests_with_awex(recv_reqs):
+                plugin._raise_initialization_error()
                 result = original_process_input_requests(recv_reqs)
                 if getattr(scheduler, "_engine_paused", False):
                     plugin.process_awex_queue()
@@ -667,6 +683,7 @@ class AwexSchedulerPlugin:
                 )
 
         def _recv_requests():
+            plugin._raise_initialization_error()
             if hasattr(scheduler, "recv_requests"):
                 return scheduler.recv_requests()
             return scheduler.request_receiver.recv_requests()
@@ -891,7 +908,8 @@ class AwexSchedulerPlugin:
 
         try:
             self._init_receiver_from_meta_server(meta_server_addr)
-        except Exception:
+        except Exception as exc:
+            self._initialization_error = exc
             logger.exception("AWEX background worker initialization failed")
             return
 
@@ -1092,6 +1110,27 @@ def register_awex_plugin() -> None:
     assert_supported_sglang_version()
     from sglang.srt.managers.scheduler import Scheduler
 
+    if os.environ.get("QWEN_AWEX_FROZEN_CONTRACT"):
+        from sglang.srt.managers.scheduler_components import weight_updater
+
+        from areal.engine.sglang_fork_contract import check_static_contract
+        from areal.models.mcore.qwen4_exp_awex_memory import install_kv_residency_hooks
+        from areal.models.mcore.qwen4_exp_frozen_state import install_static_state_hooks
+
+        check_static_contract()
+        # This executes inside each worker before Scheduler construction, so
+        # preservation is installed before any native weights release.
+        install_static_state_hooks(weight_updater)
+        install_kv_residency_hooks(weight_updater, Scheduler)
+
+    # Install before construction: the scheduler dispatcher captures bound
+    # handlers during __init__. Metadata aggregation runs in our worker thread.
+    freeze_gc = getattr(Scheduler, "handle_freeze_gc", None)
+    if callable(freeze_gc) and not getattr(freeze_gc, "_areal_awex_gc_guard", False):
+        guarded_freeze_gc = serialize_metadata_gc(freeze_gc)
+        guarded_freeze_gc._areal_awex_gc_guard = True
+        Scheduler.handle_freeze_gc = guarded_freeze_gc
+
     _orig_init = Scheduler.__init__
 
     def _patched_init(self, *args, **kwargs):
@@ -1107,6 +1146,10 @@ def register_awex_plugin() -> None:
         except BaseException:
             logger.exception("[AWEX] Scheduler.__init__ original init failed")
             raise
+        if os.environ.get("QWEN_AWEX_FROZEN_CONTRACT"):
+            from areal.engine.sglang_fork_contract import check_scheduler_contract
+
+            check_scheduler_contract(self)
         plugin = AwexSchedulerPlugin(self)
         logger.info(
             "[AWEX] Scheduler.__init__ original init complete "

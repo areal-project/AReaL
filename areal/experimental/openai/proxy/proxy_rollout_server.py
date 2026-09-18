@@ -900,6 +900,31 @@ async def _call_client_create(
             raise HTTPException(status_code=500, detail=message) from e
         kwargs["messages"] = prepared_messages
 
+    # The OpenAI SDK flattens extra_body into the HTTP request. Restore template
+    # options to the internal client's extra_body before filtering its arguments.
+    if "chat_template_kwargs" in kwargs and "extra_body" in areal_client_allowed_args:
+        template_kwargs = kwargs.pop("chat_template_kwargs")
+        template_kwargs = {} if template_kwargs is None else template_kwargs
+        extra_body = kwargs.get("extra_body")
+        extra_body = {} if extra_body is None else extra_body
+        if not isinstance(template_kwargs, Mapping) or not isinstance(
+            extra_body, Mapping
+        ):
+            raise HTTPException(
+                status_code=400, detail="Template options must be objects"
+            )
+        nested_options = extra_body.get("chat_template_kwargs")
+        nested_options = {} if nested_options is None else nested_options
+        if not isinstance(nested_options, Mapping):
+            raise HTTPException(
+                status_code=400, detail="Template options must be objects"
+            )
+        # Preserve explicitly nested options when both wire forms are supplied.
+        kwargs["extra_body"] = {
+            **extra_body,
+            "chat_template_kwargs": {**template_kwargs, **nested_options},
+        }
+
     dropped_args = []
     for k, v in kwargs.items():
         if k not in areal_client_allowed_args:

@@ -355,6 +355,8 @@ def make_hf_and_mcore_config(
         if hasattr(hf_config, "_name_or_path"):
             hf_config._name_or_path = hf_path
         return hf_config, bridge.transformer_config
+    elif bridge is not None and bridge_type == "mcore-bridge":
+        return bridge.hf_config, bridge.config
     else:
         hf_config: PretrainedConfig = AutoConfig.from_pretrained(
             pretrained_model_name_or_path=hf_path,
@@ -540,6 +542,23 @@ def make_mcore_model(
         else:
             _configure_actor_output_layers(models, mcore_config)
 
+        return models
+
+    if bridge is not None and bridge_type == "mcore-bridge":
+        if is_critic or use_lora:
+            raise NotImplementedError(
+                "mcore-bridge currently supports the base actor model only; "
+                "critic heads and LoRA are not adapted."
+            )
+        models = bridge.get_model(
+            wrap_with_ddp=mcore_config.wrap_with_ddp,
+            ddp_config=dataclasses.asdict(mcore_config.ddp),
+            use_torch_fsdp2=mcore_config.use_torch_fsdp2,
+            use_custom_fsdp=mcore_config.use_custom_fsdp,
+            overlap_param_gather_with_optimizer_step=mcore_config.overlap_param_gather_with_optimizer_step,
+        )
+        models = list(models)
+        _configure_actor_output_layers(models, mcore_config)
         return models
 
     else:

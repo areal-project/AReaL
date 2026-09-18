@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+from pathlib import Path
+
 from datasets import load_dataset
+
+
+def _rank_local_cache_dir(cache_dir: str | None) -> str | None:
+    if cache_dir is None:
+        return None
+    return str(Path(cache_dir) / f"rank-{os.getenv('RANK', '0')}")
 
 
 def get_gsm8k_sft_dataset(
@@ -8,8 +17,16 @@ def get_gsm8k_sft_dataset(
     split: str,
     tokenizer,
     max_length: int | None = None,
+    cache_dir: str | None = None,
+    **_: object,
 ):
-    dataset = load_dataset(path=path, name="main", split=split)
+    dataset = load_dataset(
+        path=path,
+        name="main",
+        split=split,
+        cache_dir=_rank_local_cache_dir(cache_dir),
+        keep_in_memory=True,
+    )
 
     def process(sample):
         seq_token = tokenizer.encode(
@@ -19,11 +36,15 @@ def get_gsm8k_sft_dataset(
         loss_mask = [0] * len(prompt_token) + [1] * (len(seq_token) - len(prompt_token))
         return {"input_ids": seq_token, "loss_mask": loss_mask}
 
-    dataset = dataset.map(process).remove_columns(["question", "answer"])
+    dataset = dataset.map(process, keep_in_memory=True).remove_columns(
+        ["question", "answer"]
+    )
 
     if max_length is not None:
         # Filter out sequences longer than max_length
-        dataset = dataset.filter(lambda x: len(x["input_ids"]) <= max_length)
+        dataset = dataset.filter(
+            lambda x: len(x["input_ids"]) <= max_length, keep_in_memory=True
+        )
 
     return dataset
 
@@ -33,8 +54,16 @@ def get_gsm8k_rl_dataset(
     split: str,
     tokenizer,
     max_length: int | None = None,
+    cache_dir: str | None = None,
+    **_: object,
 ):
-    dataset = load_dataset(path=path, name="main", split=split)
+    dataset = load_dataset(
+        path=path,
+        name="main",
+        split=split,
+        cache_dir=_rank_local_cache_dir(cache_dir),
+        keep_in_memory=True,
+    )
 
     def process(sample):
         messages = [

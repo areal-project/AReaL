@@ -1,0 +1,332 @@
+experiment_name: qwen38-flash-next-gsm8k-awex256
+trial_name: ${oc.env:QWEN_GSM8K_TRIAL}
+seed: 1234
+enable_offload: false
+total_train_epochs: 10
+total_train_steps: ${oc.env:TOTAL_TRAIN_STEPS,10}
+tokenizer_path: ${oc.env:QWEN_MODEL}
+cluster:
+  n_nodes: 8
+  n_gpus_per_node: 8
+  fileroot: ${oc.env:QWEN_GSM8K_OUTPUT}
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${cluster.fileroot}/name_resolve/${experiment_name}/${trial_name}
+allocation_mode: megatron[actor]:(attn:d1p8t8|ffn:d1p8t1e8)|sglang[rollout]:d16t4
+scheduler:
+  type: slurm
+gconfig:
+  n_samples: 8
+  min_new_tokens: 0
+  max_new_tokens: 65536
+  max_tokens: 262144
+  greedy: false
+  top_p: 1.0
+  top_k: 1000000
+  temperature: 1.0
+  stop_token_ids: []
+  ignore_eos: false
+  skip_special_tokens: true
+  stop: null
+  frequency_penalty: 0.0
+  lora_name: ''
+  use_beam_search: false
+  reward_normalization: true
+  reward_normalization_use_std: false
+  drop_incomplete_group: false
+eval_gconfig:
+  n_samples: 1
+  min_new_tokens: 0
+  max_new_tokens: 65536
+  max_tokens: 262144
+  greedy: false
+  top_p: 1.0
+  top_k: 1000000
+  temperature: 1.0
+  stop_token_ids: []
+  ignore_eos: false
+  skip_special_tokens: true
+  stop: null
+  frequency_penalty: 0.0
+  lora_name: ''
+  use_beam_search: false
+  reward_normalization: false
+  drop_incomplete_group: false
+rollout:
+  backend: sglang:d16t4
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 16
+  queue_size: 32
+  consumer_batch_size: 16
+  max_head_offpolicyness: 0
+  enable_rollout_tracing: true
+  check_trajectory_format: false
+  scheduling_spec:
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    cpu: 4
+    mem: 64
+    mount: ${oc.env:QWEN_MOUNTS}
+    cmd: python3 -m areal.infra.rpc.rpc_server
+    reservation: ${oc.env:QWEN_RESERVATION}
+    nodelist: ${oc.env:QWEN_NODELIST}
+    exclusive: false
+    srun_additional_args: --unbuffered --mpi=pmi2 -K --chdir ${oc.env:QWEN_REPO}
+    env_vars:
+      TMS_INIT_ENABLE: '0'
+      TMS_INIT_ENABLE_CPU_BACKUP: '0'
+      QWEN_AWEX_FROZEN_CONTRACT: ${oc.env:QWEN_AWEX_FROZEN_CONTRACT}
+      QWEN_QSA_QUERY_CHUNK_SIZE: '1024'
+      QWEN_QSA_STABLE_TOPK: '1'
+      NO_PROXY: '*'
+      no_proxy: '*'
+      TOKENIZERS_PARALLELISM: 'false'
+      PLE_CPU_OFFLOAD: '0'
+      AWEX_ACTOR_ALLOC_CONF: expandable_segments:False
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NCCL_DEBUG: WARN
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+      OMP_NUM_THREADS: '4'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      PYTHONUNBUFFERED: '1'
+      PYTHONPATH: ${oc.env:QWEN_ROLLOUT_PYTHONPATH}
+    additional_bash_cmds:
+    - set -euo pipefail
+    - test "$TMS_INIT_ENABLE" = 0
+    - test "$TMS_INIT_ENABLE_CPU_BACKUP" = 0
+    - cd ${oc.env:QWEN_REPO}
+    # Requires a fresh writable layer of SGLang 0.5.19.dev125+g119b5ffe4.
+    - python3 -m examples.swe.qwen38_flash_next.patch_sglang_qsa_topk
+    - python3 -m examples.swe.qwen38_flash_next.patch_sglang_qsa_compress_gather
+    image: ${oc.env:QWEN_ROLLOUT_IMAGE}
+  scheduling_strategy:
+    type: colocation
+    target: actor
+    fork: true
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  setup_timeout: 7200
+  request_timeout: 15600
+  request_retries: 0
+  pause_grace_period: 60
+  agent:
+    mode: inline
+    admin_api_key: ${oc.env:QWEN_GSM8K_PROXY_KEY}
+    tool_call_parser: qwen3_coder
+    reasoning_parser: qwen3
+    chat_template_type: hf
+    engine_max_tokens: 262144
+    export_style: individual
+    turn_discount: 1.0
+    prm:
+      enabled: false
+  return_routed_experts: false
+  _version: v1
+actor:
+  min_usable_group_size: 8
+  backend: megatron:(attn:d1p8t8|ffn:d1p8t1e8)
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${tokenizer_path}
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  weight_update_mode: awex
+  mb_spec:
+    n_mbs: 128
+    granularity: 1
+    max_tokens_per_mb: 262144
+    n_mbs_divisor: 8
+  optimizer:
+    type: adam
+    lr: 3.0e-06
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1.0e-08
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps: 0
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: false
+    enable_fp32_lm_head: false
+    cross_entropy_loss_fusion: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: null
+    moe_token_dispatcher_type: alltoall
+    moe_router_bias_update_rate: 0.0
+    bridge_type: mcore-bridge
+    freeze_ple_table: true
+    language_model_only: true
+    use_bridge_for_update_weights: false
+    enable_mtp: false
+    moe_permute_fusion: true
+    moe_router_fusion: false
+    use_precision_aware_optimizer: false
+    main_grads_dtype: float32
+    main_params_dtype: float32
+    exp_avg_dtype: float32
+    exp_avg_sq_dtype: float32
+  eps_clip: 0.2
+  eps_clip_higher: 0.28
+  temperature: ${gconfig.temperature}
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: false
+  prox_logp_method: reuse_train_logp
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+    lower: 0.5
+  discount: 1.0
+  gae_timestep_unit: token
+  gae_lambda: 1.0
+  gae_lambda_kwargs: {}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_clip: 5.0
+  reward_norm: null
+  adv_norm:
+    mean_level: null
+    std_level: null
+  token_rewards_as_adv: true
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    cpu: 4
+    mem: 64
+    mount: ${oc.env:QWEN_MOUNTS}
+    cmd: python3 -m examples.swe.qwen38_flash_next.actor_worker
+    reservation: ${oc.env:QWEN_RESERVATION}
+    nodelist: ${oc.env:QWEN_NODELIST}
+    exclusive: false
+    srun_additional_args: --unbuffered --mpi=pmi2 -K --chdir ${oc.env:QWEN_REPO}
+    env_vars:
+      TMS_INIT_ENABLE: '0'
+      TMS_INIT_ENABLE_CPU_BACKUP: '0'
+      QWEN_AWEX_FROZEN_CONTRACT: ${oc.env:QWEN_AWEX_FROZEN_CONTRACT}
+      QWEN_QSA_QUERY_CHUNK_SIZE: '1024'
+      NO_PROXY: '*'
+      no_proxy: '*'
+      TOKENIZERS_PARALLELISM: 'false'
+      PLE_CPU_OFFLOAD: '0'
+      AWEX_ACTOR_ALLOC_CONF: expandable_segments:False
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False,garbage_collection_threshold:0.7
+      NCCL_DEBUG: WARN
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+      NVIDIA_TF32_OVERRIDE: '0'
+      CUBLAS_WORKSPACE_CONFIG: :4096:8
+      OMP_NUM_THREADS: '4'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      PYTHONUNBUFFERED: '1'
+      PYTHONPATH: ${oc.env:QWEN_ACTOR_PYTHONPATH}
+    additional_bash_cmds:
+    - set -euo pipefail
+    - test "$TMS_INIT_ENABLE" = 0
+    - test "$TMS_INIT_ENABLE_CPU_BACKUP" = 0
+    - cd ${oc.env:QWEN_REPO}
+    image: ${oc.env:QWEN_ACTOR_IMAGE}
+  _version: v1
+ref: null
+sglang:
+  model_path: ${tokenizer_path}
+  random_seed: 1234
+  skip_tokenizer_init: false
+  dtype: bfloat16
+  context_length: 262144
+  max_prefill_tokens: 8192
+  chunked_prefill_size: 8192
+  max_running_requests: 16
+  mem_fraction_static: 0.65
+  attention_backend: null
+  sampling_backend: null
+  disable_cuda_graph: true
+  disable_radix_cache: false
+  enable_memory_saver: true
+  mamba_ssm_dtype: bfloat16
+  ep_size: 4
+  log_level: info
+train_dataset:
+  batch_size: 16
+  shuffle: true
+  pin_memory: true
+  num_workers: 0
+  path: ${oc.env:QWEN_GSM8K_DATA}
+  type: rl
+  max_length: 4096
+  drop_last: true
+  scheduling_spec: null
+  setup_timeout: 600
+valid_dataset:
+  batch_size: 16
+  shuffle: false
+  pin_memory: true
+  num_workers: 0
+  path: ${oc.env:QWEN_GSM8K_DATA}
+  type: rl
+  max_length: 4096
+  drop_last: false
+  scheduling_spec: null
+  setup_timeout: 600
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+recover:
+  mode: auto
+  retries: 3
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: 5
+  freq_secs: null
+  no_save_optim: false
+  no_load_optim: false
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+    project: ${experiment_name}
+    name: ${trial_name}
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

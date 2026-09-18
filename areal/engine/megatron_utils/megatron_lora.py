@@ -275,7 +275,7 @@ def _build_adapter_config_dict(
     }
 
 
-def _monkey_patch_save_hf_adapter():
+def apply_megatron_bridge_lora_patch() -> None:
     """Add save_hf_adapter to AutoBridge when megatron-bridge does not provide it."""
     from megatron.bridge import AutoBridge
 
@@ -389,10 +389,3 @@ def _monkey_patch_save_hf_adapter():
 
     # Attach the method to the class
     AutoBridge.save_hf_adapter = save_hf_adapter
-
-
-# Current: This monkey patch is needed as the current megatron-bridge 0.3.0 does not have a built-in method
-# to save LoRA adapters in HuggingFace PEFT format, which is required for our use case.
-# Future: This code is however present in main branch of megatron-bridge so this patch is temporary
-# and can be removed later when we upgrade the megatron-bridge version.
-_monkey_patch_save_hf_adapter()

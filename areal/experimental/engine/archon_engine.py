@@ -700,6 +700,7 @@ class ArchonEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         """Perform rollout using connected inference engine."""
         self._check_rollout_engine_connected()
@@ -710,6 +711,7 @@ class ArchonEngine(TrainEngine):
             group_size=group_size,
             min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
 
@@ -724,6 +726,7 @@ class ArchonEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         """Prepare batch from dataloader with rollout."""
         self._check_rollout_engine_connected()
@@ -736,6 +739,7 @@ class ArchonEngine(TrainEngine):
             min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
 

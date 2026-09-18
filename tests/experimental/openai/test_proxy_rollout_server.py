@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -31,6 +32,53 @@ from areal.utils import stats_tracker
 # ---------------------------------------------------------------------------
 
 _ADMIN_KEY = "test-admin-key"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_form", ["flat", "nested", "both"])
+async def test_template_options_survive_proxy_filtering(monkeypatch, wire_form):
+    options = {"enable_thinking": True, "reasoning_effort": "medium"}
+    request = {"unsupported_option": "ignored"}
+    if wire_form in ("flat", "both"):
+        request["chat_template_kwargs"] = options
+    if wire_form in ("nested", "both"):
+        request["extra_body"] = {
+            "chat_template_kwargs": {"reasoning_effort": "low"},
+            "other_extension": 1,
+        }
+    original = deepcopy(request)
+    monkeypatch.setattr(srv, "_openai_client", object())
+    srv._session_cache["session"] = SessionData(session_id="session")
+
+    async def create_fn(extra_body=None, **kwargs):
+        assert "unsupported_option" not in kwargs
+        return extra_body
+
+    result = await srv._call_client_create(create_fn, request, "session")
+    expected = dict(options) if wire_form != "nested" else {}
+    if wire_form != "flat":
+        expected["reasoning_effort"] = "low"
+        assert result["other_extension"] == 1
+    assert result["chat_template_kwargs"] == expected
+    assert request == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [[], "medium", 1])
+async def test_invalid_template_options_return_bad_request(monkeypatch, invalid):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(srv, "_openai_client", object())
+    srv._session_cache["session"] = SessionData(session_id="session")
+
+    async def create_fn(extra_body=None, **kwargs):
+        pytest.fail("Invalid template options reached the client")
+
+    with pytest.raises(HTTPException) as exc:
+        await srv._call_client_create(
+            create_fn, {"chat_template_kwargs": invalid}, "session"
+        )
+    assert exc.value.status_code == 400
 
 
 @pytest.mark.asyncio

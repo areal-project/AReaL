@@ -135,6 +135,8 @@ LOGGER_COLORS_EXACT = {
     "RPCGuard": "white",
     # AWEX weight exchange - cyan (compute backend)
     "AwexColocate": "light_cyan",
+    "QwenRecipe": "white",
+    "QwenWireAudit": "white",
     "AwexColocateReader": "light_cyan",
     "MegatronResidency": "light_cyan",
     "MOPDTeacherPhase": "light_cyan",

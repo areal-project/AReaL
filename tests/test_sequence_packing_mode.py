@@ -18,6 +18,21 @@ def test_qwen3_vl_family_uses_model_thd_with_megatron_bridge(model_type):
     )
 
 
+def test_qwen4_exp_uses_wrapper_thd_with_mcore_bridge():
+    assert not supports_model_packed_seq("qwen4_exp", "mcore-bridge")
+    assert (
+        resolve_sequence_packing_mode("qwen4_exp", "mcore-bridge")
+        == SequencePackingMode.WRAPPER_THD
+    )
+
+
+def test_qwen4_exp_is_registered_as_vision_and_moe_model():
+    from areal.engine.core.model import is_moe_model, is_valid_vision_model
+
+    assert is_valid_vision_model("qwen4_exp")
+    assert is_moe_model("qwen4_exp")
+
+
 @pytest.mark.parametrize(
     ("model_type", "bridge_type"),
     [
@@ -26,6 +41,8 @@ def test_qwen3_vl_family_uses_model_thd_with_megatron_bridge(model_type):
         ("qwen2_5_vl", "megatron-bridge"),
         ("qwen3_5", "megatron-bridge"),
         ("qwen3_5_moe", "megatron-bridge"),
+        ("qwen4_exp", "megatron-bridge"),
+        ("qwen3_vl", "mcore-bridge"),
     ],
 )
 def test_models_without_gpu_model_thd_contract_stay_padded(model_type, bridge_type):
