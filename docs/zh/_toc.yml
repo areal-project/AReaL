@@ -42,6 +42,7 @@ parts:
     chapters:
     - file: reference/checkpointing
     - file: reference/metrics_tracking
+    - file: reference/moe_visualization
     - file: reference/alloc_mode
     - file: reference/lora
     - file: reference/bridge_backend
