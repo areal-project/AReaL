@@ -307,6 +307,50 @@ stats_logger:
     path: "/path/to/tensorboard/logs"  # null 禁用
 ```
 
+## 训练诊断指标
+
+当 advantage 预处理获得重算的 proximal logprob 时，`ppo_actor/train_infer/` 会在标准 PPO 覆盖原始 rollout
+logprob 之前比较两者，不增加模型 forward。 不重算 logprob 的运行和纯 MOPD 预处理路径不会产生这组指标。
+
+设对齐后的有效生成 token 上 `d = log(p_trainer) - log(p_rollout)`：
+
+| 指标                                                                                             | 定义                             |
+| ------------------------------------------------------------------------------------------------ | -------------------------------- |
+| `logp_diff/{avg,min,max}`                                                                        | 带符号差值 d                     |
+| `logp_abs_diff/{avg,min,max}`                                                                    | 绝对差值 abs(d)                  |
+| `logp_diff_squared`                                                                              | d² 的 token 加权均值             |
+| `trainer_nll`、`rollout_nll`                                                                     | 采样 token 负对数概率的均值      |
+| `kl_k1`、`kl_k2`、`kl_k3`                                                                        | -d、d²/2、exp(d)-1-d 的均值      |
+| `ratio_outside_1.5`、`ratio_outside_2`、`ratio_outside_3`、`ratio_outside_5`、`ratio_outside_10` | abs(d) > log(阈值) 的 token 比例 |
+
+统计使用后续 rejection/advantage masking 之前的生成掩码。陈旧 rollout 的差异包含策略变化， 不能全部归因于引擎数值误差。KL
+估计还取决于采样分布、过滤和 logprob 口径；有限样本的 k1 可以为负，k2 是局部近似。聚合后可以用
+`sqrt(max(0, E[d²] - E[abs(d)]²))` 推导绝对差值的总体标准差。
+
+概率比尾部定义与 [R3 论文公式 (3)](https://arxiv.org/html/2510.11370v1) 相同。 当 token 确实来自返回的 rollout
+概率分布且支持集匹配时，k1/k3 估计 `KL(rollout || trainer)`。 top-p/top-k 过滤或 greedy 采样后的实际分布，不一定等于接口返回
+logprob 所描述的分布。
+
+`nonfinite_logp_fraction` 表示有效 token 中任一侧 float32 logprob 为 NaN 或无穷大的比例。 存在这样的 token
+时，概率比尾部指标输出 NaN，不将无效比较误报成零。 掩码之外的 padding 不参与此比例，也不会污染尾部指标。
+
+`ppo_actor/advantage_{positive,negative,zero}_fraction` 基于塑形后的输入 advantage 和 batch loss
+mask，统计位置在 **M2/rejection 过滤之前**。它表示 token 占比，不表示任务成功率或梯度符号。 GSPO 还可能在 loss 内对 advantage
+做序列聚合。
+
+`ppo_actor/update/version_stats/sample_staleness_{theta,proximal}_{avg,min,max}`
+仅统计掩码有效且版本非负的生成 token。均值按 token 加权，极值是聚合组中的全局极值。 theta/proximal 两组兼容字段均使用最近发布的
+checkpoint 版本：actor 和 rollout 在 PPO 更新后一起升版， 这不是 optimizer minibatch
+计数。`stale_token_fraction` 表示 behavior 版本落后的比例， `future_token_fraction` 表示 behavior
+版本超前的比例。统计时将原始版本数组局部左移到预测位置。 统计总体在 **M2/rejection 过滤之前**，每次 `_ppo_update` 计一次，与
+minibatch forward 次数无关。 `n_valid_generated_tokens` 累加这部分 token 观测；不同 update
+重用同一轨迹仍会重复计数。 没有有效 token 时省略均值和极值，不填充为零。
+
+tracker 会保留 detached 张量副本直到 export。一个 batch 的诊断完整启用时， train-infer 统计约保留 57 字节/padded
+token，版本统计约 37 字节，优势符号比例约 12 字节（复用现有 batch 分母），合计约 106 字节/padded
+token/worker，不含临时张量及其他指标。 例如 1000 万 padded token 约需 1.06 GB 的诊断张量存储。这是存储量推导，不是 GPU 峰值实测；
+长上下文内存及运行时开销仍需结合实际 workload 验证。
+
 ## 最佳实践
 
 1. **选择正确的范式**：对标量使用 `scalar()`，对批量 PyTorch 张量（通常是训练指标）使用带分母的 `stat()`。
