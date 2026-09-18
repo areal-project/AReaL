@@ -2,9 +2,67 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
+
+from areal.utils import stats_tracker
+from areal.utils.stats_tracker import ReduceType
+
+
+def log_train_inference_stats(
+    trainer_logp: torch.Tensor,
+    rollout_logp: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    """Compare recomputed and original rollout logprobs before PPO overwrites them.
+
+    Both inputs use next-token alignment. This includes policy drift for stale
+    rollouts; it measures engine agreement only for matching policy versions.
+    Ratio tails follow R3's extreme token fraction F(tau), Eq. (3) in
+    https://arxiv.org/abs/2510.11370. Matching a live dashboard also requires
+    matching its mask, sampling convention, and compared policy versions.
+    """
+    if trainer_logp.shape != rollout_logp.shape or trainer_logp.shape != mask.shape:
+        raise ValueError("Trainer logprobs, rollout logprobs, and mask must match")
+    with stats_tracker.scope("ppo_actor/train_infer"):
+        mask = mask.bool()
+        trainer_logp = trainer_logp.detach().float()
+        rollout_logp = rollout_logp.detach().float()
+        finite_logps = torch.isfinite(trainer_logp) & torch.isfinite(rollout_logp)
+        delta = torch.where(mask, trainer_logp - rollout_logp, 0.0)
+        stats_tracker.denominator(n_valid_tokens=mask)
+        stats_tracker.stat(
+            logp_diff=delta,
+            logp_abs_diff=delta.abs(),
+            denominator="n_valid_tokens",
+        )
+        stats_tracker.stat(
+            trainer_nll=torch.where(mask, -trainer_logp, 0.0),
+            rollout_nll=torch.where(mask, -rollout_logp, 0.0),
+            kl_k1=-delta,
+            kl_k2=delta.square() / 2,
+            kl_k3=delta.expm1() - delta,
+            logp_diff_squared=delta.square(),
+            nonfinite_logp_fraction=(~finite_logps).float(),
+            denominator="n_valid_tokens",
+            reduce_type=ReduceType.AVG,
+        )
+        for threshold in (1.5, 2, 3, 5, 10):
+            stats_tracker.stat(
+                **{
+                    # A NaN comparison is false, which would otherwise turn
+                    # corrupt valid tokens into apparently healthy zero tails.
+                    f"ratio_outside_{threshold}": torch.where(
+                        finite_logps,
+                        (delta.abs() > math.log(threshold)).float(),
+                        float("nan"),
+                    )
+                },
+                denominator="n_valid_tokens",
+                reduce_type=ReduceType.AVG,
+            )
 
 
 def infer_token_denominator(
