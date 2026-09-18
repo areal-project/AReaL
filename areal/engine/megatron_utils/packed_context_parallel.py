@@ -9,7 +9,7 @@ import torch.distributed.nn.functional as dist_F
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
-from areal.engine.core.model import SequencePackingMode
+from areal.engine.core.model import SequencePackingMode, supports_gdn_packed_seq
 from areal.utils.data import (
     MicroBatchItem,
     MicroBatchList,
@@ -429,18 +429,13 @@ def _prepare_mtp_forward_kwargs(
             f"as 1-D tensors, got {labels.shape=} and {loss_mask.shape=}."
         )
 
-    if uses_model_packed_seq:
-        raise NotImplementedError(
-            "MTP training with model-owned THD packing is not supported yet."
-        )
-
     if labels.numel() != packed_num_tokens:
         raise ValueError(
             "MTP labels must match the packed sequence length, got "
             f"{labels.numel()} labels for {packed_num_tokens} tokens."
         )
 
-    if uses_padded_form:
+    if uses_padded_form and not uses_model_packed_seq:
         if attention_mask is None:
             raise ValueError("Padded MTP training requires a 2-D validity mask.")
         padded_labels = torch.zeros_like(input_ids)
@@ -517,9 +512,13 @@ def packed_context_parallel_forward(
                     "Attention mask and tree attention are not supported with "
                     "the model-packed THD forward."
                 )
-            if mpu.get_context_parallel_world_size() > 1:
+            if (
+                mpu.get_context_parallel_world_size() > 1
+                and not supports_gdn_packed_seq()
+            ):
                 raise NotImplementedError(
-                    "The model-packed THD forward does not support CP > 1 yet."
+                    "Model-packed THD with CP > 1 requires megatron-core>=0.18.2 "
+                    "and megatron-bridge>=0.5.1."
                 )
             input_ids, attention_mask, _, max_seqlen = _reconstruct_padded_2d(
                 input_ids, cu_seqlens, input_.get("max_seqlen")

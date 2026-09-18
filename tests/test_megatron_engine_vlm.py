@@ -542,8 +542,77 @@ class TestPackedContextParallelForward:
         assert call["packed_seq_params"] is None
         assert output.shape == (5, 4)
 
+    @pytest.mark.parametrize("cp_rank", [0, 1])
+    def test_model_thd_mtp_alignment_matches_bridge_after_padding(
+        self, monkeypatch, cp_rank
+    ):
+        from areal.api.cli_args import MicroBatchSpec
+        from areal.engine.core.model import SequencePackingMode
+        from areal.engine.megatron_utils import packed_context_parallel as packing
+        from areal.utils.data import MicroBatchList
+
+        bridge_utils = pytest.importorskip(
+            "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils"
+        )
+        for module in (packing, bridge_utils):
+            monkeypatch.setattr(
+                module.mpu, "get_tensor_model_parallel_world_size", lambda: 2
+            )
+            monkeypatch.setattr(
+                module.mpu, "get_context_parallel_world_size", lambda: 2
+            )
+            monkeypatch.setattr(
+                module.mpu, "get_context_parallel_rank", lambda: cp_rank
+            )
+        ids = torch.arange(1, 21)
+        mask = torch.ones_like(ids)
+        mask[[12, 19]] = 0
+        mb = {
+            "input_ids": ids,
+            "loss_mask": mask,
+            "cu_seqlens": torch.tensor([0, 13, 20], dtype=torch.int32),
+            "max_seqlen": 13,
+        }
+        batches = MicroBatchList(
+            data=mb, mb_spec=MicroBatchSpec(), mbs=[mb], group_lens=[20]
+        )
+        prepared = packing.prepare_microbatches_for_sequence_layout(
+            batches, SequencePackingMode.MODEL_THD, pad_to_maximum=False, seq_align_to=8
+        ).padded_mbs[0]
+        assert prepared["cu_seqlens"].tolist() == [0, 16, 24]
+        assert prepared["loss_mask"].sum() == 18
+        padded_ids, validity, _, _ = packing._reconstruct_padded_2d(
+            prepared["input_ids"], prepared["cu_seqlens"], prepared["max_seqlen"]
+        )
+        bridge_ids, bridge_packed = bridge_utils.preprocess_packed_seqs(
+            padded_ids, validity
+        )
+        mtp = packing._prepare_mtp_forward_kwargs(
+            {
+                "mtp_labels": prepared["input_ids"],
+                "mtp_loss_mask": prepared["loss_mask"],
+            },
+            padded_ids,
+            validity,
+            cu_seqlens=prepared["cu_seqlens"],
+            packed_num_tokens=24,
+            uses_padded_form=True,
+            uses_model_packed_seq=True,
+        )
+        torch.testing.assert_close(mtp["mtp_labels"], bridge_ids, rtol=0, atol=0)
+        torch.testing.assert_close(
+            bridge_packed.cu_seqlens_q, prepared["cu_seqlens"], rtol=0, atol=0
+        )
+        expected_mask = bridge_ids.ne(0) & bridge_ids.ne(13) & bridge_ids.ne(20)
+        torch.testing.assert_close(
+            mtp["mtp_loss_mask"].bool(), expected_mask, rtol=0, atol=0
+        )
+
     @pytest.mark.parametrize("cp_size", [2, 4])
-    def test_packed_mtp_uses_input_ids_cp_zigzag_layout(self, monkeypatch, cp_size):
+    @pytest.mark.parametrize("model_packed", [False, True])
+    def test_packed_mtp_uses_input_ids_cp_zigzag_layout(
+        self, monkeypatch, cp_size, model_packed
+    ):
         """Packed MTP labels and masks must follow input_ids on every CP rank."""
         from areal.engine.megatron_utils import packed_context_parallel
 
@@ -554,6 +623,10 @@ class TestPackedContextParallelForward:
         input_ids = torch.arange(sum(seq_lengths), dtype=torch.long)
         labels = input_ids + 100
         loss_mask = input_ids.remainder(3).ne(0)
+
+        monkeypatch.setattr(
+            packed_context_parallel, "supports_gdn_packed_seq", lambda: True
+        )
 
         monkeypatch.setattr(
             packed_context_parallel.mpu,
@@ -609,12 +682,24 @@ class TestPackedContextParallelForward:
                     },
                 },
                 gather_cp_output=False,
+                is_vision_model=model_packed,
+                use_model_packed_seq=model_packed,
             )
 
             call = model.call_args.kwargs
-            torch.testing.assert_close(
-                call["input_ids"].squeeze(0), expected_ids, rtol=0, atol=0
-            )
+            if model_packed:
+                # The bridge sees full BSHD tokens and packs them internally;
+                # its decoder's MTP channel must already use local THD tokens.
+                torch.testing.assert_close(
+                    call["input_ids"][call["attention_mask"]],
+                    input_ids,
+                    rtol=0,
+                    atol=0,
+                )
+            else:
+                torch.testing.assert_close(
+                    call["input_ids"].squeeze(0), expected_ids, rtol=0, atol=0
+                )
             torch.testing.assert_close(
                 call["mtp_kwargs"]["mtp_labels"].squeeze(0),
                 expected_ids + 100,

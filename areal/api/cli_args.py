@@ -1127,6 +1127,18 @@ class MegatronEngineConfig:
         },
     )
 
+    mtp_only: bool = field(
+        default=False,
+        metadata={
+            "help": "Freeze all non-MTP parameters before DDP/optimizer construction. "
+            "Requires enable_mtp_training=True, bridge_type='megatron-bridge', "
+            "and one native MTP layer. Pipeline stages without MTP stay frozen. "
+            "Shared embeddings and output weights stay frozen. "
+            "Not supported with LoRA, critic models, or FSDP wrappers. The main "
+            "loss path is retained to trigger the auxiliary MTP backward.",
+        },
+    )
+
     mtp_loss_scaling_factor: float = field(
         default=0.1,
         metadata={
@@ -1138,6 +1150,53 @@ class MegatronEngineConfig:
     def __post_init__(self) -> None:
         if self.enable_mtp_training and not self.enable_mtp:
             raise ValueError("enable_mtp_training requires enable_mtp=True")
+        if self.mtp_only:
+            if not self.enable_mtp_training:
+                raise ValueError("mtp_only requires enable_mtp_training=True")
+            if self.bridge_type != "megatron-bridge":
+                raise ValueError("mtp_only requires bridge_type='megatron-bridge'")
+            if (
+                not math.isfinite(self.mtp_loss_scaling_factor)
+                or self.mtp_loss_scaling_factor <= 0
+            ):
+                raise ValueError(
+                    "mtp_only requires a finite, positive mtp_loss_scaling_factor"
+                )
+            if self.use_custom_fsdp or self.use_torch_fsdp2:
+                raise ValueError("mtp_only does not support FSDP wrappers")
+            # Check the actual runtime: package metadata alone cannot establish
+            # which cuDNN shared library PyTorch loads.
+            from importlib.metadata import PackageNotFoundError
+
+            import torch
+
+            for package, minimum in (
+                ("megatron-core", "0.18.2"),
+                ("megatron-bridge", "0.5.1"),
+            ):
+                try:
+                    installed = pkg_version.get_version(package)
+                except PackageNotFoundError as exc:
+                    raise ValueError(
+                        f"mtp_only requires {package}>={minimum}; package not installed"
+                    ) from exc
+                if pkg_version.compare_versions(installed, minimum) < 0:
+                    raise ValueError(
+                        f"mtp_only requires {package}>={minimum}; found {installed}"
+                    )
+            try:
+                cudnn_version = torch.backends.cudnn.version()
+            except RuntimeError as exc:
+                raise ValueError(
+                    "mtp_only requires loaded cuDNN>=9.19.0; "
+                    "PyTorch could not load cuDNN"
+                ) from exc
+            if cudnn_version is None or cudnn_version < 91900:
+                raise ValueError(
+                    "mtp_only requires loaded cuDNN>=9.19.0 (91900); "
+                    f"torch.backends.cudnn.version() returned {cudnn_version}. "
+                    "Ensure PyTorch loads the upgraded cuDNN shared libraries."
+                )
         if self.lm_head_loss_chunk_size < 0:
             raise ValueError(
                 "lm_head_loss_chunk_size must be non-negative, got "

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+import inspect
 import types
+from functools import partial
 from typing import Any
 
 import torch
@@ -12,10 +14,12 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig as MCoreDDPConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 from transformers import AutoConfig, PretrainedConfig
 
 from areal.api.cli_args import MegatronEngineConfig
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
+from areal.engine.megatron_utils.mtp_only import freeze_non_mtp_parameters
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
@@ -406,6 +410,12 @@ def make_mcore_model(
     is_critic: bool = False,
     use_lora: bool = False,
 ) -> list[GPTModel | DDP]:
+    if mcore_config is not None and mcore_config.mtp_only:
+        if bridge_type != "megatron-bridge" or bridge is None:
+            raise ValueError("mtp_only requires a megatron-bridge model")
+        if use_lora or is_critic:
+            raise ValueError("mtp_only does not support LoRA or critic models")
+
     if bridge is not None and bridge_type == "mbridge":
         models = bridge.get_model(
             # TODO: Add DDP options when supporting training
@@ -448,6 +458,11 @@ def make_mcore_model(
         )
         provider.sequence_parallel = mpu.get_tensor_model_parallel_world_size() > 1
         provider.pipeline_dtype = tf_config.params_dtype
+
+        # Bridge defaults to fused cross entropy, whereas AReaL defaults to the
+        # unfused implementation. Honor the explicit engine setting for native
+        # internal objectives such as MTP as well as the main model loss.
+        provider.cross_entropy_loss_fusion = mcore_config.cross_entropy_loss_fusion
 
         provider.recompute_granularity = mcore_config.recompute_granularity
         provider.recompute_method = mcore_config.recompute_method
@@ -515,6 +530,31 @@ def make_mcore_model(
             set_deterministic_algorithms(provider, prebuild=True)
 
         provider.finalize()
+
+        if mcore_config.mtp_only:
+            if getattr(provider, "moe_router_enable_expert_bias", False):
+                raise ValueError(
+                    "mtp_only does not support MoE router expert-bias updates"
+                )
+            # Preserve existing Bridge hooks and freeze before DDP allocates
+            # buffers. Do not disable autograd: the main loss still triggers
+            # Megatron-Core's auxiliary MTP loss through MTPLossAutoScaler.
+            # Stages without MTP are fully frozen, including all their virtual
+            # chunks. Keep the missing-MTP check on ranks expected to own MTP.
+            if "config" in inspect.signature(mtp_on_this_rank).parameters:
+                owns_mtp = mtp_on_this_rank(provider, ignore_virtual=True)
+            else:
+                owns_mtp = mtp_on_this_rank(
+                    layout=getattr(provider, "pipeline_model_parallel_layout", None),
+                    mtp_num_layers=provider.mtp_num_layers,
+                    ignore_virtual=True,
+                )
+            provider.register_pre_wrap_hook(
+                partial(
+                    freeze_non_mtp_parameters,
+                    allow_missing_mtp=not owns_mtp,
+                )
+            )
 
         ddp_config = MCoreDDPConfig(**dataclasses.asdict(mcore_config.ddp))
         if use_lora:
