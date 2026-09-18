@@ -905,21 +905,33 @@ async def _call_client_create(
     )
     extra_body = dict(kwargs.get("extra_body") or {})
     session_template = session_data.metadata.get("chat_template_kwargs") or {}
-    request_template = {
-        **session_template,
-        **(extra_body.get("chat_template_kwargs") or {}),
-        **(kwargs.pop("chat_template_kwargs", None) or {}),
-    }
     thinking_keys = ("thinking_option", "enable_thinking", "thinking")
-    session_thinking = {k: v for k, v in session_template.items() if k in thinking_keys}
+    template_kwargs = {}
+    for layer in (
+        defaults,
+        session_template,
+        extra_body.get("chat_template_kwargs") or {},
+        kwargs.pop("chat_template_kwargs", None) or {},
+    ):
+        effective = {
+            key: value
+            for key, value in layer.items()
+            if key not in thinking_keys or value is not None
+        }
+        # Thinking aliases share precedence, even when their names differ.
+        if any(key in effective for key in thinking_keys):
+            for key in thinking_keys:
+                template_kwargs.pop(key, None)
+        template_kwargs.update(effective)
+    session_thinking = {
+        key: value
+        for key, value in session_template.items()
+        if key in thinking_keys and value is not None
+    }
     if session_thinking:
         for key in thinking_keys:
-            request_template.pop(key, None)
-        request_template.update(session_thinking)
-    if any(key in request_template for key in thinking_keys):
-        for key in thinking_keys:
-            defaults.pop(key, None)
-    template_kwargs = {**defaults, **request_template}
+            template_kwargs.pop(key, None)
+        template_kwargs.update(session_thinking)
     if template_kwargs:
         extra_body["chat_template_kwargs"] = template_kwargs
         kwargs["extra_body"] = extra_body
