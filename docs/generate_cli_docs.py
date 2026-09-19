@@ -83,6 +83,7 @@ def categorize_dataclasses(
     logging_configs = [
         "StatsLoggerConfig",
         "WandBConfig",
+        "WandBSystemMetricsConfig",
         "SwanlabConfig",
         "TensorBoardConfig",
         "TrackioConfig",
@@ -186,31 +187,43 @@ def get_type_description(field_type, all_dataclasses: dict[str, Any]) -> str:
 def format_default_value(field_obj) -> str:
     """Format default values for display."""
 
-    if field_obj.default is not DATACLASSES_MISSING:
-        default_value = field_obj.default
-        if default_value == OMEGACONF_MISSING:
+    scalar_types = (str, int, float, bool, type(None))
+
+    def is_literal(default_value) -> bool:
+        """Whether a value is simple enough to print verbatim."""
+        if isinstance(default_value, scalar_types):
+            return True
+        elif isinstance(default_value, (list, tuple)):
+            return all(isinstance(item, scalar_types) for item in default_value)
+        elif isinstance(default_value, dict):
+            return all(
+                isinstance(item, scalar_types)
+                for pair in default_value.items()
+                for item in pair
+            )
+        return False
+
+    def format_value(default_value) -> str:
+        if default_value is OMEGACONF_MISSING:
             return "**Required**"
         elif default_value is None:
             return "`None`"
         elif isinstance(default_value, str):
             return f'`"{default_value}"`'
-        elif isinstance(default_value, list) and len(default_value) == 0:
-            return "`[]`"
-        elif isinstance(default_value, bool):
-            return f"`{default_value}`"
         else:
             return f"`{default_value}`"
+
+    if field_obj.default is not DATACLASSES_MISSING:
+        return format_value(field_obj.default)
     elif field_obj.default_factory is not DATACLASSES_MISSING:
         try:
             factory_result = field_obj.default_factory()
-            if isinstance(factory_result, list) and len(factory_result) == 0:
-                return "`[]`"
-            elif isinstance(factory_result, dict) and len(factory_result) == 0:
-                return "`{}`"
-            else:
-                return f"*{type(factory_result).__name__}*"
         except Exception:
             return f"*default {field_obj.default_factory.__name__}*"
+        if is_literal(factory_result):
+            return format_value(factory_result)
+        # Composite defaults (nested configs) render as their type name.
+        return f"*{type(factory_result).__name__}*"
     else:
         return "**Required**"
 
