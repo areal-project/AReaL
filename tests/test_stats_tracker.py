@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -9,6 +10,48 @@ from areal.utils.stats_tracker import (
     ReduceType,
     _StatMetadata,
 )
+
+
+def test_compact_stats_match_masked_tensor_reductions_across_unequal_batches():
+    tracker = DistributedStatsTracker()
+    tracker.stat_compact(
+        torch.tensor([True, False, True]),
+        ReduceType.AVG_MIN_MAX,
+        value=torch.tensor([2.0, float("nan"), 6.0]),
+    )
+    tracker.stat_compact(
+        torch.tensor([True]),
+        ReduceType.AVG_MIN_MAX,
+        value=torch.tensor([12.0]),
+    )
+    assert tracker.export() == {
+        "value/avg": 20 / 3,
+        "value/min": 2,
+        "value/max": 12,
+    }
+
+
+def test_compact_stats_no_valid_tokens_omit_avg_but_keep_sum():
+    tracker = DistributedStatsTracker()
+    mask = torch.tensor([False, False])
+    tracker.stat_compact(mask, ReduceType.AVG_MIN_MAX, value=torch.ones(2))
+    tracker.stat_compact(mask, ReduceType.SUM, count=torch.ones(2))
+    assert tracker.export() == {"count": 0}
+
+
+def test_compact_stats_cannot_reuse_a_normal_stat_key():
+    tracker = DistributedStatsTracker()
+    mask = torch.tensor([True])
+    tracker.denominator(valid=mask)
+    tracker.stat(denominator="valid", value=torch.ones(1))
+    with pytest.raises(ValueError, match="non-compact stats"):
+        tracker.stat_compact(mask, ReduceType.AVG, value=torch.ones(1))
+
+    compact_tracker = DistributedStatsTracker()
+    compact_tracker.stat_compact(mask, ReduceType.AVG, value=torch.ones(1))
+    compact_tracker.denominator(valid=mask)
+    with pytest.raises(ValueError, match="compact stats"):
+        compact_tracker.stat(denominator="valid", value=torch.ones(1))
 
 
 def test_export_uses_key_sync_group_for_missing_per_key_stat():
