@@ -119,18 +119,22 @@ def resolve_sequence_packing_mode(
     """Select one packing path from the model and bridge contract."""
     if supports_model_packed_seq(model_type, bridge_type):
         return SequencePackingMode.MODEL_THD
-    if is_valid_vision_model(model_type) or requires_padded_seq(model_type):
+    if is_valid_vision_model(model_type) or requires_padded_seq(
+        model_type, bridge_type
+    ):
         return SequencePackingMode.PADDED
     return SequencePackingMode.WRAPPER_THD
 
 
-def requires_padded_seq(model_type: str) -> bool:
+def requires_padded_seq(model_type: str, bridge_type: str | None = None) -> bool:
     """Whether the model must run the padded (BSHD) forward instead of packed (THD).
 
-    Older GDN kernels reject packed sequences. Keep their padded fallback;
-    newer kernels and bridges support THD for the Qwen3.5 architecture family.
+    Only the active Megatron-Bridge backend has a validated GDN THD contract.
+    Keep other or unspecified bridges padded regardless of installed packages.
     """
-    return is_qwen3_5_model(model_type) and not supports_gdn_packed_seq()
+    return is_qwen3_5_model(model_type) and not (
+        bridge_type == "megatron-bridge" and supports_gdn_packed_seq()
+    )
 
 
 # Copied from trl

@@ -70,4 +70,42 @@ def test_qwen35_packing_requires_compatible_releases(
             else SequencePackingMode.MODEL_THD
         )
     assert resolve_sequence_packing_mode(model_type, "megatron-bridge") == expected
-    assert model.requires_padded_seq(model_type) is not packed
+    assert model.requires_padded_seq(model_type, "megatron-bridge") is not packed
+
+
+@pytest.mark.parametrize(
+    "model_type", ["qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"]
+)
+@pytest.mark.parametrize("bridge_version", [None, "0.4.0", "0.5.1", "0.6.0"])
+def test_qwen35_mbridge_stays_padded_when_unused_bridge_changes(
+    monkeypatch, model_type, bridge_version
+):
+    from areal.engine.core import model
+
+    def version(package):
+        if package == "megatron-core":
+            return "0.18.2"
+        if bridge_version is None:
+            raise model.PackageNotFoundError(package)
+        return bridge_version
+
+    monkeypatch.setattr(model, "version", version)
+    assert not supports_model_packed_seq(model_type, "mbridge")
+    assert model.requires_padded_seq(model_type, "mbridge")
+    assert (
+        resolve_sequence_packing_mode(model_type, "mbridge")
+        == SequencePackingMode.PADDED
+    )
+
+
+@pytest.mark.parametrize("bridge_type", [None, "mbridge"])
+def test_qwen35_unvalidated_bridge_does_not_query_package_versions(
+    monkeypatch, bridge_type
+):
+    from areal.engine.core import model
+
+    def unexpected(package):
+        pytest.fail(f"Inactive bridge must not query {package}")
+
+    monkeypatch.setattr(model, "version", unexpected)
+    assert model.requires_padded_seq("qwen3_5_text", bridge_type)

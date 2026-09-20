@@ -559,7 +559,9 @@ class MegatronEngine(TrainEngine):
             # ``PADDED`` is the input-routing fallback for every VLM without a
             # model-owned THD contract. ``use_padded_seq`` is narrower: it
             # enables Qwen3.5/GDN-specific dense-mask and LM-head semantics.
-            self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
+            self.use_padded_seq = requires_padded_seq(
+                self.hf_config.model_type, self.bridge_cls
+            )
             if self.is_vision_model:
                 if self.parallel_strategy.context_parallel_size > 1 and not (
                     self.use_model_packed_seq and supports_gdn_packed_seq()
