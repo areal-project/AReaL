@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -254,6 +255,78 @@ def test_ppo_trainer_orders_initial_eval_around_recovery(monkeypatch, recovered:
             "epoch_step": -1,
             "global_step": -1,
         }
+
+
+@pytest.mark.parametrize("role", ["ref", "critic", "teacher", None])
+@pytest.mark.parametrize(
+    ("version", "mode"), [("v1", "awex"), ("v1", "disk"), ("v2", "awex")]
+)
+def test_ppo_train_colocated_auxiliary_scoring_releases_rollout_first(
+    monkeypatch, role, version, mode
+):
+    """Auxiliary scoring must not overlap rollout memory or load the actor early."""
+    _disable_timing_contexts(monkeypatch, rl_trainer)
+    trainer = _build_ppo_trainer([])
+    trainer.config.actor._version = version
+    trainer.config.actor.weight_update_mode = mode
+    trainer.config.rollout._version = version
+    awex_colocate = version == "v1" and mode == "awex"
+    trainer._should_offload_rollout = not awex_colocate
+    trainer._should_offload_actor = not awex_colocate
+    trainer.rollout = Mock()
+    released = set()
+    memory_tags = {"kv_cache", "weights", "cuda_graph"}
+
+    def release_rollout(*, tags=None):
+        trainer.rollout.pause.assert_called_once()
+        pause = (
+            trainer.rollout.pause_generation_sync
+            if awex_colocate
+            else trainer.rollout.pause_generation
+        )
+        pause.assert_called_once()
+        released.update(memory_tags if tags is None else tags)
+
+    trainer.rollout.offload.side_effect = release_rollout
+    trainer.actor.onload = Mock()
+    auxiliary = Mock(parallel_strategy=SimpleNamespace(dp_size=1))
+
+    def check_auxiliary_memory():
+        assert released == memory_tags, "rollout memory is still resident"
+        trainer.actor.onload.assert_not_called()
+
+    def score(batch):
+        check_auxiliary_memory()
+        return [object() for _ in batch]
+
+    auxiliary.onload.side_effect = check_auxiliary_memory
+    auxiliary.compute_logp.side_effect = score
+    auxiliary.compute_values.side_effect = score
+    if role is not None:
+        setattr(trainer, role, auxiliary)
+        setattr(trainer, f"_should_offload_{role}", True)
+    if role == "teacher":
+        trainer.config.teacher = SimpleNamespace(
+            engine_type="train", rl_loss_weight=1.0, distill_loss_weight=1.0
+        )
+
+    def check_actor_memory():
+        assert released == memory_tags
+        if role is not None:
+            scorer = (
+                auxiliary.compute_values if role == "critic" else auxiliary.compute_logp
+            )
+            scorer.assert_called_once()
+            if role != "critic":
+                auxiliary.offload.assert_called_once()
+
+    trainer.actor.onload.side_effect = check_actor_memory
+
+    with pytest.raises(_StopAfterFirstUpdate):
+        trainer.train(workflow=object())
+
+    trainer.actor.onload.assert_called_once()
+    assert trainer.rollout.offload.call_count == (3 if awex_colocate else 1)
 
 
 @pytest.mark.parametrize(
