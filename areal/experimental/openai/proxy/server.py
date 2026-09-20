@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -13,9 +15,38 @@ from areal.experimental.openai.cache import InteractionCache
 
 if TYPE_CHECKING:
     from areal.experimental.openai.types import InteractionWithTokenLogpReward
+    from areal.infra.processor_cache import ProcessorCallCache
+
+    from .tensor_reference import GroupTensorStore
 
 # Session timeout for cleanup (1 hour)
 SESSION_TIMEOUT_SECONDS = 3600
+
+_SESSION_GATEWAY_KEY_CONTEXT = b"areal-session-gateway-key-v1"
+_SESSION_GATEWAY_TOKEN_CONTEXT = b"areal-session-gateway-token-v1:"
+
+
+def derive_session_gateway_api_key(admin_api_key: str) -> str:
+    """Derive a generation-only gateway credential from the admin key."""
+
+    digest = hmac.new(
+        admin_api_key.encode(),
+        _SESSION_GATEWAY_KEY_CONTEXT,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"areal-gateway-{digest}"
+
+
+def derive_session_gateway_token(admin_api_key: str, session_id: str) -> str:
+    """Bind a public-gateway request to exactly one proxy session."""
+
+    gateway_key = derive_session_gateway_api_key(admin_api_key)
+    digest = hmac.new(
+        gateway_key.encode(),
+        _SESSION_GATEWAY_TOKEN_CONTEXT + session_id.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"areal-session-{digest}"
 
 
 # =============================================================================
@@ -28,6 +59,9 @@ class StartSessionRequest(BaseModel):
 
     task_id: str
     api_key: str | None = None  # Reuse a previously-issued key (refresh)
+    processor_cache_group_id: str | None = None
+    processor_cache_group_size: int = 1
+    metadata: dict[str, Any] | None = None
 
 
 class StartSessionResponse(BaseModel):
@@ -35,6 +69,25 @@ class StartSessionResponse(BaseModel):
 
     session_id: str
     api_key: str
+
+
+class ProcessorCacheGroupRequest(BaseModel):
+    """Request to discard one completed or aborted processor-cache group."""
+
+    group_id: str
+
+
+class FetchSharedTensorsRequest(BaseModel):
+    """Request unique multimodal tensors referenced by grouped trajectories."""
+
+    group_id: str
+    ref_ids: list[str]
+
+
+class FetchSharedTensorsResponse(BaseModel):
+    """Response containing tensors keyed by their group-scoped references."""
+
+    tensors: dict[str, Any]
 
 
 class SetRewardRequest(BaseModel):
@@ -51,12 +104,15 @@ class ExportTrajectoriesRequest(BaseModel):
     discount: float = 1.0
     style: str = "individual"
     drop_retry_orphans: bool = False
+    supports_shared_tensor_references: bool = False
+    is_eval: bool = False
 
 
 class ExportTrajectoriesResponse(BaseModel):
     """Response containing serialized interactions."""
 
     interactions: dict[str, Any]
+    tensor_reference_group_id: str | None = None
 
 
 # =============================================================================
@@ -72,9 +128,15 @@ class SessionData:
         session_id: str,
         prefix_matcher=None,
         sampling_seed_identity: str | None = None,
+        processor_cache: ProcessorCallCache | None = None,
+        processor_cache_group_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ):
         self.session_id = session_id
         self.sampling_seed_identity = sampling_seed_identity or session_id
+        self.processor_cache = processor_cache
+        self.processor_cache_group_id = processor_cache_group_id
+        self.metadata = dict(metadata or {})
 
         self._completed = False
         self._completions = InteractionCache(
@@ -86,7 +148,13 @@ class SessionData:
         self._last_access_time = time.time()
         self._end_time = None
         self._lock = threading.Lock()
+        self.stream_completion_aliases: dict[str, str] = {}
+        self.context_overflow = False
+        self.context_overflow_message = ""
+        self.system_error = False
+        self.system_error_message = ""
         self._next_sampling_request_index = 0
+        self._processor_cache_released = False
 
     def next_sampling_request_index(self) -> int:
         """Reserve a unique request index without serializing request execution."""
@@ -95,10 +163,25 @@ class SessionData:
             self._next_sampling_request_index += 1
         return request_index
 
+    @property
+    def generation_args(self) -> dict[str, Any]:
+        """Generation defaults for requests that omit the corresponding field."""
+        value = self.metadata.get("generation_args")
+        return value if isinstance(value, dict) else {}
+
     def update_last_access(self):
         """Update the last access time for this session."""
         with self._lock:
             self._last_access_time = time.time()
+
+    def take_processor_cache_group_id(self) -> str | None:
+        """Detach the cache and return its group ID once for idempotent release."""
+        with self._lock:
+            if self._processor_cache_released:
+                return None
+            self._processor_cache_released = True
+            self.processor_cache = None
+            return self.processor_cache_group_id
 
     def is_stale(self, timeout_seconds: float = SESSION_TIMEOUT_SECONDS) -> bool:
         """Check if this session has been inactive for too long."""
@@ -109,6 +192,19 @@ class SessionData:
         self._completed = True
         self._end_time = time.time()
         self._completed_event.set()
+
+    def mark_context_overflow(self, message: str) -> None:
+        """Mark the session as recoverable after a context-length failure."""
+        with self._lock:
+            self.context_overflow = True
+            self.context_overflow_message = message
+
+    def mark_system_error(self, message: str) -> None:
+        """Record an internal proxy failure for downstream rejection policy."""
+        with self._lock:
+            self.system_error = True
+            if not self.system_error_message:
+                self.system_error_message = message
 
     @property
     def is_completed(self) -> bool:
@@ -135,10 +231,15 @@ class SessionData:
     ) -> dict[str, InteractionWithTokenLogpReward]:
         if len(self.completions) == 0:
             return {}
-        if drop_retry_orphans:
-            self.completions.drop_retry_orphans()
-        self.completions.apply_reward_discount(turn_discount=discount)
-        return self.completions.export_interactions(style=style)
+        interactions = self.completions.export_interactions(
+            style=style,
+            reward_discount=discount,
+            drop_retry_orphans=drop_retry_orphans,
+        )
+        for interaction in interactions.values():
+            # Interaction-specific values override session defaults.
+            interaction.metadata = {**self.metadata, **interaction.metadata}
+        return interactions
 
 
 # =============================================================================
@@ -148,6 +249,7 @@ class SessionData:
 
 def serialize_interactions(
     interactions: dict[str, InteractionWithTokenLogpReward],
+    tensor_store: GroupTensorStore | None = None,
 ) -> dict[str, Any]:
     """Serialize interactions into a json-compatible format for HTTP transport."""
     from areal.infra.rpc.serialization import serialize_value
@@ -167,6 +269,11 @@ def serialize_interactions(
                 "reward": interaction.reward,
                 "interaction_id": interaction.interaction_id,
             }
+        result[key]["rollout_reward"] = interaction.rollout_reward
+        result[key]["rollout_index"] = interaction.rollout_index
+        result[key]["metadata"] = dict(interaction.metadata)
+    if tensor_store is not None:
+        result = tensor_store.encode_multimodal_tensors(result)
     return serialize_value(result)
 
 
@@ -187,7 +294,10 @@ def deserialize_interactions(
             interaction.messages = item["messages"]
             interaction.output_message_list = item["output_message_list"]
         interaction.reward = item["reward"]
+        interaction.rollout_reward = item.get("rollout_reward")
+        interaction.rollout_index = item.get("rollout_index")
         interaction.interaction_id = item["interaction_id"]
+        interaction.metadata = dict(item.get("metadata") or {})
         result[key] = interaction
     return result
 
@@ -198,8 +308,11 @@ def deserialize_interactions(
 
 RL_START_SESSION_PATHNAME = "rl/start_session"
 RL_END_SESSION_PATHNAME = "rl/end_session"
+RL_END_PROCESSOR_CACHE_GROUP_PATHNAME = "rl/end_processor_cache_group"
+RL_FETCH_SHARED_TENSORS_PATHNAME = "rl/fetch_shared_tensors"
 RL_SET_REWARD_PATHNAME = "rl/set_reward"
 CHAT_COMPLETIONS_PATHNAME = "chat/completions"
+OPENAI_CHAT_COMPLETIONS_PATHNAME = "v1/chat/completions"
 RESPONSES_PATHNAME = "responses"
 ANTHROPIC_MESSAGES_PATHNAME = "v1/messages"
 GRANT_CAPACITY_PATHNAME = "grant_capacity"

@@ -7,6 +7,7 @@ from areal.utils import logging
 logger = logging.getLogger("EnvironUtils")
 
 _warned_bool_env_var_keys = set()
+_warned_numeric_env_var_values = set()
 _warned_rank_env_var_values = set()
 
 
@@ -65,6 +66,34 @@ def get_bool_env_var(
         _warned_bool_env_var_keys.add(value)
 
     return value in truthy_values
+
+
+def get_float_env_var(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        warn_key = (name, value)
+        if warn_key not in _warned_numeric_env_var_values:
+            logger.warning("Invalid %s=%r; using %s", name, value, default)
+            _warned_numeric_env_var_values.add(warn_key)
+        return default
+
+
+def get_int_env_var(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        warn_key = (name, value)
+        if warn_key not in _warned_numeric_env_var_values:
+            logger.warning("Invalid %s=%r; using %s", name, value, default)
+            _warned_numeric_env_var_values.add(warn_key)
+        return default
 
 
 def is_in_ci():

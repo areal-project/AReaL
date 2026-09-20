@@ -23,6 +23,10 @@ class _FakeSaver:
         pass
 
 
+class _FakeDataLoader(list):
+    sampler = None
+
+
 class _FakeLastStepInfo:
     def next(self):
         return SimpleNamespace(global_step=1)
@@ -79,6 +83,8 @@ class _FailingUpdateActor:
 
 
 class _FailingPPOActor:
+    parallel_strategy = SimpleNamespace(dp_size=1)
+
     def __init__(self, events: list[tuple]):
         self.events = events
 
@@ -134,7 +140,7 @@ def _build_supervised_trainer(
     trainer.recover_info = (
         SimpleNamespace(last_step_info=_FakeLastStepInfo()) if recovered else None
     )
-    trainer.train_dataloader = [[{}], [{}]] if recovered else [[{}]]
+    trainer.train_dataloader = _FakeDataLoader([[{}], [{}]] if recovered else [[{}]])
     trainer.saver = _FakeSaver()
     trainer.actor = _FailingUpdateActor(update_method, events)
     trainer._load_bcast_from = lambda data_generator: next(data_generator)
@@ -150,7 +156,8 @@ def _build_ppo_trainer(events: list[tuple], *, recovered: bool = False):
     trainer.config = SimpleNamespace(
         total_train_epochs=1,
         total_train_steps=None,
-        rollout=SimpleNamespace(agent=None),
+        rollout=SimpleNamespace(agent=None, _version="v1"),
+        teacher=None,
         gconfig=SimpleNamespace(
             n_samples=1,
             reward_normalization=False,
@@ -160,6 +167,8 @@ def _build_ppo_trainer(events: list[tuple], *, recovered: bool = False):
         actor=SimpleNamespace(
             _version="v1",
             weight_update_mode="xccl",
+            min_usable_group_size=None,
+            resolve_min_usable_group_size=lambda _: 1,
             should_compute_prox_logp=lambda: False,
         ),
         memory_profiler=None,
@@ -173,6 +182,8 @@ def _build_ppo_trainer(events: list[tuple], *, recovered: bool = False):
     trainer.critic = None
     trainer.ref = None
     trainer.teacher = None
+    trainer.mopd_execution_plan = None
+    trainer.mopd_teacher_phase = None
     trainer._should_offload_rollout = False
     trainer._should_offload_actor = False
     trainer._requires_proxy_workflow = lambda _workflow: False
@@ -243,6 +254,33 @@ def test_ppo_trainer_orders_initial_eval_around_recovery(monkeypatch, recovered:
             "epoch_step": -1,
             "global_step": -1,
         }
+
+
+@pytest.mark.parametrize(
+    ("requires_rl", "explicit_minimum", "expected"),
+    [(False, None, 1), (False, 3, 3), (True, None, 2)],
+)
+def test_rollout_minimum_uses_only_active_rl_estimator(
+    monkeypatch, requires_rl, explicit_minimum, expected
+):
+    from areal.api.cli_args import NormConfig, PPOActorConfig
+
+    _disable_timing_contexts(monkeypatch, rl_trainer)
+    trainer = _build_ppo_trainer([])
+    trainer.config.actor = PPOActorConfig(
+        reward_norm=NormConfig(mean_level="group", std_level="group", group_size=4),
+        min_usable_group_size=explicit_minimum,
+    )
+    trainer.config.gconfig.n_samples = 4
+    trainer.mopd_execution_plan = SimpleNamespace(requires_rl=requires_rl)
+
+    def prepare_batch(*args, **kwargs):
+        assert kwargs["min_usable_group_size"] == expected
+        raise _StopAfterFirstUpdate
+
+    trainer.actor.prepare_batch = prepare_batch
+    with pytest.raises(_StopAfterFirstUpdate):
+        trainer.train(workflow=object())
 
 
 def test_ppo_initial_eval_offloads_rollout_when_evaluation_fails(monkeypatch):

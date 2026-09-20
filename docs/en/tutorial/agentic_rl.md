@@ -295,6 +295,12 @@ class CamelRLVRWorkflow(RolloutWorkflow):
         return client.export_interactions(style="individual")
 ```
 
+> **Note**: `style="individual"` exports several samples per episode. On grouped
+> rollouts (`n_samples >= 2`) this is incompatible with group-relative normalization
+> (`mean_level: group` / `std_level: group`) and raises a non-retryable
+> `WorkflowContractError`; use `style="concat"` or batch-level normalization there. See
+> the [grouped-rollout contract](../reference/rollout_workflow.md#grouped-rollout).
+
 **Key points:**
 
 - **Parallel episode execution**: AReaL's training loop calls `arun_episode` in parallel

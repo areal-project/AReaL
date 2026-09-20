@@ -16,6 +16,10 @@ from areal.api.io_struct import detect_image_mime
 
 
 def format_reward(predict_str: str) -> float:
+    # A repeated opening tag must not earn a bonus when the chat template
+    # already started the reasoning section in the prompt.
+    if predict_str.count("<think>") != 1 or predict_str.count("</think>") != 1:
+        return 0.0
     pattern = re.compile(r"<think>.*</think>.*\\boxed\{.*\}.*", re.DOTALL)
     match_result = re.fullmatch(pattern, predict_str)
     return 1.0 if match_result else 0.0
@@ -26,8 +30,12 @@ def acc_reward(predict_str: str, ground_truth: str) -> float:
     return 1.0 if grade_answer(answer, ground_truth) else 0.0
 
 
-def geometry3k_reward_fn(completions: str, answer: str, **_: Any) -> float:
-    format_reward_val = format_reward(completions)
+def geometry3k_reward_fn(
+    completions: str, answer: str, *, think_prefilled: bool = False, **_: Any
+) -> float:
+    """Score format across the assistant prefill/completion boundary only."""
+    format_input = "<think>\n" + completions if think_prefilled else completions
+    format_reward_val = format_reward(format_input)
     acc_reward_val = acc_reward(completions, answer)
     format_score = 0.1
     score = (1.0 - format_score) * (acc_reward_val) + format_score * format_reward_val
@@ -132,4 +140,7 @@ class Geometry3KAgent:
         return await self._reward_fn(
             completions=output,
             answer=data["answer"],
+            # Derived when the dataset applies the chat template. Custom request
+            # template overrides must be reflected in that rendering as well.
+            think_prefilled=data.get("think_prefilled", False),
         )

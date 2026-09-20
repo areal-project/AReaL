@@ -141,7 +141,8 @@ class AwexSchedulerBridge:
 # AReaL additions are between # ---- BEGIN AREAL ---- / # ---- END AREAL ----
 # markers.  Deltas vs upstream:
 #   1. AwexSchedulerBridge(scheduler).bind()   -- awex weight update service
-#   2. PPSchedulerBridge(scheduler, server_args).bind()  -- per-PP-rank NCCL groups
+#   2. MTPDistributedWeightUpdateBridge(...).bind() -- NEXTN draft weight routing
+#   3. PPSchedulerBridge(scheduler, server_args).bind()  -- per-PP-rank NCCL groups
 # ---------------------------------------------------------------------------
 
 
@@ -164,7 +165,10 @@ def areal_run_scheduler_process(
 
     Deltas vs upstream:
       1. After ``Scheduler()`` creation -> ``AwexSchedulerBridge(scheduler).bind()``
-      2. After ``Scheduler()`` creation -> ``PPSchedulerBridge(scheduler, server_args).bind()``
+      2. After ``Scheduler()`` creation ->
+         ``MTPDistributedWeightUpdateBridge(scheduler, server_args).bind()``
+      3. After ``Scheduler()`` creation ->
+         ``PPSchedulerBridge(scheduler, server_args).bind()``
     """
     import signal
 
@@ -186,6 +190,9 @@ def areal_run_scheduler_process(
     )
     from sglang.utils import get_exception_traceback
 
+    from areal.v2.inference_service.sglang.mtp_weight_update_bridge import (
+        MTPDistributedWeightUpdateBridge,
+    )
     from areal.v2.inference_service.sglang.pp_bridge import (
         PPSchedulerBridge,
     )
@@ -233,6 +240,7 @@ def areal_run_scheduler_process(
 
         # ---- BEGIN AREAL ----
         AwexSchedulerBridge(scheduler).bind()
+        MTPDistributedWeightUpdateBridge(scheduler, server_args).bind()
         PPSchedulerBridge(scheduler, server_args).bind()
         # ---- END AREAL ----
 

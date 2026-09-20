@@ -13,8 +13,9 @@ Replicates the dispatch semantics of
   collectives via intra-group broadcast).
 - Collect results from DP heads and merge them back into the original
   trajectory order.
-- Pad the batch to a multiple of ``dp_size * group_size`` when not
-  evenly divisible (eval-padding behaviour from PR 1109).
+- Pad eval-route batches (``pad_eval_batch=True``) to a multiple of
+  ``dp_size * group_size`` (eval-padding behaviour from PR 1109); training
+  routes dispatch ragged shards whose cardinalities differ by at most one.
 
 Usage::
 

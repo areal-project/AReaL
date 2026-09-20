@@ -125,7 +125,7 @@ class FrequencyControl:
                     self.__interval_seconds = interval_seconds.item()
                 # We pass time check if the interval second in any process
                 # is larger than self.frequency_seconds.
-                if interval_seconds < self.frequency_seconds:
+                if self.__interval_seconds < self.frequency_seconds:
                     return False
             if (
                 self.frequency_steps is not None

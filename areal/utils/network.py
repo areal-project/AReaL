@@ -152,10 +152,13 @@ def find_free_ports(
 
     max_attempts = count * 10  # Reasonable limit to avoid infinite loops
     attempts = 0
+    # Network resources must not follow or advance the training RNG: jobs with
+    # the same training seed otherwise compete for the same port sequence.
+    port_rng = random.SystemRandom()
 
     while len(free_ports) < count and attempts < max_attempts:
         # Generate random port within range
-        port = random.randint(min_port, max_port)
+        port = port_rng.randint(min_port, max_port)
 
         # Skip if port already attempted or excluded
         if port in attempted_ports or port in exclude_ports:

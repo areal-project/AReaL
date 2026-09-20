@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import aiohttp
 import httpx
 
+from areal.infra.processor_cache import ProcessorCallCache
 from areal.infra.utils.concurrent import register_loop_cleanup
 from areal.infra.utils.http import (
     DEFAULT_REQUEST_TIMEOUT,
@@ -35,11 +36,17 @@ class WorkflowContext:
         Index of this sample within its rollout group, when the workflow runs
         under a grouped workflow. Gives group members a stable identity that
         does not depend on completion order.
+    group_size : int
+        Number of samples in the current rollout group.
+    processor_cache : ProcessorCallCache | None
+        Group-scoped cache shared by candidate workflows in the same process.
     """
 
     is_eval: bool = False
     task_id: int | None = None
     sample_idx: int | None = None
+    group_size: int = 1
+    processor_cache: ProcessorCallCache | None = None
 
 
 _current_context: ContextVar[WorkflowContext] = ContextVar(

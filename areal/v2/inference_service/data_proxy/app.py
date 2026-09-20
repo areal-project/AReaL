@@ -38,7 +38,7 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import serialize_value
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
-from areal.utils.data import concat_padded_tensors
+from areal.utils.data import concat_padded_tensors, is_multi_modal_key
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.seeding import derive_deterministic_seed
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
@@ -70,7 +70,14 @@ def _remotize_trajectory(traj: dict[str, Any], node_addr: str) -> dict[str, Any]
     """Keep scalar reward metadata local while remotizing large tensors."""
     inline = {key: traj[key] for key in _INLINE_TRAJECTORY_FIELDS if key in traj}
     remote_payload = {key: value for key, value in traj.items() if key not in inline}
-    remotized = RTensor.remotize(remote_payload, node_addr=node_addr)
+    # Export already combines all sessions in a group into one trajectory dict.
+    # A single memo therefore covers every occurrence of its shared images.
+    if any(is_multi_modal_key(key) for key in remote_payload):
+        remotized = RTensor.remotize(
+            remote_payload, node_addr=node_addr, preserve_tensor_aliases=True
+        )
+    else:
+        remotized = RTensor.remotize(remote_payload, node_addr=node_addr)
     return {**remotized, **inline}
 
 
@@ -244,10 +251,12 @@ def _create_areal_client(
     return ArealOpenAI(
         engine=inf_bridge,
         tokenizer=tok._tok,
+        processor=tok.processor,
         tool_call_parser=config.tool_call_parser,
         reasoning_parser=config.reasoning_parser,
         engine_max_tokens=config.engine_max_tokens,
         chat_template_type=config.chat_template_type,
+        require_multimodal_processor=True,
     )
 
 
@@ -429,6 +438,11 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         kwargs.setdefault("temperature", 1.0)
         kwargs.setdefault("top_p", 1.0)
         areal_cache = session.active_completions if session is not None else None
+        # Cache ownership comes from authenticated session creation, never from
+        # the request body. Text-only and ungrouped requests keep the old path.
+        kwargs.pop("processor_cache", None)
+        if session is not None and session.processor_cache is not None:
+            kwargs["processor_cache"] = session.processor_cache
 
         deterministic_sampling = session is not None and config.deterministic_sampling
         request_index = (
@@ -570,6 +584,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     sampling_seed_identity=(
                         f"{body.task_id}:{i}" if group_size > 1 else body.task_id
                     ),
+                    processor_cache_group_id=group_id if group_size > 1 else None,
+                    processor_cache_group_size=group_size,
                 )
             except ValueError as e:
                 raise HTTPException(status_code=409, detail=str(e))
@@ -591,10 +607,17 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             )
 
         try:
-            reward_result = session.set_reward(
-                interaction_id=body.interaction_id,
-                reward=body.reward,
-            )
+            if body.rewards is not None:
+                if not body.rewards:
+                    raise HTTPException(
+                        status_code=400, detail="rewards must not be empty"
+                    )
+                reward_result = session.set_rewards(body.rewards)
+            else:
+                reward_result = session.set_reward(
+                    interaction_id=body.interaction_id,
+                    reward=body.reward,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -4,6 +4,7 @@
 # Copyright (c) 2023, Tri Dao.
 
 import copy
+import math
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -13,6 +14,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
+from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api.cli_args import MicroBatchSpec, NormConfig
@@ -22,6 +24,8 @@ from areal.utils.math import align
 from areal.utils.seqpack import get_allocate_fn
 
 logger = logging.getLogger("DataUtils")
+
+TRANSPORT_DUMMY_KEY = "_transport_dummy"
 
 
 def get_batch_size(data: dict[str, Any]) -> int:
@@ -88,6 +92,28 @@ def list_of_dict2dict_of_list(
 def is_multi_modal_key(key: str) -> bool:
     # Any key matching: multi_modal_input*
     return key.startswith("multi_modal_input")
+
+
+def has_multi_modal_tensors(data: Any) -> bool:
+    """Whether a nested payload contains nonempty multi_modal_input* tensors."""
+    pending = [(data, False)]
+    while pending:
+        value, in_multi_modal = pending.pop()
+        if torch.is_tensor(value):
+            if in_multi_modal and value.numel() > 0:
+                return True
+        elif isinstance(value, dict):
+            pending.extend(
+                (
+                    child,
+                    in_multi_modal
+                    or (isinstance(key, str) and is_multi_modal_key(key)),
+                )
+                for key, child in value.items()
+            )
+        elif isinstance(value, (list, tuple)):
+            pending.extend((child, in_multi_modal) for child in value)
+    return False
 
 
 def _get_first_non_multimodal_seq(item: dict[str, Any]) -> Any:
@@ -357,6 +383,45 @@ def split_and_unpad_tensor(
     return result
 
 
+@dataclass(frozen=True)
+class RolloutGroup:
+    """Logical rollouts within one prompt, each occupying contiguous tensor rows.
+
+    Workflows own optional raw reward references. A reference is required when
+    reward normalization consumes a rollout whose row rewards differ.
+    """
+
+    row_counts: tuple[int, ...]
+    rewards: tuple[float | None, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "row_counts", tuple(self.row_counts))
+        object.__setattr__(self, "rewards", tuple(self.rewards))
+        if not self.row_counts or any(
+            type(count) is not int or count < 1 for count in self.row_counts
+        ):
+            raise ValueError("rollout row_counts must be positive integers")
+        if not self.rewards:
+            object.__setattr__(self, "rewards", (None,) * len(self.row_counts))
+        if len(self.rewards) != len(self.row_counts):
+            raise ValueError("rollout rewards must match row_counts")
+        if any(
+            r is not None and (type(r) not in (int, float) or not math.isfinite(r))
+            for r in self.rewards
+        ):
+            raise ValueError("rollout_reward must be finite")
+
+    def validate_rows(self, rows: int) -> "RolloutGroup":
+        # RPC restores dataclass fields without running the constructor and
+        # encodes tuples as lists. Revalidate at the consuming boundary.
+        group = RolloutGroup(self.row_counts, self.rewards)
+        if sum(group.row_counts) != rows:
+            raise ValueError(
+                f"rollout row_counts sum to {sum(group.row_counts)}, expected {rows}"
+            )
+        return group
+
+
 @dataclass
 class TrajBatchMeta:
     """Metadata for reversing concat_batch: traj counts, group sizes, seqlens."""
@@ -364,6 +429,16 @@ class TrajBatchMeta:
     n_trajs: int
     traj_group_sizes: list[int]
     traj_seqlens: list[int]
+    rollout_groups: list[RolloutGroup | None] | None = None
+
+    @property
+    def logical_group_sizes(self) -> list[int]:
+        if self.rollout_groups is None:
+            return self.traj_group_sizes
+        return [
+            len(group.row_counts) if group is not None else rows
+            for group, rows in zip(self.rollout_groups, self.traj_group_sizes)
+        ]
 
 
 def concat_batch(
@@ -373,21 +448,22 @@ def concat_batch(
     assert isinstance(data, list) and all(isinstance(d, dict) for d in data), (
         f"Expected list[dict], got {type(data)}"
     )
-    traj_group_sizes = []
-    for d in data:
-        first_tensor = next(
-            (v for v in d.values() if isinstance(v, torch.Tensor)), None
-        )
-        traj_group_sizes.append(
-            first_tensor.shape[0] if first_tensor is not None else 1
-        )
+    traj_group_sizes = [get_batch_size(d) for d in data]
+    rollout_groups = [d.get("rollout_group") for d in data]
+    for i, (group, rows) in enumerate(zip(rollout_groups, traj_group_sizes)):
+        if group is not None:
+            if not isinstance(group, RolloutGroup):
+                raise ValueError("rollout_group must be a RolloutGroup")
+            rollout_groups[i] = group.validate_rows(rows)
     traj_seqlens = [d["attention_mask"].shape[-1] for d in data]
     meta = TrajBatchMeta(
         n_trajs=len(data),
         traj_group_sizes=traj_group_sizes,
         traj_seqlens=traj_seqlens,
+        rollout_groups=rollout_groups,
     )
-    return concat_padded_tensors(data), meta
+    tensors = [{k: v for k, v in d.items() if k != "rollout_group"} for d in data]
+    return concat_padded_tensors(tensors), meta
 
 
 def split_batch(
@@ -395,9 +471,14 @@ def split_batch(
     meta: TrajBatchMeta,
 ) -> list[Any] | None:
     """Inverse of concat_batch: split batched result back into per-trajectory list."""
-    return split_and_unpad_tensor(
+    split = split_and_unpad_tensor(
         result, meta.n_trajs, meta.traj_group_sizes, meta.traj_seqlens
     )
+    if isinstance(result, dict) and meta.rollout_groups is not None:
+        for item, group in zip(split, meta.rollout_groups):
+            if group is not None:
+                item["rollout_group"] = group
+    return split
 
 
 def batched_call(
@@ -656,6 +737,7 @@ class MicroBatchList:
     # sequence-level padding information
     align_to_lengths: list[int] | None = None
     old_cu_seqlens_list: list[torch.Tensor] | None = None
+    transport_dummy_count: int = 0
 
     @property
     def max_seqlen(self) -> int:
@@ -726,16 +808,78 @@ class MicroBatchList:
             padded_to_lengths=self.padded_to_lengths,
             old_cu_seqlens_list=old_cu_seqlens_list,
             align_to_lengths=self.align_to_lengths,
+            transport_dummy_count=self.transport_dummy_count,
         )
 
 
 DEFAULT_MAX_TOKENS_PER_MB = int(1e12)
 
 
+def make_transport_dummy(template: dict[str, Any]) -> dict[str, Any]:
+    """Create one model-valid row for collective participation."""
+    batch_size = get_batch_size(template)
+    if batch_size < 1:
+        raise ValueError("Cannot create transport padding from an empty batch")
+
+    dummy: dict[str, Any] = {}
+    for key, value in template.items():
+        if is_multi_modal_key(key) and isinstance(value, list):
+            dummy[key] = [{}]
+        elif (
+            isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and value.shape[0] == batch_size
+        ):
+            dummy[key] = torch.zeros_like(value[:1])
+        elif isinstance(value, list) and len(value) == batch_size:
+            dummy[key] = [copy.deepcopy(value[0])]
+        else:
+            dummy[key] = copy.deepcopy(value)
+
+    attention_mask = dummy.get("attention_mask")
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+        raise ValueError("Transport padding requires a 2D attention_mask")
+    if attention_mask.shape[1] < 1:
+        raise ValueError("Transport padding requires sequence length >= 1")
+    attention_mask[:, 0] = 1
+    if isinstance(dummy.get("loss_mask"), torch.Tensor):
+        dummy["loss_mask"].zero_()
+    return dummy
+
+
+def make_transport_microbatch(template: dict[str, Any]) -> dict[str, Any]:
+    """Create one transport-only batch that arbitrary objectives must bypass."""
+    dummy = make_transport_dummy(template)
+    dummy[TRANSPORT_DUMMY_KEY] = True
+    return dummy
+
+
+def _pad_batch_to_min_groups(
+    data: dict[str, Any],
+    *,
+    min_groups: int,
+    granularity: int,
+) -> tuple[dict[str, Any], int]:
+    batch_size = get_batch_size(data)
+    if batch_size % granularity != 0:
+        raise RuntimeError(
+            f"Batch size {batch_size} cannot divide granularity {granularity}."
+        )
+    current_groups = batch_size // granularity
+    pad_count = max(min_groups - current_groups, 0) * granularity
+    if pad_count == 0:
+        return data, 0
+    dummies = [make_transport_dummy(data) for _ in range(pad_count)]
+    return concat_padded_tensors([data, *dummies]), pad_count
+
+
 def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
+    allow_transport_padding: bool = False,
+    *,
+    sync_mbs: bool = True,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -743,6 +887,10 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
+        allow_transport_padding: Add model-valid rows when execution requires
+            more micro-batches than local semantic data can provide.
+        sync_mbs: Synchronize micro-batch counts across ranks. Engines that pad
+            execution with zero-contribution forwards can disable this.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -755,19 +903,56 @@ def split_padded_tensor_dict_into_mb_list(
             mb_spec, max_tokens_per_mb=DEFAULT_MAX_TOKENS_PER_MB
         )
     granularity = mb_spec.granularity
-    bs = data["attention_mask"].shape[0]
-    if bs % granularity != 0:
-        raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
-    max_seqlen = data["attention_mask"].shape[1]
-    seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
-    input_lens = (
-        data["attention_mask"]
-        .view(bs // granularity, granularity, -1)
-        .sum(dim=(1, 2))
-        .long()
-        .cpu()
-        .numpy()
-    )
+    semantic_batch_size = data["attention_mask"].shape[0]
+    allocation_spec = mb_spec
+    transport_dummy_count = 0
+    target_n_mbs = max(mb_spec.n_mbs or 1, mb_spec.n_mbs_divisor)
+
+    while True:
+        if allow_transport_padding:
+            data, added = _pad_batch_to_min_groups(
+                data,
+                min_groups=target_n_mbs,
+                granularity=granularity,
+            )
+            transport_dummy_count += added
+            allocation_spec = MicroBatchSpec.new(mb_spec, n_mbs=target_n_mbs)
+
+        bs = data["attention_mask"].shape[0]
+        if bs % granularity != 0:
+            raise RuntimeError(
+                f"Batch size {bs} cannot divide granularity {granularity}."
+            )
+        max_seqlen = data["attention_mask"].shape[1]
+        seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
+        input_lens = (
+            data["attention_mask"]
+            .view(bs // granularity, granularity, -1)
+            .sum(dim=(1, 2))
+            .long()
+            .cpu()
+            .numpy()
+        )
+        if transport_dummy_count:
+            input_lens[-transport_dummy_count // granularity :] = 0
+
+        if not allow_transport_padding:
+            group_indices = (
+                allocate_balanced_mbs_synced(allocation_spec, input_lens, group=group)
+                if sync_mbs
+                else allocate_balanced_mbs(allocation_spec, input_lens)
+            )
+            break
+
+        group_indices = allocate_balanced_mbs(allocation_spec, input_lens)
+        if not sync_mbs or not dist.is_initialized():
+            break
+        all_n_mbs: list[int | None] = [None] * dist.get_world_size(group)
+        dist.all_gather_object(all_n_mbs, len(group_indices), group=group)
+        synchronized_n_mbs = max(n for n in all_n_mbs if n is not None)
+        if all(n == synchronized_n_mbs for n in all_n_mbs):
+            break
+        target_n_mbs = synchronized_n_mbs
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}
@@ -787,7 +972,6 @@ def split_padded_tensor_dict_into_mb_list(
             not_to_split[key] = value
 
     # split
-    group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
     group_indices = [
         seqpack.flat2d(
             [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
@@ -838,17 +1022,99 @@ def split_padded_tensor_dict_into_mb_list(
     results = []
     # organize splitted micro batches
     assert len(mbs) == len(splitted_lens), (len(mbs), len(splitted_lens))
-    for i, (mb, lens) in enumerate(zip(mbs, splitted_lens)):
-        results.append({**mb, **not_to_split})
+    for mb, indices in zip(mbs, group_indices, strict=True):
+        has_transport_dummy = any(index >= semantic_batch_size for index in indices)
+        is_transport_dummy = has_transport_dummy and all(
+            index >= semantic_batch_size for index in indices
+        )
+        if has_transport_dummy and not is_transport_dummy:
+            raise RuntimeError(
+                "Transport padding must not share a micro-batch with semantic rows"
+            )
+        result = {**mb, **not_to_split}
+        if is_transport_dummy:
+            result[TRANSPORT_DUMMY_KEY] = True
+        results.append(result)
 
     return MicroBatchList(
         data=data,
-        mb_spec=mb_spec,
+        mb_spec=allocation_spec,
         mbs=results,
         forward_indices=forward_indices,
         backward_indices=backward_indices.tolist(),
         group_lens=group_lens,
+        transport_dummy_count=transport_dummy_count,
     )
+
+
+def split_training_batch_into_microbatches(
+    data: dict[str, Any],
+    n_mbs: int,
+    group: dist.ProcessGroup | None = None,
+) -> list[dict[str, Any]]:
+    """Build a synchronized PPO schedule without all-dummy global steps."""
+    if n_mbs < 1:
+        raise ValueError(f"n_mbs must be positive, got {n_mbs}")
+    batch_size = get_batch_size(data)
+    if batch_size < 1:
+        raise ValueError("Cannot split an empty training batch")
+
+    local_n_mbs = min(batch_size, n_mbs)
+    local_mbs = split_padded_tensor_dict_into_mb_list(
+        data,
+        MicroBatchSpec(n_mbs=local_n_mbs),
+        sync_mbs=False,
+    ).mbs
+    if not dist.is_initialized():
+        if local_n_mbs < n_mbs:
+            logger.warning(
+                "Reducing PPO minibatches from %d to %d for a batch of %d rows",
+                n_mbs,
+                local_n_mbs,
+                batch_size,
+            )
+        return local_mbs
+
+    counts: list[int | None] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(counts, len(local_mbs), group=group)
+    concrete_counts = [count for count in counts if count is not None]
+    effective_n_mbs = max(
+        min(n_mbs, sum(concrete_counts)),
+        max(concrete_counts),
+    )
+    if effective_n_mbs < n_mbs:
+        logger.warning(
+            "Reducing synchronized PPO minibatches from %d to %d for %d global "
+            "training microbatches",
+            n_mbs,
+            effective_n_mbs,
+            sum(concrete_counts),
+        )
+    elif effective_n_mbs > n_mbs:
+        logger.warning(
+            "Increasing synchronized PPO minibatches from %d to %d because one "
+            "data-parallel rank produced that many local microbatches",
+            n_mbs,
+            effective_n_mbs,
+        )
+
+    group_rank = dist.get_rank(group=group)
+    offset = sum(concrete_counts[:group_rank])
+    scheduled: list[dict[str, Any] | None] = [None] * effective_n_mbs
+    for index, microbatch in enumerate(local_mbs):
+        slot = (offset + index) % effective_n_mbs
+        if scheduled[slot] is not None:
+            raise RuntimeError(
+                "Microbatch scheduling collision at slot "
+                f"{slot} with {effective_n_mbs} synchronized slots"
+            )
+        scheduled[slot] = microbatch
+
+    dummy = make_transport_microbatch(data)
+    return [
+        microbatch if microbatch is not None else copy.deepcopy(dummy)
+        for microbatch in scheduled
+    ]
 
 
 N_TOKENS_PER_PAGE = 256
@@ -1044,6 +1310,9 @@ def align_mb_list_sequences(
             seq_align_to=seq_align_to,
         )
         assert align_to_length is not None
+        padded_mb = {
+            key: value for key, value in padded_mb.items() if key != TRANSPORT_DUMMY_KEY
+        }
         padded_mbs.append(padded_mb)
         old_cu_seqlens_list.append(old_cu_seqlens)
         align_to_lengths.append(align_to_length)
@@ -1107,6 +1376,9 @@ def pad_mb_list(
             pad_value=pad_value,
             seq_align_to=seq_align_to,
         )
+        padded_mb = {
+            key: value for key, value in padded_mb.items() if key != TRANSPORT_DUMMY_KEY
+        }
         padded_mb_inputs.append(padded_mb)
         pad_lengths.append(pad_len)
         pad_to_lengths.append(pad_to_length)
@@ -1326,11 +1598,188 @@ def all_gather_tensor_container(data, group=None) -> list:
     return results
 
 
-def broadcast_tensor_container(data, src_rank=0, group=None):
+@dataclass(frozen=True)
+class _TensorLeaf:
+    """Picklable stand-in for a tensor leaf inside a gathered container skeleton."""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device_type: str
+
+    @property
+    def numel(self) -> int:
+        return int(np.prod(self.shape))
+
+
+def _deconstruct_tensor_container(value, out_tensors: list[torch.Tensor]):
+    """Split a container into a picklable skeleton and its tensor leaves (DFS order)."""
+    if torch.is_tensor(value):
+        out_tensors.append(value)
+        return _TensorLeaf(tuple(value.shape), value.dtype, value.device.type)
+    if isinstance(value, list):
+        return [_deconstruct_tensor_container(item, out_tensors) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _deconstruct_tensor_container(item, out_tensors)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _reconstruct_tensor_container(skeleton, tensors: Iterator[torch.Tensor]):
+    """Rebuild a container from its skeleton, consuming tensor leaves in DFS order."""
+    if isinstance(skeleton, _TensorLeaf):
+        return next(tensors)
+    if isinstance(skeleton, list):
+        return [_reconstruct_tensor_container(item, tensors) for item in skeleton]
+    if isinstance(skeleton, dict):
+        return {
+            key: _reconstruct_tensor_container(item, tensors)
+            for key, item in skeleton.items()
+        }
+    return skeleton
+
+
+def _skeleton_tensor_leaves(skeletons) -> list[_TensorLeaf]:
+    leaves: list[_TensorLeaf] = []
+
+    def _walk(value):
+        if isinstance(value, _TensorLeaf):
+            leaves.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                _walk(item)
+
+    _walk(skeletons)
+    return leaves
+
+
+def all_gather_ragged_tensor_container(items: list, group=None) -> list[list]:
+    """All-gather per-rank container lists whose lengths differ across ranks.
+
+    Complements :func:`all_gather_tensor_container`, which requires every rank
+    to contribute the same number of items. One object all-gather exchanges
+    per-item skeletons (structure, non-tensor leaves, and tensor metadata);
+    tensor payloads then travel in one padded all-gather per (dtype, device
+    type) bucket. Buckets are derived from the gathered metadata, so every
+    rank — including ranks with no items — joins the same collectives.
+    """
+    world_size = dist.get_world_size(group)
+
+    local_tensors: list[torch.Tensor] = []
+    local_skeletons = [
+        _deconstruct_tensor_container(item, local_tensors) for item in items
+    ]
+
+    all_skeletons: list[list | None] = [None] * world_size
+    dist.all_gather_object(all_skeletons, local_skeletons, group=group)
+
+    leaves_by_rank = [_skeleton_tensor_leaves(skeletons) for skeletons in all_skeletons]
+    buckets = sorted(
+        {
+            (leaf.dtype, leaf.device_type)
+            for rank_leaves in leaves_by_rank
+            for leaf in rank_leaves
+        },
+        key=str,
+    )
+
+    local_rank = dist.get_rank(group=group)
+    payloads: dict[tuple[torch.dtype, str], list[list[torch.Tensor]]] = {}
+    for bucket in buckets:
+        dtype, device_type = bucket
+        device = (
+            torch.device("cpu")
+            if device_type == "cpu"
+            else current_platform.current_device()
+        )
+        max_numel = max(
+            sum(
+                leaf.numel
+                for leaf in rank_leaves
+                if (leaf.dtype, leaf.device_type) == bucket
+            )
+            for rank_leaves in leaves_by_rank
+        )
+        local_bucket_tensors = [
+            tensor
+            for tensor, leaf in zip(
+                local_tensors, leaves_by_rank[local_rank], strict=True
+            )
+            if (leaf.dtype, leaf.device_type) == bucket
+        ]
+        flat = (
+            torch.cat([tensor.reshape(-1) for tensor in local_bucket_tensors])
+            if local_bucket_tensors
+            else torch.empty(0, dtype=dtype, device=device)
+        )
+        padded = F.pad(flat, (0, max_numel - flat.numel()))
+        if max_numel > 0:
+            gathered = [torch.empty_like(padded) for _ in range(world_size)]
+            dist.all_gather(gathered, padded, group=group)
+        else:
+            # Every rank's payload is empty; slicing below yields 0-numel views.
+            gathered = [padded] * world_size
+
+        bucket_payload: list[list[torch.Tensor]] = []
+        for rank_leaves, buffer in zip(leaves_by_rank, gathered, strict=True):
+            offset = 0
+            rank_tensors = []
+            for leaf in rank_leaves:
+                if (leaf.dtype, leaf.device_type) != bucket:
+                    continue
+                # Clone so results do not alias the padded gather buffers,
+                # which would otherwise pin world_size * max_rank_payload
+                # memory for the lifetime of the batch.
+                rank_tensors.append(
+                    buffer.narrow(0, offset, leaf.numel).view(leaf.shape).clone()
+                )
+                offset += leaf.numel
+            bucket_payload.append(rank_tensors)
+        payloads[bucket] = bucket_payload
+
+    results: list[list] = []
+    for rank_index, (skeletons, rank_leaves) in enumerate(
+        zip(all_skeletons, leaves_by_rank, strict=True)
+    ):
+        cursors = {
+            bucket: iter(bucket_payload[rank_index])
+            for bucket, bucket_payload in payloads.items()
+        }
+        ordered = [
+            next(cursors[(leaf.dtype, leaf.device_type)]) for leaf in rank_leaves
+        ]
+        results.append(_reconstruct_tensor_container(skeletons, iter(ordered)))
+    return results
+
+
+def broadcast_tensor_container(
+    data, src_rank=0, group=None, *, preserve_tensor_aliases: bool = False
+):
+    """Broadcast nested tensors; alias preservation is an internal VLM opt-in.
+
+    Only a source payload with nonempty multi_modal_input* tensors activates
+    the opt-in. Receivers follow source metadata, even when their input is None.
+    Text-only calls retain the original wire format and per-reference buffers.
+    """
+    if (
+        preserve_tensor_aliases
+        and dist.get_rank() == src_rank
+        and has_multi_modal_tensors(data)
+    ):
+        dist.broadcast_object_list(
+            [("tensor_aliases", None)], src=src_rank, group=group
+        )
+        return _broadcast_tensor_container_with_aliases(data, src_rank, group)
     if dist.get_rank() != src_rank:
         metadata = [None]
         dist.broadcast_object_list(metadata, src=src_rank, group=group)
         data_type, info = metadata[0]
+        if data_type == "tensor_aliases":
+            return _broadcast_tensor_container_with_aliases(None, src_rank, group)
         if data_type == "none":
             return None
         if data_type == "tensor":
@@ -1404,6 +1853,97 @@ def broadcast_tensor_container(data, src_rank=0, group=None):
             return to_broadcast[0]
 
 
+def _broadcast_tensor_container_with_aliases(data, src_rank=0, group=None):
+    """Preserve repeated tensor objects within a source-selected VLM payload.
+
+    Distinct views are not merged, even when they share a backing storage.
+    """
+    source_indices: dict[int, int] = {}
+    tensor_memo: list[tuple[torch.Tensor | None, torch.Tensor]] = []
+
+    def _broadcast(data):
+        if dist.get_rank() != src_rank:
+            metadata = [None]
+            dist.broadcast_object_list(metadata, src=src_rank, group=group)
+            data_type, info = metadata[0]
+            if data_type == "none":
+                return None
+            if data_type == "tensor_ref":
+                return tensor_memo[info][1]
+            if data_type == "tensor":
+                result = broadcast_tensor(data, src_rank=src_rank, group=group)
+                tensor_memo.append((None, result))
+                return result
+            elif data_type == "list":
+                length = info
+                return [_broadcast(None) for _ in range(length)]
+            elif data_type == "tuple":
+                length, container_type = info
+                values = [_broadcast(None) for _ in range(length)]
+                if container_type is not None:
+                    return container_type(*values)
+                return tuple(values)
+            elif data_type == "dict":
+                keys = info
+                return {k: _broadcast(None) for k in keys}
+            elif data_type == "object":
+                to_broadcast = [None]
+                dist.broadcast_object_list(to_broadcast, src=src_rank, group=group)
+                return to_broadcast[0]
+            else:
+                raise ValueError(f"Unknown data type: {data_type}")
+        else:
+            if data is None:
+                metadata = [("none", None)]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                return None
+            elif torch.is_tensor(data):
+                if id(data) in source_indices:
+                    index = source_indices[id(data)]
+                    dist.broadcast_object_list(
+                        [("tensor_ref", index)], src=src_rank, group=group
+                    )
+                    return tensor_memo[index][1]
+                metadata = [("tensor", None)]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                result = broadcast_tensor(data, src_rank=src_rank, group=group)
+                source_indices[id(data)] = len(tensor_memo)
+                # Retain the source too: contiguous() can create a temporary,
+                # and id reuse must never alias two different input tensors.
+                tensor_memo.append((data, result))
+                return result
+            elif isinstance(data, list):
+                metadata = [("list", len(data))]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                return [_broadcast(d) for d in data]
+            elif isinstance(data, tuple):
+                container_type = type(data) if hasattr(data, "_fields") else None
+                metadata = [("tuple", (len(data), container_type))]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                values = [_broadcast(d) for d in data]
+                if container_type is not None:
+                    return container_type(*values)
+                return tuple(values)
+            elif isinstance(data, dict):
+                metadata = [("dict", list(data.keys()))]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                return {k: _broadcast(v) for k, v in data.items()}
+            else:
+                metadata = [("object", None)]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                to_broadcast = [data]
+                dist.broadcast_object_list(to_broadcast, src=src_rank, group=group)
+                return to_broadcast[0]
+
+    try:
+        return _broadcast(data)
+    finally:
+        # The recursive closure can form a reference cycle. Drop tensor
+        # ownership immediately instead of waiting for cyclic GC.
+        source_indices.clear()
+        tensor_memo.clear()
+
+
 def bcast_mb_list(
     mb_list: MicroBatchList | None, src_rank=0, group=None
 ) -> MicroBatchList:
@@ -1432,9 +1972,10 @@ def bcast_mb_list(
             mb_list.padding_lengths,
             mb_list.padded_to_lengths,
             mb_list.align_to_lengths,
+            mb_list.transport_dummy_count,
         ]
         if mb_list
-        else [None for _ in range(7)]
+        else [None for _ in range(8)]
     )
     dist.broadcast_object_list(to_broadcast, src=src_rank, group=group)
     (
@@ -1445,6 +1986,7 @@ def bcast_mb_list(
         padding_lengths,
         padded_to_lengths,
         align_to_lengths,
+        transport_dummy_count,
     ) = to_broadcast
     return MicroBatchList(
         data=data,
@@ -1458,19 +2000,98 @@ def bcast_mb_list(
         padded_to_lengths=padded_to_lengths,
         old_cu_seqlens_list=old_cu_seqlens_list,
         align_to_lengths=align_to_lengths,
+        transport_dummy_count=transport_dummy_count,
     )
 
 
 def cycle_dataloader(dataloader: StatefulDataLoader, num_cycles: int = -1):
     """Cycle through a dataloader indefinitely."""
     epoch = 0
+    if hasattr(dataloader, "sampler") and isinstance(
+        dataloader.sampler, DistributedSampler
+    ):
+        # Respect an epoch restored by the trainer. Starting from zero here
+        # overwrites the sampler epoch after StatefulDataLoader.load_state_dict
+        # and changes the sample order after recovery.
+        epoch = dataloader.sampler.epoch
+    completed_cycles = 0
     while True:
         if hasattr(dataloader, "sampler") and hasattr(dataloader.sampler, "set_epoch"):
             dataloader.sampler.set_epoch(epoch)
         yield from dataloader
         epoch += 1
-        if num_cycles > 0 and epoch >= num_cycles:
+        completed_cycles += 1
+        if num_cycles > 0 and completed_cycles >= num_cycles:
             break
+
+
+def normalize_rollout_rewards(
+    row_rewards: torch.Tensor,
+    norm: "Normalization",
+    meta: TrajBatchMeta,
+    *,
+    reward_bias: float = 0.0,
+    reward_scaling: float = 1.0,
+    reward_clip: float = float("inf"),
+    unpenalized_rewards: torch.Tensor | None = None,
+    reduce_group=None,
+) -> torch.Tensor:
+    """Normalize row scores against one reference per logical rollout.
+
+    Explicit references bypass row-length penalties; all scores share the
+    actor's bias, scaling and clipping. Missing references require equal rows.
+    """
+    scores = ((row_rewards + reward_bias) * reward_scaling).clamp(
+        min=-reward_clip, max=reward_clip
+    )
+    if norm.mean_level is None and norm.std_level is None:
+        return scores.float()
+    counts: list[int] = []
+    explicit: list[float | None] = []
+    groups = meta.rollout_groups or [None] * meta.n_trajs
+    for group, rows in zip(groups, meta.traj_group_sizes):
+        counts.extend(group.row_counts if group is not None else [1] * rows)
+        explicit.extend(group.rewards if group is not None else [None] * rows)
+    repeats = torch.tensor(counts, device=row_rewards.device, dtype=torch.long)
+    starts = repeats.cumsum(0) - repeats
+    member = torch.repeat_interleave(
+        torch.arange(len(counts), device=row_rewards.device),
+        repeats,
+        output_size=row_rewards.shape[0],
+    )
+    supplied = torch.tensor(
+        [r is not None for r in explicit], device=row_rewards.device, dtype=torch.bool
+    )
+    reference = torch.where(
+        supplied,
+        scores.new_tensor([r if r is not None else 0.0 for r in explicit]),
+        row_rewards[starts],
+    )
+    equal_rows = row_rewards == reference[member]
+    if unpenalized_rewards is not None:
+        equal_rows &= unpenalized_rewards == unpenalized_rewards[starts][member]
+    invalid_reference = torch.any(~supplied[member] & ~equal_rows)
+    if dist.is_initialized() and (
+        norm.mean_level == "batch" or norm.std_level == "batch"
+    ):
+        dist.all_reduce(invalid_reference, op=dist.ReduceOp.MAX, group=reduce_group)
+    torch._assert_async(
+        ~invalid_reference,
+        "Split rollout row rewards differ; supply an explicit rollout_reward "
+        "for reward normalization.",
+    )
+    reference = ((reference + reward_bias) * reward_scaling).clamp(
+        min=-reward_clip, max=reward_clip
+    )
+    mean, scale = norm.affine_parameters(
+        reference,
+        group_sizes=meta.logical_group_sizes,
+        reduce_group=reduce_group,
+    )
+    if norm.std_level is not None:
+        # affine_parameters includes epsilon in the divisor.
+        scale = torch.where(scale <= 2 * norm.eps, 1.0, scale)
+    return ((scores - mean[member]) / scale[member]).float()
 
 
 class Normalization:
@@ -1530,18 +2151,50 @@ class Normalization:
         high_precision: bool = True,
         reduce_group=None,
         group_sizes: list[int] | None = None,
+        group_member_counts: list[int] | None = None,
     ) -> torch.Tensor:
-        bs = x.size(0)
-        eps = self.eps
-
-        # Early return if no elements are active (all masked out)
         if loss_mask is not None and loss_mask.sum().item() == 0:
             return x.float()
+        mean, scale = self.affine_parameters(
+            x,
+            loss_mask,
+            high_precision,
+            reduce_group,
+            group_sizes,
+            group_member_counts,
+        )
+        centered = x - mean
+        if loss_mask is not None:
+            centered = centered * loss_mask
+        return (centered / scale).float()
+
+    @torch.no_grad()
+    def affine_parameters(
+        self,
+        x: torch.Tensor,
+        loss_mask: torch.Tensor | None = None,
+        high_precision: bool = True,
+        reduce_group=None,
+        group_sizes: list[int] | None = None,
+        group_member_counts: list[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the baseline and divisor, retaining masked token statistics.
+
+        Logical member counts only select singleton fallbacks; they do not
+        change the token weights used for advantage normalization.
+        """
+        bs = x.size(0)
+        eps = self.eps
 
         # Pre-compute group slices once (variable-size groups via group_sizes).
         group_slices = None
         if self.mean_level == "group" or self.std_level == "group":
             group_slices = self._build_group_slices(bs, group_sizes)
+            if group_member_counts is not None and (
+                len(group_member_counts) != len(group_slices)
+                or any(count < 1 for count in group_member_counts)
+            ):
+                raise ValueError("group_member_counts must match the prompt groups")
 
         # Step 1: Compute mean
         if self.mean_level == "batch":
@@ -1556,10 +2209,14 @@ class Normalization:
             mean = mean.expand_as(x)
         elif self.mean_level == "group":
             mean = torch.zeros_like(x)
-            for s in group_slices:
+            for i, s in enumerate(group_slices):
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
-                group_sz = s.stop - s.start
+                group_sz = (
+                    group_member_counts[i]
+                    if group_member_counts is not None
+                    else s.stop - s.start
+                )
 
                 # A singleton group has no peer to leave out. Use itself as the
                 # baseline so leave-one-out normalization outputs zero instead
@@ -1581,12 +2238,6 @@ class Normalization:
         else:  # mean_level == "none"
             mean = torch.zeros_like(x)
 
-        # Subtract mean
-        x_centered = x - mean
-        # mask unrelevant elements as 0
-        if loss_mask is not None:
-            x_centered = x_centered * loss_mask
-
         # Step 2: Compute std
         if self.std_level == "batch":
             std = self._compute_std(
@@ -1601,11 +2252,15 @@ class Normalization:
             std = std.expand_as(x)
         elif self.std_level == "group":
             std = torch.zeros_like(x)
-            for s in group_slices:
+            for i, s in enumerate(group_slices):
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
                 group_mean_slice = mean[s]  # already computed and expanded
-                group_sz = s.stop - s.start
+                group_sz = (
+                    group_member_counts[i]
+                    if group_member_counts is not None
+                    else s.stop - s.start
+                )
 
                 # Special case: with group_size=1 and std_unbiased=True, std should be 1 for numerical stability
                 if group_sz == 1 and self.std_unbiased:
@@ -1628,8 +2283,7 @@ class Normalization:
             std = torch.ones_like(x)
             eps = 0.0
 
-        # Normalize
-        return (x_centered / (std + eps)).float()
+        return mean, std + eps
 
     @staticmethod
     def _compute_mean(
@@ -1792,33 +2446,58 @@ class KLEstimator:
         return log_ratio
 
 
-def make_dummy_eval_item(template: dict[str, Any]) -> dict[str, Any]:
+def make_dummy_eval_item(
+    template: dict[str, Any], *, active_attention: bool = False
+) -> dict[str, Any]:
     """Create a zero-contribution dummy item matching *template*'s schema.
 
     Every tensor field is replaced with a minimal all-zeros tensor that
-    preserves dtype and device.  ``attention_mask`` and ``loss_mask`` are
-    set to zero so that downstream loss/metric code treats the item as
-    contributing nothing.
+    preserves dtype, device, and all leading dimensions.  Keeping the
+    trajectory group dimension is required when distributed ranks synchronize
+    their microbatch counts: a padded rank must be able to create as many
+    microbatches as a rank holding a real multi-sample trajectory.
+    ``attention_mask`` and ``loss_mask`` are normally zero so downstream
+    loss/metric code treats the item as contributing nothing.
+    ``active_attention=True`` creates one attended token per sequence for
+    pipeline evaluation; callers must discard its output.
     """
+    from areal.infra.rpc.rtensor import RTensor
 
-    def _zero_tensor_like(tensor: torch.Tensor) -> torch.Tensor:
-        return torch.zeros((1, 1), dtype=tensor.dtype, device=tensor.device)
+    def _minimal_tensor_like(
+        tensor: torch.Tensor | RTensor, *, fill_value: int = 0
+    ) -> torch.Tensor:
+        if isinstance(tensor, RTensor):
+            device = torch.device("cpu")
+        else:
+            device = tensor.device
+        shape = (*tensor.shape[:-1], 1) if tensor.ndim > 0 else (1,)
+        return torch.full(shape, fill_value, dtype=tensor.dtype, device=device)
+
+    group_size = 1
+    attention_mask = template.get("attention_mask")
+    if isinstance(attention_mask, (torch.Tensor, RTensor)) and attention_mask.ndim >= 2:
+        group_size = attention_mask.shape[0]
 
     dummy: dict[str, Any] = {}
     for key, value in template.items():
         if key in {"attention_mask", "loss_mask"}:
-            if isinstance(value, torch.Tensor):
-                dummy[key] = _zero_tensor_like(value)
+            if isinstance(value, (torch.Tensor, RTensor)):
+                fill_value = int(active_attention and key == "attention_mask")
+                dummy[key] = _minimal_tensor_like(value, fill_value=fill_value)
             else:
-                dummy[key] = torch.zeros((1, 1), dtype=torch.bool)
+                dummy[key] = torch.full(
+                    (1, 1),
+                    int(active_attention and key == "attention_mask"),
+                    dtype=torch.bool,
+                )
             continue
 
         if key.startswith("multi_modal_input"):
-            dummy[key] = [{}]
+            dummy[key] = [{} for _ in range(group_size)]
             continue
 
-        if isinstance(value, torch.Tensor):
-            dummy[key] = _zero_tensor_like(value)
+        if isinstance(value, (torch.Tensor, RTensor)):
+            dummy[key] = _minimal_tensor_like(value)
         else:
             dummy[key] = copy.deepcopy(value)
 

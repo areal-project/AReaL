@@ -57,6 +57,34 @@ from areal.utils.offload import get_tms_env_vars
 logger = logging.getLogger("SlurmScheduler")
 
 
+def _resolve_fork_python_executable(spec: SchedulingSpec | None) -> str:
+    """Resolve Python inside the worker that will own a forked process."""
+    if spec is None or not spec.cmd:
+        return sys.executable
+    try:
+        command = shlex.split(spec.cmd)
+    except ValueError:
+        return sys.executable
+    if not command:
+        return sys.executable
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(command[0]).name):
+        try:
+            module_flag = command.index("-m", 1)
+        except ValueError:
+            pass
+        else:
+            if module_flag + 1 < len(command):
+                return command[0]
+    return sys.executable
+
+
+def _resolve_srun_additional_args(spec: SchedulingSpec, scheduler_args: str) -> str:
+    """Prefer an explicit role override while preserving scheduler defaults."""
+    if spec.srun_additional_args != SchedulingSpec().srun_additional_args:
+        return spec.srun_additional_args
+    return scheduler_args
+
+
 @dataclass
 class SlurmWorkerInfo:
     """Slurm worker information."""
@@ -494,6 +522,7 @@ class SlurmScheduler(Scheduler):
         target_wi: SlurmWorkerInfo,
         target_role: str,
         command: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> SlurmWorkerInfo:
         """Fork a single worker asynchronously.
 
@@ -536,7 +565,7 @@ class SlurmScheduler(Scheduler):
             # 2. Build the full raw command
             module_path = command or "areal.infra.rpc.rpc_server"
             raw_cmd = [
-                sys.executable,
+                _resolve_fork_python_executable(target_wi.spec),
                 "-m",
                 module_path,
                 "--host",
@@ -568,6 +597,7 @@ class SlurmScheduler(Scheduler):
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "env": env or {},
             }
             async with session.post(
                 f"{guard_url}/fork",
@@ -715,6 +745,7 @@ class SlurmScheduler(Scheduler):
         target_role: str,
         target_workers: list[SlurmWorkerInfo],
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
 
@@ -732,7 +763,13 @@ class SlurmScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    command,
+                    None if env_vars is None else env_vars[idx],
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -795,6 +832,7 @@ class SlurmScheduler(Scheduler):
         role: str,
         target_role: str,
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Fork new worker processes from existing workers.
 
@@ -827,6 +865,7 @@ class SlurmScheduler(Scheduler):
                 target_role,
                 target_workers,
                 command,
+                env_vars,
             )
         except Exception:
             # Cleanup on failure
@@ -912,24 +951,37 @@ class SlurmScheduler(Scheduler):
 
         bash_cmds = (spec.additional_bash_cmds or []).copy()
 
-        # Set CUDA_VISIBLE_DEVICES based on SLURM_LOCALID before any Python imports.
-        # This MUST happen before Python starts, otherwise CUDA runtime ignores the
-        # env var change once it's initialized.
-        # We use bash commands instead of env_vars_dict because SLURM_LOCALID is only
-        # available at runtime and each task needs a different value.
+        # Slice Slurm's node-local allocation before CUDA is initialized. Rebuilding
+        # device IDs from zero can put separate jobs on the same physical GPU.
+        # Preserve the runtime namespace, including cgroup remapping and UUIDs.
         if total_gpus > 0:
             gpus_per_task = spec.gpu
-            if gpus_per_task == 1:
-                cuda_setup_cmd = (
-                    f"export CUDA_VISIBLE_DEVICES=$((SLURM_LOCALID * {gpus_per_task}))"
-                )
-            else:
-                cuda_setup_cmd = (
-                    f"export CUDA_VISIBLE_DEVICES=$(seq -s, $((SLURM_LOCALID * {gpus_per_task})) "
-                    f"$((SLURM_LOCALID * {gpus_per_task} + {gpus_per_task} - 1)))"
-                )
+            cuda_setup_cmd = (
+                f"areal_device_offset=$((SLURM_LOCALID * {gpus_per_task}));\n"
+                'if [[ -z "${CUDA_VISIBLE_DEVICES-}" && -z "${ASCEND_RT_VISIBLE_DEVICES-}" ]]; then\n'
+                '  echo "Missing Slurm-visible device allocation" >&2; exit 1;\n'
+                "fi;\n"
+                "for areal_device_var in CUDA_VISIBLE_DEVICES ASCEND_RT_VISIBLE_DEVICES; do\n"
+                '  [[ -v "$areal_device_var" ]] || continue;\n'
+                '  areal_visible="${!areal_device_var}";\n'
+                '  [[ -n "$areal_visible" ]] || continue;\n'
+                '  if [[ "$areal_visible" == ,* || '
+                '"$areal_visible" == *, || "$areal_visible" == *,,* || '
+                '",$areal_visible," == *,-1,* ]]; then\n'
+                '    echo "Invalid Slurm-visible device allocation" >&2; exit 1;\n'
+                "  fi;\n"
+                '  IFS=, read -r -a areal_devices <<< "$areal_visible";\n'
+                f"  if (( ${{#areal_devices[@]}} < areal_device_offset + {gpus_per_task} )); then\n"
+                '    echo "Insufficient Slurm-visible devices for worker '
+                '${SLURM_LOCALID}; expected a node-local device allocation" >&2; exit 1;\n'
+                "  fi;\n"
+                '  printf -v "$areal_device_var" "%s" "$(IFS=,; echo '
+                f'"${{areal_devices[*]:areal_device_offset:{gpus_per_task}}}")";\n'
+                '  export "$areal_device_var";\n'
+                "done"
+            )
             # Also set ASCEND_RT_VISIBLE_DEVICES for Ascend NPU compatibility
-            ascend_setup_cmd = "export ASCEND_RT_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+            ascend_setup_cmd = 'export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES-${CUDA_VISIBLE_DEVICES-}}"'
             bash_cmds.insert(0, cuda_setup_cmd)
             bash_cmds.insert(1, ascend_setup_cmd)
 
@@ -964,9 +1016,10 @@ class SlurmScheduler(Scheduler):
         merged_log = self._merged_log_path()
 
         # Build srun command with streaming log pipeline
-        srun_cmd = (
-            f"srun {self.srun_additional_args} {' '.join(srun_flags)} {final_cmd}"
+        srun_additional_args = _resolve_srun_additional_args(
+            spec, self.srun_additional_args
         )
+        srun_cmd = f"srun {srun_additional_args} {' '.join(srun_flags)} {final_cmd}"
         log_pipeline = build_streaming_log_cmd(srun_cmd, role_log, merged_log, role)
 
         # Complete sbatch script with single srun command
@@ -1042,7 +1095,11 @@ class SlurmScheduler(Scheduler):
                 # Check if fork mode is enabled
                 if strategy.fork:
                     # Fork mode: spawn new processes on same nodes via /fork endpoint
-                    return self.fork_workers(role, colocate_role)
+                    return self.fork_workers(
+                        role,
+                        colocate_role,
+                        env_vars=[scheduling.env_vars for scheduling in schedulings],
+                    )
 
                 # Reuse existing workers - no new Slurm job submitted
                 worker_ids = [w.worker.id for w in target_workers]

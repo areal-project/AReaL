@@ -311,7 +311,8 @@ Check our [contribution guide](CONTRIBUTING.md).
 
 ## Historical Milestones
 
-Check [our historical milestone summaries since open-source](docs/version_history.md).
+Check
+[our historical milestone summaries since open-source](docs/en/version_history.md).
 
 ## Long-Term Vision
 

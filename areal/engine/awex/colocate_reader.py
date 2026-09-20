@@ -32,56 +32,98 @@ from typing import Any
 
 import torch
 
-
-def _patch_tms_hook_mode() -> None:
-    """Make ``torch_memory_saver.hook_mode`` setter a no-op once initialized.
-
-    ``megatron.core.inference.contexts.dynamic_context`` (pulled in transitively
-    by ``awex.converter.mcore_converter`` -> ``megatron.core``) runs a
-    module-level ``torch_memory_saver.hook_mode = "torch"``. In the SGLang
-    scheduler process the memory_saver singleton is already initialized (sglang
-    ran ``_ensure_initialized``, which ``del``s ``_impl_ctor_kwargs``), so that
-    late assignment raises ``AttributeError``. awex's model registry swallows the
-    import error, the BailingMoe converter never registers, and weight transfer
-    later dies with ``Unsupported attention parameter name: attention.g_proj``.
-    The singleton's own assert already declares post-init configuration
-    unsupported, so dropping the late set is the intended behavior.
-    """
-    try:
-        import torch_memory_saver as _tms
-    except Exception:
-        return
-    inst = getattr(_tms, "torch_memory_saver", None)
-    if inst is None:
-        return
-    cls = type(inst)
-    prop = cls.hook_mode
-    if getattr(prop.fset, "_awex_safe", False):
-        return
-
-    def _safe_setter(self, value):
-        if not hasattr(self, "_impl_ctor_kwargs"):
-            return  # singleton already initialized; late set is a design no-op
-        prop.fset(self, value)
-
-    _safe_setter._awex_safe = True
-    cls.hook_mode = property(prop.fget, _safe_setter)
-
+from areal.engine.awex.memory_saver import patch_tms_hook_mode
 
 # Must run before any awex import: awex.models.registry auto-imports model
 # modules at module load, and the BailingMoe module's transitive megatron import
 # trips the hook_mode race above.
-_patch_tms_hook_mode()
+patch_tms_hook_mode()
 
 from awex.meta.infer_meta_resolver import InferParamMetaResolver  # noqa: E402
 from awex.meta.meta_resolver import ParamMetaResolver  # noqa: E402
 from awex.reader.nccl_reader import NCCLWorkerWeightsReader  # noqa: E402
 from awex.sharding import get_sharding_strategy_builder  # noqa: E402
-from awex.util.common import simple_hf_config  # noqa: E402
+from awex.util.common import AttrDict, simple_hf_config  # noqa: E402
 
 from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexColocateReader")
+
+
+class _DeviceBoundWeightsReader(NCCLWorkerWeightsReader):
+    """Bind communication to the model's logical CUDA device, not a rank id."""
+
+    def __init__(self, *args, model: torch.nn.Module, **kwargs):
+        device = next(model.parameters()).device
+        if device.type != "cuda" or device.index is None:
+            raise RuntimeError("AWEX reader requires model weights resumed on CUDA")
+        self._model_device = device
+        super().__init__(*args, model=model, **kwargs)
+
+    def _set_device(self) -> None:
+        # TODO(agent): This adapter is CUDA-only; physical ids remain metadata
+        # identities and must not be used as CUDA_VISIBLE_DEVICES indices.
+        torch.cuda.set_device(self._model_device)
+        self.barrier_device = self._model_device.index
+        self.backend = "nccl"
+        self.ready_tensor = torch.tensor(1, device=self._model_device)
+        logger.info(
+            "Bound AWEX reader rank %s to model device %s",
+            self.transfer_rank,
+            self._model_device,
+        )
+
+
+class _PhysicalDeviceMetaServerClient:
+    """Use physical GPU ids in AWEX colocate metadata and handshake keys."""
+
+    _DEVICE_KEY_PREFIXES = (
+        "training_serialized_weights_",
+        "weights_update_finished_",
+        "write_finished_",
+    )
+
+    def __init__(self, client: Any, physical_gpu_id: int):
+        self._client = client
+        self._physical_gpu_id = physical_gpu_id
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    def _rewrite_device_key(self, key: str) -> str:
+        if not key.startswith(self._DEVICE_KEY_PREFIXES):
+            return key
+        prefix_and_ip, step = key.rsplit("_", 1)
+        prefix_and_ip, _logical_gpu_id = prefix_and_ip.rsplit("_", 1)
+        return f"{prefix_and_ip}_{self._physical_gpu_id}_{step}"
+
+    def add_object_to_set(self, key: str, value: Any) -> Any:
+        if key == "inference_device_rank_entries":
+            ip_address, _logical_gpu_id, transfer_rank = value
+            value = (ip_address, self._physical_gpu_id, transfer_rank)
+        return self._client.add_object_to_set(key, value)
+
+    def get_object(self, key: str, *args: Any, **kwargs: Any) -> Any:
+        return self._client.get_object(self._rewrite_device_key(key), *args, **kwargs)
+
+    def put_object(self, key: str, *args: Any, **kwargs: Any) -> Any:
+        return self._client.put_object(self._rewrite_device_key(key), *args, **kwargs)
+
+    def get_object_then_delete(self, key: str, *args: Any, **kwargs: Any) -> Any:
+        return self._client.get_object_then_delete(
+            self._rewrite_device_key(key), *args, **kwargs
+        )
+
+
+def _to_awex_attr_dict(value: Any) -> Any:
+    """Restore recursive attribute access missing from AWEX 0.8.1 configs."""
+    if isinstance(value, dict):
+        return AttrDict({key: _to_awex_attr_dict(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return [_to_awex_attr_dict(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_awex_attr_dict(item) for item in value)
+    return value
 
 
 def _get_router_dtype(config):
@@ -102,7 +144,7 @@ def _get_awex_infer_hf_config(model, model_runner=None):
     config = getattr(model_config, "hf_config", None)
     if config is None:
         config = model.config
-    serialized_config = simple_hf_config(config)
+    serialized_config = _to_awex_attr_dict(simple_hf_config(config))
     if not getattr(serialized_config, "architectures", None):
         serialized_config.architectures = [type(model).__name__]
     return serialized_config
@@ -246,29 +288,58 @@ class AwexColocateReader:
         tp_size = int(getattr(server_args, "tp_size", 1))
         pp_size = int(getattr(server_args, "pp_size", 1))
         dp_size = int(getattr(server_args, "dp_size", 1))
-        tp_rank = int(getattr(scheduler, "tp_rank", 0))
+
+        def rank_attr(name: str) -> int | None:
+            for obj in (
+                scheduler,
+                getattr(scheduler, "ps", None),
+                getattr(scheduler, "tp_worker", None),
+            ):
+                value = getattr(obj, name, None) if obj is not None else None
+                if value is not None:
+                    return int(value)
+            return None
+
+        tp_rank = rank_attr("tp_rank")
+        if tp_rank is None and self._instance_local_rank is not None:
+            tp_rank = self._instance_local_rank % tp_size
+        if tp_rank is None or not 0 <= tp_rank < tp_size:
+            raise RuntimeError("Cannot resolve a valid AWEX inference TP rank")
+        pp_rank = rank_attr("pp_rank")
+        if pp_rank is None:
+            pp_rank = (
+                self._instance_local_rank // tp_size
+                if self._instance_local_rank is not None
+                else (0 if pp_size == 1 else None)
+            )
+        if pp_rank is None or not 0 <= pp_rank < pp_size:
+            raise RuntimeError("Cannot resolve a valid AWEX inference PP rank")
 
         if self._infer_instance_world_size is not None:
             world_size = self._infer_instance_world_size
             global_rank = self._instance_local_rank
         else:
             world_size = tp_size * pp_size
-            global_rank = tp_rank
+            global_rank = pp_rank * tp_size + tp_rank
+
+        attn_tp_rank = rank_attr("attn_tp_rank")
+        attn_tp_size = rank_attr("attn_tp_size")
+        attn_dp_rank = rank_attr("attn_dp_rank")
 
         return {
             "scheduler": scheduler,
             "infer_engine_config": server_args,
             "tp_rank": tp_rank,
             "tp_size": tp_size,
-            "pp_rank": int(getattr(scheduler, "pp_rank", 0)),
+            "pp_rank": pp_rank,
             "pp_size": pp_size,
             "dp_size": dp_size,
             "world_size": world_size,
             "global_rank": global_rank,
             "local_rank": tp_rank,
-            "attn_tp_rank": int(getattr(scheduler, "attn_tp_rank", tp_rank)),
-            "attn_tp_size": int(getattr(scheduler, "attn_tp_size", tp_size)),
-            "attn_dp_rank": int(getattr(scheduler, "attn_dp_rank", 0)),
+            "attn_tp_rank": tp_rank if attn_tp_rank is None else attn_tp_rank,
+            "attn_tp_size": tp_size if attn_tp_size is None else attn_tp_size,
+            "attn_dp_rank": 0 if attn_dp_rank is None else attn_dp_rank,
         }
 
     def get_parallelism(self) -> dict:
@@ -289,7 +360,7 @@ class AwexColocateReader:
         """Per-rank raw meta via awex's own staticmethod (HF-converted names)."""
         server_args = self._scheduler.server_args
         model_context = self._build_model_context()
-        return InferParamMetaResolver._get_model_param_info(
+        raw_meta = InferParamMetaResolver._get_model_param_info(
             "sglang",
             server_args,
             convert_params=True,
@@ -297,6 +368,7 @@ class AwexColocateReader:
             model=self._get_model(),
             model_context=model_context,
         )
+        return raw_meta
 
     def _build_instance_params_meta(self):
         """Gather single-instance raw meta via the MetaServer, then aggregate.
@@ -437,7 +509,7 @@ class AwexColocateReader:
             # papers over any such mismatch generically, but keep the
             # semantic path whole so new models behave identically to native
             # awex.
-            "router_dtype": _get_router_dtype(self._get_model().config),
+            "router_dtype": _get_router_dtype(awex_hf_config),
         }
         self._infer_conf = infer_conf
 
@@ -475,7 +547,7 @@ class AwexColocateReader:
         logger.info("Got training_params_meta from MetaServer")
 
         model_context = self._build_model_context()
-        reader = NCCLWorkerWeightsReader(
+        reader = _DeviceBoundWeightsReader(
             engine_name="sglang",
             model=self._get_model(),
             model_context=model_context,
@@ -489,6 +561,13 @@ class AwexColocateReader:
             ipc_backend="cuda",
             enable_debug_mode=False,
         )
+        # SGLang t1 workers are CUDA_VISIBLE_DEVICES-isolated, so AWEX observes
+        # logical device 0 on every process while the colocated trainer
+        # publishes IPC handles under node-local physical ids. Keep CUDA calls
+        # on logical device 0, but translate only MetaServer identities/keys.
+        reader.meta_server_client = _PhysicalDeviceMetaServerClient(
+            reader.meta_server_client, self._local_gpu_id
+        )
         reader.initialize()
         self._reader = reader
         logger.info(
@@ -500,6 +579,7 @@ class AwexColocateReader:
         )
         return reader
 
+    @torch.no_grad()
     def update_weights(self, version: int) -> None:
         """Run one colocate weight update via the native awex worker reader.
 

@@ -1,6 +1,7 @@
 """Test suite for remote inference engines (vLLM and SGLang)."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch.distributed as dist
@@ -25,6 +26,110 @@ MODEL_PATH = get_model_path(
 
 IS_VLLM_INSTALLED = is_available("vllm")
 IS_SGLANG_INSTALLED = is_available("sglang")
+
+
+def test_sglang_uses_functional_health_check_by_default() -> None:
+    from areal.engine.sglang_remote import SGLangBackend
+
+    assert SGLangBackend().get_health_check_request().endpoint == "/health"
+
+
+def test_sglang_awex_uses_metadata_readiness_check(monkeypatch) -> None:
+    from areal.engine.sglang_remote import SGLangBackend
+
+    backend = SGLangBackend()
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.SGLangConfig.build_cmd_from_args",
+        lambda args: ["sglang.launch_server"],
+    )
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.subprocess.Popen",
+        lambda *args, **kwargs: SimpleNamespace(pid=1, poll=lambda: None),
+    )
+
+    backend.launch_server(
+        {"model_path": "model", "awex_meta_server_addr": "127.0.0.1:1234"}
+    )
+
+    assert backend.get_health_check_request().endpoint == "/model_info"
+
+
+def test_wait_for_server_raises_when_subprocess_exits() -> None:
+    from areal.infra.remote_inf_engine import RemoteInfEngine
+
+    engine = RemoteInfEngine(
+        InferenceEngineConfig(setup_timeout=60),
+        backend=SimpleNamespace(),
+    )
+    engine.check_health = lambda _: False
+    process = SimpleNamespace(
+        pid=123,
+        args=["python3", "-m", "sglang.launch_server"],
+        returncode=42,
+        poll=lambda: 42,
+    )
+
+    with pytest.raises(RuntimeError, match="pid=123.*code 42"):
+        engine._wait_for_server("127.0.0.1:1", process=process)
+
+
+def test_awex_sglang_child_drops_training_ld_preload(monkeypatch) -> None:
+    from areal.engine.sglang_remote import SGLangBackend
+
+    backend = SGLangBackend()
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/torch_memory_saver.so")
+    monkeypatch.setenv("TMS_INIT_ENABLE", "1")
+    monkeypatch.setenv("TMS_INIT_ENABLE_CPU_BACKUP", "1")
+    monkeypatch.delenv("AREAL_SGLANG_DROP_LD_PRELOAD", raising=False)
+    monkeypatch.setenv("AWEX_META_SERVER_ADDR", "127.0.0.1:1234")
+
+    captured = {}
+
+    class Process:
+        pid = 1
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, *, env, stdout, stderr):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return Process()
+
+    monkeypatch.setattr("areal.engine.sglang_remote.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.SGLangConfig.build_cmd_from_args",
+        lambda args: ["sglang.launch_server"],
+    )
+    backend.launch_server({"model_path": "model"})
+
+    assert "LD_PRELOAD" not in captured["env"]
+    assert "TMS_INIT_ENABLE" not in captured["env"]
+    assert "TMS_INIT_ENABLE_CPU_BACKUP" not in captured["env"]
+
+
+def test_awex_sglang_child_enables_cuda_graph_memory_saver(monkeypatch) -> None:
+    """AWEX enables graph region capture before the SGLang child starts."""
+    from areal.engine.sglang_remote import SGLangBackend
+
+    backend = SGLangBackend()
+    monkeypatch.setenv("AWEX_META_SERVER_ADDR", "127.0.0.1:1234")
+    monkeypatch.delenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", raising=False)
+    captured = {}
+
+    def fake_popen(cmd, *, env, stdout, stderr):
+        captured["env"] = env
+        return SimpleNamespace(pid=1, poll=lambda: None)
+
+    monkeypatch.setattr("areal.engine.sglang_remote.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.SGLangConfig.build_cmd_from_args",
+        lambda args: ["sglang.launch_server"],
+    )
+
+    backend.launch_server({"model_path": "model", "enable_memory_saver": True})
+
+    assert captured["env"]["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] == "1"
 
 
 def _dummy_reward_fn(*args, **kwargs):

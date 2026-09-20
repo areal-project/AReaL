@@ -206,13 +206,67 @@ When `group_size > 1`, the workflow is wrapped in `GroupedRolloutWorkflow`:
 1. Results are merged based on their type:
    - **Tensor dictionaries**: Concatenated along the batch dimension
    - **InteractionWithTokenLogpReward dicts**: Merged into a single dictionary
-1. If some runs return `None` (rejected), only valid results are kept
-1. If all runs return `None`, the entire grouped result is `None`
+1. Each slot returns its normal result type when usable and `None` when unusable. `None`
+   is intentionally opaque: classification and retry policy stay in the producer.
+1. The wrapper waits only for the original slots. It neither retries an unusable slot
+   nor duplicates a usable result.
+1. Usable slots are retained exactly once and concatenated. Their actual count remains a
+   prompt-group boundary during reward and advantage normalization.
+1. With `reward_normalization=True`, interaction rewards are normalized across the
+   usable rollouts after the group passes the minimum-size filter.
+   `drop_incomplete_group=True` still requires every original slot to succeed. A
+   surviving rollout with a missing row reward causes the group to be dropped.
+1. `min_usable_group_size` defaults to `1`. The v1 RL trainer sets it to `2` when reward
+   or advantage normalization uses group statistics, because that statistic needs at
+   least two observations; a singleton target group (`n_samples: 1`) is complete by
+   definition and keeps the minimum of `1`. Setting `actor.min_usable_group_size`
+   replaces this derived value; explicit values below `2` are rejected while group
+   statistics are in use. Groups below the minimum return `None`; the asynchronous
+   collector then takes another ready prompt group. Batch-relative PPO and REINFORCE
+   retain a usable singleton.
+1. Each v1 `arun_episode` call is one logical rollout. Context compaction and
+   `agent.export_style: individual` can export multiple rows without aborting the group.
+   The collector records contiguous row counts and optional reward references in
+   `RolloutGroup`, under the `rollout_group` trajectory key. Batch concatenation moves
+   this metadata into `TrajBatchMeta`; splitting restores it to trajectories. Usable
+   group sizes count logical rollouts, including for `n_samples: 1`.
+1. Reward normalization uses one reference per logical rollout, for both group and batch
+   statistics. When a rollout's row rewards differ, the workflow must supply a finite
+   `rollout_reward` scalar in its tensor dictionary, or on an exported
+   `InteractionWithTokenLogpReward`. All supplied references within a rollout must
+   agree. If omitted, equal row rewards provide the reference. The same centering and
+   scaling apply to every row's own reward; leave-one-out excludes the entire logical
+   rollout from its reference baseline. When the computed reference standard deviation
+   is at or below normalization epsilon, centering is retained with a divisor of `1`.
+   The built-in v1 agent workflow explicitly supplies its terminal reward for
+   `individual` exports, preserving discounted row rewards and any reference already
+   supplied. Custom workflows must declare their own reference for differing row
+   rewards; no terminal, sum, or mean score is inferred.
+1. An explicit reference is unchanged by the built-in row-length overlong penalty. Actor
+   reward bias, scaling, and clipping apply to both rows and references. Without an
+   explicit reference, penalized row rewards must still agree. Advantage normalization
+   keeps its existing masked token statistics and per-token leave-one-out behavior;
+   logical counts only select singleton fallbacks. GAE still runs separately on each
+   row.
+
+PPO-family actor loss remains globally token-weighted by default. Consequently, a
+partial group with more valid response tokens contributes more loss weight than a
+smaller or shorter group. This is the existing backward-compatible estimator, not an
+implicit claim of equal prompt weighting.
+
+Grouped rollouts export `target_slot_count`, `usable_slot_count`,
+`trainable_slot_count`, `fully_masked_group`, `singleton_slot_group`,
+`pre_filter_usable_slot_yield`, and `pre_filter_trainable_slot_yield`. These count the
+original rollout calls; final accepted and rejected counts remain collector metrics
+after `should_accept_fn` runs. PPO training separately reports the logical usable
+group-size and valid-token loss-weight distributions, including per-size
+`group_loss_weight_size_<N>` metrics.
 
 ### Output Shape
 
-With `group_size=4` and a workflow returning `[1, seq_len]` tensors, the grouped output
-has shape `[4, seq_len]` (4 samples concatenated).
+With `group_size=4`, a workflow returning `[1, seq_len]` tensors, and all four slots
+usable, the grouped output has shape `[4, seq_len]`. An incomplete accepted group uses
+its actual usable count as the leading dimension.
 
 ### Implementation
 
@@ -227,9 +281,9 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
               for _ in range(self.group_size)]
         )
 
-        # Filter None results
+        # A normal result is usable; None is unusable.
         valid_results = [r for r in results if r is not None]
-        if not valid_results:
+        if len(valid_results) < self.min_usable_group_size:
             return None
 
         # Merge based on result type

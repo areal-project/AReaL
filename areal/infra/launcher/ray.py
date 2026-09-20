@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import getpass
 import importlib.util
+import os
 import pathlib
 import re
 import sys
+import threading
 import time
+import traceback
 import warnings
 from collections.abc import Callable
 from functools import partial
 
 import ray
 import ray.exceptions
+from ray.actor import ActorHandle
 from ray.runtime_env import RuntimeEnv
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -26,7 +31,14 @@ from areal.api.cli_args import (
     to_structured_cfg,
     vLLMConfig,
 )
-from areal.infra.platforms import current_platform, is_npu_available
+from areal.infra.launcher.ray_bootstrap import (
+    bootstrap_head,
+    bootstrap_worker,
+    detect_node_ip,
+    detect_node_rank,
+    stop_local_ray,
+)
+from areal.infra.platforms import current_platform
 from areal.infra.utils.exp_metadata import save_experiment_metadata
 from areal.infra.utils.launcher import (
     BASE_ENVIRONS,
@@ -49,6 +61,47 @@ RAY_WAIT_CHECK_TIME_INTERVAL = 5  # seconds
 DEFAULT_MAIN_FUNC_NAME = "main"
 RAY_LAUNCHER = None
 RECOVER_TIME_INTERVAL = 10  # seconds
+LOG_WRITER_PING_TIMEOUT = 30  # seconds
+LOG_WRITER_DRAIN_TIMEOUT = 30  # seconds
+
+
+def _select_trainer_node_count(
+    train_world_size: int,
+    available_nodes: int,
+    n_gpus_per_node: int,
+) -> int:
+    if train_world_size <= 0:
+        raise ValueError(
+            f"Training world size must be positive, got {train_world_size}"
+        )
+    if available_nodes <= 0:
+        raise ValueError(
+            "No nodes are available for trainer processes: "
+            f"available_nodes={available_nodes}"
+        )
+    if n_gpus_per_node <= 0:
+        raise ValueError(f"n_gpus_per_node must be positive, got {n_gpus_per_node}")
+
+    available_gpus = available_nodes * n_gpus_per_node
+    if train_world_size > available_gpus:
+        raise ValueError(
+            f"Training allocation requires {train_world_size} GPUs, but only "
+            f"{available_gpus} trainer GPUs are available "
+            f"({available_nodes} nodes x {n_gpus_per_node} GPUs)."
+        )
+
+    min_nodes = (train_world_size + n_gpus_per_node - 1) // n_gpus_per_node
+    max_nodes = min(available_nodes, train_world_size)
+    for node_count in range(min_nodes, max_nodes + 1):
+        if train_world_size % node_count == 0:
+            return node_count
+
+    raise ValueError(
+        f"Cannot evenly place {train_world_size} trainer processes on up to "
+        f"{available_nodes} nodes with {n_gpus_per_node} GPUs per node. "
+        "RayLauncher.submit_array requires an equal number of trainer "
+        "processes on each trainer node."
+    )
 
 
 def run_func(file_path, function_name, *args, **kwargs):
@@ -78,6 +131,135 @@ def run_func(file_path, function_name, *args, **kwargs):
     return function(*args, **kwargs)
 
 
+@ray.remote(num_cpus=0)
+class _LogWriter:
+    """Appends log data from all tasks of a job to a single file.
+
+    Funneling every task's output through one actor keeps the merged log file
+    consistent: concurrent O_APPEND writes from multiple nodes are not atomic
+    on NFS, where `cluster.fileroot` usually lives.
+    """
+
+    def __init__(self, log_file: str):
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        # Unbuffered append so `tail -f` works and recover runs concatenate.
+        self._log_f = open(log_file, "ab", buffering=0)
+
+    def write(self, data: bytes):
+        self._log_f.write(data)
+
+    def drain(self):
+        """Acknowledge that all previously queued writes reached the file."""
+        self._log_f.flush()
+
+
+def run_func_with_file_log(
+    log_writer, task_label, file_path, function_name, *args, **kwargs
+):
+    """Run `run_func` while tee-ing the task's stdout/stderr to a job log file.
+
+    Mimics the per-job log files written by the slurm launcher (sbatch
+    ``--output``): the output of all tasks of a job (e.g. every trainer rank)
+    is merged into one file, written by the shared `_LogWriter` actor.
+    Redirection happens at the file-descriptor level so output from C
+    extensions and subprocesses is captured as well. The original stdout is
+    preserved via a pump thread, so Ray keeps streaming task output to the
+    driver.
+    """
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    read_fd, write_fd = os.pipe()
+    os.dup2(write_fd, 1)
+    os.dup2(write_fd, 2)
+    os.close(write_fd)
+    # Line-buffer python-level stdio so bare `print` reaches the pipe (and
+    # thus the log file and ray's driver streaming) in real time.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+    def _ship(data: bytes):
+        try:
+            log_writer.write.remote(data)
+        except Exception:
+            # Never let log shipping break the task or the console stream.
+            pass
+
+    launch_banner = (
+        f"==== {task_label} launched at {time.strftime('%Y-%m-%d %H:%M:%S')} ====\n"
+    ).encode()
+    drain_ref = []
+
+    def _pump():
+        console_ok = True
+        try:
+            # Submit the banner, every output chunk, and the drain acknowledgement
+            # from this thread so Ray's per-caller actor FIFO ordering applies.
+            _ship(launch_banner)
+            while True:
+                data = os.read(read_fd, 65536)
+                if not data:
+                    break
+                _ship(data)
+                if console_ok:
+                    try:
+                        os.write(saved_stdout, data)
+                    except OSError:
+                        # The driver-stream pipe broke. Keep draining the
+                        # task's pipe (a full pipe would block the task's
+                        # next print forever) and keep shipping to the log
+                        # file; only the console copy is lost.
+                        console_ok = False
+        except OSError:
+            pass
+        finally:
+            try:
+                drain_ref.append(log_writer.drain.remote())
+            except Exception:
+                # Log actor failure must not change the task result.
+                pass
+            finally:
+                os.close(read_fd)
+
+    pump_thread = threading.Thread(target=_pump, daemon=True)
+    pump_thread.start()
+    try:
+        return run_func(file_path, function_name, *args, **kwargs)
+    except BaseException:
+        # Print while stderr still points at the pipe so the traceback lands
+        # in the log file before Ray reports the failure to the driver.
+        traceback.print_exc()
+        raise
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(saved_stderr)
+        # EOF reaches the pump thread once all pipe writers are gone; leaked
+        # subprocesses may keep it open, so don't block task completion on it.
+        pump_thread.join(timeout=5)
+        if pump_thread.is_alive():
+            logger.warning(
+                f"Timed out draining the output pipe for task `{task_label}`; "
+                "a child process may still hold it open, so trailing logs may be lost."
+            )
+        else:
+            if drain_ref:
+                try:
+                    ray.get(
+                        drain_ref[0],
+                        timeout=LOG_WRITER_DRAIN_TIMEOUT,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to drain merged logs for task `{task_label}`: {e}"
+                    )
+            os.close(saved_stdout)
+
+
 class RayLauncher:
     def __init__(self, experiment_name: str, trial_name: str, fileroot: str):
         self.experiment_name = experiment_name
@@ -87,10 +269,57 @@ class RayLauncher:
         # job_name to ray future
         self.jobs = {}
         self.placement_groups = {}
+        # base job name (e.g. "trainer") to its shared _LogWriter actor
+        self._log_writers = {}
 
     @property
     def run_name(self):
         return f"{self.experiment_name}_{self.trial_name}"
+
+    def log_path_of(self, job_name: str) -> str:
+        log_path = f"{self.fileroot}/logs/{getpass.getuser()}/{self.experiment_name}/{self.trial_name}"
+        os.makedirs(log_path, exist_ok=True)
+        return os.path.join(log_path, f"{job_name}.log")
+
+    def _log_writer_of(self, job_name: str):
+        # All tasks of a job share one merged log file ("trainer:3" ->
+        # trainer.log), matching the per-job logs of the slurm launcher.
+        base_name = job_name.split(":")[0]
+        writer = self._log_writers.get(base_name)
+        if writer is not None and self._log_writer_alive(writer, base_name):
+            return writer
+        writer = _LogWriter.remote(self.log_path_of(base_name))
+        # Surface actor construction errors (e.g. fileroot not mounted on
+        # the actor's node) at submit time instead of silently dropping all
+        # log output later. A timeout only means slow storage -- fine.
+        try:
+            ray.get(writer.write.remote(b""), timeout=LOG_WRITER_PING_TIMEOUT)
+        except ray.exceptions.GetTimeoutError:
+            pass
+        self._log_writers[base_name] = writer
+        return writer
+
+    def _log_writer_alive(self, writer, base_name: str) -> bool:
+        """Ping a cached log writer actor before reusing it.
+
+        A recover run may inherit a handle whose actor died with its node
+        (often the very failure that triggered the recover); reusing it
+        would silently drop the whole recovered run's logs.
+        """
+        try:
+            ray.get(writer.write.remote(b""), timeout=LOG_WRITER_PING_TIMEOUT)
+            return True
+        except ray.exceptions.GetTimeoutError:
+            # Alive but busy (e.g. NFS stall backlog). Do NOT recreate:
+            # the queued log data would be lost with the old actor.
+            return True
+        except Exception:
+            logger.warning(
+                f"Log writer actor of job `{base_name}` is gone (node "
+                "failure?); recreating it. Log lines buffered in the old "
+                "actor may be lost."
+            )
+            return False
 
     def submit(
         self,
@@ -107,9 +336,12 @@ class RayLauncher:
         kwargs: (
             dict[str, str] | None
         ) = None,  # keyword arguments to pass to the function
+        log_writer: ActorHandle | None = None,
     ):
         if kwargs is None:
             kwargs = {}
+        if log_writer is None:
+            log_writer = self._log_writer_of(job_name)
         runtime_env = RuntimeEnv(
             env_vars=env_vars or dict(),
         )
@@ -122,14 +354,16 @@ class RayLauncher:
             if placement_group is not None
             else "DEFAULT"
         )
-        if is_npu_available:
+        if current_platform.ray_device_key == "NPU":
             future = ray.remote(
                 num_cpus=cpus,
                 resources={"NPU": gpus},
                 memory=mem * 1024 * 1024,  # Convert MB to bytes
                 runtime_env=runtime_env,
                 scheduling_strategy=scheduling_strategy,
-            )(run_func).remote(file_path, func_name, *args, **kwargs)
+            )(run_func_with_file_log).remote(
+                log_writer, job_name, file_path, func_name, *args, **kwargs
+            )
             self.jobs[job_name] = future
         else:
             future = ray.remote(
@@ -138,7 +372,9 @@ class RayLauncher:
                 memory=mem * 1024 * 1024,  # Convert MB to bytes
                 runtime_env=runtime_env,
                 scheduling_strategy=scheduling_strategy,
-            )(run_func).remote(file_path, func_name, *args, **kwargs)
+            )(run_func_with_file_log).remote(
+                log_writer, job_name, file_path, func_name, *args, **kwargs
+            )
             self.jobs[job_name] = future
         return future
 
@@ -185,7 +421,7 @@ class RayLauncher:
         mem_per_node = mem_per_task * tasks_per_node
 
         if job_name not in self.placement_groups:
-            if is_npu_available:
+            if current_platform.ray_device_key == "NPU":
                 device_bundles = [
                     {
                         "CPU": cpus_per_node,
@@ -224,6 +460,10 @@ class RayLauncher:
         if env_hook:
             extra_env_vars = env_hook(placement_group)
 
+        # Resolve and probe the shared writer once for this job submission.
+        # Calling through submit() for every rank would serialize startup behind
+        # repeated health checks when the writer is busy on slow storage.
+        log_writer = self._log_writer_of(job_name)
         futures = []
         for i in range(count):
             args = list_args[i]
@@ -256,9 +496,15 @@ class RayLauncher:
                 placement_group=placement_group,
                 bundle_index=node_id,
                 kwargs=kwargs,
+                log_writer=log_writer,
             )
             futures.append(future)
 
+        logger.info(
+            f"Submitted {count} Ray tasks for job `{job_name}`. To check the "
+            f"merged output of all tasks, run\n\t`tail -f "
+            f"{self.log_path_of(job_name)}`."
+        )
         return futures
 
     def stop(self, job_name: str, force: bool = False):
@@ -294,12 +540,17 @@ class RayLauncher:
                 self.jobs.pop(job_name)
 
     def wait(
-        self, check_status=(JobState.FAILED,), remove_status=(JobState.COMPLETED,)
+        self,
+        check_status=(JobState.FAILED,),
+        remove_status=(JobState.COMPLETED,),
+        complete_all_worker_types: tuple[str, ...] = (),
     ):
         """Check every RAY_WAIT_CHECK_TIME_INTERVAL seconds for the status of all jobs.
         If a ray job returns, its status changes to JobState.COMPLETED.
         If a ray job failed, its status changes to JobState.FAILED.
-        If any job is in check_status, stop all jobs at once.
+        If any job is in check_status, stop all jobs at once. Worker types in
+        complete_all_worker_types only report COMPLETED after all of their tasks
+        complete.
         If any job is in remove status, remove them from job list.
         Return if all jobs are removed from job list, or some job is in check status.
         """
@@ -309,9 +560,12 @@ class RayLauncher:
                 JobState.FAILED,
             ], "In RayLauncher.wait, we only check completed or failed jobs."
         logger.info(f"Waiting for {len(self.jobs)} jobs.")
+        completed_jobs = set()
         while self.jobs:
             job_status = {}
             for job_name, future in list(self.jobs.items()):
+                if job_name in completed_jobs:
+                    continue
                 try:
                     r = ray.get(future, timeout=0.1)
                     logger.info(f"Job {job_name} completed with result: {r}")
@@ -322,27 +576,128 @@ class RayLauncher:
                 except ray.exceptions.GetTimeoutError:
                     continue
 
+            # A failure must win over a completion observed in the same poll.
             for job_name, status in job_status.items():
-                if status in check_status:
-                    logger.info(f"Job {job_name} is {status}, stopping all jobs.")
-                    # raise exception to enter recover.
-                    # should not changed to stop_all
-                    raise JobException(
-                        run_name=self.run_name,
-                        worker_type=job_name.split(":")[0],
-                        host="ray",
-                        reason=status,
-                    )
+                if status == JobState.FAILED and status in check_status:
+                    self._raise_job_status(job_name, status)
+
+            # A server completing on its own is abnormal and must also win
+            # over an aggregate trainer success in the same poll.
+            for job_name, status in job_status.items():
+                worker_type = job_name.split(":")[0]
+                if (
+                    status == JobState.COMPLETED
+                    and status in check_status
+                    and worker_type not in complete_all_worker_types
+                ):
+                    self._raise_job_status(job_name, status)
+
+            for job_name, status in job_status.items():
+                worker_type = job_name.split(":")[0]
+                if (
+                    status != JobState.COMPLETED
+                    or status not in check_status
+                    or worker_type not in complete_all_worker_types
+                ):
+                    continue
+                completed_jobs.add(job_name)
+                worker_jobs = [
+                    name for name in self.jobs if name.split(":")[0] == worker_type
+                ]
+                if all(name in completed_jobs for name in worker_jobs):
+                    self._raise_job_status(job_name, status)
+
+            for job_name, status in job_status.items():
                 if status in remove_status:
                     logger.info(f"Job {job_name} is {status}, removed.")
                     self.jobs.pop(job_name)
 
             time.sleep(RAY_WAIT_CHECK_TIME_INTERVAL)
 
+    def _raise_job_status(self, job_name: str, status: JobState):
+        logger.info(f"Job {job_name} is {status}, stopping all jobs.")
+        raise JobException(
+            run_name=self.run_name,
+            worker_type=job_name.split(":")[0],
+            host="ray",
+            reason=status,
+        )
+
 
 def main():
-    ray.init()
     config, _ = parse_cli_args(sys.argv[1:])
+    config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
+    # `to_structured_cfg` returns a DictConfig, so merged CLI/YAML values do
+    # not invoke ClusterSpecConfig.__post_init__. Validate the runtime value
+    # explicitly before any local Ray processes are stopped or started.
+    ClusterSpecConfig.validate_ray_port(config.cluster.ray_port)
+    n_nodes = config.cluster.n_nodes
+    n_gpus_per_node = config.cluster.n_gpus_per_node
+
+    if os.environ.get("RAY_ADDRESS"):
+        # A Ray cluster is explicitly designated (e.g. manually assembled via
+        # `ray start` + RAY_ADDRESS=auto): connect and run the launcher.
+        ray.init()
+        ray_main(config, run_id=0)
+        return
+
+    node_rank = detect_node_rank()
+    if n_nodes > 1 and node_rank is not None:
+        # Multi-node gang-scheduled platform job (e.g. AIS/PAI), where this
+        # same command runs on every node: assemble the Ray cluster first.
+        # Rank 0 starts the head and proceeds into the launcher; other ranks
+        # join as workers and block until the head shuts down.
+        node_ip = detect_node_ip()
+        logger.info(
+            f"Ray bootstrap: node_rank={node_rank}, node_ip={node_ip}, "
+            f"n_nodes={n_nodes}, n_gpus_per_node={n_gpus_per_node}"
+        )
+        # Clear stale Ray processes left over in reused containers.
+        stop_local_ray()
+        if node_rank == 0:
+            try:
+                bootstrap_head(
+                    node_ip,
+                    n_nodes,
+                    n_gpus_per_node,
+                    ray_port=config.cluster.ray_port,
+                    dashboard_port=config.cluster.ray_dashboard_port,
+                    wait_timeout=config.cluster.ray_bootstrap_timeout_seconds,
+                    accelerator_resource=current_platform.ray_device_key,
+                )
+                ray_main(config, run_id=0)
+            finally:
+                logger.info("Head workload finished, stopping Ray")
+                stop_local_ray()
+        else:
+            bootstrap_worker(
+                node_ip,
+                n_gpus_per_node,
+                ray_port=config.cluster.ray_port,
+                wait_timeout=config.cluster.ray_bootstrap_timeout_seconds,
+                accelerator_resource=current_platform.ray_device_key,
+            )
+        return
+
+    if n_nodes > 1:
+        # Multi-node run outside a platform job: a pre-assembled Ray cluster
+        # must already be running on this node.
+        try:
+            ray.init(address="auto")
+        except ConnectionError as e:
+            raise RuntimeError(
+                f"cluster.n_nodes={n_nodes} > 1, but no running Ray cluster "
+                "was found and no platform node-rank signal "
+                "(AREAL_NODE_RANK/RANK/...) exists. Either pre-assemble a Ray "
+                "cluster (`ray start --head` / `ray start --address=...`) "
+                "before launching, or set AREAL_NODE_RANK and run this "
+                "command on every node of the job."
+            ) from e
+        ray_main(config, run_id=0)
+        return
+
+    # Single node: connect to the local Ray instance, or start one.
+    ray.init()
     ray_main(config, run_id=0)
 
 
@@ -544,14 +899,25 @@ def ray_main(config, run_id: int = 0):
     else:
         tms_env_vars = {}
 
-    trainer_n_nodes = n_nodes - (
+    available_trainer_nodes = n_nodes - (
         n_sglang_nodes if allocation_mode.gen_backend == "sglang" else n_vllm_nodes
     )
     gpus_per_task = 1
     trainer_entry_point = sys.argv[1]
-    n_trainer_processes = trainer_n_nodes * config.cluster.n_gpus_per_node
-    trainer_args_list = [[sys.argv[2:]] for _ in range(n_trainer_processes)]
     if allocation_mode.type_ != AllocationType.LLM_SERVER_ONLY:
+        train_strategy = allocation_mode.train
+        if train_strategy is None:
+            raise ValueError(
+                "Trainer launch requested, but allocation_mode has no training "
+                f"allocation: {config.allocation_mode}"
+            )
+        n_trainer_processes = train_strategy.world_size
+        trainer_n_nodes = _select_trainer_node_count(
+            n_trainer_processes,
+            available_trainer_nodes,
+            config.cluster.n_gpus_per_node,
+        )
+        trainer_args_list = [[sys.argv[2:]] for _ in range(n_trainer_processes)]
         llm_addrs = (
             sglang_addrs if allocation_mode.gen_backend == "sglang" else vllm_addrs
         )
@@ -609,7 +975,7 @@ def ray_main(config, run_id: int = 0):
             job_name="trainer",
             file_path=trainer_entry_point,
             func_name=DEFAULT_MAIN_FUNC_NAME,
-            count=trainer_n_nodes * config.cluster.n_gpus_per_node,
+            count=n_trainer_processes,
             nodes=trainer_n_nodes,
             list_args=trainer_args_list,
             gpus_per_task=gpus_per_task,
@@ -623,11 +989,14 @@ def ray_main(config, run_id: int = 0):
                 **tms_env_vars,
                 "AREAL_SPMD_MODE": "1",
             },
-            env_hook=partial(torch_env_hook, trainer_n_nodes * n_gpus_per_node),
+            env_hook=partial(torch_env_hook, n_trainer_processes),
         )
 
     try:
-        launcher.wait(check_status=(JobState.COMPLETED, JobState.FAILED))
+        launcher.wait(
+            check_status=(JobState.COMPLETED, JobState.FAILED),
+            complete_all_worker_types=("trainer",),
+        )
     except (KeyboardInterrupt, JobException, TimeoutError) as e:
         # The 'force' is passed to ray.cancel(future, force=force).
         # If force=False, a KeyboardInterrupt will be raised in sglang_server.main(),
@@ -640,6 +1009,18 @@ def ray_main(config, run_id: int = 0):
         # handle KeyboardInterrupt properly when force=False.
         launcher.stop_all(force=True, pattern="trainer")
         run_post_exit_hook(config)
+        if (
+            isinstance(e, JobException)
+            and e.reason == JobState.COMPLETED
+            and e.worker_type == "trainer"
+        ):
+            # A trainer task finishing means the experiment is over: the
+            # remaining jobs were torn down above, so exit cleanly instead
+            # of surfacing a traceback and a non-zero exit code for a
+            # successful run. (An llm_server completing on its own is NOT
+            # normal and still falls through to the raise below.)
+            logger.info("Trainer completed; experiment finished successfully.")
+            return
         recover_states = [JobState.FAILED]
         if isinstance(e, JobException):
             recover_this = (
@@ -659,4 +1040,13 @@ def ray_main(config, run_id: int = 0):
 if __name__ == "__main__":
     # usage: python -m areal.infra.launcher.ray \
     #   <entry_point> --config <config_path> [<additional_args>]
+    #
+    # Works in three setups with the same command:
+    # 1. Single node (cluster.n_nodes=1): starts a local Ray instance.
+    # 2. Pre-assembled Ray cluster (`ray start` beforehand or RAY_ADDRESS
+    #    set): connects to it; run this command once, e.g. on the head node.
+    # 3. Multi-node platform job (AIS/PAI etc., node rank detectable from
+    #    env): use this command as the job command on EVERY node; rank 0
+    #    bootstraps the Ray head, other ranks join as workers. See
+    #    areal/infra/launcher/ray_bootstrap.py for the env knobs.
     main()

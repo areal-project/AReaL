@@ -848,10 +848,63 @@ class TestInferenceServiceWorkflow:
         )
 
     @pytest.mark.asyncio
-    async def test_offline_mode_discards_export_when_agent_fails(self):
+    async def test_offline_mode_assigns_each_interaction_reward(self):
+        class StepRewardAgent:
+            async def run(self, data, **kwargs):
+                return {"turn-1": -0.25, "turn-2": 1.0}
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=StepRewardAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        workflow._start_session = AsyncMock(
+            return_value=("grp-test-1", [("sess-1", "sess-api-key-1")])
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value={"turn-1": MagicMock(), "turn-2": MagicMock()}
+        )
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as context,
+            patch("areal.v2.inference_service.controller.workflow.stats_tracker"),
+        ):
+            context.get_aiohttp_session = AsyncMock(return_value=AsyncMock())
+            context.get.return_value = MagicMock(task_id=42)
+            context.get_httpx_client = AsyncMock(return_value=MagicMock())
+            context.stat_scope.return_value = "rollout"
+
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        assert result is not None
+        # A single request carries every step reward so the data proxy applies
+        # them all before finalizing the trajectory once.
+        assert workflow._set_last_reward.await_args_list == [
+            call(
+                context.get_aiohttp_session.return_value,
+                1.0,
+                "sess-api-key-1",
+                rewards={"turn-1": -0.25, "turn-2": 1.0},
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_type", [RuntimeError, httpx.ConnectError])
+    @pytest.mark.parametrize("failure_stage", ["agent", "reward"])
+    async def test_offline_failure_discards_export_without_fallback_reward(
+        self, error_type, failure_stage
+    ):
+        """Agent/reward failures discard all sessions without a zero-reward retry."""
+
         class FailingAgent:
             async def run(self, data, **kwargs):
-                raise RuntimeError("agent failed")
+                if failure_stage == "agent":
+                    raise error_type("agent failed")
+                return 1.0
 
         workflow = InferenceServiceWorkflow(
             controller=MagicMock(),
@@ -867,7 +920,9 @@ class TestInferenceServiceWorkflow:
                 [("sess-1", "key-1"), ("sess-2", "key-2")],
             )
         )
-        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._set_last_reward = AsyncMock(
+            side_effect=error_type("reward write failed")
+        )
         workflow._export_interactions = AsyncMock(return_value={})
 
         with patch(
@@ -879,6 +934,27 @@ class TestInferenceServiceWorkflow:
             result = await workflow.arun_episode(engine=MagicMock(), data={})
 
         assert result is None
+        if failure_stage == "agent":
+            workflow._set_last_reward.assert_not_awaited()
+        else:
+            assert workflow._set_last_reward.await_count == 2
+            workflow._set_last_reward.assert_has_awaits(
+                [
+                    call(
+                        context.get_aiohttp_session.return_value,
+                        1.0,
+                        "key-1",
+                        rewards=None,
+                    ),
+                    call(
+                        context.get_aiohttp_session.return_value,
+                        1.0,
+                        "key-2",
+                        rewards=None,
+                    ),
+                ],
+                any_order=True,
+            )
         workflow._export_interactions.assert_awaited_once_with(
             context.get_aiohttp_session.return_value,
             ["sess-1", "sess-2"],
@@ -919,7 +995,11 @@ class TestInferenceServiceWorkflow:
         ]
 
     @pytest.mark.asyncio
-    async def test_offline_group_serial_flag_exports_after_failure(self):
+    @pytest.mark.parametrize("serialize_group_samples", [False, True])
+    async def test_offline_group_failure_skips_fallback_reward_and_exports_discard(
+        self, serialize_group_samples
+    ):
+        """Only successful members write rewards; any failure discards the group."""
         (
             result,
             max_active,
@@ -927,14 +1007,18 @@ class TestInferenceServiceWorkflow:
             tracker,
             workflow,
         ) = await self._run_offline_group(
-            serialize_group_samples=True,
+            serialize_group_samples=serialize_group_samples,
             failing_member=1,
         )
 
         assert result is None
-        assert max_active == 1
+        assert max_active == (1 if serialize_group_samples else 4)
         assert start_order == [0, 1, 2, 3]
-        assert workflow._set_last_reward.await_count == 4
+        assert workflow._set_last_reward.await_count == 3
+        assert {
+            (args.args[1], args.args[2])
+            for args in workflow._set_last_reward.await_args_list
+        } == {(0.0, "session-key-0"), (2.0, "session-key-2"), (3.0, "session-key-3")}
         assert tracker.scalar.call_count == 0
 
 

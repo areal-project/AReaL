@@ -1,6 +1,30 @@
 from areal.experimental.openai.anthropic import translate_anthropic_request
 
 
+def test_anthropic_stream_queues_are_isolated(monkeypatch):
+    from areal.experimental.openai import anthropic
+
+    wrappers = []
+    real_wrapper = anthropic.AnthropicStreamWrapper
+
+    def capture_wrapper(**kwargs):
+        wrapper = real_wrapper(**kwargs)
+        wrappers.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(anthropic, "AnthropicStreamWrapper", capture_wrapper)
+
+    async def stream():
+        if False:
+            yield None
+
+    first = anthropic.translate_anthropic_stream(stream(), "test-model")
+    second = anthropic.translate_anthropic_stream(stream(), "test-model")
+    wrappers[0].chunk_queue.append("pending-first-stream-event")
+    assert list(wrappers[1].chunk_queue) == []
+    assert first is not second
+
+
 def test_translate_anthropic_request_preserves_tool_round_trip():
     translated = translate_anthropic_request(
         {

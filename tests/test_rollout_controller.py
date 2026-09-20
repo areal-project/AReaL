@@ -8,6 +8,7 @@ import torch
 from tests.utils import get_model_path
 
 from areal.api import (
+    LocalInfServerInfo,
     ModelRequest,
     ParamSpec,
     WeightUpdateMeta,
@@ -17,10 +18,16 @@ from areal.api.cli_args import (
     GenerationHyperparameters,
     InferenceEngineConfig,
     SchedulingSpec,
+    SchedulingStrategy,
     SGLangConfig,
 )
 from areal.infra import RolloutController
+from areal.infra.controller.rollout_controller import _merge_worker_stats
 from areal.infra.scheduler.local import LocalScheduler
+from areal.infra.workflow_executor import (
+    WorkflowContractError,
+    WorkflowContractFailure,
+)
 from areal.utils.hf_utils import load_hf_tokenizer
 
 
@@ -43,13 +50,16 @@ def create_test_config(backend="sglang:d2", **kwargs):
 class MockScheduler:
     def __init__(self):
         self.workers = []
+        self.jobs = []
         self.call_count = 0
         self.engine_calls = []
         self._pending_results = {}  # worker_id -> dict[task_id -> result]
         self._task_counter = 0
+        self.workflow_contract_error = None
 
     def create_workers(self, job, *args, **kwargs):
         """Create workers based on Job specification."""
+        self.jobs.append(job)
         role = job.role
         replicas = job.replicas
         worker_ids = [f"{role}/{i}" for i in range(replicas)]
@@ -57,7 +67,11 @@ class MockScheduler:
             Worker(
                 id=wid,
                 ip="127.0.0.1",
-                worker_ports=["8000", "8001"],
+                worker_ports=(
+                    ["8000", "8001"]
+                    if job.scheduling_strategy.fork
+                    else ["8000", "8001", "8002"]
+                ),
                 engine_ports=["9000", "9001"],
             )
             for wid in worker_ids
@@ -76,7 +90,9 @@ class MockScheduler:
     async def async_call_engine(self, worker_id, method, *args, **kwargs):
         self.engine_calls.append((worker_id, method, args, kwargs))
         self.call_count += 1
-        if method == "agenerate":
+        if method == "launch_server":
+            return Mock(host="127.0.0.1", port=8000)
+        elif method == "agenerate":
             return Mock()
         # Handle submit method - return a task_id and store the result
         elif method == "submit":
@@ -100,15 +116,16 @@ class MockScheduler:
             resp = requests.post(callback_addr, json=dict(task_id=task_id))
             resp.raise_for_status()
             return task_id
-        # Handle wait_for_task method
-        elif method == "wait_for_task":
+        # Handle controller-safe task result retrieval
+        elif method == "_wait_for_task_result":
             task_id = kwargs.get("task_id")
+            if self.workflow_contract_error is not None:
+                return WorkflowContractFailure(message=self.workflow_contract_error)
             if (
                 worker_id in self._pending_results
                 and task_id in self._pending_results[worker_id]
             ):
-                result = self._pending_results[worker_id].pop(task_id)
-                return result
+                return self._pending_results[worker_id].pop(task_id)
             return None
         elif method == "wait":
             # Return a result from pending results if available
@@ -177,6 +194,13 @@ class MockInferenceEngine:
         return "MockInferenceEngine"
 
 
+class _CyclingDataLoader:
+    batch_size = 4
+
+    def __iter__(self):
+        return iter([[{"id": 0}]])
+
+
 class TestRolloutControllerInitialization:
     def test_constructor(self):
         config = create_test_config(consumer_batch_size=16)
@@ -215,6 +239,93 @@ class TestRolloutControllerInitialization:
         assert controller.staleness_manager is not None
 
         controller.destroy()
+
+    def test_initialize_nonfork_colocation_uses_port_after_actor_rendezvous(self):
+        """A reused actor worker reserves port 2 for SGLang NCCL."""
+        config = create_test_config(
+            backend="sglang:d2",
+            scheduling_strategy=SchedulingStrategy(
+                type="colocation",
+                target="actor",
+                fork=False,
+            ),
+        )
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+
+        controller.initialize(role="rollout", server_args={"dist_init_addr": None})
+
+        launch_calls = [
+            call for call in scheduler.engine_calls if call[1] == "launch_server"
+        ]
+        assert len(launch_calls) == 2
+        for _, _, _, kwargs in launch_calls:
+            server_args = kwargs["server_args"]
+            assert server_args["nccl_port"] == 8002
+            assert server_args["dist_init_addr"] is None
+
+        controller.destroy()
+
+    def test_initialize_forked_colocation_uses_owned_rendezvous_port(self):
+        """A forked rollout worker can use its own port 1 for SGLang NCCL."""
+        config = create_test_config(
+            backend="sglang:d2",
+            scheduling_strategy=SchedulingStrategy(
+                type="colocation",
+                target="actor",
+                fork=True,
+            ),
+        )
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+
+        controller.initialize(role="rollout", server_args={})
+
+        launch_calls = [
+            call for call in scheduler.engine_calls if call[1] == "launch_server"
+        ]
+        assert len(launch_calls) == 2
+        for _, _, _, kwargs in launch_calls:
+            assert kwargs["server_args"]["nccl_port"] == 8001
+
+        controller.destroy()
+
+    def test_initialize_nonfork_colocation_without_third_port_fails(self):
+        """A reused actor worker must not silently reuse its train TCPStore."""
+        config = create_test_config(
+            backend="sglang:d2",
+            scheduling_strategy=SchedulingStrategy(
+                type="colocation",
+                target="actor",
+                fork=False,
+            ),
+        )
+        scheduler = MockScheduler()
+        original_create_workers = scheduler.create_workers
+
+        def create_workers_with_two_ports(job, *args, **kwargs):
+            worker_ids = original_create_workers(job, *args, **kwargs)
+            for worker in scheduler.workers:
+                worker.worker_ports = ["8000", "8001"]
+            return worker_ids
+
+        scheduler.create_workers = create_workers_with_two_ports
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+
+        with pytest.raises(ValueError, match="needs at least 3 allocated ports"):
+            controller.initialize(role="rollout", server_args={})
 
     def test_initialize_creates_staleness_manager(self):
         config = create_test_config(
@@ -273,6 +384,51 @@ class TestRolloutControllerInitialization:
 
         controller.destroy()
 
+    @pytest.mark.parametrize(
+        ("role", "expected_writes"),
+        [
+            ("rollout", 1),
+            ("eval-rollout", 0),
+        ],
+    )
+    def test_initialize_with_provided_eval_servers_skips_duplicate_targets(
+        self, monkeypatch, role, expected_writes
+    ):
+        write_calls = []
+
+        def fake_write_inference_targets(**kwargs):
+            write_calls.append(kwargs)
+
+        monkeypatch.setattr(
+            "areal.infra.controller.rollout_controller.write_inference_targets",
+            fake_write_inference_targets,
+        )
+        config = create_test_config(backend="sglang:d2")
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+        server_infos = [
+            LocalInfServerInfo(host="127.0.0.1", port=8000, process=None),
+            LocalInfServerInfo(host="127.0.0.1", port=8001, process=None),
+        ]
+
+        controller.initialize(
+            role=role,
+            server_args={},
+            server_infos=server_infos,
+        )
+
+        assert controller.server_infos == server_infos
+        assert len(write_calls) == expected_writes
+        if write_calls:
+            assert write_calls[0]["role"] == role
+            assert write_calls[0]["source"] == "provided"
+
+        controller.destroy()
+
 
 class TestRolloutControllerDestroy:
     def test_destroy_cleans_up_resources(self):
@@ -321,7 +477,8 @@ class TestRolloutControllerDestroy:
 
         controller.initialize(role="rollout", server_args={})
 
-        controller.destroy()
+        with pytest.raises(RuntimeError, match="rollout worker delete"):
+            controller.destroy()
 
 
 class TestRolloutControllerCapacity:
@@ -486,6 +643,38 @@ class TestRolloutControllerSubmitAndWait:
 
 
 class TestRolloutControllerBatchOperations:
+    @pytest.mark.parametrize("dynamic_bs", [False, True])
+    def test_prepare_batch_propagates_workflow_contract_error(self, dynamic_bs):
+        config = create_test_config(
+            backend="sglang:d1",
+            consumer_batch_size=1,
+            max_concurrent_rollouts=1,
+        )
+        scheduler = MockScheduler()
+        scheduler.workflow_contract_error = "logical slot produced two members"
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+        controller.initialize(role="rollout", server_args={})
+
+        try:
+            with pytest.raises(
+                WorkflowContractError, match="logical slot produced two members"
+            ):
+                controller.prepare_batch(
+                    _CyclingDataLoader(),
+                    workflow="tests.utils.TestWorkflow",
+                    workflow_kwargs={},
+                    dynamic_bs=dynamic_bs,
+                )
+        finally:
+            controller.destroy()
+
+        submit_calls = [call for call in scheduler.engine_calls if call[1] == "submit"]
+        assert len(submit_calls) == 1
+
     def test_rollout_batch_returns_list_of_dicts(self):
         """Verify RolloutController returns list of regular dicts, NOT RTensors.
 
@@ -1197,6 +1386,60 @@ class TestRolloutControllerRunner:
 
 class TestRolloutControllerExportStats:
     """Tests for export_stats method."""
+
+    def test_merge_worker_stats_preserves_reduction_semantics(self):
+        """Worker distributions retain weighted average and extrema semantics."""
+        all_raw_stats = [
+            {
+                "rollout/reward": 0.5,
+                "rollout/reward__count": 2,
+                "rollout/num_turns_count": 2,
+                "rollout/num_turns/avg": 15.0,
+                "rollout/num_turns/min": 10.0,
+                "rollout/num_turns/max": 20.0,
+                "rollout/prm_metric/turn/scorer/accepted/count": 3,
+            },
+            {
+                "rollout/reward": 0.8,
+                "rollout/reward__count": 1,
+                "rollout/num_turns_count": 1,
+                "rollout/num_turns/avg": 40.0,
+                "rollout/num_turns/min": 40.0,
+                "rollout/num_turns/max": 40.0,
+                "rollout/prm_metric/turn/scorer/accepted/count": 5,
+            },
+        ]
+
+        stats = _merge_worker_stats(all_raw_stats)
+
+        assert stats["rollout/reward"] == pytest.approx(0.6)
+        assert "rollout/reward__count" not in stats
+        assert stats["rollout/num_turns_count"] == 3
+        assert stats["rollout/num_turns/avg"] == pytest.approx(70 / 3)
+        assert stats["rollout/num_turns/min"] == 10.0
+        assert stats["rollout/num_turns/max"] == 40.0
+        assert stats["rollout/prm_metric/turn/scorer/accepted/count"] == 8
+
+    def test_merge_worker_stats_ignores_empty_distribution_workers(self):
+        """Workers without a distribution do not change its extrema or average."""
+        all_raw_stats = [
+            {},
+            {
+                "rollout/num_turns_count": 2,
+                "rollout/num_turns/avg": 12.0,
+                "rollout/num_turns/min": 5.0,
+                "rollout/num_turns/max": 19.0,
+            },
+        ]
+
+        stats = _merge_worker_stats(all_raw_stats)
+
+        assert stats == {
+            "rollout/num_turns_count": 2.0,
+            "rollout/num_turns/avg": 12.0,
+            "rollout/num_turns/min": 5.0,
+            "rollout/num_turns/max": 19.0,
+        }
 
     def test_export_stats_aggregates_from_workers(self):
         """Test export_stats correctly aggregates stats from all workers."""

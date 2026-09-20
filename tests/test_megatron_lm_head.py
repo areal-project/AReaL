@@ -96,6 +96,17 @@ def test_chunked_lm_head_config_validation():
     assert config.lm_head_loss_chunk_size == 128
 
 
+def test_mtp_training_config_requires_mtp_enabled():
+    with pytest.raises(
+        ValueError, match="enable_mtp_training requires enable_mtp=True"
+    ):
+        MegatronEngineConfig(enable_mtp_training=True)
+
+    config = MegatronEngineConfig(enable_mtp=True, enable_mtp_training=True)
+    assert config.enable_mtp is True
+    assert config.enable_mtp_training is True
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("fp32_operands", [False, True])
 def test_actor_output_layer_replacement_configures_fp32_operands(

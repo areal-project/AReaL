@@ -57,8 +57,12 @@ from pydantic import BaseModel
 from areal.api import ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai.cache import InteractionCache
-from areal.experimental.openai.tool_call_parser import process_tool_calls
+from areal.experimental.openai.tool_call_parser import (
+    process_tool_calls,
+    split_reasoning,
+)
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
+from areal.infra.processor_cache import ProcessorCallCache
 from areal.utils import logging
 from areal.utils.hf_utils import apply_chat_template
 
@@ -74,6 +78,18 @@ class _AsyncGenerateEngine(Protocol):
 
 TRolloutEngine = TypeVar("TRolloutEngine", bound=_AsyncGenerateEngine)
 
+
+def _force_reasoning_from_chat_template_kwargs(
+    chat_template_kwargs: dict[str, Any] | None,
+) -> bool:
+    """Detect templates that pre-fill an open ``<think>`` tag."""
+    if not chat_template_kwargs:
+        return False
+    if chat_template_kwargs.get("enable_thinking") is not None:
+        return bool(chat_template_kwargs["enable_thinking"])
+    return str(chat_template_kwargs.get("thinking_option", "")).lower() == "on"
+
+
 # reset OpenAI keys when using the wrapped client.
 os.environ["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY", "none")
 os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "none")
@@ -81,11 +97,31 @@ os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "none")
 logger = logging.getLogger("OpenAIClient")
 
 
+class ContextLengthExceededError(ValueError):
+    """Raised before generation when the prompt exhausts the context window."""
+
+
 @dataclass
 class _PreparedPrompt:
     input_ids: list[int]
     mm_token_type_ids: list[int] | None = None
     multi_modal_input: dict[str, torch.Tensor] | None = None
+
+    def copy_for_consumer(self) -> "_PreparedPrompt":
+        """Copy mutable containers while sharing immutable processor tensors."""
+        return _PreparedPrompt(
+            input_ids=list(self.input_ids),
+            mm_token_type_ids=(
+                list(self.mm_token_type_ids)
+                if self.mm_token_type_ids is not None
+                else None
+            ),
+            multi_modal_input=(
+                dict(self.multi_modal_input)
+                if self.multi_modal_input is not None
+                else None
+            ),
+        )
 
 
 def _process_multimodal_prompt(
@@ -442,7 +478,9 @@ def _validate_multimodal_agent_backend(
         if isinstance(backend, str) and backend
         else type(engine).__name__.lower()
     )
-    if "vllm" in backend_name:
+    # v2 InfBridge keeps the concrete backend on .backend, without engine.config.
+    backend_impl = getattr(engine, "backend", None)
+    if "vllm" in backend_name or "vllm" in type(backend_impl).__name__.lower():
         raise ValueError(
             "Multimodal agent trajectories are currently supported only with "
             "the SGLang rollout backend; vLLM support is deferred."
@@ -713,6 +751,7 @@ async def _prepare_prompt(
     tools: Iterable[ChatCompletionToolParam] | None,
     extra_body: Body,
     require_multimodal_processor: bool = False,
+    processor_cache: ProcessorCallCache | None = None,
 ) -> _PreparedPrompt:
     """Prepare text or multimodal prompt data for one agent interaction."""
     chat_template_kwargs = extra_body.get("chat_template_kwargs", {})
@@ -723,15 +762,34 @@ async def _prepare_prompt(
             "available for this rollout model."
         )
     if image_data and processor is not None:
-        processed_prompt = await asyncio.to_thread(
-            _process_multimodal_prompt,
-            processor,
-            tokenizer,
-            tokenizer_messages,
-            image_data,
-            tools,
-            chat_template_kwargs,
-        )
+
+        def process_prompt() -> _PreparedPrompt:
+            return _process_multimodal_prompt(
+                processor,
+                tokenizer,
+                tokenizer_messages,
+                image_data,
+                tools,
+                chat_template_kwargs,
+            )
+
+        if processor_cache is None:
+            processed_prompt = await asyncio.to_thread(process_prompt)
+        else:
+            cache_key = processor_cache.make_key(
+                "openai_multimodal",
+                id(processor),
+                id(tokenizer),
+                tokenizer_messages,
+                image_data,
+                tools,
+                chat_template_kwargs,
+            )
+            cached_prompt = await processor_cache.aget_or_compute(
+                cache_key,
+                process_prompt,
+            )
+            processed_prompt = cached_prompt.copy_for_consumer()
 
     if chat_template_type == "hf":
         input_ids = (
@@ -852,9 +910,11 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self,
         completion_id: str,
         current_time: int,
+        model: str,
         output_text: str,
         tool_calls: list | None,
         response: ModelResponse,
+        reasoning_text: str = "",
     ) -> tuple[ChatCompletion, ChatCompletionMessage]:
         """Build ChatCompletion and ChatCompletionMessage objects.
 
@@ -864,6 +924,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             output_text: The generated text output.
             tool_calls: List of tool calls, or None if no tool calls.
             response: The ModelResponse from the inference engine.
+            reasoning_text: Reasoning returned separately from the answer.
 
         Returns:
             A tuple of (ChatCompletion, ChatCompletionMessage).
@@ -873,6 +934,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             role="assistant",
             # For all empty tool calls, set tool_calls=None
             tool_calls=tool_calls or None,
+            **({"reasoning_content": reasoning_text} if reasoning_text else {}),
         )
         chat_completion = ChatCompletion(
             id=completion_id,
@@ -885,7 +947,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 )
             ],
             created=current_time,
-            model="None",
+            model=model,
             object="chat.completion",
             service_tier=None,
             system_fingerprint=None,
@@ -903,6 +965,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         *,
         messages: Iterable[ChatCompletionMessageParam],
         stream: Literal[True],
+        model: str | NotGiven = NOT_GIVEN,
         frequency_penalty: float | None | NotGiven = NOT_GIVEN,
         max_completion_tokens: int | None | NotGiven = NOT_GIVEN,
         max_tokens: int | None | NotGiven = NOT_GIVEN,
@@ -915,9 +978,11 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         temperature: float | None | NotGiven = NOT_GIVEN,
         tool_choice: ChatCompletionToolChoiceOptionParam | NotGiven = NOT_GIVEN,
         tools: Iterable[ChatCompletionToolParam] | NotGiven = NOT_GIVEN,
+        top_k: int | None | NotGiven = NOT_GIVEN,
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
+        processor_cache: ProcessorCallCache | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[ChatCompletionChunk, None]: ...
 
@@ -926,6 +991,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self,
         *,
         messages: Iterable[ChatCompletionMessageParam],
+        model: str | NotGiven = NOT_GIVEN,
         stream: Literal[False] | NotGiven = NOT_GIVEN,
         frequency_penalty: float | None | NotGiven = NOT_GIVEN,
         max_completion_tokens: int | None | NotGiven = NOT_GIVEN,
@@ -939,9 +1005,11 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         temperature: float | None | NotGiven = NOT_GIVEN,
         tool_choice: ChatCompletionToolChoiceOptionParam | NotGiven = NOT_GIVEN,
         tools: Iterable[ChatCompletionToolParam] | NotGiven = NOT_GIVEN,
+        top_k: int | None | NotGiven = NOT_GIVEN,
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
+        processor_cache: ProcessorCallCache | None = None,
         **kwargs: Any,
     ) -> ChatCompletion: ...
 
@@ -949,6 +1017,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self,
         *,
         messages: Iterable[ChatCompletionMessageParam],
+        model: str | NotGiven = NOT_GIVEN,
         stream: bool | NotGiven = NOT_GIVEN,
         frequency_penalty: float | None | NotGiven = NOT_GIVEN,
         max_completion_tokens: int | None | NotGiven = NOT_GIVEN,
@@ -962,14 +1031,17 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         temperature: float | None | NotGiven = NOT_GIVEN,
         tool_choice: ChatCompletionToolChoiceOptionParam | NotGiven = NOT_GIVEN,
         tools: Iterable[ChatCompletionToolParam] | NotGiven = NOT_GIVEN,
+        top_k: int | None | NotGiven = NOT_GIVEN,
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
+        processor_cache: ProcessorCallCache | None = None,
         **kwargs: Any,
     ) -> ChatCompletion | AsyncGenerator[ChatCompletionChunk, None]:
         """Override create method to use AReaL engine and cache responses."""
 
         is_streaming = not is_omitted(stream) and stream is True
+        response_model = "default" if is_omitted(model) else str(model)
 
         # Extract and validate supported parameters
         cache, interaction = None, None
@@ -1051,6 +1123,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             tools=tools_list,
             extra_body=extra_body,
             require_multimodal_processor=self.require_multimodal_processor,
+            processor_cache=processor_cache,
         )
         prompt_token_ids = prepared_prompt.input_ids
         if interaction is not None and self.processor is not None:
@@ -1099,7 +1172,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 ):
                     # Remove the interaction from cache on failure
                     del cache[completion_id]
-                raise ValueError(
+                raise ContextLengthExceededError(
                     f"len of prompt tokens {len(prompt_token_ids)} exceeds max_total_tokens {max_total_tokens_final}"
                 )
         if not is_omitted(max_completion_tokens):
@@ -1115,6 +1188,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             )
 
         top_p_val = 1.0 if is_omitted(top_p) else (top_p or 1.0)
+        top_k_val = int(1e8) if is_omitted(top_k) or top_k is None else int(top_k)
         stop_tokens = None if is_omitted(stop) else stop
 
         # Since the concat logic cannot properly handle stop tokens yet, so we remove stop here.
@@ -1141,6 +1215,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 engine_max_tokens=self.engine_max_tokens,
             ),
             top_p=top_p_val,
+            top_k=top_k_val,
             stop=stop_tokens,
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,
@@ -1165,8 +1240,8 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         # Call inference engine
         response = await self.engine.agenerate(model_request)
         output_text = self.tokenizer.decode(response.output_tokens_without_stop)
-
-        # Parse tool calls.
+        # Parse raw output first: prefilled Qwen thinking may enter a tool call
+        # without emitting </think>. Splitting first would swallow that call.
         tool_calls = None
         try:
             if (is_omitted(tool_choice) or tool_choice != "none") and tools_list:
@@ -1184,6 +1259,14 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 f"{output_text}"
             )
 
+        reasoning_text, output_text = split_reasoning(
+            output_text,
+            self.reasoning_parser,
+            force_reasoning=_force_reasoning_from_chat_template_kwargs(
+                extra_body.get("chat_template_kwargs")
+            ),
+        )
+
         # If streaming is requested, return an async generator
         if is_streaming:
             # Update cache BEFORE returning the generator to ensure the interaction
@@ -1196,9 +1279,11 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 chat_completion, output_message = self._build_chat_completion(
                     completion_id=completion_id,
                     current_time=current_time,
+                    model=response_model,
                     output_text=output_text,
                     tool_calls=tool_calls,
                     response=response,
+                    reasoning_text=reasoning_text,
                 )
                 cache[completion_id].completion = chat_completion
                 cache[completion_id].model_response = response
@@ -1208,6 +1293,8 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             return self._create_stream(
                 completion_id=completion_id,
                 current_time=current_time,
+                model=response_model,
+                reasoning_text=reasoning_text,
                 output_text=output_text,
                 tool_calls=tool_calls,
                 response=response,
@@ -1217,9 +1304,11 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         chat_completion, output_message = self._build_chat_completion(
             completion_id=completion_id,
             current_time=current_time,
+            model=response_model,
             output_text=output_text,
             tool_calls=tool_calls,
             response=response,
+            reasoning_text=reasoning_text,
         )
 
         if cache is not None:
@@ -1234,9 +1323,11 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self,
         completion_id: str,
         current_time: int,
+        model: str,
         output_text: str,
         tool_calls: list | None,
         response: ModelResponse,
+        reasoning_text: str = "",
     ) -> AsyncGenerator[ChatCompletionChunk, None]:
         """Generate streaming ChatCompletionChunk objects.
 
@@ -1259,12 +1350,27 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                     )
                 ],
                 created=current_time,
-                model="None",
+                model=model,
                 object="chat.completion.chunk",
             )
 
             # Content chunks - yield the full text as one chunk
             # (In a true streaming implementation, this would be broken into smaller pieces)
+            if reasoning_text:
+                yield ChatCompletionChunk(
+                    id=completion_id,
+                    choices=[
+                        ChunkChoice(
+                            delta=ChoiceDelta(**{"reasoning_content": reasoning_text}),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                    created=current_time,
+                    model=model,
+                    object="chat.completion.chunk",
+                )
+
             if output_text:
                 yield ChatCompletionChunk(
                     id=completion_id,
@@ -1276,7 +1382,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                         )
                     ],
                     created=current_time,
-                    model="None",
+                    model=model,
                     object="chat.completion.chunk",
                 )
 
@@ -1314,7 +1420,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                             )
                         ],
                         created=current_time,
-                        model="None",
+                        model=model,
                         object="chat.completion.chunk",
                     )
                     # Chunk 2: arguments only, emitted as input_json_delta by
@@ -1338,7 +1444,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                             )
                         ],
                         created=current_time,
-                        model="None",
+                        model=model,
                         object="chat.completion.chunk",
                     )
 
@@ -1353,7 +1459,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                     )
                 ],
                 created=current_time,
-                model="None",
+                model=model,
                 object="chat.completion.chunk",
                 usage=CompletionUsage(
                     completion_tokens=len(response.output_tokens),
@@ -1399,6 +1505,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
     async def create(
         self,
         *,
+        model: str | NotGiven = NOT_GIVEN,
         include: list[str] | None | NotGiven = NOT_GIVEN,
         input: str | ResponseInputParam | NotGiven = NOT_GIVEN,
         instructions: str | None | NotGiven = NOT_GIVEN,
@@ -1412,9 +1519,11 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         frequency_penalty: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: dict[str, InteractionWithTokenLogpReward] | None = None,
+        processor_cache: ProcessorCallCache | None = None,
         **kwargs: Any,
     ) -> Response:
         """Override create method to use AReaL engine"""
+        response_model = "default" if is_omitted(model) else str(model)
         # Initialize IDs and timestamps
         resp_id = f"resp-{uuid.uuid4().hex[:29]}"
         msg_id = f"msg-{uuid.uuid4().hex[:29]}"
@@ -1508,6 +1617,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             tools=tools_list,
             extra_body=extra_body,
             require_multimodal_processor=self.require_multimodal_processor,
+            processor_cache=processor_cache,
         )
         prompt_token_ids = prepared_prompt.input_ids
         if self.processor is not None:
@@ -1525,7 +1635,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
                 if interaction is not None and cache is not None and resp_id in cache:
                     # Remove the interaction from cache on failure
                     del cache[resp_id]
-                raise ValueError(
+                raise ContextLengthExceededError(
                     f"len of prompt tokens {len(prompt_token_ids)} exceeds engine_max_tokens {self.engine_max_tokens}"
                 )
         if not is_omitted(max_output_tokens):
@@ -1641,7 +1751,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             incomplete_details=None,
             instructions=None if is_omitted(instructions) else instructions,
             metadata=None if is_omitted(metadata) else metadata,
-            model="None",
+            model=response_model,
             object="response",
             output=resp_output,
             parallel_tool_calls=False,

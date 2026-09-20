@@ -109,12 +109,30 @@ class VisionRLVRWorkflow(RLVRWorkflow):
             self.async_reward_fn = AsyncRewardWrapper(self.reward_fn)
 
         processor_callable = cast(Callable[..., dict[str, Any]], self.processor)
-        processed_input = processor_callable(
-            images=data["images"],
-            text=data["messages"],
-            padding=False,
-            return_tensors="pt",
-        )
+
+        def process_input() -> dict[str, Any]:
+            return processor_callable(
+                images=data["images"],
+                text=data["messages"],
+                padding=False,
+                return_tensors="pt",
+            )
+
+        processor_cache = workflow_context.get().processor_cache
+        if processor_cache is None:
+            processed_input = process_input()
+        else:
+            cache_key = processor_cache.make_key(
+                "vision_rlvr",
+                id(self.processor),
+                id(data),
+            )
+            cached_input = await processor_cache.aget_or_compute(
+                cache_key, process_input
+            )
+            # Containers remain private to each candidate. Tensor values are treated
+            # as immutable and intentionally shared within the rollout group.
+            processed_input = dict(cached_input)
 
         input_ids: list[int] = processed_input["input_ids"].tolist()[0]
         mm_token_type_ids: list[int] = processed_input["mm_token_type_ids"].tolist()[0]

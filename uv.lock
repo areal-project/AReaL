@@ -315,7 +315,6 @@ dependencies = [
     { name = "aiohttp", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "anthropic", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "awex", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
-    { name = "blosc", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "build", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "claude-agent-sdk", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "colorama", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -481,7 +480,6 @@ requires-dist = [
     { name = "areal", extras = ["sglang"], marker = "extra == 'cuda'" },
     { name = "areal", extras = ["tms"], marker = "extra == 'cuda-train'" },
     { name = "awex", specifier = "==0.8.1" },
-    { name = "blosc" },
     { name = "build", specifier = ">=1.2.1" },
     { name = "claude-agent-sdk" },
     { name = "click", marker = "extra == 'cli'", specifier = ">=8.1" },
@@ -776,26 +774,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/9d/a9/a34e8153b0203d9060ff7aa5dfcd175e161117949697a83c4cc003b523ff/blobfile-3.0.0.tar.gz", hash = "sha256:32ec777414de7bb2a76ca812a838f0d33327ca28ae844a253503cde625cdf2f1", size = 77863, upload-time = "2024-08-27T00:02:53.092Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ed/4d/1392562369b1139e741b30d624f09fe7091d17dd5579fae5732f044b12bb/blobfile-3.0.0-py3-none-any.whl", hash = "sha256:48ecc3307e622804bd8fe13bf6f40e6463c4439eba7a1f9ad49fd78aa63cc658", size = 75413, upload-time = "2024-08-27T00:02:51.518Z" },
-]
-
-[[package]]
-name = "blosc"
-version = "1.11.4"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/9e/66/3c0e1801d4674582c38f9b009e71c09eb501fc3db591e35436dac15fa7a7/blosc-1.11.4.tar.gz", hash = "sha256:e0b312d9554d3aea93c75af4ad70dfa8b815ef4fe2b658c313b2f27ed0f41d37", size = 1439535, upload-time = "2026-01-17T23:02:25.209Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/80/03/68dd30549d3140d1d2054b68ed8d45630be2e87b976bc8c3c9e2e9a1104d/blosc-1.11.4-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:7a6a713949d5b69c68f394b70131d05c9cbb73d1e3751dde3034e9d16310c1a9", size = 2196403, upload-time = "2026-01-17T23:01:31.361Z" },
-    { url = "https://files.pythonhosted.org/packages/db/99/afd1929822dfbda6d11bb88673580c079c462dc85e6cefd6f3a320396557/blosc-1.11.4-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:19521732282f6d3690a6a3e2bc67a7d61697ac8bc5f1e37d35f9bab42087bc2f", size = 1802803, upload-time = "2026-01-17T23:01:32.756Z" },
-    { url = "https://files.pythonhosted.org/packages/e3/86/256d5268e877bfa4606e9ee7d5ccd9de3b5090df7956bf0d641b1bc92f68/blosc-1.11.4-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:65f0a54185667225174b3a8f63a2bd663910cd9d440359d0ea9f0a828fc70970", size = 2637888, upload-time = "2026-01-17T23:01:34.337Z" },
-    { url = "https://files.pythonhosted.org/packages/5d/af/b455443a688632981da49b3e1a313085e2a1281111eadaca95ccee5141e9/blosc-1.11.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:247d2edd7f510e3d0b0a75178f3e6f9d8820ffc55cf897a16f24520a645a70e5", size = 2728814, upload-time = "2026-01-17T23:01:35.578Z" },
-    { url = "https://files.pythonhosted.org/packages/4b/cb/aff868e1eb1bff3d8e679862eebc0e84df073b2cd1049b378f7465ff8894/blosc-1.11.4-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:61937055333e5a567cded39fd0776625a3761e725e253db3699dc0f27b509e6e", size = 2678217, upload-time = "2026-01-17T23:01:36.857Z" },
-    { url = "https://files.pythonhosted.org/packages/9b/e2/74c45886f39127a8253a648d15d1f21cca19559071f535dcd0535d0292ff/blosc-1.11.4-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:b66d6529ff0ea981f4f963c5e2139520635b8a27155de3cbd505c17c98449cba", size = 2752709, upload-time = "2026-01-17T23:01:38.628Z" },
-    { url = "https://files.pythonhosted.org/packages/05/87/e98f022eadead03a5bc033f2476f3c8ed9ad1ecd9457ebfe4c39b065da5c/blosc-1.11.4-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:21e7f29b29aa046fb2374995961f7763619378915330696d09f2e242f0150b46", size = 2218691, upload-time = "2026-01-17T23:01:43.633Z" },
-    { url = "https://files.pythonhosted.org/packages/8e/f0/3b88c55c0bb5cc6643e35f9c61fd7698513df68e382ac0c6367932414afd/blosc-1.11.4-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:01ee3348c7e9b7e2b98c1e095811fdda1ff428da18e3da57fa840632412a42c5", size = 1802802, upload-time = "2026-01-17T23:01:44.77Z" },
-    { url = "https://files.pythonhosted.org/packages/81/d9/d7cb25e46191886c276901b2b242ff15ee10e3d0707f6b781edd54b273e9/blosc-1.11.4-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8a601dad047f6fcbcf8fae5d353a468ff3301fb9b63a22a7d8891d654f9396cb", size = 2637860, upload-time = "2026-01-17T23:01:45.834Z" },
-    { url = "https://files.pythonhosted.org/packages/db/2e/26c047a3badf62a7b2dde2e8b24068db78070d37436c56a473350479b275/blosc-1.11.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0dc74964b13beeaf842e0902d428fdc93e31a6fe26d19ea36b5639228af4cd39", size = 2728861, upload-time = "2026-01-17T23:01:47.603Z" },
-    { url = "https://files.pythonhosted.org/packages/4a/41/53fbf4498c58063c5bcb9d4c9aedbe8b59f58359e105decef771bb6dd5a4/blosc-1.11.4-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:c708f5f556749a30e90d1c933e4aadd416483addb5a80ced4c2f103fea72be88", size = 2678161, upload-time = "2026-01-17T23:01:48.758Z" },
-    { url = "https://files.pythonhosted.org/packages/32/f5/32ffb61fcc792d4965e95598688de8b5104955ec26b767745cbf216a1f91/blosc-1.11.4-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:699ec760535b21d9384e9d18305632fbd52d73b06a6bb02eac66dc11b8ca5867", size = 2752696, upload-time = "2026-01-17T23:01:49.803Z" },
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api.cli_args import ValidDatasetConfig, _DatasetConfig
+from areal.dataset.mopd import is_remote_dataset
 
 
 def create_dataloader(
@@ -31,15 +32,16 @@ def create_dataloader(
             f"batch size({dataset_config.batch_size}) must be divisible by world_size({world_size})!"
         )
 
-    from areal.infra.data_service.rdataset import RDataset, _PrefetchAwareSampler
+    from areal.infra.data_service.rdataset import _PrefetchAwareSampler
 
     drop_sampler_last = True
     if isinstance(dataset_config, ValidDatasetConfig):
         drop_sampler_last = False
 
-    if isinstance(dataset, RDataset) and isinstance(dataset_config, ValidDatasetConfig):
+    remote_dataset = is_remote_dataset(dataset)
+    if remote_dataset and isinstance(dataset_config, ValidDatasetConfig):
         sampler_cls = _PrefetchAwareEvalSampler
-    elif isinstance(dataset, RDataset):
+    elif remote_dataset:
         sampler_cls = _PrefetchAwareSampler
     elif isinstance(dataset_config, ValidDatasetConfig):
         sampler_cls = EvalDistributedSampler

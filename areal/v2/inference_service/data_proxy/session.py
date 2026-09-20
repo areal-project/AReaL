@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,7 @@ from pydantic import BaseModel
 
 from areal.experimental.openai.cache import InteractionCache, PrefixMatcher
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
+from areal.infra.processor_cache import ProcessorCacheRegistry, ProcessorCallCache
 
 # Session timeout for cleanup (1 hour)
 SESSION_TIMEOUT_SECONDS = 3600
@@ -58,6 +60,7 @@ class SetRewardRequest(BaseModel):
 
     interaction_id: str | None = None
     reward: float
+    rewards: dict[str, float] | None = None
     model: str | None = None
 
 
@@ -138,8 +141,12 @@ class SessionData:
         set_reward_finish_timeout: float = 0.0,
         sampling_seed_identity: str | None = None,
         prefix_matcher: PrefixMatcher | None = None,
+        processor_cache: ProcessorCallCache | None = None,
+        processor_cache_group_id: str | None = None,
     ):
         self.session_id = session_id
+        self.processor_cache = processor_cache
+        self.processor_cache_group_id = processor_cache_group_id
         self.sampling_seed_identity = sampling_seed_identity or session_id
         self._set_reward_finish_timeout = set_reward_finish_timeout
         self._prefix_matcher = prefix_matcher
@@ -253,11 +260,28 @@ class SessionData:
         reward: float,
     ) -> RewardResult:
         """Record reward for the active trajectory."""
+        return self.set_rewards({interaction_id: reward})
+
+    def set_rewards(
+        self,
+        rewards: Mapping[str | None, float],
+    ) -> RewardResult:
+        """Record rewards for one or more interactions of the active trajectory.
+
+        All rewards are applied under a single lock acquisition and the
+        trajectory is finalized at most once, so a caller may attribute
+        step-level rewards without the first entry finalizing the trajectory
+        out from under the remaining ones.
+        """
+        if not rewards:
+            raise ValueError("No rewards provided")
+
         with self._lock:
             now = time.time()
             self._last_access_time = now
 
-            duplicate_ready = self._resolve_duplicate_ready_locked(interaction_id)
+            last_interaction_id = next(reversed(list(rewards)))
+            duplicate_ready = self._resolve_duplicate_ready_locked(last_interaction_id)
             if duplicate_ready is not None:
                 return RewardResult(
                     session_id=self.session_id,
@@ -270,12 +294,15 @@ class SessionData:
             if len(completions) == 0:
                 raise ValueError("No interactions in session")
 
-            resolved_interaction_id = interaction_id or completions.last_interaction_id
-            if resolved_interaction_id not in completions:
-                raise ValueError(f"Interaction {resolved_interaction_id} not found")
+            for interaction_id, reward in rewards.items():
+                resolved_interaction_id = (
+                    interaction_id or completions.last_interaction_id
+                )
+                if resolved_interaction_id not in completions:
+                    raise ValueError(f"Interaction {resolved_interaction_id} not found")
 
-            completions.set_reward(resolved_interaction_id, reward)
-            self._last_reward_interaction_id = resolved_interaction_id
+                completions.set_reward(resolved_interaction_id, reward)
+                self._last_reward_interaction_id = resolved_interaction_id
             self._last_set_reward_time = now
 
             ready_result = self._finalize_if_reward_timeout_elapsed_locked(now)
@@ -398,6 +425,7 @@ class SessionStore:
         prefix_matcher: PrefixMatcher | None = None,
     ):
         self._sessions: dict[str, SessionData] = {}
+        self._processor_caches = ProcessorCacheRegistry()
         self._api_key_to_session: dict[str, str] = {}
         self._session_to_api_key: dict[str, str] = {}
         self._lock = threading.Lock()
@@ -423,6 +451,8 @@ class SessionStore:
         task_id: str,
         api_key: str | None = None,
         sampling_seed_identity: str | None = None,
+        processor_cache_group_id: str | None = None,
+        processor_cache_group_size: int = 1,
     ) -> tuple[str, str]:
         """Start a new session, returning (session_id, session_api_key).
 
@@ -430,6 +460,10 @@ class SessionStore:
         fresh opaque key is generated.
         """
         with self._lock:
+            if processor_cache_group_id is not None and processor_cache_group_size < 2:
+                raise ValueError(
+                    "A shared processor cache requires at least two sessions"
+                )
             idx = 0
             while f"{task_id}-{idx}" in self._sessions:
                 idx += 1
@@ -461,6 +495,14 @@ class SessionStore:
                 set_reward_finish_timeout=self._set_reward_finish_timeout,
                 sampling_seed_identity=sampling_seed_identity,
                 prefix_matcher=self._prefix_matcher,
+                processor_cache=(
+                    self._processor_caches.acquire(
+                        processor_cache_group_id, processor_cache_group_size
+                    )
+                    if processor_cache_group_id is not None
+                    else None
+                ),
+                processor_cache_group_id=processor_cache_group_id,
             )
             self._api_key_to_session[session_api_key] = session_id
             self._session_to_api_key[session_id] = session_api_key
@@ -493,8 +535,14 @@ class SessionStore:
 
     def remove_session(self, session_id: str) -> None:
         with self._lock:
-            self._sessions.pop(session_id, None)
-            self._remove_api_keys_for_session(session_id)
+            self._remove_session_locked(session_id)
+
+    def _remove_session_locked(self, session_id: str) -> None:
+        """Release the session's cache lease; keep exported RTensor shards alive."""
+        session = self._sessions.pop(session_id, None)
+        if session is not None and session.processor_cache_group_id is not None:
+            self._processor_caches.release(session.processor_cache_group_id)
+        self._remove_api_keys_for_session(session_id)
 
     def _remove_api_keys_for_session(self, session_id: str) -> None:
         api_key = self._session_to_api_key.pop(session_id, None)
@@ -512,8 +560,7 @@ class SessionStore:
                 stale_sessions.append(sid)
 
             for sid in stale_sessions:
-                self._sessions.pop(sid, None)
-                self._remove_api_keys_for_session(sid)
+                self._remove_session_locked(sid)
 
     def finalize_rewarded_trajectories(
         self,

@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 from megatron.core import parallel_state as mpu
+from megatron.core.utils import get_model_config
 
 from tests.fp8.engine_utils import (
     extract_gemm_kernels,
@@ -116,6 +117,9 @@ def collect_gradients_after_train_batch(
     """
     engine._ensure_ready()
     assert engine.optimizer is not None, "Optimizer is not initialized."
+    assert get_model_config(engine.model[0]).grad_scale_func is not None, (
+        "Optimizer loss scaling is not wired into the model config."
+    )
     engine.optimizer.zero_grad()
     for model in engine.model:
         model.zero_grad_buffer()
@@ -156,9 +160,7 @@ def collect_gradients_after_train_batch(
     )
 
     # Step 4: Forward-backward using Megatron's pipeline function
-    loss_multiplier = (
-        mpu.get_data_parallel_world_size() * engine.optimizer.get_loss_scale().item()
-    )
+    loss_multiplier = mpu.get_data_parallel_world_size()
 
     def process_output(output: torch.Tensor, inputs: dict[str, Any]) -> torch.Tensor:
         return engine._compute_logprobs_and_loss(

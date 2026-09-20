@@ -22,6 +22,18 @@ class RolloutWorkflow(ABC):
         ----
         Returning `None` implies that this trajectory is rejected and will not be used for training.
 
+        Each v1 ``arun_episode`` call is one logical rollout, even when context
+        compaction exports multiple tensor rows or interactions. The collector
+        carries ``RolloutGroup`` metadata through training so reward statistics
+        count each rollout once. Advantage statistics remain token-based.
+
+        If row rewards differ and reward normalization is enabled, supply one
+        finite ``rollout_reward`` scalar in a tensor result, or on its exported
+        interactions (all supplied values must agree). This reference defines
+        group/batch reward statistics while each row retains its own reward.
+        Explicit references bypass row-length overlong penalties; actor reward
+        bias, scaling and clipping apply to both rows and references.
+
         Tensor trajectories should include an ``is_truncated`` boolean tensor with
         one value per trajectory when the workflow can determine whether the final
         model response stopped because it reached a length limit. PPO uses this
