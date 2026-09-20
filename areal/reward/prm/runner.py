@@ -45,6 +45,13 @@ class BaseScorer:
         self.weight = float(weight)
         self.enabled = bool(enabled)
 
+    async def aclose(self) -> None:
+        """Release owned resources and flush pending writes; default is a no-op.
+
+        Override for asynchronous clients or background writers. Bound external
+        I/O inside the hook; the runner does not impose a timeout or retry it.
+        """
+
     async def score(
         self,
         interaction: InteractionWithTokenLogpReward,
@@ -279,9 +286,16 @@ class PRMRunner:
 
     def __init__(self, config: PRMConfig):
         self.config = config
-        self._scorers = (
-            [_resolve_scorer(spec) for spec in config.scorers] if config.enabled else []
-        )
+        self._scorers: list[BaseScorer] = []
+        self._owned_scorers: list[BaseScorer] = []
+        self._close_lock = asyncio.Lock()
+        self._closed = False
+        if config.enabled:
+            for spec in config.scorers:
+                scorer = _resolve_scorer(spec)
+                self._scorers.append(scorer)
+                if not isinstance(spec, BaseScorer):
+                    self._owned_scorers.append(scorer)
         for scorer in self._scorers:
             validate = getattr(scorer, "validate_prm_config", None)
             if validate is not None:
@@ -303,6 +317,35 @@ class PRMRunner:
     def scorers(self) -> tuple[BaseScorer, ...]:
         return tuple(self._scorers)
 
+    async def aclose(self) -> None:
+        """Close configured scorers once, after the caller has drained scoring.
+
+        Instances supplied directly are borrowed and remain caller-owned.
+        Disabled scorers created from configuration are still owned. Ordinary
+        cleanup failures are collected until all owned scorers have been tried;
+        cancellation propagates. Closing does not retry failed hooks.
+        """
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            errors: list[Exception] = []
+            seen: set[int] = set()
+            for scorer in reversed(self._owned_scorers):
+                if id(scorer) in seen:
+                    continue
+                seen.add(id(scorer))
+                try:
+                    await scorer.aclose()
+                except Exception as exc:
+                    exc.add_note(f"While closing PRM scorer {scorer.name!r}")
+                    # A later service-resource failure may replace the exception
+                    # raised by this runner during lifespan unwinding.
+                    logger.exception("Failed to close PRM scorer %r", scorer.name)
+                    errors.append(exc)
+            if errors:
+                raise ExceptionGroup("PRM scorer cleanup failed", errors)
+
     async def run(
         self,
         cache: InteractionCache,
@@ -317,6 +360,8 @@ class PRMRunner:
         compose multiple branch-local runs can set ``record_metrics=False`` and
         publish the returned values only after the whole trajectory succeeds.
         """
+        if self._closed:
+            raise RuntimeError("PRMRunner is closed")
         if not self._scorers or not cache:
             return []
 

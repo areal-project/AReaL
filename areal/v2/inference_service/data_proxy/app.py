@@ -7,7 +7,7 @@ import hmac
 import json
 import uuid
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 import httpx
@@ -365,12 +365,6 @@ async def _ready_trajectory_loop(app: FastAPI) -> None:
 def create_app(config: DataProxyConfig) -> FastAPI:
     """Factory that creates the FastAPI app with lifespan-managed resources."""
 
-    prm_runner = None
-    if config.prm.enabled and config.prm.scorers:
-        from areal.reward.prm import PRMRunner
-
-        prm_runner = PRMRunner(config.prm)
-
     message_preprocessors: list[MessagePreprocessor] = []
     for path in config.message_preprocessors:
         preprocessor_cls = import_from_string(path)
@@ -399,35 +393,49 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         )
         app.state.session_store.set_admin_key(config.admin_api_key)
         app.state.version = 0
-        app.state.http_client = create_httpx_client(timeout=config.request_timeout)
+        app.state.tokenizer = None
+        app.state.inf_bridge = None
+        app.state.areal_client = None
+        app.state.prm_runner = None
 
-        if not config.backend_addr:
-            app.state.tokenizer = None
-            app.state.inf_bridge = None
-            app.state.areal_client = None
-        else:
-            tok = TokenizerProxy(config.tokenizer_path)
-            inf_bridge = _create_inf_bridge(config.backend_addr, pause_state, config)
-            areal_client = _create_areal_client(inf_bridge, tok, config)
-            app.state.tokenizer = tok
-            app.state.inf_bridge = inf_bridge
-            app.state.areal_client = areal_client
-
-        ready_task = asyncio.create_task(_ready_trajectory_loop(app))
-        try:
-            yield
-        finally:
-            ready_task.cancel()
-            try:
-                await ready_task
-            except asyncio.CancelledError:
-                pass
+        async def close_current_bridge():
+            # /configure_backend can replace the startup-time bridge.
             if app.state.inf_bridge is not None:
                 await app.state.inf_bridge.aclose()
-            await app.state.http_client.aclose()
+
+        async with AsyncExitStack() as resources:
+            app.state.http_client = create_httpx_client(timeout=config.request_timeout)
+            resources.push_async_callback(app.state.http_client.aclose)
+            resources.push_async_callback(close_current_bridge)
+
+            if config.backend_addr:
+                tok = TokenizerProxy(config.tokenizer_path)
+                app.state.tokenizer = tok
+                inf_bridge = _create_inf_bridge(
+                    config.backend_addr, pause_state, config
+                )
+                app.state.inf_bridge = inf_bridge
+                app.state.areal_client = _create_areal_client(inf_bridge, tok, config)
+
+            if config.prm.enabled and config.prm.scorers:
+                from areal.reward.prm import PRMRunner
+
+                app.state.prm_runner = PRMRunner(config.prm)
+                resources.push_async_callback(app.state.prm_runner.aclose)
+
+            ready_task = asyncio.create_task(_ready_trajectory_loop(app))
+            try:
+                yield
+            finally:
+                ready_task.cancel()
+                try:
+                    await ready_task
+                except asyncio.CancelledError:
+                    pass
         logger.info("Data proxy shutting down")
 
     app = FastAPI(title="AReaL Data Proxy", lifespan=lifespan)
+    app.state.prm_runner = None
     _registered_models: dict[str, dict[str, str | None]] = {}
 
     async def _create_internal_chat_result(
@@ -892,6 +900,10 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 status_code=400,
                 detail="session_ids must be a non-empty list",
             )
+
+        prm_runner = app.state.prm_runner
+        if config.prm.enabled and config.prm.scorers and prm_runner is None:
+            raise HTTPException(status_code=503, detail="PRM runner is not initialized")
 
         if prm_runner is not None and not body.discard_trajectory:
             if body.style != "concat":

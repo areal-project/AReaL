@@ -61,6 +61,27 @@ and `rate`; numeric observations support `sum` and `mean`. Schemas must stay sta
 for the same scorer and metric. The example length-budget scorer demonstrates
 this interface without adding dependencies.
 
+### Scorer Lifecycle
+
+`BaseScorer.aclose()` is an optional asynchronous cleanup hook with a no-op
+default. Override it to flush buffered audit records, join background writers,
+and close clients owned by the scorer. Bound external I/O inside the hook;
+the runner does not add a cleanup timeout or retry policy.
+
+`PRMRunner.aclose()` closes scorers it created from configuration, including
+disabled scorers, in reverse creation order. Scorer instances passed directly
+to the runner are borrowed: their caller remains responsible for closing them.
+Each owned instance is closed at most once. Concurrent close calls wait for the
+same cleanup; ordinary failures are logged and collected in an `ExceptionGroup` after all
+owned scorers have been attempted. Cancellation propagates, and subsequent close
+calls do not retry failed or interrupted hooks.
+
+Callers must drain scoring before closing the runner. New `run()` calls are
+rejected once closing starts. The v2 data proxy creates its runner during service
+startup and awaits cleanup during lifespan shutdown, before closing its inference
+bridge and HTTP client. Those resources are still cleaned up if scorer cleanup
+fails. The v1 proxy does not yet invoke this hook automatically.
+
 ## Advantage Shaping
 
 Scoring produces `token_rewards` aligned to generated tokens; prompt tokens are

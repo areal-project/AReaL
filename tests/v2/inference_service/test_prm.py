@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import AsyncExitStack
 from dataclasses import asdict
 from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import httpx
 import pytest
+import pytest_asyncio
 import torch
 from pydantic import TypeAdapter
 
@@ -32,7 +34,6 @@ from areal.utils import stats_tracker
 from areal.v2.inference_service.controller.workflow import InferenceServiceWorkflow
 from areal.v2.inference_service.data_proxy.app import create_app
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
-from areal.v2.inference_service.data_proxy.session import SessionStore
 
 _HEADERS = {"Authorization": "Bearer areal-admin-key"}
 
@@ -47,30 +48,31 @@ def clear_stats():
     workflow_context.set(previous)
 
 
-@pytest.fixture
-def proxy_factory(monkeypatch):
+@pytest_asyncio.fixture
+async def proxy_factory(monkeypatch):
     """Use real session/scoring/export code, without a model or remote tensor host."""
     monkeypatch.setattr(
         "areal.v2.inference_service.data_proxy.app._remotize_trajectory",
         lambda traj, node_addr: traj,
     )
 
-    def make(scorers, *, enabled=True):
-        app = create_app(
-            DataProxyConfig(
-                backend_addr="",
-                chat_template_type="concat",
-                prm=PRMConfig(enabled=enabled, scorers=scorers),
-            )
-        )
-        store = SessionStore()
-        app.state.session_store = store
-        client = httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://test"
-        )
-        return client, store
+    async with AsyncExitStack() as lifespans:
 
-    return make
+        async def make(scorers, *, enabled=True):
+            app = create_app(
+                DataProxyConfig(
+                    backend_addr="",
+                    chat_template_type="concat",
+                    prm=PRMConfig(enabled=enabled, scorers=scorers),
+                )
+            )
+            await lifespans.enter_async_context(app.router.lifespan_context(app))
+            client = httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            )
+            return client, app.state.session_store
+
+        yield make
 
 
 def _interaction(name, *, parent=None, branch="a", output_len=2):
@@ -179,7 +181,7 @@ async def test_v2_export_matches_v1_branch_tensors_and_json_metrics(
         is_eval=is_eval,
     )
     expected_metrics = stats_tracker.export_all(reduce_group=None)
-    client, store = proxy_factory(scorers)
+    client, store = await proxy_factory(scorers)
     async with client:
         sid = _add_session(store, "v2", [root, a, b])
         cached_root = root.to_tensor_dict()
@@ -227,7 +229,7 @@ class _RewardScorer(BaseScorer):
 async def test_scoring_precedes_outcome_normalization(proxy_factory):
     """Normalize outcomes as before, without normalizing the process signals."""
     scorer = _RewardScorer()
-    client, store = proxy_factory([scorer])
+    client, store = await proxy_factory([scorer])
     async with client:
         sessions = []
         for reward in (1.0, 3.0):
@@ -273,7 +275,7 @@ async def test_failed_scorer_rejects_group_but_retains_successful_session_stats(
                 return None
             return 0.0
 
-    client, store = proxy_factory([Scorer()])
+    client, store = await proxy_factory([Scorer()])
     async with client:
         sessions = [
             _add_session(store, "group", [_interaction(name)])
@@ -302,7 +304,7 @@ async def test_later_branch_failure_returns_no_partial_session_stats(proxy_facto
             return await super().evaluate(interaction, ctx)
 
     root = _interaction("root")
-    client, store = proxy_factory([Scorer()])
+    client, store = await proxy_factory([Scorer()])
     async with client:
         sid = _add_session(
             store,
@@ -328,7 +330,9 @@ async def test_unconfigured_or_disabled_prm_keeps_original_response(
 ):
     """No configuration or disabled scoring is a no-op, including response shape."""
     scorer = _RewardScorer()
-    client, store = proxy_factory([scorer] if disabled else [], enabled=not disabled)
+    client, store = await proxy_factory(
+        [scorer] if disabled else [], enabled=not disabled
+    )
     async with client:
         sid = _add_session(store, "plain", [_interaction("plain")])
         response = await _export(client, [sid])
@@ -341,7 +345,7 @@ async def test_unconfigured_or_disabled_prm_keeps_original_response(
 async def test_discard_skips_scoring_and_cleans_sessions(proxy_factory):
     """A group already rejected by its Agent calls does not invoke judges."""
     scorer = _RewardScorer()
-    client, store = proxy_factory([scorer])
+    client, store = await proxy_factory([scorer])
     async with client:
         sid = _add_session(store, "discard", [_interaction("unused")])
         response = await _export(client, [sid], discard_trajectory=True)
@@ -355,7 +359,7 @@ async def test_discard_skips_scoring_and_cleans_sessions(proxy_factory):
 async def test_invalid_prm_export_does_not_consume_trajectory(proxy_factory, invalid):
     """Invalid protocol requests fail before claiming any ready trajectory."""
     scorer = _RewardScorer()
-    client, store = proxy_factory([scorer])
+    client, store = await proxy_factory([scorer])
     async with client:
         sid = _add_session(store, "validation", [_interaction("turn")])
         response = await _export(
@@ -385,7 +389,7 @@ async def test_overlapping_exports_score_once_and_preserve_reused_session(
             return await super().evaluate(interaction, ctx)
 
     scorer = Scorer()
-    client, store = proxy_factory([scorer])
+    client, store = await proxy_factory([scorer])
     async with client:
         sid = _add_session(store, "reused", [_interaction("first")])
         pending = asyncio.create_task(_export(client, [sid]))
@@ -423,7 +427,7 @@ async def test_cancelled_scoring_cleans_owned_sessions(proxy_factory):
             finally:
                 sessions_during_cleanup.append(store.session_count)
 
-    client, store = proxy_factory([Scorer()])
+    client, store = await proxy_factory([Scorer()])
     async with client:
         ids = [
             _add_session(store, "cancel", [_interaction(name)])
@@ -450,7 +454,7 @@ async def test_concurrent_sessions_keep_context_and_statistics_isolated(proxy_fa
             await asyncio.sleep(0)
             return await super().evaluate(interaction, ctx)
 
-    client, store = proxy_factory([Scorer()])
+    client, store = await proxy_factory([Scorer()])
     async with client:
         one, two = _interaction("one"), _interaction("two")
         one.reward, two.reward = 1.0, 3.0
@@ -489,7 +493,7 @@ async def test_group_sessions_score_concurrently_and_retain_request_order(
             return await super().evaluate(interaction, ctx)
 
     scorer = Scorer()
-    client, store = proxy_factory([scorer])
+    client, store = await proxy_factory([scorer])
     async with client:
         first, second = _interaction("first"), _interaction("second")
         first.reward, second.reward = 1.0, 3.0
@@ -510,7 +514,7 @@ async def test_group_sessions_score_concurrently_and_retain_request_order(
 async def test_persistent_session_scores_each_ready_trajectory_only_once(proxy_factory):
     """A retained session can produce subsequent complete trajectories, not re-score old ones."""
     scorer = _RewardScorer()
-    client, store = proxy_factory([scorer])
+    client, store = await proxy_factory([scorer])
     async with client:
         sid = _add_session(store, "persistent", [_interaction("first")])
         first = await _export(client, [sid], trajectory_id=0, remove_session=False)
@@ -547,7 +551,7 @@ async def test_online_scoring_preserves_next_hitl_trajectory(
                     return None
             return await super().evaluate(interaction, ctx)
 
-    client, store = proxy_factory([Scorer()])
+    client, store = await proxy_factory([Scorer()])
     session = store.get_or_create_hitl_session()
     session.active_completions["first"] = _interaction("first")
     session.set_reward("first", 1.0)
@@ -604,7 +608,7 @@ async def test_online_export_retains_only_persistent_sessions(
     proxy_factory, hitl, prm_enabled
 ):
     """HITL IDs keep advancing; ordinary session keys remain refreshable."""
-    client, store = proxy_factory([_RewardScorer()], enabled=prm_enabled)
+    client, store = await proxy_factory([_RewardScorer()], enabled=prm_enabled)
     if hitl:
         session = store.get_or_create_hitl_session()
         sid, api_key = session.session_id, None
@@ -652,7 +656,7 @@ async def test_online_export_retains_only_persistent_sessions(
 @pytest.mark.asyncio
 async def test_missing_member_rejects_prm_group_without_normalization(proxy_factory):
     """PRM cannot silently shrink a group when one requested session is unavailable."""
-    client, store = proxy_factory([_RewardScorer()])
+    client, store = await proxy_factory([_RewardScorer()])
     async with client:
         sid = _add_session(store, "missing", [_interaction("present")])
         response = await _export(client, [sid, "not-present"])
@@ -664,7 +668,7 @@ async def test_missing_member_rejects_prm_group_without_normalization(proxy_fact
 @pytest.mark.asyncio
 async def test_http_export_retry_records_received_metrics_once(proxy_factory):
     """Retry connection setup without duplicating a successfully received report."""
-    client, store = proxy_factory([_RewardScorer()])
+    client, store = await proxy_factory([_RewardScorer()])
     async with client:
         sid = _add_session(store, "retry", [_interaction("turn")])
         exported = await _export(client, [sid])

@@ -78,10 +78,18 @@ async def proxy(monkeypatch, request):
     )
     monkeypatch.setattr(bridge, "_send_request", send)
     areal_client = _create_areal_client(bridge, tok, config)
-    store = SessionStore()
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app.TokenizerProxy", lambda path: tok
+    )
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app._create_inf_bridge",
+        lambda *args: bridge,
+    )
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app._create_areal_client",
+        lambda *args: areal_client,
+    )
     app = create_app(config)
-    app.state.session_store = store
-    app.state.areal_client = areal_client
 
     tensors = {}
 
@@ -97,13 +105,16 @@ async def proxy(monkeypatch, request):
     ]
     monkeypatch.setattr(rtensor, "get_backend", lambda: backend)
     monkeypatch.setattr(rtensor, "_fetch_buffer", {})
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client,
+    ):
         try:
             yield SimpleNamespace(
                 client=client,
-                store=store,
+                store=app.state.session_store,
                 processor=processor,
                 send=send,
                 tensors=tensors,
@@ -113,7 +124,6 @@ async def proxy(monkeypatch, request):
             )
         finally:
             await areal_client.close()
-            await bridge.aclose()
 
 
 async def _run_group(proxy, colors):
