@@ -1032,8 +1032,6 @@ class WorkflowExecutor:
             return False, "trajectory is None"
 
         try:
-            traj = RTensor.localize(traj)
-
             dump_dir = self._get_dump_dir(is_eval)
             if dump_dir is None:
                 return False, "dump dir is empty"
@@ -1041,6 +1039,28 @@ class WorkflowExecutor:
             tokenizer = self._get_tokenizer()
             if tokenizer is None:
                 return False, "tokenizer not configured"
+
+            # Dump only consumed fields, never vision payloads. localize mutates
+            # RTensor.data, so copy the wrappers as well as the container: the
+            # original training trajectory must remain reference-only for RPC.
+            dump_fields = (
+                "input_ids",
+                "rewards",
+                "loss_mask",
+                "attention_mask",
+                "versions",
+                "original_rewards",
+            )
+            dump_input = {}
+            for key in dump_fields:
+                if key in traj:
+                    value = traj[key]
+                    dump_input[key] = (
+                        RTensor(shard=value.shard, data=value.data)
+                        if isinstance(value, RTensor)
+                        else value
+                    )
+            traj = RTensor.localize(dump_input)
 
             # Extract tensors
             input_ids = traj.get("input_ids")

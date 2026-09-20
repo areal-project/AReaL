@@ -316,6 +316,75 @@ stats_logger:
     path: "/path/to/tensorboard/logs"  # null to disable
 ```
 
+## Training Diagnostics
+
+When recomputed proximal log-probabilities are available during advantage preprocessing,
+`ppo_actor/train_infer/` compares them with the original rollout log-probabilities
+**before** standard PPO replaces those values. This requires no additional model forward
+pass. Runs without recomputation and pure MOPD preprocessing do not emit this namespace.
+
+Let `d = log(p_trainer) - log(p_rollout)` on aligned, valid generated tokens:
+
+| Metric                                                                                           | Definition                                  |
+| ------------------------------------------------------------------------------------------------ | ------------------------------------------- |
+| `logp_diff/{avg,min,max}`                                                                        | Signed difference `d`                       |
+| `logp_abs_diff/{avg,min,max}`                                                                    | Absolute difference `abs(d)`                |
+| `logp_diff_squared`                                                                              | Token-weighted mean of `d²`                 |
+| `trainer_nll`, `rollout_nll`                                                                     | Mean negative sampled-token log-probability |
+| `kl_k1`, `kl_k2`, `kl_k3`                                                                        | Means of `-d`, `d²/2`, and `exp(d)-1-d`     |
+| `ratio_outside_1.5`, `ratio_outside_2`, `ratio_outside_3`, `ratio_outside_5`, `ratio_outside_10` | Fraction with `abs(d) > log(threshold)`     |
+
+These metrics use the generation mask before subsequent rejection/advantage masking. For
+stale rollouts, differences include policy drift, not just numerical engine
+disagreement. KL estimates also depend on the sampling distribution, filtering, and
+log-probability convention. The `k1` sample estimate can be negative; `k2` is a local
+approximation. The mean squared difference and absolute mean permit deriving the
+population standard deviation of absolute differences after aggregation:
+`sqrt(max(0, E[d²] - E[abs(d)]²))`.
+
+The ratio tail definition matches the extreme token fraction in
+[R3, Equation (3)](https://arxiv.org/html/2510.11370v1). For samples drawn from the
+reported rollout distribution with matching support, `k1` and `k3` estimate
+`KL(rollout || trainer)`. Returned logprobs are not necessarily those of the actual
+sampling distribution after top-p/top-k filtering or greedy selection.
+
+`nonfinite_logp_fraction` reports the fraction of valid tokens for which either logprob
+is NaN or infinite. If any such token participates, ratio tail metrics are NaN rather
+than silently classifying invalid comparisons as zero. Masked padding does not
+contribute to this fraction or contaminate the tails. `kl_k3_overflow_fraction` reports
+finite-input gaps whose `expm1` exceeds float64.
+
+`ppo_actor/advantage_{positive,negative,zero}_fraction` uses the shaped input advantages
+and batch loss mask **before M2/rejection filtering**. It measures token occupancy, not
+task success or gradient signs. GSPO can further aggregate advantages by sequence inside
+the loss.
+
+`ppo_actor/update/version_stats/sample_staleness_{theta,proximal}_{avg,min,max}` uses
+generated tokens with nonnegative versions. Averages are token-weighted and extrema are
+global over the reduction group. Both legacy theta/proximal keys use the last published
+checkpoint version: actor and rollout versions advance together after a PPO update. They
+do not track intermediate optimizer minibatches. `stale_token_fraction` counts behavior
+versions older than that checkpoint; `future_token_fraction` counts newer versions. Raw
+rollout versions are shifted to prediction positions locally for this diagnostic,
+including pure MOPD batches. This does not change the existing version-aware proximal
+approximation used in the loss. The population is the batch **before M2/rejection
+filtering**, counted once per `_ppo_update`, independently of minibatch forwards.
+`n_valid_generated_tokens` sums these observations; reused trajectories in separate
+updates are counted again. Empty populations omit averages and extrema rather than
+reporting a fabricated zero.
+
+New diagnostics use `stat_compact`: each metric stores only four float64 scalars (masked
+sum, count, minimum, maximum) per batch until export. This avoids the former
+approximately 106 bytes of retained diagnostic tensors per padded token. Existing PPO
+statistics still retain their own full tensors, and the transient computation of
+summaries still allocates per-token tensors. Long-context peak memory and runtime
+overhead require workload-specific validation.
+
+The optional loglinear proximal approximation still uses raw token-position rollout
+versions and its original `current_version - 1` interpolation assumption. Those
+pre-existing algorithm semantics require separate step-level validation; the
+checkpoint-age diagnostics above are not evidence that they are corrected.
+
 ## Best Practices
 
 1. **Choose the right paradigm**: Use `scalar()` for scalars, `stat()` with denominators
