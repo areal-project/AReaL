@@ -729,12 +729,12 @@ class PPOActor:
                 final_reward=data["tot_rewards"],
                 denominator="n_valid_tokens",
             )
-            stats_tracker.stat(
+            stats_tracker.stat_compact(
+                loss_mask.bool(),
+                ReduceType.AVG,
                 advantage_positive_fraction=(data["advantages"] > 0).float(),
                 advantage_negative_fraction=(data["advantages"] < 0).float(),
                 advantage_zero_fraction=(data["advantages"] == 0).float(),
-                denominator="n_valid_tokens",
-                reduce_type=ReduceType.AVG,
             )
 
         prompt_lens = _infer_prompt_lens(data["attention_mask"], data["loss_mask"])
@@ -747,9 +747,9 @@ class PPOActor:
         )
         stats_tracker.stat(**seq_stats, denominator="n_seqs")
         if "versions" in data:
-            # Workflow versions describe token positions, while the loss mask
-            # describes next-token predictions. Align a local copy before
-            # packing/splitting, without changing the algorithm's input data.
+            # Both regular advantage preprocessing and pure MOPD retain raw
+            # token-position versions. Align only the diagnostic copy here;
+            # changing proximal approximation requires separate validation.
             metric_versions = torch.roll(data["versions"], shifts=-1, dims=-1)
             metric_versions[..., -1] = -1
             with stats_tracker.scope("update"):
@@ -1839,7 +1839,6 @@ def _log_version_staleness_stats(
     """
     with stats_tracker.scope("version_stats"):
         valid_generated_mask = version_metrics_mask.bool() & (versions >= 0)
-        stats_tracker.denominator(n_valid_tokens=valid_generated_mask)
 
         # The trainer publishes actor and rollout versions together AFTER an
         # update. Before the next update, proximal uses that published version.
@@ -1856,24 +1855,24 @@ def _log_version_staleness_stats(
             ("min", ReduceType.MIN),
             ("max", ReduceType.MAX),
         ):
-            stats_tracker.stat(
+            stats_tracker.stat_compact(
+                valid_generated_mask,
+                reduction,
                 **{
                     f"sample_staleness_proximal_{suffix}": v_proximal - v_behave,
                     f"sample_staleness_theta_{suffix}": v_theta - v_behave,
                 },
-                denominator="n_valid_tokens",
-                reduce_type=reduction,
             )
-        stats_tracker.stat(
+        stats_tracker.stat_compact(
+            valid_generated_mask,
+            ReduceType.SUM,
             n_valid_generated_tokens=torch.ones_like(v_behave),
-            denominator="n_valid_tokens",
-            reduce_type=ReduceType.SUM,
         )
-        stats_tracker.stat(
+        stats_tracker.stat_compact(
+            valid_generated_mask,
+            ReduceType.AVG,
             stale_token_fraction=(v_behave < v_proximal).float(),
             future_token_fraction=(v_behave > v_theta).float(),
-            denominator="n_valid_tokens",
-            reduce_type=ReduceType.AVG,
         )
         stats_tracker.scalar(
             v_theta=v_theta,

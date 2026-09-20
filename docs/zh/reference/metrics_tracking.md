@@ -331,8 +331,9 @@ logprob 之前比较两者，不增加模型 forward。 不重算 logprob 的运
 概率分布且支持集匹配时，k1/k3 估计 `KL(rollout || trainer)`。 top-p/top-k 过滤或 greedy 采样后的实际分布，不一定等于接口返回
 logprob 所描述的分布。
 
-`nonfinite_logp_fraction` 表示有效 token 中任一侧 float32 logprob 为 NaN 或无穷大的比例。 存在这样的 token
-时，概率比尾部指标输出 NaN，不将无效比较误报成零。 掩码之外的 padding 不参与此比例，也不会污染尾部指标。
+`nonfinite_logp_fraction` 表示有效 token 中任一侧 logprob 为 NaN 或无穷大的比例。 存在这样的 token 时，概率比尾部指标输出
+NaN，不将无效比较误报成零。 掩码之外的 padding 不参与此比例，也不会污染尾部指标。 `kl_k3_overflow_fraction` 记录有限输入差值经
+float64 `expm1` 后仍溢出的比例。
 
 `ppo_actor/advantage_{positive,negative,zero}_fraction` 基于塑形后的输入 advantage 和 batch loss
 mask，统计位置在 **M2/rejection 过滤之前**。它表示 token 占比，不表示任务成功率或梯度符号。 GSPO 还可能在 loss 内对 advantage
@@ -342,14 +343,17 @@ mask，统计位置在 **M2/rejection 过滤之前**。它表示 token 占比，
 仅统计掩码有效且版本非负的生成 token。均值按 token 加权，极值是聚合组中的全局极值。 theta/proximal 两组兼容字段均使用最近发布的
 checkpoint 版本：actor 和 rollout 在 PPO 更新后一起升版， 这不是 optimizer minibatch
 计数。`stale_token_fraction` 表示 behavior 版本落后的比例， `future_token_fraction` 表示 behavior
-版本超前的比例。统计时将原始版本数组局部左移到预测位置。 统计总体在 **M2/rejection 过滤之前**，每次 `_ppo_update` 计一次，与
-minibatch forward 次数无关。 `n_valid_generated_tokens` 累加这部分 token 观测；不同 update
-重用同一轨迹仍会重复计数。 没有有效 token 时省略均值和极值，不填充为零。
+版本超前的比例。包括 pure MOPD 在内，诊断在 `_ppo_update` 中局部左移 raw rollout version 到预测位置， 不修改 loss
+的原有近端策略近似。统计总体在 **M2/rejection 过滤之前**，每次 `_ppo_update` 计一次，与 minibatch forward 次数无关。
+`n_valid_generated_tokens` 累加这部分 token 观测；不同 update 重用同一轨迹仍会重复计数。 没有有效 token
+时省略均值和极值，不填充为零。
 
-tracker 会保留 detached 张量副本直到 export。一个 batch 的诊断完整启用时， train-infer 统计约保留 57 字节/padded
-token，版本统计约 37 字节，优势符号比例约 12 字节（复用现有 batch 分母），合计约 106 字节/padded
-token/worker，不含临时张量及其他指标。 例如 1000 万 padded token 约需 1.06 GB 的诊断张量存储。这是存储量推导，不是 GPU 峰值实测；
-长上下文内存及运行时开销仍需结合实际 workload 验证。
+新增诊断使用 `stat_compact`：每个指标在每个 batch 仅保留四个 float64 标量（掩码和、数量、最小、最大） 直到 export，避免原先约 106
+字节/padded token 的诊断张量长期留存。已有 PPO 指标仍有自身的全量张量， 诊断计算过程中也会临时分配逐 token
+张量。长上下文的峰值内存和运行时间仍需按实际 workload 验证。
+
+可选的 loglinear 近端策略近似仍读取原始 token 位置的 rollout version，且保留原先 `current_version - 1`
+的插值假设。其算法语义需要另行按真实 optimizer step 验证； 这里修正的 checkpoint 年龄指标不能证明 loglinear 路径也已修复。
 
 ## 最佳实践
 

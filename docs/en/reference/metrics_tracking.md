@@ -348,10 +348,11 @@ reported rollout distribution with matching support, `k1` and `k3` estimate
 `KL(rollout || trainer)`. Returned logprobs are not necessarily those of the actual
 sampling distribution after top-p/top-k filtering or greedy selection.
 
-`nonfinite_logp_fraction` reports the fraction of valid tokens for which either float32
-logprob is NaN or infinite. If any such token participates, ratio tail metrics are NaN
-rather than silently classifying invalid comparisons as zero. Masked padding does not
-contribute to this fraction or contaminate the tails.
+`nonfinite_logp_fraction` reports the fraction of valid tokens for which either logprob
+is NaN or infinite. If any such token participates, ratio tail metrics are NaN rather
+than silently classifying invalid comparisons as zero. Masked padding does not
+contribute to this fraction or contaminate the tails. `kl_k3_overflow_fraction` reports
+finite-input gaps whose `expm1` exceeds float64.
 
 `ppo_actor/advantage_{positive,negative,zero}_fraction` uses the shaped input advantages
 and batch loss mask **before M2/rejection filtering**. It measures token occupancy, not
@@ -364,20 +365,25 @@ global over the reduction group. Both legacy theta/proximal keys use the last pu
 checkpoint version: actor and rollout versions advance together after a PPO update. They
 do not track intermediate optimizer minibatches. `stale_token_fraction` counts behavior
 versions older than that checkpoint; `future_token_fraction` counts newer versions. Raw
-rollout versions are shifted to prediction positions locally for logging. The population
-is the batch **before M2/rejection filtering**, counted once per `_ppo_update`,
-independently of minibatch forwards. `n_valid_generated_tokens` sums these observations;
-reused trajectories in separate updates are counted again. Empty populations omit
-averages and extrema rather than reporting a fabricated zero.
+rollout versions are shifted to prediction positions locally for this diagnostic,
+including pure MOPD batches. This does not change the existing version-aware proximal
+approximation used in the loss. The population is the batch **before M2/rejection
+filtering**, counted once per `_ppo_update`, independently of minibatch forwards.
+`n_valid_generated_tokens` sums these observations; reused trajectories in separate
+updates are counted again. Empty populations omit averages and extrema rather than
+reporting a fabricated zero.
 
-The tracker retains detached tensor copies until export. For one batch with all
-diagnostics present, train-inference statistics retain approximately 57 bytes per padded
-token, version statistics 37 bytes, and advantage sign fractions 12 bytes (reusing the
-existing batch denominator). Together this is about 106 bytes per padded token per
-worker, excluding temporary tensors and other metrics. Ten million padded tokens
-therefore require about 1.06 GB of retained diagnostic tensors. This is a storage
-estimate, not a measured GPU peak; long-context memory and runtime overhead still
-require workload-specific validation.
+New diagnostics use `stat_compact`: each metric stores only four float64 scalars (masked
+sum, count, minimum, maximum) per batch until export. This avoids the former
+approximately 106 bytes of retained diagnostic tensors per padded token. Existing PPO
+statistics still retain their own full tensors, and the transient computation of
+summaries still allocates per-token tensors. Long-context peak memory and runtime
+overhead require workload-specific validation.
+
+The optional loglinear proximal approximation still uses raw token-position rollout
+versions and its original `current_version - 1` interpolation assumption. Those
+pre-existing algorithm semantics require separate step-level validation; the
+checkpoint-age diagnostics above are not evidence that they are corrected.
 
 ## Best Practices
 

@@ -1,4 +1,5 @@
 import math
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -193,7 +194,52 @@ def test_ppo_update_aligns_versions_before_counting_checkpoint_age(
     assert result[prefix + "future_token_fraction"] == pytest.approx(expected_future)
     assert result[prefix + "n_valid_generated_tokens"] == count
     assert engine.train_batch.call_count == 2
-    torch.testing.assert_close(data["versions"], raw_versions, rtol=0, atol=0)
+    assert all(
+        value.numel() <= 4
+        for key, values in tracker.stats.items()
+        if "version_stats" in key
+        for value in values
+    )
+    torch.testing.assert_close(
+        raw_versions,
+        torch.tensor([versions], dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_pure_mopd_uses_raw_versions_for_checkpoint_age_diagnostics():
+    """The pure-MOPD preprocessing route skips _compute_advantages."""
+    engine = MagicMock()
+    engine.get_version.return_value = 5
+    actor = PPOActor(PPOActorConfig(backend="fsdp:d1"), engine)
+    actor._mopd_loss_config = SimpleNamespace(rl_coefficient=0)
+    batch = {
+        "input_ids": torch.ones((1, 3), dtype=torch.long),
+        "attention_mask": torch.ones((1, 3), dtype=torch.bool),
+        "loss_mask": torch.tensor([[0, 0, 1]], dtype=torch.bool),
+        "versions": torch.tensor([[-1, -1, 4]], dtype=torch.int32),
+        "logprobs": torch.zeros((1, 3)),
+        "rewards": torch.ones(1),
+        "mopd_teacher_logp_sum": torch.zeros((1, 3)),
+        "is_truncated": torch.tensor([False]),
+    }
+    raw_versions = batch["versions"].clone()
+    batch = actor._prepare_mopd_batch(batch)
+    assert batch["versions"].equal(raw_versions)
+    tracker = DistributedStatsTracker()
+    with (
+        patch("areal.trainer.ppo.actor.stats_tracker", tracker),
+        patch("areal.trainer.ppo.actor.stage_batch_for_engine"),
+        patch(
+            "areal.trainer.ppo.actor.split_training_batch_into_microbatches",
+            return_value=[],
+        ),
+    ):
+        actor._ppo_update(batch)
+    result = tracker.export()
+    assert result["update/version_stats/n_valid_generated_tokens"] == 1
+    assert result["update/version_stats/sample_staleness_theta_avg"] == 1
 
 
 def test_kl_estimators_match_rollout_to_trainer_direction():
@@ -220,6 +266,32 @@ def test_train_infer_rejects_broadcastable_mismatched_shapes():
         log_train_inference_stats(
             torch.zeros(2, 3), torch.zeros(3), torch.ones(2, 3).bool()
         )
+
+
+def test_large_finite_logprob_gap_keeps_k3_finite():
+    tracker = DistributedStatsTracker()
+    with patch("areal.trainer.ppo.stats.stats_tracker", tracker):
+        log_train_inference_stats(
+            torch.tensor([-1.0]), torch.tensor([-101.0]), torch.tensor([True])
+        )
+    result = tracker.export()
+    assert result["ppo_actor/train_infer/nonfinite_logp_fraction"] == 0
+    assert result["ppo_actor/train_infer/kl_k3_overflow_fraction"] == 0
+    assert result["ppo_actor/train_infer/kl_k3"] == pytest.approx(math.expm1(100) - 100)
+
+
+def test_train_infer_keeps_only_compact_summaries_for_long_sequences():
+    tracker = DistributedStatsTracker()
+    with patch("areal.trainer.ppo.stats.stats_tracker", tracker):
+        log_train_inference_stats(
+            torch.full((20000,), -1.0),
+            torch.full((20000,), -2.0),
+            torch.ones(20000, dtype=torch.bool),
+        )
+    assert all(
+        value.numel() <= 4 for values in tracker.stats.values() for value in values
+    )
+    assert tracker.export()["ppo_actor/train_infer/n_valid_tokens"] == 20000
 
 
 def test_ratio_tail_is_symmetric_and_decreases_with_threshold():
