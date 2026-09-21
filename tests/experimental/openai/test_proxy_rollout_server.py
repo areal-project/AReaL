@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -88,6 +89,14 @@ def _reset_server_globals(monkeypatch):
     monkeypatch.setattr(srv, "_worker_index", None)
     monkeypatch.setattr(srv, "_engine", None)
     monkeypatch.setattr(srv, "_openai_client", None)
+    monkeypatch.setattr(srv, "_prm_runner", None)
+    monkeypatch.setattr(srv, "_prm_required", False)
+    monkeypatch.setattr(srv, "_proxy_closing", False)
+    monkeypatch.setattr(srv, "_engine_init_request", None)
+    monkeypatch.setattr(srv, "_engine_init_result", None)
+    monkeypatch.setattr(srv, "_engine_lifecycle_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "_active_prm_exports", 0)
+    monkeypatch.setattr(srv, "_prm_idle", asyncio.Event())
     monkeypatch.setattr(srv, "_processor_cache_registry", ProcessorCacheRegistry())
     monkeypatch.setattr(srv, "_group_tensor_store_registry", GroupTensorStoreRegistry())
 
@@ -671,7 +680,8 @@ class TestEndSessionInteractionCount:
         }
 
 
-def test_setup_openai_client_loads_and_passes_vlm_processor(monkeypatch):
+@pytest.mark.asyncio
+async def test_setup_openai_client_loads_and_passes_vlm_processor(monkeypatch):
     """The v1 proxy should reuse the model processor for trajectory export."""
     processor = SimpleNamespace(image_processor=object())
     tokenizer = object()
@@ -701,7 +711,7 @@ def test_setup_openai_client_loads_and_passes_vlm_processor(monkeypatch):
     monkeypatch.setattr(srv, "ArealOpenAI", client_cls)
     monkeypatch.setattr(srv, "validate_admin_api_key", lambda *_args, **_kwargs: None)
 
-    srv._setup_openai_client()
+    await srv._setup_openai_client()
 
     assert client_cls.call_args.kwargs["processor"] is processor
     assert client_cls.call_args.kwargs["tokenizer"] is tokenizer

@@ -417,12 +417,20 @@ class PRMRunner:
                     for (_, interaction), result in zip(items, raw_results, strict=True)
                 ]
             else:
-                results = await asyncio.gather(
-                    *[
-                        self._score_one(scorer, interaction, score_ctx)
-                        for _, interaction in items
-                    ]
-                )
+                tasks = [
+                    asyncio.create_task(self._score_one(scorer, interaction, score_ctx))
+                    for _, interaction in items
+                ]
+                try:
+                    results = await asyncio.gather(*tasks)
+                except BaseException:
+                    # A self-cancelled child does not cancel its gather siblings.
+                    # Drain them before callers can close the scorer's resources.
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    raise
             failures = [
                 result
                 for result in results

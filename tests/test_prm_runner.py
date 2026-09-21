@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -63,6 +64,62 @@ class _ScalarScorer(BaseScorer):
 
     async def evaluate(self, interaction, ctx):
         return self.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_child", [False, True])
+async def test_cancelled_scoring_drains_children_before_propagating(cancel_child):
+    """Neither caller nor child cancellation can leave scoring behind the runner."""
+    stats_tracker.export_all(reduce_group=None)
+    sibling_started = asyncio.Event()
+    cancel = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    children = []
+
+    class Scorer(_ScalarScorer):
+        async def evaluate(self, interaction, ctx):
+            children.append(asyncio.current_task())
+            if interaction.interaction_id == "completed":
+                return self.value
+            if interaction.interaction_id == "cancelled":
+                await sibling_started.wait()
+                await cancel.wait()
+                raise asyncio.CancelledError
+            sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_started.set()
+                await release_cleanup.wait()
+
+    interactions = {
+        name: _interaction(name) for name in ("completed", "cancelled", "sibling")
+    }
+    runner = PRMRunner(PRMConfig(scorers=[Scorer(value=1.0)]))
+    pending = asyncio.create_task(runner.run(InteractionCache.from_dict(interactions)))
+    try:
+        await asyncio.wait_for(sibling_started.wait(), timeout=2)
+        if cancel_child:
+            cancel.set()
+        else:
+            pending.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+        assert not pending.done()
+        assert all(x.token_rewards is None for x in interactions.values())
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, timeout=2)
+        assert all(child.done() for child in children)
+        assert all(x.token_rewards is None for x in interactions.values())
+        assert not stats_tracker.export_all(reduce_group=None)
+    finally:
+        release_cleanup.set()
+        for task in [pending, *children]:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(pending, *children, return_exceptions=True)
+        stats_tracker.export_all(reduce_group=None)
 
 
 @pytest.mark.asyncio
