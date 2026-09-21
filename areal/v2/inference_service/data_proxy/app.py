@@ -420,7 +420,21 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             if config.prm.enabled and config.prm.scorers:
                 from areal.reward.prm import PRMRunner
 
-                app.state.prm_runner = PRMRunner(config.prm)
+                try:
+                    app.state.prm_runner = await PRMRunner.create(config.prm)
+                except BaseException as startup_error:
+                    # Drain the stack here so service cleanup cannot replace the
+                    # original scorer construction/validation error on exit.
+                    try:
+                        await resources.aclose()
+                    except Exception as cleanup_error:
+                        logger.exception(
+                            "Failed to close resources after PRM startup failure"
+                        )
+                        startup_error.add_note(
+                            f"Service cleanup after PRM startup failed: {cleanup_error}"
+                        )
+                    raise
                 resources.push_async_callback(app.state.prm_runner.aclose)
 
             ready_task = asyncio.create_task(_ready_trajectory_loop(app))

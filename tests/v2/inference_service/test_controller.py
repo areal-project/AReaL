@@ -359,6 +359,44 @@ class TestRolloutControllerV2APISurface:
 
 
 class TestRolloutControllerV2Construction:
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    @pytest.mark.parametrize("api_url", ["https://upstream.invalid/v1", ""])
+    def test_external_prm_rejected_before_allocating_resources(self, version, api_url):
+        """Direct v2 callers can set api_url after the PPO config was validated."""
+        from areal.api.cli_args import PPOConfig, PRMScorerConfig
+
+        config = PPOConfig()
+        config.rollout._version = version
+        config.rollout.agent.prm.scorers = [PRMScorerConfig(path="unused.Scorer")]
+        config.rollout.agent.export_style = "concat"
+        config.rollout.agent.chat_template_type = "concat"
+        config.__post_init__()
+        config.rollout.api_url = api_url
+        scheduler = _make_scheduler()
+
+        with patch(
+            "areal.v2.inference_service.controller.controller.httpx.Client"
+        ) as client:
+            with pytest.raises(ValueError, match="PRM.*api_url.*token-backed"):
+                RolloutControllerV2(config=config.rollout, scheduler=scheduler)
+
+        client.assert_not_called()
+        assert scheduler.mock_calls == []
+
+    @pytest.mark.parametrize("inactive", ["disabled", "empty"])
+    def test_external_mode_accepts_inactive_prm(self, inactive):
+        """Disabled and empty PRM configurations keep the external-model path."""
+        from areal.api.cli_args import PRMScorerConfig
+
+        cfg = InferenceEngineConfig(api_url="https://upstream.invalid/v1")
+        if inactive == "disabled":
+            cfg.agent.prm.enabled = False
+            cfg.agent.prm.scorers = [PRMScorerConfig(path="unused.Scorer")]
+
+        controller = RolloutControllerV2(config=cfg, scheduler=_make_scheduler())
+        assert controller.rollout_alloc is None
+        controller._sync_client.close()
+
     def test_admin_api_key_none_raises(self):
         cfg = InferenceEngineConfig(backend="sglang:d1")
         cfg.admin_api_key = ""
@@ -481,6 +519,7 @@ class TestRolloutControllerV2Construction:
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             tokenizer_path="mock-tokenizer",
+            _version="v2",
             request_timeout=15.0,
             deterministic_sampling=deterministic_sampling,
             agent=AgentConfig(
@@ -538,6 +577,9 @@ class TestRolloutControllerV2Construction:
         ]
         assert len(data_proxy_calls) == 1
         data_proxy_cmd = data_proxy_calls[0].kwargs["raw_cmd"]
+        # Pre-existing SGLang servers still use token-backed inference, not api_url.
+        backend_arg = data_proxy_cmd.index("--backend-addr")
+        assert data_proxy_cmd[backend_arg + 1] == "http://127.0.0.1:30000"
         assert "--set-reward-finish-timeout" in data_proxy_cmd
         assert "7.5" in data_proxy_cmd
         assert "--callback-server-addr" in data_proxy_cmd

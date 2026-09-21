@@ -35,6 +35,12 @@ with the same scorer configuration. Individual export and string-only external
 model responses are not supported. This integration scores completed training
 trajectories, not the optional Agent Service's reconstructed chat history.
 
+Active PRM scorers are rejected with v2 external-model mode (`rollout.api_url`),
+because that path stores string-only responses without token-backed interactions.
+This does not restrict ordinary SGLang/vLLM backends, including pre-existing servers
+passed through `server_infos`. External mode remains available when PRM is disabled
+or the scorer list is empty.
+
 ## Scorer Contract
 
 Subclass `areal.reward.prm.BaseScorer`, set a unique class-level `name`, and implement
@@ -76,11 +82,23 @@ same cleanup; ordinary failures are logged and collected in an `ExceptionGroup` 
 owned scorers have been attempted. Cancellation propagates, and subsequent close
 calls do not retry failed or interrupted hooks.
 
+Use `await PRMRunner.create(config)` when constructing a runner in async code.
+If scorer resolution, construction, or configuration validation fails, it awaits
+cleanup of all previously constructed owned scorers before re-raising the original
+startup error. Ordinary cleanup failures are logged and attached as error notes;
+external cancellation during cleanup still propagates. Borrowed instances are not
+closed. A scorer whose own constructor raises before returning remains responsible
+for cleaning up resources acquired inside that constructor.
+
 Callers must drain scoring before closing the runner. New `run()` calls are
 rejected once closing starts. The v2 data proxy creates its runner during service
-startup and awaits cleanup during lifespan shutdown, before closing its inference
+startup with the async factory and awaits cleanup during lifespan shutdown, before closing its inference
 bridge and HTTP client. Those resources are still cleaned up if scorer cleanup
-fails. The v1 proxy does not yet invoke this hook automatically.
+fails. A PRM startup error also closes the bridge and HTTP client without letting
+ordinary service cleanup failures replace that startup error. The synchronous
+`PRMRunner(config)` interface remains available for compatibility, without async
+startup rollback. The v1 proxy still uses it and does not yet invoke `aclose()`
+automatically.
 
 ## Advantage Shaping
 

@@ -92,6 +92,16 @@ class RolloutControllerV2:
             )
         if not config.model:
             raise ValueError("InferenceEngineConfig.model must not be empty")
+        if (
+            config.api_url is not None
+            and config.agent is not None
+            and config.agent.prm.enabled
+            and config.agent.prm.scorers
+        ):
+            raise ValueError(
+                "PRM scorers do not support v2 external-model mode "
+                "(rollout.api_url); scoring requires token-backed interactions"
+            )
         self.config = config
         self.scheduler = scheduler
 

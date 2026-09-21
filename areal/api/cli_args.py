@@ -4047,6 +4047,11 @@ class PPOConfig(BaseExperimentConfig):
                 raise ValueError(
                     "rollout.agent.prm requires rollout._version='v1' or 'v2'"
                 )
+            if self.rollout._version == "v2" and self.rollout.api_url is not None:
+                raise ValueError(
+                    "PRM scorers do not support v2 external-model mode "
+                    "(rollout.api_url); scoring requires token-backed interactions"
+                )
             if self.rollout.agent.export_style != "concat":
                 raise ValueError(
                     "rollout.agent.prm currently requires export_style='concat'"

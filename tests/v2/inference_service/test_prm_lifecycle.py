@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -325,3 +326,204 @@ async def test_proxy_shutdown_closes_reconfigured_bridge(services, monkeypatch):
     original_bridge.aclose.assert_awaited_once()
     replacement.aclose.assert_awaited_once()
     http_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_async_factory_preserves_validation_and_ownership(monkeypatch):
+    """Resolve once before validation, pass the original config, and own only factories."""
+    borrowed = ResourceScorer("borrowed")
+    config = PRMConfig(
+        scorers=[asdict(_spec("first")), borrowed, _spec("disabled", enabled=False)]
+    )
+    validated = []
+
+    def validate(scorer, received_config, *, training_enabled):
+        assert received_config is config
+        assert len(ResourceScorer.instances) == 3
+        validated.append((scorer.label, training_enabled))
+
+    monkeypatch.setattr(ResourceScorer, "validate_prm_config", validate, raising=False)
+    runner = await PRMRunner.create(config)
+
+    assert runner.config is config
+    assert validated == [("first", True), ("borrowed", True), ("disabled", False)]
+    await runner.aclose()
+    await runner.aclose()
+    assert ResourceScorer.close_order == ["disabled", "first"]
+    assert borrowed.close_calls == 0
+    assert len(ResourceScorer.instances) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["resolution", "construction", "validation"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_async_factory_rolls_back_without_replacing_startup_error(
+    monkeypatch, phase, cleanup_fails
+):
+    """Every constructed owned scorer closes even if later setup and cleanup fail."""
+    original_error = ValueError(f"{phase} failed")
+    borrowed = ResourceScorer("borrowed")
+    specs = [
+        _spec("first"),
+        borrowed,
+        _spec("disabled", enabled=False, fail=cleanup_fails),
+    ]
+    if phase == "resolution":
+        real_import = prm_runner.import_from_string
+
+        def failing_import(path):
+            if path == "missing.Scorer":
+                raise original_error
+            return real_import(path)
+
+        monkeypatch.setattr(prm_runner, "import_from_string", failing_import)
+        specs.append(PRMScorerConfig(path="missing.Scorer"))
+    elif phase == "construction":
+        real_init = ResourceScorer.__init__
+
+        def failing_init(self, label, **kwargs):
+            if label == "broken":
+                raise original_error
+            real_init(self, label=label, **kwargs)
+
+        monkeypatch.setattr(ResourceScorer, "__init__", failing_init)
+        specs.append(_spec("broken"))
+    else:
+
+        def failing_validation(self, config, *, training_enabled):
+            # Even a failure in the first validator closes all constructed scorers.
+            assert len(ResourceScorer.instances) == 3
+            raise original_error
+
+        monkeypatch.setattr(
+            ResourceScorer, "validate_prm_config", failing_validation, raising=False
+        )
+
+    with pytest.raises(ValueError) as caught:
+        await PRMRunner.create(PRMConfig(scorers=specs))
+
+    assert caught.value is original_error
+    assert ResourceScorer.close_order == ["disabled", "first"]
+    assert borrowed.close_calls == 0
+    assert ResourceScorer.instances[1].flushed
+    assert all(
+        s.close_calls == 1 for s in ResourceScorer.instances if s is not borrowed
+    )
+    if cleanup_fails:
+        assert any("cleanup" in note for note in original_error.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_async_factory_borrowed_validation_failure_only_closes_owned(monkeypatch):
+    """A borrowed validator's failure does not transfer ownership to the runner."""
+    borrowed = ResourceScorer("borrowed")
+    error = ValueError("borrowed validation failed")
+    monkeypatch.setattr(
+        borrowed, "validate_prm_config", MagicMock(side_effect=error), raising=False
+    )
+    with pytest.raises(ValueError) as caught:
+        await PRMRunner.create(PRMConfig(scorers=[_spec(), borrowed]))
+
+    assert caught.value is error
+    assert ResourceScorer.close_order == ["owned"]
+    assert borrowed.close_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_cleanup", [False, True])
+async def test_async_factory_waits_for_rollback_and_propagates_cancellation(
+    monkeypatch, cancel_cleanup
+):
+    """Startup failure awaits audit flushing, but external cancellation still propagates."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original_error = ValueError("invalid configuration")
+
+    def fail_validation(scorer, config, *, training_enabled):
+        scorer.started = started
+        scorer.release = release
+        raise original_error
+
+    monkeypatch.setattr(
+        ResourceScorer, "validate_prm_config", fail_validation, raising=False
+    )
+    pending = asyncio.create_task(PRMRunner.create(PRMConfig(scorers=[_spec()])))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert not pending.done()
+    finally:
+        if cancel_cleanup:
+            pending.cancel()
+        release.set()
+
+    if cancel_cleanup:
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+    else:
+        with pytest.raises(ValueError) as caught:
+            await pending
+        assert caught.value is original_error
+        assert ResourceScorer.instances[0].flushed
+
+
+@pytest.mark.asyncio
+async def test_async_factory_rolls_back_when_validation_raises_cancellation(
+    monkeypatch,
+):
+    """A startup cancellation unwinds owned resources without changing its type."""
+    error = asyncio.CancelledError("startup cancelled")
+    monkeypatch.setattr(
+        ResourceScorer,
+        "validate_prm_config",
+        MagicMock(side_effect=error),
+        raising=False,
+    )
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await PRMRunner.create(PRMConfig(scorers=[_spec()]))
+
+    assert caught.value is error
+    assert ResourceScorer.instances[0].flushed
+    assert ResourceScorer.instances[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("phase", ["resolution", "validation"])
+async def test_proxy_partial_startup_closes_all_resources_and_preserves_error(
+    services, cleanup_fails, phase, caplog, monkeypatch
+):
+    """Scorer startup failures remain primary even when owned/service cleanup fails."""
+    for logger in (prm_runner.logger, data_proxy.logger):
+        monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
+    if cleanup_fails:
+        for resource in services:
+            resource.aclose.side_effect = RuntimeError("service cleanup failed")
+    if phase == "resolution":
+        last_spec = PRMScorerConfig(path="missing_prm_test.Scorer")
+        error_type, message = ImportError, "missing_prm_test"
+    else:
+        last_spec = _spec("second")
+        error_type, message = ValueError, "invalid PRM config"
+        monkeypatch.setattr(
+            ResourceScorer,
+            "validate_prm_config",
+            MagicMock(side_effect=ValueError(message)),
+            raising=False,
+        )
+    app = _app(_spec(fail=cleanup_fails), last_spec)
+
+    with pytest.raises(error_type, match=message) as caught:
+        async with app.router.lifespan_context(app):
+            pytest.fail("Partial PRM startup must not enter the service body")
+
+    assert app.state.prm_runner is None
+    assert all(s.close_calls == 1 for s in ResourceScorer.instances)
+    for resource in services:
+        resource.aclose.assert_awaited_once()
+    if cleanup_fails:
+        assert any("cleanup" in note for note in caught.value.__notes__)
+        errors = [record for record in caplog.records if record.exc_info]
+        assert any("cannot flush owned" in str(record.exc_info[1]) for record in errors)
+        assert any(
+            "service cleanup failed" in str(record.exc_info[1]) for record in errors
+        )
