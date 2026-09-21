@@ -9,7 +9,7 @@ import torch.distributed.nn.functional as dist_F
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
-from areal.engine.core.model import SequencePackingMode, supports_gdn_packed_seq
+from areal.engine.core.model import SequencePackingMode
 from areal.utils.data import (
     MicroBatchItem,
     MicroBatchList,
@@ -511,14 +511,6 @@ def packed_context_parallel_forward(
                 raise ValueError(
                     "Attention mask and tree attention are not supported with "
                     "the model-packed THD forward."
-                )
-            if (
-                mpu.get_context_parallel_world_size() > 1
-                and not supports_gdn_packed_seq()
-            ):
-                raise NotImplementedError(
-                    "Model-packed THD with CP > 1 requires megatron-core>=0.18.2 "
-                    "and megatron-bridge>=0.5.1."
                 )
             # Keep the full BSHD inputs on every CP rank. The bridge first fuses
             # vision embeddings and computes multimodal RoPE, then partitions

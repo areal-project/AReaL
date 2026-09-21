@@ -625,10 +625,6 @@ class TestPackedContextParallelForward:
         loss_mask = input_ids.remainder(3).ne(0)
 
         monkeypatch.setattr(
-            packed_context_parallel, "supports_gdn_packed_seq", lambda: True
-        )
-
-        monkeypatch.setattr(
             packed_context_parallel.mpu,
             "get_context_parallel_world_size",
             lambda: cp_size,
