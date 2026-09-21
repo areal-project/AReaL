@@ -29,6 +29,7 @@ parts:
   - caption: Customization
     chapters:
     - file: customization/dataset
+    - file: customization/reward
     - file: customization/agent
   - caption: Algorithms
     chapters:
