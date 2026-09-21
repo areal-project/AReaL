@@ -57,11 +57,7 @@ def assert_alloc_conf_supports_memory_saver(conf: str) -> None:
 assert_alloc_conf_supports_memory_saver(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
 
 from areal.utils import pkg_version  # noqa: E402
-from areal.utils.environ import (  # noqa: E402
-    get_bool_env_var,
-    get_float_env_var,
-    get_int_env_var,
-)
+from areal.utils.environ import get_float_env_var  # noqa: E402
 from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexSGLangPlugin")
@@ -234,14 +230,6 @@ class AwexSchedulerPlugin:
         self._paused_poll_interval_s = max(
             0.0, get_float_env_var("AWEX_PAUSED_POLL_INTERVAL_S", 0.01)
         )
-        self._process_queue_when_idle = get_bool_env_var(
-            "AREAL_AWEX_PROCESS_QUEUE_WHEN_IDLE", "true"
-        )
-        # Idle-poll throttle in *loop iterations*, not wall-clock time: TP
-        # ranks run the scheduler loop in lockstep, so a loop-count gate is
-        # deterministic across ranks (a time-based gate deadlocks, see
-        # _maybe_process_awex_queue_when_idle).
-        self._idle_poll_loops = max(1, get_int_env_var("AWEX_IDLE_POLL_LOOPS", 64))
 
     @staticmethod
     def _int_attr(scheduler: Any, name: str, default: int) -> int:
@@ -677,56 +665,6 @@ class AwexSchedulerPlugin:
             else:
                 scheduler.on_idle()
 
-        def _is_idle_for_awex_update() -> bool:
-            is_fully_idle = getattr(scheduler, "is_fully_idle", None)
-            if callable(is_fully_idle):
-                try:
-                    return bool(is_fully_idle())
-                except TypeError:
-                    return bool(is_fully_idle(for_health_check=False))
-
-            for attr in ("cur_batch", "last_batch"):
-                if getattr(scheduler, attr, None) is not None:
-                    return False
-
-            result_queue = getattr(scheduler, "result_queue", None)
-            if result_queue is not None and len(result_queue) > 0:
-                return False
-
-            running_batch = getattr(scheduler, "running_batch", None)
-            if running_batch is not None:
-                is_empty = getattr(running_batch, "is_empty", None)
-                if callable(is_empty) and not is_empty():
-                    return False
-
-            return True
-
-        def _maybe_process_awex_queue_when_idle(loop_count: int) -> None:
-            if not plugin._process_queue_when_idle:
-                return
-            # DEADLOCK WARNING: everything gating the all_reduce inside
-            # process_awex_queue() MUST be deterministic and identical across
-            # TP ranks. Loop iterations are lockstep (every iteration goes
-            # through the recv_requests broadcast), so a loop-count throttle
-            # is safe. A wall-clock throttle (time.monotonic) is NOT: ranks
-            # hit the window at different times, some skip the all_reduce
-            # while others enter it, and the next recv_requests broadcast
-            # cross-deadlocks against the pending all_reduce (observed as
-            # TP0 stuck in broadcast_pyobj vs TP1-7 stuck in all_reduce).
-            if loop_count % plugin._idle_poll_loops != 0:
-                return
-
-            tp_size = self._int_attr(scheduler, "tp_size", 1)
-            is_idle = _is_idle_for_awex_update()
-            if tp_size == 1:
-                if is_idle and not plugin._weight_queue.empty():
-                    plugin.process_awex_queue()
-                return
-
-            # Rank-local idle state is folded into the collective vote instead
-            # of gating it, so all ranks always enter the all_reduce together.
-            plugin.process_awex_queue(extra_ready=is_idle)
-
         # Patch event_loop_overlap (the one actually used by SGLang)
         _orig_overlap = scheduler.event_loop_overlap
 
@@ -809,8 +747,6 @@ class AwexSchedulerPlugin:
                 elif batch is None:
                     _on_idle()
 
-                _maybe_process_awex_queue_when_idle(_loop_count)
-
                 if scheduler.is_generation:
                     scheduler.launch_batch_sample_if_needed(batch_result)
 
@@ -825,7 +761,6 @@ class AwexSchedulerPlugin:
             logger.info(
                 f"[AWEX] _patched_normal STARTING (gpu_id={getattr(scheduler, 'gpu_id', '?')})",
             )
-            _loop_count = 0
             while True:
                 recv_reqs = _recv_requests()
                 scheduler.process_input_requests(recv_reqs)
@@ -833,7 +768,6 @@ class AwexSchedulerPlugin:
                     plugin.process_awex_queue()
                     time.sleep(plugin._paused_poll_interval_s)
                     continue
-                _loop_count += 1
                 batch = scheduler.get_next_batch_to_run()
                 scheduler.cur_batch = batch
                 if batch:
@@ -844,7 +778,6 @@ class AwexSchedulerPlugin:
                     )
                 else:
                     _on_idle()
-                _maybe_process_awex_queue_when_idle(_loop_count)
                 scheduler.last_batch = batch
 
         scheduler.event_loop_normal = _patched_normal
