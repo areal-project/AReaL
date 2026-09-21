@@ -6,11 +6,14 @@ from areal.engine.core.model import (
     SequencePackingMode,
     resolve_sequence_packing_mode,
     supports_model_packed_seq,
+    validate_model_packed_seq_dependencies,
 )
 
 
-@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen3_vl_moe"])
-def test_qwen3_vl_family_uses_model_thd_with_megatron_bridge(model_type):
+@pytest.mark.parametrize(
+    "model_type", ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
+)
+def test_qwen_vl_family_uses_model_thd_with_megatron_bridge(model_type):
     assert supports_model_packed_seq(model_type, "megatron-bridge")
     assert (
         resolve_sequence_packing_mode(model_type, "megatron-bridge")
@@ -23,9 +26,9 @@ def test_qwen3_vl_family_uses_model_thd_with_megatron_bridge(model_type):
     [
         ("qwen3_vl", "mbridge"),
         ("qwen3_vl_moe", "mbridge"),
+        ("qwen3_5", "mbridge"),
+        ("qwen3_5_moe", "mbridge"),
         ("qwen2_5_vl", "megatron-bridge"),
-        ("qwen3_5", "megatron-bridge"),
-        ("qwen3_5_moe", "megatron-bridge"),
     ],
 )
 def test_models_without_gpu_model_thd_contract_stay_padded(
@@ -49,28 +52,77 @@ def test_text_models_keep_wrapper_thd(model_type):
     )
 
 
+@pytest.mark.parametrize("model_type,cp_size", [("qwen3_5", 1), ("qwen3_vl", 2)])
 @pytest.mark.parametrize(
-    "core_version,bridge_version,packed",
-    [("0.17.0", "0.5.1", False), ("0.18.2", "0.4.0", False), ("0.18.2", "0.5.1", True)],
+    "core_version,bridge_version",
+    [("0.17.0", "0.5.1"), ("0.18.2", "0.4.0")],
 )
-@pytest.mark.parametrize("text_only", [False, True])
-def test_qwen35_packing_requires_compatible_releases(
-    monkeypatch, core_version, bridge_version, packed, text_only
+def test_model_thd_dependency_guard_rejects_old_releases(
+    monkeypatch, model_type, cp_size, core_version, bridge_version
 ):
     from areal.engine.core import model
 
     versions = {"megatron-core": core_version, "megatron-bridge": bridge_version}
     monkeypatch.setattr(model, "version", versions.__getitem__)
-    model_type = "qwen3_5_text" if text_only else "qwen3_5"
-    expected = SequencePackingMode.PADDED
-    if packed:
-        expected = (
-            SequencePackingMode.WRAPPER_THD
-            if text_only
-            else SequencePackingMode.MODEL_THD
-        )
-    assert resolve_sequence_packing_mode(model_type, "megatron-bridge") == expected
-    assert model.requires_padded_seq(model_type, "megatron-bridge") is not packed
+
+    with pytest.raises(RuntimeError, match="megatron-core>=0.18.2"):
+        validate_model_packed_seq_dependencies(model_type, "megatron-bridge", cp_size)
+
+
+@pytest.mark.parametrize(
+    "model_type,cp_size",
+    [
+        ("qwen3_5", 1),
+        ("qwen3_5_moe", 2),
+        ("qwen3_vl", 2),
+        ("qwen3_vl_moe", 2),
+    ],
+)
+def test_model_thd_dependency_guard_accepts_minimum_releases(
+    monkeypatch, model_type, cp_size
+):
+    from areal.engine.core import model
+
+    versions = {"megatron-core": "0.18.2", "megatron-bridge": "0.5.1"}
+    monkeypatch.setattr(model, "version", versions.__getitem__)
+    validate_model_packed_seq_dependencies(model_type, "megatron-bridge", cp_size)
+
+
+@pytest.mark.parametrize(
+    "model_type,bridge_type,cp_size",
+    [
+        ("qwen3_vl", "megatron-bridge", 1),
+        ("qwen2_5_vl", "megatron-bridge", 2),
+        ("qwen3_5", "mbridge", 2),
+        ("qwen3", "megatron-bridge", 2),
+    ],
+)
+def test_model_thd_dependency_guard_skips_unrelated_paths(
+    monkeypatch, model_type, bridge_type, cp_size
+):
+    from areal.engine.core import model
+
+    def unexpected(package):
+        pytest.fail(f"Unrelated path must not query {package}")
+
+    monkeypatch.setattr(model, "version", unexpected)
+    validate_model_packed_seq_dependencies(model_type, bridge_type, cp_size)
+
+
+@pytest.mark.parametrize("missing_package", ["megatron-core", "megatron-bridge"])
+def test_model_thd_dependency_guard_reports_missing_package(
+    monkeypatch, missing_package
+):
+    from areal.engine.core import model
+
+    def installed_version(package):
+        if package == missing_package:
+            raise model.PackageNotFoundError(package)
+        return {"megatron-core": "0.18.2", "megatron-bridge": "0.5.1"}[package]
+
+    monkeypatch.setattr(model, "version", installed_version)
+    with pytest.raises(RuntimeError, match=f"{missing_package}=not installed"):
+        validate_model_packed_seq_dependencies("qwen3_5", "megatron-bridge", 1)
 
 
 @pytest.mark.parametrize(

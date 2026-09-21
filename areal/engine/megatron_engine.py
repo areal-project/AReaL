@@ -67,7 +67,7 @@ from areal.engine.core.model import (
     lang_config,
     requires_padded_seq,
     resolve_sequence_packing_mode,
-    supports_gdn_packed_seq,
+    validate_model_packed_seq_dependencies,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.bailing_v3 import (
@@ -559,6 +559,11 @@ class MegatronEngine(TrainEngine):
             self.use_model_packed_seq = (
                 self.sequence_packing_mode == SequencePackingMode.MODEL_THD
             )
+            validate_model_packed_seq_dependencies(
+                self.hf_config.model_type,
+                self.bridge_cls,
+                self.parallel_strategy.context_parallel_size,
+            )
             # ``PADDED`` is the input-routing fallback for every VLM without a
             # model-owned THD contract. ``use_padded_seq`` is narrower: it
             # enables Qwen3.5/GDN-specific dense-mask and LM-head semantics.
@@ -566,8 +571,9 @@ class MegatronEngine(TrainEngine):
                 self.hf_config.model_type, self.bridge_cls
             )
             if self.is_vision_model:
-                if self.parallel_strategy.context_parallel_size > 1 and not (
-                    self.use_model_packed_seq and supports_gdn_packed_seq()
+                if (
+                    self.parallel_strategy.context_parallel_size > 1
+                    and not self.use_model_packed_seq
                 ):
                     raise NotImplementedError(
                         "Context parallel (CP > 1) requires a VLM with a "
