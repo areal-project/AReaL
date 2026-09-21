@@ -91,14 +91,36 @@ closed. A scorer whose own constructor raises before returning remains responsib
 for cleaning up resources acquired inside that constructor.
 
 Callers must drain scoring before closing the runner. New `run()` calls are
-rejected once closing starts. The v2 data proxy creates its runner during service
+rejected once closing starts. If parallel turn scoring is cancelled, including by
+a scoring child task itself, `run()` cancels and awaits the remaining scoring tasks
+before propagating cancellation. The interrupted scorer does not commit partial
+results, and that run does not publish metrics.
+
+The v2 data proxy creates its runner during service
 startup with the async factory and awaits cleanup during lifespan shutdown, before closing its inference
 bridge and HTTP client. Those resources are still cleaned up if scorer cleanup
 fails. A PRM startup error also closes the bridge and HTTP client without letting
-ordinary service cleanup failures replace that startup error. The synchronous
-`PRMRunner(config)` interface remains available for compatibility, without async
-startup rollback. The v1 proxy still uses it and does not yet invoke `aclose()`
-automatically.
+ordinary service cleanup failures replace that startup error.
+
+The v1 proxy uses the same async factory during its `initialize` RPC. It publishes
+the configured client only after setup succeeds. Repeating the same initialization
+request reuses successful engine initialization and, if ready, the existing runner;
+a failed proxy setup can be retried without initializing the engine again.
+Initialization with different arguments is rejected rather than replacing live resources.
+The controller's `destroy` RPC stops admission of new PRM exports, waits for scoring
+already in progress, then closes the runner before destroying the engine. ASGI
+lifespan shutdown provides the same cleanup when no destroy RPC was sent. Ordinary
+scorer cleanup failures do not skip engine destruction. An export still waiting for
+its session to finish does not hold up the destroy RPC's PRM drain; if it later needs
+PRM, it is rejected with HTTP 503 instead of being exported unscored. This does not
+change the ASGI server's own handling of outstanding HTTP requests during shutdown.
+If engine destruction fails, the error propagates and the engine is retained for a
+later destroy or shutdown attempt; completed scorer cleanup is not repeated. Normal scoring remains
+concurrent. Cancellation retains the runner's semantics above; interrupted cleanup
+hooks are not retried automatically.
+
+The synchronous `PRMRunner(config)` interface remains available for compatibility,
+without async startup rollback.
 
 ## Advantage Shaping
 
