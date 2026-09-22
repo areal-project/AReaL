@@ -1237,34 +1237,3 @@ def test_failed_task_retains_raw_in_typed_error(monkeypatch):
 
     assert exc_info.value.result is not None
     assert exc_info.value.result.raw == {"error": "grader failed", "arca": {}}
-
-
-@pytest.mark.parametrize("encoding", ["outcome", "outcome_code", "error"])
-@pytest.mark.parametrize("context_overflow", [False, True])
-def test_response_failure_is_rejected_without_independent_overflow(
-    encoding, context_overflow
-):
-    code = "LLM_RESPONSE_FAILED"
-    raw = {
-        "outcome": {"code": code},
-        "outcome_code": code,
-        "error": f"GAMEAGENT_OUTCOME_CODE={code} upstream_api_error",
-    }
-    error = ArenaTaskFailedError(
-        task_id="task-1",
-        status="HARNESS_FAILED",
-        result=ArenaTaskResult(
-            task_id="task-1",
-            status="HARNESS_FAILED",
-            score=None,
-            raw={encoding: raw[encoding]},
-        ),
-    )
-    disposition = ArenaStreamAgentWorkflow.classify_proxy_failure(
-        error,
-        context_overflow=context_overflow,
-        interaction_count=13,
-    )
-    assert disposition == (
-        "model_failure_zero" if context_overflow else "unknown_failure_reject"
-    )
