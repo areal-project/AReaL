@@ -82,6 +82,11 @@ from areal.engine.megatron_utils.bailing_v3 import (
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
+from areal.engine.megatron_utils.gpu_staged_muon import (
+    GPUStagedMuonConfig,
+    get_megatron_optimizer_with_dist_muon,
+    get_megatron_optimizer_with_gpu_staged_muon,
+)
 from areal.engine.megatron_utils.gpu_staged_optimizer import (
     GPUStagedAdamWConfig,
     get_megatron_optimizer_with_gpu_staged_adamw,
@@ -2159,26 +2164,59 @@ class MegatronEngine(TrainEngine):
         staged_settings = self.mcore_config.cpu_staged_offload
         staged = staged_settings.enabled
         optimizer_type = self.optimizer_config.type
-        if staged and optimizer_type != "adam":
+        use_dist_muon = optimizer_type == "dist_muon"
+
+        if staged and optimizer_type not in {"adam", "dist_muon"}:
             raise ValueError(
-                "CPU-staged offload supports optimizer.type='adam', "
-                f"got {optimizer_type!r}"
+                "CPU-staged offload supports optimizer.type='adam' or "
+                f"'dist_muon', got {optimizer_type!r}"
             )
-        if staged and not self.mcore_config.ddp.use_distributed_optimizer:
+        if use_dist_muon and staged and self.config.use_lora:
+            raise ValueError("CPU-staged Muon does not support LoRA")
+        if use_dist_muon:
+            if self.mcore_config.ddp.use_distributed_optimizer:
+                raise ValueError(
+                    "optimizer.type='dist_muon' requires "
+                    "megatron.ddp.use_distributed_optimizer=false"
+                )
+            if self.mcore_config.use_precision_aware_optimizer:
+                raise ValueError(
+                    "optimizer.type='dist_muon' does not support "
+                    "megatron.use_precision_aware_optimizer=true"
+                )
+            if self.mcore_config.overlap_param_gather_with_optimizer_step:
+                raise ValueError(
+                    "optimizer.type='dist_muon' does not support "
+                    "overlap_param_gather_with_optimizer_step"
+                )
+            if staged and self.mcore_config.ddp.overlap_param_gather:
+                raise ValueError(
+                    "CPU-staged dist_muon requires "
+                    "megatron.ddp.overlap_param_gather=false"
+                )
+            if staged and self.optimizer_config.muon.tp_mode != "duplicated":
+                raise ValueError(
+                    "CPU-staged dist_muon currently supports only "
+                    "optimizer.muon.tp_mode='duplicated'"
+                )
+            if self.dtype is not torch.bfloat16:
+                raise ValueError("optimizer.type='dist_muon' requires dtype=bfloat16")
+        elif staged and not self.mcore_config.ddp.use_distributed_optimizer:
             raise ValueError(
                 "CPU-staged AdamW requires megatron.ddp.use_distributed_optimizer=true"
             )
 
         use_distributed_optimizer = (
             False
-            if self.config.use_lora
+            if self.config.use_lora or use_dist_muon
             else self.mcore_config.ddp.use_distributed_optimizer
         )
 
         assert self.optimizer_config.type in [
             "adam",
             "sgd",
-        ], "Only AdamW/SGD optimizer is supported in this engine."
+            "dist_muon",
+        ], "Only AdamW/SGD/distributed Muon optimizer is supported in this engine."
         if self.optimizer_config.type == "sgd":
             self.logger.warning(
                 "Using the 'sgd' optimizer with Megatron may be less stable. Consider using the 'adam' (AdamW) optimizer for improved stability."
@@ -2211,6 +2249,14 @@ class MegatronEngine(TrainEngine):
             if staged and optimizer_type == "adam"
             else None
         )
+        staged_muon_config = (
+            GPUStagedMuonConfig(
+                buffer_count=staged_settings.buffer_count,
+                slot_size_mb=staged_settings.bucket_size_mb,
+            )
+            if staged and use_dist_muon
+            else None
+        )
         # Make megatron optimizer config
         mcore_opt_config = MCoreOptimizerConfig(
             optimizer=self.optimizer_config.type,
@@ -2229,11 +2275,18 @@ class MegatronEngine(TrainEngine):
             overlap_param_gather_with_optimizer_step=(
                 self.mcore_config.overlap_param_gather_with_optimizer_step
             ),
+            overlap_param_gather=self.mcore_config.ddp.overlap_param_gather,
             use_precision_aware_optimizer=(
-                staged_adamw_config is not None
+                False
+                if use_dist_muon
+                else staged_adamw_config is not None
                 or self.mcore_config.use_precision_aware_optimizer
             ),
-            main_grads_dtype=getattr(torch, self.mcore_config.main_grads_dtype),
+            main_grads_dtype=(
+                torch.float32
+                if use_dist_muon
+                else getattr(torch, self.mcore_config.main_grads_dtype)
+            ),
             main_params_dtype=(
                 torch.float32
                 if staged_adamw_config is not None
@@ -2249,9 +2302,29 @@ class MegatronEngine(TrainEngine):
                 if staged_adamw_config is not None
                 else getattr(torch, self.mcore_config.exp_avg_sq_dtype)
             ),
+            muon_momentum=self.optimizer_config.muon.momentum,
+            muon_use_nesterov=self.optimizer_config.muon.use_nesterov,
+            muon_fp32_matmul_prec=self.optimizer_config.muon.fp32_matmul_prec,
+            muon_coefficient_type=self.optimizer_config.muon.coefficient_type,
+            muon_num_ns_steps=self.optimizer_config.muon.num_ns_steps,
+            muon_scale_mode=self.optimizer_config.muon.scale_mode,
+            muon_split_qkv=self.optimizer_config.muon.split_qkv,
+            muon_tp_mode=self.optimizer_config.muon.tp_mode,
+            muon_extra_scale_factor=self.optimizer_config.muon.extra_scale_factor,
+            muon_scalar_optimizer="adam",
         )
 
-        if staged_adamw_config is None:
+        if staged_muon_config is not None:
+            self.optimizer = get_megatron_optimizer_with_gpu_staged_muon(
+                mcore_opt_config, self.model, staged_muon_config
+            )
+            self.optimizer.bind_managed_checkpoint_process_group(self.cpu_group)
+        elif use_dist_muon:
+            self.optimizer = get_megatron_optimizer_with_dist_muon(
+                mcore_opt_config,
+                self.model,
+            )
+        elif staged_adamw_config is None:
             self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
         else:
             self.optimizer = get_megatron_optimizer_with_gpu_staged_adamw(

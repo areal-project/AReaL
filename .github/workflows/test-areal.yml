@@ -307,6 +307,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install Muon dependency in the prebuilt environment
+        run: |
+          export PATH="/opt/.venv/bin:$PATH"
+          uv pip install --python /opt/.venv/bin/python --target "$RUNNER_TEMP/muon-deps" --no-deps "emerging-optimizers==0.3.0"
+
       - name: Validate Docker installation
         run: |
           export PATH="/opt/.venv/bin:$PATH"
@@ -316,7 +321,7 @@ jobs:
         env:
           CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONPATH: ${{ github.workspace }}:${{ runner.temp }}/muon-deps
           TOKENIZERS_PARALLELISM: false
           AREAL_IS_IN_CI: 1
           VIRTUAL_ENV: /opt/.venv

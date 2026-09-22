@@ -382,6 +382,55 @@ class GenerationHyperparameters:
 
 
 @dataclass
+class MuonOptimizerConfig:
+    """Algorithm settings for Megatron's distributed Muon optimizer."""
+
+    momentum: float = 0.95
+    use_nesterov: bool = False
+    fp32_matmul_prec: str = field(
+        default="medium",
+        metadata={"choices": ["low", "medium", "high"]},
+    )
+    coefficient_type: str = "quintic"
+    num_ns_steps: int = 5
+    scale_mode: str = field(
+        default="spectral",
+        metadata={"choices": ["spectral", "unit_rms_norm", "shape_scaling"]},
+    )
+    split_qkv: bool = True
+    tp_mode: str = field(
+        default="duplicated",
+        metadata={"choices": ["blockwise", "duplicated", "distributed"]},
+    )
+    extra_scale_factor: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.momentum < 1.0:
+            raise ValueError("optimizer.muon.momentum must be in [0, 1)")
+        if self.fp32_matmul_prec not in {"low", "medium", "high"}:
+            raise ValueError(
+                "optimizer.muon.fp32_matmul_prec must be low, medium, or high"
+            )
+        if self.num_ns_steps < 1:
+            raise ValueError("optimizer.muon.num_ns_steps must be at least 1")
+        if self.scale_mode not in {
+            "spectral",
+            "unit_rms_norm",
+            "shape_scaling",
+        }:
+            raise ValueError(
+                "optimizer.muon.scale_mode must be spectral, unit_rms_norm, "
+                "or shape_scaling"
+            )
+        if self.tp_mode not in {"blockwise", "duplicated", "distributed"}:
+            raise ValueError(
+                "optimizer.muon.tp_mode must be blockwise, duplicated, or distributed"
+            )
+        if self.extra_scale_factor <= 0:
+            raise ValueError("optimizer.muon.extra_scale_factor must be positive")
+
+
+@dataclass
 class OptimizerConfig:
     """Configuration for model optimization during training."""
 
@@ -392,8 +441,9 @@ class OptimizerConfig:
         metadata={
             "help": "Optimizer type. For FSDP Engine, adam_bf16 enables memory-efficient BF16 optimizer states. "
             "For Megatron Engine, adam_bf16 requires dtype=bfloat16 and is automatically converted to adam "
-            "with precision-aware optimizer enabled.",
-            "choices": ["adam", "sgd", "adam_bf16"],
+            "with precision-aware optimizer enabled. dist_muon selects Megatron's layer-wise distributed "
+            "Muon optimizer and uses AdamW for scalar/non-matrix parameters.",
+            "choices": ["adam", "sgd", "adam_bf16", "dist_muon"],
         },
     )
     lr: float = field(default=1e-3, metadata={"help": "Learning rate"})
@@ -415,6 +465,10 @@ class OptimizerConfig:
         metadata={
             "help": "Adam epsilon parameter. Only effective when optimizer_type is adam/adam_bf16"
         },
+    )
+    muon: MuonOptimizerConfig = field(
+        default_factory=MuonOptimizerConfig,
+        metadata={"help": "Muon algorithm settings used when type=dist_muon."},
     )
     min_lr_ratio: float = field(
         default=0.0,
