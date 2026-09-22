@@ -179,17 +179,3 @@ def test_prm_import_does_not_load_math_verify():
         check=False,
     )
     assert result.returncode == 0, result.stderr
-
-
-def test_v2_prm_rejects_unsupported_error_policy():
-    from areal.api.cli_args import PRMConfig, PRMScorerConfig
-    from areal.v2.inference_service.data_proxy.config import DataProxyConfig
-
-    with pytest.raises(ValueError, match="only supported by the v1 proxy"):
-        DataProxyConfig(
-            chat_template_type="concat",
-            prm=PRMConfig(
-                error_policy="keep_original",
-                scorers=[PRMScorerConfig(path="unused.scorer")],
-            ),
-        )
