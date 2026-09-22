@@ -1229,3 +1229,27 @@ async def test_prm_keep_original_does_not_swallow_cancellation(monkeypatch):
         await srv.export_trajectories(
             srv.ExportTrajectoriesRequest(session_id=session.session_id)
         )
+
+
+@pytest.mark.parametrize("status", [True, False, None, "false", 0, 1])
+def test_anthropic_tool_result_preserves_only_explicit_booleans(monkeypatch, status):
+    block = {"type": "tool_result", "tool_use_id": "call-a", "content": "receipt"}
+    if status is not None:
+        block["is_error"] = status
+    request = {"messages": [{"role": "user", "content": [block]}]}
+    monkeypatch.setattr(
+        srv,
+        "translate_anthropic_request",
+        lambda _: {
+            "messages": [
+                {"role": "tool", "tool_call_id": "call-a", "content": "receipt"}
+            ]
+        },
+    )
+    result = srv._translate_anthropic_to_openai_request(request)
+    message = result["messages"][0]
+    assert message["content"] == "receipt"
+    if isinstance(status, bool):
+        assert message["is_error"] is status
+    else:
+        assert "is_error" not in message
