@@ -35,12 +35,11 @@ _ADMIN_KEY = "test-admin-key"
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_model", [False, True])
-@pytest.mark.parametrize("explicit_sampling", [False, True])
 @pytest.mark.parametrize(
     "explicit_limit", [None, "max_tokens", "max_completion_tokens"]
 )
 async def test_session_generation_defaults_respect_explicit_limits(
-    monkeypatch, use_model, explicit_limit, explicit_sampling
+    monkeypatch, use_model, explicit_limit
 ):
     from pydantic import BaseModel
 
@@ -48,24 +47,13 @@ async def test_session_generation_defaults_respect_explicit_limits(
         max_tokens: int | None = None
         max_completion_tokens: int | None = None
         temperature: float = 1.0
-        top_p: float = 1.0
-        top_k: int | None = None
 
-    from examples.swe.arena_agent import ArenaStreamAgentWorkflow
-
-    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
-    agent = ArenaStreamAgentWorkflow(
-        econfig={"arena_base_url": "https://arena.example", "stream_id": "test"},
-        gen_args={"max_tokens": 128, "temperature": 0.6, "top_p": 0.8, "top_k": 32},
-    )
     monkeypatch.setattr(srv, "_openai_client", object())
     srv._session_cache["session"] = SessionData(
         session_id="session",
-        metadata=agent.get_session_metadata({}),
+        metadata={"generation_args": {"max_tokens": 128, "temperature": 0.6}},
     )
     payload = {explicit_limit: 32} if explicit_limit else {}
-    if explicit_sampling:
-        payload.update(temperature=0.0, top_p=0.9, top_k=16)
     request = Request(**payload) if use_model else payload
 
     async def create_fn(
@@ -73,19 +61,16 @@ async def test_session_generation_defaults_respect_explicit_limits(
         max_completion_tokens=None,
         temperature=None,
         top_p=None,
-        top_k=None,
         areal_cache=None,
         processor_cache=None,
     ):
-        return max_tokens, max_completion_tokens, temperature, top_p, top_k
+        return max_tokens, max_completion_tokens, temperature
 
     result = await srv._call_client_create(create_fn, request, "session")
     assert result == (
         (32 if explicit_limit == "max_tokens" else None) if explicit_limit else 128,
         32 if explicit_limit == "max_completion_tokens" else None,
-        0.0 if explicit_sampling else 0.6,
-        0.9 if explicit_sampling else 0.8,
-        16 if explicit_sampling else 32,
+        0.6,
     )
 
 

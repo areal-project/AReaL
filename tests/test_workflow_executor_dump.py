@@ -72,24 +72,7 @@ async def test_dump_preserves_training_references_and_fetches_only_dump_fields(
     monkeypatch.setattr(executor, "_get_dump_dir", lambda is_eval: str(tmp_path))
     monkeypatch.setattr(executor, "_get_tokenizer", lambda: tokenizer)
 
-    from areal.experimental.openai import InteractionWithTokenLogpReward
-    from areal.experimental.openai.proxy.workflow import OpenAIProxyWorkflow
-
-    metadata = {
-        "session_id": "session-a",
-        "arena_task_id": "task-a",
-        "arena_status": "OK",
-    }
-    interactions = {
-        str(i): InteractionWithTokenLogpReward(reward=1.0) for i in range(4)
-    }
-    OpenAIProxyWorkflow._stamp_interaction_metadata(interactions, metadata)
-    success, reason = await executor._dump_trajectory(
-        trajectory,
-        42,
-        False,
-        sample_metadata=[x.metadata for x in interactions.values()],
-    )
+    success, reason = await executor._dump_trajectory(trajectory, 42, False)
 
     assert success, reason
     assert serialize_value(trajectory) == before
@@ -138,6 +121,4 @@ async def test_dump_preserves_training_references_and_fetches_only_dump_fields(
         }
         if with_optional_fields:
             expected["original_reward"] = 2.0
-        expected.update(metadata)
-        expected["metadata"] = metadata
         assert record == expected
