@@ -768,6 +768,11 @@ class ArenaStreamAgentWorkflow:
         )
         self._task_result_dumped.set(True)
 
+    def get_session_metadata(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Supply generation defaults for requests that omit these fields."""
+        del data
+        return {"generation_args": dict(self.gen_args)} if self.gen_args else {}
+
     async def record_failure_disposition(
         self,
         data: dict[str, Any],
