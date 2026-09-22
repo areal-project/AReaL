@@ -1,9 +1,9 @@
 # Process Rewards
 
 Process rewards attach a training signal to each generated turn, in addition to
-the trajectory's outcome reward. The v1 OpenAI proxy scores complete trajectories
-before exporting them to PPO/GRPO. Scorers are supplied as Python classes; no
-external judge service is required by AReaL itself.
+the trajectory's outcome reward. The v1 OpenAI proxy and v2 inference data proxy
+score complete trajectories before exporting them to PPO/GRPO. Scorers are supplied
+as Python classes; no external judge service is required by AReaL itself.
 
 ## Configuration
 
@@ -29,8 +29,17 @@ actor:
 ```
 
 An empty scorer list or `enabled: false` disables proxy scoring. Scorers currently
-require v1 rollout, concat export, concat chat templates, and direct process
-advantages. Individual export and the v2 agent service are not supported.
+require concat export, concat chat templates, token-backed interactions, and direct
+process advantages. To use the v2 inference service, set `rollout._version: v2`
+with the same scorer configuration. Individual export and string-only external
+model responses are not supported. This integration scores completed training
+trajectories, not the optional Agent Service's reconstructed chat history.
+
+Active PRM scorers are rejected with v2 external-model mode (`rollout.api_url`),
+because that path stores string-only responses without token-backed interactions.
+This does not restrict ordinary SGLang/vLLM backends, including pre-existing servers
+passed through `server_infos`. External mode remains available when PRM is disabled
+or the scorer list is empty.
 
 ## Scorer Contract
 
@@ -57,6 +66,39 @@ scope, target ID, value type and aggregations. Boolean observations support `cou
 and `rate`; numeric observations support `sum` and `mean`. Schemas must stay stable
 for the same scorer and metric. The example length-budget scorer demonstrates
 this interface without adding dependencies.
+
+### Scorer Lifecycle
+
+`BaseScorer.aclose()` is an optional asynchronous cleanup hook with a no-op
+default. Override it to flush buffered audit records, join background writers,
+and close clients owned by the scorer. Bound external I/O inside the hook;
+the runner does not add a cleanup timeout or retry policy.
+
+`PRMRunner.aclose()` closes scorers it created from configuration, including
+disabled scorers, in reverse creation order. Scorer instances passed directly
+to the runner are borrowed: their caller remains responsible for closing them.
+Each owned instance is closed at most once. Concurrent close calls wait for the
+same cleanup; ordinary failures are logged and collected in an `ExceptionGroup` after all
+owned scorers have been attempted. Cancellation propagates, and subsequent close
+calls do not retry failed or interrupted hooks.
+
+Use `await PRMRunner.create(config)` when constructing a runner in async code.
+If scorer resolution, construction, or configuration validation fails, it awaits
+cleanup of all previously constructed owned scorers before re-raising the original
+startup error. Ordinary cleanup failures are logged and attached as error notes;
+external cancellation during cleanup still propagates. Borrowed instances are not
+closed. A scorer whose own constructor raises before returning remains responsible
+for cleaning up resources acquired inside that constructor.
+
+Callers must drain scoring before closing the runner. New `run()` calls are
+rejected once closing starts. The v2 data proxy creates its runner during service
+startup with the async factory and awaits cleanup during lifespan shutdown, before closing its inference
+bridge and HTTP client. Those resources are still cleaned up if scorer cleanup
+fails. A PRM startup error also closes the bridge and HTTP client without letting
+ordinary service cleanup failures replace that startup error. The synchronous
+`PRMRunner(config)` interface remains available for compatibility, without async
+startup rollback. The v1 proxy still uses it and does not yet invoke `aclose()`
+automatically.
 
 ## Advantage Shaping
 
@@ -91,6 +133,36 @@ Metrics include `prm_turn_reward/<scorer>`, `prm_trajectory_reward/<scorer>` and
 unweighted; reward metrics include scorer weights. Worker means and rates are
 weighted by observation counts, while counts and sums are added. Evaluation uses
 the `eval-rollout` namespace.
+
+### v2 Export And Metric Transport
+
+The v2 controller forwards the existing `PRMConfig` to each inference data proxy.
+Scoring runs after ready trajectories are collected and before v2's existing
+group outcome-reward normalization. Independent sessions are scored concurrently,
+with branches within a session scored in order. Process token rewards are not
+group-normalized. No online per-step scoring or new advantage formula is introduced.
+
+A missing or failed PRM-scored session rejects the entire requested group, even
+when outcome-reward normalization is disabled. An explicit discard request skips
+scoring. Sessions are cleaned up on success, scoring failure, and cancellation
+when `remove_session` is true. This does not add partial-group acceptance.
+The online workflow retains the persistent HITL session (`__hitl__`) and consumes
+only the selected ready trajectory, so new interactions and subsequent ready
+trajectories survive an in-flight export. Ordinary session-key exports still
+remove their session.
+
+The export response carries `prm_stats` containing the existing typed turn results
+and per-branch scorer totals. The workflow records them through the same metric
+recorders as v1, outside the HTTP retry boundary. Means and rates therefore retain
+their observation counts; concurrent exports do not drain a shared server-side
+statistics buffer. Each successfully scored session contributes observations even
+if another member rejects the group. These are scoring metrics, not counts of
+samples eventually used by the optimizer. Failed sessions publish no partial
+branch observations. Requests without PRM retain the original response shape.
+
+Export consumes a ready trajectory once. Retrying an already consumed trajectory
+does not run its scorer again. As with existing v2 export, a lost response is not
+replayed: this is not an exactly-once delivery guarantee for trajectories or metrics.
 
 For grouped rollout filtering, `examples.swe.filter_function` provides
 `filter_mixed_or_penalized_all_wrong`: it retains mixed-outcome groups and

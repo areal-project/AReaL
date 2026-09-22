@@ -16,6 +16,7 @@ import pytest_asyncio
 import torch
 from PIL import Image
 
+from areal.api.cli_args import PRMConfig, PRMScorerConfig
 from areal.infra.rpc import rtensor
 from areal.infra.rpc.serialization import deserialize_value
 from areal.v2.inference_service.data_proxy.app import (
@@ -29,9 +30,25 @@ from areal.v2.inference_service.data_proxy.session import SessionStore
 
 
 @pytest_asyncio.fixture
-async def proxy(monkeypatch):
+async def proxy(monkeypatch, request):
     """Use real cache/export code with fake inference and tensor transport."""
     config = DataProxyConfig(tokenizer_path="mock-vlm", backend_type="sglang")
+    prm_enabled = getattr(request, "param", False)
+    if prm_enabled:
+        config = DataProxyConfig(
+            tokenizer_path="mock-vlm",
+            backend_type="sglang",
+            chat_template_type="concat",
+            prm=PRMConfig(
+                scorers=[
+                    PRMScorerConfig(
+                        path="examples.prm.scorers.LengthBudgetScorer",
+                        weight=0.5,
+                        kwargs={"max_output_tokens": 32},
+                    )
+                ]
+            ),
+        )
     tokenizer = MagicMock(eos_token_id=99, pad_token_id=0)
     tokenizer.apply_chat_template.side_effect = lambda *args, tokenize=True, **kwargs: (
         {"input_ids": [10, 2, 20]} if tokenize else "describe"
@@ -61,10 +78,18 @@ async def proxy(monkeypatch):
     )
     monkeypatch.setattr(bridge, "_send_request", send)
     areal_client = _create_areal_client(bridge, tok, config)
-    store = SessionStore()
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app.TokenizerProxy", lambda path: tok
+    )
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app._create_inf_bridge",
+        lambda *args: bridge,
+    )
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app._create_areal_client",
+        lambda *args: areal_client,
+    )
     app = create_app(config)
-    app.state.session_store = store
-    app.state.areal_client = areal_client
 
     tensors = {}
 
@@ -80,22 +105,25 @@ async def proxy(monkeypatch):
     ]
     monkeypatch.setattr(rtensor, "get_backend", lambda: backend)
     monkeypatch.setattr(rtensor, "_fetch_buffer", {})
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client,
+    ):
         try:
             yield SimpleNamespace(
                 client=client,
-                store=store,
+                store=app.state.session_store,
                 processor=processor,
                 send=send,
                 tensors=tensors,
                 backend=backend,
                 admin={"Authorization": f"Bearer {config.admin_api_key}"},
+                prm_enabled=prm_enabled,
             )
         finally:
             await areal_client.close()
-            await bridge.aclose()
 
 
 async def _run_group(proxy, colors):
@@ -152,7 +180,7 @@ async def _export(proxy, sessions, *, discard=False):
         headers=proxy.admin,
         json={
             "session_ids": [member["session_id"] for member in sessions],
-            "style": "individual",
+            "style": "concat" if proxy.prm_enabled else "individual",
             "discard_trajectory": discard,
         },
     )
@@ -161,6 +189,7 @@ async def _export(proxy, sessions, *, discard=False):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("proxy", [False, True], indirect=True)
 @pytest.mark.parametrize(
     "colors,unique_images", [(["red"] * 4, 1), (["red", "blue"], 2), (["red"], 1)]
 )
@@ -206,6 +235,17 @@ async def test_group_export_shares_only_matching_images(proxy, colors, unique_im
         rtol=0,
         atol=0,
     )
+    if proxy.prm_enabled:
+        torch.testing.assert_close(
+            local["token_rewards"],
+            torch.tensor([[0.0, 0.0, 0.0, 0.5]] * len(colors)),
+            rtol=0,
+            atol=0,
+        )
+        assert local["mm_token_type_ids"].shape == local["input_ids"].shape
+        assert not local["mm_token_type_ids"][:, -1].any()
+    else:
+        assert "token_rewards" not in local
 
 
 @pytest.mark.asyncio

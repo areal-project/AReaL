@@ -223,46 +223,45 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
             # Worker reported an error; forward it without touching history.
             return JSONResponse(result, status_code=status_code)
 
-        session.history.append({"role": "user", "content": message})
-
-        call_counter = 0
+        # The Worker has normalized IDs and validated explicit message groups.
+        # Stage this turn before modifying the saved cross-request history.
+        new_messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
+        tool_messages: dict[str, dict[str, Any]] = {}
         for evt in result.get("events", []):
             if evt.get("type") == "tool_call":
-                call_id = f"call_{evt.get('name', '')}_{run_id}_{call_counter}"
-                call_counter += 1
-                session.history.append(
-                    {
+                call = {
+                    "id": evt["call_id"],
+                    "type": "function",
+                    "function": {
+                        "name": evt.get("name", ""),
+                        "arguments": evt.get("args", ""),
+                    },
+                }
+                message_id = evt.get("message_id")
+                if message_id is not None and message_id in tool_messages:
+                    tool_messages[message_id]["tool_calls"].append(call)
+                else:
+                    tool_message = {
                         "role": "assistant",
                         "content": None,
-                        "tool_calls": [
-                            {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": evt.get("name", ""),
-                                    "arguments": evt.get("args", ""),
-                                },
-                            }
-                        ],
+                        "tool_calls": [call],
                     }
-                )
+                    new_messages.append(tool_message)
+                    if message_id is not None:
+                        tool_messages[message_id] = tool_message
             elif evt.get("type") == "tool_result":
-                result_call_id = (
-                    f"call_{evt.get('name', '')}_{run_id}_{call_counter - 1}"
-                    if call_counter > 0
-                    else f"call_{evt.get('name', '')}_{run_id}_0"
-                )
-                session.history.append(
+                new_messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": result_call_id,
+                        "tool_call_id": evt["call_id"],
                         "content": evt.get("result", ""),
                     }
                 )
 
         summary = result.get("summary", "")
         if summary:
-            session.history.append({"role": "assistant", "content": summary})
+            new_messages.append({"role": "assistant", "content": summary})
+        session.history.extend(new_messages)
 
         session.last_active = time.monotonic()
         return JSONResponse(result, status_code=status_code)

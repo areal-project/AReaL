@@ -9,7 +9,7 @@ import torch.distributed.nn.functional as dist_F
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
-from areal.engine.core.model import SequencePackingMode, supports_gdn_packed_seq
+from areal.engine.core.model import SequencePackingMode
 from areal.utils.data import (
     MicroBatchItem,
     MicroBatchList,
@@ -512,14 +512,9 @@ def packed_context_parallel_forward(
                     "Attention mask and tree attention are not supported with "
                     "the model-packed THD forward."
                 )
-            if (
-                mpu.get_context_parallel_world_size() > 1
-                and not supports_gdn_packed_seq()
-            ):
-                raise NotImplementedError(
-                    "Model-packed THD with CP > 1 requires megatron-core>=0.18.2 "
-                    "and megatron-bridge>=0.5.1."
-                )
+            # Keep the full BSHD inputs on every CP rank. The bridge first fuses
+            # vision embeddings and computes multimodal RoPE, then partitions
+            # the resulting THD sequence with its model-owned CP layout.
             input_ids, attention_mask, _, max_seqlen = _reconstruct_padded_2d(
                 input_ids, cu_seqlens, input_.get("max_seqlen")
             )
@@ -567,13 +562,6 @@ def packed_context_parallel_forward(
             if key in input_:
                 vlm_kwargs[key] = input_[key]
 
-    # For BSHD text-only, drop the packed-form position_ids (a 1D tensor of
-    # length total_len) — they don't match the 2D [B, S] input. Let mcore
-    # compute the default torch.arange positions per row; padding positions
-    # are masked out by attention_mask.
-    if dense_mask_text_forward:
-        position_ids = None
-
     # MTP training: convert the independent label and mask channels to the
     # exact layout used by this forward. MCore rolls both once per MTP layer;
     # keeping them aligned prevents cross-sequence targets and masks padding
@@ -587,7 +575,7 @@ def packed_context_parallel_forward(
             attention_mask,
             cu_seqlens=cu_seqlens,
             packed_num_tokens=packed_num_tokens,
-            uses_padded_form=needs_padded_form,
+            uses_padded_form=is_vision_model and not use_model_packed_seq,
             uses_model_packed_seq=use_model_packed_seq,
         )
 

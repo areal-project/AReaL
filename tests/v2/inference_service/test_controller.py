@@ -173,6 +173,38 @@ class TestControllerWorkflowResolution:
         assert isinstance(resolved.agent, MockAgent)
         assert resolved.drop_retry_orphans is True
 
+    @pytest.mark.parametrize("prm_enabled", [False, True])
+    def test_online_workflow_uses_configured_prm_export_settings(self, prm_enabled):
+        """Completed online trajectories use concat for PRM; disabled defaults stay unchanged."""
+        from areal.api.cli_args import PRMConfig, PRMScorerConfig
+
+        controller = RolloutControllerV2(
+            config=InferenceEngineConfig(
+                backend="sglang:d1",
+                _version="v2",
+                agent=AgentConfig(
+                    agent_cls_path="areal.experimental.openai.proxy.online_agent._OnlineAgent",
+                    chat_template_type="concat",
+                    export_style="concat",
+                    turn_discount=0.75,
+                    prm=PRMConfig(
+                        enabled=prm_enabled,
+                        scorers=[PRMScorerConfig(path="unused.Scorer")],
+                    ),
+                ),
+            ),
+            scheduler=_make_scheduler(),
+        )
+        resolved = controller._resolve_workflow(None)
+        assert resolved.export_style == ("concat" if prm_enabled else "individual")
+        assert resolved.discount == (0.75 if prm_enabled else 1.0)
+
+        overridden = controller._resolve_workflow(
+            None, workflow_kwargs={"export_style": "concat", "discount": 0.5}
+        )
+        assert overridden.export_style == "concat"
+        assert overridden.discount == 0.5
+
     def test_resolve_workflow_forwards_reward_normalization(self):
         controller = RolloutControllerV2(
             config=InferenceEngineConfig(
@@ -327,6 +359,44 @@ class TestRolloutControllerV2APISurface:
 
 
 class TestRolloutControllerV2Construction:
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    @pytest.mark.parametrize("api_url", ["https://upstream.invalid/v1", ""])
+    def test_external_prm_rejected_before_allocating_resources(self, version, api_url):
+        """Direct v2 callers can set api_url after the PPO config was validated."""
+        from areal.api.cli_args import PPOConfig, PRMScorerConfig
+
+        config = PPOConfig()
+        config.rollout._version = version
+        config.rollout.agent.prm.scorers = [PRMScorerConfig(path="unused.Scorer")]
+        config.rollout.agent.export_style = "concat"
+        config.rollout.agent.chat_template_type = "concat"
+        config.__post_init__()
+        config.rollout.api_url = api_url
+        scheduler = _make_scheduler()
+
+        with patch(
+            "areal.v2.inference_service.controller.controller.httpx.Client"
+        ) as client:
+            with pytest.raises(ValueError, match="PRM.*api_url.*token-backed"):
+                RolloutControllerV2(config=config.rollout, scheduler=scheduler)
+
+        client.assert_not_called()
+        assert scheduler.mock_calls == []
+
+    @pytest.mark.parametrize("inactive", ["disabled", "empty"])
+    def test_external_mode_accepts_inactive_prm(self, inactive):
+        """Disabled and empty PRM configurations keep the external-model path."""
+        from areal.api.cli_args import PRMScorerConfig
+
+        cfg = InferenceEngineConfig(api_url="https://upstream.invalid/v1")
+        if inactive == "disabled":
+            cfg.agent.prm.enabled = False
+            cfg.agent.prm.scorers = [PRMScorerConfig(path="unused.Scorer")]
+
+        controller = RolloutControllerV2(config=cfg, scheduler=_make_scheduler())
+        assert controller.rollout_alloc is None
+        controller._sync_client.close()
+
     def test_admin_api_key_none_raises(self):
         cfg = InferenceEngineConfig(backend="sglang:d1")
         cfg.admin_api_key = ""
@@ -428,11 +498,15 @@ class TestRolloutControllerV2Construction:
         controller.save_perf_tracer()
 
     @pytest.mark.parametrize("deterministic_sampling", [False, True])
+    @pytest.mark.parametrize("prm_enabled", [False, True])
     @pytest.mark.asyncio
     async def test_async_initialize_passes_config_to_data_proxy(
-        self, deterministic_sampling
+        self, deterministic_sampling, prm_enabled
     ):
-        from areal.api.cli_args import SchedulingSpec
+        import json
+        from dataclasses import asdict
+
+        from areal.api.cli_args import PRMConfig, PRMScorerConfig, SchedulingSpec
         from areal.api.io_struct import LocalInfServerInfo
 
         worker = MagicMock()
@@ -445,6 +519,7 @@ class TestRolloutControllerV2Construction:
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             tokenizer_path="mock-tokenizer",
+            _version="v2",
             request_timeout=15.0,
             deterministic_sampling=deterministic_sampling,
             agent=AgentConfig(
@@ -455,6 +530,17 @@ class TestRolloutControllerV2Construction:
                     "examples.swe.preprocessors.StripAllSystemReminders",
                 ],
                 prefix_matcher="examples.swe.prefix_matchers.swe_prefix_matcher",
+                chat_template_type="concat",
+                prm=PRMConfig(
+                    enabled=prm_enabled,
+                    scorers=[
+                        PRMScorerConfig(
+                            path="examples.prm.scorers.LengthBudgetScorer",
+                            weight=0.5,
+                            kwargs={"max_output_tokens": 32},
+                        )
+                    ],
+                ),
             ),
             scheduling_spec=(
                 SchedulingSpec(
@@ -491,6 +577,9 @@ class TestRolloutControllerV2Construction:
         ]
         assert len(data_proxy_calls) == 1
         data_proxy_cmd = data_proxy_calls[0].kwargs["raw_cmd"]
+        # Pre-existing SGLang servers still use token-backed inference, not api_url.
+        backend_arg = data_proxy_cmd.index("--backend-addr")
+        assert data_proxy_cmd[backend_arg + 1] == "http://127.0.0.1:30000"
         assert "--set-reward-finish-timeout" in data_proxy_cmd
         assert "7.5" in data_proxy_cmd
         assert "--callback-server-addr" in data_proxy_cmd
@@ -505,6 +594,10 @@ class TestRolloutControllerV2Construction:
         assert data_proxy_cmd[matcher + 1] == (
             "examples.swe.prefix_matchers.swe_prefix_matcher"
         )
+        assert ("--prm-config" in data_proxy_cmd) is prm_enabled
+        if prm_enabled:
+            encoded = data_proxy_cmd[data_proxy_cmd.index("--prm-config") + 1]
+            assert json.loads(encoded) == asdict(cfg.agent.prm)
 
 
 class TestOnlineCallbackFlow:
@@ -739,13 +832,20 @@ class TestInferenceServiceWorkflow:
         assert result == {}
         assert session.post.call_args.kwargs["json"]["reward_normalization"] is True
 
-    @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
-    async def test_online_mode_waits_on_controller(self):
-        mock_interaction = MagicMock(reward=1.0)
+    @pytest.mark.parametrize("session_id", ["sess-1", "__hitl__"])
+    async def test_online_mode_waits_on_controller(self, session_id):
+        import torch
+
+        from areal.infra.rpc.serialization import serialize_value
+
+        trajectory = {
+            "input_ids": torch.tensor([[1, 2]]),
+            "rewards": torch.tensor([1.0]),
+        }
         controller = MagicMock()
         controller.wait_for_online_trajectory = AsyncMock(
-            return_value={"session_id": "sess-1", "trajectory_id": 7}
+            return_value={"session_id": session_id, "trajectory_id": 7}
         )
 
         workflow = InferenceServiceWorkflow(
@@ -763,18 +863,12 @@ class TestInferenceServiceWorkflow:
             patch(
                 "areal.v2.inference_service.controller.workflow.stats_tracker"
             ) as mock_st,
-            patch(
-                "areal.v2.inference_service.controller.workflow.deserialize_interactions"
-            ) as mock_deserialize,
         ):
-            mock_deserialize.return_value = {"chatcmpl-1": mock_interaction}
-
-            # _run_online uses ``async with http_session.post(...)`` directly,
-            # so the mock must support the async context-manager protocol.
+            # Keep the real export deserializer; only mock the HTTP transport.
             mock_response = MagicMock()
             mock_response.raise_for_status = MagicMock()
             mock_response.json = AsyncMock(
-                return_value={"interactions": {"chatcmpl-1": {}}}
+                return_value={"traj": serialize_value(trajectory)}
             )
 
             mock_cm = MagicMock()
@@ -785,16 +879,23 @@ class TestInferenceServiceWorkflow:
             mock_http_session.post = MagicMock(return_value=mock_cm)
 
             mock_wf_ctx.get_aiohttp_session = AsyncMock(return_value=mock_http_session)
+            mock_wf_ctx.get.return_value.is_eval = False
             mock_wf_ctx.stat_scope.return_value = "rollout"
             mock_st.get.return_value = MagicMock()
 
             result = await workflow.arun_episode(engine=MagicMock(), data={})
 
         assert result is not None
-        assert "chatcmpl-1" in result
+        for key, expected in trajectory.items():
+            torch.testing.assert_close(result[key], expected, rtol=0, atol=0)
         controller.wait_for_online_trajectory.assert_awaited_once_with(timeout=3.0)
         mock_http_session.post.assert_called_once()
-        mock_deserialize.assert_called_once_with({"chatcmpl-1": {}})
+        payload = mock_http_session.post.call_args.kwargs["json"]
+        assert payload["session_ids"] == [session_id]
+        assert payload["trajectory_id"] == 7
+        assert payload["is_eval"] is False
+        assert payload["remove_session"] is (session_id != "__hitl__")
+        mock_st.get.return_value.scalar.assert_called_once_with(reward=1.0)
 
     @pytest.mark.asyncio
     async def test_offline_mode_runs_agent(self):

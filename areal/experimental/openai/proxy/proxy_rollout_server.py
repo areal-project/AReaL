@@ -37,7 +37,7 @@ from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
-from areal.utils import name_resolve, names, seeding, stats_tracker
+from areal.utils import name_resolve, names, seeding
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.logging import getLogger
@@ -73,7 +73,7 @@ from .tensor_reference import GroupTensorStoreRegistry
 
 if TYPE_CHECKING:
     from areal.api import InferenceEngine
-    from areal.reward.prm import PRMRunner, PRMTurnResult
+    from areal.reward.prm import PRMRunner
 
 
 logger = getLogger("ProxyRolloutServer")
@@ -1372,8 +1372,7 @@ async def _score_prm_branches(
     Turn observations count each duplicated turn occurrence, and trajectory reward
     metrics sum the turn rewards once per exported branch.
     """
-    from areal.experimental.openai.cache import InteractionCache
-    from areal.reward.prm import record_prm_results
+    from areal.reward.prm.export import score_prm_branches
 
     if len(interactions) > 1:
         logger.warning(
@@ -1383,41 +1382,10 @@ async def _score_prm_branches(
             len(interactions),
         )
 
-    scored_interactions: dict[str, InteractionWithTokenLogpReward] = {}
-    committed_turn_results: list[PRMTurnResult] = []
-    committed_trajectory_metrics: list[tuple[str, float]] = []
-    for leaf_id, leaf in interactions.items():
-        branch_cache, cloned_leaf = InteractionCache.clone_chain(
-            leaf, session_id=session_id
-        )
-        if cloned_leaf.interaction_id != leaf_id:
-            raise ValueError(
-                "PRM exported leaf ID mismatch: "
-                f"mapping key {leaf_id!r}, interaction ID "
-                f"{cloned_leaf.interaction_id!r}"
-            )
-        full_messages = list(cloned_leaf.messages or []) + list(
-            cloned_leaf.output_message_list or []
-        )
-        branch_results = await runner.run(
-            branch_cache,
-            ctx={"messages": full_messages},
-            is_eval=is_eval,
-            record_metrics=False,
-        )
-        committed_turn_results.extend(branch_results)
-        branch_totals: dict[str, float] = {}
-        for result in branch_results:
-            branch_totals[result.scorer_name] = (
-                branch_totals.get(result.scorer_name, 0.0) + result.reward
-            )
-        committed_trajectory_metrics.extend(branch_totals.items())
-        scored_interactions[leaf_id] = cloned_leaf
-
-    record_prm_results(committed_turn_results, is_eval=is_eval)
-    tracker = stats_tracker.get("eval-rollout" if is_eval else "rollout")
-    for scorer_name, metric in committed_trajectory_metrics:
-        tracker.scalar(**{f"prm_trajectory_reward/{scorer_name}": metric})
+    scored_interactions, stats = await score_prm_branches(
+        interactions, runner, session_id=session_id, is_eval=is_eval
+    )
+    stats.record(is_eval=is_eval)
     return scored_interactions
 
 

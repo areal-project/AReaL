@@ -19,9 +19,48 @@ def _config_with_prm() -> PPOConfig:
     return config
 
 
-def test_prm_accepts_v1_concat_agent_config():
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_prm_accepts_concat_agent_config(version):
+    config = _config_with_prm()
+    config.rollout._version = version
+    config.rollout.agent.export_style = "concat"
+    config.rollout.agent.chat_template_type = "concat"
+
+    config.__post_init__()
+
+
+@pytest.mark.parametrize("api_url", ["https://upstream.invalid/v1", ""])
+def test_prm_rejects_v2_external_model_mode(api_url):
+    """External v2 responses lack the token records needed for process rewards."""
+    config = _config_with_prm()
+    config.rollout._version = "v2"
+    config.rollout.api_url = api_url
+    config.rollout.agent.export_style = "concat"
+    config.rollout.agent.chat_template_type = "concat"
+
+    with pytest.raises(ValueError, match="PRM.*api_url.*token-backed"):
+        config.__post_init__()
+
+
+@pytest.mark.parametrize("inactive", ["disabled", "empty"])
+def test_v2_external_model_mode_accepts_inactive_prm(inactive):
+    """The new compatibility check must not change external mode without scorers."""
+    config = _config_with_prm()
+    config.rollout._version = "v2"
+    config.rollout.api_url = "https://upstream.invalid/v1"
+    if inactive == "disabled":
+        config.rollout.agent.prm.enabled = False
+    else:
+        config.rollout.agent.prm.scorers = []
+
+    config.__post_init__()
+
+
+def test_prm_external_model_guard_leaves_v1_configuration_unchanged():
+    """The v2-only rejection must not change v1's existing configuration contract."""
     config = _config_with_prm()
     config.rollout._version = "v1"
+    config.rollout.api_url = "https://upstream.invalid/v1"
     config.rollout.agent.export_style = "concat"
     config.rollout.agent.chat_template_type = "concat"
 
@@ -43,7 +82,7 @@ def test_prm_rejects_folded_process_rewards_until_semantics_are_defined():
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("version", "v2", "rollout._version='v1'"),
+        ("version", "v3", "rollout._version='v1' or 'v2'"),
         ("export_style", "individual", "export_style='concat'"),
         ("chat_template_type", "hf", "chat_template_type='concat'"),
     ],
