@@ -263,6 +263,7 @@ def test_registry_freezes_before_distributed_wrap(
         mtp_num_layers = 1
         pipeline_model_parallel_layout = None
         cross_entropy_loss_fusion = not fused_loss
+        gradient_accumulation_fusion = False
         moe_router_enable_expert_bias = expert_bias
 
         def __init__(self):

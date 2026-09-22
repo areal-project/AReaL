@@ -6,7 +6,11 @@ import pytest
 import torch
 
 from areal.api import FinetuneSpec
-from areal.api.cli_args import MegatronEngineConfig, OptimizerConfig
+from areal.api.cli_args import (
+    CPUStagedOffloadConfig,
+    MegatronEngineConfig,
+    OptimizerConfig,
+)
 from areal.engine import megatron_engine as megatron_engine_module
 
 
@@ -21,6 +25,8 @@ def _make_test_engine(optimizer_config: OptimizerConfig):
     engine.dtype = torch.bfloat16
     engine.enable_fp8 = False
     engine.fp8_config = None
+    engine.process_group_initialized = True
+    engine._cpu_group = object()
     return engine
 
 
@@ -78,6 +84,9 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
     )
     engine._awex_adapter = None
     engine._weight_residency = None
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(calculate_per_token_loss=False)
+    engine.model = [model]
     engine.device = torch.device("cpu")
     engine.optimizer = _Optimizer()
     engine._ensure_ready = lambda: None
@@ -176,6 +185,51 @@ def test_precision_aware_optimizer_fields_are_applied_before_validation(
     assert config.use_precision_aware_optimizer is True
     assert config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 is True
     assert config.main_grads_dtype is torch.bfloat16
+    assert config.main_params_dtype is torch.float32
+    assert config.exp_avg_dtype is torch.float32
+    assert config.exp_avg_sq_dtype is torch.float32
+
+
+def test_cpu_staged_adamw_config_selects_precision_aware_factory(monkeypatch) -> None:
+    """The core Megatron config directly selects the staged AdamW factory."""
+    captured = {}
+    engine = _make_test_engine(OptimizerConfig(type="adam"))
+    engine.mcore_config.cpu_staged_offload = CPUStagedOffloadConfig(
+        enabled=True, buffer_count=3, bucket_size_mb=4
+    )
+
+    def capture_optimizer(config, model, config_arg):
+        captured["config"] = config
+        captured["model"] = model
+        captured["staged_config"] = config_arg
+        return object()
+
+    monkeypatch.setattr(
+        megatron_engine_module,
+        "get_megatron_optimizer_with_gpu_staged_adamw",
+        capture_optimizer,
+    )
+    monkeypatch.setattr(
+        megatron_engine_module,
+        "OptimizerParamScheduler",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        megatron_engine_module,
+        "MegatronCheckpointManager",
+        lambda **kwargs: captured.setdefault("checkpoint", kwargs) or object(),
+    )
+
+    engine._create_optimizer(
+        FinetuneSpec(total_train_epochs=1, dataset_size=2, train_batch_size=1)
+    )
+
+    config = captured["config"]
+    assert captured["model"] is engine.model
+    assert captured["staged_config"].buffer_count == 3
+    assert captured["staged_config"].bucket_size_mb == 4
+    assert config.use_precision_aware_optimizer is True
+    assert config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 is True
     assert config.main_params_dtype is torch.float32
     assert config.exp_avg_dtype is torch.float32
     assert config.exp_avg_sq_dtype is torch.float32

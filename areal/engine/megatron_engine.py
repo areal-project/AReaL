@@ -70,6 +70,10 @@ from areal.engine.core.model import (
     validate_model_packed_seq_dependencies,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
+from areal.engine.megatron_utils.activation_storage import (
+    install_activation_storage_tracking,
+    track_activation_storage,
+)
 from areal.engine.megatron_utils.bailing_v3 import (
     BailingV3MlaWeightPairs,
     is_bailing_v3,
@@ -78,6 +82,10 @@ from areal.engine.megatron_utils.bailing_v3 import (
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
+from areal.engine.megatron_utils.gpu_staged_optimizer import (
+    GPUStagedAdamWConfig,
+    get_megatron_optimizer_with_gpu_staged_adamw,
+)
 from areal.engine.megatron_utils.megatron import (
     all_gather_param,
     convert_to_hf,
@@ -355,6 +363,7 @@ class MegatronEngine(TrainEngine):
     )
 
     def __init__(self, config: TrainEngineConfig):
+        install_activation_storage_tracking()
         self.config = config
         self.hf_config: PretrainedConfig
         self.tf_config: TransformerConfig
@@ -1133,7 +1142,9 @@ class MegatronEngine(TrainEngine):
             self._weight_residency.release_grad_memory()
             gc.collect()
             torch.cuda.empty_cache()
-        with self._offload_aware_context():
+        with self._checkpoint_aware_context(
+            with_model=True, with_optimizer=meta.with_optim
+        ):
             if meta.weight_format == "hf":
                 if meta.with_optim:
                     raise ValueError(
@@ -1196,7 +1207,9 @@ class MegatronEngine(TrainEngine):
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
 
     def load(self, meta: SaveLoadMeta):
-        with self._offload_aware_context():
+        with self._checkpoint_aware_context(
+            with_model=True, with_optimizer=meta.with_optim
+        ):
             if meta.weight_format == "hf":
                 if meta.with_optim:
                     raise ValueError(
@@ -1215,6 +1228,32 @@ class MegatronEngine(TrainEngine):
                 )
             else:
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
+
+    @contextmanager
+    def _checkpoint_aware_context(self, *, with_model: bool, with_optimizer: bool):
+        """Lease AWEX-released resources without onloading managed state."""
+        if self._weight_residency is None:
+            with self._offload_aware_context():
+                yield
+            return
+
+        lease = self._weight_residency.checkpoint_residency(
+            with_model=with_model, with_optimizer=with_optimizer
+        )
+        with lease:
+            if with_model:
+                self._assert_checkpoint_model_resident()
+            yield
+
+    def _assert_checkpoint_model_resident(self) -> None:
+        """Reject checkpoint access to AWEX-resized model storage."""
+        for chunk_index, chunk in enumerate(self.model):
+            for name, param in chunk.named_parameters():
+                if param.numel() and param.untyped_storage().nbytes() == 0:
+                    raise RuntimeError(
+                        "AWEX model weights are not resident for checkpoint: "
+                        f"chunk={chunk_index}, parameter={name!r}"
+                    )
 
     @contextmanager
     def _offload_aware_context(self):
@@ -1600,11 +1639,35 @@ class MegatronEngine(TrainEngine):
                 per_token_loss=per_token_loss,
             )
 
-        self.forward_backward_batch(
-            mb_list,
-            process_output,
-            forward_only=False,
+        model_chunks = (
+            self.model if isinstance(self.model, (list, tuple)) else [self.model]
         )
+        protected_tensors = [
+            tensor
+            for model_chunk in model_chunks
+            # Megatron DDP stores gradient-buffer objects in an instance attribute
+            # named ``buffers``, shadowing ``torch.nn.Module.buffers``. Call the
+            # base implementation explicitly so registered model buffers are
+            # protected without touching Megatron's gradient-buffer list.
+            for tensor in (
+                *model_chunk.parameters(),
+                *torch.nn.Module.buffers(model_chunk),
+            )
+        ]
+        with track_activation_storage(protected_tensors) as activation_tracker:
+            self.forward_backward_batch(
+                mb_list,
+                process_output,
+                forward_only=False,
+            )
+
+        released_storages, released_bytes = activation_tracker.release()
+        if released_storages:
+            self.logger.debug(
+                "Released %d retained Megatron/TE activation storages (%.3f GiB)",
+                released_storages,
+                released_bytes / 1024**3,
+            )
 
         # Step 4: Optimizer step
         stats = self.optimizer_step()
@@ -1937,6 +2000,11 @@ class MegatronEngine(TrainEngine):
     def _normalize_adam_bf16_config(self) -> None:
         if self.optimizer_config is None or self.optimizer_config.type != "adam_bf16":
             return
+        if self.mcore_config.cpu_staged_offload.enabled:
+            raise ValueError(
+                "optimizer.type='adam_bf16' is not supported with "
+                "megatron.cpu_staged_offload.enabled=true; use optimizer.type='adam'"
+            )
 
         self.logger.info(
             "Detected 'adam_bf16' optimizer with Megatron Engine. "
@@ -2088,6 +2156,19 @@ class MegatronEngine(TrainEngine):
             return
         assert self.model is not None and len(self.model) > 0
 
+        staged_settings = self.mcore_config.cpu_staged_offload
+        staged = staged_settings.enabled
+        optimizer_type = self.optimizer_config.type
+        if staged and optimizer_type != "adam":
+            raise ValueError(
+                "CPU-staged offload supports optimizer.type='adam', "
+                f"got {optimizer_type!r}"
+            )
+        if staged and not self.mcore_config.ddp.use_distributed_optimizer:
+            raise ValueError(
+                "CPU-staged AdamW requires megatron.ddp.use_distributed_optimizer=true"
+            )
+
         use_distributed_optimizer = (
             False
             if self.config.use_lora
@@ -2097,7 +2178,7 @@ class MegatronEngine(TrainEngine):
         assert self.optimizer_config.type in [
             "adam",
             "sgd",
-        ], "Only AdamW/sgd optimizer is supported in this engine."
+        ], "Only AdamW/SGD optimizer is supported in this engine."
         if self.optimizer_config.type == "sgd":
             self.logger.warning(
                 "Using the 'sgd' optimizer with Megatron may be less stable. Consider using the 'adam' (AdamW) optimizer for improved stability."
@@ -2122,6 +2203,14 @@ class MegatronEngine(TrainEngine):
                 f"total_train_steps={total_train_steps}"
             )
 
+        staged_adamw_config = (
+            GPUStagedAdamWConfig(
+                buffer_count=staged_settings.buffer_count,
+                bucket_size_mb=staged_settings.bucket_size_mb,
+            )
+            if staged and optimizer_type == "adam"
+            else None
+        )
         # Make megatron optimizer config
         mcore_opt_config = MCoreOptimizerConfig(
             optimizer=self.optimizer_config.type,
@@ -2141,15 +2230,33 @@ class MegatronEngine(TrainEngine):
                 self.mcore_config.overlap_param_gather_with_optimizer_step
             ),
             use_precision_aware_optimizer=(
-                self.mcore_config.use_precision_aware_optimizer
+                staged_adamw_config is not None
+                or self.mcore_config.use_precision_aware_optimizer
             ),
             main_grads_dtype=getattr(torch, self.mcore_config.main_grads_dtype),
-            main_params_dtype=getattr(torch, self.mcore_config.main_params_dtype),
-            exp_avg_dtype=getattr(torch, self.mcore_config.exp_avg_dtype),
-            exp_avg_sq_dtype=getattr(torch, self.mcore_config.exp_avg_sq_dtype),
+            main_params_dtype=(
+                torch.float32
+                if staged_adamw_config is not None
+                else getattr(torch, self.mcore_config.main_params_dtype)
+            ),
+            exp_avg_dtype=(
+                torch.float32
+                if staged_adamw_config is not None
+                else getattr(torch, self.mcore_config.exp_avg_dtype)
+            ),
+            exp_avg_sq_dtype=(
+                torch.float32
+                if staged_adamw_config is not None
+                else getattr(torch, self.mcore_config.exp_avg_sq_dtype)
+            ),
         )
 
-        self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
+        if staged_adamw_config is None:
+            self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
+        else:
+            self.optimizer = get_megatron_optimizer_with_gpu_staged_adamw(
+                mcore_opt_config, self.model, staged_adamw_config
+            )
 
         lr_scheduler = OptimizerParamScheduler(
             self.optimizer,
@@ -2178,7 +2285,6 @@ class MegatronEngine(TrainEngine):
         )
         self.lr_scheduler = lr_scheduler
 
-        # MegatronCheckpointManager now only support distributed optimizer which lora does not support
         if not self.config.use_lora:
             self.checkpointer = MegatronCheckpointManager(
                 model=self.model,
@@ -3067,10 +3173,21 @@ class MegatronEngine(TrainEngine):
             n_mbs=max(min_n_mbs, self.config.mb_spec.n_mbs),
             n_mbs_divisor=pp_size,
         )
+        # Account for the per-sequence padding required by context/sequence
+        # parallelism while allocating micro-batches. Otherwise a group that is
+        # within max_tokens_per_mb before alignment can exceed it in the forward.
+        align_to_multiple_of = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+        align_to_multiple_of = (
+            math.lcm(align_to_multiple_of, DEFAULT_VECTORIZED_ALIGNMENT_BYTES)
+            if self.enable_fp8
+            else align_to_multiple_of
+        )
         mb_list = split_padded_tensor_dict_into_mb_list(
             input_,
             mb_spec,
             group=mpu.get_data_parallel_group(),
+            seq_align_to=align_to_multiple_of,
+            padded=self.sequence_packing_mode == SequencePackingMode.PADDED,
             allow_transport_padding=allow_transport_padding,
         )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
@@ -3079,12 +3196,6 @@ class MegatronEngine(TrainEngine):
         # The default BSHD/model-owned THD path cannot, because reconstruction
         # would turn that segment into a synthetic batch row. Every layout
         # still aligns each real sequence for Megatron parallelism.
-        align_to_multiple_of = tp_size * cp_size * 2 if cp_size > 1 else tp_size
-        align_to_multiple_of = (
-            math.lcm(align_to_multiple_of, DEFAULT_VECTORIZED_ALIGNMENT_BYTES)
-            if self.enable_fp8
-            else align_to_multiple_of
-        )
         assert self.sequence_packing_mode is not None
         mb_list = prepare_microbatches_for_sequence_layout(
             mb_list,

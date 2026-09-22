@@ -160,11 +160,10 @@ def test_simple_forward(model_env, tmp_path_factory):
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 @pytest.mark.parametrize(
-    "model_path",
-    [DENSE_MODEL_PATHS["qwen3_vl"], DENSE_MODEL_PATHS["qwen3_5"]],
-    ids=["qwen3_vl", "qwen3_5"],
+    "model_key",
+    ["qwen3_vl", "qwen3_5"],
 )
-def test_model_thd_context_parallel_forward(model_path, tmp_path_factory):
+def test_model_thd_context_parallel_forward(model_key, tmp_path_factory):
     """Model-owned VLM THD delegates its language sequence partition to CP."""
     if torch.cuda.device_count() < 2:
         pytest.skip("VLM context parallel forward requires at least 2 GPUs")
@@ -176,7 +175,7 @@ def test_model_thd_context_parallel_forward(model_path, tmp_path_factory):
         env_overrides={
             "AREAL_TEST_BRIDGE_TYPE": "megatron-bridge",
             "AREAL_TEST_EXPECT_MODEL_THD": "1",
-            "VLM_MODEL_PATH": model_path,
+            "VLM_MODEL_PATH": DENSE_MODEL_PATHS[model_key],
         },
     )
 

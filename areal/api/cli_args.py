@@ -908,6 +908,36 @@ class FP8EngineConfig:
 
 
 @dataclass
+class CPUStagedOffloadConfig:
+    """Bounded GPU staging for CPU-resident Megatron optimizer state."""
+
+    enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Keep optimizer state in pinned CPU memory and stream bounded "
+                "update units through GPU staging buffers. The optimizer algorithm "
+                "is selected independently by optimizer.type. Megatron only."
+            )
+        },
+    )
+    buffer_count: int = field(
+        default=2,
+        metadata={"help": "Number of reusable GPU optimizer staging buffers."},
+    )
+    bucket_size_mb: float = field(
+        default=128.0,
+        metadata={"help": "Maximum size in MiB of one GPU optimizer staging unit."},
+    )
+
+    def __post_init__(self) -> None:
+        if self.buffer_count < 1:
+            raise ValueError("cpu_staged_offload.buffer_count must be at least 1")
+        if self.bucket_size_mb <= 0:
+            raise ValueError("cpu_staged_offload.bucket_size_mb must be positive")
+
+
+@dataclass
 class MegatronEngineConfig:
     """Configuration for Megatron-LM training framework.
     Refer to Megatron-LM documentation for implementation details.
@@ -946,6 +976,15 @@ class MegatronEngineConfig:
     main_params_dtype: str = "float32"
     exp_avg_dtype: str = "float32"
     exp_avg_sq_dtype: str = "float32"
+    cpu_staged_offload: CPUStagedOffloadConfig = field(
+        default_factory=CPUStagedOffloadConfig,
+        metadata={
+            "help": (
+                "Keep the selected optimizer's state CPU-resident and use bounded "
+                "GPU staging buffers for optimizer steps."
+            )
+        },
+    )
 
     # Checkpointing Configuration
     async_save: bool = field(
@@ -1148,6 +1187,11 @@ class MegatronEngineConfig:
     )
 
     def __post_init__(self) -> None:
+        if self.cpu_staged_offload.enabled and self.async_save:
+            raise ValueError(
+                "megatron.async_save is not supported with "
+                "megatron.cpu_staged_offload.enabled=true"
+            )
         if self.enable_mtp_training and not self.enable_mtp:
             raise ValueError("enable_mtp_training requires enable_mtp=True")
         if self.mtp_only:

@@ -740,8 +740,11 @@ class TestRemotize:
     """Test remotize method with various input types."""
 
     @pytest.mark.parametrize("preserve_tensor_aliases", [False, True])
-    def test_remotize_list_of_dicts(self, rpc_server, preserve_tensor_aliases):
+    def test_remotize_list_of_dicts(self, monkeypatch, preserve_tensor_aliases):
         """Test remotizing list of dicts with different attention masks."""
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        monkeypatch.setattr("areal.infra.rpc.rtensor._fetch_buffer", {})
         # Create two trajectory dicts with different seqlens
         traj1 = {
             "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]]),
@@ -758,7 +761,7 @@ class TestRemotize:
 
         result = RTensor.remotize(
             [traj1, traj2],
-            node_addr=rpc_server,
+            node_addr="test-node",
             preserve_tensor_aliases=preserve_tensor_aliases,
         )
 
@@ -774,30 +777,10 @@ class TestRemotize:
         assert result[0]["logits"].shape[0] == 2
         assert result[1]["logits"].shape[0] == 3
 
-        # Remotize stores locally; the separate RPC process needs its own copy.
-
-        for remote in result:
-            for tensor in remote.values():
-                shard_id = tensor.shard.shard_id
-                serialized = serialize_value(fetch(shard_id))
-                response = requests.put(
-                    f"http://{rpc_server}/data/{shard_id}",
-                    data=orjson.dumps(serialized),
-                )
-                assert response.status_code == 200
-
         for original, remote, seqlen in zip(
             [traj1, traj2], result, [3, 4], strict=True
         ):
             for key in original:
-                # remotize stores locally; to_local fetches from the RPC process.
-                shard_id = remote[key].shard.shard_id
-                response = requests.put(
-                    f"http://{rpc_server}/data/{shard_id}",
-                    data=orjson.dumps(serialize_value(fetch(shard_id))),
-                    timeout=5,
-                )
-                assert response.status_code == 200
                 torch.testing.assert_close(
                     remote[key].to_local(), original[key][:, :seqlen], rtol=0, atol=0
                 )
