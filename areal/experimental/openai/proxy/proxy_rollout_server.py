@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
@@ -116,7 +117,16 @@ def _warn_once(msg: str) -> None:
 # Engine and client (created via /create_engine and /call with method "initialize")
 _engine: InferenceEngine | None = None
 _openai_client: ArealOpenAI | None = None
-_prm_runner = None
+_prm_runner: PRMRunner | None = None
+# Initialization and shutdown share the server event loop. Keep successful engine
+# initialization across RPC retries, including retries after proxy setup fails.
+_engine_lifecycle_lock = asyncio.Lock()
+_engine_init_request: tuple[Any, Any] | None = None
+_engine_init_result: Any = None
+_proxy_closing = False
+_prm_required = False
+_active_prm_exports = 0
+_prm_idle = asyncio.Event()
 
 # Session management
 _session_cache: dict[str, SessionData] = {}
@@ -316,14 +326,24 @@ def _remove_api_keys_for_session(session_id: str) -> None:
 # FastAPI Application
 # =============================================================================
 
-app = FastAPI()
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    try:
+        yield
+    finally:
+        # Run on the serving loop, not after uvicorn.run() has closed it.
+        await _shutdown_proxy()
+
+
+app = FastAPI(lifespan=_lifespan)
 
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "initialized": _engine is not None,
+        "initialized": _openai_client is not None and not _proxy_closing,
         "role": _worker_role,
         "worker_index": _worker_index,
     }
@@ -370,29 +390,18 @@ async def alloc_ports(raw_request: Request):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-def _setup_openai_client():
+async def _setup_openai_client() -> None:
     global _openai_client, _session_timeout_seconds, _admin_api_key
     global _message_preprocessors, _prefix_matcher, _deterministic_sampling
-    global _prm_runner
+    global _prm_runner, _prm_required
     config = _engine.config
-    _deterministic_sampling = bool(getattr(config, "deterministic_sampling", False))
+    agent_cfg = config.agent
+    # A failed or still-in-progress setup must not export configured PRM data
+    # without scoring just because the runner has not been published yet.
+    _prm_required = bool(agent_cfg.prm.enabled and agent_cfg.prm.scorers)
     processor, tokenizer = load_hf_processor_and_tokenizer(config.tokenizer_path)
     if processor is not None and not hasattr(processor, "image_processor"):
         processor = None
-    agent_cfg = config.agent
-    _openai_client = ArealOpenAI(
-        engine=_engine,
-        tokenizer=tokenizer,
-        processor=processor,
-        tool_call_parser=agent_cfg.tool_call_parser,
-        reasoning_parser=agent_cfg.reasoning_parser,
-        engine_max_tokens=agent_cfg.engine_max_tokens,
-        chat_template_type=agent_cfg.chat_template_type,
-        lora_name=config.lora_name,
-        require_multimodal_processor=True,
-    )
-    # Set session timeout from config
-    _session_timeout_seconds = agent_cfg.session_timeout_seconds
     # Validate admin API key BEFORE assigning it to the global, so a
     # failed validation cannot leave the default key live on the server.
     # The default admin key is publicly known; refuse to use it when the
@@ -405,32 +414,60 @@ def _setup_openai_client():
         default_key=DEFAULT_ADMIN_API_KEY,
         config_field="AgentConfig.admin_api_key",
     )
-    # Only commit the key to the global after validation has passed.
-    with _lock:
-        _admin_api_key = agent_cfg.admin_api_key
-
-    _message_preprocessors = []
+    message_preprocessors = []
     for path in agent_cfg.message_preprocessors:
         cls = import_from_string(path)
-        _message_preprocessors.append(cls())
+        message_preprocessors.append(cls())
         logger.info("Loaded message preprocessor: %s", path)
 
     if agent_cfg.prefix_matcher:
-        _prefix_matcher = import_from_string(agent_cfg.prefix_matcher)
+        prefix_matcher = import_from_string(agent_cfg.prefix_matcher)
         logger.info("Loaded prefix matcher: %s", agent_cfg.prefix_matcher)
     else:
-        _prefix_matcher = None
+        prefix_matcher = None
 
-    if agent_cfg.prm.enabled and agent_cfg.prm.scorers:
+    runner = None
+    if _prm_required:
         from areal.reward.prm import PRMRunner
 
-        _prm_runner = PRMRunner(agent_cfg.prm)
+        runner = await PRMRunner.create(agent_cfg.prm)
+
+    try:
+        client = ArealOpenAI(
+            engine=_engine,
+            tokenizer=tokenizer,
+            processor=processor,
+            tool_call_parser=agent_cfg.tool_call_parser,
+            reasoning_parser=agent_cfg.reasoning_parser,
+            engine_max_tokens=agent_cfg.engine_max_tokens,
+            chat_template_type=agent_cfg.chat_template_type,
+            lora_name=config.lora_name,
+            require_multimodal_processor=True,
+        )
+    except BaseException as startup_error:
+        if runner is not None:
+            try:
+                await runner.aclose()
+            except Exception as cleanup_error:
+                startup_error.add_note(
+                    f"PRM cleanup after client setup failed: {cleanup_error}"
+                )
+        raise
+
+    # Publish the configured proxy only after all setup, including PRM, succeeds.
+    _prm_runner = runner
+    _message_preprocessors = message_preprocessors
+    _prefix_matcher = prefix_matcher
+    _session_timeout_seconds = agent_cfg.session_timeout_seconds
+    _deterministic_sampling = bool(getattr(config, "deterministic_sampling", False))
+    with _lock:
+        _admin_api_key = agent_cfg.admin_api_key
+    _openai_client = client
+    if runner is not None:
         logger.info(
             "Loaded PRM runner with scorers: %s",
-            [scorer.name for scorer in _prm_runner.scorers],
+            [scorer.name for scorer in runner.scorers],
         )
-    else:
-        _prm_runner = None
 
 
 @app.post("/configure")
@@ -453,32 +490,51 @@ async def set_env(raw_request: Request):
 @app.post("/create_engine")
 async def create_engine(raw_request: Request):
     global _engine
-    if _engine is not None:
-        raise HTTPException(status_code=400, detail="Engine already exists")
-
     data = await raw_request.json()
-    engine_class = import_from_string(data.get("engine"))
-    init_kwargs = deserialize_value(data.get("init_kwargs", {}))
-    _engine = engine_class(**init_kwargs)
+    async with _engine_lifecycle_lock:
+        if _proxy_closing:
+            raise HTTPException(status_code=400, detail="Proxy is shutting down")
+        if _engine is not None:
+            raise HTTPException(status_code=400, detail="Engine already exists")
+        engine_class = import_from_string(data.get("engine"))
+        init_kwargs = deserialize_value(data.get("init_kwargs", {}))
+        _engine = engine_class(**init_kwargs)
     return {"status": "success"}
 
 
 @app.post("/call")
 async def call_engine_method(raw_request: Request):
-    global _engine, _openai_client
-    if _engine is None:
-        raise HTTPException(status_code=400, detail="Engine not initialized")
+    global _engine_init_request, _engine_init_result
 
     data = await raw_request.json()
     method_name = data.get("method")
     args = deserialize_value(data.get("args", []))
     kwargs = deserialize_value(data.get("kwargs", {}))
 
-    method = getattr(_engine, method_name)
-    result = method(*args, **kwargs)
-
-    if method_name == "initialize":
-        _setup_openai_client()
+    if method_name == "destroy":
+        result = await _shutdown_proxy(*args, **kwargs)
+    elif method_name == "initialize":
+        async with _engine_lifecycle_lock:
+            if _proxy_closing:
+                raise HTTPException(status_code=400, detail="Proxy is shutting down")
+            if _engine is None:
+                raise HTTPException(status_code=400, detail="Engine not initialized")
+            init_request = (data.get("args", []), data.get("kwargs", {}))
+            if _engine_init_request is None:
+                _engine_init_result = _engine.initialize(*args, **kwargs)
+                _engine_init_request = init_request
+            elif _engine_init_request != init_request:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Engine already initialized with different arguments",
+                )
+            if _openai_client is None:
+                await _setup_openai_client()
+            result = _engine_init_result
+    else:
+        if _engine is None:
+            raise HTTPException(status_code=400, detail="Engine not initialized")
+        result = getattr(_engine, method_name)(*args, **kwargs)
 
     return {"status": "success", "result": serialize_value(result)}
 
@@ -1402,6 +1458,7 @@ async def export_trajectories(
     and authenticate with the admin key.  This avoids routing ambiguity
     when an API key has been reused across sessions.
     """
+    global _active_prm_exports
     session_id = request.session_id
 
     with _lock:
@@ -1421,7 +1478,14 @@ async def export_trajectories(
         drop_retry_orphans=request.drop_retry_orphans,
     )
 
-    if _prm_runner is not None and interactions:
+    if _prm_required and interactions:
+        # Check after waiting for the session: shutdown may have begun while
+        # this request was waiting. Admission and counting have no intervening
+        # await, so shutdown on the same event loop cannot race between them.
+        if _proxy_closing or _prm_runner is None:
+            raise HTTPException(status_code=503, detail="PRM runner is not available")
+        _active_prm_exports += 1
+        _prm_idle.clear()
         try:
             interactions = await _score_prm_branches(
                 interactions,
@@ -1434,6 +1498,10 @@ async def export_trajectories(
                 "PRM runner failed for session %s; rejecting trajectory", session_id
             )
             interactions = {}
+        finally:
+            _active_prm_exports -= 1
+            if _active_prm_exports == 0:
+                _prm_idle.set()
 
     # Remove session from cache and clean up API key mapping
     with _lock:
@@ -1462,6 +1530,34 @@ async def export_trajectories(
 # =============================================================================
 # Cleanup
 # =============================================================================
+
+
+async def _shutdown_proxy(*args: Any, **kwargs: Any) -> Any:
+    """Drain PRM and release its resources before destroying the engine.
+
+    Both the controller's destroy RPC and ASGI shutdown use this path. Scoring
+    remains concurrent during normal service; shutdown waits only for admitted
+    scoring, not unfinished sessions. Cancellation retains the runner's cleanup
+    semantics and does not retry interrupted scorer hooks.
+    """
+    global _proxy_closing, _engine, _openai_client
+    async with _engine_lifecycle_lock:
+        _proxy_closing = True
+        if _active_prm_exports:
+            await _prm_idle.wait()
+        result = None
+        try:
+            if _prm_runner is not None:
+                await _prm_runner.aclose()
+        finally:
+            # Keep the runner/required flag so a late export cannot silently
+            # bypass configured scoring after shutdown.
+            _openai_client = None
+            if _engine is not None:
+                result = _engine.destroy(*args, **kwargs)
+                # Preserve failed destruction for a later RPC or shutdown retry.
+                _engine = None
+        return result
 
 
 def cleanup_engine():

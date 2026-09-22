@@ -446,6 +446,59 @@ async def test_cancelled_scoring_cleans_owned_sessions(proxy_factory):
 
 
 @pytest.mark.asyncio
+async def test_self_cancelled_turn_drains_siblings_before_releasing_session(
+    proxy_factory,
+):
+    """The shared runner keeps a multi-turn export alive until all scoring exits."""
+    sibling_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    sessions_during_cleanup = []
+    children = []
+
+    class Scorer(BaseScorer):
+        name = "self_cancelled"
+
+        async def evaluate(self, interaction, ctx):
+            children.append(asyncio.current_task())
+            if interaction.interaction_id == "root":
+                await sibling_started.wait()
+                raise asyncio.CancelledError
+            sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_started.set()
+                await release_cleanup.wait()
+                sessions_during_cleanup.append(store.session_count)
+
+    client, store = await proxy_factory([Scorer()])
+    async with client:
+        root = _interaction("root")
+        leaf = _interaction("leaf", parent=root)
+        sid = _add_session(store, "cancel-child", [root, leaf])
+        pending = asyncio.create_task(_export(client, [sid]))
+        try:
+            await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+            assert not pending.done()
+            assert store.session_count == 1
+            release_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=2)
+            assert all(child.done() for child in children)
+            assert sessions_during_cleanup == [1]
+            assert store.session_count == 0
+            assert root.token_rewards is leaf.token_rewards is None
+            assert not stats_tracker.export_all(reduce_group=None)
+        finally:
+            release_cleanup.set()
+            for task in [pending, *children]:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(pending, *children, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_concurrent_sessions_keep_context_and_statistics_isolated(proxy_factory):
     """One request's JSON report cannot drain or mix another request's observations."""
 
