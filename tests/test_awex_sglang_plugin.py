@@ -109,6 +109,7 @@ def test_awex_config_preserves_nested_router_and_vision_metadata(monkeypatch):
     assert config.architectures == ["SimpleNamespace"]
 
 
+@pytest.mark.sglang
 def test_memory_transitions_are_idempotent():
     class Scheduler:
         def __init__(self):
