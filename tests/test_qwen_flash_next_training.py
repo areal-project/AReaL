@@ -471,16 +471,15 @@ def test_model_owned_thd_keeps_full_ids_and_video_payload(packed_forward):
     assert inputs["pixel_values_videos"] is pixels
 
 
-def test_wrapper_mtp_preserves_thd_labels_without_padding_mask(packed_forward):
+def test_wrapper_mtp_preserves_thd_supervision_without_padding_mask(packed_forward):
     model = MagicMock(return_value=torch.zeros(1, 8, 1))
-    labels = torch.arange(8)
     mask = torch.tensor([1, 1, 1, 0, 1, 1, 1, 0], dtype=torch.float32)
     packed_forward.packed_context_parallel_forward(
         model,
         {
             "input_ids": torch.arange(8),
             "cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32),
-            "mtp_kwargs": {"mtp_labels": labels, "mtp_loss_mask": mask},
+            "mtp_loss_mask": mask,
         },
         gather_cp_output=False,
         is_vision_model=True,
@@ -488,8 +487,7 @@ def test_wrapper_mtp_preserves_thd_labels_without_padding_mask(packed_forward):
     )
     kwargs = model.call_args.kwargs
     assert kwargs["attention_mask"] is None
-    torch.testing.assert_close(kwargs["mtp_kwargs"]["mtp_labels"].reshape(-1), labels)
-    torch.testing.assert_close(kwargs["mtp_kwargs"]["mtp_loss_mask"].reshape(-1), mask)
+    torch.testing.assert_close(kwargs["loss_mask"].reshape(-1), mask)
 
 
 class _SourceConfig(PretrainedConfig):
@@ -814,3 +812,13 @@ def test_bridge_live_sync_non_sender_does_not_stage_exports(monkeypatch):
     stage.assert_not_called()
     engine._update_bucket_weights_from_distributed.assert_not_called()
     barrier.assert_called_once_with(group=engine.cpu_group)
+
+
+def test_mcore_bridge_rejects_unsupported_mtp_before_model_construction():
+    from areal.engine.megatron_engine import MegatronEngine
+
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.bridge_cls = "mcore-bridge"
+    engine.mcore_config = SimpleNamespace(enable_mtp_training=True)
+    with pytest.raises(NotImplementedError, match="MCore 0.19 MTP supervision"):
+        engine._build_hf_mcore_bridge()

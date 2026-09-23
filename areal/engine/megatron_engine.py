@@ -902,10 +902,6 @@ class MegatronEngine(TrainEngine):
         elif self.bridge_cls == "megatron-bridge":
             from megatron.bridge import AutoBridge as MegatronBridgeAutoBridge
 
-            from areal.engine.megatron_utils import (
-                megatron_bridge_patches,  # noqa: F401
-            )
-
             if self.enable_tree_training:
                 raise NotImplementedError(
                     "Tree training is not supported with bridge_type='megatron-bridge'."
@@ -920,6 +916,11 @@ class MegatronEngine(TrainEngine):
             )
 
         elif self.bridge_cls == "mcore-bridge":
+            if self.mcore_config.enable_mtp_training:
+                raise NotImplementedError(
+                    "The pinned mcore-bridge does not support MCore 0.19 MTP "
+                    "supervision; set enable_mtp_training=False."
+                )
             if self.enable_tree_training:
                 raise NotImplementedError(
                     "Tree training is not supported with bridge_type='mcore-bridge'."
@@ -1457,10 +1458,10 @@ class MegatronEngine(TrainEngine):
                     "only for text-only models such as Qwen3.5"
                 )
 
-            # MTP training: feed the MTP head independent label and mask
-            # channels so the main forward keeps labels=None and returns
-            # logits. packed_context_parallel_forward converts both tensors to
-            # the model's actual THD or BSHD layout before forwarding them.
+            # MTP training: pass the token loss mask through the model's actual
+            # THD or BSHD layout. MCore 0.19 derives MTP labels directly from
+            # input_ids when the main forward keeps labels=None, so AReaL only
+            # needs to provide the aligned supervision mask.
             # This is intentionally enabled by the training config rather than
             # gated by the model family: Qwen3.5 is registered as vision-capable
             # but its text-only and multimodal batches use the same padded MTP
@@ -1477,17 +1478,14 @@ class MegatronEngine(TrainEngine):
                         "multimodal, padding, and sequence-boundary positions are "
                         "not used as MTP supervision."
                     )
-                mtp_labels = mb_input.padded_mb["input_ids"]
-                if mtp_loss_mask.shape != mtp_labels.shape:
+                input_ids = mb_input.padded_mb["input_ids"]
+                if mtp_loss_mask.shape != input_ids.shape:
                     raise ValueError(
                         "MTP training requires loss_mask to match input_ids before "
                         f"layout conversion, got {mtp_loss_mask.shape} and "
-                        f"{mtp_labels.shape}."
+                        f"{input_ids.shape}."
                     )
-                mb_input.padded_mb["mtp_kwargs"] = {
-                    "mtp_labels": mtp_labels,
-                    "mtp_loss_mask": mtp_loss_mask,
-                }
+                mb_input.padded_mb["mtp_loss_mask"] = mtp_loss_mask
 
             output = packed_context_parallel_forward(
                 model,
@@ -1581,8 +1579,8 @@ class MegatronEngine(TrainEngine):
                         ),
                     )
 
-            # Release MTP label channel after forward pass
-            mb_input.padded_mb.pop("mtp_kwargs", None)
+            # Release the MTP-only model input after the forward pass.
+            mb_input.padded_mb.pop("mtp_loss_mask", None)
 
             # Release tree attention metadata after forward pass
             for key in tree_attn_keys:
@@ -1730,7 +1728,7 @@ class MegatronEngine(TrainEngine):
 
         Megatron-Core's ``process_mtp_loss`` accumulates the (detached) per-layer
         MTP loss across micro-batches into ``MTPLossLoggingHelper.tracker`` and
-        records the reduce/avg groups. The tracker only holds ``values`` on the
+        records the reduce/avg groups. The tracker only holds ``loss_values`` on the
         last pipeline stage (where the MTP loss is computed); other stages skip
         the reduction. The reduce step's collectives stay matched because the
         avg_group (data-parallel + context-parallel) is contained within a single
@@ -1744,13 +1742,14 @@ class MegatronEngine(TrainEngine):
         )
 
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
+        if "loss_values" not in tracker:
             return None
 
-        MTPLossLoggingHelper.reduce_loss_in_tracker()
-        # `values` is summed over micro-batches; normalize to a per-microbatch loss.
-        mtp_loss = tracker["values"].sum().item() / max(num_microbatches, 1)
-        MTPLossLoggingHelper.clean_loss_in_tracker()
+        MTPLossLoggingHelper.reduce_metrics_in_tracker()
+        # `loss_values` is summed over micro-batches; normalize to a
+        # per-microbatch loss.
+        mtp_loss = tracker["loss_values"].sum().item() / max(num_microbatches, 1)
+        MTPLossLoggingHelper.clean_metrics_in_tracker()
         return mtp_loss
 
     @torch.no_grad()

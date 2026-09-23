@@ -202,8 +202,8 @@ rollout:
 1. 设置 `reward_normalization=True` 时，group 通过最小大小检查后，只对可用 rollout 的 interaction rewards
    进行归一化。`drop_incomplete_group=True` 仍要求所有原始 slot 成功；若保留的 rollout 缺少某一行的 reward，整个
    group 会被丢弃。
-1. `min_usable_group_size` 默认为 `1`。仅当 v1 RL trainer 的 reward 或 advantage normalization
-   使用 group statistics（该统计量至少需要两个观测值）时，才会将其设为 `2`；singleton 目标 group
+1. `min_usable_group_size` 默认为 `1`。当 RL trainer 的 reward 或 advantage normalization 使用
+   group statistics（该统计量至少需要两个观测值）时，才会将其设为 `2`；singleton 目标 group
    （`n_samples: 1`）本身即是完整的，因此下限保持为 `1`。设置 `actor.min_usable_group_size` 可覆盖该推导值；使用 group
    statistics 时，低于 `2` 的显式值会被拒绝。低于下限的 group 返回 `None`，异步 collector 随后会接收另一个已就绪的 prompt
    group。采用 batch-relative PPO 或 REINFORCE 时则会保留可用的 singleton。
