@@ -27,6 +27,7 @@ def test_data_proxy_main_formats_ipv6_serving_addr():
         chat_template_type="hf",
         message_preprocessor=[],
         prefix_matcher=None,
+        prm_config="{}",
     )
 
     with (
