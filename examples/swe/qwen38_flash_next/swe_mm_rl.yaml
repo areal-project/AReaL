@@ -87,7 +87,6 @@ rollout:
       no_proxy: '*'
       TOKENIZERS_PARALLELISM: 'false'
       PLE_CPU_OFFLOAD: '0'
-      AWEX_ACTOR_ALLOC_CONF: expandable_segments:False
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
       NCCL_DEBUG: WARN
       CUDA_DEVICE_MAX_CONNECTIONS: '1'
@@ -251,7 +250,6 @@ actor:
       no_proxy: '*'
       TOKENIZERS_PARALLELISM: 'false'
       PLE_CPU_OFFLOAD: '0'
-      AWEX_ACTOR_ALLOC_CONF: expandable_segments:True
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,garbage_collection_threshold:0.7
       NCCL_DEBUG: WARN
       NCCL_ALGO: Ring

@@ -308,8 +308,6 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Validate Docker installation
-        env:
-          PYTHONPATH: ${{ github.workspace }}
         run: |
           export PATH="/opt/.venv/bin:$PATH"
           python areal/tools/validate_docker_installation.py
