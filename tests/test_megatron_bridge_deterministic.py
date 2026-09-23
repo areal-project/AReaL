@@ -59,6 +59,7 @@ def _make_mcore_config(*, deterministic: bool) -> SimpleNamespace:
         mtp_only=False,
         moe_token_dispatcher_type="alltoall",
         use_deterministic_algorithms=deterministic,
+        cross_entropy_loss_fusion=True,
     )
 
 
