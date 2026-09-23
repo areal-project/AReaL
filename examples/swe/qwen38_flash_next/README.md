@@ -104,3 +104,7 @@ zero-gradient replay do not establish full-model numerical parity or RL learning
 
 The experiment runtime pins bridge `557aaf93b16d083fdec4f82a8251d47d47c76ccb` from
 `dingzhiqiang/mcore-bridge` for modality-aware visual embedding scatter.
+
+RL output defaults to `/storage/openpsi/experiments/qwen38-flash-next/<profile>`. Set
+`QWEN_OUTPUT_ROOT` for a specific experiment directory, or `QWEN_EXPERIMENTS_ROOT` to
+change the shared experiments root.

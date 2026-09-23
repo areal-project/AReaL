@@ -12,6 +12,7 @@ case "$profile" in swe|swe-eval) ;; *) echo 'Expected swe or swe-eval' >&2; exit
 if [[ -n ${QWEN_LAUNCH_ENV:-} ]]; then
   set -a; source "$QWEN_LAUNCH_ENV"; set +a
 fi
+export QWEN_OUTPUT_ROOT=${QWEN_OUTPUT_ROOT:-${QWEN_EXPERIMENTS_ROOT:-/storage/openpsi/experiments}/qwen38-flash-next/$profile}
 for name in QWEN_OUTPUT_ROOT QWEN_MODEL QWEN_ACTOR_IMAGE QWEN_ROLLOUT_IMAGE \
   QWEN_RESERVATION QWEN_NODELIST QWEN_PARTITION QWEN_CONTROLLER_NODE \
   QWEN_MOUNTS QWEN_CONTROLLER_MOUNTS MCORE_BRIDGE_ROOT MEGATRON_ROOT; do
