@@ -730,6 +730,7 @@ DEFAULT_TRACKER = DistributedStatsTracker()
 stat = DEFAULT_TRACKER.stat
 stat_compact = DEFAULT_TRACKER.stat_compact
 denominator = DEFAULT_TRACKER.denominator
+disable_scope = DEFAULT_TRACKER.disable_scope
 export = DEFAULT_TRACKER.export
 scope = DEFAULT_TRACKER.scope
 scalar = DEFAULT_TRACKER.scalar

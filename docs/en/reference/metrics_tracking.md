@@ -321,7 +321,9 @@ stats_logger:
 When recomputed proximal log-probabilities are available during advantage preprocessing,
 `ppo_actor/train_infer/` compares them with the original rollout log-probabilities
 **before** standard PPO replaces those values. This requires no additional model forward
-pass. Runs without recomputation do not emit this namespace.
+pass. With `prox_logp_method="reuse"`, the same diagnostics use detached training
+log-probabilities before loss filtering. Other runs without recomputation do not emit
+this namespace.
 
 Let `d = log(p_trainer) - log(p_rollout)` on aligned, valid generated tokens:
 
