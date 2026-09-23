@@ -942,7 +942,7 @@ class MegatronEngineConfig:
         metadata={
             "help": (
                 "For multimodal ModelScope bridges, build only the language model. "
-                "Set True for text-only SWE inputs and False for vision inputs."
+                "Set True for text-only inputs and False for vision inputs."
             )
         },
     )

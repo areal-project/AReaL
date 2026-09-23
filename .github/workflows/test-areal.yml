@@ -307,52 +307,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install pinned AWEX release
-        id: awex-runtime
-        env:
-          TEST_VARIANT: ${{ matrix.variant }}
-        run: |
-          export PATH="/opt/.venv/bin:$PATH"
-          python - <<'PYTHON'
-          import importlib.metadata
-          import os
-          import subprocess
-          import sys
-          import tempfile
-          import tomllib
-          from pathlib import Path
-
-          from packaging.requirements import Requirement
-          from packaging.utils import canonicalize_name
-
-          path = "pyproject.vllm.toml" if os.environ["TEST_VARIANT"] == "vllm" else "pyproject.toml"
-          config = tomllib.loads(Path(path).read_text())
-          requirements = [Requirement(dep) for dep in config["project"]["dependencies"]]
-          awex = [req for req in requirements if canonicalize_name(req.name) == "awex"
-                  and (req.marker is None or req.marker.evaluate())]
-          if len(awex) != 1:
-              raise RuntimeError(f"Expected one active AWEX dependency in {path}")
-          requirement = awex[0]
-          pins = list(requirement.specifier)
-          if requirement.url or len(pins) != 1 or pins[0].operator != "==" or "*" in pins[0].version:
-              raise RuntimeError("AWEX must pin one exact release version")
-          target = tempfile.mkdtemp(prefix="awex-", dir=os.environ["RUNNER_TEMP"])
-          subprocess.run([
-              "uv", "pip", "install", "--python", "/opt/.venv/bin/python",
-              "--target", target, "--no-deps", str(requirement),
-          ], check=True)
-          sys.path.insert(0, target)
-          installed = importlib.metadata.version("awex")
-          if installed not in requirement.specifier:
-              raise RuntimeError(f"Installed AWEX {installed} does not match {requirement}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"pythonpath={target}\n")
-          print(f"Verified AWEX release: {installed}")
-          PYTHON
-
       - name: Validate Docker installation
         env:
-          PYTHONPATH: ${{ steps.awex-runtime.outputs.pythonpath }}:${{ github.workspace }}
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           export PATH="/opt/.venv/bin:$PATH"
           python areal/tools/validate_docker_installation.py
@@ -361,7 +318,7 @@ jobs:
         env:
           CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          PYTHONPATH: ${{ steps.awex-runtime.outputs.pythonpath }}:${{ github.workspace }}
+          PYTHONPATH: ${{ github.workspace }}
           TOKENIZERS_PARALLELISM: false
           AREAL_IS_IN_CI: 1
           VIRTUAL_ENV: /opt/.venv
