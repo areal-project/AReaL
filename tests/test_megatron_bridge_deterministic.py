@@ -55,6 +55,7 @@ def _make_mcore_config(*, deterministic: bool) -> SimpleNamespace:
         recompute_num_layers=None,
         distribute_saved_activations=False,
         recompute_modules=None,
+        cross_entropy_loss_fusion=False,
         enable_mtp=False,
         mtp_only=False,
         moe_token_dispatcher_type="alltoall",
@@ -121,8 +122,8 @@ def test_megatron_bridge_provider_applies_determinism_before_finalize():
     )
 
 
-def test_megatron_bridge_provider_preserves_defaults_when_disabled():
-    """The Megatron-Bridge provider remains unchanged without the opt-in."""
+def test_megatron_bridge_provider_applies_fusion_config_when_nondeterministic():
+    """The engine fusion setting still applies without deterministic mode."""
     attention_backend = object()
     provider = _make_provider(attention_backend)
 
@@ -131,7 +132,7 @@ def test_megatron_bridge_provider_preserves_defaults_when_disabled():
     assert provider.config_at_finalize == (
         False,
         attention_backend,
-        True,
+        False,
         True,
     )
 
