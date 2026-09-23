@@ -95,3 +95,6 @@ Training allocations retain expandable segments; AWEX disables them only for IPC
 allocation and restores allocator settings. Validate CUDA IPC compatibility, repeated
 weight equality and checkpoint recovery with the actual image pair. CPU tests and
 zero-gradient replay do not establish full-model numerical parity or RL learning.
+
+The experiment runtime pins bridge `557aaf93b16d083fdec4f82a8251d47d47c76ccb` from
+`dingzhiqiang/mcore-bridge` for modality-aware visual embedding scatter.

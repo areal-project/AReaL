@@ -646,10 +646,21 @@ def packed_context_parallel_forward(
             if key in input_:
                 vlm_kwargs[key] = input_[key]
 
-    if use_wrapper_packed_seq and is_vision_model and "mm_token_type_ids" in input_:
-        # ModelScope reconstructs full IDs before visual scatter, then partitions
-        # embeddings. Keep modality provenance in that same full packed layout.
-        vlm_kwargs["mm_token_type_ids"] = input_["mm_token_type_ids"].reshape(1, -1)
+    if is_vision_model and input_.get("mm_token_type_ids") is not None:
+        token_types = input_["mm_token_type_ids"]
+        if token_types.shape != input_["input_ids"].shape:
+            raise ValueError("mm_token_type_ids must match input_ids before packing.")
+        if cu_seqlens is not None:
+            if use_wrapper_packed_seq:
+                # Bridge reconstructs full ids before vision embedding, then
+                # partitions embeddings for CP. Its kwargs are not gathered, so
+                # modality types must stay in that full embedding-domain layout.
+                token_types = token_types.unsqueeze(0)
+            elif needs_padded_form or use_model_packed_seq:
+                token_types, _, _, _ = _reconstruct_padded_2d(
+                    token_types, cu_seqlens, input_.get("max_seqlen")
+                )
+        vlm_kwargs["mm_token_type_ids"] = token_types.to(dtype=torch.long)
 
     # MTP training: convert the independent label and mask channels to the
     # exact layout used by this forward. MCore rolls both once per MTP layer;

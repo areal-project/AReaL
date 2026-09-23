@@ -11,6 +11,7 @@ import re
 import socket
 import stat
 import uuid
+from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from numbers import Real
@@ -853,6 +854,49 @@ class ArenaStreamAgentWorkflow:
             return
         await self.persist_episode_result(data, None)
 
+    async def _maintain_gateway_registration(
+        self,
+        *,
+        model_name: str,
+        deployment_id: str,
+        proxy_base_url: str,
+        proxy_api_key: str,
+        protocol: LLMProtocol,
+        client: httpx.AsyncClient,
+    ) -> None:
+        """Keep a prompt route alive while colocated training pauses generation."""
+        while True:
+            await asyncio.sleep(self.registration_probe_interval)
+            try:
+                present = await asyncio.wait_for(
+                    self.client.renew_llm_proxy_async(
+                        model_name, client=client, timeout=self.registration_timeout
+                    ),
+                    timeout=self.registration_timeout,
+                )
+                if not present:
+                    await asyncio.wait_for(
+                        self.client.register_llm_proxy_async(
+                            model_name=model_name,
+                            upstream_base_url=proxy_base_url,
+                            upstream_api_key=proxy_api_key,
+                            deployment_id=deployment_id,
+                            protocol=protocol,
+                            client=client,
+                            timeout=self.registration_timeout,
+                        ),
+                        timeout=self.registration_timeout,
+                    )
+                _record_arena_metrics(**{"arena/registration_renew_success": 1.0})
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _record_arena_metrics(**{"arena/registration_renew_success": 0.0})
+                logger.warning(
+                    "Failed to renew active Arena gateway registration: model_id=%s",
+                    model_name,
+                )
+
     async def run(
         self,
         data: dict[str, Any],
@@ -923,6 +967,7 @@ class ArenaStreamAgentWorkflow:
         launch_api_key = str(proxy_api_key)
         launch_task_envs = dict(stream_config.task_envs)
         registration_created = False
+        registration_keepalive: asyncio.Task[None] | None = None
         session_gateway_acquired = False
         session_gateway_registry: _WorkerSessionGatewayRegistry | None = None
         session_gateway_key = str(proxy_base_url).rstrip("/")
@@ -982,6 +1027,16 @@ class ArenaStreamAgentWorkflow:
                     _record_arena_metrics(**{"arena/registration_success": 0.0})
                     _record_arena_metrics(**{"arena/call_success": 0.0})
                     raise
+                registration_keepalive = asyncio.create_task(
+                    self._maintain_gateway_registration(
+                        model_name=registered_model_id,
+                        deployment_id=deployment_id,
+                        proxy_base_url=str(proxy_base_url),
+                        proxy_api_key=str(proxy_api_key),
+                        protocol=llm_protocol,
+                        client=client,
+                    )
+                )
                 launch_api_key = self.client.llm_gateway_api_key
                 _record_arena_metrics(**{"arena/registration_success": 1.0})
                 logger.info(
@@ -1167,6 +1222,12 @@ class ArenaStreamAgentWorkflow:
             _record_arena_metrics(**{"arena/terminal_success": 1.0})
             _record_arena_metrics(**{"arena/call_success": 1.0})
         finally:
+            if registration_keepalive is not None:
+                # Stop renewal/restoration before DELETE, including cancellation,
+                # so the background task cannot resurrect a finished route.
+                registration_keepalive.cancel()
+                with suppress(asyncio.CancelledError):
+                    await registration_keepalive
             if session_gateway_acquired and session_gateway_registry is not None:
                 await session_gateway_registry.release(
                     arena_base_url=self.client.base_url,
