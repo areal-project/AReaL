@@ -127,13 +127,15 @@ not an RL learning or evaluation run.
 
 ## Pinned bridge and multimodal recipes
 
-`runtime.env` pins upstream ModelScope mcore-bridge to
-`bc58ea9cf9b1dd2314637703973904f359e67c75`. `submit_rl.sh` rejects a different or dirty
-bridge checkout before submitting. Supply its path through `MCORE_BRIDGE_ROOT`. This
-main revision already includes QSA/PLE int64 offsets, checkpoint helpers and QSA indexer
-freezing; do not apply the duplicate local QSA patch. The earlier SWE recipe used an
-AReaL-local checkpoint validator, explaining why its older bridge worked without the
-newly imported checkpoint module.
+`runtime.env` pins `dingzhiqiang/mcore-bridge` to
+`557aaf93b16d083fdec4f82a8251d47d47c76ccb`, based on upstream `bc58ea9`. This revision
+preserves generated image/video special tokens as text embeddings using explicit
+modality types; it must accompany the AReaL mRoPE provenance fix. `submit_rl.sh` rejects
+a different or dirty bridge checkout before submitting. Supply its path through
+`MCORE_BRIDGE_ROOT`. The upstream base already includes QSA/PLE int64 offsets,
+checkpoint helpers and QSA indexer freezing; do not apply the duplicate local QSA patch.
+The earlier SWE recipe used an AReaL-local checkpoint validator, explaining why its
+older bridge worked without the newly imported checkpoint module.
 
 Set `QWEN_CONFIG` to `swe_mm_rl.yaml` for the small ten-step vision RL recipe (batch2,
 samples4, CP2, chunk loss1024, PLE chunk8192, staleness2). Paths, images, reservation,

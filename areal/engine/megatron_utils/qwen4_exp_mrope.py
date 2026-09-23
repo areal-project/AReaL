@@ -63,13 +63,13 @@ def prepare_qwen4_exp_mrope_inputs(
     # Generated special tokens are text, not evidence of image/video payloads.
     # Only the rollout loss mask can establish this provenance; unmarked prompt
     # placeholders still trigger the strict payload validation below.
+    generated_tokens = torch.zeros_like(attention_mask)
     loss_mask = data.get("loss_mask")
     if loss_mask is not None:
         if loss_mask.shape != input_ids.shape:
             raise ValueError("loss_mask must have the same [B, S] shape as input_ids.")
-        vision_tokens = vision_tokens & ~loss_mask.to(
-            device=input_ids.device, dtype=torch.bool
-        )
+        generated_tokens = loss_mask.to(device=input_ids.device, dtype=torch.bool)
+        vision_tokens = vision_tokens & ~generated_tokens
     token_types = data.get("mm_token_type_ids")
     has_typed_vision = token_types is not None and bool((token_types != 0).any())
     has_vision = (
@@ -103,6 +103,9 @@ def prepare_qwen4_exp_mrope_inputs(
             device=input_ids.device,
             dtype=torch.long,
         )
+        # Processor inference has no generation provenance; restore text types
+        # for model-generated special tokens before computing vision positions.
+        token_types.masked_fill_(generated_tokens, 0)
     if token_types.shape != input_ids.shape:
         raise ValueError(
             "mm_token_type_ids must have the same [B, S] shape as input_ids."
@@ -119,7 +122,8 @@ def prepare_qwen4_exp_mrope_inputs(
         (2, hf_config.video_token_id, "pixel_values_videos", "video_grid_thw"),
     ):
         if (
-            ((token_types == modality) != (input_ids == token_id)) & attention_mask
+            ((token_types == modality) != ((input_ids == token_id) & ~generated_tokens))
+            & attention_mask
         ).any():
             raise ValueError(
                 f"mm_token_type_ids disagree with Qwen4Exp {grid_key} token ids."

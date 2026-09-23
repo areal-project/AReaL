@@ -251,3 +251,44 @@ def test_wrapper_mtp_preserves_thd_labels_without_padding_mask(packed_forward):
     assert kwargs["attention_mask"] is None
     torch.testing.assert_close(kwargs["mtp_kwargs"]["mtp_labels"].reshape(-1), labels)
     torch.testing.assert_close(kwargs["mtp_kwargs"]["mtp_loss_mask"].reshape(-1), mask)
+
+
+@pytest.mark.parametrize("model_packed", [False, True])
+def test_modality_types_follow_padded_embedding_layout(packed_forward, model_packed):
+    model = MagicMock(return_value=torch.ones(2, 6, 2))
+    types = torch.tensor([0, 1, 0, 2, 0, 0, 0, 0])
+    packed_forward.packed_context_parallel_forward(
+        model,
+        {
+            "input_ids": torch.arange(8),
+            "cu_seqlens": torch.tensor([0, 2, 8], dtype=torch.int32),
+            "mm_token_type_ids": types,
+        },
+        gather_cp_output=False,
+        is_vision_model=True,
+        use_model_packed_seq=model_packed,
+    )
+    kwargs = model.call_args.kwargs
+    assert kwargs["mm_token_type_ids"].shape == kwargs["input_ids"].shape
+    torch.testing.assert_close(
+        kwargs["mm_token_type_ids"],
+        torch.tensor([[0, 1, 0, 0, 0, 0], [0, 2, 0, 0, 0, 0]]),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_modality_type_shape_mismatch_is_rejected_before_model(packed_forward):
+    model = MagicMock()
+    with pytest.raises(ValueError, match="mm_token_type_ids must match"):
+        packed_forward.packed_context_parallel_forward(
+            model,
+            {
+                "input_ids": torch.arange(8),
+                "cu_seqlens": torch.tensor([0, 8]),
+                "mm_token_type_ids": torch.zeros(4),
+            },
+            is_vision_model=True,
+            use_wrapper_packed_seq=True,
+        )
+    model.assert_not_called()

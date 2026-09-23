@@ -182,7 +182,12 @@ def test_mrope_survives_microbatch_reorder_padding_and_cp_partition(
             assert inputs["position_ids"].shape == (3, 1, inputs["input_ids"].shape[-1])
             for key, value in expected_payload.items():
                 torch.testing.assert_close(inputs[key], value, atol=0, rtol=0)
-            assert "mm_token_type_ids" in padded_mb
+            torch.testing.assert_close(
+                inputs["mm_token_type_ids"],
+                padded_mb["mm_token_type_ids"][None],
+                atol=0,
+                rtol=0,
+            )
         indices = module._build_cp_reassemble_indices(padded_mb["cu_seqlens"], cp_size)
         reassembled = torch.cat(cp_outputs)[indices]
         outputs.append(
@@ -316,3 +321,61 @@ def test_prompt_placeholder_without_pixels_still_rejected(qwen_config):
     }
     with pytest.raises(ValueError, match="language_model_only"):
         prepare_qwen4_exp_mrope_inputs(inputs, qwen_config, language_model_only=True)
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("separate_row", [False, True])
+@pytest.mark.parametrize("infer_types", [False, True])
+def test_generated_placeholder_in_vision_batch_preserves_text_positions(
+    qwen_config, hf_qwen4_exp, modality, separate_row, infer_types
+):
+    inputs = _minimal_vision_input(qwen_config)
+    special = getattr(qwen_config, f"{modality}_token_id")
+    if separate_row:
+        inputs["input_ids"] = torch.cat(
+            [inputs["input_ids"], torch.tensor([[10, special, 11]])]
+        )
+        inputs["mm_token_type_ids"] = torch.tensor([[0, 1, 0], [0, 0, 0]])
+        inputs["loss_mask"] = torch.tensor([[0, 0, 1], [0, 1, 1]])
+        inputs["multi_modal_input"].append({})
+    else:
+        inputs["input_ids"][0, 2] = special
+        inputs["loss_mask"] = torch.tensor([[0, 0, 1]])
+    inputs["attention_mask"] = torch.ones_like(inputs["input_ids"], dtype=torch.bool)
+    original_ids = inputs["input_ids"].clone()
+    expected_types = inputs["mm_token_type_ids"].clone()
+    reference, _ = hf_qwen4_exp.get_rope_index(
+        input_ids=original_ids,
+        mm_token_type_ids=expected_types,
+        image_grid_thw=inputs["multi_modal_input"][0]["image_grid_thw"],
+        attention_mask=inputs["attention_mask"],
+    )
+    processor = None
+    if infer_types:
+        from transformers.processing_utils import ProcessorMixin
+
+        processor = SimpleNamespace(
+            image_token_ids=[qwen_config.image_token_id],
+            video_token_ids=[qwen_config.video_token_id],
+            audio_token_ids=[],
+        )
+        processor.create_mm_token_type_ids = MethodType(
+            ProcessorMixin.create_mm_token_type_ids, processor
+        )
+        inputs.pop("mm_token_type_ids")
+    result = prepare_qwen4_exp_mrope_inputs(inputs, qwen_config, processor)
+    torch.testing.assert_close(result["input_ids"], original_ids, atol=0, rtol=0)
+    torch.testing.assert_close(
+        result["mm_token_type_ids"], expected_types, atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        result["position_ids"], reference.permute(1, 2, 0), atol=0, rtol=0
+    )
+
+
+def test_unmarked_prompt_placeholder_in_mixed_batch_still_rejected(qwen_config):
+    inputs = _minimal_vision_input(qwen_config)
+    inputs["input_ids"][0, 2] = qwen_config.image_token_id
+    inputs["loss_mask"] = torch.zeros_like(inputs["input_ids"])
+    with pytest.raises(ValueError, match="disagree"):
+        prepare_qwen4_exp_mrope_inputs(inputs, qwen_config)
