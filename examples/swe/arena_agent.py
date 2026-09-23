@@ -42,14 +42,6 @@ _GAMEAGENT_OUTCOME_CODE_PATTERN = re.compile(
     r"(?:^|\s)GAMEAGENT_OUTCOME_CODE=([A-Z][A-Z0-9_]{0,127})(?:\s|$)"
 )
 _GAMEAGENT_OUTCOME_CODE_VALUE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
-_GAMEAGENT_MODEL_FAILURE_CODES = frozenset(
-    {
-        "AGENT_MAX_TURNS_EXCEEDED",
-        "AGENT_RUN_TIMEOUT",
-        "AUTONOMOUS_INCOMPLETE_NO_SHIP",
-        "LLM_RESPONSE_TIMEOUT",
-    }
-)
 _GAMEAGENT_OUTCOME_METRIC_CODES = tuple(sorted(HARNESS_OUTCOME_METRIC_CODES))
 _WORKER_GATEWAY_REGISTRY_ATTR = "_arena_session_gateway_registry_v1"
 _WORKER_GATEWAY_CLEANUP_KEY = "arena-session-gateway-registrations"
@@ -459,10 +451,10 @@ def _arena_task_type(data: dict[str, Any]) -> str:
 class ArenaStreamAgentWorkflow:
     """Launch an Arena online task and use its returned reward for RL."""
 
-    _MODEL_FAILURE_STATUSES_WITH_INTERACTIONS = {"NO_OUTPUT", "TIMEOUT"}
     _SYSTEM_FAILURE_STATUSES = ArenaOpenAPIClient.FAILED_TASK_STATUSES - {
         "HARNESS_FAILED",
-        *_MODEL_FAILURE_STATUSES_WITH_INTERACTIONS,
+        "NO_OUTPUT",
+        "TIMEOUT",
     }
 
     def __init__(
@@ -617,7 +609,8 @@ class ArenaStreamAgentWorkflow:
         if not isinstance(raw, dict):
             return False
         if (
-            raw.get("nativeRlReceiptVersion") != 1
+            type(raw.get("nativeRlReceiptVersion")) is not int
+            or raw.get("nativeRlReceiptVersion") != 1
             or raw.get("nativeExecutionHealthy") is not True
             or raw.get("nativeExportHealthy") is not True
             or raw.get("status") != "ERROR"
@@ -632,6 +625,7 @@ class ArenaStreamAgentWorkflow:
         if (
             not isinstance(terminals, dict)
             or not terminals
+            or type(raw.get("exportedRunCount")) is not int
             or raw.get("exportedRunCount") != len(terminals)
             or not isinstance(failures, list)
             or not failures
@@ -687,22 +681,22 @@ class ArenaStreamAgentWorkflow:
     def _is_model_attributed_harness_failure(cls, error: ArenaTaskFailedError) -> bool:
         """Recognize explicit, allowlisted Harness model-failure outcomes."""
 
+        # Only the native receipt currently proves both execution/export health
+        # and model attribution. Legacy text and outcome codes do not establish
+        # health, and must never provide a fallback for an invalid receipt.
         result = error.result
         raw = result.raw if result is not None else None
-        if cls._is_native_model_failure(raw):
-            return True
-        if cls._gameagent_outcome_code(raw) in _GAMEAGENT_MODEL_FAILURE_CODES:
-            return True
         if not isinstance(raw, dict):
             return False
-        detail = raw.get("error")
-        if not isinstance(detail, str):
+        if "outcome" in raw or "outcome_code" in raw:
             return False
-        normalized = detail.lower()
-        return (
-            "harness: harness agent phase exited with code" in normalized
-            and "harness: agent phase error: claude reported error" in normalized
-        )
+        detail = raw.get("error")
+        if isinstance(detail, str) and (
+            "GAMEAGENT_OUTCOME_CODE=" in detail
+            or "claude reported error" in detail.lower()
+        ):
+            return False
+        return cls._is_native_model_failure(raw)
 
     @classmethod
     def classify_proxy_failure(
@@ -712,27 +706,20 @@ class ArenaStreamAgentWorkflow:
         context_overflow: bool,
         interaction_count: int,
     ) -> str:
-        """Keep attributed model failures without accepting arbitrary errors.
+        """Retain only healthy, explicitly model-attributed Harness failures.
 
-        Explicit GameAgent outcomes, local context overflow, and the legacy
-        Claude agent-phase envelope may identify a model failure. A GameAgent
-        log marker is supported for Harnesses without structured outcome fields.
-        Unknown outcomes and system failures retain their rejection behavior.
+        Overflow, timeout, missing output, and legacy outcome markers alone
+        cannot establish execution/export health. Unknown or conflicting evidence
+        is rejected; a failed health check never falls through to another format.
         """
-
         if not isinstance(error, ArenaTaskFailedError):
             return "system_failure_reject"
         if error.status in cls._SYSTEM_FAILURE_STATUSES:
             return "system_failure_reject"
         if (
-            error.status in cls._MODEL_FAILURE_STATUSES_WITH_INTERACTIONS
-            and interaction_count > 0
-        ):
-            return "model_failure_zero"
-        if (
             error.status == "HARNESS_FAILED"
             and interaction_count > 0
-            and (context_overflow or cls._is_model_attributed_harness_failure(error))
+            and cls._is_model_attributed_harness_failure(error)
         ):
             return "model_failure_zero"
         return "unknown_failure_reject"

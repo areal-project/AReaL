@@ -249,16 +249,21 @@ The concrete agent behaviour — system prompt, `cli_flags`, tool allow-list,
 thinking-token budgets — lives entirely in the AReaL-SWEAgent cc config; see that
 repository for the available `cc_agent_config` values and their fields.
 
-### Native runtime failure rewards
+### Failure rewards
 
-Arena may return a structured `nativeRlReceiptVersion: 1` failure receipt. The adapter
-retains a zero-reward trajectory only when execution and export are healthy, the native
-run completed, every terminal is accounted for, and every failed run reports
+No additional protocol configuration is required. Failed Arena tasks contribute a
+zero-reward sample only when a complete native version-1 receipt proves healthy
+execution and export, every run terminal is accounted for, and every failed run reports
 `RUNTIME_EXECUTION_FAILED` with `DSH_PUBLIC_ANSWER_MISSING` / `public_answer_missing`.
-Duplicate, incomplete, or unrecognized failures do not qualify. System failures take
-precedence, and an episode must have usable interactions to contribute a training
-sample.
+The task must have status `HARNESS_FAILED` and usable interactions.
 
-For concat exports, a scalar episode reward also fills previously unscored trajectory
-branches. Explicit branch rewards and per-completion reward maps retain their existing
+Missing, malformed, unhealthy, unknown, or conflicting receipts are rejected without
+trying another format. GameAgent outcome codes, legacy Claude error text, local context
+overflow, `TIMEOUT`, and `NO_OUTPUT` do not independently prove healthy model failure
+and no longer authorize zero-reward recovery. System failures always take precedence.
+This intentionally excludes failures from older Harnesses that lack sufficient health
+evidence; successful tasks retain their normal score handling.
+
+For concat exports, missing branch rewards are not inferred from a scalar episode
+reward. Explicit branch rewards and per-completion reward maps retain their existing
 semantics.

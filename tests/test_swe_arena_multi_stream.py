@@ -764,20 +764,20 @@ def test_workflow_rejects_live_reward_ref_drift(monkeypatch):
 @pytest.mark.parametrize(
     ("status", "context_overflow", "interaction_count", "expected"),
     [
-        ("HARNESS_FAILED", True, 1, "model_failure_zero"),
+        ("HARNESS_FAILED", True, 1, "unknown_failure_reject"),
         ("HARNESS_FAILED", True, 0, "unknown_failure_reject"),
         ("HARNESS_FAILED", False, 1, "unknown_failure_reject"),
         ("SETUP_FAILED", True, 1, "system_failure_reject"),
-        ("TIMEOUT", False, 1, "model_failure_zero"),
+        ("TIMEOUT", False, 1, "unknown_failure_reject"),
         ("TIMEOUT", True, 0, "unknown_failure_reject"),
-        ("NO_OUTPUT", False, 1, "model_failure_zero"),
+        ("NO_OUTPUT", False, 1, "unknown_failure_reject"),
         ("NO_OUTPUT", False, 0, "unknown_failure_reject"),
     ],
 )
 def test_arena_failure_classifier_is_conservative(
     status, context_overflow, interaction_count, expected
 ):
-    """Only a typed, recoverable Arena model overflow may become reward zero."""
+    """A status or overflow flag alone cannot prove healthy model failure."""
     error = ArenaTaskFailedError(task_id="task-1", status=status)
 
     disposition = ArenaStreamAgentWorkflow.classify_proxy_failure(
@@ -800,8 +800,8 @@ def test_arena_failure_classifier_rejects_non_terminal_api_error():
     assert disposition == "system_failure_reject"
 
 
-def test_arena_failure_classifier_keeps_explicit_claude_agent_phase_failure():
-    """A Harness-attributed Claude agent failure is a trainable zero reward."""
+def test_arena_failure_classifier_rejects_claude_failure_without_health():
+    """A Claude error envelope does not establish execution/export health."""
     error = ArenaTaskFailedError(
         task_id="task-1",
         status="HARNESS_FAILED",
@@ -822,7 +822,7 @@ def test_arena_failure_classifier_keeps_explicit_claude_agent_phase_failure():
         interaction_count=3,
     )
 
-    assert disposition == "model_failure_zero"
+    assert disposition == "unknown_failure_reject"
 
 
 @pytest.mark.parametrize(
@@ -835,10 +835,10 @@ def test_arena_failure_classifier_keeps_explicit_claude_agent_phase_failure():
         ("LLM_RESPONSE_FAILED", "outcome", 0),
     ],
 )
-def test_gameagent_failure_with_interactions_keeps_zero_reward(
+def test_gameagent_failure_without_health_is_rejected(
     code, encoding, interaction_count
 ):
-    """Only attributed failures with existing interactions are recoverable."""
+    """Outcome codes and interactions alone cannot establish healthy execution."""
     raw = {
         "outcome": {"code": code},
         "outcome_code": code,
@@ -859,9 +859,7 @@ def test_gameagent_failure_with_interactions_keeps_zero_reward(
         error, context_overflow=False, interaction_count=interaction_count
     )
 
-    assert disposition == (
-        "model_failure_zero" if interaction_count else "unknown_failure_reject"
-    )
+    assert disposition == "unknown_failure_reject"
 
 
 @pytest.mark.parametrize(
@@ -1277,7 +1275,9 @@ def native_model_failure_receipt():
     }
 
 
-def _native_failure_disposition(raw, *, status="HARNESS_FAILED", interactions=1):
+def _native_failure_disposition(
+    raw, *, status="HARNESS_FAILED", interactions=1, context_overflow=False
+):
     error = ArenaTaskFailedError(
         task_id="native-task",
         status=status,
@@ -1287,7 +1287,7 @@ def _native_failure_disposition(raw, *, status="HARNESS_FAILED", interactions=1)
     )
     return ArenaStreamAgentWorkflow.classify_proxy_failure(
         error,
-        context_overflow=False,
+        context_overflow=context_overflow,
         interaction_count=interactions,
     )
 
@@ -1419,3 +1419,110 @@ def test_unattributed_native_harness_error_is_not_a_model_zero(message):
         "harness": {"exit_code": 1, "phase": "agent", "result_status": "ERROR"},
     }
     assert _native_failure_disposition(raw) == "unknown_failure_reject"
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize("status", ["HARNESS_FAILED", "TIMEOUT", "NO_OUTPUT"])
+def test_native_healthy_model_failure_requires_consistent_status(
+    native_model_failure_receipt, status, context_overflow
+):
+    """Only a completed Harness model failure has enough evidence for recovery."""
+    assert _native_failure_disposition(
+        native_model_failure_receipt,
+        status=status,
+        context_overflow=context_overflow,
+    ) == (
+        "model_failure_zero" if status == "HARNESS_FAILED" else "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize(
+    "signal",
+    [
+        {"outcome": {"code": "AGENT_MAX_TURNS_EXCEEDED"}},
+        {"outcome_code": "AGENT_MAX_TURNS_EXCEEDED"},
+        {"outcome_code": "SYSTEM_FAILURE"},
+        {"error": "GAMEAGENT_OUTCOME_CODE=AGENT_MAX_TURNS_EXCEEDED"},
+        {
+            "error": "harness: harness agent phase exited with code 1: "
+            "harness: agent phase error: claude reported error:"
+        },
+    ],
+)
+@pytest.mark.parametrize(
+    "health_field", [None, "nativeExecutionHealthy", "nativeExportHealthy"]
+)
+def test_native_receipt_conflicting_formats_never_recover(
+    native_model_failure_receipt, signal, health_field, context_overflow
+):
+    """Neither healthy nor unhealthy receipts may hide conflicting format signals."""
+    raw = native_model_failure_receipt
+    raw.update(signal)
+    if health_field is not None:
+        raw[health_field] = False
+    assert (
+        _native_failure_disposition(raw, context_overflow=context_overflow)
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "nativeRlReceiptVersion",
+        "nativeExecutionHealthy",
+        "nativeExportHealthy",
+        "status",
+        "trajectoryHealth",
+        "nativeStopReason",
+        "nativeFailure",
+        "exportedRunCount",
+        "runTerminals",
+        "runFailures",
+    ],
+)
+def test_native_receipt_missing_evidence_never_recovers(
+    native_model_failure_receipt, field, context_overflow
+):
+    """Every health and attribution field is required, even with local overflow."""
+    raw = native_model_failure_receipt
+    raw.pop(field)
+    assert (
+        _native_failure_disposition(raw, context_overflow=context_overflow)
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("nativeRlReceiptVersion", True),
+        ("nativeRlReceiptVersion", 1.0),
+        ("nativeRlReceiptVersion", 2),
+        ("exportedRunCount", 2.0),
+    ],
+)
+def test_native_receipt_invalid_numeric_contract_rejected(
+    native_model_failure_receipt, field, value
+):
+    """Python numeric equality must not accept malformed versions or counts."""
+    native_model_failure_receipt[field] = value
+    assert (
+        _native_failure_disposition(native_model_failure_receipt)
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize("status", ["HARNESS_FAILED", "TIMEOUT", "NO_OUTPUT"])
+@pytest.mark.parametrize("raw", [None, {}, [], {"nativeExportHealthy": False}])
+def test_failure_without_health_evidence_never_recovers(status, raw, context_overflow):
+    """Unknown results and infrastructure evidence cannot become training zeros."""
+    assert (
+        _native_failure_disposition(
+            raw, status=status, context_overflow=context_overflow
+        )
+        == "unknown_failure_reject"
+    )
