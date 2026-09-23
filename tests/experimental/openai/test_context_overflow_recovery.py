@@ -539,3 +539,88 @@ async def test_arena_unhealthy_receipt_with_overflow_never_exports(monkeypatch, 
         stats_tracker.export_all(reset=True)
     assert fake_client.last_reward is None
     fake_client.export_interactions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"outcome_code": "AGENT_MAX_TURNS_EXCEEDED"},
+        {
+            "error": "harness: harness agent phase exited with code 1: "
+            "harness: agent phase error: claude reported error: Prompt is too long"
+        },
+    ],
+)
+@pytest.mark.parametrize(
+    "trajectory",
+    ["usable", "system_error", "no_interactions", "empty_export", "failed_export"],
+)
+async def test_arena_legacy_model_failure_requires_usable_proxy_trajectory(
+    monkeypatch, raw, context_overflow, trajectory
+):
+    """Real legacy classification only trains successfully exported model interactions."""
+    monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    fake_client = _FakeProxyClient(
+        interaction_count=0 if trajectory == "no_interactions" else 1
+    )
+    fake_client.context_overflow = context_overflow
+    fake_client.system_error = trajectory == "system_error"
+    fake_client.export_interactions = AsyncMock(
+        return_value={}
+        if trajectory == "empty_export"
+        else {"completion-1": fake_client.interaction},
+        side_effect=RuntimeError("export failed")
+        if trajectory == "failed_export"
+        else None,
+    )
+    monkeypatch.setattr(
+        workflow_module, "OpenAIProxyClient", lambda *args, **kwargs: fake_client
+    )
+    agent = ArenaStreamAgentWorkflow(
+        econfig={"arena_streams": [{"name": "test", "stream_id": "stream"}]}
+    )
+    agent.persist_episode_result = AsyncMock()
+    error = ArenaTaskFailedError(
+        task_id="task",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task", status="HARNESS_FAILED", score=0.0, raw=raw
+        ),
+    )
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
+    monkeypatch.setattr(workflow, "_run_agent", AsyncMock(side_effect=error))
+    monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
+    monkeypatch.setattr(
+        workflow, "_record_interaction_stats", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        workflow, "record_episode_metrics", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    workflow_context.set(WorkflowContext(task_id=8))
+    try:
+        if trajectory in {"system_error", "no_interactions"}:
+            with pytest.raises(ArenaTaskFailedError):
+                await workflow.arun_episode(engine=None, data={})
+            assert fake_client.last_reward is None
+            fake_client.export_interactions.assert_not_awaited()
+        elif trajectory == "failed_export":
+            with pytest.raises(RuntimeError, match="export failed"):
+                await workflow.arun_episode(engine=None, data={})
+            agent.persist_episode_result.assert_not_awaited()
+        else:
+            result = await workflow.arun_episode(engine=None, data={})
+            if trajectory == "empty_export":
+                assert result is None
+                agent.persist_episode_result.assert_awaited_once_with({}, None)
+            else:
+                assert result["completion-1"].reward == 0.0
+                agent.persist_episode_result.assert_awaited_once_with({}, 0.0)
+    finally:
+        workflow_context.set(WorkflowContext())
+        stats_tracker.export_all(reset=True)

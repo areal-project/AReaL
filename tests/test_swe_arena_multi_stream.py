@@ -835,10 +835,8 @@ def test_arena_failure_classifier_rejects_claude_failure_without_health():
         ("LLM_RESPONSE_FAILED", "outcome", 0),
     ],
 )
-def test_gameagent_failure_without_health_is_rejected(
-    code, encoding, interaction_count
-):
-    """Outcome codes and interactions alone cannot establish healthy execution."""
+def test_gameagent_failure_uses_model_attribution(code, encoding, interaction_count):
+    """Explicit model termination is recoverable; timeout remains ambiguous."""
     raw = {
         "outcome": {"code": code},
         "outcome_code": code,
@@ -859,7 +857,13 @@ def test_gameagent_failure_without_health_is_rejected(
         error, context_overflow=False, interaction_count=interaction_count
     )
 
-    assert disposition == "unknown_failure_reject"
+    expected = (
+        "model_failure_zero"
+        if interaction_count
+        and code in {"AGENT_MAX_TURNS_EXCEEDED", "AUTONOMOUS_INCOMPLETE_NO_SHIP"}
+        else "unknown_failure_reject"
+    )
+    assert disposition == expected
 
 
 @pytest.mark.parametrize(
@@ -1523,6 +1527,208 @@ def test_failure_without_health_evidence_never_recovers(status, raw, context_ove
     assert (
         _native_failure_disposition(
             raw, status=status, context_overflow=context_overflow
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ({"nativeRlReceiptVersion": None}, "native"),
+        ({"runFailures": []}, "native"),
+        ({"harness": "AReaLHarness", "exit_code": 1}, "native"),
+        ({"outcome": None}, "gameagent"),
+        ({"error": "GAMEAGENT_OUTCOME_CODE=invalid"}, "gameagent"),
+        ({"error": "gameagent.envarena: starting GameAgent gateway"}, "gameagent"),
+        (
+            {
+                "error": "harness: harness agent phase exited with code 1: "
+                "harness: agent phase error: claude reported error:"
+            },
+            "legacy-claude",
+        ),
+        (
+            {
+                "error": "harness: harness agent phase exited with code 1: "
+                "running task lifecycle (claude=/tmp/runtime/claude, session=test)"
+            },
+            "legacy-claude",
+        ),
+        (
+            {
+                "error": "harness: harness agent phase exited with code 1: "
+                "running task lifecycle (runner=/tmp/runtime/runner)"
+            },
+            None,
+        ),
+        (
+            {"nativeExportHealthy": False, "outcome_code": "AGENT_MAX_TURNS_EXCEEDED"},
+            None,
+        ),
+        (
+            {
+                "outcome": {},
+                "error": "harness: harness agent phase exited with code 1: "
+                "harness: agent phase error: claude reported error:",
+            },
+            None,
+        ),
+        ({}, None),
+    ],
+)
+def test_harness_format_detection_does_not_depend_on_admission(raw, expected):
+    """Malformed receipts keep their family; multiple families are ambiguous."""
+    assert ArenaStreamAgentWorkflow._harness_result_format(raw) == expected
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"outcome": None, "error": "GAMEAGENT_OUTCOME_CODE=AGENT_MAX_TURNS_EXCEEDED"},
+        {
+            "outcome": {"code": "SYSTEM_FAILURE"},
+            "outcome_code": "AGENT_MAX_TURNS_EXCEEDED",
+        },
+        {"outcome": {"code": "AGENT_MAX_TURNS_EXCEEDED"}, "outcome_code": None},
+        {
+            "outcome_code": "AGENT_MAX_TURNS_EXCEEDED",
+            "error": "GAMEAGENT_OUTCOME_CODE=LLM_RESPONSE_FAILED",
+        },
+        {
+            "error": "GAMEAGENT_OUTCOME_CODE=AGENT_MAX_TURNS_EXCEEDED\nGAMEAGENT_OUTCOME_CODE=invalid"
+        },
+        {"outcome_code": "AGENT_MAX_TURNS_EXCEEDED", "trajectoryHealth": "degraded"},
+        {
+            "outcome_code": "AGENT_MAX_TURNS_EXCEEDED",
+            "failure": {"code": "EXPORT_FAILED"},
+        },
+        {"outcome_code": "AGENT_MAX_TURNS_EXCEEDED", "status": "OK"},
+        {
+            "outcome_code": "AGENT_MAX_TURNS_EXCEEDED",
+            "error": "export failed: no space left",
+        },
+        {
+            "outcome_code": "AGENT_MAX_TURNS_EXCEEDED",
+            "error": "HTTP 503 service unavailable",
+        },
+    ],
+)
+def test_gameagent_conflicting_or_unhealthy_evidence_rejected(raw, context_overflow):
+    """No representation or earlier overflow rescues conflicting evidence."""
+    assert (
+        _native_failure_disposition(raw, context_overflow=context_overflow)
+        == "unknown_failure_reject"
+    )
+
+
+def test_gameagent_consistent_repeated_outcomes_keep_zero():
+    """Structured fields and repeated matching log markers are one outcome."""
+    raw = {
+        "outcome": {"code": "AGENT_MAX_TURNS_EXCEEDED"},
+        "outcome_code": "AGENT_MAX_TURNS_EXCEEDED",
+        "error": "GAMEAGENT_OUTCOME_CODE=AGENT_MAX_TURNS_EXCEEDED\n" * 2,
+    }
+    assert _native_failure_disposition(raw) == "model_failure_zero"
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize(
+    "reason,model_error",
+    [
+        ("Prompt is too long", True),
+        ("Maximum context length is 8192 tokens", True),
+        ("Maximum context length is 500 tokens", True),
+        ("Reached max turns", True),
+        ("Max turns exceeded", True),
+        ("", None),
+        ("Invalid API key", False),
+        ("Rate limit exceeded", False),
+        ("HTTP 503 service unavailable; prompt too long", False),
+        ("Connection reset", False),
+        ("Request timed out", False),
+        ("Export failed after max turns exceeded", False),
+        ("An unspecified error occurred", False),
+    ],
+)
+def test_claude_failure_requires_specific_model_reason(
+    reason, model_error, context_overflow
+):
+    """The Claude envelope identifies the format, not automatically the cause."""
+    raw = {
+        "error": "harness: harness agent phase exited with code 1: "
+        "harness: agent phase error: claude reported error: " + reason
+    }
+    expected = (
+        "model_failure_zero"
+        if (model_error is True or (model_error is None and context_overflow))
+        else "unknown_failure_reject"
+    )
+    assert (
+        _native_failure_disposition(raw, context_overflow=context_overflow) == expected
+    )
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Sanitized shapes observed in production results/trajectory artifacts.
+        {
+            "error": "harness: harness agent phase exited with code 1: "
+            "harness: running setup hook\nSelecting previously unselected package l"
+        },
+        {
+            "error": "harness: harness agent phase exited with code 1: "
+            "gameagent.envarena: starting GameAgent gateway on 127.0.0.1:18080"
+        },
+        {
+            "error": "harness: harness agent phase exited with code 1: "
+            "harness: agent phase error: claude exited: exit status 87: wrapper: starting claude"
+        },
+        {
+            "harness": "AReaLHarness",
+            "exit_code": 1,
+            "run_completed": 0,
+            "failure": None,
+        },
+        {
+            "status": "ERROR",
+            "runner_status": "ERROR",
+            "finish_reason": "error",
+            "error_summary": {
+                "kind": "agent",
+                "message": "unexpected finish_reason: error",
+            },
+        },
+    ],
+)
+def test_observed_incomplete_trajectory_evidence_rejected(raw, context_overflow):
+    """A startup log, exit code, or unattributed run error is not model attribution."""
+    assert (
+        _native_failure_disposition(raw, context_overflow=context_overflow)
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize(
+    "signal",
+    [
+        {"failure": {"code": "EXPORT_FAILED"}},
+        {"error": "LLM_RESPONSE_FAILED"},
+        {"error": "HTTP 503 service unavailable"},
+    ],
+)
+def test_healthy_native_receipt_cannot_hide_explicit_system_failure(
+    native_model_failure_receipt, signal, context_overflow
+):
+    """Explicit contradictory failures veto even an otherwise complete receipt."""
+    native_model_failure_receipt.update(signal)
+    assert (
+        _native_failure_disposition(
+            native_model_failure_receipt, context_overflow=context_overflow
         )
         == "unknown_failure_reject"
     )

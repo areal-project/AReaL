@@ -15,7 +15,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -39,9 +39,32 @@ logger = logging.getLogger("ArenaStreamAgent")
 
 _ARENA_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
 _GAMEAGENT_OUTCOME_CODE_PATTERN = re.compile(
-    r"(?:^|\s)GAMEAGENT_OUTCOME_CODE=([A-Z][A-Z0-9_]{0,127})(?:\s|$)"
+    r"(?:^|\s)GAMEAGENT_OUTCOME_CODE=([A-Z][A-Z0-9_]{0,127})(?=\s|$)"
 )
 _GAMEAGENT_OUTCOME_CODE_VALUE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+_GAMEAGENT_MODEL_FAILURE_CODES = {
+    "AGENT_MAX_TURNS_EXCEEDED",
+    "AUTONOMOUS_INCOMPLETE_NO_SHIP",
+}
+_CLAUDE_AGENT_ERROR_MARKER = "harness: agent phase error: claude reported error:"
+_CLAUDE_MODEL_ERROR_PATTERN = re.compile(
+    r"prompt (?:is )?too long|context (?:window|length) (?:exceeded|exhausted)"
+    r"|exceeds? (?:the )?(?:maximum )?context (?:window|length)"
+    r"|maximum context length|(?:max(?:imum)? turns? (?:exceeded|reached))"
+    r"|reached (?:the )?max(?:imum)? (?:number of )?turns?",
+    re.IGNORECASE,
+)
+_HARNESS_SYSTEM_ERROR_PATTERN = re.compile(
+    r"authentication|unauthorized|invalid api key|permission denied|rate.?limit"
+    r"|connection (?:reset|refused|error)|connectionerror|connecttimeout"
+    r"|readtimeout|timed out|timeout|service unavailable|internal server error"
+    r"|bad gateway|out of memory|no space left|traceback"
+    r"|LLM_RESPONSE_FAILED|SYSTEM_FAILURE|EXPORT_FAILED|SETUP_FAILED|EVAL_FAILED"
+    r"|(?:export|collect|setup)[^\n]*(?:failed|error)"
+    r"|(?:http(?: error)?|status(?: code)?|api error)\s*[:=]?\s*"
+    r"(?:401|403|408|429|500|502|503|504)\b",
+    re.IGNORECASE,
+)
 _GAMEAGENT_OUTCOME_METRIC_CODES = tuple(sorted(HARNESS_OUTCOME_METRIC_CODES))
 _WORKER_GATEWAY_REGISTRY_ATTR = "_arena_session_gateway_registry_v1"
 _WORKER_GATEWAY_CLEANUP_KEY = "arena-session-gateway-registrations"
@@ -582,26 +605,67 @@ class ArenaStreamAgentWorkflow:
 
     @staticmethod
     def _gameagent_outcome_code(raw: Any) -> str | None:
-        """Read an explicit GameAgent outcome, preferring structured fields."""
+        """Read one consistent outcome; malformed fields never fall back to logs."""
         if not isinstance(raw, dict):
             return None
-        outcome = raw.get("outcome")
-        if isinstance(outcome, dict):
-            code = outcome.get("code")
-            if isinstance(
-                code, str
-            ) and _GAMEAGENT_OUTCOME_CODE_VALUE_PATTERN.fullmatch(code):
-                return code
-        code = raw.get("outcome_code")
-        if isinstance(code, str) and _GAMEAGENT_OUTCOME_CODE_VALUE_PATTERN.fullmatch(
-            code
-        ):
-            return code
+        codes = []
+        if "outcome" in raw:
+            outcome = raw["outcome"]
+            if not isinstance(outcome, dict):
+                return None
+            codes.append(outcome.get("code"))
+        if "outcome_code" in raw:
+            codes.append(raw["outcome_code"])
         detail = raw.get("error")
-        if not isinstance(detail, str):
+        if isinstance(detail, str) and "GAMEAGENT_OUTCOME_CODE=" in detail:
+            markers = _GAMEAGENT_OUTCOME_CODE_PATTERN.findall(detail)
+            if len(markers) != detail.count("GAMEAGENT_OUTCOME_CODE="):
+                return None
+            codes.extend(markers)
+        if not codes or any(
+            not isinstance(code, str)
+            or not _GAMEAGENT_OUTCOME_CODE_VALUE_PATTERN.fullmatch(code)
+            for code in codes
+        ):
             return None
-        marker = _GAMEAGENT_OUTCOME_CODE_PATTERN.search(detail)
-        return marker.group(1) if marker is not None else None
+        return codes[0] if len(set(codes)) == 1 else None
+
+    @staticmethod
+    def _harness_result_format(
+        raw: Any,
+    ) -> Literal["native", "gameagent", "legacy-claude"] | None:
+        """Identify the envelope before validation, including broken receipts.
+
+        Presence of reserved fields identifies a family even if their values are
+        invalid. Multiple families are ambiguous, never an ordered parser list.
+        """
+        if not isinstance(raw, dict):
+            return None
+        detail = raw.get("error")
+        detail = detail if isinstance(detail, str) else ""
+        native = any(
+            isinstance(key, str) and key.startswith("native") for key in raw
+        ) or any(
+            key in raw for key in ("runTerminals", "runFailures", "exportedRunCount")
+        )
+        # Recognize the older native wrapper too, without treating it as a v1
+        # health receipt. This prevents a partial wrapper becoming legacy data.
+        native = native or raw.get("harness") == "AReaLHarness"
+        gameagent = (
+            "outcome" in raw
+            or "outcome_code" in raw
+            or "GAMEAGENT_OUTCOME_CODE=" in detail
+            or "gameagent.envarena:" in detail
+        )
+        claude = "harness: harness agent phase exited with code" in detail.lower() and (
+            "harness: agent phase error: claude " in detail.lower()
+            or "(claude=" in detail
+        )
+        if sum((native, gameagent, claude)) != 1:
+            return None
+        if native:
+            return "native"
+        return "gameagent" if gameagent else "legacy-claude"
 
     @staticmethod
     def _is_native_model_failure(raw: Any) -> bool:
@@ -678,25 +742,42 @@ class ArenaStreamAgentWorkflow:
         return code if code in HARNESS_OUTCOME_METRIC_CODES else "OTHER"
 
     @classmethod
-    def _is_model_attributed_harness_failure(cls, error: ArenaTaskFailedError) -> bool:
-        """Recognize explicit, allowlisted Harness model-failure outcomes."""
-
-        # Only the native receipt currently proves both execution/export health
-        # and model attribution. Legacy text and outcome codes do not establish
-        # health, and must never provide a fallback for an invalid receipt.
+    def _is_model_attributed_harness_failure(
+        cls, error: ArenaTaskFailedError, *, context_overflow: bool = False
+    ) -> bool:
+        """Select one result family, then apply only that family's admission rules."""
         result = error.result
         raw = result.raw if result is not None else None
-        if not isinstance(raw, dict):
+        result_format = cls._harness_result_format(raw)
+        if result_format is None:
             return False
-        if "outcome" in raw or "outcome_code" in raw:
+        if "trajectoryHealth" in raw and raw["trajectoryHealth"] != "healthy":
+            return False
+        if raw.get("failure") is not None:
+            return False
+        if "status" in raw and raw["status"] != "ERROR":
             return False
         detail = raw.get("error")
-        if isinstance(detail, str) and (
-            "GAMEAGENT_OUTCOME_CODE=" in detail
-            or "claude reported error" in detail.lower()
-        ):
+        if detail is not None and not isinstance(detail, str):
             return False
-        return cls._is_native_model_failure(raw)
+        detail = detail or ""
+        # Explicit runtime/provider errors cannot be overridden by a model code
+        # or by an overflow from an earlier request in the same trajectory.
+        if _HARNESS_SYSTEM_ERROR_PATTERN.search(detail):
+            return False
+        if result_format == "native":
+            return cls._is_native_model_failure(raw)
+        if result_format == "gameagent":
+            return cls._gameagent_outcome_code(raw) in _GAMEAGENT_MODEL_FAILURE_CODES
+        normalized = detail.lower()
+        if normalized.count(_CLAUDE_AGENT_ERROR_MARKER) != 1:
+            return False
+        _, _, reason = normalized.partition(_CLAUDE_AGENT_ERROR_MARKER)
+        if reason.strip():
+            return _CLAUDE_MODEL_ERROR_PATTERN.search(reason) is not None
+        # Some Claude result events omit their error detail. Only the proxy's
+        # typed overflow can attribute that otherwise empty agent error.
+        return context_overflow
 
     @classmethod
     def classify_proxy_failure(
@@ -706,11 +787,12 @@ class ArenaStreamAgentWorkflow:
         context_overflow: bool,
         interaction_count: int,
     ) -> str:
-        """Retain only healthy, explicitly model-attributed Harness failures.
+        """Retain model-attributed failures using the identified Harness format.
 
-        Overflow, timeout, missing output, and legacy outcome markers alone
-        cannot establish execution/export health. Unknown or conflicting evidence
-        is rejected; a failed health check never falls through to another format.
+        Format detection and admission are separate. An invalid native receipt,
+        conflicting outcome, or infrastructure error cannot be rescued by a
+        different parser or an earlier overflow. The proxy independently rejects
+        service errors and must successfully export usable interactions.
         """
         if not isinstance(error, ArenaTaskFailedError):
             return "system_failure_reject"
@@ -719,7 +801,9 @@ class ArenaStreamAgentWorkflow:
         if (
             error.status == "HARNESS_FAILED"
             and interaction_count > 0
-            and cls._is_model_attributed_harness_failure(error)
+            and cls._is_model_attributed_harness_failure(
+                error, context_overflow=context_overflow
+            )
         ):
             return "model_failure_zero"
         return "unknown_failure_reject"
