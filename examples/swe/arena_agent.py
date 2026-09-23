@@ -47,6 +47,10 @@ _GAMEAGENT_MODEL_FAILURE_CODES = {
     "AUTONOMOUS_INCOMPLETE_NO_SHIP",
 }
 _CLAUDE_AGENT_ERROR_MARKER = "harness: agent phase error: claude reported error:"
+_CLAUDE_LIFECYCLE_RECORD_PATTERN = re.compile(
+    r"\n(?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? )?"
+    r"harness: (running collect hook(?=\r?\n|$)|claude reported error:)"
+)
 _CLAUDE_MODEL_ERROR_PATTERN = re.compile(
     r"prompt (?:is )?too long|context (?:window|length) (?:exceeded|exhausted)"
     r"|exceeds? (?:the )?(?:maximum )?context (?:window|length)"
@@ -773,7 +777,19 @@ class ArenaStreamAgentWorkflow:
         if normalized.count(_CLAUDE_AGENT_ERROR_MARKER) != 1:
             return False
         _, _, reason = normalized.partition(_CLAUDE_AGENT_ERROR_MARKER)
-        if reason.strip():
+        # EnvArena runs collect after the agent error, then logs that error
+        # again. Keep multiline error details, but do not interpret collect
+        # output as the Claude reason. The whole-log system veto above still
+        # applies, and a conflicting repeated error is not model attribution.
+        records = _CLAUDE_LIFECYCLE_RECORD_PATTERN.split(reason)
+        if len(records) > 1 and records[-2] != "claude reported error:":
+            # A truncated collect log can hide a later infrastructure failure.
+            return False
+        reason = records[0].strip()
+        for marker, body in zip(records[1::2], records[2::2], strict=True):
+            if marker == "claude reported error:" and body.strip() != reason:
+                return False
+        if reason:
             return _CLAUDE_MODEL_ERROR_PATTERN.search(reason) is not None
         # Some Claude result events omit their error detail. Only the proxy's
         # typed overflow can attribute that otherwise empty agent error.

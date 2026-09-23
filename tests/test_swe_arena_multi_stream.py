@@ -1671,6 +1671,117 @@ def test_claude_failure_requires_specific_model_reason(
 
 
 @pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize("log_prefix", ["", "2026/09/23 12:00:00 "])
+@pytest.mark.parametrize("collect_hook", [False, True])
+@pytest.mark.parametrize(
+    "reason,model_error",
+    [
+        ("", None),
+        ("\n", None),
+        ("Prompt is too long", True),
+        ("\nPrompt is too long", True),
+        ("\nAn unspecified error occurred", False),
+    ],
+)
+def test_claude_failure_followed_by_lifecycle_logs_preserves_attribution(
+    reason, model_error, log_prefix, collect_hook, context_overflow
+):
+    """EnvArena collects and repeats the agent error after logging its reason."""
+    collect_log = (
+        f"{log_prefix}harness: running collect hook\nCollected 2 artifacts\n"
+        if collect_hook
+        else ""
+    )
+    raw = {
+        "error": "harness: harness agent phase exited with code 1: "
+        f"{log_prefix}harness: agent phase error: claude reported error: {reason}\n"
+        f"{collect_log}"
+        f"{log_prefix}harness: claude reported error: {reason}"
+    }
+    expected = (
+        "model_failure_zero"
+        if model_error is True or (model_error is None and context_overflow)
+        else "unknown_failure_reject"
+    )
+
+    assert (
+        _native_failure_disposition(raw, context_overflow=context_overflow) == expected
+    )
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize("reason", ["", "Prompt is too long"])
+def test_claude_failure_truncated_collect_log_is_rejected(reason, context_overflow):
+    """A log prefix cannot establish whether the collect phase later failed."""
+    full_log = (
+        f"harness: agent phase error: claude reported error: {reason}\n"
+        "harness: running collect hook\n"
+        "Collecting artifact " + "x" * 800 + "\n"
+        "harness: collect phase error: collect hook: exit status 1\n"
+        f"harness: claude reported error: {reason}"
+    )
+    raw = {
+        "error": "harness: harness agent phase exited with code 1: " + full_log[:800]
+    }
+
+    assert (
+        _native_failure_disposition(raw, context_overflow=context_overflow)
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize("reason", ["", "Prompt is too long"])
+def test_claude_failure_followed_by_collect_error_is_rejected(reason, context_overflow):
+    """A system failure after the agent error still vetoes model recovery."""
+    raw = {
+        "error": "harness: harness agent phase exited with code 1: "
+        f"harness: agent phase error: claude reported error: {reason}\n"
+        "harness: running collect hook\n"
+        "harness: collect phase error: collect hook: exit status 1\n"
+        f"harness: claude reported error: {reason}"
+    }
+
+    assert (
+        _native_failure_disposition(raw, context_overflow=context_overflow)
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize("reason", ["", "Prompt is too long"])
+def test_claude_failure_conflicting_terminal_error_is_rejected(
+    reason, context_overflow
+):
+    raw = {
+        "error": "harness: harness agent phase exited with code 1: "
+        f"2026/09/23 12:00:00 harness: agent phase error: claude reported error: {reason}\n"
+        "2026/09/23 12:00:00 harness: claude reported error: An unspecified error occurred"
+    }
+
+    assert (
+        _native_failure_disposition(raw, context_overflow=context_overflow)
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+def test_claude_failure_collect_output_does_not_supply_model_reason(context_overflow):
+    raw = {
+        "error": "harness: harness agent phase exited with code 1: "
+        "harness: agent phase error: claude reported error:\n"
+        "harness: running collect hook\n"
+        "Archived previous result: Prompt is too long\n"
+        "harness: claude reported error:"
+    }
+    expected = "model_failure_zero" if context_overflow else "unknown_failure_reject"
+
+    assert (
+        _native_failure_disposition(raw, context_overflow=context_overflow) == expected
+    )
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
 @pytest.mark.parametrize(
     "raw",
     [

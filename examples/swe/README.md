@@ -266,7 +266,9 @@ native validation can never fall through to GameAgent or Claude handling.
 - Legacy Claude requires its explicit agent-phase error envelope and a recognized
   context-limit or turn-limit error. If its error detail is empty, a typed context
   overflow recorded by the AReaL proxy may provide the missing attribution. Unknown
-  nonempty errors, service faults, and truncated startup logs are rejected.
+  nonempty errors, service faults, and truncated startup logs are rejected. Subsequent
+  collect logs are separate from the error detail and must end in a matching repeated
+  terminal error; truncated collect logs cannot establish safe recovery.
 
 An earlier overflow never overrides an invalid receipt, conflicting outcome, explicit
 infrastructure fault, or system terminal status. `TIMEOUT` and `NO_OUTPUT` alone remain

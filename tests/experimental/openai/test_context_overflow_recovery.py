@@ -544,13 +544,25 @@ async def test_arena_unhealthy_receipt_with_overflow_never_exports(monkeypatch, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("context_overflow", [False, True])
 @pytest.mark.parametrize(
-    "raw",
+    "raw,requires_overflow",
     [
-        {"outcome_code": "AGENT_MAX_TURNS_EXCEEDED"},
-        {
-            "error": "harness: harness agent phase exited with code 1: "
-            "harness: agent phase error: claude reported error: Prompt is too long"
-        },
+        ({"outcome_code": "AGENT_MAX_TURNS_EXCEEDED"}, False),
+        (
+            {
+                "error": "harness: harness agent phase exited with code 1: "
+                "harness: agent phase error: claude reported error: Prompt is too long"
+            },
+            False,
+        ),
+        (
+            {
+                "error": "harness: harness agent phase exited with code 1: "
+                "2026/09/23 12:00:00 harness: agent phase error: claude reported error:\n"
+                "2026/09/23 12:00:00 harness: running collect hook\n"
+                "2026/09/23 12:00:00 harness: claude reported error:"
+            },
+            True,
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -558,7 +570,7 @@ async def test_arena_unhealthy_receipt_with_overflow_never_exports(monkeypatch, 
     ["usable", "system_error", "no_interactions", "empty_export", "failed_export"],
 )
 async def test_arena_legacy_model_failure_requires_usable_proxy_trajectory(
-    monkeypatch, raw, context_overflow, trajectory
+    monkeypatch, raw, requires_overflow, context_overflow, trajectory
 ):
     """Real legacy classification only trains successfully exported model interactions."""
     monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
@@ -604,7 +616,9 @@ async def test_arena_legacy_model_failure_requires_usable_proxy_trajectory(
     )
     workflow_context.set(WorkflowContext(task_id=8))
     try:
-        if trajectory in {"system_error", "no_interactions"}:
+        if trajectory in {"system_error", "no_interactions"} or (
+            requires_overflow and not context_overflow
+        ):
             with pytest.raises(ArenaTaskFailedError):
                 await workflow.arun_episode(engine=None, data={})
             assert fake_client.last_reward is None
