@@ -15,24 +15,14 @@ def _environment(tmp_path):
     tools = tmp_path / "tools"
     tools.mkdir()
     scripts = {
-        "singularity": """while [[ $1 != bash ]]; do shift; done
-exec "$@"
+        "git": """case "${3}" in
+    rev-parse) printf '%s\\n' "${TEST_BRIDGE_REVISION}" ;;
+    status) printf '%s' "${TEST_BRIDGE_DIRTY:-}" ;;
+    *) exit 99 ;;
+esac
 """,
-        "uv": """echo "$*" >> "$TEST_LOG"
-if [[ $1 == venv ]]; then
-    runtime=${@: -1}
-    mkdir -p "$runtime/bin"
-    cat > "$runtime/bin/python" <<'RUNTIME'
-#!/usr/bin/env bash
-cat >/dev/null
-exit "${TEST_PROBE_EXIT:-0}"
-RUNTIME
-    chmod +x "$runtime/bin/python"
-else
-    exit "${TEST_SYNC_EXIT:-0}"
-fi
-""",
-        "sbatch": """printf '%s\\n' "$QWEN_TRAIN_PYTHON" "$QWEN_ACTOR_PYTHONPATH" "$QWEN_ROLLOUT_PYTHONPATH" >> "$TEST_SUBMITTED"
+        "uv": "exit 99\n",
+        "sbatch": """printf '%s\\n' "$QWEN_ACTOR_PYTHONPATH" "$QWEN_CONTROLLER_PYTHONPATH" "$QWEN_ROLLOUT_PYTHONPATH" >> "$TEST_SUBMITTED"
 """,
     }
     for name, script in scripts.items():
@@ -59,7 +49,9 @@ fi
         QWEN_MOUNTS=str(tmp_path),
         QWEN_CONTROLLER_MOUNTS=str(tmp_path),
         MEGATRON_ROOT="/inference/megatron",
-        QWEN_TRAIN_EXTRA_PYTHONPATH="/stale/transformers",
+        MCORE_BRIDGE_ROOT="/training/bridge",
+        QWEN_TRAIN_EXTRA_PYTHONPATH="/training/transformers",
+        TEST_BRIDGE_REVISION="557aaf93b16d083fdec4f82a8251d47d47c76ccb",
         QWEN_INFER_EXTRA_PYTHONPATH="/inference/overlay",
     )
     for key in ("QWEN_PRIVATE_ENV", "QWEN_ARENA_STREAMS_FILE"):
@@ -79,41 +71,37 @@ def _submit(env):
     )
 
 
-def test_submit_uses_fresh_shared_runtime_without_training_source_overrides(tmp_path):
+def test_submit_propagates_training_sources_without_changing_rollout(tmp_path):
     env = _environment(tmp_path)
-    for _ in range(2):
-        result = _submit(env)
-        assert result.returncode == 0, result.stderr
-    submitted = Path(env["TEST_SUBMITTED"]).read_text().splitlines()
-    assert submitted[0] != submitted[3]
-    assert all(Path(submitted[i]).is_file() for i in (0, 3))
-    assert submitted[1] == env["QWEN_REPO"]
-    assert submitted[2] == f"/inference/overlay:/inference/megatron:{env['QWEN_REPO']}"
-    commands = Path(env["TEST_LOG"]).read_text()
-    assert "--system-site-packages" in commands
-    assert (
-        "sync --locked --extra cuda --no-group transformers-default --group qwen-flash-next"
-        in commands
-    )
+    result = _submit(env)
+    assert result.returncode == 0, result.stderr
+    actor, controller, rollout = Path(env["TEST_SUBMITTED"]).read_text().splitlines()
+    assert actor == f"/training/transformers:/training/bridge/src:{env['QWEN_REPO']}"
+    assert controller == actor
+    assert rollout == f"/inference/overlay:/inference/megatron:{env['QWEN_REPO']}"
 
 
-@pytest.mark.parametrize("failure", ["TEST_SYNC_EXIT", "TEST_PROBE_EXIT"])
-def test_submit_does_not_schedule_after_runtime_preparation_failure(tmp_path, failure):
+@pytest.mark.parametrize(
+    "invalid_bridge",
+    [{"TEST_BRIDGE_REVISION": "wrong"}, {"TEST_BRIDGE_DIRTY": " M code.py"}],
+)
+def test_submit_does_not_schedule_with_invalid_bridge(tmp_path, invalid_bridge):
     env = _environment(tmp_path)
-    env[failure] = "7"
-    assert _submit(env).returncode == 7
+    env.update(invalid_bridge)
+    assert _submit(env).returncode != 0
     assert not Path(env["TEST_SUBMITTED"]).exists()
 
 
-def test_actor_yaml_uses_shared_interpreter_and_keeps_inference_separate():
+def test_yaml_passes_separate_pythonpaths_to_image_interpreters():
     config = yaml.safe_load((RECIPE / "swe_mm_rl.yaml").read_text())
-    actor = config["actor"]["scheduling_spec"][0]
-    assert actor["cmd"].startswith('"${oc.env:QWEN_TRAIN_PYTHON}" -m ')
-    assert actor["env_vars"]["QWEN_TRAIN_PYTHON"] == "${oc.env:QWEN_TRAIN_PYTHON}"
-    assert actor["image"] == "${oc.env:QWEN_ACTOR_IMAGE}"
-    rollout = config["rollout"]["scheduling_spec"][0]
-    assert "QWEN_TRAIN_PYTHON" not in rollout["cmd"]
-    assert rollout["image"] == "${oc.env:QWEN_ROLLOUT_IMAGE}"
+    for name, path in [
+        ("actor", "QWEN_ACTOR_PYTHONPATH"),
+        ("rollout", "QWEN_ROLLOUT_PYTHONPATH"),
+    ]:
+        spec = config[name]["scheduling_spec"][0]
+        assert spec["cmd"].startswith("python3 -m ")
+        assert spec["env_vars"]["PYTHONPATH"] == "${oc.env:" + path + "}"
+        assert spec["image"] == "${oc.env:QWEN_" + name.upper() + "_IMAGE}"
 
 
 @pytest.mark.parametrize("training_runtime", [False, True])

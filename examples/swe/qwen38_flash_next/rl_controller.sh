@@ -6,10 +6,6 @@ profile=${1:?Expected swe or swe-eval}; shift
 recipe_dir="$QWEN_REPO/examples/swe/qwen38_flash_next"
 export NO_PROXY='*' no_proxy='*'
 export PYTHONPATH=$QWEN_CONTROLLER_PYTHONPATH
-export PYTHONNOUSERSITE=1
-: "${QWEN_TRAIN_PYTHON:?submit_rl.sh must prepare the shared runtime}"
-test -x "$QWEN_TRAIN_PYTHON"
-export PATH="$(dirname "$QWEN_TRAIN_PYTHON"):$PATH"
 cd "$QWEN_REPO"
 case "$profile" in
   swe|swe-eval)
@@ -20,14 +16,14 @@ case "$profile" in
     export QWEN_ARENA_TRIAL=${QWEN_ARENA_TRIAL:-qwen_flash_next_$SLURM_JOB_ID}
     export QWEN_ARENA_OUTPUT="$QWEN_OUTPUT_ROOT/$QWEN_ARENA_TRIAL"
     export SWE_RL_ADMIN_API_KEY
-    SWE_RL_ADMIN_API_KEY=$("$QWEN_TRAIN_PYTHON" -c 'import secrets; print(secrets.token_urlsafe(32))')
+    SWE_RL_ADMIN_API_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
     mkdir -p "$QWEN_ARENA_OUTPUT"
     config=${QWEN_CONFIG:-$recipe_dir/swe_mm_rl.yaml}
     if [[ $profile == swe-eval ]]; then
       : "${QWEN_ARENA_TASK_IDS_FILE:?Set the exact reference task manifest}"
       test -f "$QWEN_ARENA_TASK_IDS_FILE"
     fi
-    exec "$QWEN_TRAIN_PYTHON" -m examples.swe.qwen38_flash_next.train_rl "$profile" \
+    exec python3 -m examples.swe.qwen38_flash_next.train_rl "$profile" \
       --config "$config" "$@"
     ;;
   *) echo 'Expected swe or swe-eval' >&2; exit 2 ;;

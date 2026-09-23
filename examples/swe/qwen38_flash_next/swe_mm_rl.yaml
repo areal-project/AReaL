@@ -232,7 +232,7 @@ actor:
     cpu: 4
     mem: 64
     mount: ${oc.env:QWEN_MOUNTS}
-    cmd: '"${oc.env:QWEN_TRAIN_PYTHON}" -m examples.swe.qwen38_flash_next.actor_worker'
+    cmd: python3 -m examples.swe.qwen38_flash_next.actor_worker
     reservation: ${oc.env:QWEN_RESERVATION}
     nodelist: ${oc.env:QWEN_NODELIST}
     exclusive: false
@@ -263,12 +263,9 @@ actor:
       PYTHONUNBUFFERED: '1'
       PYTHONPATH: ${oc.env:QWEN_ACTOR_PYTHONPATH}
       PYTHONNOUSERSITE: '1'
-      QWEN_TRAIN_PYTHON: ${oc.env:QWEN_TRAIN_PYTHON}
     additional_bash_cmds:
     - set -euo pipefail
     - set -a; source "$QWEN_PRIVATE_ENV"; set +a
-    - test -x "$QWEN_TRAIN_PYTHON"
-    - export PATH="$(dirname "$QWEN_TRAIN_PYTHON"):$PATH"
     - test "$TMS_INIT_ENABLE" = 0
     - test "$TMS_INIT_ENABLE_CPU_BACKUP" = 0
     - cd ${oc.env:QWEN_REPO}
