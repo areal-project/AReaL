@@ -85,9 +85,6 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
     engine._awex_adapter = None
     engine._weight_residency = None
     engine.hf_config = None
-    model = torch.nn.Module()
-    model.config = SimpleNamespace(calculate_per_token_loss=False)
-    engine.model = [model]
     engine.device = torch.device("cpu")
     # This test isolates loss scaling; metrics have their own batch-aware tests.
     monkeypatch.setattr(
