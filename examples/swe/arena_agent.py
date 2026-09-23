@@ -30,6 +30,7 @@ from examples.swe.arena_client import (
 from examples.swe.arena_config import load_arena_stream_configs
 from examples.swe.arena_types import ArenaStreamConfig
 
+from areal.experimental.openai.proxy.workflow import HARNESS_OUTCOME_METRIC_CODES
 from areal.infra import workflow_context
 from areal.utils import logging, stats_tracker
 from areal.utils.dynamic_import import import_from_string
@@ -37,6 +38,19 @@ from areal.utils.dynamic_import import import_from_string
 logger = logging.getLogger("ArenaStreamAgent")
 
 _ARENA_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
+_GAMEAGENT_OUTCOME_CODE_PATTERN = re.compile(
+    r"(?:^|\s)GAMEAGENT_OUTCOME_CODE=([A-Z][A-Z0-9_]{0,127})(?:\s|$)"
+)
+_GAMEAGENT_OUTCOME_CODE_VALUE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+_GAMEAGENT_MODEL_FAILURE_CODES = frozenset(
+    {
+        "AGENT_MAX_TURNS_EXCEEDED",
+        "AGENT_RUN_TIMEOUT",
+        "AUTONOMOUS_INCOMPLETE_NO_SHIP",
+        "LLM_RESPONSE_TIMEOUT",
+    }
+)
+_GAMEAGENT_OUTCOME_METRIC_CODES = tuple(sorted(HARNESS_OUTCOME_METRIC_CODES))
 _WORKER_GATEWAY_REGISTRY_ATTR = "_arena_session_gateway_registry_v1"
 _WORKER_GATEWAY_CLEANUP_KEY = "arena-session-gateway-registrations"
 
@@ -46,7 +60,12 @@ def _record_arena_metrics(**metrics: float) -> None:
 
 
 def _record_arena_domain_reward(reward: float, arena_task_type: str) -> None:
-    _record_arena_metrics(**{f"{arena_task_type}/reward": float(reward)})
+    _record_arena_metrics(
+        **{
+            f"{arena_task_type}/reward": float(reward),
+            f"domain/{arena_task_type}/reward": float(reward),
+        }
+    )
 
 
 @dataclass
@@ -496,6 +515,9 @@ class ArenaStreamAgentWorkflow:
         self._task_result_dumped: ContextVar[bool] = ContextVar(
             "arena_task_result_dumped", default=False
         )
+        self._proxy_session_id: ContextVar[str] = ContextVar(
+            "arena_proxy_session_id", default=""
+        )
         self.result_dump_dir = str(
             self.econfig.get("arena_result_dump_dir", "") or ""
         ).strip()
@@ -535,6 +557,14 @@ class ArenaStreamAgentWorkflow:
             reward is not None and self._is_solved_reward(reward, stream_config)
             for reward in rewards
         )
+        group_quality = {
+            "all_correct": float(pass_count == group_size),
+            "all_wrong": float(pass_count == 0),
+            **{
+                f"group_pass_count_{count}_ratio": float(count == pass_count)
+                for count in range(group_size + 1)
+            },
+        }
         group_pass_distribution = {
             f"group_pass_{count}": float(count == pass_count)
             for count in range(group_size + 1)
@@ -545,15 +575,57 @@ class ArenaStreamAgentWorkflow:
                 f"{arena_task_type}/pass@k": float(pass_count > 0),
                 f"stream/{stream_config.name}/pass@k": float(pass_count > 0),
                 **group_pass_distribution,
+                **group_quality,
+                **{
+                    f"{prefix}/{name}": value
+                    for prefix in (
+                        f"domain/{arena_task_type}",
+                        f"stream/{stream_config.name}",
+                    )
+                    for name, value in group_quality.items()
+                },
+                f"domain/{arena_task_type}/pass@k": float(pass_count > 0),
             }
         )
 
+    @staticmethod
+    def _gameagent_outcome_code(raw: Any) -> str | None:
+        """Read an explicit GameAgent outcome, preferring structured fields."""
+        if not isinstance(raw, dict):
+            return None
+        outcome = raw.get("outcome")
+        if isinstance(outcome, dict):
+            code = outcome.get("code")
+            if isinstance(
+                code, str
+            ) and _GAMEAGENT_OUTCOME_CODE_VALUE_PATTERN.fullmatch(code):
+                return code
+        code = raw.get("outcome_code")
+        if isinstance(code, str) and _GAMEAGENT_OUTCOME_CODE_VALUE_PATTERN.fullmatch(
+            code
+        ):
+            return code
+        detail = raw.get("error")
+        if not isinstance(detail, str):
+            return None
+        marker = _GAMEAGENT_OUTCOME_CODE_PATTERN.search(detail)
+        return marker.group(1) if marker is not None else None
+
+    @classmethod
+    def _gameagent_outcome_metric_code(cls, raw: Any) -> str:
+        """Normalize Harness outcomes to the bounded metric cardinality."""
+
+        code = cls._gameagent_outcome_code(raw)
+        return code if code in HARNESS_OUTCOME_METRIC_CODES else "OTHER"
+
     @classmethod
     def _is_model_attributed_harness_failure(cls, error: ArenaTaskFailedError) -> bool:
-        """Recognize the Harness' explicit Claude agent-phase failure envelope."""
+        """Recognize explicit, allowlisted Harness model-failure outcomes."""
 
         result = error.result
         raw = result.raw if result is not None else None
+        if cls._gameagent_outcome_code(raw) in _GAMEAGENT_MODEL_FAILURE_CODES:
+            return True
         if not isinstance(raw, dict):
             return False
         detail = raw.get("error")
@@ -573,13 +645,12 @@ class ArenaStreamAgentWorkflow:
         context_overflow: bool,
         interaction_count: int,
     ) -> str:
-        """Classify Arena failures without parsing grader-owned ``raw`` text.
+        """Keep attributed model failures without accepting arbitrary errors.
 
-        A typed local context overflow or the Harness' explicit Claude
-        agent-phase error envelope attributes the failure to the model-facing
-        agent lifecycle. Everything ambiguous is rejected until Arena exposes
-        versioned failure attribution and semantic codes in its stable result
-        envelope.
+        Explicit GameAgent outcomes, local context overflow, and the legacy
+        Claude agent-phase envelope may identify a model failure. A GameAgent
+        log marker is supported for Harnesses without structured outcome fields.
+        Unknown outcomes and system failures retain their rejection behavior.
         """
 
         if not isinstance(error, ArenaTaskFailedError):
@@ -612,6 +683,20 @@ class ArenaStreamAgentWorkflow:
             "training_score": float(reward),
             f"stream/{stream_config.name}/training_score": float(reward),
         }
+        is_harness_error = result is not None and result.status == "HARNESS_FAILED"
+        is_harness_success = result is not None and result.status in {"DONE", "OK"}
+        outcome_code = (
+            self._gameagent_outcome_metric_code(result.raw)
+            if is_harness_error and result is not None
+            else None
+        )
+        metrics["harness_success"] = float(is_harness_success)
+        metrics["harness_error"] = float(is_harness_error)
+        for code in _GAMEAGENT_OUTCOME_METRIC_CODES:
+            metrics[f"harness_error/{code}"] = float(outcome_code == code)
+        metrics["harness_error/OTHER"] = float(
+            is_harness_error and outcome_code not in _GAMEAGENT_OUTCOME_METRIC_CODES
+        )
         if result is not None and result.score is not None:
             metrics.update(
                 {
@@ -620,6 +705,7 @@ class ArenaStreamAgentWorkflow:
                     # never the heterogeneous Arena ``raw`` object.
                     "raw_reward": result.score,
                     f"{arena_task_type}/raw_reward": result.score,
+                    f"domain/{arena_task_type}/raw_reward": result.score,
                     "arena_raw_present": float(result.raw is not None),
                     "arena_trace_present": float(result.trace_id is not None),
                     "arena_artifacts_present": float(result.artifacts_uri is not None),
@@ -641,6 +727,28 @@ class ArenaStreamAgentWorkflow:
             self._task_result.set(None)
             self._task_result_dumped.set(False)
 
+    def get_episode_metadata(self) -> dict[str, str]:
+        """Return bounded identifiers used to join rollout and Arena audits."""
+
+        metadata: dict[str, str] = {}
+        session_id = self._proxy_session_id.get()
+        if session_id:
+            metadata["session_id"] = session_id
+        result = self._task_result.get()
+        if result is None:
+            return metadata
+        metadata.update(
+            {
+                "arena_task_id": result.task_id,
+                "arena_status": result.status,
+            }
+        )
+        if result.status == "HARNESS_FAILED":
+            metadata["harness_outcome_code"] = self._gameagent_outcome_metric_code(
+                result.raw
+            )
+        return metadata
+
     async def persist_episode_result(
         self,
         data: dict[str, Any],
@@ -658,6 +766,11 @@ class ArenaStreamAgentWorkflow:
             training_score=None if reward is None else float(reward),
         )
         self._task_result_dumped.set(True)
+
+    def get_session_metadata(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Supply generation defaults for requests that omit these fields."""
+        del data
+        return {"generation_args": dict(self.gen_args)} if self.gen_args else {}
 
     async def record_failure_disposition(
         self,
@@ -681,6 +794,7 @@ class ArenaStreamAgentWorkflow:
         """Launch the row's task with the current rollout proxy session."""
         self._task_result.set(None)
         self._task_result_dumped.set(False)
+        self._proxy_session_id.set("")
         stream_config = self._stream_config_for_data(data)
         stream_id = str(data.get("stream_id") or stream_config.stream_id or "")
         data_id = str(data.get("data_id") or "")
@@ -690,6 +804,7 @@ class ArenaStreamAgentWorkflow:
         proxy_base_url = extra_kwargs.get("base_url")
         proxy_api_key = extra_kwargs.get("api_key")
         proxy_session_id = str(extra_kwargs.get("session_id") or "").strip()
+        self._proxy_session_id.set(proxy_session_id)
         arena_http_client: httpx.AsyncClient | None = extra_kwargs.get(
             "arena_http_client"
         ) or extra_kwargs.get("http_client")
@@ -1190,7 +1305,14 @@ class ArenaStreamAgentWorkflow:
                 "stream_id": str(data.get("stream_id") or stream_config.stream_id),
                 "data_id": str(data.get("data_id") or ""),
                 "task_id": result.task_id,
+                "arena_task_id": result.task_id,
+                "session_id": self._proxy_session_id.get() or None,
                 "status": result.status,
+                "harness_outcome_code": (
+                    self._gameagent_outcome_metric_code(result.raw)
+                    if result.status == "HARNESS_FAILED"
+                    else None
+                ),
                 "expected_reward_ref": {
                     "key": expected_ref.key,
                     "version": expected_ref.version,

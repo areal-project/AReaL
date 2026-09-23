@@ -73,7 +73,7 @@ from .tensor_reference import GroupTensorStoreRegistry
 
 if TYPE_CHECKING:
     from areal.api import InferenceEngine
-    from areal.reward.prm import PRMRunner, PRMTurnResult
+    from areal.reward.prm import PRMRunner
 
 
 logger = getLogger("ProxyRolloutServer")
@@ -900,6 +900,42 @@ async def _call_client_create(
             raise HTTPException(status_code=500, detail=message) from e
         kwargs["messages"] = prepared_messages
 
+    defaults = dict(
+        getattr(_engine.config.agent, "chat_template_kwargs", {}) if _engine else {}
+    )
+    extra_body = dict(kwargs.get("extra_body") or {})
+    session_template = session_data.metadata.get("chat_template_kwargs") or {}
+    thinking_keys = ("thinking_option", "enable_thinking", "thinking")
+    template_kwargs = {}
+    for layer in (
+        defaults,
+        session_template,
+        extra_body.get("chat_template_kwargs") or {},
+        kwargs.pop("chat_template_kwargs", None) or {},
+    ):
+        effective = {
+            key: value
+            for key, value in layer.items()
+            if key not in thinking_keys or value is not None
+        }
+        # Thinking aliases share precedence, even when their names differ.
+        if any(key in effective for key in thinking_keys):
+            for key in thinking_keys:
+                template_kwargs.pop(key, None)
+        template_kwargs.update(effective)
+    session_thinking = {
+        key: value
+        for key, value in session_template.items()
+        if key in thinking_keys and value is not None
+    }
+    if session_thinking:
+        for key in thinking_keys:
+            template_kwargs.pop(key, None)
+        template_kwargs.update(session_thinking)
+    if template_kwargs:
+        extra_body["chat_template_kwargs"] = template_kwargs
+        kwargs["extra_body"] = extra_body
+
     dropped_args = []
     for k, v in kwargs.items():
         if k not in areal_client_allowed_args:
@@ -1144,9 +1180,11 @@ async def responses(
     )
 
 
-def _anthropic_tool_error_ids(anthropic_request: dict[str, Any]) -> set[str]:
-    """Return IDs of Anthropic tool results explicitly marked as errors."""
-    failed_ids: set[str] = set()
+def _anthropic_tool_result_statuses(
+    anthropic_request: dict[str, Any],
+) -> dict[str, bool]:
+    """Preserve explicit success and error states without inferring missing flags."""
+    statuses: dict[str, bool] = {}
     for message in anthropic_request.get("messages") or []:
         content = message.get("content") if isinstance(message, Mapping) else None
         if not isinstance(content, list):
@@ -1155,11 +1193,11 @@ def _anthropic_tool_error_ids(anthropic_request: dict[str, Any]) -> set[str]:
             if (
                 isinstance(block, Mapping)
                 and block.get("type") == "tool_result"
-                and block.get("is_error")
+                and isinstance(block.get("is_error"), bool)
                 and block.get("tool_use_id")
             ):
-                failed_ids.add(str(block["tool_use_id"]))
-    return failed_ids
+                statuses[str(block["tool_use_id"])] = block["is_error"]
+    return statuses
 
 
 def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) -> dict:
@@ -1170,15 +1208,15 @@ def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) ->
         raise ValueError("Failed to translate request")
     openai_request = dict(openai_request)
 
-    failed_ids = _anthropic_tool_error_ids(anthropic_request)
-    if failed_ids:
+    statuses = _anthropic_tool_result_statuses(anthropic_request)
+    if statuses:
         for message in openai_request.get("messages") or []:
             if (
                 isinstance(message, dict)
                 and message.get("role") == "tool"
-                and message.get("tool_call_id") in failed_ids
+                and message.get("tool_call_id") in statuses
             ):
-                message["is_error"] = True
+                message["is_error"] = statuses[message["tool_call_id"]]
 
     return openai_request
 
@@ -1336,8 +1374,7 @@ async def _score_prm_branches(
     Turn observations count each duplicated turn occurrence, and trajectory reward
     metrics sum the turn rewards once per exported branch.
     """
-    from areal.experimental.openai.cache import InteractionCache
-    from areal.reward.prm import record_prm_results
+    from areal.reward.prm.export import score_prm_branches
 
     if len(interactions) > 1:
         logger.warning(
@@ -1347,41 +1384,10 @@ async def _score_prm_branches(
             len(interactions),
         )
 
-    scored_interactions: dict[str, InteractionWithTokenLogpReward] = {}
-    committed_turn_results: list[PRMTurnResult] = []
-    committed_trajectory_metrics: list[tuple[str, float]] = []
-    for leaf_id, leaf in interactions.items():
-        branch_cache, cloned_leaf = InteractionCache.clone_chain(
-            leaf, session_id=session_id
-        )
-        if cloned_leaf.interaction_id != leaf_id:
-            raise ValueError(
-                "PRM exported leaf ID mismatch: "
-                f"mapping key {leaf_id!r}, interaction ID "
-                f"{cloned_leaf.interaction_id!r}"
-            )
-        full_messages = list(cloned_leaf.messages or []) + list(
-            cloned_leaf.output_message_list or []
-        )
-        branch_results = await runner.run(
-            branch_cache,
-            ctx={"messages": full_messages},
-            is_eval=is_eval,
-            record_metrics=False,
-        )
-        committed_turn_results.extend(branch_results)
-        branch_totals: dict[str, float] = {}
-        for result in branch_results:
-            branch_totals[result.scorer_name] = (
-                branch_totals.get(result.scorer_name, 0.0) + result.reward
-            )
-        committed_trajectory_metrics.extend(branch_totals.items())
-        scored_interactions[leaf_id] = cloned_leaf
-
-    record_prm_results(committed_turn_results, is_eval=is_eval)
-    tracker = stats_tracker.get("eval-rollout" if is_eval else "rollout")
-    for scorer_name, metric in committed_trajectory_metrics:
-        tracker.scalar(**{f"prm_trajectory_reward/{scorer_name}": metric})
+    scored_interactions, stats = await score_prm_branches(
+        interactions, runner, session_id=session_id, is_eval=is_eval
+    )
+    stats.record(is_eval=is_eval)
     return scored_interactions
 
 
@@ -1426,10 +1432,26 @@ async def export_trajectories(
                 is_eval=request.is_eval,
             )
         except Exception:
-            logger.exception(
-                "PRM runner failed for session %s; rejecting trajectory", session_id
+            if _prm_runner.config.error_policy == "keep_original":
+                logger.exception(
+                    "PRM runner failed for session %s; keeping pre-scoring rewards",
+                    session_id,
+                )
+                stats_tracker.get(
+                    "eval-rollout" if request.is_eval else "rollout"
+                ).scalar(prm_fallback=1.0)
+            else:
+                logger.exception(
+                    "PRM runner failed for session %s; rejecting trajectory", session_id
+                )
+                interactions = {}
+                stats_tracker.get(
+                    "eval-rollout" if request.is_eval else "rollout"
+                ).scalar(prm_fallback=0.0)
+        else:
+            stats_tracker.get("eval-rollout" if request.is_eval else "rollout").scalar(
+                prm_fallback=0.0
             )
-            interactions = {}
 
     # Remove session from cache and clean up API key mapping
     with _lock:

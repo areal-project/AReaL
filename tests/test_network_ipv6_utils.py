@@ -37,6 +37,57 @@ def test_dual_stack_environment_executes_correct_branch(ip_stack):
     assert ip not in {"127.0.0.1", "::1"}
 
 
+def test_gethostip_uses_custom_ipv6_probe(monkeypatch):
+    network = _load_network_module()
+    probe_host = "2001:db8::100"
+    probe_port = 4321
+    connect_calls = []
+
+    def fake_getaddrinfo(host, port, family, socktype):
+        if host == "local-host":
+            return []
+        assert (host, port, family, socktype) == (
+            probe_host,
+            probe_port,
+            network.socket.AF_UNSPEC,
+            network.socket.SOCK_DGRAM,
+        )
+        return [
+            (
+                network.socket.AF_INET6,
+                network.socket.SOCK_DGRAM,
+                0,
+                "",
+                (probe_host, probe_port, 0, 0),
+            )
+        ]
+
+    class FakeSocket:
+        def __init__(self, family, socktype, proto):
+            assert family == network.socket.AF_INET6
+            assert socktype == network.socket.SOCK_DGRAM
+            assert proto == 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def connect(self, sockaddr):
+            connect_calls.append(sockaddr)
+
+        def getsockname(self):
+            return ("2001:db8::200", 12345, 0, 0)
+
+    monkeypatch.setattr(network.socket, "gethostname", lambda: "local-host")
+    monkeypatch.setattr(network.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(network.socket, "socket", FakeSocket)
+
+    assert network.gethostip(probe_host, probe_port) == "2001:db8::200"
+    assert connect_calls == [(probe_host, probe_port, 0, 0)]
+
+
 def test_split_hostport_accepts_unbracketed_ipv6():
     network = _load_network_module()
     host, port = network.split_hostport("2001:db8::1:8000")

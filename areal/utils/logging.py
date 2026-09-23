@@ -36,6 +36,7 @@ LOG_PREFIX_WIDTH = 10  # Fixed width for alignment in merged.log
 #   - light_green: Stats, Perf, Dataset, Trainers (data/metrics)
 #   - light_cyan/cyan: Engines, Platforms, MCore (compute backends)
 LOGGER_COLORS_EXACT = {
+    "MTPTrainingTest": "light_cyan",
     # Schedulers - blue
     "LocalScheduler": "blue",
     "RayScheduler": "blue",

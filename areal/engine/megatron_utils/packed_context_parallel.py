@@ -11,6 +11,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 
 from areal.engine.core.model import SequencePackingMode
 from areal.utils.data import (
+    MicroBatchItem,
     MicroBatchList,
     align_mb_list_sequences,
     is_multi_modal_key,
@@ -342,6 +343,14 @@ def extract_vision_from_multi_modal(
     _drop_multi_modal_payload(mb)
 
 
+def prepare_vision_microbatch(source: MicroBatchItem) -> MicroBatchItem:
+    """Assemble current vision inputs without mutating reusable CPU sources."""
+    orig_mb = dict(source.orig_mb)
+    padded_mb = dict(source.padded_mb)
+    extract_vision_from_multi_modal(orig_mb, padded_mb)
+    return source._replace(orig_mb=orig_mb, padded_mb=padded_mb)
+
+
 def _reconstruct_padded_2d(
     input_ids: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -420,18 +429,13 @@ def _prepare_mtp_forward_kwargs(
             f"as 1-D tensors, got {labels.shape=} and {loss_mask.shape=}."
         )
 
-    if uses_model_packed_seq:
-        raise NotImplementedError(
-            "MTP training with model-owned THD packing is not supported yet."
-        )
-
     if labels.numel() != packed_num_tokens:
         raise ValueError(
             "MTP labels must match the packed sequence length, got "
             f"{labels.numel()} labels for {packed_num_tokens} tokens."
         )
 
-    if uses_padded_form:
+    if uses_padded_form and not uses_model_packed_seq:
         if attention_mask is None:
             raise ValueError("Padded MTP training requires a 2-D validity mask.")
         padded_labels = torch.zeros_like(input_ids)
@@ -508,10 +512,9 @@ def packed_context_parallel_forward(
                     "Attention mask and tree attention are not supported with "
                     "the model-packed THD forward."
                 )
-            if mpu.get_context_parallel_world_size() > 1:
-                raise NotImplementedError(
-                    "The model-packed THD forward does not support CP > 1 yet."
-                )
+            # Keep the full BSHD inputs on every CP rank. The bridge first fuses
+            # vision embeddings and computes multimodal RoPE, then partitions
+            # the resulting THD sequence with its model-owned CP layout.
             input_ids, attention_mask, _, max_seqlen = _reconstruct_padded_2d(
                 input_ids, cu_seqlens, input_.get("max_seqlen")
             )
@@ -559,13 +562,6 @@ def packed_context_parallel_forward(
             if key in input_:
                 vlm_kwargs[key] = input_[key]
 
-    # For BSHD text-only, drop the packed-form position_ids (a 1D tensor of
-    # length total_len) — they don't match the 2D [B, S] input. Let mcore
-    # compute the default torch.arange positions per row; padding positions
-    # are masked out by attention_mask.
-    if dense_mask_text_forward:
-        position_ids = None
-
     # MTP training: convert the independent label and mask channels to the
     # exact layout used by this forward. MCore rolls both once per MTP layer;
     # keeping them aligned prevents cross-sequence targets and masks padding
@@ -579,7 +575,7 @@ def packed_context_parallel_forward(
             attention_mask,
             cu_seqlens=cu_seqlens,
             packed_num_tokens=packed_num_tokens,
-            uses_padded_form=needs_padded_form,
+            uses_padded_form=is_vision_model and not use_model_packed_seq,
             uses_model_packed_seq=use_model_packed_seq,
         )
 

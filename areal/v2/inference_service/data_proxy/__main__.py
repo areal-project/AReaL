@@ -7,7 +7,9 @@ from __future__ import annotations
 import argparse
 
 import uvicorn
+from pydantic import TypeAdapter
 
+from areal.api.cli_args import PRMConfig
 from areal.infra.utils.http import (
     get_default_uvicorn_kwargs,
     validate_admin_api_key,
@@ -89,6 +91,11 @@ def main():
         "--prefix-matcher",
         default=None,
     )
+    parser.add_argument(
+        "--prm-config",
+        default="{}",
+        help="JSON-encoded PRMConfig for complete concat trajectory scoring.",
+    )
     args, _ = parser.parse_known_args()
 
     validate_admin_api_key(args.host, args.admin_api_key)
@@ -119,6 +126,7 @@ def main():
         chat_template_type=args.chat_template_type,
         message_preprocessors=tuple(args.message_preprocessor),
         prefix_matcher=args.prefix_matcher,
+        prm=TypeAdapter(PRMConfig).validate_json(args.prm_config),
     )
     suppress_http_loggers()
     app = create_app(config)

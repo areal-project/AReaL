@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from areal.api.cli_args import PRMConfig
 
 
 @dataclass
@@ -29,3 +31,16 @@ class DataProxyConfig:
     chat_template_type: str = "hf"
     message_preprocessors: tuple[str, ...] = ()
     prefix_matcher: str | None = None
+    prm: PRMConfig = field(default_factory=PRMConfig)
+
+    def __post_init__(self) -> None:
+        if self.prm.enabled and self.prm.scorers and self.prm.error_policy != "reject":
+            raise ValueError(
+                "PRM keep_original error policy is only supported by the v1 proxy"
+            )
+        if (
+            self.prm.enabled
+            and self.prm.scorers
+            and self.chat_template_type != "concat"
+        ):
+            raise ValueError("PRM scorers require chat_template_type='concat'")

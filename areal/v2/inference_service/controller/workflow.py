@@ -95,17 +95,27 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         session: aiohttp.ClientSession,
         reward: float,
         session_api_key: str,
+        rewards: dict[str, float] | None = None,
     ) -> int | None:
+        """Report the trajectory reward.
+
+        ``rewards`` optionally carries the per-interaction breakdown, applied
+        server-side in a single request so the trajectory is finalized once.
+        """
         url = f"{self.gateway_addr}/{_RL_SET_REWARD_PATHNAME}"
         headers = {"Authorization": f"Bearer {session_api_key}"}
-        payload: dict[str, Any] = {"interaction_id": None, "reward": reward}
+        payload: dict[str, Any] = {
+            "interaction_id": None,
+            "reward": reward,
+        }
+        if rewards is not None:
+            payload["rewards"] = rewards
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             data = await resp.json()
         trajectory_id = data.get("trajectory_id")
         return int(trajectory_id) if trajectory_id is not None else None
 
-    @async_http_retry
     async def _export_interactions(
         self,
         session: aiohttp.ClientSession,
@@ -113,25 +123,42 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         group_id: str | None = None,
         trajectory_id: int | None = None,
         discard_trajectory: bool = False,
+        remove_session: bool = True,
     ) -> dict[str, Any]:
-        url = f"{self.gateway_addr}/{_EXPORT_TRAJECTORIES_PATHNAME}"
-        headers = {"Authorization": f"Bearer {self._admin_api_key}"}
         payload: dict[str, Any] = {
             "session_ids": session_ids,
             "group_id": group_id,
             "trajectory_id": trajectory_id,
             "discount": self.discount,
             "style": self.export_style,
-            "remove_session": True,
+            "remove_session": remove_session,
             "drop_retry_orphans": self.drop_retry_orphans,
             "reward_normalization": self.reward_normalization,
             "discard_trajectory": discard_trajectory,
+            "is_eval": workflow_context.get().is_eval,
         }
+        data = await self._request_export(session, payload)
+        traj = deserialize_value(data["traj"])
+        if data.get("prm_stats") is not None:
+            from pydantic import TypeAdapter
+
+            from areal.reward.prm.export import PRMExportStats
+
+            stats = TypeAdapter(PRMExportStats).validate_python(data["prm_stats"])
+            # Outside the HTTP retry boundary, and before the empty-trajectory
+            # check: these are scoring observations, not training acceptance stats.
+            stats.record(is_eval=payload["is_eval"])
+        return traj
+
+    @async_http_retry
+    async def _request_export(
+        self, session: aiohttp.ClientSession, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        url = f"{self.gateway_addr}/{_EXPORT_TRAJECTORIES_PATHNAME}"
+        headers = {"Authorization": f"Bearer {self._admin_api_key}"}
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
-            data = await resp.json()
-
-        return deserialize_value(data["traj"])
+            return await resp.json()
 
     async def arun_episode(
         self,
@@ -193,16 +220,24 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                     http_client=http_client,
                     api_key=session_api_key,
                 )
+                step_rewards: dict[str, float] | None = None
                 if isinstance(rewards, dict):
-                    final_reward = float(
-                        next(reversed(rewards.values())) if rewards else 0.0
-                    )
+                    if rewards:
+                        step_rewards = {str(k): float(v) for k, v in rewards.items()}
+                        final_reward = float(next(reversed(rewards.values())))
+                    else:
+                        final_reward = 0.0
                 elif isinstance(rewards, (int, float)):
                     final_reward = float(rewards)
                 else:
                     raise ValueError(f"Invalid reward type: {type(rewards)}")
 
-                await self._set_last_reward(http_session, final_reward, session_api_key)
+                await self._set_last_reward(
+                    http_session,
+                    final_reward,
+                    session_api_key,
+                    rewards=step_rewards,
+                )
                 return final_reward
             except Exception as exc:
                 is_conn_err = isinstance(exc, _CONNECTION_ERROR_TYPES) or (
@@ -221,14 +256,9 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                         exc,
                         exc_info=True,
                     )
-                try:
-                    await self._set_last_reward(http_session, 0.0, session_api_key)
-                except Exception:
-                    logger.warning(
-                        "Failed to set reward for session %s in group %s",
-                        session_id,
-                        group_id,
-                    )
+                # Failed groups are discarded below, so a fallback reward is
+                # unnecessary and can trigger another round of HTTP retries.
+                # Discard export still handles session cleanup.
                 return None
             finally:
                 logger.debug(
@@ -297,10 +327,15 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         if not export_request:
             return None
 
+        session_id = export_request["session_id"]
         traj = await self._export_interactions(
             http_session,
-            [export_request["session_id"]],
+            [session_id],
             trajectory_id=export_request["trajectory_id"],
+            # The persistent HITL session may receive its next trajectory while
+            # this export awaits scoring. Ordinary session-key exports still end
+            # their session so that the key can be refreshed.
+            remove_session=session_id != "__hitl__",
         )
         if not traj:
             return None

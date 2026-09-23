@@ -19,7 +19,7 @@ from areal.trainer.ppo.gae import (
     _compute_turn_level_gae,
 )
 from areal.trainer.ppo.lambda_fn import resolve_gae_lambda_fn
-from areal.trainer.ppo.stats import infer_token_denominator
+from areal.trainer.ppo.stats import infer_token_denominator, log_train_inference_stats
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
     PROX_APPROX_METHOD_LINEAR,
@@ -48,6 +48,7 @@ from areal.utils.functional import (
     sapo_loss_fn,
 )
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.stats_tracker import ReduceType
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
@@ -442,6 +443,12 @@ class PPOActor:
                 "include 'turn_ids'."
             )
         # Apply the mask to log probabilities.
+        if data.get("prox_logp") is not None:
+            log_train_inference_stats(
+                data["prox_logp"],
+                torch.roll(data["logprobs"], shifts=-1, dims=-1),
+                loss_mask.bool(),
+            )
         if not self.config.use_decoupled_loss and self.config.recompute_logprob:
             # Overwrite logprobs produced by the inference engine
             prox_logp_value = data["prox_logp"]
@@ -722,6 +729,13 @@ class PPOActor:
                 final_reward=data["tot_rewards"],
                 denominator="n_valid_tokens",
             )
+            stats_tracker.stat_compact(
+                loss_mask.bool(),
+                ReduceType.AVG,
+                advantage_positive_fraction=(data["advantages"] > 0).float(),
+                advantage_negative_fraction=(data["advantages"] < 0).float(),
+                advantage_zero_fraction=(data["advantages"] == 0).float(),
+            )
 
         prompt_lens = _infer_prompt_lens(data["attention_mask"], data["loss_mask"])
         seq_truncated_mask = _get_truncated_mask(data, seqlens)
@@ -732,6 +746,16 @@ class PPOActor:
             seq_len=seqlens.float(),
         )
         stats_tracker.stat(**seq_stats, denominator="n_seqs")
+        if "versions" in data:
+            # Both regular advantage preprocessing and pure MOPD retain raw
+            # token-position versions. Align only the diagnostic copy here;
+            # changing proximal approximation requires separate validation.
+            metric_versions = torch.roll(data["versions"], shifts=-1, dims=-1)
+            metric_versions[..., -1] = -1
+            with stats_tracker.scope("update"):
+                _log_version_staleness_stats(
+                    metric_versions, self.engine.get_version(), loss_mask.bool()
+                )
         if group_metrics is not None:
             group_starts, usable_group_sizes, group_loss_weights = group_metrics
             stats_tracker.stat(
@@ -945,11 +969,56 @@ class PPOActorControllerV2(GatewayTrainController):
         return self._gateway_post_result("/ppo/actor/compute_logp", payload)
 
     def compute_advantages(self, *args, **kwargs):
+        multi_modal_payloads = []
+        if (
+            self.train_alloc.backend == "megatron"
+            and args
+            and isinstance(args[0], list)
+            and all(isinstance(item, dict) for item in args[0])
+        ):
+            data = args[0]
+            multi_modal_payloads = [
+                {key: value for key, value in item.items() if is_multi_modal_key(key)}
+                for item in data
+            ]
+            if any(multi_modal_payloads):
+                # Match v1: advantage computation never consumes vision data.
+                # Keep the original references here, avoiding a worker round
+                # trip and replication when the batched result is split.
+                args = (
+                    [
+                        {
+                            key: value
+                            for key, value in item.items()
+                            if not is_multi_modal_key(key)
+                        }
+                        for item in data
+                    ],
+                    *args[1:],
+                )
         payload = {
             "args": serialize_value(list(args)),
             "kwargs": serialize_value(kwargs),
         }
-        return self._gateway_post_result("/ppo/actor/compute_advantages", payload)
+        results = self._gateway_post_result("/ppo/actor/compute_advantages", payload)
+        if any(multi_modal_payloads):
+            if not isinstance(results, list) or len(results) != len(
+                multi_modal_payloads
+            ):
+                raise RuntimeError(
+                    "Megatron compute_advantages returned an invalid trajectory batch: "
+                    f"expected {len(multi_modal_payloads)} items, got "
+                    f"{type(results).__name__} of length "
+                    f"{len(results) if isinstance(results, list) else 'unknown'}"
+                )
+            for result, mm_payload in zip(results, multi_modal_payloads, strict=True):
+                if not isinstance(result, dict):
+                    raise RuntimeError(
+                        "Megatron compute_advantages returned a non-dict trajectory: "
+                        f"{type(result).__name__}"
+                    )
+                result.update(mm_payload)
+        return results
 
     def ppo_update(self, *args, **kwargs) -> None:
         payload = {
@@ -1285,15 +1354,6 @@ def grpo_loss_fn(
         current_version=current_version,
         compute_logp_mask=compute_logp_mask,
     )
-
-    # Log version staleness metrics
-    if "versions" in input_data and current_version is not None:
-        version_metrics_mask = stat.get("behave_mask", loss_mask)
-        _log_version_staleness_stats(
-            versions=input_data["versions"],
-            current_version=current_version,
-            version_metrics_mask=version_metrics_mask,
-        )
 
     return loss
 
@@ -1773,39 +1833,48 @@ def _log_version_staleness_stats(
     Log sample staleness metrics based on policy versions.
 
     Args:
-        versions: Per-token policy versions from rollout.
-        current_version: Current training version.
-        version_metrics_mask: Mask for valid tokens.
+        versions: Rollout versions aligned to next-token prediction positions.
+        current_version: Last published policy version, before the PPO update.
+        version_metrics_mask: Batch loss mask before M2/rejection filtering.
     """
     with stats_tracker.scope("version_stats"):
-        stats_tracker.denominator(n_valid_tokens=version_metrics_mask.bool())
+        valid_generated_mask = version_metrics_mask.bool() & (versions >= 0)
 
-        v_proximal = current_version - 1
+        # The trainer publishes actor and rollout versions together AFTER an
+        # update. Before the next update, proximal uses that published version.
+        # Retain theta/proximal keys as aliases for checkpoint age, not an
+        # optimizer-minibatch counter.
+        v_proximal = current_version
         v_theta = current_version
         v_behave = versions.float()
 
-        # Filter to generated tokens only (version >= 0)
-        valid_generated_mask = version_metrics_mask & (versions >= 0)
-
-        if not valid_generated_mask.any():
-            return
-
-        # Compute staleness for valid tokens
-        staleness_proximal = (v_proximal - v_behave)[valid_generated_mask]
-        staleness_theta = (v_theta - v_behave)[valid_generated_mask]
-
-        # Compute and log statistics
-        proximal_stats = _tensor_scalar_stats(staleness_proximal)
-        theta_stats = _tensor_scalar_stats(staleness_theta)
-
+        # Retain full shapes and reduce by token count, not microbatch count.
+        # In particular, extrema must not be averaged across workers.
+        for suffix, reduction in (
+            ("avg", ReduceType.AVG),
+            ("min", ReduceType.MIN),
+            ("max", ReduceType.MAX),
+        ):
+            stats_tracker.stat_compact(
+                valid_generated_mask,
+                reduction,
+                **{
+                    f"sample_staleness_proximal_{suffix}": v_proximal - v_behave,
+                    f"sample_staleness_theta_{suffix}": v_theta - v_behave,
+                },
+            )
+        stats_tracker.stat_compact(
+            valid_generated_mask,
+            ReduceType.SUM,
+            n_valid_generated_tokens=torch.ones_like(v_behave),
+        )
+        stats_tracker.stat_compact(
+            valid_generated_mask,
+            ReduceType.AVG,
+            stale_token_fraction=(v_behave < v_proximal).float(),
+            future_token_fraction=(v_behave > v_theta).float(),
+        )
         stats_tracker.scalar(
-            sample_staleness_proximal_avg=proximal_stats["avg"],
-            sample_staleness_proximal_max=proximal_stats["max"],
-            sample_staleness_proximal_min=proximal_stats["min"],
-            sample_staleness_theta_avg=theta_stats["avg"],
-            sample_staleness_theta_max=theta_stats["max"],
-            sample_staleness_theta_min=theta_stats["min"],
             v_theta=v_theta,
             v_proximal=v_proximal,
-            n_valid_generated_tokens=valid_generated_mask.sum().item(),
         )

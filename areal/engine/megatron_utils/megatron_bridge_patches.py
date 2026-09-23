@@ -12,6 +12,7 @@ sentinel prevents double-application. Apply patches at import time via
 from __future__ import annotations
 
 import contextvars
+import inspect
 
 import areal.utils.logging as logging
 
@@ -243,12 +244,14 @@ def _patch_gpt_model_mtp_training() -> None:
         out = _orig_get_embeddings(self, *args, **kwargs)
         if _MTP_TRAIN_LABELS.get() is None:
             return out
-        input_ids, position_ids, decoder_input, hidden_states = out
+        # MCore 0.18 adds padding_mask before the two activation tensors.
+        # Preserve all layout metadata for both the four- and five-item APIs.
+        *layout, decoder_input, hidden_states = out
         # detach the shared embedding output and the backbone hidden states so
         # only MTP-internal parameters receive gradients.
         decoder_input = decoder_input.detach()
         hidden_states = hidden_states.detach().requires_grad_(True)
-        return input_ids, position_ids, decoder_input, hidden_states
+        return (*layout, decoder_input, hidden_states)
 
     MultiTokenPredictionLayer._get_embeddings = _patched_get_embeddings
 
@@ -300,10 +303,43 @@ def _patch_qwen3vl_mtp_training() -> None:
     )
 
 
+def _patch_mtp_checkpoint_padding_mask() -> None:
+    """Handle MCore 0.18's missing padding-mask argument for THD recompute.
+
+    Its layer forward passes padding_mask even when None, but the checkpoint
+    method predates that argument. A real mask cannot be discarded safely.
+    """
+    try:
+        from megatron.core.transformer.multi_token_prediction import (
+            MultiTokenPredictionLayer,
+        )
+    except ImportError:
+        return
+    original = MultiTokenPredictionLayer._checkpointed_forward
+    if (
+        "padding_mask"
+        not in inspect.signature(MultiTokenPredictionLayer.forward).parameters
+        or "padding_mask" in inspect.signature(original).parameters
+    ):
+        return
+
+    def checkpointed_forward(self, *args, padding_mask=None, **kwargs):
+        if padding_mask is not None:
+            raise NotImplementedError(
+                "This Megatron-Core version does not support an MTP padding mask "
+                "with full recomputation. Use THD packing without a padding mask "
+                "or disable full recomputation."
+            )
+        return original(self, *args, **kwargs)
+
+    MultiTokenPredictionLayer._checkpointed_forward = checkpointed_forward
+
+
 def _apply_patches_on_import() -> None:
     _patch_qwen3vl_pr3143_word_embeddings()
     _patch_gpt_model_mtp_training()
     _patch_qwen3vl_mtp_training()
+    _patch_mtp_checkpoint_padding_mask()
 
 
 _apply_patches_on_import()

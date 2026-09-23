@@ -39,18 +39,39 @@ def gethostip(probe_host: str = "8.8.8.8", probe_port: int = 80) -> str:
         pass
 
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect((probe_host, probe_port))
-            return sock.getsockname()[0]
-    except OSError as e:
+        probe_infos = socket.getaddrinfo(
+            probe_host, probe_port, socket.AF_UNSPEC, socket.SOCK_DGRAM
+        )
+    except socket.gaierror:
+        probe_infos = []
+
+    # Keep an IPv6 fallback for the default IPv4-only probe address while
+    # respecting custom IPv6 addresses supplied by callers.
+    if probe_host == "8.8.8.8":
+        probe_infos.append(
+            (
+                socket.AF_INET6,
+                socket.SOCK_DGRAM,
+                0,
+                "",
+                ("2001:4860:4860::8888", probe_port, 0, 0),
+            )
+        )
+
+    last_error = None
+    for family, socktype, proto, _, sockaddr in probe_infos:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
         try:
-            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
-                sock.connect(("2001:4860:4860::8888", probe_port))
-                ip6 = sock.getsockname()[0]
-                if ip6 and ip6 != "::1":
-                    return ip6
-        except OSError:
-            raise RuntimeError("Could not determine host IP") from e
+            with socket.socket(family, socktype, proto) as sock:
+                sock.connect(sockaddr)
+                ip = sock.getsockname()[0]
+                if ip and ip not in {"127.0.0.1", "::1"}:
+                    return ip
+        except OSError as e:
+            last_error = e
+
+    raise RuntimeError("Could not determine host IP") from last_error
 
 
 def get_loopback_ip() -> str:

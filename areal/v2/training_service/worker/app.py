@@ -134,17 +134,25 @@ def _execute_compute(
                     )
 
             if group is not None:
+                # Match v1: opt in by engine capability on every rank. The
+                # broadcast source selects the alias protocol only for VLM data.
+                preserve_broadcast_aliases = (
+                    method_name in cpu_staged_methods
+                    and getattr(engine, "is_vision_model", False)
+                )
                 args = tensor_container_to(args, broadcast_device)
                 kwargs = tensor_container_to(kwargs, broadcast_device)
                 args = broadcast_tensor_container(
                     args,
                     src_rank=engine.current_data_parallel_head(),
                     group=group,
+                    preserve_tensor_aliases=preserve_broadcast_aliases,
                 )
                 kwargs = broadcast_tensor_container(
                     kwargs,
                     src_rank=engine.current_data_parallel_head(),
                     group=group,
+                    preserve_tensor_aliases=preserve_broadcast_aliases,
                 )
         return method(*args, **kwargs)
 

@@ -7,7 +7,7 @@ import hmac
 import json
 import uuid
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 import httpx
@@ -38,7 +38,7 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import serialize_value
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
-from areal.utils.data import concat_padded_tensors
+from areal.utils.data import concat_padded_tensors, is_multi_modal_key
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.seeding import derive_deterministic_seed
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
@@ -70,7 +70,14 @@ def _remotize_trajectory(traj: dict[str, Any], node_addr: str) -> dict[str, Any]
     """Keep scalar reward metadata local while remotizing large tensors."""
     inline = {key: traj[key] for key in _INLINE_TRAJECTORY_FIELDS if key in traj}
     remote_payload = {key: value for key, value in traj.items() if key not in inline}
-    remotized = RTensor.remotize(remote_payload, node_addr=node_addr)
+    # Export already combines all sessions in a group into one trajectory dict.
+    # A single memo therefore covers every occurrence of its shared images.
+    if any(is_multi_modal_key(key) for key in remote_payload):
+        remotized = RTensor.remotize(
+            remote_payload, node_addr=node_addr, preserve_tensor_aliases=True
+        )
+    else:
+        remotized = RTensor.remotize(remote_payload, node_addr=node_addr)
     return {**remotized, **inline}
 
 
@@ -386,35 +393,63 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         )
         app.state.session_store.set_admin_key(config.admin_api_key)
         app.state.version = 0
-        app.state.http_client = create_httpx_client(timeout=config.request_timeout)
+        app.state.tokenizer = None
+        app.state.inf_bridge = None
+        app.state.areal_client = None
+        app.state.prm_runner = None
 
-        if not config.backend_addr:
-            app.state.tokenizer = None
-            app.state.inf_bridge = None
-            app.state.areal_client = None
-        else:
-            tok = TokenizerProxy(config.tokenizer_path)
-            inf_bridge = _create_inf_bridge(config.backend_addr, pause_state, config)
-            areal_client = _create_areal_client(inf_bridge, tok, config)
-            app.state.tokenizer = tok
-            app.state.inf_bridge = inf_bridge
-            app.state.areal_client = areal_client
-
-        ready_task = asyncio.create_task(_ready_trajectory_loop(app))
-        try:
-            yield
-        finally:
-            ready_task.cancel()
-            try:
-                await ready_task
-            except asyncio.CancelledError:
-                pass
+        async def close_current_bridge():
+            # /configure_backend can replace the startup-time bridge.
             if app.state.inf_bridge is not None:
                 await app.state.inf_bridge.aclose()
-            await app.state.http_client.aclose()
+
+        async with AsyncExitStack() as resources:
+            app.state.http_client = create_httpx_client(timeout=config.request_timeout)
+            resources.push_async_callback(app.state.http_client.aclose)
+            resources.push_async_callback(close_current_bridge)
+
+            if config.backend_addr:
+                tok = TokenizerProxy(config.tokenizer_path)
+                app.state.tokenizer = tok
+                inf_bridge = _create_inf_bridge(
+                    config.backend_addr, pause_state, config
+                )
+                app.state.inf_bridge = inf_bridge
+                app.state.areal_client = _create_areal_client(inf_bridge, tok, config)
+
+            if config.prm.enabled and config.prm.scorers:
+                from areal.reward.prm import PRMRunner
+
+                try:
+                    app.state.prm_runner = await PRMRunner.create(config.prm)
+                except BaseException as startup_error:
+                    # Drain the stack here so service cleanup cannot replace the
+                    # original scorer construction/validation error on exit.
+                    try:
+                        await resources.aclose()
+                    except Exception as cleanup_error:
+                        logger.exception(
+                            "Failed to close resources after PRM startup failure"
+                        )
+                        startup_error.add_note(
+                            f"Service cleanup after PRM startup failed: {cleanup_error}"
+                        )
+                    raise
+                resources.push_async_callback(app.state.prm_runner.aclose)
+
+            ready_task = asyncio.create_task(_ready_trajectory_loop(app))
+            try:
+                yield
+            finally:
+                ready_task.cancel()
+                try:
+                    await ready_task
+                except asyncio.CancelledError:
+                    pass
         logger.info("Data proxy shutting down")
 
     app = FastAPI(title="AReaL Data Proxy", lifespan=lifespan)
+    app.state.prm_runner = None
     _registered_models: dict[str, dict[str, str | None]] = {}
 
     async def _create_internal_chat_result(
@@ -431,6 +466,11 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         kwargs.setdefault("temperature", 1.0)
         kwargs.setdefault("top_p", 1.0)
         areal_cache = session.active_completions if session is not None else None
+        # Cache ownership comes from authenticated session creation, never from
+        # the request body. Text-only and ungrouped requests keep the old path.
+        kwargs.pop("processor_cache", None)
+        if session is not None and session.processor_cache is not None:
+            kwargs["processor_cache"] = session.processor_cache
 
         deterministic_sampling = session is not None and config.deterministic_sampling
         request_index = (
@@ -572,6 +612,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     sampling_seed_identity=(
                         f"{body.task_id}:{i}" if group_size > 1 else body.task_id
                     ),
+                    processor_cache_group_id=group_id if group_size > 1 else None,
+                    processor_cache_group_size=group_size,
                 )
             except ValueError as e:
                 raise HTTPException(status_code=409, detail=str(e))
@@ -593,10 +635,17 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             )
 
         try:
-            reward_result = session.set_reward(
-                interaction_id=body.interaction_id,
-                reward=body.reward,
-            )
+            if body.rewards is not None:
+                if not body.rewards:
+                    raise HTTPException(
+                        status_code=400, detail="rewards must not be empty"
+                    )
+                reward_result = session.set_rewards(body.rewards)
+            else:
+                reward_result = session.set_reward(
+                    interaction_id=body.interaction_id,
+                    reward=body.reward,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -853,7 +902,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     # Trajectory export (admin key required)
     # =========================================================================
 
-    @app.post("/export_trajectories")
+    @app.post("/export_trajectories", response_model_exclude_unset=True)
     async def export_trajectories(
         body: ExportTrajectoriesRequest, request: Request
     ) -> ExportTrajectoriesResponse:
@@ -866,55 +915,134 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 detail="session_ids must be a non-empty list",
             )
 
+        prm_runner = app.state.prm_runner
+        if config.prm.enabled and config.prm.scorers and prm_runner is None:
+            raise HTTPException(status_code=503, detail="PRM runner is not initialized")
+
+        if prm_runner is not None and not body.discard_trajectory:
+            if body.style != "concat":
+                raise HTTPException(
+                    status_code=400, detail="PRM scorers require style='concat'"
+                )
+            if len(set(body.session_ids)) != len(body.session_ids):
+                raise HTTPException(
+                    status_code=400, detail="PRM export requires distinct session_ids"
+                )
+
         grouped_interactions: list[
             dict[str, InteractionWithTokenLogpReward] | None
         ] = []
 
-        for sid in body.session_ids:
-            session = store.get_session(sid)
-            if session is None:
-                grouped_interactions.append(None)
-                continue
-
-            try:
-                _, interactions = session.export_trajectory(
-                    discount=body.discount,
-                    style=body.style,
-                    trajectory_id=body.trajectory_id,
-                    drop_retry_orphans=body.drop_retry_orphans,
-                )
-                grouped_interactions.append(interactions)
-            except KeyError:
-                grouped_interactions.append(None)
-                continue
-
-        if body.discard_trajectory:
-            grouped_interactions = []
-        elif body.reward_normalization and len(body.session_ids) > 1:
-            if not normalize_group_rewards(grouped_interactions):
-                logger.warning(
-                    "Reward normalization dropped an incomplete group (%d sessions)",
-                    len(body.session_ids),
-                )
-                grouped_interactions = []
-
-        merged: dict[str, InteractionWithTokenLogpReward] = {}
-        for interactions in grouped_interactions:
-            if interactions is not None:
-                merged.update(interactions)
-
-        if all(v.has_tensor_data for v in merged.values()):
-            traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
-            traj = _remotize_trajectory(traj, node_addr=config.serving_addr)
-        else:
-            traj = concat_string_interactions(merged)
-
-        if body.remove_session:
+        owned_sessions: dict[str, SessionData] = {}
+        try:
+            # Claim every ready trajectory before the first scoring await. A
+            # concurrent/retried export must not consume part of the same group.
             for sid in body.session_ids:
-                store.remove_session(sid)
+                session = store.get_session(sid)
+                if session is None:
+                    grouped_interactions.append(None)
+                    continue
+                owned_sessions[sid] = session
+                try:
+                    _, interactions = session.export_trajectory(
+                        discount=body.discount,
+                        style=body.style,
+                        trajectory_id=body.trajectory_id,
+                        drop_retry_orphans=body.drop_retry_orphans,
+                    )
+                    grouped_interactions.append(interactions)
+                except KeyError:
+                    grouped_interactions.append(None)
 
-        serialized = serialize_value(traj)
-        return ExportTrajectoriesResponse(traj=serialized)
+            prm_stats = None
+            if body.discard_trajectory:
+                grouped_interactions = []
+            elif prm_runner is not None:
+                from areal.reward.prm.export import PRMExportStats, score_prm_branches
+
+                prm_stats = PRMExportStats()
+
+                async def score_session(
+                    sid: str,
+                    interactions: dict[str, InteractionWithTokenLogpReward] | None,
+                ) -> (
+                    tuple[dict[str, InteractionWithTokenLogpReward], PRMExportStats]
+                    | None
+                ):
+                    if not interactions:
+                        return None
+                    try:
+                        return await score_prm_branches(
+                            interactions,
+                            prm_runner,
+                            session_id=sid,
+                            is_eval=body.is_eval,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "PRM runner failed for session %s; rejecting group", sid
+                        )
+                        return None
+
+                # Match v1's independently exported group members. Serial judge
+                # calls can exceed the gateway timeout even when each succeeds.
+                # Wait for session-scoring tasks before releasing their sessions.
+                async with asyncio.TaskGroup() as scoring:
+                    tasks = [
+                        scoring.create_task(score_session(sid, interactions))
+                        for sid, interactions in zip(
+                            body.session_ids, grouped_interactions, strict=True
+                        )
+                    ]
+                rejected = False
+                for index, task in enumerate(tasks):
+                    result = task.result()
+                    if result is None:
+                        rejected = True
+                        continue
+                    scored, session_stats = result
+                    grouped_interactions[index] = scored
+                    # Match v1: successfully scored sessions contribute metrics
+                    # even if a different member later rejects the whole group.
+                    prm_stats.extend(session_stats)
+                if rejected:
+                    grouped_interactions = []
+
+            # Scorers see original outcome rewards, just as in v1. Keep v2's
+            # existing group normalization; process token rewards are untouched.
+            if (
+                grouped_interactions
+                and body.reward_normalization
+                and len(body.session_ids) > 1
+            ):
+                if not normalize_group_rewards(grouped_interactions):
+                    logger.warning(
+                        "Reward normalization dropped an incomplete group (%d sessions)",
+                        len(body.session_ids),
+                    )
+                    grouped_interactions = []
+
+            merged: dict[str, InteractionWithTokenLogpReward] = {}
+            for interactions in grouped_interactions:
+                if interactions is not None:
+                    merged.update(interactions)
+
+            if all(v.has_tensor_data for v in merged.values()):
+                traj = concat_padded_tensors(
+                    [v.to_tensor_dict() for v in merged.values()]
+                )
+                traj = _remotize_trajectory(traj, node_addr=config.serving_addr)
+            else:
+                traj = concat_string_interactions(merged)
+
+            serialized = serialize_value(traj)
+            if prm_stats is not None:
+                return ExportTrajectoriesResponse(traj=serialized, prm_stats=prm_stats)
+            return ExportTrajectoriesResponse(traj=serialized)
+        finally:
+            if body.remove_session:
+                for sid, session in owned_sessions.items():
+                    store.remove_session(sid, expected_session=session)
 
     # =========================================================================
     # Runtime backend reconfiguration (for fork-based deployment)

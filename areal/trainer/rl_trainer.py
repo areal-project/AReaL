@@ -935,6 +935,18 @@ class PPOTrainer:
                 )
             if self._should_offload_rollout:
                 self._offload_rollout()
+            elif self._is_v1_awex_colocate(self.config):
+                # Auxiliary models may share the rollout GPUs too.
+                logger.info("[AWEX] colocate: pausing rollout...")
+                self.rollout.pause()
+                logger.info("[AWEX] colocate: pause_generation_sync...")
+                self.rollout.pause_generation_sync()
+                logger.info("[AWEX] colocate: offload kv_cache...")
+                self.rollout.offload(tags=["kv_cache"])
+                logger.info("[AWEX] colocate: offload weights...")
+                self.rollout.offload(tags=["weights"])
+                logger.info("[AWEX] colocate: offload cuda_graph...")
+                self.rollout.offload(tags=["cuda_graph"])
 
             if self.critic is not None:
                 if self._should_offload_critic:
@@ -992,19 +1004,8 @@ class PPOTrainer:
                 if self._should_offload_teacher:
                     self._offload_model(self.teacher, role="teacher")
 
-            # In colocate (awex) mode: switch GPU from inference to training.
-            # Release SGLang KV cache + weights to free GPU for actor.
+            # TODO(agent): Keep actor onload after auxiliary scoring on shared GPUs.
             if self._is_v1_awex_colocate(self.config):
-                logger.info("[AWEX] colocate: pausing rollout...")
-                self.rollout.pause()
-                logger.info("[AWEX] colocate: pause_generation_sync...")
-                self.rollout.pause_generation_sync()
-                logger.info("[AWEX] colocate: offload kv_cache...")
-                self.rollout.offload(tags=["kv_cache"])
-                logger.info("[AWEX] colocate: offload weights...")
-                self.rollout.offload(tags=["weights"])
-                logger.info("[AWEX] colocate: offload cuda_graph...")
-                self.rollout.offload(tags=["cuda_graph"])
                 try:
                     if self.mopd_teacher_phase is not None:
                         rollout_batch = self.mopd_teacher_phase.materialize(

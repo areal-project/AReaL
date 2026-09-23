@@ -234,6 +234,9 @@ All RL algorithms support both asynchronous and synchronous versions by setting
 | -------------------------- | -------- | ------------ | -------------- | -------------------------------------------------------- |
 | **Qwen2/3**                | ✅       | ✅           | ✅             | -                                                        |
 | **Qwen3-MoE**              | ✅       | ✅           | ✅             | -                                                        |
+| **Qwen3.5**                | ✅       | ✅           | ❌             | Vision-language model                                    |
+| **Qwen3.5-MoE**            | ✅       | ✅           | ❌             | Vision-language model                                    |
+| **Bailing V3**             | ✅       | ❌           | ❌             | -                                                        |
 | **Qwen2.5-VL**             | ✅       | ✅           | ❌             | Vision-language model                                    |
 | **Qwen3-VL**               | ✅       | ✅           | ❌             | Vision-language model                                    |
 | **Gemma 3**                | ❌       | ✅           | ❌             | Vision-language model                                    |

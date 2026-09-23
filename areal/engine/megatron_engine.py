@@ -67,6 +67,7 @@ from areal.engine.core.model import (
     lang_config,
     requires_padded_seq,
     resolve_sequence_packing_mode,
+    validate_model_packed_seq_dependencies,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.bailing_v3 import (
@@ -85,10 +86,12 @@ from areal.engine.megatron_utils.megatron import (
 )
 from areal.engine.megatron_utils.megatron_lora import get_vllm_lora_target_modules
 from areal.engine.megatron_utils.packed_context_parallel import (
+    _VLM_FORWARD_KEYS,
     _is_multi_modal_payload_key,
     extract_vision_from_multi_modal,
     packed_context_parallel_forward,
     prepare_microbatches_for_sequence_layout,
+    prepare_vision_microbatch,
     reassemble_cp_packed_logprobs,
     split_packed_seqs_for_context_parallel,
 )
@@ -136,6 +139,7 @@ from areal.utils.data import (
     batched_call,
     broadcast_tensor,
     concat_batch,
+    has_multi_modal_tensors,
     pack_tensor_dict,
     split_batch,
     split_padded_tensor_dict_into_mb_list,
@@ -557,16 +561,28 @@ class MegatronEngine(TrainEngine):
             self.use_model_packed_seq = (
                 self.sequence_packing_mode == SequencePackingMode.MODEL_THD
             )
+            validate_model_packed_seq_dependencies(
+                self.hf_config.model_type,
+                self.bridge_cls,
+                self.parallel_strategy.context_parallel_size,
+            )
             # ``PADDED`` is the input-routing fallback for every VLM without a
             # model-owned THD contract. ``use_padded_seq`` is narrower: it
             # enables Qwen3.5/GDN-specific dense-mask and LM-head semantics.
-            self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
+            self.use_padded_seq = requires_padded_seq(
+                self.hf_config.model_type, self.bridge_cls
+            )
             if self.is_vision_model:
-                if self.parallel_strategy.context_parallel_size > 1:
+                if (
+                    self.parallel_strategy.context_parallel_size > 1
+                    and not self.use_model_packed_seq
+                ):
                     raise NotImplementedError(
-                        "Context parallel (CP > 1) is not supported with VLM models. "
+                        "Context parallel (CP > 1) requires a VLM with a "
+                        "model-owned THD contract. "
                         f"Got context_parallel_size={self.parallel_strategy.context_parallel_size} "
-                        f"for model_type={self.hf_config.model_type}."
+                        f"for model_type={self.hf_config.model_type} and "
+                        f"bridge_type={self.bridge_cls}."
                     )
                 self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
                     self.config.path
@@ -1251,7 +1267,13 @@ class MegatronEngine(TrainEngine):
                 param_group["_areal_last_step_lr"] = float(param_group["lr"])
         with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
-        current_lr = self.optimizer.param_groups[0]["lr"]
+        # MTP-only pipeline stages without an MTP block have no parameter
+        # groups. Their stub optimizer must still step for global grad stats.
+        current_lr = (
+            self.optimizer.param_groups[0]["lr"]
+            if self.optimizer.param_groups
+            else self.lr_scheduler.get_lr({})
+        )
 
         return dict(
             update_successful=float(update_successful),
@@ -1268,7 +1290,7 @@ class MegatronEngine(TrainEngine):
         mb_list: MicroBatchList,
         process_output_fn: Callable[
             [torch.Tensor | ChunkedLMHeadOutput, dict[str, Any]],
-            torch.Tensor | None,
+            torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
         ],
         forward_only: bool = False,
         gather_cp_output: bool = False,
@@ -1286,7 +1308,13 @@ class MegatronEngine(TrainEngine):
             # Keep MicroBatchList CPU-only. The returned accelerator dictionaries
             # are owned solely by this forward step and cannot accumulate in the
             # source list as the schedule consumes more microbatches.
-            mb_input = source_mb.to(
+            mb_input = (
+                prepare_vision_microbatch(source_mb)
+                if self.is_vision_model
+                and not self.enable_tree_training
+                and has_multi_modal_tensors(source_mb.padded_mb)
+                else source_mb
+            ).to(
                 self.device,
                 non_blocking=True,
             )
@@ -1467,15 +1495,18 @@ class MegatronEngine(TrainEngine):
                 del mb_input.padded_mb[key]
 
             def _process_output(input_, output_):
-                loss = process_output_fn(output_, input_)
-                if loss is None:
+                loss_output = process_output_fn(output_, input_)
+                if loss_output is None:
                     device = (
                         output_.logprobs.device
                         if isinstance(output_, ChunkedLMHeadOutput)
                         else output_.device
                     )
-                    loss = torch.tensor(1.0, device=device)
-                return loss, {}
+                    loss_output = torch.tensor(1.0, device=device)
+                if isinstance(loss_output, tuple):
+                    loss, num_tokens = loss_output
+                    return loss, num_tokens, {}
+                return loss_output, {}
 
             if is_pipeline_last_stage:
                 if use_chunked_lm_head:
@@ -1545,32 +1576,35 @@ class MegatronEngine(TrainEngine):
                 tensor_container_to(input_batched, "cpu"), allow_transport_padding=True
             )
 
-            # Step 2: Compute total loss weight.
-            # Use DP+CP group: after CP all-gather each rank computes the full-sequence
-            # loss, so all_gather's backward (reduce_scatter) sums cp_size identical
-            # gradients, amplifying by cp_size. Including CP in the weight all-reduce
-            # introduces a matching cp_size factor in the denominator, cancelling out.
-            total_loss_weight = compute_total_loss_weight(
-                mb_list,
-                loss_weight_fn,
-                mpu.get_data_parallel_group(with_context_parallel=True),
-                device=self.device,
-            )
-
-            # Step 3: Forward-backward using Megatron's pipeline function.
-            # `len(mb_list)` compensates Megatron Core's `output_tensor /= num_microbatches`
-            # applied in the 2-tuple `(loss, {})` branch of
-            # `megatron.core.pipeline_parallel.schedules._forward_step_helper`. Our
-            # per-microbatch loss is already globally normalized via `w_i / W_total`, so
-            # that extra division would shrink every gradient (and thus grad_norm and the
-            # effective optimizer step) by `num_microbatches`. MCore applies the dynamic
-            # FP16 loss scale through `model_config.grad_scale_func` to both the main loss
-            # and auxiliary losses such as MTP and MoE.
-            loss_multiplier = mpu.get_data_parallel_world_size() * len(mb_list)
+            # Step 2: Select the normalization path from the model's effective config.
+            # Megatron Core requires a 3-tuple loss callback when per-token loss is
+            # enabled. It accumulates the provided token counts and normalizes all
+            # gradients, including MoE auxiliary losses, in finalize_model_grads.
+            # Preserve the existing 2-tuple/manual-normalization path for every model
+            # that does not explicitly enable calculate_per_token_loss.
+            model_config = get_model_config(self.model[0])
+            per_token_loss = model_config.calculate_per_token_loss
+            if per_token_loss:
+                # MCore applies the optimizer loss scale configured during engine
+                # initialization to both the main loss and auxiliary losses.
+                total_loss_weight = None
+                loss_multiplier = 1.0
+            else:
+                # Use DP+CP group: after CP all-gather each rank computes the
+                # full-sequence loss, so all_gather's backward (reduce_scatter) sums
+                # cp_size identical gradients. Including CP in the weight all-reduce
+                # introduces a matching factor in the denominator.
+                total_loss_weight = compute_total_loss_weight(
+                    mb_list,
+                    loss_weight_fn,
+                    mpu.get_data_parallel_group(with_context_parallel=True),
+                    device=self.device,
+                )
+                loss_multiplier = mpu.get_data_parallel_world_size() * len(mb_list)
 
             def process_output(
                 output: torch.Tensor, inputs: dict[str, Any]
-            ) -> torch.Tensor:
+            ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
                 return self._compute_logprobs_and_loss(
                     output,
                     inputs,
@@ -1578,6 +1612,7 @@ class MegatronEngine(TrainEngine):
                     loss_weight_fn,
                     total_loss_weight,
                     loss_multiplier=loss_multiplier,
+                    per_token_loss=per_token_loss,
                 )
 
             self.forward_backward_batch(
@@ -3100,20 +3135,28 @@ class MegatronEngine(TrainEngine):
         for mb in mb_list.padded_mbs:
             mb["max_seqlen"] = int(mb["max_seqlen"])
 
-        # Extract vision data from multi_modal_input into top-level keys.
-        # Vision tensors are placed only on padded_mb (forward side); mb (loss
-        # side) gets multimodal payloads stripped. Also rebind mb_list.data to
-        # a filtered copy so multimodal references are released from the
-        # MicroBatchList without mutating the caller's input dict (which may
-        # be reused across forward calls — see save/load round-trip test).
+        # Keep shared CPU vision tensors on the forward side. Concatenate only
+        # when forward_step consumes a microbatch, avoiding a second full batch
+        # of pixels while the microbatch list waits for the schedule.
         if self.is_vision_model:
             for mb, padded_mb in zip(mb_list.mbs, mb_list.padded_mbs):
-                extract_vision_from_multi_modal(mb, padded_mb)
-            mb_list.data = {
-                k: v
-                for k, v in mb_list.data.items()
-                if not _is_multi_modal_payload_key(k)
-            }
+                if has_multi_modal_tensors((mb, padded_mb)):
+                    if "multi_modal_input" in mb:
+                        padded_mb["multi_modal_input"] = mb["multi_modal_input"]
+                    # Drop stale batched fields that eager extraction would
+                    # overwrite; do not retain another batch of pixels while
+                    # deferring the concatenation. Top-level-only fields stay.
+                    images = padded_mb.get("multi_modal_input") or ()
+                    for key in _VLM_FORWARD_KEYS:
+                        if any(key in image for image in images):
+                            padded_mb.pop(key, None)
+                    for key in list(mb):
+                        if _is_multi_modal_payload_key(key):
+                            mb.pop(key)
+                else:
+                    # VLM text-only/empty-image microbatches retain the eager
+                    # preparation path; they need no lazy vision assembly.
+                    extract_vision_from_multi_modal(mb, padded_mb)
 
         # No Megatron schedule or output reordering path consumes the original
         # dense batch after packing. Keep only the CPU microbatch sources.
@@ -3127,15 +3170,21 @@ class MegatronEngine(TrainEngine):
         inputs: dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
-        total_loss_weight: torch.Tensor,
+        total_loss_weight: torch.Tensor | None,
         loss_multiplier: float = 1.0,
-    ) -> torch.Tensor:
+        per_token_loss: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         local_weight = compute_microbatch_loss_weight(inputs, loss_weight_fn)
         if local_weight == 0:
             connected_output = (
                 output.logprobs if isinstance(output, ChunkedLMHeadOutput) else output
             )
-            return connected_output.mean() * 0.0
+            loss = connected_output.mean() * 0.0
+            if per_token_loss:
+                return self._build_per_token_loss_output(
+                    loss, local_weight, loss_multiplier
+                )
+            return loss
 
         if self.config.is_critic and self.enable_tree_training:
             raise NotImplementedError(
@@ -3149,7 +3198,12 @@ class MegatronEngine(TrainEngine):
                 if trie_node is None or not trie_node.all_sequence_ids:
                     # Return zero loss that maintains gradient connection to output
                     # This ensures backward() works correctly for distributed synchronization
-                    return output.mean() * 0.0
+                    loss = output.mean() * 0.0
+                    if per_token_loss:
+                        return self._build_per_token_loss_output(
+                            loss, local_weight, loss_multiplier
+                        )
+                    return loss
 
                 # For tree training, use gather_packed_tree_vocab_stats to properly
                 # unpack vocab stats from tree structure back to per-sequence format.
@@ -3284,8 +3338,36 @@ class MegatronEngine(TrainEngine):
             values = output.squeeze(-1)
             loss = loss_fn(values, inputs)
 
+        if per_token_loss:
+            return self._build_per_token_loss_output(
+                loss, local_weight, loss_multiplier
+            )
+        assert total_loss_weight is not None
         loss_scale = local_weight / total_loss_weight * loss_multiplier
         return loss * loss_scale
+
+    def _build_per_token_loss_output(
+        self,
+        loss: torch.Tensor,
+        loss_weight: torch.Tensor,
+        loss_multiplier: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build MCore's per-token loss numerator and local token count.
+
+        CP training reassembles the full loss on every CP rank. Split the integer
+        loss weight across those ranks so their numerators and token counts sum to
+        exactly one copy of the microbatch. This keeps the main loss invariant to
+        CP while letting MCore apply the same global-token normalization to MoE
+        auxiliary gradients.
+        """
+        loss_weight = loss_weight.detach().to(device=loss.device, dtype=torch.int64)
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
+        local_weight = torch.div(loss_weight, cp_size, rounding_mode="floor")
+        remainder = torch.remainder(loss_weight, cp_size)
+        local_weight = local_weight + (remainder > cp_rank).to(local_weight.dtype)
+        loss_numerator = loss * local_weight.to(loss.dtype) * loss_multiplier
+        return loss_numerator, local_weight
 
     def _compute_forward_result(
         self,
