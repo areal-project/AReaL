@@ -23,6 +23,7 @@ from areal.utils.constants import (
     PROX_LOGP_METHOD_LOGLINEAR,
     PROX_LOGP_METHOD_METRICS,
     PROX_LOGP_METHOD_RECOMPUTE,
+    PROX_LOGP_METHOD_REUSE,
     ProxLogpMethod,
 )
 from areal.utils.data import (
@@ -116,6 +117,7 @@ class PPOActor:
             # Log proximal policy computation method
             method_descriptions = {
                 PROX_LOGP_METHOD_RECOMPUTE: "RECOMPUTED via forward pass (standard decoupled PPO)",
+                PROX_LOGP_METHOD_REUSE: "REUSE TRAINING FORWARD PASS (detached, no extra forward)",
                 PROX_LOGP_METHOD_LOGLINEAR: "LOG-LINEAR APPROXIMATION (no forward pass)",
                 PROX_LOGP_METHOD_METRICS: "RECOMPUTED + APPROXIMATION METRICS (for evaluation)",
             }
@@ -663,6 +665,10 @@ def grpo_loss_fn(
         current_version=current_version,
     )
 
+    if prox_logp_method == PROX_LOGP_METHOD_REUSE:
+        with stats_tracker.disable_scope():
+            log_train_inference_stats(prox_logp, old_logp, denominator_mask)
+
     # Apply M2PO masking if threshold is set
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
@@ -1023,7 +1029,7 @@ def _resolve_proximal_logp(
 
     Args:
         prox_logp_gt: Ground truth proximal logp (from forward pass), or None if skipped.
-        prox_logp_method: Method to use (recompute, loglinear, metrics).
+        prox_logp_method: Method to use (recompute, reuse, loglinear, metrics).
         old_logp: Behavior policy log-probabilities.
         logprobs: Current policy log-probabilities (should be detached).
         versions: Per-token policy versions, or None.
@@ -1045,7 +1051,7 @@ def _resolve_proximal_logp(
                 f"prox_logp is None but prox_logp_method='{prox_logp_method}'. "
                 "This indicates compute_logp() was skipped incorrectly."
             )
-        if versions is None:
+        if prox_logp_method != PROX_LOGP_METHOD_REUSE and versions is None:
             raise ValueError(
                 f"prox_logp is None with prox_logp_method='{prox_logp_method}' "
                 "but versions not available. "
@@ -1055,7 +1061,10 @@ def _resolve_proximal_logp(
     # Determine prox_logp based on method
     prox_logp = prox_logp_gt  # Default to ground truth (could be None)
 
-    if prox_logp_method == PROX_LOGP_METHOD_LOGLINEAR:
+    if prox_logp_method == PROX_LOGP_METHOD_REUSE:
+        # With one PPO minibatch, the training policy is also the proximal policy.
+        prox_logp = logprobs.detach()
+    elif prox_logp_method == PROX_LOGP_METHOD_LOGLINEAR:
         # Use loglinear approximation (must compute if prox_logp is None)
         if prox_logp_is_none and versions is not None and current_version is not None:
             approximations = compute_prox_logp_approximations(

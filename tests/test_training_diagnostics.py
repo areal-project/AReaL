@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from areal.api.cli_args import PPOActorConfig
-from areal.trainer.ppo.actor import PPOActor, _log_version_staleness_stats
+from areal.api.cli_args import PPOActorConfig, RejectionSamplingConfig
+from areal.trainer.ppo.actor import PPOActor, _log_version_staleness_stats, grpo_loss_fn
 from areal.trainer.ppo.stats import log_train_inference_stats
 from areal.utils.data import concat_batch
 from areal.utils.stats_tracker import DistributedStatsTracker
@@ -114,6 +114,78 @@ def test_advantages_logs_original_rollout_before_recompute_overwrite(decoupled):
     result = tracker.export()
     assert result["ppo_actor/train_infer/logp_diff/avg"] == 1.5
     assert result["ppo_actor/train_infer/n_valid_tokens"] == 2
+
+
+@pytest.mark.parametrize("method", ["reuse", "recompute"])
+@pytest.mark.parametrize("m2_threshold", [None, 0.3])
+def test_train_infer_collector_counts_microbatches_before_two_stage_correction(
+    method, m2_threshold
+):
+    """Reuse shares the recompute namespace and counts each valid token once."""
+    tracker = DistributedStatsTracker()
+    masks = [torch.tensor([[True, True, True, True, False]]), torch.tensor([[True]])]
+    proximal = [torch.tensor([[0.6, 0.2 / 3, 0.2, 0.2, 0.9]]), torch.tensor([[0.2]])]
+    with (
+        patch("areal.trainer.ppo.actor.stats_tracker", tracker),
+        patch("areal.trainer.ppo.stats.stats_tracker", tracker),
+    ):
+        for probs, mask in zip(proximal, masks, strict=True):
+            behavior_logp = torch.full_like(probs, 0.2).log()
+            logprobs = probs.log().requires_grad_(True)
+            if method == "recompute":
+                log_train_inference_stats(logprobs, behavior_logp, mask)
+            with tracker.scope("ppo_actor"), tracker.scope("update"):
+                loss = grpo_loss_fn(
+                    logprobs=logprobs,
+                    entropy=torch.zeros_like(logprobs),
+                    input_data={
+                        "logprobs": behavior_logp,
+                        "prox_logp": None if method == "reuse" else logprobs.detach(),
+                        "advantages": torch.ones_like(logprobs),
+                        "loss_mask": mask,
+                    },
+                    eps_clip=0.2,
+                    eps_clip_higher=None,
+                    c_clip=None,
+                    prox_logp_method=method,
+                    use_decoupled_loss=True,
+                    rejection_sampling=RejectionSamplingConfig(
+                        level="sequence",
+                        action="mask",
+                        metric="ratio",
+                        agg="mean",
+                        lower=0.98,
+                        upper=1.02,
+                    ),
+                    importance_sampling=RejectionSamplingConfig(
+                        level="token",
+                        action="clamp",
+                        metric="ratio",
+                        upper=2.0,
+                    ),
+                    m2_threshold=m2_threshold,
+                )
+                assert tracker.scope_stack == ["ppo_actor", "update"]
+            loss.backward()
+            assert torch.isfinite(logprobs.grad).all()
+            if m2_threshold is None:
+                weight = torch.where(mask, (probs / 0.2).clamp(max=2.0), 0.0)
+                torch.testing.assert_close(
+                    logprobs.grad, -weight / mask.sum(), rtol=1e-6, atol=1e-6
+                )
+    assert all(
+        not value.requires_grad
+        for key, values in tracker.stats.items()
+        if key.startswith("ppo_actor/train_infer/")
+        for value in values
+    )
+    result = tracker.export()
+    assert result["ppo_actor/train_infer/n_valid_tokens"] == 5
+    assert result["ppo_actor/train_infer/ratio_outside_2"] == pytest.approx(2 / 5)
+    assert result["ppo_actor/train_infer/logp_abs_diff/avg"] == pytest.approx(
+        2 * math.log(3) / 5
+    )
+    assert not any(key.startswith("ppo_actor/update/ppo_actor/") for key in result)
 
 
 def test_ppo_update_advantage_sign_fractions_ignore_padding():

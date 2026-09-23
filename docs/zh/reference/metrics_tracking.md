@@ -310,7 +310,8 @@ stats_logger:
 ## 训练诊断指标
 
 当 advantage 预处理获得重算的 proximal logprob 时，`ppo_actor/train_infer/` 会在标准 PPO 覆盖原始 rollout
-logprob 之前比较两者，不增加模型 forward。 不重算 logprob 的运行不会产生这组指标。
+logprob 之前比较两者，不增加模型 forward。 `prox_logp_method="reuse"` 在 loss 过滤前使用 detached 训练
+logprob 采集相同指标。其他不重算 logprob 的运行不会产生这组指标。
 
 设对齐后的有效生成 token 上 `d = log(p_trainer) - log(p_rollout)`：
 
