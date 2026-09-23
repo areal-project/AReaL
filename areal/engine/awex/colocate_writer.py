@@ -135,10 +135,6 @@ class AwexWeightPublisher:
         train_info = build_awex_train_info(self._engine, dist.get_world_size())
         if dist.get_rank() == 0:
             self._meta_server_client.put_object("awex_train_info", train_info)
-            logger.info(
-                "Registered awex_train_info (train_world_size=%d) with MetaServer",
-                dist.get_world_size(),
-            )
 
         logger.info(
             "AwexWeightPublisher initialized: meta_server=%s, transfer_rank=%d",
@@ -149,26 +145,62 @@ class AwexWeightPublisher:
     def eager_publish_train_info(self, meta_server_addr: str | None) -> None:
         """Publish train world metadata before the colocated reader starts."""
         addr = meta_server_addr or os.environ.get("AWEX_META_SERVER_ADDR", "")
-        if not addr or (dist.is_initialized() and dist.get_rank() != 0):
+        if not addr:
             return
         from areal.models.mcore.qwen4_exp_awex_binding import build_awex_train_info
 
+        is_qwen = self._engine.hf_config.architectures == [
+            "Qwen4ExpForConditionalGeneration"
+        ]
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world = dist.get_world_size() if dist.is_initialized() else 1
+        if rank != 0 and not is_qwen:
+            return
         try:
             from awex.meta.meta_server import MetaServerClient
 
             host, port = addr.rsplit(":", 1)
             client = MetaServerClient(host, int(port))
-            world = dist.get_world_size() if dist.is_initialized() else 1
-            client.put_object(
-                "awex_train_info", build_awex_train_info(self._engine, world)
-            )
-            logger.info(
-                "Eager-published awex_train_info (train_world_size=%d) to %s",
-                world,
-                addr,
-            )
+            if is_qwen:
+                from areal.models.mcore.qwen4_exp_awex_binding import (
+                    actor_frozen_binder,
+                )
+                from areal.models.mcore.qwen4_exp_awex_contract import (
+                    merge_frozen_proofs,
+                )
+
+                binder = actor_frozen_binder(self._engine)
+                record = binder.verify_loaded()
+                # A language-only actor still supplies the checkpoint reference
+                # for the inference-only vision tower, but does not claim to own it.
+                if rank == 0 and binder.contract.language_model_only:
+                    record["proof"] = dict(record["proof"])
+                    for name in binder.contract.visual_parameter_names:
+                        record["proof"][name] = binder.checkpoint.verify_source(name)
+                client.put_object(f"qwen4_frozen_actor_{rank}", record)
+                # Wait only for other actors, never for inference: inference is
+                # started after this call and actor offload have completed.
+                if rank == 0:
+                    records = [
+                        client.get_object(
+                            f"qwen4_frozen_actor_{i}", timeout=awex_colocate_timeout_s()
+                        )
+                        for i in range(world)
+                    ]
+                    proof = merge_frozen_proofs(binder.checkpoint, records)
+                    client.put_object("qwen4_frozen_proof", proof)
+                self._engine._qwen4_awex_frozen_proof = client.get_object(
+                    "qwen4_frozen_proof", timeout=awex_colocate_timeout_s()
+                )
+            if rank == 0:
+                client.put_object(
+                    "awex_train_info", build_awex_train_info(self._engine, world)
+                )
+                logger.info(
+                    "Published verified AWEX training metadata (world_size=%d)", world
+                )
         except Exception as exc:
-            if os.environ.get("QWEN_AWEX_FROZEN_CONTRACT"):
+            if is_qwen:
                 raise
             logger.warning("Eager publish awex_train_info failed: %s", exc)
 
@@ -229,16 +261,16 @@ class AwexWeightPublisher:
             from awex.models.qwen4_exp import register_qwen4_exp_awex
 
             from areal.models.mcore.qwen4_exp_awex_binding import (
-                McoreFrozenBinder,
-                load_actor_frozen_contract,
+                actor_frozen_binder,
             )
 
-            contract = load_actor_frozen_contract(self._engine)
+            binder = actor_frozen_binder(self._engine)
+            contract = binder.contract
             if infer_conf.get("qwen4_exp_frozen_contract") != contract.to_dict():
                 raise ValueError(
                     "Inference did not confirm the training frozen contract"
                 )
-            self._qwen4_frozen_binder = McoreFrozenBinder(self._engine, contract)
+            self._qwen4_frozen_binder = binder
             register_qwen4_exp_awex(mcore_binder=self._qwen4_frozen_binder)
 
         meta_resolver = McoreParamMetaResolver(shim, self._engine.hf_config, infer_conf)

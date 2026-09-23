@@ -311,6 +311,15 @@ class AwexSchedulerPlugin:
 
         meta_server_addr = os.environ.get("AWEX_META_SERVER_ADDR")
         if meta_server_addr:
+            model = getattr(
+                getattr(
+                    getattr(self._scheduler, "tp_worker", None), "model_runner", None
+                ),
+                "model",
+                None,
+            )
+            if type(model).__name__ == "Qwen4ExpForConditionalGeneration":
+                self._require_receiver().prepare_frozen_weights(meta_server_addr)
             self._start_background_worker(meta_server_addr)
             self._patch_event_loop()
 
@@ -1030,6 +1039,31 @@ class ModelWorkerTask:
     kwargs: dict = field(default_factory=dict)
 
 
+def _install_qwen_frozen_hooks(scheduler_type: type) -> None:
+    # Legacy SGLang used by other architectures has no static-state API.
+    # Qwen's binder requires these hooks and fails explicitly on such versions.
+    try:
+        from sglang.srt.managers.scheduler_components import weight_updater
+    except ModuleNotFoundError as exc:
+        if exc.name != "sglang.srt.managers.scheduler_components":
+            raise
+        return
+    if not all(
+        hasattr(weight_updater, name)
+        for name in (
+            "_export_static_state",
+            "_import_static_state",
+            "SchedulerWeightUpdaterManager",
+        )
+    ):
+        return
+    from areal.models.mcore.qwen4_exp_awex_memory import install_kv_residency_hooks
+    from areal.models.mcore.qwen4_exp_frozen_state import install_static_state_hooks
+
+    install_static_state_hooks(weight_updater)
+    install_kv_residency_hooks(weight_updater, scheduler_type)
+
+
 def register_awex_plugin() -> None:
     """Patch Scheduler.__init__ to inject awex plugin after construction.
 
@@ -1040,16 +1074,7 @@ def register_awex_plugin() -> None:
     assert_supported_sglang_version()
     from sglang.srt.managers.scheduler import Scheduler
 
-    if os.environ.get("QWEN_AWEX_FROZEN_CONTRACT"):
-        from sglang.srt.managers.scheduler_components import weight_updater
-
-        from areal.models.mcore.qwen4_exp_awex_memory import install_kv_residency_hooks
-        from areal.models.mcore.qwen4_exp_frozen_state import install_static_state_hooks
-
-        # This executes inside each worker before Scheduler construction, so
-        # preservation is installed before any native weights release.
-        install_static_state_hooks(weight_updater)
-        install_kv_residency_hooks(weight_updater, Scheduler)
+    _install_qwen_frozen_hooks(Scheduler)
 
     # Install before construction: the scheduler dispatcher captures bound
     # handlers during __init__. Metadata aggregation runs in our worker thread.

@@ -85,11 +85,17 @@ The small Python helpers in this directory are runtime support, not additional e
   each supplied batch once and requires disabled recovery and matching step count; it
   does not restore RNG or optimizer state and is not an on-policy RL run.
 
-Vision requires `language_model_only: false`, multimodal SGLang, processor-produced
-modality IDs and a validated schema 2 frozen-weight contract supplied through
-`QWEN_AWEX_FROZEN_CONTRACT`. Both sides load the same checkpoint; the frozen visual
-parameters are excluded from transfer and preserved across offload/resume. A public
-manifest-generation tool is not yet provided.
+Vision requires `language_model_only: false`, multimodal SGLang, and processor-produced
+modality IDs. AWEX derives frozen-weight exclusions from the model configuration and
+checkpoint automatically; no separate manifest is needed. Before the first transfer,
+every training rank verifies its frozen PLE/visual weights against the checkpoint. Each
+inference rank verifies its local weights and the matching checkpoint content
+fingerprints before excluding them from transfer. Only the validated BF16 PLE layout
+with absent/unit scale is supported. Visual parameters are preserved across
+offload/resume. Checkpoint loading invalidates cached verification, including in-place
+parameter updates; changed frozen weights are rejected before the next transfer. Initial
+verification reads frozen weights in bounded chunks and can add startup I/O for large
+PLE tables.
 
 Training allocations retain expandable segments; AWEX disables them only for IPC staging
 allocation and restores allocator settings. Validate CUDA IPC compatibility, repeated

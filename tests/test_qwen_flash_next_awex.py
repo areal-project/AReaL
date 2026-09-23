@@ -253,60 +253,105 @@ def table():
     return nn.Parameter(torch.ones(4, 3, dtype=torch.bfloat16), requires_grad=False)
 
 
-@pytest.fixture
-def manifest_files(tmp_path, contract):
-    import hashlib
+def frozen_checkpoint(tmp_path, *, global_id=0):
     import json
 
-    model = tmp_path / "model"
-    model.mkdir()
-    config = b'{"architectures":["Qwen4ExpForConditionalGeneration"]}'
-    index = b"{}"
-    (model / "config.json").write_bytes(config)
-    (model / "model.safetensors.index.json").write_bytes(index)
-    basis = {
-        "config_sha256": hashlib.sha256(config).hexdigest(),
-        "weight_index_sha256": hashlib.sha256(index).hexdigest(),
-        "ple_source_shards": [
-            {
-                "name": "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
-                "sha256": "b" * 64,
-            }
-        ],
-        "visual_reference": [{"tp_rank": 0, "parameters": [{"name": VISUAL}]}],
+    from safetensors.torch import save_file
+
+    from areal.models.mcore.qwen4_exp_awex_contract import FrozenCheckpoint
+
+    prefix = (
+        f"model.language_model.layers.{global_id}.ple.ple_embedding.ngram_embedding"
+    )
+    values = {
+        prefix + ".shard_0.weight": torch.ones(2, 2, dtype=torch.bfloat16),
+        prefix + ".shard_1.weight": torch.ones(1, 2, dtype=torch.bfloat16),
+        "model.visual.weight": torch.ones(3, 2, dtype=torch.bfloat16),
     }
-    digest = hashlib.sha256(
-        json.dumps(basis, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    declared = replace(contract, checkpoint_manifest_sha256=digest)
-    manifest = {"contract": declared.to_dict(), "identity_basis": basis}
-    path = tmp_path / "manifest.json"
-    path.write_text(json.dumps(manifest))
-    return path, model, declared
+    save_file(values, tmp_path / "weights.safetensors")
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen4ExpForConditionalGeneration"],
+                "text_config": {"split_ngram_parts": 2},
+            }
+        )
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {n: "weights.safetensors" for n in values},
+            }
+        )
+    )
+    return FrozenCheckpoint(tmp_path, True)
 
 
-@pytest.mark.parametrize("fault", ["evidence", "ple", "visual", "config"])
-def test_manifest_rejects_identity_or_exclusion_drift(manifest_files, fault):
-    import json
+@pytest.mark.parametrize(
+    "fault", ["none", "values", "coverage", "replica", "scale", "dtype"]
+)
+def test_automatic_frozen_proof_checks_contents_and_ownership(tmp_path, fault):
+    import shutil
 
-    from areal.models.mcore.qwen4_exp_awex_contract import load_frozen_contract
+    from safetensors.torch import load_file, save_file
 
-    path, model, _ = manifest_files
-    data = json.loads(path.read_text())
-    if fault == "evidence":
-        data["identity_basis"]["ple_source_shards"][0]["sha256"] = "c" * 64
-    elif fault == "ple":
-        data["contract"]["ple_table_names"] = [TABLE.replace("layers.1", "layers.2")]
-    elif fault == "visual":
-        data["contract"]["visual_parameter_names"] = ["model.visual.other.weight"]
+    from areal.models.mcore.qwen4_exp_awex_contract import (
+        FrozenCheckpoint,
+        check_frozen_proof,
+        merge_frozen_proofs,
+    )
+
+    checkpoint = frozen_checkpoint(tmp_path)
+    name = next(iter(checkpoint.tables))
+    emb = nn.Embedding(3, 2, dtype=torch.bfloat16)
+    emb.requires_grad_(False)
+    emb.weight.data.fill_(1)
+    emb.vocab_start_index, emb.vocab_end_index = 0, 3
+    proof = checkpoint.verify_table(name, emb, "actor")
+    proof["model.visual.weight"] = checkpoint.verify_source("model.visual.weight")
+    record = {
+        "contract": checkpoint.contract.to_dict(),
+        "proof": proof,
+        "ranges": {name: [0, 3]},
+    }
+    expected = merge_frozen_proofs(checkpoint, [record, record])
+    copied = tmp_path / "copy"
+    copied.mkdir()
+    for file in ("config.json", "model.safetensors.index.json", "weights.safetensors"):
+        shutil.copyfile(tmp_path / file, copied / file)
+    other = FrozenCheckpoint(copied, True)
+    assert other.contract == checkpoint.contract
+    if fault == "coverage":
+        record["ranges"][name] = [0, 2]
+        with pytest.raises(ValueError, match="ownership"):
+            merge_frozen_proofs(checkpoint, [record])
+    elif fault == "replica":
+        wrong = dict(proof)
+        wrong["model.visual.weight"] = {"sha256": "changed"}
+        with pytest.raises(ValueError, match="contents differ"):
+            merge_frozen_proofs(checkpoint, [record, {**record, "proof": wrong}])
     else:
-        (model / "config.json").write_text("{}")
-    path.write_text(json.dumps(data))
-    with pytest.raises(ValueError):
-        load_frozen_contract(path, model)
+        emb.shard_indices = SimpleNamespace(
+            org_vocab_start_index=0, org_vocab_end_index=3
+        )
+        emb.org_vocab_size = 3
+        emb.weight_scale = torch.tensor([2 if fault == "scale" else 1])
+        if fault == "values":
+            values = load_file(copied / "weights.safetensors")
+            values[other.tables[name][0]].zero_()
+            save_file(values, copied / "weights.safetensors")
+            emb.weight.data[:2].zero_()  # agrees locally, disagrees with actor
+        elif fault == "dtype":
+            emb.weight = nn.Parameter(emb.weight.float(), requires_grad=False)
+        if fault == "none":
+            check_frozen_proof(other.verify_table(name, emb, "inference"), expected)
+        else:
+            with pytest.raises(ValueError):
+                check_frozen_proof(other.verify_table(name, emb, "inference"), expected)
 
 
-def setup_binding(global_id=0, mapped=False, table=True):
+def setup_binding(tmp_path, global_id=0, mapped=False, table=True):
+    checkpoint = frozen_checkpoint(tmp_path, global_id=global_id)
     layer = nn.Module()
     layer.layer_number = global_id + 1
     layer.ple = nn.Module()
@@ -315,24 +360,22 @@ def setup_binding(global_id=0, mapped=False, table=True):
         layer.ple.ple_embedding.ngram_embedding = nn.Embedding(
             3, 2, dtype=torch.bfloat16
         )
-        layer.ple.ple_embedding.ngram_embedding.weight.requires_grad_(False)
+        emb = layer.ple.ple_embedding.ngram_embedding
+        emb.weight.requires_grad_(False)
+        emb.weight.data.fill_(1)
+        emb.vocab_start_index, emb.vocab_end_index = 0, 3
     chunk = nn.Module()
     chunk.decoder = nn.Module()
     chunk.decoder.layers = nn.ModuleList([layer])
     engine = SimpleNamespace(
         model=[chunk],
+        config=SimpleNamespace(path=str(tmp_path)),
+        pipeline_parallel_rank=0,
+        bridge_cls="mcore-bridge",
         mcore_config=SimpleNamespace(language_model_only=True, freeze_ple_table=True),
         hf_config=SimpleNamespace(architectures=["Qwen4ExpForConditionalGeneration"]),
     )
-    contract = Qwen4ExpFrozenContract(
-        "a" * 64,
-        frozenset(
-            {f"model.layers.{global_id}.ple.ple_embedding.ngram_embedding.weight"}
-        ),
-        frozenset({"model.visual.weight"}),
-        True,
-        True,
-    )
+    contract = checkpoint.contract
     converter_cls = build_mcore_converter()
     converter = converter_cls.__new__(converter_cls)
     converter.rank_info = SimpleNamespace(pp_rank=1)
@@ -340,10 +383,10 @@ def setup_binding(global_id=0, mapped=False, table=True):
     return engine, converter, McoreFrozenBinder(engine, contract)
 
 
-def test_production_conversion_refreshes_binding_before_detach():
+def test_production_conversion_refreshes_binding_before_detach(tmp_path):
     from areal.engine.awex.colocate_writer import AwexWeightPublisher
 
-    engine, unused, binder = setup_binding()
+    engine, unused, binder = setup_binding(tmp_path)
     cls = build_mcore_converter(binder)
     converter = cls.__new__(cls)
     converter.rank_info = SimpleNamespace(pp_rank=0, pp_size=1)
@@ -357,7 +400,7 @@ def test_production_conversion_refreshes_binding_before_detach():
     assert adapter._convert_parameters() == {}
     embedding = engine.model[0].decoder.layers[0].ple.ple_embedding.ngram_embedding
     old = embedding.weight
-    embedding.weight = nn.Parameter(torch.zeros_like(old), requires_grad=False)
+    embedding.weight = nn.Parameter(old.detach().clone(), requires_grad=False)
     assert adapter._convert_parameters() == {}
     assert next(iter(converter._qwen4_original_parameters.values())) is embedding.weight
     embedding.weight = nn.Parameter(torch.ones_like(old))
@@ -367,11 +410,7 @@ def test_production_conversion_refreshes_binding_before_detach():
 
 
 def _vision_binding(tmp_path, *, pp_rank=0):
-    import json
-
-    from safetensors.torch import save_file
-
-    engine, converter, old_binder = setup_binding()
+    engine, converter, old_binder = setup_binding(tmp_path)
     chunk = engine.model[0]
     chunk.pre_process = pp_rank == 0
     contract = replace(old_binder.contract, language_model_only=False, schema_version=2)
@@ -383,13 +422,6 @@ def _vision_binding(tmp_path, *, pp_rank=0):
         chunk.visual.requires_grad_(False)
         chunk.visual.visual.weight.data.fill_(1)
     engine.config = SimpleNamespace(path=str(tmp_path))
-    save_file(
-        {"model.visual.weight": torch.ones(3, 2, dtype=torch.bfloat16)},
-        tmp_path / "vision.safetensors",
-    )
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"model.visual.weight": "vision.safetensors"}})
-    )
     return engine, converter, McoreFrozenBinder(engine, contract)
 
 
@@ -602,3 +634,98 @@ def test_reader_selects_bounded_awex_transport(monkeypatch):
     assert isinstance(transport, BoundedMemoryNcclColocateStreamBatchTransport)
     assert transport.transfer_rank == 7
     assert transport.world_size == 64
+
+
+def test_frozen_binding_revalidates_in_place_recovery(tmp_path):
+    engine, converter, binder = setup_binding(tmp_path)
+    binder.verify_loaded()
+    parameter = (
+        engine.model[0].decoder.layers[0].ple.ple_embedding.ngram_embedding.weight
+    )
+    with torch.no_grad():
+        parameter.add_(1)
+    binder.invalidate()
+    with pytest.raises(ValueError, match="differs from checkpoint"):
+        binder.verify_loaded()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["QKVParallelLinear", "ColumnParallelLinear", "RowParallelLinear", "Conv3dLayer"],
+)
+def test_frozen_visual_verification_uses_layer_tp(tmp_path, kind):
+    from safetensors.torch import save_file
+
+    from areal.models.mcore.qwen4_exp_awex_contract import visual_segments
+
+    checkpoint = frozen_checkpoint(tmp_path)
+    name = next(iter(checkpoint.visual_sources))
+    source_name = checkpoint.visual_sources[name]
+    source = torch.arange(48, dtype=torch.bfloat16).reshape(12, 4)
+    # Each source is in a separate file so the PLE fixture remains intact.
+    checkpoint.weight_map[source_name] = "vision.safetensors"
+    save_file({source_name: source}, str(tmp_path / "vision.safetensors"))
+    module = type(kind, (), {})()
+    module.tp_rank, module.tp_size = 1, 2
+    module.kv_tp_rank, module.kv_tp_size = 1, 2
+    module.total_num_heads = module.total_num_kv_heads = 4
+    module.head_size = module.v_head_size = 1
+    module.output_partition_sizes = [6]
+    if kind == "QKVParallelLinear":
+        local = torch.cat([part.chunk(2)[1] for part in source.chunk(3)])
+    elif kind == "ColumnParallelLinear":
+        local = source.chunk(2)[1]
+    elif kind == "RowParallelLinear":
+        local = source.chunk(2, dim=1)[1]
+    else:
+        local = source
+    segments, shape = visual_segments(module, name, tuple(source.shape))
+    assert tuple(local.shape) == shape
+    parameter = nn.Parameter(local.clone(), requires_grad=False)
+    checkpoint.verify_source(name, parameter, segments)
+    with torch.no_grad():
+        parameter[0, 0].add_(1)
+    with pytest.raises(ValueError, match="differs from checkpoint"):
+        checkpoint.verify_source(name, parameter, segments)
+
+
+def test_inference_frozen_binding_ignores_padding_and_rechecks_load(tmp_path):
+    from areal.models.mcore.qwen4_exp_awex_binding import SglangFrozenBinder
+
+    engine, _, actor = setup_binding(tmp_path)
+    model = type("Qwen4ExpForConditionalGeneration", (nn.Module,), {})()
+    model.model = nn.Module()
+    model.model.layers = engine.model[0].decoder.layers
+    model.visual = nn.Linear(2, 3, bias=False, dtype=torch.bfloat16)
+    model.visual.weight = nn.Parameter(
+        torch.ones(3, 2, dtype=torch.bfloat16), requires_grad=False
+    )
+    embedding = model.model.layers[0].ple.ple_embedding.ngram_embedding
+    embedding.org_vocab_size = 3
+    embedding.shard_indices = SimpleNamespace(
+        org_vocab_start_index=2, org_vocab_end_index=3
+    )
+    embedding.weight = nn.Parameter(
+        torch.tensor([[1, 1], [99, 99]], dtype=torch.bfloat16), requires_grad=False
+    )
+    embedding.weight_scale = torch.ones(1)
+    checkpoint = actor.checkpoint
+    expected = {
+        name: checkpoint.verify_source(name) for name in checkpoint.source_names
+    }
+    binder = SglangFrozenBinder(
+        lambda: model,
+        actor.contract,
+        SimpleNamespace(_areal_qwen4_exp_static_hooks=True),
+        checkpoint,
+        expected,
+    )
+    binder.verify_loaded()
+    state = {name: value.clone() for name, value in model.state_dict().items()}
+    name = "model.layers.0.ple.ple_embedding.ngram_embedding.weight"
+    state[name][0, 0] = 2
+    original = embedding.weight
+    model.load_state_dict(state)
+    assert embedding.weight is original
+    with pytest.raises(ValueError, match="differs from checkpoint"):
+        binder.verify_loaded()

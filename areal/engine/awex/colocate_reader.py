@@ -28,7 +28,6 @@ signal-finished); see ``awex_sglang_plugin.process_awex_queue``.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
@@ -428,6 +427,20 @@ class AwexColocateReader:
         )
         return resolver.get_parameters_meta()
 
+    def prepare_frozen_weights(self, meta_server_addr: str) -> None:
+        """Verify before the scheduler can accept its first offload request."""
+        from awex.meta.meta_server import MetaServerClient
+
+        from areal.engine.awex.colocate_writer import awex_colocate_timeout_s
+
+        host, port = meta_server_addr.rsplit(":", 1)
+        self._meta_server_client = MetaServerClient(host, int(port))
+        info = self._meta_server_client.get_object(
+            "awex_train_info", timeout=awex_colocate_timeout_s()
+        )
+        self._train_world_size = info["train_world_size"]
+        self._bind_qwen4_frozen_contract(awex_colocate_timeout_s())
+
     def _bind_qwen4_frozen_contract(self, timeout_s: float) -> None:
         from pathlib import Path
 
@@ -435,23 +448,36 @@ class AwexColocateReader:
         from sglang.srt.managers.scheduler_components import weight_updater
 
         from areal.models.mcore.qwen4_exp_awex_binding import SglangFrozenBinder
-        from areal.models.mcore.qwen4_exp_awex_contract import load_frozen_contract
+        from areal.models.mcore.qwen4_exp_awex_contract import FrozenCheckpoint
 
-        manifest = os.environ.get("QWEN_AWEX_FROZEN_CONTRACT")
-        if not manifest:
-            raise ValueError("Qwen4Exp AWEX requires QWEN_AWEX_FROZEN_CONTRACT")
-        contract = load_frozen_contract(
-            Path(manifest), Path(self._scheduler.server_args.model_path)
-        )
         train_info = self._meta_server_client.get_object(
             "awex_train_info", timeout=timeout_s
         )
+        description = train_info["qwen4_exp_frozen_contract"]
+        checkpoint = FrozenCheckpoint(
+            Path(self._scheduler.server_args.model_path),
+            description["language_model_only"],
+        )
+        contract = checkpoint.contract
         if (
             train_info.get("train_world_size") != self._train_world_size
             or train_info.get("qwen4_exp_frozen_contract") != contract.to_dict()
         ):
             raise ValueError("Training and inference frozen contracts differ")
-        binder = SglangFrozenBinder(self._get_model, contract, weight_updater)
+        proof = train_info["qwen4_exp_frozen_proof"]
+        if proof.keys() != checkpoint.source_names:
+            raise ValueError("Incomplete training frozen-weight proof")
+        if self._qwen4_frozen_binder is not None:
+            if (
+                self._qwen4_frozen_contract != contract
+                or self._qwen4_frozen_binder.expected_proof != proof
+            ):
+                raise ValueError("Frozen initialization evidence changed")
+            return
+        binder = SglangFrozenBinder(
+            self._get_model, contract, weight_updater, checkpoint, proof
+        )
+        binder.verify_loaded()
         register_qwen4_exp_awex(sglang_binder=binder)
         self._qwen4_frozen_contract = contract
         self._qwen4_frozen_binder = binder

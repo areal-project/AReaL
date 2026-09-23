@@ -1,20 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bind frozen exclusions to live MCore Parameters and actual PP ownership."""
 
-import json
-import os
 import re
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-import torch
 from awex.models.qwen4_exp_contract import (
     Qwen4ExpFrozenContract,
     mcore_visual_parameter_name,
 )
 from torch import nn
+
+from areal.models.mcore.qwen4_exp_awex_contract import (
+    FrozenCheckpoint,
+    check_frozen_proof,
+    visual_segments,
+)
 
 
 class McoreFrozenBinder:
@@ -29,57 +32,20 @@ class McoreFrozenBinder:
     def __init__(self, engine: Any, contract: Qwen4ExpFrozenContract) -> None:
         self.engine = engine
         self.contract = contract
-        self._visual_shapes: dict[str, tuple[int, ...]] | None = None
+        self.checkpoint = FrozenCheckpoint(
+            Path(engine.config.path), contract.language_model_only
+        )
+        if self.checkpoint.contract != contract:
+            raise ValueError("Actor frozen checkpoint description changed")
+        self._proof = None
+        self._validated_identity = None
+        self._embeddings = {}
 
-    def _validate_visual_shapes(self, parameters: dict[str, nn.Parameter]) -> None:
-        """The HF vision tower is replicated, so checkpoint shapes must match."""
-        if self._visual_shapes is None:
-            from safetensors import safe_open
+    def invalidate(self) -> None:
+        """Checkpoint loads may overwrite the same Parameter objects in place."""
+        self._validated_identity = None
 
-            directory = Path(self.engine.config.path)
-            index = json.loads((directory / "model.safetensors.index.json").read_text())
-            shapes = {}
-            by_shard: dict[str, list[str]] = {}
-            for name, shard in index["weight_map"].items():
-                if name.startswith("model.visual."):
-                    by_shard.setdefault(shard, []).append(name)
-            for shard, names in by_shard.items():
-                with safe_open(
-                    directory / shard, framework="pt", device="cpu"
-                ) as source:
-                    for name in names:
-                        actor_name = "visual.visual." + name[len("model.visual.") :]
-                        canonical = mcore_visual_parameter_name(
-                            actor_name, self.contract
-                        )
-                        if canonical in shapes:
-                            raise ValueError(
-                                f"Duplicate checkpoint visual identity: {canonical}"
-                            )
-                        shapes[canonical] = tuple(source.get_slice(name).get_shape())
-                        parameter = parameters[canonical]
-                        if tuple(parameter.shape) != shapes[canonical]:
-                            raise ValueError(
-                                f"Frozen actor visual shape differs from checkpoint: {canonical}"
-                            )
-                        checkpoint = source.get_tensor(name).to(dtype=parameter.dtype)
-                        if not torch.equal(parameter.detach().cpu(), checkpoint):
-                            raise ValueError(
-                                f"Frozen actor visual values differ from checkpoint: {canonical}"
-                            )
-            if shapes.keys() != self.contract.visual_parameter_names:
-                raise ValueError("Checkpoint visual keys differ from frozen contract")
-            self._visual_shapes = shapes
-        for name, parameter in parameters.items():
-            if (
-                name.startswith("model.visual.")
-                and tuple(parameter.shape) != self._visual_shapes[name]
-            ):
-                raise ValueError(
-                    f"Frozen actor visual shape differs from checkpoint: {name}"
-                )
-
-    def __call__(self, converter: Any) -> None:
+    def _collect(self, pp_rank: int, stage_map: dict | None):
         config = self.engine.mcore_config
         if (
             config.language_model_only is not self.contract.language_model_only
@@ -97,7 +63,7 @@ class McoreFrozenBinder:
         global_layers: set[int] = set()
         visual_owners = 0
         local_visual_names: set[str] = set()
-        stage_map = converter._pp_stage_layer_id_map
+        self._embeddings = {}
         for vp_stage, model in enumerate(models):
             unwrapped = model
             while hasattr(unwrapped, "module"):
@@ -109,7 +75,7 @@ class McoreFrozenBinder:
                         "Vision binding requires explicit chunk pre_process ownership"
                     )
                 owns_visual = unwrapped.pre_process
-                if owns_visual and (converter.rank_info.pp_rank != 0 or vp_stage != 0):
+                if owns_visual and (pp_rank != 0 or vp_stage != 0):
                     raise ValueError(
                         "Frozen visual owner must be the first PP/VP stage"
                     )
@@ -132,9 +98,7 @@ class McoreFrozenBinder:
                 global_layers.add(global_id)
                 layers[path] = (local_id, global_id)
                 if stage_map:
-                    mapped = stage_map.get(
-                        (converter.rank_info.pp_rank, vp_stage), {}
-                    ).get(local_id)
+                    mapped = stage_map.get((pp_rank, vp_stage), {}).get(local_id)
                     if mapped != global_id:
                         raise ValueError(
                             f"AWEX PP map disagrees with actual layer: {path}"
@@ -163,7 +127,7 @@ class McoreFrozenBinder:
                     raise ValueError(f"PLE parameter has no actual layer owner: {name}")
                 local_id, global_id = layers[match[1]]
                 canonical = f"model.layers.{global_id}.{match[2]}"
-                if not stage_map and local_id != global_id:
+                if stage_map == {} and local_id != global_id:
                     raise ValueError(
                         "Metadata PLE local/global identity differs; unsupported placement"
                     )
@@ -172,6 +136,9 @@ class McoreFrozenBinder:
                         f"Duplicate frozen parameter identity: {canonical}"
                     )
                 parameters[canonical] = parameter
+                self._embeddings[canonical] = model.get_submodule(
+                    name.rsplit(".", 1)[0]
+                )
             if (
                 owns_visual
                 and chunk_visual_names != self.contract.visual_parameter_names
@@ -181,18 +148,66 @@ class McoreFrozenBinder:
                 )
             local_visual_names.update(chunk_visual_names)
         if not self.contract.language_model_only:
-            if visual_owners != int(converter.rank_info.pp_rank == 0):
+            if visual_owners != int(pp_rank == 0):
                 raise ValueError("Missing or duplicate frozen visual PP owner")
-            if local_visual_names:
-                self._validate_visual_shapes(parameters)
         expected = frozenset(
             name
             for name in self.contract.ple_table_names
             if int(name.split(".")[2]) in global_layers
         )
-        converter.bind_frozen_contract(
-            self.contract, parameters, expected, frozenset(local_visual_names)
+        self.contract.validate_actor_parameters(
+            parameters, expected, frozenset(local_visual_names)
         )
+        return parameters, expected, frozenset(local_visual_names)
+
+    def _verify(self, parameters: dict) -> dict:
+        identity = tuple(
+            (n, id(p), tuple(p.shape), p.dtype, p.requires_grad)
+            for n, p in parameters.items()
+        )
+        if identity != self._validated_identity:
+            proof = {}
+            for name, parameter in parameters.items():
+                if name in self._embeddings:
+                    proof.update(
+                        self.checkpoint.verify_table(
+                            name, self._embeddings[name], "actor"
+                        )
+                    )
+                else:
+                    shape = self.checkpoint.shape(name)
+                    if tuple(parameter.shape) != shape:
+                        raise ValueError(
+                            f"Frozen actor visual shape differs from checkpoint: {name}"
+                        )
+                    proof[name] = self.checkpoint.verify_source(
+                        name, parameter, [(0, 0, shape[0], 0)]
+                    )
+            if self._proof is not None:
+                check_frozen_proof(proof, self._proof)
+                if proof.keys() != self._proof.keys():
+                    raise ValueError(
+                        "Frozen actor ownership changed after initialization"
+                    )
+            self._proof = proof
+            self._validated_identity = identity
+        return self._proof
+
+    def verify_loaded(self) -> dict:
+        parameters, _, _ = self._collect(self.engine.pipeline_parallel_rank, None)
+        proof = self._verify(parameters)
+        ranges = {
+            name: [emb.vocab_start_index, emb.vocab_end_index]
+            for name, emb in self._embeddings.items()
+        }
+        return {"contract": self.contract.to_dict(), "proof": proof, "ranges": ranges}
+
+    def __call__(self, converter: Any) -> None:
+        parameters, expected, visual = self._collect(
+            converter.rank_info.pp_rank, converter._pp_stage_layer_id_map
+        )
+        self._verify(parameters)
+        converter.bind_frozen_contract(self.contract, parameters, expected, visual)
 
 
 def _clean_name(name: str) -> str:
@@ -203,28 +218,29 @@ def _clean_name(name: str) -> str:
     return name
 
 
-def load_actor_frozen_contract(engine: Any) -> Qwen4ExpFrozenContract:
-    """Load explicit local evidence without enabling the engine AWEX guard."""
-    from areal.models.mcore.qwen4_exp_awex_contract import load_frozen_contract
-
-    if engine.bridge_cls != "mcore-bridge":
-        raise ValueError("Qwen4Exp frozen contract requires mcore-bridge")
-    if engine.mcore_config.freeze_ple_table is not True:
-        raise ValueError("Frozen binding requires frozen PLE")
-    manifest = os.environ.get("QWEN_AWEX_FROZEN_CONTRACT")
-    if not manifest:
-        raise ValueError("Qwen4Exp AWEX requires QWEN_AWEX_FROZEN_CONTRACT")
-    contract = load_frozen_contract(Path(manifest), Path(engine.config.path))
-    if engine.mcore_config.language_model_only is not contract.language_model_only:
-        raise ValueError("Actor model mode differs from frozen contract")
-    return contract
+def actor_frozen_binder(engine: Any) -> McoreFrozenBinder:
+    """Reuse the verification across eager publication and converter binding."""
+    binder = getattr(engine, "_qwen4_awex_frozen_binder", None)
+    if binder is None:
+        if (
+            engine.bridge_cls != "mcore-bridge"
+            or engine.mcore_config.freeze_ple_table is not True
+        ):
+            raise ValueError("Qwen4Exp AWEX requires mcore-bridge and frozen PLE")
+        checkpoint = FrozenCheckpoint(
+            Path(engine.config.path), engine.mcore_config.language_model_only
+        )
+        binder = McoreFrozenBinder(engine, checkpoint.contract)
+        engine._qwen4_awex_frozen_binder = binder
+    return binder
 
 
 def build_awex_train_info(engine: Any, world_size: int) -> dict[str, Any]:
-    """Use one payload for eager publication and adapter initialization."""
     info: dict[str, Any] = {"train_world_size": world_size}
     if engine.hf_config.architectures == ["Qwen4ExpForConditionalGeneration"]:
-        info["qwen4_exp_frozen_contract"] = load_actor_frozen_contract(engine).to_dict()
+        binder = actor_frozen_binder(engine)
+        info["qwen4_exp_frozen_contract"] = binder.contract.to_dict()
+        info["qwen4_exp_frozen_proof"] = engine._qwen4_awex_frozen_proof
     return info
 
 
@@ -236,12 +252,21 @@ class SglangFrozenBinder:
         get_model: Callable[[], nn.Module],
         contract: Qwen4ExpFrozenContract,
         weight_updater: ModuleType,
+        checkpoint: FrozenCheckpoint,
+        expected_proof: dict,
     ) -> None:
         self.get_model = get_model
         self.contract = contract
         self.weight_updater = weight_updater
+        self.checkpoint = checkpoint
+        self.expected_proof = expected_proof
+        self._validated_identity = None
+        self._hooked_model = None
 
-    def __call__(self, converter: Any) -> None:
+    def invalidate(self, *args, **kwargs) -> None:
+        self._validated_identity = None
+
+    def verify_loaded(self):
         model = self.get_model()
         if type(model).__name__ != "Qwen4ExpForConditionalGeneration":
             raise ValueError("Frozen inference binding requires Qwen4Exp")
@@ -250,6 +275,7 @@ class SglangFrozenBinder:
                 "Qwen4Exp visual preservation must be installed before release"
             )
         parameters = {}
+        owners = {}
         visual_names = set()
         for name, parameter in model.named_parameters():
             if name.startswith("visual."):
@@ -262,6 +288,46 @@ class SglangFrozenBinder:
             if canonical in parameters:
                 raise ValueError(f"Duplicate frozen inference identity: {canonical}")
             parameters[canonical] = parameter
-        converter.bind_frozen_contract(
-            self.contract, parameters, frozenset(visual_names)
+            owners[canonical] = model.get_submodule(name.rsplit(".", 1)[0])
+        self.contract.validate_inference_parameters(parameters, frozenset(visual_names))
+        self._verify(model, parameters, owners)
+        return parameters, frozenset(visual_names)
+
+    def __call__(self, converter: Any) -> None:
+        parameters, visual_names = self.verify_loaded()
+        converter.bind_frozen_contract(self.contract, parameters, visual_names)
+
+    def _verify(self, model: nn.Module, parameters: dict, owners: dict) -> None:
+        identity = tuple(
+            (n, id(p), tuple(p.shape), p.dtype, p.requires_grad)
+            for n, p in parameters.items()
         )
+        if identity == self._validated_identity:
+            return
+        proof = {}
+        for name, parameter in parameters.items():
+            if name in self.contract.ple_table_names:
+                proof.update(
+                    self.checkpoint.verify_table(name, owners[name], "inference")
+                )
+            else:
+                shape = self.checkpoint.shape(name)
+                segments, local_shape = visual_segments(owners[name], name, shape)
+                if tuple(parameter.shape) != local_shape:
+                    raise ValueError(
+                        f"Frozen inference visual shape differs from checkpoint: {name}"
+                    )
+                proof[name] = self.checkpoint.verify_source(name, parameter, segments)
+        check_frozen_proof(proof, self.expected_proof)
+        if self._hooked_model is not model:
+            model.register_load_state_dict_pre_hook(self.invalidate)
+            if hasattr(model, "load_weights"):
+                original = model.load_weights
+
+                def load_weights(*args, **kwargs):
+                    self.invalidate()
+                    return original(*args, **kwargs)
+
+                model.load_weights = load_weights
+            self._hooked_model = model
+        self._validated_identity = identity

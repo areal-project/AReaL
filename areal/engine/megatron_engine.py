@@ -1076,10 +1076,10 @@ class MegatronEngine(TrainEngine):
                         "mcore-bridge AWEX requires the explicit Qwen4Exp adapter."
                     )
                 from areal.models.mcore.qwen4_exp_awex_binding import (
-                    load_actor_frozen_contract,
+                    actor_frozen_binder,
                 )
 
-                load_actor_frozen_contract(self)
+                actor_frozen_binder(self)
             if (
                 meta.type == "xccl"
                 and not self.mcore_config.use_bridge_for_update_weights
@@ -1280,6 +1280,9 @@ class MegatronEngine(TrainEngine):
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
 
     def load(self, meta: SaveLoadMeta):
+        binder = getattr(self, "_qwen4_awex_frozen_binder", None)
+        if binder is not None:
+            binder.invalidate()
         with self._offload_aware_context():
             if meta.weight_format == "hf":
                 if meta.with_optim:
