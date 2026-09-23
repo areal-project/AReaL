@@ -396,7 +396,7 @@ async def test_proxy_system_error_overrides_model_failure_classifier(monkeypatch
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_failure", [False, True])
 @pytest.mark.parametrize("explicit_reference", [None, 2.0])
-async def test_concat_episode_reward_fills_unscored_branch_and_cached_tensors(
+async def test_concat_episode_reward_preserves_unscored_branch_and_cached_tensors(
     monkeypatch, model_failure, explicit_reference
 ):
     missing = InteractionWithTokenLogpReward(reward=None)
@@ -431,18 +431,16 @@ async def test_concat_episode_reward_fills_unscored_branch_and_cached_tensors(
         workflow_context.set(WorkflowContext())
         stats_tracker.export_all(reset=True)
     expected = 0.0 if model_failure else 1.0
-    assert result["child"].reward == expected
+    assert result["child"].reward is None
     assert result["main"].reward == expected
     assert result["explicit"].reward == 0.25
     for key in ["rewards", "original_rewards"]:
         torch.testing.assert_close(
-            missing._cache[key], torch.full((2,), expected, dtype=torch.float64)
+            missing._cache[key], torch.zeros(2, dtype=torch.float64)
         )
-    assert result["main"].rollout_reward == (
-        expected if explicit_reference is None else None
-    )
+    assert result["main"].rollout_reward is None
     assert explicit.rollout_reward == explicit_reference
-    assert normalize_logical_rollout_rewards([result])
+    assert not normalize_logical_rollout_rewards([result])
 
 
 @pytest.mark.asyncio
