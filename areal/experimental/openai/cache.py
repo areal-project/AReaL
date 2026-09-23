@@ -88,21 +88,24 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
 
     def set_reward(self, interaction_id: str, reward: float) -> None:
         """Set reward for a specific completion/response by its ID."""
-        with self._lock:  # usually no need to lock, but just in case
-            interaction = self[interaction_id]
-            self._total_reward -= interaction.reward or 0.0
-            interaction.reward = reward
-            if interaction._cache is not None:
-                interaction._cache["rewards"] = torch.tensor([float(reward)])
-                original_reward = (
-                    interaction.original_reward
-                    if interaction.original_reward is not None
-                    else reward
-                )
-                interaction._cache["original_rewards"] = torch.tensor(
-                    [float(original_reward)]
-                )
-            self._total_reward += reward
+        with self._lock:
+            self._set_reward_unlocked(interaction_id, reward)
+
+    def _set_reward_unlocked(self, interaction_id: str, reward: float) -> None:
+        interaction = self[interaction_id]
+        self._total_reward -= interaction.reward or 0.0
+        interaction.reward = reward
+        if interaction._cache is not None:
+            interaction._cache["rewards"] = torch.tensor([float(reward)])
+            original_reward = (
+                interaction.original_reward
+                if interaction.original_reward is not None
+                else reward
+            )
+            interaction._cache["original_rewards"] = torch.tensor(
+                [float(original_reward)]
+            )
+        self._total_reward += reward
 
     @classmethod
     def from_dict(
@@ -174,8 +177,20 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         return cache, cloned_parent
 
     def set_last_reward(self, reward: float) -> None:
-        """Set reward for the most recent completion/response."""
-        self.set_reward(self.last_interaction_id, reward)
+        """Set reward on the latest completed interaction."""
+        with self._lock:
+            for interaction_id, interaction in reversed(self.items()):
+                if self._is_complete(interaction):
+                    self._set_reward_unlocked(interaction_id, reward)
+                    return
+            raise ValueError("No completed interactions in session")
+
+    @staticmethod
+    def _is_complete(interaction: InteractionWithTokenLogpReward) -> bool:
+        return (
+            interaction.interaction_id is not None
+            and interaction.output_message_list is not None
+        )
 
     def _invalidate_tensor_caches_from(
         self, interaction: InteractionWithTokenLogpReward
@@ -289,7 +304,7 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         # Group entries by hashed input messages, preserving insertion order.
         groups: dict[str, list[str]] = defaultdict(list)
         for cid, entry in self.items():
-            if entry.messages is None:
+            if not self._is_complete(entry) or entry.messages is None:
                 continue
             try:
                 serialized = json.dumps(
@@ -623,10 +638,7 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         # that are still in-flight when the main user request completes.
         complete_cache = {}
         for id, interaction in self.items():
-            if (
-                interaction.interaction_id is None
-                or interaction.output_message_list is None
-            ):
+            if not self._is_complete(interaction):
                 logger.warning(
                     f"Skipping incomplete interaction during export: cache_key={id}, "
                     f"messages={interaction.messages[:1] if interaction.messages else []}..."
