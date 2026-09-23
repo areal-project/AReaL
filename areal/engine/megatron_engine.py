@@ -2894,7 +2894,17 @@ class MegatronEngine(TrainEngine):
             if bucket_size + size > weight_chunked_mem_size:
                 self._update_bucket_weights_from_distributed(meta, bucket)
                 bucket_size = 0
-            bucket.append((hf_name, hf_tensor.contiguous()))
+            # Some bridges assemble export shards (e.g. PLE) on CPU even with
+            # cpu=False. Stage only this bucket, after draining the previous one,
+            # so accelerator memory is bounded by the bucket or one large shard.
+            bucket.append(
+                (
+                    hf_name,
+                    hf_tensor.to(
+                        device=self.device, memory_format=torch.contiguous_format
+                    ).contiguous(),
+                )
+            )
             bucket_size += size
 
         if bucket:

@@ -114,3 +114,47 @@ def test_actor_yaml_uses_shared_interpreter_and_keeps_inference_separate():
     rollout = config["rollout"]["scheduling_spec"][0]
     assert "QWEN_TRAIN_PYTHON" not in rollout["cmd"]
     assert rollout["image"] == "${oc.env:QWEN_ROLLOUT_IMAGE}"
+
+
+@pytest.mark.parametrize("training_runtime", [False, True])
+def test_rollout_startup_uses_image_python_for_patches_and_rpc(
+    tmp_path, training_runtime
+):
+    config = yaml.safe_load((RECIPE / "swe_mm_rl.yaml").read_text())
+    rollout = config["rollout"]["scheduling_spec"][0]
+    image_bin = tmp_path / "image-bin"
+    image_bin.mkdir()
+    image_python = image_bin / "python3"
+    image_python.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_LOG"\n')
+    image_python.chmod(0o755)
+    train_bin = tmp_path / "training-bin"
+    train_bin.mkdir()
+    for name in ("python", "python3"):
+        executable = train_bin / name
+        executable.write_text("#!/bin/sh\nexit 99\n")
+        executable.chmod(0o755)
+    private_env = tmp_path / "private.env"
+    private_env.touch()
+    env = dict(os.environ)
+    env.pop("BASH_ENV", None)
+    env.pop("QWEN_TRAIN_PYTHON", None)
+    env.update(
+        PATH=f"{image_bin}:{os.environ['PATH']}",
+        QWEN_PRIVATE_ENV=str(private_env),
+        TMS_INIT_ENABLE="0",
+        TMS_INIT_ENABLE_CPU_BACKUP="0",
+        TEST_LOG=str(tmp_path / "python-calls"),
+    )
+    if training_runtime:
+        env["QWEN_TRAIN_PYTHON"] = str(train_bin / "python")
+    script = "\n".join([*rollout["additional_bash_cmds"], rollout["cmd"]])
+    script = script.replace("${oc.env:QWEN_REPO}", str(RECIPE.parents[2]))
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode == 0, result.stderr
+    assert Path(env["TEST_LOG"]).read_text().splitlines() == [
+        "-m examples.swe.qwen38_flash_next.patch_sglang_qsa_topk",
+        "-m examples.swe.qwen38_flash_next.patch_sglang_qsa_compress_gather",
+        "-m areal.infra.rpc.rpc_server",
+    ]

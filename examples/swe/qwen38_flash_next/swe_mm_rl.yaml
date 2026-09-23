@@ -98,8 +98,6 @@ rollout:
     additional_bash_cmds:
     - set -euo pipefail
     - set -a; source "$QWEN_PRIVATE_ENV"; set +a
-    - test -x "$QWEN_TRAIN_PYTHON"
-    - export PATH="$(dirname "$QWEN_TRAIN_PYTHON"):$PATH"
     - test "$TMS_INIT_ENABLE" = 0
     - test "$TMS_INIT_ENABLE_CPU_BACKUP" = 0
     - cd ${oc.env:QWEN_REPO}

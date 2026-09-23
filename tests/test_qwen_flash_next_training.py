@@ -728,3 +728,89 @@ def test_cp_causal_convolution_preserves_remote_input_gradients(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta", "cuda"])
+def test_bridge_live_sync_stages_cpu_exports_after_draining_bucket(monkeypatch, device):
+    from areal.engine.megatron_engine import MegatronEngine
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("Requires CUDA")
+    tensors = [
+        torch.arange(4, dtype=torch.bfloat16).reshape(2, 2).t(),
+        torch.tensor([7], dtype=torch.int64),
+        torch.tensor([1.25, 2.5, 3.75]),
+    ]
+    exports = [(f"ple.shard_{i}", tensor) for i, tensor in enumerate(tensors)]
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.device = torch.device(device)
+    engine.model = []
+    engine.process_group_initialized = True
+    engine._cpu_group = object()
+    engine.bridge = SimpleNamespace(export_hf_weights=Mock(return_value=iter(exports)))
+    engine.is_pipeline_parallel_head = lambda: True
+    events = []
+    original_to = torch.Tensor.to
+    names = {id(tensor): name for name, tensor in exports}
+
+    def stage(tensor, *args, **kwargs):
+        if id(tensor) in names:
+            events.append(("stage", names[id(tensor)]))
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", stage)
+    received = []
+
+    def send(meta, bucket):
+        # The normal sender waits for broadcasts and then clears the bucket.
+        assert len(bucket) == 1
+        name, tensor = bucket[0]
+        source = dict(exports)[name]
+        assert tensor.device.type == device
+        assert tensor.dtype == source.dtype
+        assert tensor.shape == source.shape
+        assert tensor.is_contiguous()
+        if device != "meta":
+            torch.testing.assert_close(tensor.cpu(), source, rtol=0, atol=0)
+        events.append(("send", name))
+        received.append(name)
+        bucket.clear()
+
+    engine._update_bucket_weights_from_distributed = send
+    barrier = Mock()
+    monkeypatch.setattr(dist, "barrier", barrier)
+    engine._update_weights_via_bridge(
+        SimpleNamespace(weight_chunked_mem_mb=8 / 1024**2)
+    )
+    assert received == [name for name, _ in exports]
+    assert events == [
+        (action, name) for name, _ in exports for action in ("stage", "send")
+    ]
+    engine.bridge.export_hf_weights.assert_called_once_with(
+        engine.model, cpu=False, show_progress=False
+    )
+    barrier.assert_called_once_with(group=engine.cpu_group)
+
+
+def test_bridge_live_sync_non_sender_does_not_stage_exports(monkeypatch):
+    from areal.engine.megatron_engine import MegatronEngine
+
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.model = []
+    engine.process_group_initialized = True
+    engine._cpu_group = object()
+    engine.bridge = SimpleNamespace(
+        export_hf_weights=lambda *args, **kwargs: iter(
+            [("ple.shard", torch.ones(4)), ("other", None)]
+        )
+    )
+    engine.is_pipeline_parallel_head = lambda: False
+    engine._update_bucket_weights_from_distributed = Mock()
+    stage = Mock(side_effect=AssertionError("Non-sender must not stage tensors"))
+    monkeypatch.setattr(torch.Tensor, "to", stage)
+    barrier = Mock()
+    monkeypatch.setattr(dist, "barrier", barrier)
+    engine._update_weights_via_bridge(SimpleNamespace(weight_chunked_mem_mb=1))
+    stage.assert_not_called()
+    engine._update_bucket_weights_from_distributed.assert_not_called()
+    barrier.assert_called_once_with(group=engine.cpu_group)
