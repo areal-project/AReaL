@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +15,7 @@ from areal.engine.awex.colocate_reader import (
     _PhysicalDeviceMetaServerClient,
 )
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
+from areal.engine.awex.metadata import serialize_metadata_gc
 from areal.engine.awex.sglang_plugin import (
     AwexSchedulerPlugin,
     _load_sglang_plugins_if_available,
@@ -109,8 +113,23 @@ def test_awex_config_preserves_nested_router_and_vision_metadata(monkeypatch):
     assert config.architectures == ["SimpleNamespace"]
 
 
-def test_memory_transitions_are_idempotent():
-    pytest.importorskip("sglang")
+def test_memory_transitions_are_idempotent(monkeypatch):
+    import sys
+
+    class ReleaseOutput:
+        pass
+
+    class ResumeOutput:
+        pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.io_struct",
+        SimpleNamespace(
+            ReleaseMemoryOccupationReqOutput=ReleaseOutput,
+            ResumeMemoryOccupationReqOutput=ResumeOutput,
+        ),
+    )
 
     class Scheduler:
         def __init__(self):
@@ -130,9 +149,9 @@ def test_memory_transitions_are_idempotent():
     request = SimpleNamespace(tags=["kv_cache"])
 
     scheduler.release_memory_occupation(request)
-    scheduler.release_memory_occupation(request)
+    assert isinstance(scheduler.release_memory_occupation(request), ReleaseOutput)
     scheduler.resume_memory_occupation(request)
-    scheduler.resume_memory_occupation(request)
+    assert isinstance(scheduler.resume_memory_occupation(request), ResumeOutput)
 
     assert scheduler.calls == [
         ("release", ["kv_cache"]),
@@ -209,7 +228,7 @@ def test_awex_weight_update_runs_without_grad_tracking():
     reader = SimpleNamespace(
         update_weights=lambda step_id: grad_modes.append(torch.is_grad_enabled())
     )
-    instance = object.__new__(AwexColocateReader)
+    instance = AwexColocateReader(SimpleNamespace())
     instance._initialized = True
     instance._ensure_reader = lambda: reader
     instance._rebuild_derived_weights = lambda: None
@@ -302,3 +321,237 @@ def test_awex_rejects_megatron_without_ddp_flat_buffers():
             weight_update_mode="awex",
             megatron=MegatronEngineConfig(wrap_with_ddp=False),
         )
+
+
+@pytest.mark.parametrize(
+    "installed", ["0.5.9", "0.5.10.post1", "0.5.18.dev10+g85b539146"]
+)
+def test_supported_sglang_builds_are_accepted(monkeypatch, installed):
+    import areal.engine.awex.sglang_plugin as plugin
+
+    monkeypatch.setattr(plugin.pkg_version, "get_version", lambda name: installed)
+    plugin.assert_supported_sglang_version()
+
+
+def test_unverified_sglang_build_is_rejected(monkeypatch):
+    import areal.engine.awex.sglang_plugin as plugin
+
+    monkeypatch.setattr(plugin.pkg_version, "get_version", lambda name: "0.5.19.dev126")
+    with pytest.raises(RuntimeError, match="Re-check Scheduler"):
+        plugin.assert_supported_sglang_version()
+
+
+@pytest.mark.parametrize(
+    "visible,logical", [(None, 7), ("7", 0), ("4,5,6,7", 2), ("GPU-uuid", 0)]
+)
+def test_awex_reader_uses_model_device_independent_of_physical_ids(
+    monkeypatch, visible, logical
+):
+    from areal.engine.awex.colocate_reader import _DeviceBoundWeightsReader
+
+    if visible is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+    reader = _DeviceBoundWeightsReader.__new__(_DeviceBoundWeightsReader)
+    reader._model_device = torch.device("cuda", logical)
+    reader.transfer_rank = 7
+    devices = []
+    monkeypatch.setattr(torch.cuda, "set_device", devices.append)
+    monkeypatch.setattr(torch, "tensor", lambda value, **kwargs: kwargs["device"])
+
+    reader._set_device()
+
+    assert devices == [reader._model_device]
+    assert reader.barrier_device == logical
+    assert reader.backend == "nccl"
+    assert reader.ready_tensor == reader._model_device
+
+
+def test_awex_reader_rejects_model_weights_still_on_cpu():
+    from areal.engine.awex.colocate_reader import _DeviceBoundWeightsReader
+
+    with pytest.raises(RuntimeError, match="model weights resumed on CUDA"):
+        _DeviceBoundWeightsReader(model=torch.nn.Linear(2, 2))
+
+
+def test_receiver_initialization_failure_reaches_scheduler_loop():
+    plugin = AwexSchedulerPlugin(SimpleNamespace())
+    failure = SystemError("metadata tuple construction failed")
+    plugin._initialization_error = failure
+    with pytest.raises(
+        RuntimeError, match="AWEX receiver initialization failed"
+    ) as exc:
+        plugin.process_awex_queue()
+    assert exc.value.__cause__ is failure
+
+
+def test_native_scheduler_surfaces_initialization_error_while_unpaused():
+    calls = []
+    scheduler = SimpleNamespace(
+        _apply_war_barrier=lambda: None,
+        _engine_paused=False,
+        process_input_requests=lambda requests: calls.append(requests),
+    )
+    plugin = AwexSchedulerPlugin(scheduler)
+    plugin._patch_event_loop()
+    plugin._initialization_error = ValueError("invalid metadata")
+    with pytest.raises(RuntimeError, match="AWEX receiver initialization failed"):
+        scheduler.process_input_requests([])
+    assert not calls
+
+
+def test_scheduler_dispatcher_captures_gc_guard_and_registration_is_idempotent(
+    monkeypatch,
+):
+    import sys
+
+    import areal.engine.awex.sglang_plugin as plugin_module
+
+    class Scheduler:
+        def __init__(self):
+            self.dispatch = {"freeze": self.handle_freeze_gc}
+
+        def handle_freeze_gc(self, request):
+            return request
+
+    original_freeze = Scheduler.handle_freeze_gc
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.scheduler",
+        SimpleNamespace(Scheduler=Scheduler),
+    )
+    monkeypatch.delenv("QWEN_AWEX_FROZEN_CONTRACT", raising=False)
+    monkeypatch.setattr(plugin_module, "assert_supported_sglang_version", lambda: None)
+    monkeypatch.setattr(AwexSchedulerPlugin, "bind", lambda self: None)
+    monkeypatch.setattr(
+        plugin_module, "_patch_execute_task_in_model_worker", lambda *a: None
+    )
+    plugin_module.register_awex_plugin()
+    guarded = Scheduler.handle_freeze_gc
+    assert guarded.__wrapped__ is original_freeze
+    plugin_module.register_awex_plugin()
+    assert Scheduler.handle_freeze_gc is guarded
+    scheduler = Scheduler()
+    assert scheduler.dispatch["freeze"].__func__ is guarded
+    assert scheduler.dispatch["freeze"]("request") == "request"
+
+
+def test_gc_scan_waits_until_metadata_tuple_is_complete():
+    building = threading.Event()
+    scan_requested = threading.Event()
+    events = []
+    marker = object()
+
+    @serialize_metadata_gc
+    def build_metadata():
+        def dimensions():
+            yield marker
+            building.set()
+            assert scan_requested.wait(5)
+            yield 2
+
+        result = tuple(dimensions())
+        events.append("metadata complete")
+        return result
+
+    @serialize_metadata_gc
+    def freeze_gc():
+        # Holding references to a growing tuple here would cause SystemError
+        # when tuple(dimensions()) resizes its allocation after iteration.
+        retained = gc.get_referrers(marker)
+        events.append("GC scan")
+        return retained
+
+    def request_scan():
+        assert building.wait(5)
+        scan_requested.set()
+        return freeze_gc()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        metadata = pool.submit(build_metadata)
+        scan = pool.submit(request_scan)
+        assert metadata.result(timeout=10) == (marker, 2)
+        scan.result(timeout=10)
+    assert events == ["metadata complete", "GC scan"]
+
+
+def test_metadata_gc_guard_releases_lock_after_failure():
+    import pytest
+
+    @serialize_metadata_gc
+    def fail():
+        raise ValueError("metadata failed")
+
+    @serialize_metadata_gc
+    def succeed():
+        return "ready"
+
+    with pytest.raises(ValueError, match="metadata failed"):
+        fail()
+    assert succeed() == "ready"
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("location", ["scheduler", "worker", "runner", "worker_direct"])
+def test_legacy_model_worker_callback_preserves_native_tp_rank(rank, location):
+    from areal.engine.awex.sglang_plugin import _patch_execute_task_in_model_worker
+
+    runner = SimpleNamespace(model=object())
+    worker = SimpleNamespace(model_runner=runner)
+    scheduler = SimpleNamespace(
+        tp_worker=worker, server_args=SimpleNamespace(tp_size=4)
+    )
+    owner = {
+        "scheduler": scheduler,
+        "worker": worker,
+        "runner": runner,
+        "worker_direct": worker,
+    }[location]
+    if location == "worker_direct":
+        owner.tp_rank = rank
+        owner.tp_size = 4
+    else:
+        owner.ps = SimpleNamespace(tp_rank=rank, tp_size=4)
+    plugin = AwexSchedulerPlugin(scheduler)
+    _patch_execute_task_in_model_worker(scheduler, plugin)
+    task = SimpleNamespace(
+        kwargs={}, task_func=lambda **kwargs: kwargs["model_context"]
+    )
+
+    context = scheduler.execute_task_in_model_worker(task)
+
+    assert context["tp_rank"] == rank
+    assert context["tp_size"] == 4
+
+
+@pytest.mark.parametrize("rank", [None, -1, 4])
+def test_legacy_model_worker_callback_rejects_unresolved_or_invalid_tp_rank(rank):
+    from areal.engine.awex.sglang_plugin import _patch_execute_task_in_model_worker
+
+    scheduler = SimpleNamespace(
+        tp_rank=rank,
+        server_args=SimpleNamespace(tp_size=4),
+        tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=object())),
+    )
+    plugin = AwexSchedulerPlugin(scheduler)
+    _patch_execute_task_in_model_worker(scheduler, plugin)
+    task = SimpleNamespace(kwargs={}, task_func=lambda **kwargs: kwargs)
+
+    with pytest.raises(RuntimeError, match="valid AWEX inference TP rank"):
+        scheduler.execute_task_in_model_worker(task)
+
+
+def test_legacy_model_worker_callback_allows_single_rank_without_parallel_state():
+    from areal.engine.awex.sglang_plugin import _patch_execute_task_in_model_worker
+
+    scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(tp_size=1),
+        tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=object())),
+    )
+    plugin = AwexSchedulerPlugin(scheduler)
+    _patch_execute_task_in_model_worker(scheduler, plugin)
+    task = SimpleNamespace(
+        kwargs={}, task_func=lambda **kwargs: kwargs["model_context"]
+    )
+    assert scheduler.execute_task_in_model_worker(task)["tp_rank"] == 0

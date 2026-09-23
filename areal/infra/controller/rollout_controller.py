@@ -674,6 +674,12 @@ class RolloutController:
             )
         await asyncio.gather(*init_tasks)
 
+        # Recovery may publish weights before these proxy engines exist.
+        # Initialize their request versions before admitting agent workflows.
+        await self._proxy_collective_rpc_async(
+            "set_version", version=self.get_version(), http_timeout=60.0
+        )
+
         logger.info(f"Proxy servers initialized. Addresses: {self.proxy_addrs}")
 
     def get_proxy_addr(self, rank: int) -> str:

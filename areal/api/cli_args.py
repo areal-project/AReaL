@@ -267,8 +267,7 @@ class GenerationHyperparameters:
                 "If True, discard the entire group when any of the n_samples "
                 "rollouts fails or returns None. prepare_batch will automatically "
                 "retry with a new prompt. This prevents partial groups from "
-                "causing reward normalization group misalignment. Not supported by "
-                "RolloutControllerV2 yet."
+                "causing reward normalization group misalignment."
             )
         },
     )
@@ -1888,8 +1887,7 @@ class PPOActorConfig(TrainEngineConfig):
             "help": "Minimum usable rollout slots a prompt group must keep to stay "
             "trainable when some slots fail or are filtered. None derives the "
             "minimum from reward_norm/adv_norm: 2 when either uses group "
-            "statistics (1 for a singleton target group), else 1. Only the v1 "
-            "rollout path consumes this option."
+            "statistics (1 for a singleton target group), else 1."
         },
     )
 

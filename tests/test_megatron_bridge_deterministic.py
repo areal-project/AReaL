@@ -6,6 +6,8 @@ from unittest import mock
 import pytest
 import torch
 
+from areal.api.cli_args import MegatronEngineConfig
+
 
 class _FinalizeReached(RuntimeError):
     pass
@@ -47,18 +49,9 @@ def _restore_global_deterministic_state(monkeypatch):
     )
 
 
-def _make_mcore_config(*, deterministic: bool) -> SimpleNamespace:
-    return SimpleNamespace(
-        virtual_pipeline_parallel_size=None,
-        recompute_granularity=None,
-        recompute_method=None,
-        recompute_num_layers=None,
-        distribute_saved_activations=False,
-        recompute_modules=None,
-        cross_entropy_loss_fusion=False,
-        enable_mtp=False,
-        mtp_only=False,
-        moe_token_dispatcher_type="alltoall",
+def _make_mcore_config(*, deterministic: bool) -> MegatronEngineConfig:
+    return MegatronEngineConfig(
+        cross_entropy_loss_fusion=True,
         use_deterministic_algorithms=deterministic,
     )
 
@@ -122,8 +115,8 @@ def test_megatron_bridge_provider_applies_determinism_before_finalize():
     )
 
 
-def test_megatron_bridge_provider_applies_fusion_config_when_nondeterministic():
-    """The engine fusion setting still applies without deterministic mode."""
+def test_megatron_bridge_provider_preserves_defaults_when_disabled():
+    """The Megatron-Bridge provider remains unchanged without the opt-in."""
     attention_backend = object()
     provider = _make_provider(attention_backend)
 
@@ -132,7 +125,7 @@ def test_megatron_bridge_provider_applies_fusion_config_when_nondeterministic():
     assert provider.config_at_finalize == (
         False,
         attention_backend,
-        False,
+        True,
         True,
     )
 

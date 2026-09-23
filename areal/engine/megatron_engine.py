@@ -2174,6 +2174,12 @@ class MegatronEngine(TrainEngine):
         )
 
         self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
+        if mcore_opt_config.optimizer_cpu_offload:
+            from areal.engine.megatron_utils.hybrid_optimizer import (
+                install_hybrid_optimizer_checkpoint_compat,
+            )
+
+            install_hybrid_optimizer_checkpoint_compat(self.optimizer)
 
         lr_scheduler = OptimizerParamScheduler(
             self.optimizer,

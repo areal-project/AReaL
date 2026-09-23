@@ -504,6 +504,11 @@ class MegatronCheckpointManager:
             )
             optimizer_state_dict = state_dict["optimizer"]
             self.optimizer.load_state_dict(optimizer_state_dict)
+            from areal.engine.megatron_utils.hybrid_optimizer import (
+                sync_loaded_hybrid_optimizer_state,
+            )
+
+            sync_loaded_hybrid_optimizer_state(self.optimizer)
             log_with_rank(
                 f"Loaded optimizer checkpoint from {local_path}",
                 rank=self.rank,
