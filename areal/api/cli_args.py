@@ -1118,12 +1118,11 @@ class MegatronEngineConfig:
         default=False,
         metadata={
             "help": "Train the Multi-Token-Prediction (MTP) head as an auxiliary "
-            "objective (SFT/RL). Requires enable_mtp=True. The MTP loss is fed an "
-            "independent label channel (mtp_kwargs) so the main forward keeps "
-            "labels=None and returns logits; MTP gradients are isolated from the "
-            "backbone (output weight detached, backbone hidden states cut from the "
-            "MTP graph). bridge_type=megatron-bridge only; packed context parallel "
-            "training is supported.",
+            "objective (SFT/RL). Requires enable_mtp=True. The main forward keeps "
+            "labels=None and returns logits; Megatron-Core derives MTP targets from "
+            "input_ids and isolates MTP gradients from the backbone and LM head. "
+            "bridge_type=megatron-bridge only; packed context parallel training is "
+            "supported.",
         },
     )
 
@@ -1171,8 +1170,8 @@ class MegatronEngineConfig:
             import torch
 
             for package, minimum in (
-                ("megatron-core", "0.18.2"),
-                ("megatron-bridge", "0.5.1"),
+                ("megatron-core", "0.19.0"),
+                ("megatron-bridge", "0.6.0"),
             ):
                 try:
                     installed = pkg_version.get_version(package)

@@ -391,8 +391,8 @@ def _build_thd_packed_seq_params(
     )
 
 
-def _prepare_mtp_forward_kwargs(
-    mtp_kwargs: dict[str, Any],
+def _prepare_mtp_loss_mask(
+    loss_mask: torch.Tensor,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None,
     *,
@@ -400,68 +400,51 @@ def _prepare_mtp_forward_kwargs(
     packed_num_tokens: int,
     uses_padded_form: bool,
     uses_model_packed_seq: bool,
-) -> dict[str, torch.Tensor]:
-    """Align packed MTP labels and masks with the model's execution layout."""
-    labels = mtp_kwargs.get("mtp_labels")
-    loss_mask = mtp_kwargs.get("mtp_loss_mask")
-    if labels is None or loss_mask is None:
-        raise ValueError("MTP training requires both mtp_labels and mtp_loss_mask.")
-    if labels.shape != loss_mask.shape:
-        raise ValueError(
-            "MTP labels and loss mask must have identical shapes, got "
-            f"{labels.shape} and {loss_mask.shape}."
-        )
+) -> torch.Tensor:
+    """Align MTP supervision with the model's execution layout.
 
+    MCore 0.19 derives MTP labels from the layout-aligned ``input_ids`` and
+    accepts ``loss_mask`` directly. AReaL therefore only needs to apply the
+    same padding or context-parallel partition to the mask.
+    """
     if cu_seqlens is None:
-        if labels.numel() != input_ids.numel():
+        if loss_mask.numel() != input_ids.numel():
             raise ValueError(
-                "MTP labels must contain one value per input token, got "
-                f"{labels.numel()} labels for {input_ids.numel()} tokens."
+                "MTP loss mask must contain one value per input token, got "
+                f"{loss_mask.numel()} values for {input_ids.numel()} tokens."
             )
-        return {
-            "mtp_labels": labels.reshape(input_ids.shape).contiguous(),
-            "mtp_loss_mask": loss_mask.reshape(input_ids.shape).contiguous(),
-        }
+        return loss_mask.reshape(input_ids.shape).contiguous()
 
-    if labels.ndim != 1:
+    if loss_mask.ndim != 1:
         raise ValueError(
-            "MTP labels and loss mask must enter packed sequence-layout conversion "
-            f"as 1-D tensors, got {labels.shape=} and {loss_mask.shape=}."
+            "MTP loss mask must enter packed sequence-layout conversion as a "
+            f"1-D tensor, got {loss_mask.shape=}."
         )
 
-    if labels.numel() != packed_num_tokens:
+    if loss_mask.numel() != packed_num_tokens:
         raise ValueError(
-            "MTP labels must match the packed sequence length, got "
-            f"{labels.numel()} labels for {packed_num_tokens} tokens."
+            "MTP loss mask must match the packed sequence length, got "
+            f"{loss_mask.numel()} values for {packed_num_tokens} tokens."
         )
 
     if uses_padded_form and not uses_model_packed_seq:
         if attention_mask is None:
             raise ValueError("Padded MTP training requires a 2-D validity mask.")
-        padded_labels = torch.zeros_like(input_ids)
         padded_loss_mask = torch.zeros(
             input_ids.shape,
             dtype=loss_mask.dtype,
             device=loss_mask.device,
         )
-        padded_labels[attention_mask] = labels
         padded_loss_mask[attention_mask] = loss_mask
-        return {
-            "mtp_labels": padded_labels,
-            "mtp_loss_mask": padded_loss_mask,
-        }
+        return padded_loss_mask
 
     # Packed context parallelism assigns each rank two zigzag chunks per
     # sequence. Apply the exact same mapping used for input_ids so every local
     # hidden state keeps its token-aligned MTP target and validity mask. MCore's
     # roll_tensor subsequently uses cp_group and packed_seq_params to exchange
     # future-token boundaries across CP ranks.
-    labels = split_packed_seqs_for_context_parallel(labels, cu_seqlens)
     loss_mask = split_packed_seqs_for_context_parallel(loss_mask, cu_seqlens)
-    return {
-        "mtp_labels": labels.unsqueeze(0).contiguous(),
-        "mtp_loss_mask": loss_mask.unsqueeze(0).contiguous(),
-    }
+    return loss_mask.unsqueeze(0).contiguous()
 
 
 def packed_context_parallel_forward(
@@ -562,20 +545,26 @@ def packed_context_parallel_forward(
             if key in input_:
                 vlm_kwargs[key] = input_[key]
 
-    # MTP training: convert the independent label and mask channels to the
-    # exact layout used by this forward. MCore rolls both once per MTP layer;
-    # keeping them aligned prevents cross-sequence targets and masks padding
-    # or unavailable future-token positions.
+    # For BSHD text-only, drop the packed-form position_ids (a 1D tensor of
+    # length total_len) — they don't match the 2D [B, S] input. Let mcore
+    # compute the default torch.arange positions per row; padding positions
+    # are masked out by attention_mask.
+    if dense_mask_text_forward:
+        position_ids = None
+
+    # MTP training: convert the supervision mask to the exact layout used by
+    # this forward. MCore 0.19 derives targets from input_ids and performs the
+    # boundary-safe rolls internally.
     extra_forward_kwargs: dict[str, Any] = {}
-    mtp_kwargs = input_.get("mtp_kwargs", None)
-    if mtp_kwargs is not None:
-        extra_forward_kwargs["mtp_kwargs"] = _prepare_mtp_forward_kwargs(
-            mtp_kwargs,
+    mtp_loss_mask = input_.get("mtp_loss_mask", None)
+    if mtp_loss_mask is not None:
+        extra_forward_kwargs["loss_mask"] = _prepare_mtp_loss_mask(
+            mtp_loss_mask,
             input_ids,
             attention_mask,
             cu_seqlens=cu_seqlens,
             packed_num_tokens=packed_num_tokens,
-            uses_padded_form=is_vision_model and not use_model_packed_seq,
+            uses_padded_form=needs_padded_form,
             uses_model_packed_seq=use_model_packed_seq,
         )
 

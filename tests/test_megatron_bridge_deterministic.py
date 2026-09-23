@@ -137,7 +137,7 @@ def test_megatron_bridge_provider_preserves_defaults_when_disabled():
 
 
 def test_megatron_bridge_rejects_multilayer_mtp_training():
-    """The gradient-isolation patch currently supports one MTP layer only."""
+    """AReaL currently supports training one MTP prediction layer."""
     pytest.importorskip("mbridge")
     pytest.importorskip("megatron.core")
     from areal.models.mcore.registry import make_mcore_model
@@ -169,3 +169,41 @@ def test_megatron_bridge_rejects_multilayer_mtp_training():
             bridge=_FakeBridge(provider),
             bridge_type="megatron-bridge",
         )
+
+
+def test_megatron_bridge_enables_native_mtp_gradient_isolation():
+    """MCore's native detach path must be configured before provider finalize."""
+    pytest.importorskip("mbridge")
+    pytest.importorskip("megatron.core")
+    from areal.models.mcore.registry import make_mcore_model
+
+    provider = _make_provider(attention_backend=object())
+    provider.mtp_num_layers = 1
+    provider.mtp_detach_heads = False
+    mcore_config = _make_mcore_config(deterministic=False)
+    mcore_config.enable_mtp = True
+    mcore_config.enable_mtp_training = True
+    mcore_config.mtp_loss_scaling_factor = 0.1
+
+    with (
+        mock.patch.multiple(
+            "areal.models.mcore.registry.mpu",
+            get_tensor_model_parallel_world_size=mock.DEFAULT,
+            get_pipeline_model_parallel_world_size=mock.DEFAULT,
+            get_context_parallel_world_size=mock.DEFAULT,
+            get_expert_model_parallel_world_size=mock.DEFAULT,
+            get_expert_tensor_parallel_world_size=mock.DEFAULT,
+        ) as mpu_mocks,
+        pytest.raises(_FinalizeReached),
+    ):
+        for getter in mpu_mocks.values():
+            getter.return_value = 1
+        make_mcore_model(
+            hf_config=SimpleNamespace(),
+            tf_config=SimpleNamespace(params_dtype=None),
+            mcore_config=mcore_config,
+            bridge=_FakeBridge(provider),
+            bridge_type="megatron-bridge",
+        )
+
+    assert provider.mtp_detach_heads is True

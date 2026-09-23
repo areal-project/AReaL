@@ -17,7 +17,7 @@ def supported_mtp_runtime(monkeypatch):
     from areal.utils import pkg_version
 
     original = pkg_version.get_version
-    versions = {"megatron-core": "0.18.2", "megatron-bridge": "0.5.1"}
+    versions = {"megatron-core": "0.19.0", "megatron-bridge": "0.6.0"}
     monkeypatch.setattr(
         pkg_version,
         "get_version",
@@ -365,12 +365,6 @@ def test_mtp_full_recompute_matches_direct_gradients(
     mtp_module = pytest.importorskip("megatron.core.transformer.multi_token_prediction")
     from megatron.core.tensor_parallel import random as mcore_random
 
-    from areal.engine.megatron_utils.megatron_bridge_patches import (
-        _patch_mtp_checkpoint_padding_mask,
-    )
-
-    _patch_mtp_checkpoint_padding_mask()
-
     # Only CUDA RNG bookkeeping is replaced; checkpoint forward/backward is real.
     monkeypatch.setattr(mcore_random, "_get_all_rng_states", lambda: ())
     monkeypatch.setattr(mcore_random, "_set_all_rng_states", lambda *args: None)
@@ -478,53 +472,13 @@ def test_mtp_input_hook_preserves_autograd_and_no_grad() -> None:
     assert not output.requires_grad
 
 
-def test_mtp_checkpoint_compatibility_preserves_masks_or_rejects_them(monkeypatch):
-    """The compatibility shim must never silently discard a real padding mask."""
-    mtp = pytest.importorskip("megatron.core.transformer.multi_token_prediction")
-    from areal.engine.megatron_utils.megatron_bridge_patches import (
-        _patch_mtp_checkpoint_padding_mask,
-    )
-
-    def forward(self, hidden_states, padding_mask=None):
-        return hidden_states
-
-    def old_checkpoint(self, hidden_states):
-        return hidden_states.square()
-
-    monkeypatch.setattr(mtp.MultiTokenPredictionLayer, "forward", forward)
-    monkeypatch.setattr(
-        mtp.MultiTokenPredictionLayer, "_checkpointed_forward", old_checkpoint
-    )
-    _patch_mtp_checkpoint_padding_mask()
-    patched = mtp.MultiTokenPredictionLayer._checkpointed_forward
-    _patch_mtp_checkpoint_padding_mask()
-    assert mtp.MultiTokenPredictionLayer._checkpointed_forward is patched
-    hidden = torch.randn(3, 4, requires_grad=True)
-    patched(None, hidden, padding_mask=None).sum().backward()
-    torch.testing.assert_close(hidden.grad, 2 * hidden, rtol=0, atol=0)
-    mask = torch.ones(3, 4, dtype=torch.bool)
-    with pytest.raises(NotImplementedError, match="MTP padding mask"):
-        patched(None, hidden, padding_mask=mask)
-
-    def fixed_checkpoint(self, hidden_states, padding_mask=None):
-        assert padding_mask is mask
-        return hidden_states
-
-    monkeypatch.setattr(
-        mtp.MultiTokenPredictionLayer, "_checkpointed_forward", fixed_checkpoint
-    )
-    _patch_mtp_checkpoint_padding_mask()
-    assert mtp.MultiTokenPredictionLayer._checkpointed_forward is fixed_checkpoint
-    assert fixed_checkpoint(None, hidden, padding_mask=mask) is hidden
-
-
 @pytest.mark.parametrize(
     "package, version",
     [
-        ("megatron-core", "0.18.1"),
-        ("megatron-core", "0.18.2rc1"),
-        ("megatron-bridge", "0.5.0"),
-        ("megatron-bridge", "0.5.1rc1"),
+        ("megatron-core", "0.18.9"),
+        ("megatron-core", "0.19.0rc1"),
+        ("megatron-bridge", "0.5.1"),
+        ("megatron-bridge", "0.6.0rc1"),
     ],
 )
 def test_mtp_only_old_package_raises(supported_mtp_runtime, package, version):
@@ -569,7 +523,7 @@ def test_mtp_only_cudnn_load_failure_raises(monkeypatch):
 
 @pytest.mark.parametrize("version", [91900, 92000])
 def test_mtp_only_supported_runtime_passes(monkeypatch, supported_mtp_runtime, version):
-    supported_mtp_runtime["megatron-core"] = "0.18.2+vendor.1"
+    supported_mtp_runtime["megatron-core"] = "0.19.0+vendor.1"
     supported_mtp_runtime["megatron-bridge"] = "0.6.0"
     monkeypatch.setattr(torch.backends.cudnn, "version", lambda: version)
     assert _config().mtp_only

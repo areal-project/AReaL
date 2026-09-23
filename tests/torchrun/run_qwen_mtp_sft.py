@@ -21,7 +21,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from transformers import AutoConfig
 
 from areal.api.cli_args import MegatronEngineConfig
-from areal.engine.megatron_utils.megatron_bridge_patches import _apply_patches_on_import
 from areal.engine.megatron_utils.packed_context_parallel import (
     packed_context_parallel_forward,
     split_packed_seqs_for_context_parallel,
@@ -42,7 +41,6 @@ def main():
     parser.add_argument("--export")
     parser.add_argument("--lr", type=float, default=2e-5)
     args = parser.parse_args()
-    _apply_patches_on_import()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     mpu.initialize_model_parallel(
@@ -157,7 +155,7 @@ def main():
                 "input_ids": ids,
                 "cu_seqlens": cu_seqlens,
                 "max_seqlen": 64,
-                "mtp_kwargs": {"mtp_labels": ids, "mtp_loss_mask": loss_mask},
+                "mtp_loss_mask": loss_mask,
             },
             gather_cp_output=False,
             is_vision_model=True,
