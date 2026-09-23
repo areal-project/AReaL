@@ -659,7 +659,8 @@ class PPOTrainer:
                 category=Category.INSTR,
             ),
         ):
-            call_maybe_async(rollout.pause_generation)
+            if not self._should_offload_rollout:
+                call_maybe_async(rollout.pause_generation)
 
         with (
             stats_tracker.record_timing("rollout_offload"),
@@ -697,7 +698,8 @@ class PPOTrainer:
                     category=Category.INSTR,
                 ),
             ):
-                call_maybe_async(rollout.continue_generation)
+                if not self._should_offload_rollout:
+                    call_maybe_async(rollout.continue_generation)
         except Exception as exc:  # noqa: BLE001
             if cleanup_error is None:
                 cleanup_error = exc

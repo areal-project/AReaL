@@ -2627,10 +2627,11 @@ class MegatronEngine(TrainEngine):
         step_id = self.get_version()
         self.awex_writer.set_global_step(step_id)
 
-        if dist.get_rank() == 0:
-            self.rollout_engine.pause_generation()
+        if not meta.enable_colocate_mode:
+            if dist.get_rank() == 0:
+                self.rollout_engine.pause_generation()
 
-        dist.barrier(group=self.cpu_group)
+            dist.barrier(group=self.cpu_group)
 
         comm_backend = meta.comm_backend or "file"
         fut = None
@@ -2655,8 +2656,7 @@ class MegatronEngine(TrainEngine):
 
         if dist.get_rank() == 0 and fut is not None:
             fut.result()
-            self.rollout_engine.continue_generation()
-        elif dist.get_rank() == 0:
+        if not meta.enable_colocate_mode and dist.get_rank() == 0:
             self.rollout_engine.continue_generation()
 
         current_platform.synchronize()

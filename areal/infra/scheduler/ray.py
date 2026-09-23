@@ -954,7 +954,7 @@ class RayScheduler(Scheduler):
         session: aiohttp.ClientSession,
         host: str,
         port: int,
-        timeout: float = 60,
+        timeout: float = 720,
     ) -> bool:
         url = f"http://{format_hostport(host, port)}/health"
         deadline = time.time() + timeout

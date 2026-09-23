@@ -137,7 +137,7 @@ dependencies = [
     # Distributed computing
     "ray[default]>=2.53.0",
     "redis",
-    "awex==0.7.0",
+    "awex-ascend==0.8.2",
 
     # Web frameworks
     "fastapi>=0.115.12",
