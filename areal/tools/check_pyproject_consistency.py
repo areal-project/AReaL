@@ -208,10 +208,24 @@ class _Checker:
     # ── [tool.uv].override-dependencies ─────────────────────────────────
 
     def check_override_deps(
-        self, overrides_a: list[str], overrides_b: list[str]
+        self, overrides_a: list[str | dict], overrides_b: list[str | dict]
     ) -> None:
-        dict_a = _dep_list_to_dict(overrides_a)
-        dict_b = _dep_list_to_dict(overrides_b)
+        scoped = []
+        for overrides in (overrides_a, overrides_b):
+            entries = {}
+            for override in overrides:
+                if not isinstance(override, dict):
+                    continue
+                package = override["package"]
+                name = _normalize_name(package["name"])
+                if _is_escapable(name):
+                    continue
+                key = (name, package.get("version", "*"))
+                entries.setdefault(key, []).append(override["dependencies"])
+            scoped.append(entries)
+        self._cmp_values("tool.uv.override-dependencies.scoped", *scoped)
+        dict_a = _dep_list_to_dict([d for d in overrides_a if isinstance(d, str)])
+        dict_b = _dep_list_to_dict([d for d in overrides_b if isinstance(d, str)])
         for name in sorted(set(dict_a) | set(dict_b)):
             if _is_escapable(name):
                 continue
@@ -328,11 +342,19 @@ class _Checker:
         )
 
         # 5. dependency-groups
-        self._cmp_values(
-            "dependency-groups",
-            toml_a.get("dependency-groups", {}),
-            toml_b.get("dependency-groups", {}),
-        )
+        groups_a = toml_a.get("dependency-groups", {})
+        groups_b = toml_b.get("dependency-groups", {})
+        for group in sorted(set(groups_a) | set(groups_b)):
+            if group not in groups_a or group not in groups_b:
+                self._err(f"dependency-groups.{group}: missing in one variant")
+                continue
+            if group == "transformers-default":
+                # This group preserves each inference backend's existing runtime.
+                self.check_dependencies(groups_a[group], groups_b[group])
+            else:
+                self._cmp_values(
+                    f"dependency-groups.{group}", groups_a[group], groups_b[group]
+                )
 
         # 6. tool.uv
         self.check_tool_uv(

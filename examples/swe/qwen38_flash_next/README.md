@@ -26,8 +26,23 @@ For RL, set `QWEN_LAUNCH_ENV` to your launch environment file and run:
 bash examples/swe/qwen38_flash_next/submit_rl.sh swe
 ```
 
-The script validates required paths and the bridge revision before submission.
-`QWEN_PRIVATE_ENV` supplies credentials to the controller and workers;
+The script prepares a fresh shared uv environment inside `QWEN_ACTOR_IMAGE` before
+calling `sbatch`. The image must provide Python 3.12, uv >=0.12.6, and the training CUDA
+extensions (including Transformer Engine and FlashAttention). Environment preparation
+needs package-index and Git access. An installation or import-check failure stops
+submission.
+
+Each submission creates `QWEN_OUTPUT_ROOT/uv-runtime-XXXXXXXX`. Bind that shared output
+directory and the repository at the **same absolute paths** through both
+`QWEN_CONTROLLER_MOUNTS` and `QWEN_MOUNTS` on every training node. The controller and
+all actor workers use this environment's Python; workers do not install packages. The
+environment inherits CUDA extensions from the actor image and installs the locked Qwen
+dependency group. Keep it until the job finishes; a later submission creates a new
+environment without modifying an active job's runtime.
+
+RL no longer needs `MCORE_BRIDGE_ROOT` or `QWEN_TRAIN_EXTRA_PYTHONPATH`: it imports the
+installed bridge and Transformers. The rollout image and its inference `PYTHONPATH`
+remain separate. `QWEN_PRIVATE_ENV` supplies credentials to the controller and workers;
 `QWEN_ARENA_STREAMS_FILE` uses the standard Arena stream configuration format.
 `QWEN_ARENA_TASK_IDS_FILE`, when supplied, selects an ordered subset with explicit
 `env:key@version` references from one stream. Match the stream's harness and reward to
@@ -57,20 +72,41 @@ device assertions avoid per-call host synchronization; invalid inputs invalidate
 CUDA context and require terminating the worker, not retrying the request. Errors may
 surface at a subsequent CUDA operation. CPU inputs retain immediate `ValueError`s.
 
-Qwen4Exp vision needs a Transformers runtime exposing `Qwen4ExpModel.get_rope_index` and
-`get_vision_position_ids`, validated with Transformers 5.16.1. The standard locked
-SGLang/vLLM environments (Transformers 5.3.0/5.7.0) do not provide this model. Supply a
-compatible training runtime; initialization checks these capabilities before model
-allocation. The standard CI image does not validate full Qwen4Exp vision training.
+Qwen4Exp vision uses Transformers 5.16.1, including `Qwen4ExpModel.get_rope_index` and
+`get_vision_position_ids`. The opt-in group below installs that version; default
+SGLang/vLLM installs retain Transformers 5.3.0/5.7.0. Initialization checks the vision
+capabilities before model allocation. The standard CI image does not validate full
+Qwen4Exp vision training.
 
 For CP training, the adapter repairs the pinned bridge's PLE hidden-state gather with an
 autograd collective: backward sums gradients from all consuming CP ranks. The bridge's
 packed zigzag order and sequence-parallel handling are preserved.
 
-Both dependency declarations and lockfiles pin the official ModelScope bridge to
-`bc58ea9cf9b1dd2314637703973904f359e67c75` and the released `awex==0.8.2`, which
-includes [AWEX #121](https://github.com/inclusionAI/Awex/pull/121). Actor and rollout
-images must use these versions. AWEX 0.8.1 lacks the required APIs.
+In a Python 3.12 Linux x86_64 environment with uv 0.12.6 or newer, install the Qwen
+runtime from an AReaL source checkout:
+
+```bash
+uv sync --locked --extra cuda --no-group transformers-default --group qwen-flash-next
+```
+
+The group pins Transformers 5.16.1, Tokenizers 0.23.1, and
+`dingzhiqiang/mcore-bridge@557aaf93b16d083fdec4f82a8251d47d47c76ccb`, based on
+ModelScope `bc58ea9` with the generated-vision-token embedding fix. The default
+Transformers group is explicitly excluded because the two versions cannot be installed
+together. Dependency groups are not published extras, so the bridge Git URL stays out of
+the package's published requirements. Stop environment preparation if installation
+fails; do not launch workers with a stale bridge. The RL submission script performs this
+preparation automatically and selects the shared interpreter for the controller and
+every training worker. Do not also prepend another Transformers or bridge checkout to
+`PYTHONPATH`, which would override these installed versions. Existing experiments with
+separate launch scripts can keep their source-directory setup; the supplied
+`submit_rl.sh` now uses the installed runtime. Selecting the group configures
+dependencies; full GPU training and inference compatibility still requires validation
+with the actual images.
+
+The released `awex==0.8.2` includes
+[AWEX #121](https://github.com/inclusionAI/Awex/pull/121). Actor and rollout images must
+use this version; AWEX 0.8.1 lacks the required APIs.
 
 The small Python helpers in this directory are runtime support, not additional examples:
 
@@ -101,9 +137,6 @@ Training allocations retain expandable segments; AWEX disables them only for IPC
 allocation and restores allocator settings. Validate CUDA IPC compatibility, repeated
 weight equality and checkpoint recovery with the actual image pair. CPU tests and
 zero-gradient replay do not establish full-model numerical parity or RL learning.
-
-The experiment runtime pins bridge `557aaf93b16d083fdec4f82a8251d47d47c76ccb` from
-`dingzhiqiang/mcore-bridge` for modality-aware visual embedding scatter.
 
 RL output defaults to `/storage/openpsi/experiments/qwen38-flash-next/<profile>`. Set
 `QWEN_OUTPUT_ROOT` for a specific experiment directory, or `QWEN_EXPERIMENTS_ROOT` to
