@@ -379,3 +379,27 @@ def test_unmarked_prompt_placeholder_in_mixed_batch_still_rejected(qwen_config):
     inputs["loss_mask"] = torch.zeros_like(inputs["input_ids"])
     with pytest.raises(ValueError, match="disagree"):
         prepare_qwen4_exp_mrope_inputs(inputs, qwen_config)
+
+
+@pytest.mark.parametrize("method", ["_train_lm", "_evaluate_lm"])
+def test_sft_preserves_token_provenance_before_loss_alignment(
+    qwen_config, method, monkeypatch
+):
+    from areal.trainer.sft import lm_engine
+
+    engine = MagicMock()
+    engine.train_batch.return_value = {}
+    monkeypatch.setattr(lm_engine, "stage_batch_for_engine", lambda *_: None)
+    inputs = {
+        "input_ids": torch.tensor([[10, 11, 12, qwen_config.image_token_id]]),
+        "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+        "loss_mask": torch.tensor([[0, 0, 1, 1]]),
+    }
+    getattr(lm_engine.LMEngine(engine), method)(inputs)
+    call = engine.train_batch if method == "_train_lm" else engine.eval_batch
+    batch = call.call_args.kwargs["input_"]
+    result = prepare_qwen4_exp_mrope_inputs(batch, qwen_config)
+    assert "position_ids" not in result
+    torch.testing.assert_close(
+        batch["loss_mask"], torch.tensor([[False, True, True, False]]), rtol=0, atol=0
+    )

@@ -64,7 +64,7 @@ def prepare_qwen4_exp_mrope_inputs(
     # Only the rollout loss mask can establish this provenance; unmarked prompt
     # placeholders still trigger the strict payload validation below.
     generated_tokens = torch.zeros_like(attention_mask)
-    loss_mask = data.get("loss_mask")
+    loss_mask = data.get("input_token_loss_mask", data.get("loss_mask"))
     if loss_mask is not None:
         if loss_mask.shape != input_ids.shape:
             raise ValueError("loss_mask must have the same [B, S] shape as input_ids.")
