@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from numbers import Real
 from typing import Any, Literal
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
@@ -80,6 +80,11 @@ def _is_retryable_status(status_code: int) -> bool:
 def _is_retryable_response(response: httpx.Response) -> bool:
     if _is_retryable_status(response.status_code):
         return True
+    if response.status_code == 302:
+        # Spanner renders an upstream 502 as a redirect to an HTML waiting page.
+        # Retry the original request within its existing budget, never the redirect.
+        location = response.headers.get("location", "")
+        return parse_qs(urlsplit(location).query).get("fromspanner") == ["apigwmoe_502"]
     if response.status_code != 403:
         return False
     return "spanner-http-ant-group-watch-all" in response.text[:1000]
