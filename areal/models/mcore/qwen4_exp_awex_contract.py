@@ -255,6 +255,33 @@ def visual_segments(
 ) -> tuple[list, tuple[int, ...]]:
     """Use the actual vision layer's attention-TP layout, never the global TP."""
     kind = type(module).__name__
+    if kind == "VocabParallelEmbedding" and name == "model.visual.pos_embed.weight":
+        # The vision position table is sharded by rows in SGLang. Support the
+        # exact unpadded layout so every live row can be checked against HF.
+        indices = module.shard_indices
+        size = module.tp_size
+        start, end = indices.org_vocab_start_index, indices.org_vocab_end_index
+        if (
+            len(shape) != 2
+            or getattr(module, "use_presharded_weights", False)
+            or module.org_vocab_size != shape[0]
+            or module.num_embeddings != shape[0]
+            or module.org_vocab_size_padded != shape[0]
+            or module.num_embeddings_padded != shape[0]
+            or module.embedding_dim != shape[1]
+            or size < 1
+            or shape[0] % size
+        ):
+            raise ValueError(f"Unsupported frozen vision position layout: {name}")
+        part = shape[0] // size
+        if (
+            module.num_embeddings_per_partition != part
+            or not 0 <= start < end <= shape[0]
+            or end - start != part
+            or start % part
+        ):
+            raise ValueError(f"Invalid frozen vision position shard: {name}")
+        return [(0, start, end, 0)], (part, shape[1])
     if kind in ("ColumnParallelLinear", "RowParallelLinear", "QKVParallelLinear"):
         if getattr(module, "use_presharded_weights", False):
             raise ValueError(f"Unsupported presharded frozen vision weight: {name}")
