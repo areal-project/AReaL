@@ -844,6 +844,15 @@ class PPOTrainer:
         total_epochs: int | None = None,
     ):
         config = self.config
+        is_v1_rollout = config.rollout._version == "v1"
+        if (
+            not is_v1_rollout
+            and config.gconfig.reward_normalization
+            and not config.gconfig.reward_normalization_use_std
+        ):
+            raise ValueError(
+                "Mean-only rollout reward normalization requires a v1 rollout backend."
+            )
         min_usable_group_size = (
             config.actor.resolve_min_usable_group_size(config.gconfig.n_samples)
             if (
@@ -934,6 +943,10 @@ class PPOTrainer:
                     drop_incomplete_group=config.gconfig.drop_incomplete_group,
                     min_usable_group_size=min_usable_group_size,
                 )
+                if is_v1_rollout:
+                    prepare_kwargs["reward_normalization_use_std"] = (
+                        config.gconfig.reward_normalization_use_std
+                    )
                 rollout_batch = _collect_trainable_rollout_batch(
                     functools.partial(
                         self.actor.prepare_batch,

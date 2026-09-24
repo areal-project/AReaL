@@ -260,6 +260,13 @@ class GenerationHyperparameters:
             )
         },
     )
+    reward_normalization_use_std: bool = field(
+        default=True,
+        metadata={
+            "help": "Divide grouped rollout rewards by their standard deviation. "
+            "Set False to subtract only the mean when reward_normalization is enabled."
+        },
+    )
     drop_incomplete_group: bool = field(
         default=False,
         metadata={
@@ -324,6 +331,7 @@ class GenerationHyperparameters:
     # OpenAI client kwargs even when users enable them.
     _WORKFLOW_ONLY_ARGS: ClassVar[set[str]] = {
         "reward_normalization",
+        "reward_normalization_use_std",
         "drop_incomplete_group",
     }
 

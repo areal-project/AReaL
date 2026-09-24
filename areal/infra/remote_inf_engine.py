@@ -81,12 +81,14 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ):
         validate_rollout_group_sizes(group_size, min_usable_group_size)
         self.workflow = workflow
         self.group_size = group_size
         self.min_usable_group_size = min_usable_group_size
         self.logger = logger
+        self.reward_normalization_use_std = reward_normalization_use_std
         self.reward_normalization = reward_normalization
         self.drop_incomplete_group = drop_incomplete_group
 
@@ -283,7 +285,9 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         from areal.experimental.openai.types import normalize_logical_rollout_rewards
 
         try:
-            if normalize_logical_rollout_rewards(results):
+            if normalize_logical_rollout_rewards(
+                results, use_std=self.reward_normalization_use_std
+            ):
                 return True
         except (ValueError, RuntimeError) as exc:
             raise WorkflowContractError(str(exc)) from exc
@@ -843,6 +847,7 @@ class RemoteInfEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> RolloutWorkflow:
         validate_rollout_group_sizes(group_size, min_usable_group_size)
         resolved: RolloutWorkflow
@@ -864,6 +869,7 @@ class RemoteInfEngine(InferenceEngine):
                     group_size,
                     self.logger,
                     reward_normalization=reward_normalization,
+                    reward_normalization_use_std=reward_normalization_use_std,
                     drop_incomplete_group=drop_incomplete_group,
                     min_usable_group_size=min_usable_group_size,
                 )
@@ -962,6 +968,7 @@ class RemoteInfEngine(InferenceEngine):
                 group_size,
                 self.logger,
                 reward_normalization=reward_normalization,
+                reward_normalization_use_std=reward_normalization_use_std,
                 drop_incomplete_group=drop_incomplete_group,
                 min_usable_group_size=min_usable_group_size,
             )
@@ -1366,6 +1373,7 @@ class RemoteInfEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -1411,6 +1419,7 @@ class RemoteInfEngine(InferenceEngine):
             min_usable_group_size=min_usable_group_size,
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
         resolved_should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
@@ -1473,6 +1482,7 @@ class RemoteInfEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         """Submit a batch of requests and wait for results.
 
@@ -1507,6 +1517,7 @@ class RemoteInfEngine(InferenceEngine):
             group_size,
             min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
 
@@ -1526,6 +1537,7 @@ class RemoteInfEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready.
 
@@ -1564,6 +1576,7 @@ class RemoteInfEngine(InferenceEngine):
             group_size,
             min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
         resolved_should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
