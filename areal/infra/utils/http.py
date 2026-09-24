@@ -19,6 +19,8 @@ from areal.utils.network import format_hostport, gethostip, split_hostport
 
 DEFAULT_RETRIES = 1
 DEFAULT_REQUEST_TIMEOUT = 3600
+_HTTP_ERROR_BODY_LIMIT = 4096
+_HTTP_ERROR_BODY_TIMEOUT = 5.0
 
 DEFAULT_ADMIN_API_KEY = "areal-admin-key"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -125,6 +127,28 @@ def get_default_connector():
     return aiohttp.TCPConnector(limit=0, use_dns_cache=False, force_close=True)
 
 
+async def _read_http_error_body(response: aiohttp.ClientResponse) -> str:
+    """Read a bounded error excerpt without delaying retries on a stalled body."""
+    body = bytearray()
+    read_error = ""
+    try:
+        async with asyncio.timeout(_HTTP_ERROR_BODY_TIMEOUT):
+            while len(body) <= _HTTP_ERROR_BODY_LIMIT:
+                chunk = await response.content.read(
+                    _HTTP_ERROR_BODY_LIMIT + 1 - len(body)
+                )
+                if not chunk:
+                    break
+                body.extend(chunk)
+    except (TimeoutError, aiohttp.ClientError) as exc:
+        read_error = f" [body read failed: {type(exc).__name__}]"
+
+    excerpt = body[:_HTTP_ERROR_BODY_LIMIT].decode("utf-8", errors="replace")
+    if len(body) > _HTTP_ERROR_BODY_LIMIT:
+        excerpt += " [truncated]"
+    return (excerpt or "<empty>") + read_error
+
+
 async def arequest_with_retry(
     addr: str,
     endpoint: str,
@@ -178,7 +202,13 @@ async def arequest_with_retry(
             async with ctx as response:
                 if verbose:
                     logger.info("http requests return")
-                response.raise_for_status()
+                if response.status >= 400:
+                    error_body = await _read_http_error_body(response)
+                    try:
+                        response.raise_for_status()
+                    except aiohttp.ClientResponseError as exc:
+                        exc.message = f"{exc.message}. Response body: {error_body}"
+                        raise
                 ctype = response.content_type or ""
                 if ctype == "application/json":
                     res = await response.json()
@@ -219,9 +249,9 @@ async def arequest_with_retry(
         await _session.close()
     raise RuntimeError(
         f"Failed after {max_retries} retries each. "
-        f"Payload: {payload}. Addr: {addr}. Endpoint: {endpoint}. "
-        f"Last error: {repr(last_exception)}"
-    )
+        f"Method: {method.upper()}. Addr: {addr}. Endpoint: {endpoint}. "
+        f"Last error: {last_exception}"
+    ) from last_exception
 
 
 def response_ok(http_code: int) -> bool:
