@@ -15,6 +15,7 @@ import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
+import aiohttp
 import uvicorn
 from anthropic.types.message import Message
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -831,6 +832,47 @@ def _prepare_request_messages(messages: Any) -> Any:
     return _preprocess_messages(normalized)
 
 
+def _backend_context_length_message(error: Exception) -> str | None:
+    """Recognize a bounded backend length rejection without model attribution."""
+    seen: set[int] = set()
+    cause: BaseException | None = error
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, aiohttp.ClientResponseError):
+            if cause.status != 400:
+                return None
+            # arequest_with_retry retains the bounded response body on the
+            # chained HTTP error. Do not classify arbitrary outer error text.
+            _, separator, body = cause.message.partition("Response body: ")
+            if not separator:
+                return None
+            try:
+                response = json.loads(body)
+            except json.JSONDecodeError:
+                return None
+            detail = response.get("error") if isinstance(response, dict) else None
+            if not isinstance(detail, dict):
+                return None
+            message = detail.get("message")
+            if not isinstance(message, str):
+                return None
+            if (
+                detail.get("code") == "context_length_exceeded"
+                or detail.get("type") == "context_length_exceeded"
+                or message.startswith(
+                    "Requested token count exceeds the model's maximum context length"
+                )
+                or (
+                    message.startswith("The input (")
+                    and "is longer than the model's context length (" in message
+                )
+            ):
+                return message
+            return None
+        cause = cause.__cause__
+    return None
+
+
 async def _call_client_create(
     create_fn,
     request: dict[str, Any] | BaseModel,
@@ -1028,6 +1070,23 @@ async def _call_client_create(
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         session_data.mark_system_error(f"{type(e).__name__}: {e}")
+        backend_context_message = _backend_context_length_message(e)
+        if backend_context_message is not None:
+            # A backend can reject a locally valid prompt after multimodal
+            # preprocessing. Keep it a system failure for reward/admission,
+            # while telling callers this request cannot succeed by retrying.
+            logger.warning(
+                "Backend rejected session %s context length: %s",
+                session_id,
+                backend_context_message,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "type": "context_length_exceeded",
+                    "message": backend_context_message,
+                },
+            ) from e
         logger.exception("AReaL client request failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
@@ -1154,14 +1213,29 @@ async def _deferred_openai_sse_stream(
         yield "data: [DONE]\n\n"
     except asyncio.CancelledError:
         raise
-    except Exception:
-        logger.exception("Error producing streaming response")
+    except Exception as exc:
         error = {
             "error": {
                 "message": "AReaL stream generation failed",
                 "type": "server_error",
             }
         }
+        if (
+            isinstance(exc, HTTPException)
+            and exc.status_code == 400
+            and isinstance(exc.detail, dict)
+            and exc.detail.get("type") == "context_length_exceeded"
+        ):
+            # Headers and heartbeat chunks have already been sent. Preserve
+            # the permanent error classification in the SSE body so callers
+            # do not retry it as a transient server failure.
+            error["error"] = {
+                "message": exc.detail["message"],
+                "type": "context_length_exceeded",
+                "code": "context_length_exceeded",
+            }
+        else:
+            logger.exception("Error producing streaming response")
         yield f"data: {json.dumps(error, separators=(',', ':'))}\n\n"
     finally:
         if not create_task.done():
