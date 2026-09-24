@@ -231,6 +231,7 @@ def main(profile, args):
             max_completion_tokens=generation.max_new_tokens,
         ),
         timeout=config.econfig.timeout,
+        reject_terminal_task_failures=not evaluation_only,
     )
 
     class RecipeTrainer(PPOTrainer):

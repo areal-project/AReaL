@@ -580,6 +580,25 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 failure_disposition,
             )
 
+        reject_failed_sample = getattr(self.agent, "should_reject_failed_sample", None)
+        if (
+            agent_error is not None
+            and callable(reject_failed_sample)
+            and reject_failed_sample(agent_error, failure_disposition)
+        ):
+            logger.warning(
+                "Agent task failed with disposition %s (%s: %s). "
+                "Rejecting this sample from its rollout group.",
+                failure_disposition,
+                type(agent_error).__name__,
+                agent_error,
+            )
+            stats_tracker.get(workflow_context.stat_scope()).scalar(
+                context_overflow=float(proxy_client.context_overflow),
+                proxy_system_error=float(proxy_client.system_error),
+            )
+            return None
+
         if agent_error is not None and failure_disposition != "model_failure_zero":
             logger.warning(
                 "Agent task failed with disposition %s (%s: %s). This "

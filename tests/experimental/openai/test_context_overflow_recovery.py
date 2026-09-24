@@ -487,8 +487,19 @@ async def test_concat_per_completion_rewards_do_not_fill_unscored_branch(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["HARNESS_FAILED", "TIMEOUT", "NO_OUTPUT"])
-async def test_arena_unhealthy_receipt_with_overflow_never_exports(monkeypatch, status):
+@pytest.mark.parametrize(
+    "status,can_reject_sample",
+    [
+        ("HARNESS_FAILED", True),
+        ("TIMEOUT", True),
+        ("NO_OUTPUT", True),
+        ("SETUP_FAILED", False),
+    ],
+)
+@pytest.mark.parametrize("reject_terminal_task_failures", [False, True])
+async def test_arena_unhealthy_receipt_with_overflow_never_exports(
+    monkeypatch, status, can_reject_sample, reject_terminal_task_failures
+):
     """An actual Arena classifier rejection survives the proxy overflow path."""
     monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
@@ -505,8 +516,10 @@ async def test_arena_unhealthy_receipt_with_overflow_never_exports(monkeypatch, 
                     "stream_id": "stream",
                 }
             ]
-        }
+        },
+        reject_terminal_task_failures=reject_terminal_task_failures,
     )
+    agent.persist_episode_result = AsyncMock()
     error = ArenaTaskFailedError(
         task_id="task",
         status=status,
@@ -531,14 +544,18 @@ async def test_arena_unhealthy_receipt_with_overflow_never_exports(monkeypatch, 
     )
     workflow_context.set(WorkflowContext(task_id=6))
     try:
-        with pytest.raises(ArenaTaskFailedError) as caught:
-            await workflow.arun_episode(engine=None, data={})
-        assert caught.value is error
+        if reject_terminal_task_failures and can_reject_sample:
+            assert await workflow.arun_episode(engine=None, data={}) is None
+        else:
+            with pytest.raises(ArenaTaskFailedError) as caught:
+                await workflow.arun_episode(engine=None, data={})
+            assert caught.value is error
     finally:
         workflow_context.set(WorkflowContext())
         stats_tracker.export_all(reset=True)
     assert fake_client.last_reward is None
     fake_client.export_interactions.assert_not_awaited()
+    agent.persist_episode_result.assert_awaited_once_with({}, None)
 
 
 @pytest.mark.asyncio

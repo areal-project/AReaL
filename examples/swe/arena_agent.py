@@ -490,9 +490,11 @@ class ArenaStreamAgentWorkflow:
         econfig: dict[str, Any] | None = None,
         gen_args: dict[str, Any] | None = None,
         timeout: float = 3600.0,
+        reject_terminal_task_failures: bool = False,
     ) -> None:
         self.econfig = econfig or {}
         self.gen_args = gen_args or {}
+        self.reject_terminal_task_failures = reject_terminal_task_failures
         self.timeout = float(self.econfig.get("timeout", timeout))
         self.registration_timeout = float(
             self.econfig.get("arena_registration_timeout", 180.0)
@@ -824,6 +826,15 @@ class ArenaStreamAgentWorkflow:
         ):
             return "model_failure_zero"
         return "unknown_failure_reject"
+
+    def should_reject_failed_sample(self, error: Exception, disposition: str) -> bool:
+        """Drop a failed Arena sample while retaining healthy group siblings."""
+        return (
+            self.reject_terminal_task_failures
+            and isinstance(error, ArenaTaskFailedError)
+            and error.status in {"HARNESS_FAILED", "NO_OUTPUT", "TIMEOUT"}
+            and disposition == "unknown_failure_reject"
+        )
 
     def record_episode_metrics(
         self,
