@@ -583,6 +583,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         reject_failed_sample = getattr(self.agent, "should_reject_failed_sample", None)
         if (
             agent_error is not None
+            and not proxy_client.system_error
             and callable(reject_failed_sample)
             and reject_failed_sample(agent_error, failure_disposition)
         ):

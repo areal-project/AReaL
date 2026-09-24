@@ -829,10 +829,16 @@ class ArenaStreamAgentWorkflow:
 
     def should_reject_failed_sample(self, error: Exception, disposition: str) -> bool:
         """Drop a failed Arena sample while retaining healthy group siblings."""
+        if not self.reject_terminal_task_failures or not isinstance(
+            error, ArenaTaskFailedError
+        ):
+            return False
+        # A failed grader leaves this task unscored. It does not invalidate
+        # other tasks' rewards, even though it is not a model-attributed failure.
+        if error.status == "EVAL_FAILED":
+            return disposition == "system_failure_reject"
         return (
-            self.reject_terminal_task_failures
-            and isinstance(error, ArenaTaskFailedError)
-            and error.status in {"HARNESS_FAILED", "NO_OUTPUT", "TIMEOUT"}
+            error.status in {"HARNESS_FAILED", "NO_OUTPUT", "TIMEOUT"}
             and disposition == "unknown_failure_reject"
         )
 

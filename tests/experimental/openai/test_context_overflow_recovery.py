@@ -493,17 +493,27 @@ async def test_concat_per_completion_rewards_do_not_fill_unscored_branch(monkeyp
         ("HARNESS_FAILED", True),
         ("TIMEOUT", True),
         ("NO_OUTPUT", True),
+        ("EVAL_FAILED", True),
         ("SETUP_FAILED", False),
     ],
 )
 @pytest.mark.parametrize("reject_terminal_task_failures", [False, True])
-async def test_arena_unhealthy_receipt_with_overflow_never_exports(
-    monkeypatch, status, can_reject_sample, reject_terminal_task_failures
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize("proxy_system_error", [False, True])
+async def test_arena_unhealthy_receipt_rejection_preserves_failure_scope(
+    monkeypatch,
+    status,
+    can_reject_sample,
+    reject_terminal_task_failures,
+    context_overflow,
+    proxy_system_error,
 ):
-    """An actual Arena classifier rejection survives the proxy overflow path."""
+    """Task failures stay unscored; proxy failures still abort the group."""
     monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
     fake_client = _FakeProxyClient()
+    fake_client.context_overflow = context_overflow
+    fake_client.system_error = proxy_system_error
     fake_client.export_interactions = AsyncMock()
     monkeypatch.setattr(
         workflow_module, "OpenAIProxyClient", lambda *args, **kwargs: fake_client
@@ -544,7 +554,11 @@ async def test_arena_unhealthy_receipt_with_overflow_never_exports(
     )
     workflow_context.set(WorkflowContext(task_id=6))
     try:
-        if reject_terminal_task_failures and can_reject_sample:
+        if (
+            reject_terminal_task_failures
+            and can_reject_sample
+            and not proxy_system_error
+        ):
             assert await workflow.arun_episode(engine=None, data={}) is None
         else:
             with pytest.raises(ArenaTaskFailedError) as caught:
