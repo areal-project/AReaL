@@ -576,7 +576,7 @@ requires-dist = [
     { name = "areal", extras = ["megatron"], marker = "extra == 'cuda-train'" },
     { name = "areal", extras = ["tms"], marker = "extra == 'cuda-train'" },
     { name = "areal", extras = ["vllm"], marker = "extra == 'cuda'" },
-    { name = "awex", specifier = "==0.8.1" },
+    { name = "awex", specifier = "==0.8.2" },
     { name = "build", specifier = ">=1.2.1" },
     { name = "claude-agent-sdk" },
     { name = "click", marker = "extra == 'cli'", specifier = ">=8.1" },
@@ -756,10 +756,10 @@ wheels = [
 
 [[package]]
 name = "awex"
-version = "0.8.1"
+version = "0.8.2"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/13/11/16b4aed68bc2761516c125d9182c5f77ac3674d390dcc57ffeca92d77362/awex-0.8.1-py3-none-any.whl", hash = "sha256:abe5e5c23964e88e1b268274a9d7e64dd52809349e2c87aef703b347ba8c67d7", size = 268145, upload-time = "2026-08-20T07:45:46.522Z" },
+    { url = "https://files.pythonhosted.org/packages/59/b5/7dea110beee338d0e920cbdccf6be97409b487013fc6653b2f230e071b05/awex-0.8.2-py3-none-any.whl", hash = "sha256:aae3d469eb6494d5a8f73417eb51b107b270d24bc953a99661d61e472fe3a4c1", size = 292394, upload-time = "2026-09-22T12:55:44.998Z" },
 ]
 
 [[package]]
