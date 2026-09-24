@@ -148,22 +148,63 @@ torch.cuda.synchronize()
 PLE_PREFIX = f"{LAYERS_PREFIX}.1.ple.ple_embedding."
 
 
-def test_arena_training_wraps_nineteen_prompts_into_full_batches():
-    from datasets import Dataset
+@pytest.mark.parametrize("batch_size", [8, 19])
+def test_arena_training_preserves_rows_and_cycles_tail(batch_size, monkeypatch):
+    """Fill rollout batches across cycles without oversampling the first tasks."""
+    from itertools import chain, islice
 
-    from examples.swe.qwen38_flash_next.train_rl import pad_training_dataset_to_batch
+    from datasets import Dataset
+    from torchdata.stateful_dataloader import StatefulDataLoader
+
+    from examples.swe import train_swe_rl
+    from examples.swe.qwen38_flash_next import train_rl
+    from examples.swe.utils import SWEPPOConfig
+
+    import areal
+    from areal.api import cli_args
+    from areal.utils.data import cycle_dataloader
 
     source = Dataset.from_list([{"data_id": str(index)} for index in range(19)])
-    padded = pad_training_dataset_to_batch(source, batch_size=8)
+    config = SWEPPOConfig()
+    config.train_dataset.batch_size = batch_size
+    monkeypatch.setattr(cli_args, "load_expr_config", lambda *_: (config, None))
+    monkeypatch.setattr(
+        train_swe_rl, "get_arena_mixture_dataset", lambda *_, **__: (source, [])
+    )
+    for name in (
+        "QWEN_ARENA_TASK_IDS_FILE",
+        "QWEN_BATCH_REPLAY_PATH",
+        "QWEN_BATCH_REPLAY_PATHS",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
-    assert len(padded) == 24
-    assert padded["data_id"] == [str(index) for index in range(19)] + [
-        str(index) for index in range(5)
-    ]
-    assert [len(padded[start : start + 8]["data_id"]) for start in range(0, 24, 8)] == [
-        8,
-        8,
-        8,
+    class TrainerBoundaryReached(Exception):
+        pass
+
+    class CaptureTrainer:
+        def __init__(self, config, train_dataset, valid_dataset):
+            self.dataset = train_dataset
+            captured.append(self.dataset)
+            raise TrainerBoundaryReached
+
+    captured = []
+    monkeypatch.setattr(areal, "PPOTrainer", CaptureTrainer)
+    with pytest.raises(TrainerBoundaryReached):
+        train_rl.main("swe", [])
+
+    assert captured[0]["data_id"] == source["data_id"]
+    loader = StatefulDataLoader(
+        captured[0],
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        collate_fn=list,
+    )
+    rows = chain.from_iterable(cycle_dataloader(loader))
+    batches = [list(islice(rows, batch_size)) for _ in range(5)]
+    assert [[row["data_id"] for row in batch] for batch in batches] == [
+        [str((batch * batch_size + offset) % 19) for offset in range(batch_size)]
+        for batch in range(5)
     ]
 
 

@@ -101,22 +101,6 @@ def select_evaluation_rows(rows: list[dict], selected: list[str]) -> list[dict]:
     ]
 
 
-def pad_training_dataset_to_batch(dataset, batch_size: int):
-    """Complete the final Arena batch by cycling from the first prompt row."""
-    if batch_size < 1:
-        raise ValueError("Training batch size must be positive")
-    if not len(dataset):
-        raise ValueError("Arena training dataset must not be empty")
-    missing = -len(dataset) % batch_size
-    if not missing:
-        return dataset
-
-    from datasets import concatenate_datasets
-
-    repeated_indices = [index % len(dataset) for index in range(missing)]
-    return concatenate_datasets([dataset, dataset.select(repeated_indices)])
-
-
 def configure_training_rpc(scheduler):
     """Allow cold 256K steps without replaying a timed-out optimizer update."""
     original = scheduler.async_call_engine
@@ -231,10 +215,8 @@ def main(profile, args):
         dataset = select_arena_dataset(dataset, selected)
         if len(dataset) < config.train_dataset.batch_size:
             raise ValueError("Task selection must contain at least one training batch")
-    if not evaluation_only:
-        dataset = pad_training_dataset_to_batch(
-            dataset, config.train_dataset.batch_size
-        )
+    # RolloutController cycles the loader to fill batches across epoch boundaries.
+    # Keep the original rows so a short final batch does not duplicate head tasks.
     config.econfig.arena_streams = streams
     config.econfig.arena_streams_file = ""
     config.econfig.arena_streams_yaml_b64 = ""
