@@ -148,6 +148,25 @@ torch.cuda.synchronize()
 PLE_PREFIX = f"{LAYERS_PREFIX}.1.ple.ple_embedding."
 
 
+def test_arena_training_wraps_nineteen_prompts_into_full_batches():
+    from datasets import Dataset
+
+    from examples.swe.qwen38_flash_next.train_rl import pad_training_dataset_to_batch
+
+    source = Dataset.from_list([{"data_id": str(index)} for index in range(19)])
+    padded = pad_training_dataset_to_batch(source, batch_size=8)
+
+    assert len(padded) == 24
+    assert padded["data_id"] == [str(index) for index in range(19)] + [
+        str(index) for index in range(5)
+    ]
+    assert [len(padded[start : start + 8]["data_id"]) for start in range(0, 24, 8)] == [
+        8,
+        8,
+        8,
+    ]
+
+
 @pytest.mark.parametrize("profile", ["swe", "swe-eval"])
 @pytest.mark.parametrize("explicit_timeout", [None, "120"])
 def test_recipe_task_timeout_preserves_eval_defaults_and_explicit_overrides(

@@ -197,7 +197,7 @@ def get_arena_mixture_dataset(
     if size_multiple > 1 and len(dataset) % size_multiple:
         logger.warning(
             "Arena raw union has %d rows, not divisible by training batch size %d; "
-            "drop_last will omit %d tail rows without repeating source data",
+            "the caller must pad or accept a final batch of %d rows",
             len(dataset),
             size_multiple,
             len(dataset) % size_multiple,
