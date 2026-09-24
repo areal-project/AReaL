@@ -18,6 +18,7 @@ from areal.experimental.openai.client import (
     _process_multimodal_prompt,
 )
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
+from areal.infra.processor_cache import ProcessorCallCache
 
 
 class _FakeTokenizer:
@@ -449,3 +450,33 @@ def test_inline_image_uri_preserved_for_backend_and_decoded_locally(image_format
         _FakeProcessor(), _FakeTokenizer(), tokenizer_messages, image_data, None, {}
     )
     assert prepared is not None
+
+
+@pytest.mark.asyncio
+async def test_prepare_prompt_changed_text_shares_identical_vision_tensors():
+    cache = ProcessorCallCache()
+    tokenizer = _FakeTokenizer()
+    processor = _FakeProcessor()
+    message = {"role": "user", "content": [{"type": "image"}]}
+    images = [_png_base64()]
+    prompts = []
+    for messages in ([message], [message, {"role": "user", "content": "Again"}]):
+        prompts.append(
+            await _prepare_prompt(
+                tokenizer=tokenizer,
+                processor=processor,
+                tokenizer_messages=messages,
+                concat_messages=messages,
+                image_data=images,
+                parent=None,
+                chat_template_type="hf",
+                tools=None,
+                extra_body={},
+                processor_cache=cache,
+            )
+        )
+    assert prompts[0].input_ids == [10, 2, 20]
+    assert prompts[1].input_ids == [10, 2, 20, 30, 2, 40]
+    assert prompts[1].mm_token_type_ids == [1, 1, 1, 0, 0, 2]
+    for name, tensor in prompts[0].multi_modal_input.items():
+        assert tensor is prompts[1].multi_modal_input[name]

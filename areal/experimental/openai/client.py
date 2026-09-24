@@ -124,6 +124,37 @@ class _PreparedPrompt:
         )
 
 
+def _share_multimodal_tensors(
+    prompt: _PreparedPrompt,
+    cache: ProcessorCallCache,
+    processor: Any,
+    image_data: list[str],
+) -> _PreparedPrompt:
+    """Share identical CPU vision tensors across turns without caching text output.
+
+    Called in the processor thread. Compare bytes before sharing: some processors
+    can produce different tensors for the same images in different contexts.
+    """
+    tensors = prompt.multi_modal_input
+    if not tensors or any(t.device.type != "cpu" for t in tensors.values()):
+        return prompt
+    key = cache.make_key("openai_vision_tensors", id(processor), image_data)
+    canonical = cache.get_or_compute(key, lambda: dict(tensors))
+    if tensors.keys() != canonical.keys():
+        return prompt
+    for name, tensor in tensors.items():
+        other = canonical[name]
+        if tensor.shape != other.shape or tensor.dtype != other.dtype:
+            return prompt
+        if tensor is not other and not torch.equal(
+            tensor.contiguous().reshape(-1).view(torch.uint8),
+            other.contiguous().reshape(-1).view(torch.uint8),
+        ):
+            return prompt
+    prompt.multi_modal_input = dict(canonical)
+    return prompt
+
+
 def _process_multimodal_prompt(
     processor: "ProcessorMixin",
     tokenizer: "PreTrainedTokenizerFast",
@@ -762,7 +793,7 @@ async def _prepare_prompt(
     if image_data and processor is not None:
 
         def process_prompt() -> _PreparedPrompt:
-            return _process_multimodal_prompt(
+            prompt = _process_multimodal_prompt(
                 processor,
                 tokenizer,
                 tokenizer_messages,
@@ -770,6 +801,11 @@ async def _prepare_prompt(
                 tools,
                 chat_template_kwargs,
             )
+            if processor_cache is not None:
+                prompt = _share_multimodal_tensors(
+                    prompt, processor_cache, processor, image_data
+                )
+            return prompt
 
         if processor_cache is None:
             processed_prompt = await asyncio.to_thread(process_prompt)
