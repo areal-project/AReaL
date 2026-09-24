@@ -42,6 +42,36 @@ from areal.utils.network import format_host_for_url
 logger = getLogger("SGLangRemote")
 
 
+def _compact_image_tokens(req: ModelRequest) -> list[int]:
+    """Use one placeholder per image on the wire, preserving training token IDs.
+
+    HF processors expand an image placeholder into patch tokens. SGLang expands
+    placeholders again while processing image_data; sending expanded tokens can
+    force it to decode and retokenize the entire prompt, changing generated token
+    IDs and invalidating the context budget. Only compact when image-token runs
+    match the supplied images, leaving unknown processor formats unchanged.
+    """
+    image_token_id = getattr(req.processor, "image_token_id", None)
+    if not req.image_data or not isinstance(image_token_id, int):
+        return req.input_ids.copy()
+
+    compact_ids: list[int] = []
+    image_count = 0
+    previous_is_image = False
+    for token in req.input_ids:
+        is_image = token == image_token_id
+        if is_image and previous_is_image:
+            continue
+        if is_image:
+            image_count += 1
+        compact_ids.append(token)
+        previous_is_image = is_image
+
+    if image_count != len(req.image_data):
+        return req.input_ids.copy()
+    return compact_ids
+
+
 class SGLangBackend:
     """SGLang-specific backend implementation for remote inference."""
 
@@ -84,7 +114,7 @@ class SGLangBackend:
             sample_params["sampling_seed"] = gconfig.seed
 
         payload = {
-            "input_ids": req.input_ids.copy(),
+            "input_ids": _compact_image_tokens(req),
             "image_data": req.image_data,  # ImageObject or str
             "sampling_params": sample_params,
             "return_logprob": True,
