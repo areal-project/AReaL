@@ -2,7 +2,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 # Apache-2.0; wrappers copied unchanged from Megatron-LM f007db77b9d86517af2f2cfc15b610338cbe3434.
-# Compatibility for Megatron-Core 0.17; scoped to this recipe.
+# Compatibility for Megatron-Core 0.17 and 0.19; scoped to this recipe.
 
 import torch
 
@@ -152,7 +152,8 @@ def install_config_compat():
     """Relax only the legacy GDN CP guard, only for bridge Qwen4 configs.
 
     All other TransformerConfig validation runs with the real CP size.
-    Fail closed if the pinned guard has changed; this is not a general CP override.
+    Core 0.19 supports GDN CP natively and needs no config rewrite. Fail closed
+    for unknown runtimes or changed legacy guards; this is not a general CP override.
     """
     import ast
     import inspect
@@ -173,6 +174,17 @@ def install_config_compat():
                 in ast.unparse(node.msg)
             ):
                 matches.append(node)
+    if not matches:
+        import megatron.core as core
+        from megatron.core.ssm import gated_delta_net as native
+
+        # Check the imported runtime, including PYTHONPATH overrides. Keep its
+        # original validation intact, including TP * CP head divisibility.
+        if getattr(core, "__version__", None) == "0.19.0" and all(
+            callable(getattr(native, name, None))
+            for name in ("tensor_a2a_cp2hp", "tensor_a2a_hp2cp")
+        ):
+            return
     if len(matches) != 1:
         raise RuntimeError(
             "Unexpected TransformerConfig guard; review CP compatibility before enabling"
