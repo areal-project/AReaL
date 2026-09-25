@@ -84,6 +84,41 @@ class MergeSystemMessages:
         return [merged, *(msg for msg in messages if msg.get("role") != "system")]
 
 
+class RestoreGrayboxOutputInstructions:
+    """Tell Arena graybox agents where the reward collector reads submissions.
+
+    The rc6 Harness omits the output-directory sentence included by the older
+    graybox Harness. Its workspace-root files are visible to the agent but not
+    collected as a submission. This opt-in preprocessor restores that sentence
+    on every model request so prefix matching sees a stable conversation.
+    """
+
+    _INSTRUCTION = (
+        "Graybox public inputs are unpacked at public/. Run Blender as blender. "
+        "Write deliverables to output/ using the task-required structure."
+    )
+
+    def __call__(self, messages: list[dict]) -> list[dict]:
+        for msg in messages:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str) and self._INSTRUCTION not in content:
+                msg["content"] = f"{content.rstrip()}\n{self._INSTRUCTION}"
+            elif isinstance(content, list) and not any(
+                isinstance(part, dict)
+                and isinstance(part.get("text"), str)
+                and self._INSTRUCTION in part["text"]
+                for part in content
+            ):
+                msg["content"] = [
+                    *content,
+                    {"type": "text", "text": self._INSTRUCTION},
+                ]
+            break
+        return messages
+
+
 class StripAnthropicCacheFields:
     """Strip Anthropic-specific fields that are not preserved in stored output."""
 
