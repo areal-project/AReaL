@@ -95,7 +95,10 @@ from areal.engine.megatron_utils.packed_context_parallel import (
 from areal.engine.megatron_utils.pipeline_parallel import (
     configure_pipeline_layer_splits,
 )
-from areal.engine.megatron_utils.transport import validate_transport_padding
+from areal.engine.megatron_utils.transport import (
+    nonempty_microbatch_target,
+    validate_transport_padding,
+)
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform, is_npu_available
 from areal.models.mcore.bailing_v3_bridge import BailingV3Bridge
@@ -3263,9 +3266,17 @@ class MegatronEngine(TrainEngine):
         # The micro batch list splitted here will be splitted to each
         # context parallel rank, so the total number of tokens per
         # GPU in a forward pass here will be `max_tokens_per_mb / cp_size`.
+        requested_n_mbs = max(min_n_mbs, self.config.mb_spec.n_mbs)
+        if allow_transport_padding:
+            requested_n_mbs = nonempty_microbatch_target(
+                requested_n_mbs,
+                input_["attention_mask"].shape[0] // self.config.mb_spec.granularity,
+                pp_size,
+                min_n_mbs,
+            )
         mb_spec = MicroBatchSpec.new(
             self.config.mb_spec,
-            n_mbs=max(min_n_mbs, self.config.mb_spec.n_mbs),
+            n_mbs=requested_n_mbs,
             n_mbs_divisor=pp_size,
         )
         mb_list = split_padded_tensor_dict_into_mb_list(
