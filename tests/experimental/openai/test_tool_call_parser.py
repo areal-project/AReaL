@@ -307,6 +307,64 @@ def test_qwen3_coder_xml_literal_closing_tag_is_not_silently_truncated():
 
 
 @pytest.mark.sglang
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.parametrize("use_responses", [False, True])
+def test_sglang_malformed_tool_block_preserves_text_and_finish_reason(
+    finish_reason: str, use_responses: bool
+):
+    """Replay a captured response that produced a tool_calls finish without calls."""
+    pytest.importorskip("sglang.srt.function_call.function_call_parser")
+    pytest.importorskip("sglang.srt.parser.reasoning_parser")
+    text = (
+        "Let me replace the mesh-construction layer.</think>\n\n"
+        "<tool_call>\n<\n</function>\n</tool_call><|im_end|>"
+    )
+    tools = QWEN3_CODER_TOOLS
+    if use_responses:
+        tools = [{"type": "function", **tool["function"]} for tool in tools]
+
+    tool_calls, new_text, new_finish_reason = parser_module.process_tool_calls(
+        text=text,
+        tools=tools,
+        tool_call_parser="qwen3_coder",
+        reasoning_parser="qwen3",
+        finish_reason=finish_reason,
+        use_responses=use_responses,
+    )
+
+    assert not tool_calls
+    assert new_text == text
+    assert new_finish_reason == finish_reason
+
+
+@pytest.mark.sglang
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_sglang_parser_failure_preserves_text_and_finish_reason(
+    monkeypatch, finish_reason: str
+):
+    """A parser exception must not announce a tool call that was never emitted."""
+    backend = pytest.importorskip("sglang.srt.function_call.function_call_parser")
+    pytest.importorskip("sglang.srt.parser.reasoning_parser")
+
+    def fail_parse(self, text):
+        raise ValueError("invalid tool arguments")
+
+    monkeypatch.setattr(backend.FunctionCallParser, "parse_non_stream", fail_parse)
+
+    tool_calls, new_text, new_finish_reason = parser_module._process_tool_calls_sglang(
+        text=QWEN3_CODER_TEXT,
+        tools=QWEN3_CODER_TOOLS,
+        tool_call_parser="qwen3_coder",
+        reasoning_parser="qwen3",
+        finish_reason=finish_reason,
+    )
+
+    assert tool_calls is None
+    assert new_text == QWEN3_CODER_TEXT
+    assert new_finish_reason == finish_reason
+
+
+@pytest.mark.sglang
 @pytest.mark.parametrize("reasoning_parser", ["", None], ids=["empty", "none"])
 def test_process_tool_calls_without_reasoning_parser_returns_plain_text(
     reasoning_parser: str | None,

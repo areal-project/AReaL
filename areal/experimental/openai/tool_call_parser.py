@@ -405,10 +405,10 @@ def _process_tool_calls_sglang(
         reasoning_text, content_text = "", text
 
     if parser_p.has_tool_call(content_text):
-        if finish_reason == "stop":
-            finish_reason = "tool_calls"
         try:
             content_text, call_info_list = parser_p.parse_non_stream(content_text)
+            if not call_info_list:
+                return None, text, finish_reason
 
             if use_responses:
                 tool_calls = [
@@ -434,6 +434,8 @@ def _process_tool_calls_sglang(
                     for call_info in call_info_list
                 ]
 
+            if finish_reason == "stop":
+                finish_reason = "tool_calls"
             return tool_calls, reasoning_text + content_text, finish_reason
         except Exception as e:
             logger.error(f"Tool call parsing error: {e}")
