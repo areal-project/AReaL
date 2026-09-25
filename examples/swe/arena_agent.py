@@ -750,6 +750,37 @@ class ArenaStreamAgentWorkflow:
             and harness["exit_code"] == 1
         )
 
+    @classmethod
+    def _is_runner_compaction_disabled_overflow(
+        cls, raw: dict[str, Any], receipt: Any
+    ) -> bool:
+        """Accept only the Harness guard's explicit no-compaction overflow."""
+
+        if not cls._is_runner_context_failure(raw) or not isinstance(receipt, dict):
+            return False
+        if (
+            receipt.get("implementation") != "rust-core-runtime"
+            or receipt.get("status") != "ERROR"
+            or type(receipt.get("exit_code")) is not int
+            or receipt["exit_code"] != 1
+            or receipt.get("delivery") is not None
+            or receipt.get("turn_statuses") != ["failed"]
+        ):
+            return False
+        errors = receipt.get("error")
+        return (
+            isinstance(errors, list)
+            and len(errors) == 1
+            and isinstance(errors[0], dict)
+            and isinstance(errors[0].get("message"), str)
+            and re.fullmatch(
+                r"context window limit exceeded: compaction is disabled "
+                r"\([1-9][0-9]* bytes / [1-9][0-9]* estimated tokens\)",
+                errors[0]["message"],
+            )
+            is not None
+        )
+
     @staticmethod
     def _is_native_model_failure(raw: Any) -> bool:
         """Require a complete, healthy native receipt with only model failures."""
@@ -841,7 +872,9 @@ class ArenaStreamAgentWorkflow:
         if "status" in raw and raw["status"] != "ERROR":
             return False
         if result_format == "native-runner":
-            return context_overflow and cls._is_runner_context_failure(raw)
+            return (
+                context_overflow and cls._is_runner_context_failure(raw)
+            ) or cls._is_runner_compaction_disabled_overflow(raw, error.harness_result)
         detail = raw.get("error")
         if detail is not None and not isinstance(detail, str):
             return False
@@ -1366,6 +1399,26 @@ class ArenaStreamAgentWorkflow:
                 _record_arena_metrics(**{"arena/call_success": 0.0})
                 if exc.result is not None:
                     self._task_result.set(exc.result)
+                    if (
+                        exc.status == "HARNESS_FAILED"
+                        and self._harness_result_format(exc.result.raw)
+                        == "native-runner"
+                    ):
+                        try:
+                            exc.harness_result = (
+                                await self.client.get_harness_result_async(
+                                    exc.task_id,
+                                    client=client,
+                                    timeout=min(self.request_timeout, 15.0),
+                                )
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to fetch Harness receipt for task %s; "
+                                "keeping the failure unscored.",
+                                exc.task_id,
+                                exc_info=True,
+                            )
                 raise
             except asyncio.CancelledError:
                 await audit_incomplete_task("LOCAL_WAIT_CANCELLED")

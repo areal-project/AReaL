@@ -165,6 +165,56 @@ def test_runner_overflow_requires_unambiguous_terminal_failure(
     )
 
 
+@pytest.mark.parametrize(
+    "message,interaction_count,expected",
+    [
+        (
+            "context window limit exceeded: compaction is disabled "
+            "(510810 bytes / 196803 estimated tokens)",
+            65,
+            "model_failure_zero",
+        ),
+        (
+            "context window limit exceeded: compaction is disabled "
+            "(510810 bytes / 196803 estimated tokens)",
+            0,
+            "unknown_failure_reject",
+        ),
+        ("agent timed out", 65, "unknown_failure_reject"),
+        ("HTTP 400 context length exceeded", 65, "unknown_failure_reject"),
+    ],
+)
+def test_harness_compaction_disabled_overflow_uses_terminal_receipt(
+    message, interaction_count, expected
+):
+    raw = {
+        "error": "harness: running setup hook (timeout=10m0s)",
+        "harness": {"phase": "agent", "exit_code": 1, "result_status": "ERROR"},
+    }
+    error = ArenaTaskFailedError(
+        task_id="task",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task", status="HARNESS_FAILED", score=0, raw=raw
+        ),
+    )
+    error.harness_result = {
+        "implementation": "rust-core-runtime",
+        "status": "ERROR",
+        "exit_code": 1,
+        "turn_statuses": ["failed"],
+        "delivery": None,
+        "error": [{"message": message}],
+    }
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=interaction_count
+        )
+        == expected
+    )
+    assert error.result.raw == raw
+
+
 def test_gameagent_metadata_does_not_change_receipt_family():
     error = ArenaTaskFailedError(
         task_id="task",

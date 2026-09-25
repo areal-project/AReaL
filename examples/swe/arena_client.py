@@ -70,6 +70,7 @@ class ArenaTaskFailedError(ArenaAPIError):
         self.status = status
         self.payload = dict(payload or {})
         self.result = result
+        self.harness_result: dict[str, Any] | None = None
         super().__init__(f"Arena task {task_id!r} failed with {status}")
 
 
@@ -311,6 +312,31 @@ class ArenaOpenAPIClient:
         "SETUP_FAILED",
         "TIMEOUT",
     }
+
+    async def get_harness_result_async(
+        self,
+        task_id: str,
+        *,
+        client: httpx.AsyncClient,
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Fetch the terminal Harness receipt for one failed task."""
+
+        encoded_task_id = quote(task_id, safe="")
+        url = f"{self.base_url}/api/artifacts/{encoded_task_id}/harness_result.json"
+        response = await self._async_request(
+            client, "GET", url, headers=self._headers, timeout=timeout
+        )
+        response.raise_for_status()
+        if len(response.content) > 65536:
+            raise ArenaAPIError("Harness result artifact exceeds 64 KiB")
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise ArenaAPIError("Harness result artifact is not JSON") from exc
+        if not isinstance(result, dict):
+            raise ArenaAPIError("Harness result artifact must be a JSON object")
+        return result
 
     def __init__(
         self,

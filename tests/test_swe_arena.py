@@ -40,6 +40,33 @@ def _reset_stats() -> None:
     stats_tracker.export_all(reset=True)
 
 
+@pytest.mark.asyncio
+async def test_get_harness_result_fetches_authenticated_terminal_artifact(monkeypatch):
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    task_id = "job:env:0"
+    receipt = {
+        "status": "ERROR",
+        "error": [
+            {
+                "message": "context window limit exceeded: compaction is disabled "
+                "(510810 bytes / 196803 estimated tokens)"
+            }
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/artifacts/job:env:0/harness_result.json"
+        assert request.headers["Authorization"] == "Bearer test-token"
+        return httpx.Response(200, json=receipt)
+
+    client = ArenaOpenAPIClient(base_url="https://arena.example")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        actual = await client.get_harness_result_async(
+            task_id, client=http_client, timeout=5.0
+        )
+    assert actual == receipt
+
+
 def test_resolve_stream_id_when_unspecified_returns_first_active(monkeypatch):
     """The first active Stream should be selected when no id is configured."""
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
