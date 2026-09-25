@@ -271,7 +271,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 **metadata,
             }
 
-    async def _call_agent_hook(self, name: str, *args: Any, **kwargs: Any) -> None:
+    async def _call_agent_hook(self, name: str, *args: Any, **kwargs: Any) -> Any:
         """Call an optional agent lifecycle hook without blocking the event loop."""
 
         hook = getattr(self.agent, name, None)
@@ -279,7 +279,8 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             return
         result = hook(*args, **kwargs)
         if inspect.isawaitable(result):
-            await result
+            return await result
+        return result
 
     def _classify_agent_failure(
         self,
@@ -641,12 +642,30 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 proxy_system_error=float(proxy_client.system_error),
             )
 
+        # Request episode-return assignment while the proxy still owns the full
+        # parent graph. This is an explicit agent opt-in, never a scalar default.
+        export_kwargs = {}
+        if (
+            agent_error is None
+            and not proxy_client.context_overflow
+            and isinstance(rewards, float)
+        ):
+            episode_reward = await self._call_agent_hook(
+                "get_episode_reward_for_export",
+                data,
+                rewards,
+                export_style=self.export_style,
+            )
+            if episode_reward is not None:
+                export_kwargs["episode_reward"] = episode_reward
+
         # Apply turn-level discount and export interactions
         interactions = await proxy_client.export_interactions(
             discount=self.discount,
             style=self.export_style,
             drop_retry_orphans=self.drop_retry_orphans,
             is_eval=workflow_context.get().is_eval,
+            **export_kwargs,
         )
 
         if not interactions:

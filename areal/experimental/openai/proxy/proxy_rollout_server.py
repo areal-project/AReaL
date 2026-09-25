@@ -1504,12 +1504,31 @@ async def export_trajectories(
     # Wait for session to complete (non-blocking, outside lock)
     await session_data.wait_for_finish()
 
+    if request.episode_reward is not None and request.style != "concat":
+        raise HTTPException(
+            status_code=400, detail="Episode reward assignment requires concat export"
+        )
+
     # Export interactions
     interactions = session_data.export_interactions(
         discount=request.discount,
         style=request.style,
         drop_retry_orphans=request.drop_retry_orphans,
     )
+
+    if request.episode_reward is not None and interactions:
+        if _prm_runner is None:
+            from areal.experimental.openai.cache import InteractionCache
+
+            InteractionCache.from_dict(
+                interactions, session_id=session_id
+            ).assign_episode_reward(request.episode_reward)
+        else:
+            logger.warning(
+                "Session %s requested episode reward assignment with PRM enabled; "
+                "preserving process-reward semantics.",
+                session_id,
+            )
 
     if _prm_runner is not None and interactions:
         try:

@@ -842,6 +842,29 @@ class ArenaStreamAgentWorkflow:
             and disposition == "unknown_failure_reject"
         )
 
+    def get_episode_reward_for_export(
+        self,
+        data: dict[str, Any],
+        reward: float,
+        *,
+        export_style: str,
+    ) -> float | None:
+        """Opt successful Arena concat episodes into segment reward assignment.
+
+        The proxy validates and scores the full conversation graph before tensor
+        serialization removes parent links. Arena's terminal score applies to
+        the whole episode, including context-compaction requests.
+        """
+        result = self._task_result.get()
+        if (
+            export_style == "concat"
+            and result is not None
+            and result.status in {"OK", "DONE"}
+            and math.isfinite(reward)
+        ):
+            return reward
+        return None
+
     def record_episode_metrics(
         self,
         data: dict[str, Any],

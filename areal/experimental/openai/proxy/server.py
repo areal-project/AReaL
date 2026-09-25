@@ -9,7 +9,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from areal.experimental.openai.cache import InteractionCache
 
@@ -106,6 +106,8 @@ class ExportTrajectoriesRequest(BaseModel):
     drop_retry_orphans: bool = False
     supports_shared_tensor_references: bool = False
     is_eval: bool = False
+    # Explicit agent opt-in; applied before serialization when PRM is disabled.
+    episode_reward: float | None = Field(default=None, allow_inf_nan=False)
 
 
 class ExportTrajectoriesResponse(BaseModel):
