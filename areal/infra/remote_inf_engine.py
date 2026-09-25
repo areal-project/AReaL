@@ -791,9 +791,32 @@ class RemoteInfEngine(InferenceEngine):
                         f"Expected {target_len} token logprobs, got {len(token_logps)}"
                     )
                 write_idx = torch.nonzero(loss_mask[i], as_tuple=False).squeeze(-1)
-                out[i, write_idx] = torch.tensor(
+                prediction_idx = write_idx - 1
+
+                token_logps_tensor = torch.tensor(
                     token_logps, device=out.device, dtype=out.dtype
                 )
+
+                if torch.any(prediction_idx < 0):
+                    raise ValueError(
+                        "Invalid loss mask: response token has no preceding "
+                        f"prediction position: {write_idx.tolist()}"
+                    )
+
+                if token_logps_tensor.numel() != prediction_idx.numel():
+                    raise ValueError(
+                        "Number of teacher logprobs does not match the number of "
+                        f"prediction positions: {token_logps_tensor.numel()} vs "
+                        f"{prediction_idx.numel()}"
+                    )
+
+                if torch.any(prediction_idx >= out.shape[1]):
+                    raise ValueError(
+                        "Prediction position is outside output tensor: "
+                        f"{prediction_idx.tolist()}, sequence length={out.shape[1]}"
+                    )
+
+                out[i, prediction_idx] = token_logps_tensor
             results.append(out)
         return results
 
