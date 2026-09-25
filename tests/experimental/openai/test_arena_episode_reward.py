@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from examples.swe.arena_agent import ArenaStreamAgentWorkflow
-from examples.swe.arena_client import ArenaTaskResult
+from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
 
 from areal.api import ModelResponse
 from areal.experimental.openai.cache import InteractionCache
@@ -76,9 +76,13 @@ def arena_agent(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reward", [0.0, 0.5275])
 @pytest.mark.parametrize("chain_lengths", [(71, 1, 15), (18, 1, 1, 76)])
+@pytest.mark.parametrize("context_overflow", [False, True])
 async def test_arena_compacted_episode_scores_all_actions_once(
-    monkeypatch, arena_agent, reward, chain_lengths
+    monkeypatch, arena_agent, reward, chain_lengths, context_overflow
 ):
+    overflow = context_overflow
+    if overflow:
+        reward = 0.0
     cache = _compacted_session(chain_lengths)
     leaves = cache.export_interactions(style="concat")
     expected_leaf_ids = [
@@ -90,7 +94,7 @@ async def test_arena_compacted_episode_scores_all_actions_once(
         leaf.to_tensor_dict()
 
     class ProxyClient:
-        context_overflow = False
+        context_overflow = overflow
         system_error = False
         interaction_count = len(cache)
         session_id = "watermill-session"
@@ -136,9 +140,25 @@ async def test_arena_compacted_episode_scores_all_actions_once(
         mode="inline", agent=arena_agent, export_style="concat", drop_retry_orphans=True
     )
     monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
-    monkeypatch.setattr(workflow, "_run_agent", AsyncMock(return_value=reward))
-    arena_agent._task_result.set(
-        ArenaTaskResult(task_id="task", status="OK", score=reward)
+    task_result = ArenaTaskResult(
+        task_id="task",
+        status="HARNESS_FAILED" if overflow else "OK",
+        score=reward,
+        raw={
+            "error": "harness: running setup hook (timeout=10m0s)",
+            "harness": {"phase": "agent", "exit_code": 1, "result_status": "ERROR"},
+        },
+    )
+    arena_agent._task_result.set(task_result)
+    error = (
+        ArenaTaskFailedError(
+            task_id="task", status="HARNESS_FAILED", result=task_result
+        )
+        if overflow
+        else None
+    )
+    monkeypatch.setattr(
+        workflow, "_run_agent", AsyncMock(return_value=reward, side_effect=error)
     )
     workflow_context.set(WorkflowContext(task_id=15, sample_idx=5, group_size=12))
     try:

@@ -5,7 +5,7 @@ enable_offload: false
 total_train_epochs: 10
 total_train_steps: 10
 tokenizer_path: ${oc.env:QWEN_MODEL}
-should_accept_fn: null
+should_accept_fn: examples.swe.filter_function.filter_function
 dynamic_bs: false
 cluster:
   n_nodes: 8
@@ -103,6 +103,7 @@ rollout:
     - cd ${oc.env:QWEN_REPO}
     - python3 -m examples.swe.qwen38_flash_next.patch_sglang_qsa_topk
     - python3 -m examples.swe.qwen38_flash_next.patch_sglang_qsa_compress_gather
+    - python3 -m examples.swe.qwen38_flash_next.patch_sglang_qwen4_vl
     image: ${oc.env:QWEN_ROLLOUT_IMAGE}
   scheduling_strategy:
     type: colocation

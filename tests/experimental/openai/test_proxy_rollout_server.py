@@ -645,6 +645,51 @@ class TestStartSessionApiKey:
 
 class TestEndSessionInteractionCount:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("overflow_first", [False, True])
+    async def test_backend_overflow_does_not_clear_system_failure(
+        self, monkeypatch, overflow_first
+    ):
+        from fastapi import HTTPException
+
+        session = SessionData(session_id="mixed")
+        monkeypatch.setattr(srv, "_session_cache", {"mixed": session})
+        failures = [400, 500] if overflow_first else [500, 400]
+
+        async def create(**_kwargs):
+            raise aiohttp.ClientResponseError(
+                request_info=SimpleNamespace(
+                    real_url="http://backend.invalid/generate"
+                ),
+                history=(),
+                status=failures.pop(0),
+                message="Bad Request. Response body: "
+                + json.dumps(
+                    {
+                        "error": {
+                            "message": "Requested token count exceeds the model's maximum context "
+                            "length of 262144 tokens. You requested a total of 262199 tokens: "
+                            "202751 tokens from the input messages and 59448 tokens for the completion."
+                        }
+                    }
+                ),
+            )
+
+        monkeypatch.setattr(
+            srv,
+            "_openai_client",
+            SimpleNamespace(
+                chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+            ),
+        )
+        for _ in range(2):
+            with pytest.raises(HTTPException):
+                await srv._call_client_create(
+                    create, {"model": "areal", "messages": []}, "mixed"
+                )
+        assert session.context_overflow
+        assert session.system_error
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize(
         "failure, context_overflow",
@@ -731,10 +776,8 @@ class TestEndSessionInteractionCount:
             assert response.status_code == (400 if context_overflow else 500)
             if context_overflow:
                 assert response.json()["detail"]["type"] == "context_length_exceeded"
-        # Backend preprocessing may invalidate a locally valid budget. Keep
-        # that failure unscored instead of turning it into a model penalty.
-        assert ended.json()["context_overflow"] is (failure == "local_context")
-        assert ended.json()["system_error"] is (failure != "local_context")
+        assert ended.json()["context_overflow"] is context_overflow
+        assert ended.json()["system_error"] is not context_overflow
 
     @pytest.mark.asyncio
     async def test_end_session_returns_interaction_count(self, monkeypatch):

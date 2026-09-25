@@ -295,6 +295,7 @@ def main(profile, args):
                 trainer.train(
                     workflow=workflow,
                     workflow_kwargs=kwargs,
+                    dynamic_filter_fn=config.should_accept_fn,
                     eval_workflow=workflow if evaluation_only else None,
                     eval_workflow_kwargs=kwargs if evaluation_only else None,
                 )

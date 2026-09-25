@@ -566,6 +566,14 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 else:
                     raise ValueError(f"Invalid reward type: {type(rewards)}")
 
+        if (
+            agent_error is None
+            and proxy_client.context_overflow
+            and proxy_client.system_error
+        ):
+            agent_error = RuntimeError(
+                "Proxy session had a system failure as well as context overflow"
+            )
         failure_disposition: AgentFailureDisposition | None = None
         if agent_error is not None:
             failure_disposition = self._classify_agent_failure(
@@ -645,7 +653,15 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         # Request episode-return assignment while the proxy still owns the full
         # parent graph. This is an explicit agent opt-in, never a scalar default.
         export_kwargs = {}
-        if (
+        if proxy_client.context_overflow or failure_disposition == "model_failure_zero":
+            episode_reward = await self._call_agent_hook(
+                "get_failure_reward_for_export",
+                data,
+                export_style=self.export_style,
+            )
+            if episode_reward is not None:
+                export_kwargs["episode_reward"] = episode_reward
+        elif (
             agent_error is None
             and not proxy_client.context_overflow
             and isinstance(rewards, float)

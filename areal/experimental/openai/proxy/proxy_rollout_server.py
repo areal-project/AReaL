@@ -1069,12 +1069,13 @@ async def _call_client_create(
         session_data.mark_system_error(f"{type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        session_data.mark_system_error(f"{type(e).__name__}: {e}")
         backend_context_message = _backend_context_length_message(e)
         if backend_context_message is not None:
-            # A backend can reject a locally valid prompt after multimodal
-            # preprocessing. Keep it a system failure for reward/admission,
-            # while telling callers this request cannot succeed by retrying.
+            # The backend's expanded input is authoritative for the context
+            # limit. Recover this episode as a zero-reward overflow without
+            # aborting healthy sibling rollouts. Other backend errors remain
+            # system failures, including any later error in this session.
+            session_data.mark_context_overflow(backend_context_message)
             logger.warning(
                 "Backend rejected session %s context length: %s",
                 session_id,
@@ -1087,6 +1088,7 @@ async def _call_client_create(
                     "message": backend_context_message,
                 },
             ) from e
+        session_data.mark_system_error(f"{type(e).__name__}: {e}")
         logger.exception("AReaL client request failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 

@@ -640,7 +640,7 @@ class ArenaStreamAgentWorkflow:
     @staticmethod
     def _harness_result_format(
         raw: Any,
-    ) -> Literal["native", "gameagent", "legacy-claude"] | None:
+    ) -> Literal["native", "native-runner", "gameagent", "legacy-claude"] | None:
         """Identify the envelope before validation, including broken receipts.
 
         Presence of reserved fields identifies a family even if their values are
@@ -668,11 +668,87 @@ class ArenaStreamAgentWorkflow:
             "harness: agent phase error: claude " in detail.lower()
             or "(claude=" in detail
         )
-        if sum((native, gameagent, claude)) != 1:
+        runner = "implementation" in raw or (
+            isinstance(raw.get("harness"), dict)
+            and not any((native, gameagent, claude))
+        )
+        if sum((native, runner, gameagent, claude)) != 1:
             return None
         if native:
             return "native"
+        if runner:
+            return "native-runner"
         return "gameagent" if gameagent else "legacy-claude"
+
+    @staticmethod
+    def _is_runner_context_failure(raw: dict[str, Any]) -> bool:
+        """Validate the runner terminal receipt or Arena's abbreviated envelope.
+
+        Requires a typed proxy overflow at the caller. Arena currently returns
+        only the beginning of the harness log, not the terminal receipt. Normal
+        setup/collect timeout settings in that prefix are not timeout failures.
+        Proxy system errors remain a separate, sticky veto in the workflow.
+        """
+        if "implementation" in raw:
+            if (
+                raw["implementation"] != "rust-core-runtime"
+                or raw.get("status") != "ERROR"
+                or type(raw.get("exit_code")) is not int
+                or raw["exit_code"] != 1
+                or raw.get("execution_state") != "exited"
+                or raw.get("unconfirmed_tools") != []
+                or raw.get("unconfirmed_tool_count") != 0
+                or raw.get("delivery") is not None
+            ):
+                return False
+            for field in (
+                "turn_statuses",
+                "recorded_turn_statuses",
+                "root_turn_statuses",
+            ):
+                statuses = raw.get(field)
+                if (
+                    not isinstance(statuses, list)
+                    or not statuses
+                    or any(status != "failed" for status in statuses)
+                ):
+                    return False
+            errors = raw.get("error")
+            return (
+                isinstance(errors, list)
+                and bool(errors)
+                and all(
+                    isinstance(error, dict)
+                    and re.fullmatch(
+                        r"model reported a streaming error \(event=error, "
+                        r'code=Some\("context_length_exceeded"\), '
+                        r'type=Some\("context_length_exceeded"\), reason=None\)',
+                        str(error.get("message", "")),
+                    )
+                    is not None
+                    for error in errors
+                )
+            )
+        detail = raw.get("error", "")
+        if not isinstance(detail, str):
+            return False
+        # Ignore only known lifecycle configuration records, not actual timeout
+        # failures or later collect/export/provider errors in the same log.
+        detail = re.sub(
+            r"running (?:setup|collect) hook \(timeout=[0-9.hms]+\)",
+            "running hook",
+            detail,
+        )
+        if _HARNESS_SYSTEM_ERROR_PATTERN.search(detail):
+            return False
+        harness = raw.get("harness")
+        return (
+            isinstance(harness, dict)
+            and harness.get("phase") == "agent"
+            and harness.get("result_status") == "ERROR"
+            and type(harness.get("exit_code")) is int
+            and harness["exit_code"] == 1
+        )
 
     @staticmethod
     def _is_native_model_failure(raw: Any) -> bool:
@@ -764,6 +840,8 @@ class ArenaStreamAgentWorkflow:
             return False
         if "status" in raw and raw["status"] != "ERROR":
             return False
+        if result_format == "native-runner":
+            return context_overflow and cls._is_runner_context_failure(raw)
         detail = raw.get("error")
         if detail is not None and not isinstance(detail, str):
             return False
@@ -864,6 +942,17 @@ class ArenaStreamAgentWorkflow:
         ):
             return reward
         return None
+
+    def get_failure_reward_for_export(
+        self, data: dict[str, Any], *, export_style: str
+    ) -> float | None:
+        """Score every valid concat segment after approved model-failure recovery.
+
+        Called only after the proxy workflow's failure classification and system
+        error veto. The cache still validates the conversation graph, preserving
+        explicit process rewards and rejecting ambiguous unscored branches.
+        """
+        return 0.0 if export_style == "concat" else None
 
     def record_episode_metrics(
         self,

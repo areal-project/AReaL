@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -101,6 +102,149 @@ class _FakeProxyClient:
         if self.interaction_count == 0:
             return {}
         return {"completion-1": self.interaction}
+
+
+@pytest.mark.parametrize("receipt", ["envelope", "full"])
+@pytest.mark.parametrize("overflow", [False, True])
+@pytest.mark.parametrize(
+    "fault", [None, "http500", "timeout", "collect", "broken_native", "bad_exit"]
+)
+def test_runner_overflow_requires_unambiguous_terminal_failure(
+    receipt, overflow, fault
+):
+    raw = {
+        "error": "harness: running setup hook (timeout=10m0s)",
+        "harness": {"phase": "agent", "exit_code": 1, "result_status": "ERROR"},
+    }
+    if receipt == "full":
+        raw = {
+            "implementation": "rust-core-runtime",
+            "status": "ERROR",
+            "exit_code": 1,
+            "execution_state": "exited",
+            "turn_statuses": ["failed"],
+            "recorded_turn_statuses": ["failed"],
+            "root_turn_statuses": ["failed"],
+            "unconfirmed_tools": [],
+            "unconfirmed_tool_count": 0,
+            "delivery": None,
+            "error": [
+                {
+                    "message": "model reported a streaming error (event=error, "
+                    'code=Some("context_length_exceeded"), '
+                    'type=Some("context_length_exceeded"), reason=None)'
+                }
+            ],
+        }
+    if fault == "broken_native":
+        raw["nativeRlReceiptVersion"] = 1
+    elif fault == "bad_exit":
+        (raw["harness"] if receipt == "envelope" else raw)["exit_code"] = 137
+    elif fault:
+        message = {
+            "http500": "HTTP 500 Internal Server Error",
+            "timeout": "agent timed out",
+            "collect": "collect hook failed",
+        }[fault]
+        if receipt == "full":
+            raw["error"].append({"message": message})
+        else:
+            raw["error"] += "\n" + message
+    error = ArenaTaskFailedError(
+        task_id="task",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task", status="HARNESS_FAILED", score=0, raw=raw
+        ),
+    )
+    actual = ArenaStreamAgentWorkflow.classify_proxy_failure(
+        error, context_overflow=overflow, interaction_count=1
+    )
+    assert actual == (
+        "model_failure_zero" if overflow and fault is None else "unknown_failure_reject"
+    )
+
+
+def test_gameagent_metadata_does_not_change_receipt_family():
+    error = ArenaTaskFailedError(
+        task_id="task",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task",
+            status="HARNESS_FAILED",
+            score=0,
+            raw={
+                "outcome_code": "AGENT_MAX_TURNS_EXCEEDED",
+                "harness": {"phase": "agent"},
+            },
+        ),
+    )
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=1
+        )
+        == "model_failure_zero"
+    )
+
+
+@pytest.mark.asyncio
+async def test_caught_system_error_cannot_be_recovered_as_context_zero(monkeypatch):
+    client = _FakeProxyClient()
+    client.system_error = True
+    client.export_interactions = AsyncMock()
+    monkeypatch.setattr(workflow_module, "OpenAIProxyClient", lambda **_: client)
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=_SuccessfulAgent())
+    monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
+    try:
+        with pytest.raises(RuntimeError, match="system failure"):
+            await workflow.arun_episode(None, {})
+        client.export_interactions.assert_not_awaited()
+    finally:
+        stats_tracker.export_all(reset=True)
+
+
+@pytest.mark.asyncio
+async def test_recovered_overflow_keeps_all_eleven_siblings(monkeypatch):
+    from areal.api import RolloutWorkflow
+    from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
+
+    client = _FakeProxyClient()
+    monkeypatch.setattr(workflow_module, "OpenAIProxyClient", lambda **_: client)
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    proxy = OpenAIProxyWorkflow(mode="inline", agent=_FailingAgent())
+    monkeypatch.setattr(proxy, "_grant_capacity", AsyncMock())
+    monkeypatch.setattr(proxy, "_record_interaction_stats", lambda *_, **__: None)
+    monkeypatch.setattr(proxy, "record_episode_metrics", lambda *_, **__: None)
+    completed = []
+
+    class Episodes(RolloutWorkflow):
+        async def arun_episode(self, engine, data):
+            index = workflow_context.get().sample_idx
+            if index == 0:
+                return await proxy.arun_episode(engine, data)
+            await asyncio.sleep(0)
+            completed.append(index)
+            return {f"peer-{index}": InteractionWithTokenLogpReward(reward=1.0)}
+
+    grouped = GroupedRolloutWorkflow(
+        Episodes(),
+        group_size=12,
+        min_usable_group_size=8,
+        logger=MagicMock(),
+        reward_normalization=False,
+    )
+    try:
+        result = await grouped.arun_episode(None, {})
+        assert sorted(completed) == list(range(1, 12))
+        assert len(result) == 12
+        assert result["completion-1"].reward == 0.0
+    finally:
+        stats_tracker.export_all(reset=True)
 
 
 @pytest.mark.asyncio
