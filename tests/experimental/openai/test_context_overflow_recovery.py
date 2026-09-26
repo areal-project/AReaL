@@ -180,11 +180,14 @@ def test_runner_overflow_requires_unambiguous_terminal_failure(
             0,
             "unknown_failure_reject",
         ),
+        ("model stopped with reason: length", 12, "model_failure_zero"),
+        ("model stopped with reason: length", 0, "unknown_failure_reject"),
+        ("model stopped with reason: error", 12, "unknown_failure_reject"),
         ("agent timed out", 65, "unknown_failure_reject"),
         ("HTTP 400 context length exceeded", 65, "unknown_failure_reject"),
     ],
 )
-def test_harness_compaction_disabled_overflow_uses_terminal_receipt(
+def test_harness_model_limit_failure_uses_terminal_receipt(
     message, interaction_count, expected
 ):
     raw = {
@@ -213,6 +216,40 @@ def test_harness_compaction_disabled_overflow_uses_terminal_receipt(
         == expected
     )
     assert error.result.raw == raw
+
+
+def test_harness_model_length_does_not_override_system_error():
+    error = ArenaTaskFailedError(
+        task_id="task",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task",
+            status="HARNESS_FAILED",
+            score=0,
+            raw={
+                "error": "harness: agent phase error: HTTP 500 Internal Server Error",
+                "harness": {
+                    "phase": "agent",
+                    "exit_code": 1,
+                    "result_status": "ERROR",
+                },
+            },
+        ),
+    )
+    error.harness_result = {
+        "implementation": "rust-core-runtime",
+        "status": "ERROR",
+        "exit_code": 1,
+        "turn_statuses": ["failed"],
+        "delivery": None,
+        "error": [{"message": "model stopped with reason: length"}],
+    }
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=12
+        )
+        == "unknown_failure_reject"
+    )
 
 
 def test_gameagent_metadata_does_not_change_receipt_family():
