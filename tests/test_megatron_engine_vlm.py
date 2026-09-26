@@ -54,6 +54,7 @@ def test_vision_microbatch_preparation_is_lazy_and_reusable(monkeypatch):
     engine.parallel_strategy = SimpleNamespace(
         pipeline_parallel_size=1, context_parallel_size=1, tensor_parallel_size=1
     )
+    engine.bridge_cls = "megatron-bridge"
     engine.enable_tree_training = False
     engine.enable_fp8 = False
     engine.is_vision_model = True
@@ -833,6 +834,41 @@ class TestPackedContextParallelForward:
         assert output.shape == (2, 1, 3)
         assert model.seen_post_process is False
         assert model.post_process is True
+
+    @pytest.mark.parametrize("fail", [False, True])
+    def test_hidden_state_mode_preserves_visual_forward_and_restores_on_error(
+        self, fail
+    ):
+        from areal.engine.megatron_utils.packed_context_parallel import (
+            _hidden_states_output,
+        )
+
+        class VisionWrapper(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.visual = torch.nn.Linear(3, 3, bias=False)
+                self.language_model = torch.nn.Identity()
+                self.language_model.post_process = True
+
+            def forward(self, pixels):
+                assert not self.language_model.post_process
+                features = self.visual(pixels)
+                if fail:
+                    raise RuntimeError("visual forward failed")
+                return self.language_model(features)
+
+        model = VisionWrapper()
+        pixels = torch.ones(2, 3, requires_grad=True)
+        try:
+            with _hidden_states_output(model, True):
+                output = model(pixels)
+                output.sum().backward()
+        except RuntimeError as exc:
+            assert fail and str(exc) == "visual forward failed"
+        assert model.language_model.post_process is True
+        if not fail:
+            assert pixels.grad is not None
+            assert model.visual.weight.grad is not None
 
     def test_padded_lm_head_labels_and_outputs_preserve_sequence_order(self):
         from areal.engine.megatron_engine import (

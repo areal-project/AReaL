@@ -304,7 +304,12 @@ def postprocess_packed_seqs_context_parallel(
     return output_new
 
 
-_VLM_FORWARD_KEYS = ("pixel_values", "image_grid_thw", "video_grid_thw")
+_VLM_FORWARD_KEYS = (
+    "pixel_values",
+    "pixel_values_videos",
+    "image_grid_thw",
+    "video_grid_thw",
+)
 
 
 def _is_multi_modal_payload_key(key: str) -> bool:
@@ -320,7 +325,7 @@ def _drop_multi_modal_payload(data: dict[str, Any]) -> None:
 def extract_vision_from_multi_modal(
     mb: dict[str, Any], padded_mb: dict[str, Any]
 ) -> None:
-    """Extract pixel_values / image_grid_thw / video_grid_thw from multi_modal_input.
+    """Extract image/video pixels and grids from multi_modal_input.
 
     Mirrors FSDPEngine's `_prepare_multimodal_forward_inputs` (#1272): vision
     tensors are placed only on ``padded_mb`` (forward side); ``mb`` is the
@@ -447,6 +452,52 @@ def _prepare_mtp_loss_mask(
     return loss_mask.unsqueeze(0).contiguous()
 
 
+def _prepare_wrapper_packed_positions(
+    position_ids: torch.Tensor | None,
+    input_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Match text or three-axis mRoPE positions to the wrapper's CP partition."""
+    if (
+        position_ids is not None
+        and position_ids.ndim == 2
+        and position_ids.shape == (input_ids.numel(), 3)
+    ):
+        position_ids = position_ids.to(device=input_ids.device, dtype=torch.long)
+        return (
+            torch.stack(
+                [
+                    split_packed_seqs_for_context_parallel(axis, cu_seqlens)
+                    for axis in position_ids.unbind(-1)
+                ]
+            )
+            .unsqueeze(1)
+            .contiguous()
+        )
+    if position_ids is None:
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        starts = torch.repeat_interleave(
+            cu_seqlens[:-1], lengths, output_size=input_ids.numel()
+        )
+        position_ids = (
+            torch.arange(input_ids.numel(), device=input_ids.device, dtype=torch.long)
+            - starts
+        )
+    elif position_ids.ndim == 2 and position_ids.shape[0] == 1:
+        position_ids = position_ids.squeeze(0)
+    if position_ids.ndim != 1 or position_ids.numel() != input_ids.numel():
+        raise ValueError(
+            "Wrapper-packed text position_ids must contain one position per "
+            "full packed token, before context parallel partitioning."
+        )
+    position_ids = position_ids.to(device=input_ids.device, dtype=torch.long)
+    return (
+        split_packed_seqs_for_context_parallel(position_ids, cu_seqlens)
+        .unsqueeze(0)
+        .contiguous()
+    )
+
+
 def packed_context_parallel_forward(
     model: torch.nn.Module,
     input_: dict[str, Any],
@@ -456,7 +507,13 @@ def packed_context_parallel_forward(
     use_model_packed_seq: bool = False,
     fp32_output: bool | None = None,
     return_hidden_states: bool = False,
+    use_wrapper_packed_seq: bool = False,
+    language_model_only: bool = False,
 ):
+    if use_model_packed_seq and use_wrapper_packed_seq:
+        raise ValueError(
+            "Model-owned and wrapper-owned packing are mutually exclusive."
+        )
     input_ids = input_["input_ids"]
     packed_num_tokens = input_ids.numel()
     position_ids = input_.get("position_ids", None)
@@ -472,7 +529,9 @@ def packed_context_parallel_forward(
     # the vision kwargs and the dense-mask exception below — never the
     # padded-vs-packed routing.
     has_vision_inputs = is_vision_model and any(
-        key in input_ for key in _VLM_FORWARD_KEYS
+        input_.get(key) is not None
+        and (not torch.is_tensor(input_[key]) or input_[key].numel() > 0)
+        for key in _VLM_FORWARD_KEYS
     )
     # Padded-vs-packed routing is keyed on the MODEL type:
     # - VLM models cannot consume the wrapper-packed [1, total_len] layout
@@ -483,6 +542,25 @@ def packed_context_parallel_forward(
     # - Architectures whose attention/SSM kernels reject packed sequences
     #   (use_padded_seq, e.g. Qwen3.5 GDN) must run on [B, S] padded input.
     needs_padded_form = is_vision_model or use_padded_seq
+    if has_vision_inputs and language_model_only:
+        raise ValueError(
+            "language_model_only=True cannot consume image or video inputs."
+        )
+    if (
+        has_vision_inputs
+        and use_wrapper_packed_seq
+        and (
+            position_ids is None
+            or position_ids.ndim != 2
+            or position_ids.shape != (input_ids.numel(), 3)
+        )
+    ):
+        raise ValueError(
+            "Wrapper-packed multimodal inputs require model-specific mRoPE "
+            "position_ids with shape [T, 3], computed before packing."
+        )
+    if use_wrapper_packed_seq and cu_seqlens is None:
+        raise ValueError("Wrapper-packed forward requires cu_seqlens.")
 
     # Track shape metadata so the output can be repacked back to packed
     # [total_len, ...] form on the last PP stage.
@@ -503,10 +581,17 @@ def packed_context_parallel_forward(
             )
             packed_seq_params = _build_thd_packed_seq_params(cu_seqlens, max_seqlen)
             position_ids = None
-        elif not needs_padded_form:
+        elif use_wrapper_packed_seq or not needs_padded_form:
             if attention_mask is not None or tree_triton_data is not None:
                 raise ValueError(
                     "Attention mask should be None when using packed sequences."
+                )
+            if use_wrapper_packed_seq:
+                # ModelScope reconstructs these local ids for vision embedding,
+                # then partitions embeddings once. Local positions prevent its
+                # legacy full-id/local-position path from splitting ids again.
+                position_ids = _prepare_wrapper_packed_positions(
+                    position_ids, input_ids, cu_seqlens
                 )
             input_ids, packed_seq_params = preprocess_packed_seqs_context_parallel(
                 input_ids, cu_seqlens
@@ -530,20 +615,35 @@ def packed_context_parallel_forward(
     dense_mask_text_forward = use_padded_seq and not has_vision_inputs
     if use_model_packed_seq:
         final_attention_mask = attention_mask
-    elif is_vision_model and not dense_mask_text_forward:
+    elif is_vision_model and not dense_mask_text_forward and not use_wrapper_packed_seq:
         final_attention_mask = None
     else:
         final_attention_mask = (
             tree_triton_data if tree_triton_data is not None else attention_mask
         )
 
-    # VLM: pass vision inputs through to model forward. The VLM model computes
-    # mRoPE position_ids internally, so position_ids remains None for VLM.
+    # Models with their own mRoPE contract receive the original vision tensors.
     vlm_kwargs: dict[str, Any] = {}
     if has_vision_inputs:
         for key in _VLM_FORWARD_KEYS:
             if key in input_:
                 vlm_kwargs[key] = input_[key]
+
+    if is_vision_model and input_.get("mm_token_type_ids") is not None:
+        token_types = input_["mm_token_type_ids"]
+        if token_types.shape != input_["input_ids"].shape:
+            raise ValueError("mm_token_type_ids must match input_ids before packing.")
+        if cu_seqlens is not None:
+            if use_wrapper_packed_seq:
+                # Bridge reconstructs full ids before vision embedding, then
+                # partitions embeddings for CP. Its kwargs are not gathered, so
+                # modality types must stay in that full embedding-domain layout.
+                token_types = token_types.unsqueeze(0)
+            elif needs_padded_form or use_model_packed_seq:
+                token_types, _, _, _ = _reconstruct_padded_2d(
+                    token_types, cu_seqlens, input_.get("max_seqlen")
+                )
+        vlm_kwargs["mm_token_type_ids"] = token_types.to(dtype=torch.long)
 
     # For BSHD text-only, drop the packed-form position_ids (a 1D tensor of
     # length total_len) — they don't match the 2D [B, S] input. Let mcore
@@ -564,7 +664,8 @@ def packed_context_parallel_forward(
             attention_mask,
             cu_seqlens=cu_seqlens,
             packed_num_tokens=packed_num_tokens,
-            uses_padded_form=needs_padded_form,
+            uses_padded_form=needs_padded_form
+            and not (use_model_packed_seq or use_wrapper_packed_seq),
             uses_model_packed_seq=use_model_packed_seq,
         )
 

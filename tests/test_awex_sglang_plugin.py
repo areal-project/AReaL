@@ -421,13 +421,37 @@ def test_scheduler_dispatcher_captures_gc_guard_and_registration_is_idempotent(
         "sglang.srt.managers.scheduler",
         SimpleNamespace(Scheduler=Scheduler),
     )
-    monkeypatch.delenv("QWEN_AWEX_FROZEN_CONTRACT", raising=False)
+    # Qwen lifecycle hooks install before Scheduler construction without an env.
+    from areal.models.mcore import qwen4_exp_awex_memory, qwen4_exp_frozen_state
+
+    calls = []
+    monkeypatch.setattr(
+        qwen4_exp_frozen_state,
+        "install_static_state_hooks",
+        lambda updater: calls.append("static"),
+    )
+    monkeypatch.setattr(
+        qwen4_exp_awex_memory,
+        "install_kv_residency_hooks",
+        lambda updater, scheduler: calls.append("kv"),
+    )
+    updater = SimpleNamespace(
+        _export_static_state=lambda model: {},
+        _import_static_state=lambda model, state: None,
+        SchedulerWeightUpdaterManager=object,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.scheduler_components",
+        SimpleNamespace(weight_updater=updater),
+    )
     monkeypatch.setattr(plugin_module, "assert_supported_sglang_version", lambda: None)
     monkeypatch.setattr(AwexSchedulerPlugin, "bind", lambda self: None)
     monkeypatch.setattr(
         plugin_module, "_patch_execute_task_in_model_worker", lambda *a: None
     )
     plugin_module.register_awex_plugin()
+    assert calls == ["static", "kv"]
     guarded = Scheduler.handle_freeze_gc
     assert guarded.__wrapped__ is original_freeze
     plugin_module.register_awex_plugin()
@@ -555,3 +579,32 @@ def test_legacy_model_worker_callback_allows_single_rank_without_parallel_state(
         kwargs={}, task_func=lambda **kwargs: kwargs["model_context"]
     )
     assert scheduler.execute_task_in_model_worker(task)["tp_rank"] == 0
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_qwen_frozen_verification_precedes_worker_start(monkeypatch, invalid):
+    model = type("Qwen4ExpForConditionalGeneration", (), {})()
+    scheduler = SimpleNamespace(
+        tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=model))
+    )
+    plugin = AwexSchedulerPlugin(scheduler)
+    calls = []
+
+    def prepare(addr):
+        calls.append("verify")
+        if invalid:
+            raise ValueError("frozen weight mismatch")
+
+    plugin._receiver = SimpleNamespace(prepare_frozen_weights=prepare)
+    monkeypatch.setenv("AWEX_META_SERVER_ADDR", "localhost:1234")
+    monkeypatch.setattr(
+        plugin, "_start_background_worker", lambda addr: calls.append("start")
+    )
+    monkeypatch.setattr(plugin, "_patch_event_loop", lambda: calls.append("loop"))
+    if invalid:
+        with pytest.raises(ValueError, match="frozen weight mismatch"):
+            plugin.bind()
+        assert calls == ["verify"]
+    else:
+        plugin.bind()
+        assert calls == ["verify", "start", "loop"]

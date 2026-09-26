@@ -90,7 +90,7 @@ class TestExtractImagesFromMessages:
         image_data, tok_msgs, vllm_msgs = _extract_images_from_messages(messages)
 
         assert len(image_data) == 1
-        assert image_data[0] == red_pixel_b64
+        assert image_data[0] == _make_data_uri(red_pixel_b64)
 
         tok_content = tok_msgs[0]["content"]
         assert tok_content[0] == {"type": "text", "text": "Describe this image"}
@@ -121,8 +121,8 @@ class TestExtractImagesFromMessages:
         image_data, tok_msgs, vllm_msgs = _extract_images_from_messages(messages)
 
         assert len(image_data) == 2
-        assert image_data[0] == red_pixel_b64
-        assert image_data[1] == blue_pixel_b64
+        assert image_data[0] == _make_data_uri(red_pixel_b64)
+        assert image_data[1] == _make_data_uri(blue_pixel_b64)
 
         tok_content = tok_msgs[0]["content"]
         assert len(tok_content) == 3
@@ -158,8 +158,8 @@ class TestExtractImagesFromMessages:
         image_data, tok_msgs, vllm_msgs = _extract_images_from_messages(messages)
 
         assert len(image_data) == 2
-        assert image_data[0] == red_pixel_b64
-        assert image_data[1] == blue_pixel_b64
+        assert image_data[0] == _make_data_uri(red_pixel_b64)
+        assert image_data[1] == _make_data_uri(blue_pixel_b64)
 
         assert tok_msgs[0] == {"role": "system", "content": "You are a VLM assistant."}
         assert tok_msgs[2] == {"role": "assistant", "content": "I see a red pixel."}
@@ -235,7 +235,7 @@ class TestExtractImagesFromMessages:
         image_data, _, _ = _extract_images_from_messages(messages)
 
         assert len(image_data) == 1
-        assert image_data[0] == jpeg_b64
+        assert image_data[0] == _make_data_uri(jpeg_b64, "image/jpeg")
 
     def test_detail_parameter_ignored_for_extraction(self, red_pixel_b64):
         data_uri = _make_data_uri(red_pixel_b64)
@@ -254,7 +254,7 @@ class TestExtractImagesFromMessages:
         image_data, _, _ = _extract_images_from_messages(messages)
 
         assert len(image_data) == 1
-        assert image_data[0] == red_pixel_b64
+        assert image_data[0] == _make_data_uri(red_pixel_b64)
 
     def test_real_png_roundtrip(self):
         """Create a real 4x4 image, encode it, extract it, and decode back."""
@@ -276,7 +276,8 @@ class TestExtractImagesFromMessages:
 
         image_data, _, _ = _extract_images_from_messages(messages)
 
-        decoded_bytes = base64.b64decode(image_data[0])
+        assert image_data[0] == data_uri
+        decoded_bytes = base64.b64decode(image_data[0].split(",", 1)[1])
         decoded_img = Image.open(io.BytesIO(decoded_bytes))
         assert decoded_img.size == (4, 4)
         assert decoded_img.getpixel((0, 0)) == (42, 128, 200)
@@ -1068,3 +1069,32 @@ class TestExtractImagesValidation:
         ]
         with pytest.raises(ValueError, match="empty or missing URL"):
             _extract_images_from_messages(messages)
+
+
+@pytest.mark.parametrize("backend_class", [VLLMBridgeBackend, SGLangBridgeBackend])
+def test_backend_preserves_image_data_uri(backend_class, red_pixel_b64):
+    uri = _make_data_uri(red_pixel_b64)
+    req = ModelRequest(
+        input_ids=[1, 2, 3],
+        gconfig=GenerationHyperparameters(max_new_tokens=1),
+        image_data=[uri],
+        vision_msg_vllm=[
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "placeholder"}}
+                    ],
+                }
+            ]
+        ],
+    )
+    payload = (
+        backend_class()
+        .build_generation_request(req, with_lora=False, version=0)
+        .payload
+    )
+    if backend_class is VLLMBridgeBackend:
+        assert payload["messages"][0]["content"][0]["image_url"]["url"] == uri
+    else:
+        assert payload["image_data"] == [uri]

@@ -77,10 +77,12 @@ class VLLMBridgeBackend:
                                 raise ValueError(
                                     "Not enough images in req.image_data to match image_url entries."
                                 ) from exc
-                            mime = detect_image_mime(base64_img)
-                            content["image_url"] = {
-                                "url": f"data:{mime};base64,{base64_img}"
-                            }
+                            if base64_img.startswith(("data:", "http://", "https://")):
+                                image_url = base64_img
+                            else:
+                                mime = detect_image_mime(base64_img)
+                                image_url = f"data:{mime};base64,{base64_img}"
+                            content["image_url"] = {"url": image_url}
             payload["messages"] = parsed_input.copy()
             payload["logprobs"] = True
             return HttpRequest(endpoint="/v1/chat/completions", payload=payload)

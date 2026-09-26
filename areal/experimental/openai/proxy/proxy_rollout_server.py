@@ -903,15 +903,29 @@ async def _call_client_create(
     defaults = dict(
         getattr(_engine.config.agent, "chat_template_kwargs", {}) if _engine else {}
     )
-    extra_body = dict(kwargs.get("extra_body") or {})
-    session_template = session_data.metadata.get("chat_template_kwargs") or {}
+    extra_body = kwargs.get("extra_body")
+    extra_body = {} if extra_body is None else extra_body
+    session_template = session_data.metadata.get("chat_template_kwargs")
+    session_template = {} if session_template is None else session_template
+    flat_template = kwargs.pop("chat_template_kwargs", None)
+    flat_template = {} if flat_template is None else flat_template
+    if not isinstance(extra_body, Mapping):
+        raise HTTPException(status_code=400, detail="Template options must be objects")
+    extra_body = dict(extra_body)
+    nested_template = extra_body.get("chat_template_kwargs")
+    nested_template = {} if nested_template is None else nested_template
+    if any(
+        not isinstance(layer, Mapping)
+        for layer in (session_template, nested_template, flat_template)
+    ):
+        raise HTTPException(status_code=400, detail="Template options must be objects")
     thinking_keys = ("thinking_option", "enable_thinking", "thinking")
     template_kwargs = {}
     for layer in (
         defaults,
         session_template,
-        extra_body.get("chat_template_kwargs") or {},
-        kwargs.pop("chat_template_kwargs", None) or {},
+        nested_template,
+        flat_template,
     ):
         effective = {
             key: value

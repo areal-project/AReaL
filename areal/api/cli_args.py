@@ -936,6 +936,15 @@ class MegatronEngineConfig:
             )
         },
     )
+    language_model_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "For multimodal ModelScope bridges, build only the language model. "
+                "Set True for text-only inputs and False for vision inputs."
+            )
+        },
+    )
     # Don't use MegatronOptimizerConfig here because OmegaConf
     # does not recognize the annotation "torch.dtype"
     overlap_param_gather_with_optimizer_step: bool = False
@@ -1081,8 +1090,8 @@ class MegatronEngineConfig:
     bridge_type: str = field(
         default="mbridge",
         metadata={
-            "help": "Bridge backend for MegatronEngine. Choices: 'mbridge' or 'megatron-bridge'.",
-            "choices": ["mbridge", "megatron-bridge"],
+            "help": "Bridge backend for MegatronEngine. Choices: 'mbridge', 'megatron-bridge', or 'mcore-bridge'.",
+            "choices": ["mbridge", "megatron-bridge", "mcore-bridge"],
         },
     )
 
@@ -1096,7 +1105,7 @@ class MegatronEngineConfig:
     use_bridge_for_update_weights: bool = field(
         default=False,
         metadata={
-            "help": "When True and bridge_type='megatron-bridge', delegate live "
+            "help": "When True and bridge_type is 'megatron-bridge' or 'mcore-bridge', delegate live "
             "weight sync to bridge.export_hf_weights instead of the hand-rolled "
             "convert_to_hf registry. Required for models without a registry entry "
             "(e.g. Qwen3.5). FP8 paths fall back to the registry automatically.",
@@ -1118,6 +1127,17 @@ class MegatronEngineConfig:
         metadata={
             "help": "Keep the model's Multi-Token-Prediction (MTP) head "
             "(bridge_type=megatron-bridge only). Default False drops it.",
+        },
+    )
+
+    freeze_ple_table: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Freeze the Qwen4-Exp PLE/N-gram table while keeping the PLE "
+                "projection, norm, convolution, and token embedding trainable. "
+                "Set False to train and export the full PLE table."
+            )
         },
     )
 
