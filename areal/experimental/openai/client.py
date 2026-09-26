@@ -1221,10 +1221,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
             seed=None if is_omitted(seed) else seed,
-            stop_token_ids=list(
-                set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
-            ),
-        )
+        ).new_with_stop_and_pad_token_ids(self.tokenizer)
 
         model_request = ModelRequest(
             input_ids=prompt_token_ids,
@@ -1672,10 +1669,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
             seed=None if is_omitted(seed) else seed,
-            stop_token_ids=list(
-                set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
-            ),
-        )
+        ).new_with_stop_and_pad_token_ids(self.tokenizer)
 
         model_request = ModelRequest(
             input_ids=prompt_token_ids,
