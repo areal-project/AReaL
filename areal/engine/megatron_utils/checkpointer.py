@@ -59,6 +59,37 @@ def get_device_name() -> str:
     return device
 
 
+def _release_cached_host_memory(rank: int) -> None:
+    """Return unused D2H staging buffers without touching live async payloads."""
+    if get_device_name() != "cuda":
+        return
+    # PyTorch 2.9 exposes only this private binding. Device empty_cache does
+    # not release the separate pinned host allocator's cached checkpoint data.
+    empty_cache = getattr(torch._C, "_host_emptyCache", None)
+    if not callable(empty_cache):
+        return
+
+    def reserved_bytes() -> int | None:
+        try:
+            return torch.cuda.host_memory_stats().get("reserved_bytes.current")
+        except Exception:
+            # Stats are optional and must never prevent reclamation.
+            return None
+
+    before = reserved_bytes()
+    try:
+        empty_cache()
+    except Exception as exc:
+        # Cleanup is best effort: do not strand peers in later collectives or
+        # turn an already published checkpoint into a reported save failure.
+        logger.warning("[Rank %s] Pinned host cache cleanup failed: %s", rank, exc)
+        return
+    log_with_rank(
+        f"Released checkpoint host cache: reserved_bytes={before}->{reserved_bytes()}",
+        rank=rank,
+    )
+
+
 class _UnsupportedMCoreAsyncLayout(RuntimeError):
     """Raised when MCore's retained async payload cannot be released safely.
 
@@ -605,6 +636,12 @@ class MegatronCheckpointManager:
             if finalize_fn is not None:
                 _run_checkpoint_publication(self.rank, finalize_fn)
 
+        # Drop this frame's owners before asking the allocator to return cached
+        # staging memory. An async writer still owns its live CPU payload; the
+        # allocator preserves it until the queue reaps that completed request.
+        del state_dict, async_save_request
+        _release_cached_host_memory(self.rank)
+
     def _reap_finished_async_saves(self) -> None:
         """Non-blocking finalize of any background save processes that have finished.
 
@@ -615,6 +652,8 @@ class MegatronCheckpointManager:
         if self._async_queue is None:
             return
         finalized = self._async_queue.maybe_finalize_async_calls(blocking=False)
+        if finalized:
+            _release_cached_host_memory(self.rank)
         for call_idx in finalized:
             log_with_rank(
                 f"Finalized async checkpoint save #{call_idx}",
@@ -645,6 +684,8 @@ class MegatronCheckpointManager:
                 log_only_rank_0=True,
             )
         finalized = self._async_queue.maybe_finalize_async_calls(blocking=True)
+        if finalized:
+            _release_cached_host_memory(self.rank)
         for call_idx in finalized:
             log_with_rank(
                 f"Finalized async checkpoint save #{call_idx}",

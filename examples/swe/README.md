@@ -249,16 +249,34 @@ The concrete agent behaviour — system prompt, `cli_flags`, tool allow-list,
 thinking-token budgets — lives entirely in the AReaL-SWEAgent cc config; see that
 repository for the available `cc_agent_config` values and their fields.
 
-### Native runtime failure rewards
+### Failure rewards
 
-Arena may return a structured `nativeRlReceiptVersion: 1` failure receipt. The adapter
-retains a zero-reward trajectory only when execution and export are healthy, the native
-run completed, every terminal is accounted for, and every failed run reports
-`RUNTIME_EXECUTION_FAILED` with `DSH_PUBLIC_ANSWER_MISSING` / `public_answer_missing`.
-Duplicate, incomplete, or unrecognized failures do not qualify. System failures take
-precedence, and an episode must have usable interactions to contribute a training
-sample.
+No additional protocol configuration is required. For `HARNESS_FAILED` tasks, the
+adapter first identifies the result family from reserved fields or recognizable Harness
+error markers, then applies only that family's admission rules. Unknown or conflicting
+formats are rejected. Invalid native fields still identify a native receipt: a failed
+native validation can never fall through to GameAgent or Claude handling.
 
-For concat exports, a scalar episode reward also fills previously unscored trajectory
-branches. Explicit branch rewards and per-completion reward maps retain their existing
+- Native version-1 receipts must prove healthy execution and export, account for every
+  run terminal, and attribute every failed run to `RUNTIME_EXECUTION_FAILED` with
+  `DSH_PUBLIC_ANSWER_MISSING` / `public_answer_missing`.
+- GameAgent accepts `AGENT_MAX_TURNS_EXCEEDED` and `AUTONOMOUS_INCOMPLETE_NO_SHIP`.
+  Structured outcomes and log markers must agree; malformed fields cannot fall back to
+  text. Response failures and run/response timeouts do not establish model attribution.
+- Legacy Claude requires its explicit agent-phase error envelope and a recognized
+  context-limit or turn-limit error. If its error detail is empty, a typed context
+  overflow recorded by the AReaL proxy may provide the missing attribution. Unknown
+  nonempty errors, service faults, and truncated startup logs are rejected. Subsequent
+  collect logs are separate from the error detail and must end in a matching repeated
+  terminal error; truncated collect logs cannot establish safe recovery.
+
+An earlier overflow never overrides an invalid receipt, conflicting outcome, explicit
+infrastructure fault, or system terminal status. `TIMEOUT` and `NO_OUTPUT` alone remain
+ambiguous and are not recovered. The proxy must have recorded model interactions, must
+not have reported a service error, and must successfully export usable trajectories
+before any recovered zero-reward sample enters training. Successful tasks retain their
+normal score handling.
+
+For concat exports, missing branch rewards are not inferred from a scalar episode
+reward. Explicit branch rewards and per-completion reward maps retain their existing
 semantics.
