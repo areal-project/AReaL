@@ -71,6 +71,26 @@ python3 examples/math/gsm8k_rl.py \
 所有配置都定义在 `areal/api/cli_args.py` 中的 `PPOActorConfig` 和 `NormConfig` 下。详见
 [CLI配置](../cli_reference.md)。
 
+### 策略梯度损失聚合（`actor.loss_aggregation`）
+
+`token_mean` 对有效 token 求平均，`seq_mean` 对每条响应的 token 均值求平均，
+`prompt_mean` 对每个提示组的 token 均值求平均，`constant` 则将 token 损失总和除以有效响应数与
+`actor.loss_aggregation_divisor` 的乘积。
+
+`prompt_mean` 与其他模式使用相同的响应级优化器调度。同一物理提示组可以跨优化器步骤和引擎微批次。
+拆分前，损失准备层为组 $g$ 中每个原始有效 token 分配权重 $1/D_g$，其中 $D_g$ 是完整组的有效 token 数。
+这些权重随张量切分和打包；后续损失过滤只改变分子。
+
+设所有数据并行 rank 共有 $G$ 个非空组，实际执行 $K$ 个优化器步骤，则每步目标为该步加权 token
+损失之和的 $K/G$ 倍。在参数和 mask 固定时，各步目标的平均值及其梯度等于完整批次的提示组均值。
+这不意味着不同调度下优化器的更新轨迹相同。梯度累积和目标指标使用微批次占该步骤响应数的比例，
+使每个步骤对报告的均值贡献相同。Megatron 的 per-token 路径保留原始 token 数用于辅助梯度归一化，
+并单独补偿主目标的权重。
+
+空组不贡献损失。没有有效 token 的真实步骤仍保留在调度中，其策略梯度损失为零；如果所有 rank
+的整个更新都没有有效 token，则拒绝该更新。仅参与通信的微批次累积权重为零。
+默认打包粒度为一时，`max_tokens_per_mb` 只需容纳单条响应。
+
 ### 奖励和优势归一化（`actor.reward_norm` 和 `actor.adv_norm`）
 
 `NormConfig` 数据类控制奖励和优势的归一化方式：

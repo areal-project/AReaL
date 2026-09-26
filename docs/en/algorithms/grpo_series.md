@@ -77,6 +77,34 @@ Note: Use `+` prefix when adding keys not present in the original YAML.
 All configurations are defined in `areal/api/cli_args.py` under `PPOActorConfig` and
 `NormConfig`. See [CLI configurations](../cli_reference.md) for full details.
 
+### Policy-gradient Loss Aggregation (`actor.loss_aggregation`)
+
+`token_mean` averages valid tokens, `seq_mean` averages per-response token means,
+`prompt_mean` averages per-prompt token means, and `constant` divides the token-loss
+sum by the active response count times `actor.loss_aggregation_divisor`.
+
+`prompt_mean` uses the same response-level optimizer schedule as the other
+modes. A physical prompt group can span optimizer steps and engine microbatches.
+Before splitting, loss preparation assigns weight $1/D_g$ to every original
+valid token in group $g$, where $D_g$ is the full group's valid-token count.
+These weights follow slicing and packing; later loss filtering changes only the
+numerator.
+
+For $G$ nonempty groups across data-parallel ranks and $K$ actual optimizer steps,
+each step's objective is $K/G$ times its weighted token-loss sum. At fixed
+parameters and masks, averaging these step objectives recovers the full-batch
+prompt mean, including its gradient. This does not imply identical optimizer
+trajectories for different schedules. Accumulation and objective metrics use each
+microbatch's response share within its step, so steps contribute equally to the
+reported average. Megatron's per-token path retains original token counts for
+auxiliary-gradient normalization and compensates the main objective separately.
+
+Empty groups contribute zero. A real step with no valid tokens retains its place
+in the schedule and contributes zero policy-gradient loss; an update with no
+valid tokens on any rank is rejected. Transport-only microbatches have zero
+accumulation weight. With the default packing granularity of one,
+`max_tokens_per_mb` only needs to fit individual responses.
+
 ### Reward and Advantage Normalization (`actor.reward_norm` and `actor.adv_norm`)
 
 The `NormConfig` dataclass controls how rewards and advantages are normalized:
