@@ -58,6 +58,7 @@ class MoE(nn.Module):
         shared_experts: Optional shared experts (always active).
         expert_bias: Buffer for load balancing (updated externally).
         tokens_per_expert: Buffer tracking expert usage (for load balancing).
+        routing_counts: Last router assignment counts, read by training diagnostics.
     """
 
     def __init__(self, moe_args: MoEArgs, dim: int, hidden_dim: int):
@@ -120,6 +121,7 @@ class MoE(nn.Module):
         # tokens_per_expert tracks usage for bias updates
         self.expert_bias: torch.Tensor | None
         self.tokens_per_expert: torch.Tensor
+        self.routing_counts: torch.Tensor
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through MoE layer.
@@ -144,6 +146,7 @@ class MoE(nn.Module):
         # Track expert usage for load balancing
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert.float())
+            self.routing_counts.copy_(num_tokens_per_expert)
 
         # Reorder tokens by expert (separate module for EP sequence parallel)
         # When ReordererSequenceParallel is applied, each rank processes
@@ -236,12 +239,17 @@ class MoE(nn.Module):
             )
 
     def init_buffers(self, buffer_device: torch.device | str):
-        """Initialize MoE buffers (tokens_per_expert, expert_bias).
+        """Initialize MoE routing diagnostics and load-balancing buffers.
 
         Args:
             buffer_device: Device for buffers.
         """
         with torch.device(buffer_device):
+            self.register_buffer(
+                "routing_counts",
+                torch.zeros(self.num_experts, dtype=torch.int64),
+                persistent=False,
+            )
             self.register_buffer(
                 "tokens_per_expert",
                 torch.zeros(self.num_experts, dtype=torch.float32),
