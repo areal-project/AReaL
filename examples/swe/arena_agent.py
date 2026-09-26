@@ -751,8 +751,8 @@ class ArenaStreamAgentWorkflow:
         )
 
     @classmethod
-    def _is_runner_model_limit_failure(cls, raw: dict[str, Any], receipt: Any) -> bool:
-        """Accept explicit Harness context or model-output length limits."""
+    def _is_runner_model_failure(cls, raw: dict[str, Any], receipt: Any) -> bool:
+        """Accept explicit native model failures with a healthy runner envelope."""
 
         if not cls._is_runner_context_failure(raw) or not isinstance(receipt, dict):
             return False
@@ -776,6 +776,7 @@ class ArenaStreamAgentWorkflow:
         message = errors[0]["message"]
         return (
             message == "model stopped with reason: length"
+            or message == "model stopped without visible output or tool calls"
             or re.fullmatch(
                 r"context window limit exceeded: compaction is disabled "
                 r"\([1-9][0-9]* bytes / [1-9][0-9]* estimated tokens\)",
@@ -877,7 +878,7 @@ class ArenaStreamAgentWorkflow:
         if result_format == "native-runner":
             return (
                 context_overflow and cls._is_runner_context_failure(raw)
-            ) or cls._is_runner_model_limit_failure(raw, error.harness_result)
+            ) or cls._is_runner_model_failure(raw, error.harness_result)
         detail = raw.get("error")
         if detail is not None and not isinstance(detail, str):
             return False

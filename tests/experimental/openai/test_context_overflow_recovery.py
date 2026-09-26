@@ -182,12 +182,23 @@ def test_runner_overflow_requires_unambiguous_terminal_failure(
         ),
         ("model stopped with reason: length", 12, "model_failure_zero"),
         ("model stopped with reason: length", 0, "unknown_failure_reject"),
+        (
+            "model stopped without visible output or tool calls",
+            11,
+            "model_failure_zero",
+        ),
+        (
+            "model stopped without visible output or tool calls",
+            0,
+            "unknown_failure_reject",
+        ),
+        ("model stopped without visible output", 11, "unknown_failure_reject"),
         ("model stopped with reason: error", 12, "unknown_failure_reject"),
         ("agent timed out", 65, "unknown_failure_reject"),
         ("HTTP 400 context length exceeded", 65, "unknown_failure_reject"),
     ],
 )
-def test_harness_model_limit_failure_uses_terminal_receipt(
+def test_harness_model_failure_uses_terminal_receipt(
     message, interaction_count, expected
 ):
     raw = {
@@ -218,7 +229,14 @@ def test_harness_model_limit_failure_uses_terminal_receipt(
     assert error.result.raw == raw
 
 
-def test_harness_model_length_does_not_override_system_error():
+@pytest.mark.parametrize(
+    "message",
+    [
+        "model stopped with reason: length",
+        "model stopped without visible output or tool calls",
+    ],
+)
+def test_harness_model_failure_does_not_override_system_error(message):
     error = ArenaTaskFailedError(
         task_id="task",
         status="HARNESS_FAILED",
@@ -242,7 +260,7 @@ def test_harness_model_length_does_not_override_system_error():
         "exit_code": 1,
         "turn_statuses": ["failed"],
         "delivery": None,
-        "error": [{"message": "model stopped with reason: length"}],
+        "error": [{"message": message}],
     }
     assert (
         ArenaStreamAgentWorkflow.classify_proxy_failure(
