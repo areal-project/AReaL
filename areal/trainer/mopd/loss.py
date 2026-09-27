@@ -39,14 +39,19 @@ def mopd_loss_fn(
     loss_mask: torch.Tensor,
     normalization_mask: torch.Tensor | None = None,
     importance_ratio_cap: float = DEFAULT_MOPD_IMPORTANCE_RATIO_CAP,
+    score_reward_min: float | None = None,
+    score_reward_max: float | None = None,
+    normalize_teacher_weights: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute a truncated-IS multi-teacher reverse-KL surrogate.
 
     ``teacher_logp_sum`` is ``sum_j(w_j * log pi_Tj)`` and
-    ``teacher_weight_sum`` is ``sum_j(w_j)`` at every response token. Teacher
-    weights are deliberately not normalized. The behavior-policy importance
-    ratio is capped with a stop-gradient weight to prevent exponential
-    overflow while retaining the score-function gradient.
+    ``teacher_weight_sum`` is ``sum_j(w_j)`` at every response token.
+    If ``normalize_teacher_weights`` is True, teacher log-probabilities are
+    normalized by the teacher weight sum to keep reward scales invariant across
+    heterogeneous routes. The behavior-policy importance ratio is capped with
+    a stop-gradient weight to prevent exponential overflow while retaining the
+    score-function gradient.
     """
     if (
         not isinstance(importance_ratio_cap, (int, float))
@@ -55,6 +60,30 @@ def mopd_loss_fn(
         or importance_ratio_cap <= 0
     ):
         raise ValueError("importance_ratio_cap must be a finite positive number")
+    if score_reward_min is not None:
+        if (
+            not isinstance(score_reward_min, (int, float))
+            or isinstance(score_reward_min, bool)
+            or not math.isfinite(score_reward_min)
+        ):
+            raise ValueError("score_reward_min must be a finite number or None")
+    if score_reward_max is not None:
+        if (
+            not isinstance(score_reward_max, (int, float))
+            or isinstance(score_reward_max, bool)
+            or not math.isfinite(score_reward_max)
+        ):
+            raise ValueError("score_reward_max must be a finite number or None")
+    if (
+        score_reward_min is not None
+        and score_reward_max is not None
+        and score_reward_min > score_reward_max
+    ):
+        raise ValueError(
+            f"score_reward_min ({score_reward_min}) cannot exceed score_reward_max ({score_reward_max})"
+        )
+    if not isinstance(normalize_teacher_weights, bool):
+        raise ValueError("normalize_teacher_weights must be a boolean")
     _validate_mopd_tensor_shapes(
         logprobs,
         old_logprobs,
@@ -96,11 +125,39 @@ def mopd_loss_fn(
     bounded_importance_weight = torch.exp(
         detached_log_ratio.clamp(max=math.log(importance_ratio_cap))
     )
-    score_reward = torch.where(
-        mask,
-        detached_teacher_logp - (detached_teacher_weight * safe_logprobs.detach()),
-        torch.zeros_like(logprobs),
+    if normalize_teacher_weights:
+        effective_teacher_weight = torch.where(
+            mask,
+            detached_teacher_weight.clamp_min(1e-8),
+            torch.ones_like(detached_teacher_weight),
+        )
+        score_reward = torch.where(
+            mask,
+            (detached_teacher_logp / effective_teacher_weight) - safe_logprobs.detach(),
+            torch.zeros_like(logprobs),
+        )
+    else:
+        score_reward = torch.where(
+            mask,
+            detached_teacher_logp - (detached_teacher_weight * safe_logprobs.detach()),
+            torch.zeros_like(logprobs),
+        )
+
+    score_reward_min_clipped = (
+        (score_reward < score_reward_min) & mask
+        if score_reward_min is not None
+        else torch.zeros_like(mask)
     )
+    score_reward_max_clipped = (
+        (score_reward > score_reward_max) & mask
+        if score_reward_max is not None
+        else torch.zeros_like(mask)
+    )
+    if score_reward_min is not None or score_reward_max is not None:
+        score_reward = torch.clamp(
+            score_reward, min=score_reward_min, max=score_reward_max
+        )
+
     # At forward time the carrier is exactly one. Its derivative is
     # d log pi_theta, preserving the score-function gradient even when
     # the detached importance ratio was clipped.
@@ -126,6 +183,8 @@ def mopd_loss_fn(
             torch.zeros_like(detached_teacher_weight),
         ),
         "reverse_kl": torch.where(mask, reverse_kl, torch.zeros_like(reverse_kl)),
+        "score_reward_min_clipped": score_reward_min_clipped,
+        "score_reward_max_clipped": score_reward_max_clipped,
     }
     return loss, stats
 
@@ -169,6 +228,9 @@ def compose_mopd_loss(
         loss_mask=loss_mask,
         normalization_mask=normalization_mask,
         importance_ratio_cap=config.importance_ratio_cap,
+        score_reward_min=config.score_reward_min,
+        score_reward_max=config.score_reward_max,
+        normalize_teacher_weights=config.normalize_teacher_weights,
     )
 
     if config.rl_coefficient == 0:

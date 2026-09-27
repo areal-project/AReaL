@@ -462,3 +462,32 @@ def test_mopd_and_legacy_teacher_are_mutually_exclusive():
 
     with pytest.raises(ValueError, match="cannot be configured at the same time"):
         _ppo_config(_mopd_config(), teacher=legacy_teacher)
+
+
+def test_mopd_loss_config_score_reward_bounds_and_normalization():
+    # Valid bounds and normalization
+    cfg = MOPDLossConfig(
+        score_reward_min=-10.0,
+        score_reward_max=10.0,
+        normalize_teacher_weights=True,
+    )
+    assert cfg.score_reward_min == -10.0
+    assert cfg.score_reward_max == 10.0
+    assert cfg.normalize_teacher_weights is True
+
+    # Inverted bounds raise ValueError
+    with pytest.raises(
+        ValueError, match=r"score_reward_min.*cannot exceed.*score_reward_max"
+    ):
+        MOPDLossConfig(score_reward_min=5.0, score_reward_max=2.0)
+
+    # Non-finite bounds raise ValueError
+    with pytest.raises(ValueError, match="must be a finite number"):
+        MOPDLossConfig(score_reward_min=float("-inf"))
+
+    with pytest.raises(ValueError, match="must be a finite number"):
+        MOPDLossConfig(score_reward_max=float("nan"))
+
+    # Invalid normalize_teacher_weights raises ValueError
+    with pytest.raises(ValueError, match="must be a boolean"):
+        MOPDLossConfig(normalize_teacher_weights="true")  # type: ignore[arg-type]
