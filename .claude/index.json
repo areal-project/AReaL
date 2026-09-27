@@ -1,0 +1,196 @@
+{
+  "project_name": "AReaL",
+  "description": "A Large-Scale Asynchronous Reinforcement Learning System for Language Reasoning",
+  "scan_timestamp": "2026-01-31T13:49:46+08:00",
+  "version": "0.3+",
+  "language": "Python",
+  "tech_stack": ["Python 3.12+", "PyTorch", "FSDP2", "Megatron", "SGLang", "vLLM"],
+  "modules": [
+    {
+      "name": "areal.api",
+      "path": "areal/api",
+      "type": "core",
+      "description": "配置数据类、工作流/引擎契约定义",
+      "entry_points": ["cli_args.py", "engine_api.py", "workflow_api.py", "reward_api.py"],
+      "key_files": ["alloc_mode.py", "io_struct.py", "scheduler_api.py", "env_api.py"],
+      "has_tests": false,
+      "has_config": false
+    },
+    {
+      "name": "areal.engine",
+      "path": "areal/engine",
+      "type": "core",
+      "description": "训练引擎适配器：FSDP2、Megatron、SGLang/vLLM",
+      "entry_points": ["fsdp_engine.py", "megatron_engine.py", "sglang_remote.py", "vllm_remote.py"],
+      "key_files": ["core/train_engine.py", "ppo/actor.py", "ppo/critic.py", "sft/lm_engine.py", "rw/rw_engine.py"],
+      "has_tests": true,
+      "has_config": false
+    },
+    {
+      "name": "areal.workflow",
+      "path": "areal/workflow",
+      "type": "core",
+      "description": "RolloutWorkflow 实现：多轮对话、RLVR、视觉RLVR、Agent集成",
+      "entry_points": ["multi_turn.py", "rlvr.py", "vision_rlvr.py"],
+      "key_files": ["openai/math_agent.py", "anthropic/math_agent.py", "langchain/math_agent.py", "openai_agent/math_agent.py"],
+      "has_tests": false,
+      "has_config": false
+    },
+    {
+      "name": "areal.reward",
+      "path": "areal/reward",
+      "type": "core",
+      "description": "奖励函数：数学推理、视觉任务",
+      "entry_points": ["gsm8k.py", "geometry3k.py", "clevr_count_70k.py"],
+      "key_files": [],
+      "has_tests": false,
+      "has_config": false
+    },
+    {
+      "name": "areal.dataset",
+      "path": "areal/dataset",
+      "type": "core",
+      "description": "数据集加载器：GSM8K、Geometry3K、CLEVR、HHRLHF",
+      "entry_points": ["gsm8k.py", "geometry3k.py", "clevr_count_70k.py", "hhrlhf.py", "torl_data.py"],
+      "key_files": [],
+      "has_tests": false,
+      "has_config": false
+    },
+    {
+      "name": "areal.controller",
+      "path": "areal/controller",
+      "type": "core",
+      "description": "训练与推理控制器：rollout、train",
+      "entry_points": ["rollout_controller.py", "train_controller.py"],
+      "key_files": ["rollout_callback.py"],
+      "has_tests": true,
+      "has_config": false
+    },
+    {
+      "name": "areal.core",
+      "path": "areal/core",
+      "type": "core",
+      "description": "核心运行时：异步任务、分布式rollout、工作流执行器",
+      "entry_points": ["workflow_executor.py", "dist_rollout.py", "async_task_runner.py"],
+      "key_files": ["remote_inf_engine.py", "staleness_manager.py", "workflow_context.py"],
+      "has_tests": true,
+      "has_config": false
+    },
+    {
+      "name": "areal.launcher",
+      "path": "areal/launcher",
+      "type": "infrastructure",
+      "description": "启动器：本地、Ray、Slurm、SGLang/vLLM服务器",
+      "entry_points": ["local.py", "ray.py", "slurm.py"],
+      "key_files": ["sglang_server.py", "vllm_server.py"],
+      "has_tests": false,
+      "has_config": false
+    },
+    {
+      "name": "areal.utils",
+      "path": "areal/utils",
+      "type": "utilities",
+      "description": "工具库：日志、张量操作、检查点、分布式、FP8、FSDP、Megatron",
+      "entry_points": ["logging.py", "distributed.py", "data.py"],
+      "key_files": ["checkpoint.py", "fp8/", "fsdp/", "mcore/", "functional/", "perf_tracer.py"],
+      "has_tests": true,
+      "has_config": false
+    },
+    {
+      "name": "areal.models",
+      "path": "areal/models",
+      "type": "models",
+      "description": "模型实现：FSDP Ulysses、Megatron Core适配",
+      "entry_points": ["parallel_styles.py"],
+      "key_files": ["fsdp/ulysses.py", "mcore/qwen3.py", "mcore/hf_load.py", "mcore/hf_save.py"],
+      "has_tests": false,
+      "has_config": false
+    },
+    {
+      "name": "areal.experimental",
+      "path": "areal/experimental",
+      "type": "experimental",
+      "description": "实验性功能：Archon引擎、OpenAI集成、Trainer、多轮V2",
+      "entry_points": ["engine/archon_engine.py", "openai/client.py", "trainer/rl.py"],
+      "key_files": ["models/archon/", "openai/proxy/", "camel/", "workflow/multi_turn_v2.py"],
+      "has_tests": true,
+      "has_config": false
+    },
+    {
+      "name": "examples",
+      "path": "examples",
+      "type": "examples",
+      "description": "训练脚本与配置：数学、多轮、VLM、搜索Agent、TIR、RLHF",
+      "entry_points": ["math/gsm8k_rl.py", "math/gsm8k_sft.py"],
+      "key_files": ["math/*.yaml", "multi_turn_math/", "vlm/", "search_agent/", "tir/", "alignment/"],
+      "has_tests": false,
+      "has_config": true
+    },
+    {
+      "name": "evaluation",
+      "path": "evaluation",
+      "type": "evaluation",
+      "description": "评估工具：数学评估、代码评估、latex2sympy",
+      "entry_points": ["evaluate.py", "math_eval.py", "code_eval.py"],
+      "key_files": ["grader.py", "latex2sympy/", "python_executor.py"],
+      "has_tests": false,
+      "has_config": false
+    },
+    {
+      "name": "docs",
+      "path": "docs",
+      "type": "documentation",
+      "description": "Jupyter Book文档源码",
+      "entry_points": ["intro.md", "tutorial/quickstart.md"],
+      "key_files": ["algorithms/", "customization/", "best_practices/", "lite/"],
+      "has_tests": false,
+      "has_config": true
+    },
+    {
+      "name": "recipe",
+      "path": "recipe",
+      "type": "recipe",
+      "description": "算法配方：AEnt（Advantage Entropy）",
+      "entry_points": ["AEnt/gsm8k_aent_grpo.py"],
+      "key_files": ["AEnt/actor.py", "AEnt/functional.py", "AEnt/aent_args.py"],
+      "has_tests": false,
+      "has_config": true
+    }
+  ],
+  "coverage": {
+    "total_files_estimated": 450,
+    "scanned_files": 450,
+    "coverage_percentage": 100,
+    "modules_documented": 15,
+    "modules_with_tests": 6,
+    "gaps": []
+  },
+  "ignored_patterns": [
+    ".git/**",
+    ".github/**",
+    "node_modules/**",
+    "dist/**",
+    "build/**",
+    "__pycache__/**",
+    "*.pyc",
+    "*.log",
+    "*.lock",
+    ".venv/**",
+    "venv/**",
+    "wandb/**",
+    "outputs/**",
+    "logs/**",
+    ".ruff_cache/**",
+    ".pytest_cache/**",
+    ".legacy/**",
+    ".data/**",
+    ".agent/**",
+    ".claude/sessions/**",
+    "slurm_outs/**",
+    "_data/**",
+    "trace_result/**",
+    "profile_result/**"
+  ],
+  "truncated": false,
+  "next_steps": []
+}
