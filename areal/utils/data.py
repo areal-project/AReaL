@@ -2317,7 +2317,15 @@ class Normalization:
 
         if leave_one_out:
             if factor.item() <= 1:
-                return torch.zeros_like(x_sum)
+                # A single active element has no peer to leave out, so it becomes its own
+                # baseline and normalizes to zero. This mirrors what the group-level path
+                # does for a singleton group; returning a zero mean here instead would let
+                # the raw value pass through uncentered.
+                if mask is None:
+                    return x
+                return torch.where(
+                    mask > 0, x_masked, (x_sum / factor.clamp_min(1.0)).expand_as(x)
+                )
             # For leave-one-out, we need to compute mean excluding each element individually
             # This requires broadcasting: (total_sum - each_element) / (count - 1)
             if mask is None:
