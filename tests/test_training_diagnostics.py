@@ -136,7 +136,7 @@ def test_ppo_update_advantage_sign_fractions_ignore_padding():
         patch("areal.trainer.ppo.actor.stage_batch_for_engine"),
         patch(
             "areal.trainer.ppo.actor.split_training_batch_into_microbatches",
-            return_value=[],
+            return_value=[data],
         ),
     ):
         actor._ppo_update(data)
@@ -212,6 +212,7 @@ def test_pure_mopd_uses_raw_versions_for_checkpoint_age_diagnostics():
     """The pure-MOPD preprocessing route skips _compute_advantages."""
     engine = MagicMock()
     engine.get_version.return_value = 5
+    engine.train_batch.return_value = {}
     actor = PPOActor(PPOActorConfig(backend="fsdp:d1"), engine)
     actor._mopd_loss_config = SimpleNamespace(rl_coefficient=0)
     batch = {
@@ -233,7 +234,7 @@ def test_pure_mopd_uses_raw_versions_for_checkpoint_age_diagnostics():
         patch("areal.trainer.ppo.actor.stage_batch_for_engine"),
         patch(
             "areal.trainer.ppo.actor.split_training_batch_into_microbatches",
-            return_value=[],
+            return_value=[batch],
         ),
     ):
         actor._ppo_update(batch)

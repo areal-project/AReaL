@@ -62,12 +62,17 @@ def test_optimizer_loss_scale_is_not_wired_without_optimizer() -> None:
 
 
 @pytest.mark.parametrize("per_token_loss", [False, True])
+@pytest.mark.parametrize("has_token_mask", [False, True])
 def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
     monkeypatch,
     per_token_loss,
+    has_token_mask,
 ) -> None:
     class _MicroBatchList:
-        mbs = [{}, {}]
+        mbs = [
+            {"loss_mask": torch.ones(1, dtype=torch.bool)} if has_token_mask else {}
+            for _ in range(2)
+        ]
 
         def __len__(self):
             return len(self.mbs)
@@ -124,6 +129,8 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
         lambda: 3,
     )
 
+    monkeypatch.setattr(megatron_engine_module.dist, "all_reduce", lambda *a, **k: None)
+
     engine.train_batch(
         input_={},
         loss_fn=lambda *args, **kwargs: torch.tensor(0.0),
@@ -132,6 +139,89 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
 
     assert captured["loss_multiplier"] == (1.0 if per_token_loss else 6)
     assert captured["per_token_loss"] is per_token_loss
+
+
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize("mode", ["token_mean", "seq_mean", "prompt_mean", "constant"])
+def test_per_token_normalization_preserves_policy_and_auxiliary_gradients(
+    monkeypatch, cp_size, mode
+):
+    from areal.trainer.ppo.loss_reduction import (
+        prepare_policy_gradient_batch,
+    )
+
+    mask = torch.tensor([[1, 1], [1, 1], [1, 0]], dtype=torch.bool)
+    retained = mask.clone()
+    retained[0, 1] = False
+    values = torch.tensor([[2.0, 8.0], [6.0, 4.0], [10.0, 0.0]], requires_grad=True)
+    auxiliary = torch.tensor(2.0, requires_grad=True)
+    data = {"loss_mask": mask}
+    prepared = prepare_policy_gradient_batch(
+        data,
+        mode=mode,
+        group_sizes=[2, 1],
+        divisor=4.0 if mode == "constant" else None,
+    )
+    step = prepared.for_steps([data])[0]
+    partitions = (slice(0, 1), slice(1, 3))
+    batches = [{key: value[rows] for key, value in data.items()} for rows in partitions]
+    engine = megatron_engine_module.MegatronEngine.__new__(
+        megatron_engine_module.MegatronEngine
+    )
+    engine.device = torch.device("cpu")
+    monkeypatch.setattr(
+        megatron_engine_module.mpu, "get_context_parallel_world_size", lambda: cp_size
+    )
+    monkeypatch.setattr(
+        megatron_engine_module.mpu, "get_data_parallel_group", lambda: None
+    )
+    monkeypatch.setattr(megatron_engine_module.dist, "all_reduce", lambda *a, **k: None)
+    multiplier = engine._per_token_loss_multiplier(
+        SimpleNamespace(mbs=batches), step.loss_weight
+    )
+    numerators, counts, auxiliary_numerators = [], [], []
+    for rows, batch in zip(partitions, batches, strict=True):
+        local_loss = step.bind(batch).aggregate(values[rows], retained[rows])
+        weight = step.loss_weight(batch)
+        tokens = mask[rows].count_nonzero()
+        for cp_rank in range(cp_size):
+            monkeypatch.setattr(
+                megatron_engine_module.mpu,
+                "get_context_parallel_rank",
+                lambda rank=cp_rank: rank,
+            )
+            numerator, count = engine._build_per_token_loss_output(
+                local_loss, weight, multiplier, token_count=tokens
+            )
+            numerators.append(numerator)
+            counts.append(count)
+            # MCore seeds token-summed auxiliary gradients outside the main loss.
+            auxiliary_numerators.append(auxiliary * tokens / cp_size)
+
+    total_tokens = sum(counts)
+    torch.testing.assert_close(total_tokens, mask.count_nonzero(), rtol=0, atol=0)
+    actual = sum(numerators) / total_tokens
+    sums = torch.where(retained, values, 0).sum(-1)
+    if mode == "token_mean":
+        expected = sums.sum() / 5
+    elif mode == "seq_mean":
+        expected = (sums / torch.tensor([2, 2, 1])).mean()
+    elif mode == "prompt_mean":
+        expected = (sums[:2].sum() / 4 + sums[2]) / 2
+    else:
+        expected = sums.sum() / 12
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    actual_gradient = torch.autograd.grad(actual, values, retain_graph=True)[0]
+    expected_gradient = torch.autograd.grad(expected, values)[0]
+    torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-6, atol=1e-6)
+    auxiliary_loss = sum(auxiliary_numerators) / total_tokens
+    torch.testing.assert_close(auxiliary_loss, auxiliary, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.autograd.grad(auxiliary_loss, auxiliary)[0],
+        torch.tensor(1.0),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_collect_mtp_loss_uses_mcore_metrics_tracker(monkeypatch) -> None:

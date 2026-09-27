@@ -24,6 +24,7 @@ class ReduceType(Enum):
     MIN = auto()
     MAX = auto()
     SCALAR = auto()
+    WEIGHTED_AVG = auto()
 
 
 @dataclass(frozen=True)
@@ -158,6 +159,8 @@ class DistributedStatsTracker:
                     raise ValueError(f"`{key}` should be non-empty")
                 if reduce_type == ReduceType.SCALAR:
                     raise ValueError("Cannot use the scalar reduce type for a tensor")
+                if reduce_type == ReduceType.WEIGHTED_AVG:
+                    raise ValueError("Use weighted_mean() for weighted averages")
                 full_key = self._get_full_key(key)
                 if full_key in self.compact_keys:
                     raise ValueError(f"`{full_key}` already uses compact stats")
@@ -175,6 +178,41 @@ class DistributedStatsTracker:
                 self.stats[full_key].append(value.detach().clone())
                 if reduce_group is not None:
                     self.reduce_groups[full_key] = reduce_group
+
+    def weighted_mean(
+        self,
+        key: str,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        reduce_group: dist.ProcessGroup | None = None,
+    ) -> None:
+        """Record a scalar mean with its finite, nonnegative scalar weight.
+
+        Inputs must be scalar tensors on the same device. Fractional weights
+        are supported; zero-weight observations contribute nothing, even when
+        their value is nonfinite. Accumulation uses detached float32 tensors
+        without synchronizing the device. Export divides the globally summed
+        weighted values by the globally summed weights, omitting zero totals.
+        """
+        for name, tensor in (("value", value), ("weight", weight)):
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim != 0:
+                raise ValueError(f"`{name}` must be a scalar tensor")
+            if tensor.is_complex():
+                raise ValueError(f"`{name}` must be real-valued")
+        if value.device != weight.device:
+            raise ValueError("`value` and `weight` must be on the same device")
+        value = value.detach().float()
+        weight = weight.detach().float()
+        pair = torch.stack((torch.where(weight > 0, value * weight, 0.0), weight))
+        with self.lock:
+            full_key = self._get_full_key(key)
+            if full_key in self.compact_keys:
+                raise ValueError(f"`{full_key}` already uses compact stats")
+            self._set_reduce_type(full_key, ReduceType.WEIGHTED_AVG)
+            self.stats[full_key].append(pair)
+            if reduce_group is not None:
+                self.reduce_groups[full_key] = reduce_group
 
     def stat_compact(
         self,
@@ -474,6 +512,10 @@ class DistributedStatsTracker:
             )
         elif reduce_type == ReduceType.AVG:
             result[key] = self._avg_of(key, reduce_group, sync_metadata, key_sync_group)
+        elif reduce_type == ReduceType.WEIGHTED_AVG:
+            result[key] = self._weighted_avg_of(
+                key, reduce_group, sync_metadata, key_sync_group
+            )
         elif reduce_type == ReduceType.SUM:
             result[key] = self._sum_of(key, reduce_group, sync_metadata, key_sync_group)
         elif reduce_type == ReduceType.MIN:
@@ -505,6 +547,29 @@ class DistributedStatsTracker:
         for k in keys_to_pop:
             result.pop(k)
         return result
+
+    def _weighted_avg_of(
+        self,
+        key,
+        reduce_group,
+        sync_metadata: dict[str, _StatMetadata] | None = None,
+        key_sync_group=None,
+    ):
+        effective_group = self._effective_reduce_group(
+            key, reduce_group, sync_metadata, key_sync_group
+        )
+        values = self.stats.get(key, [])
+        totals = (
+            torch.stack(values).sum(dim=0)
+            if values
+            else self._placeholder_scalar(group=effective_group).new_zeros(2)
+        )
+        if effective_group is not None:
+            totals = self._all_reduce(totals, group=effective_group)
+        numerator, weight = totals.unbind()
+        if weight == 0:
+            return None
+        return numerator / weight
 
     def _aggregate_compact(
         self, key, reduce_type, reduce_group, sync_metadata, key_sync_group
@@ -719,6 +784,7 @@ class DistributedStatsTracker:
 
 DEFAULT_TRACKER = DistributedStatsTracker()
 stat = DEFAULT_TRACKER.stat
+weighted_mean = DEFAULT_TRACKER.weighted_mean
 stat_compact = DEFAULT_TRACKER.stat_compact
 denominator = DEFAULT_TRACKER.denominator
 export = DEFAULT_TRACKER.export

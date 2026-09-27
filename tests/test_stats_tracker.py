@@ -224,3 +224,90 @@ def test_all_reduce_moves_cpu_stat_to_nccl_device_before_reduction():
     assert result is cuda_tensor
     cpu_tensor.to.assert_called_once_with("cuda")
     mock_all_reduce.assert_called_once_with(cuda_tensor, group=group)
+
+
+def test_weighted_mean_fractional_weights_preserve_partitioned_mean():
+    tracker = DistributedStatsTracker()
+    tracker.weighted_mean("loss", torch.tensor(2.0), torch.tensor(0.125))
+    tracker.weighted_mean("loss", torch.tensor(8.0), torch.tensor(0.375))
+    combined = DistributedStatsTracker()
+    combined.weighted_mean("loss", torch.tensor(6.5), torch.tensor(0.5))
+
+    assert tracker.export() == combined.export() == {"loss": 6.5}
+
+
+def test_stat_weighted_average_requires_weighted_mean():
+    tracker = DistributedStatsTracker()
+    tracker.denominator(tokens=torch.ones(2, dtype=torch.bool))
+
+    with pytest.raises(ValueError, match="Use weighted_mean"):
+        tracker.stat(
+            "tokens", reduce_type=ReduceType.WEIGHTED_AVG, loss=torch.tensor([2.0, 8.0])
+        )
+
+    assert tracker.export() == {"tokens": 2.0}
+
+
+def test_weighted_mean_zero_weights_ignore_nonfinite_values():
+    tracker = DistributedStatsTracker()
+    for value in (float("nan"), float("inf"), -float("inf")):
+        tracker.weighted_mean("loss", torch.tensor(value), torch.tensor(0.0))
+
+    assert tracker.export(reset=False) == {}
+    tracker.weighted_mean("loss", torch.tensor(3.0), torch.tensor(0.25))
+    assert tracker.export() == {"loss": 3.0}
+
+
+def test_weighted_mean_snapshots_detached_inputs_and_resets_scoped_key():
+    tracker = DistributedStatsTracker("update")
+    value = torch.tensor(3.0, dtype=torch.float64, requires_grad=True)
+    weight = torch.tensor(2, dtype=torch.int64)
+    tracker.weighted_mean("loss/avg", value, weight)
+    with torch.no_grad():
+        value.fill_(99)
+        weight.fill_(99)
+
+    recorded = tracker.stats["update/loss/avg"][0]
+    assert recorded.dtype == torch.float32
+    assert not recorded.requires_grad
+    assert tracker.export(reset=False) == {"update/loss/avg": 3.0}
+    assert tracker.export(key="loss/avg") == {"update/loss/avg": 3.0}
+    assert tracker.export() == {}
+    tracker.weighted_mean("loss/avg", torch.tensor(5.0), torch.tensor(1.0))
+    assert tracker.export() == {"update/loss/avg": 5.0}
+    assert tracker.export() == {}
+
+
+@pytest.mark.parametrize("argument", ["value", "weight"])
+@pytest.mark.parametrize("invalid", [1.0, torch.ones(1), torch.tensor(1j)])
+def test_weighted_mean_invalid_scalar_input_rejected(argument, invalid):
+    tracker = DistributedStatsTracker()
+    kwargs = dict(value=torch.tensor(1.0), weight=torch.tensor(1.0))
+    kwargs[argument] = invalid
+
+    with pytest.raises(ValueError, match=argument):
+        tracker.weighted_mean("loss", **kwargs)
+    assert tracker.export() == {}
+
+
+@pytest.mark.parametrize("compact_first", [False, True])
+def test_compact_and_weighted_stats_reject_same_key_without_corrupting_value(
+    compact_first,
+):
+    tracker = DistributedStatsTracker()
+
+    def compact():
+        tracker.stat_compact(
+            torch.ones(2, dtype=torch.bool),
+            ReduceType.AVG,
+            loss=torch.tensor([2.0, 4.0]),
+        )
+
+    def weighted():
+        tracker.weighted_mean("loss", torch.tensor(7.0), torch.tensor(0.25))
+
+    first, second = (compact, weighted) if compact_first else (weighted, compact)
+    first()
+    with pytest.raises(ValueError, match="compact stats"):
+        second()
+    assert tracker.export()["loss"] == (3.0 if compact_first else 7.0)
