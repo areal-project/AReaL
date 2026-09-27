@@ -32,7 +32,9 @@ class MapperBridge:
         self.model_layout = model_layout
         self._handles: dict[tuple[int, int], MapperHandle] = {}
 
-    def artifact_directory(self, source_version: int, target_version: int) -> pathlib.Path:
+    def artifact_directory(
+        self, source_version: int, target_version: int
+    ) -> pathlib.Path:
         return self.registry / f"v{source_version}-v{target_version}"
 
     def resolve(self, source_version: int, target_version: int) -> MapperHandle | None:
@@ -45,25 +47,54 @@ class MapperBridge:
             return None
         artifact = MapperArtifact.load(directory)
         self._assert_layout(artifact)
-        handle = MapperHandle(source_version=source_version, target_version=target_version, artifact=artifact)
+        handle = MapperHandle(
+            source_version=source_version,
+            target_version=target_version,
+            artifact=artifact,
+        )
         self._handles[key] = handle
         return handle
 
-    def translate(self, handle: MapperHandle, *, keys: list[torch.Tensor], values: list[torch.Tensor], positions: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    def translate(
+        self,
+        handle: MapperHandle,
+        *,
+        keys: list[torch.Tensor],
+        values: list[torch.Tensor],
+        positions: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Map pool-layout tensors: each ``[tokens, kv_heads, head_dim]`` in, same shapes out."""
-        source = DenseCache(keys=tuple(k.permute(1, 0, 2).unsqueeze(0) for k in keys), values=tuple(v.permute(1, 0, 2).unsqueeze(0) for v in values))
-        target = translate_cache(source=source, positions=positions.unsqueeze(0), artifact=handle.artifact, output_dtype=keys[0].dtype)
-        return [k[0].permute(1, 0, 2).contiguous() for k in target.keys], [v[0].permute(1, 0, 2).contiguous() for v in target.values]
+        source = DenseCache(
+            keys=tuple(k.permute(1, 0, 2).unsqueeze(0) for k in keys),
+            values=tuple(v.permute(1, 0, 2).unsqueeze(0) for v in values),
+        )
+        target = translate_cache(
+            source=source,
+            positions=positions.unsqueeze(0),
+            artifact=handle.artifact,
+            output_dtype=keys[0].dtype,
+        )
+        return [k[0].permute(1, 0, 2).contiguous() for k in target.keys], [
+            v[0].permute(1, 0, 2).contiguous() for v in target.values
+        ]
 
     def _assert_layout(self, artifact: MapperArtifact) -> None:
-        expected = {"num_layers": artifact.target.num_layers, "num_kv_heads": artifact.target.num_kv_heads, "head_dim": artifact.target.head_dim}
+        expected = {
+            "num_layers": artifact.target.num_layers,
+            "num_kv_heads": artifact.target.num_kv_heads,
+            "head_dim": artifact.target.head_dim,
+        }
         for field, value in expected.items():
             actual = self.model_layout.get(field)
             if actual != value:
-                raise ValueError(f"artifact target {field} is {value} but the server KV pool has {actual}; the registry does not belong to this model")
+                raise ValueError(
+                    f"artifact target {field} is {value} but the server KV pool has {actual}; the registry does not belong to this model"
+                )
         theta = self.model_layout.get("rope_theta")
         if theta is not None and float(theta) != artifact.target.rope_theta:
-            raise ValueError(f"artifact rope_theta {artifact.target.rope_theta} differs from the server model's {theta}")
+            raise ValueError(
+                f"artifact rope_theta {artifact.target.rope_theta} differs from the server model's {theta}"
+            )
 
 
 def create_mapper_bridge(*, registry: str, model_layout: dict) -> MapperBridge:

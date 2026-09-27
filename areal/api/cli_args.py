@@ -2861,6 +2861,15 @@ class InferenceEngineConfig:
             "help": "Whether to output verbose tracing messages for each generation request."
         },
     )
+    kv_mapper_wait_s: float = field(
+        default=0.0,
+        metadata={
+            "help": "After publishing version j, wait up to this many seconds for the KV mapper "
+            "artifact v<j-1>-v<j> to appear in sglang.kv_mapper_registry before resuming "
+            "rollouts, so resumed requests can use it. 0 disables the wait; the wait is "
+            "recorded as timeperf/mapper_wait. Requires sglang.kv_migration_mode=map."
+        },
+    )
     deterministic_sampling: bool = field(
         default=False,
         metadata={

@@ -37,6 +37,7 @@ from areal.api.cli_args import (
 )
 from areal.dataset.mopd import RoutedDataset, is_remote_dataset
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
+from areal.experimental.kvmap.wait import wait_for_path
 from areal.infra import (
     LocalScheduler,
     RayScheduler,
@@ -681,6 +682,30 @@ class PPOTrainer:
         ):
             engine.offload()
 
+    def _wait_for_mapper_artifact(self, *, new_version: int) -> None:
+        """Hold rollouts until the mapper for the transition into ``new_version`` exists, bounded by config."""
+        wait_s = self.config.rollout.kv_mapper_wait_s
+        if wait_s <= 0:
+            return
+        registry = self.config.sglang.kv_mapper_registry
+        if registry is None or self.config.sglang.kv_migration_mode != "map":
+            raise ValueError(
+                "rollout.kv_mapper_wait_s > 0 requires sglang.kv_migration_mode=map and "
+                "sglang.kv_mapper_registry; set them or set the wait to 0"
+            )
+        artifact = os.path.join(
+            registry, f"v{new_version - 1}-v{new_version}", "mapper.json"
+        )
+        waited_s, timed_out = wait_for_path(artifact, timeout_s=wait_s)
+        stats_tracker.get("timeperf").scalar(mapper_wait=waited_s)
+        stats_tracker.get("rollout").scalar(mapper_wait_timed_out=float(timed_out))
+        if timed_out:
+            logger.warning(
+                "Mapper artifact %s did not appear within %.1fs; resuming with rebuilds",
+                artifact,
+                wait_s,
+            )
+
     def _update_weights_and_publish_version(
         self, meta: WeightUpdateMeta, new_version: int
     ) -> None:
@@ -1293,6 +1318,7 @@ class PPOTrainer:
             if not self._is_final_train_step(
                 global_step=global_step, max_steps=max_steps
             ):
+                self._wait_for_mapper_artifact(new_version=global_step + 1)
                 self.rollout.resume()
             else:
                 logger.info(
