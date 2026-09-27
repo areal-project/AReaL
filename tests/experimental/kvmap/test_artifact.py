@@ -141,3 +141,22 @@ def test_artifact_rejects_weight_shape_that_disagrees_with_contract():
             diagnostics={},
             provenance={},
         )
+
+
+def test_save_accepts_non_contiguous_solver_outputs(tmp_path: pathlib.Path):
+    base = identity_artifact(
+        source=identity(SOURCE_SHA), target=identity(TARGET_SHA), provenance={}
+    )
+    transposed = torch.arange(256.0).reshape(16, 16).T  # a non-contiguous view
+    assert not transposed.is_contiguous()
+    artifact = MapperArtifact(
+        source=base.source, target=base.target, contract=base.contract, lambda_=0.01,
+        key_weights=(transposed,) * 3, key_biases=base.key_biases,
+        value_weights=base.value_weights, value_biases=base.value_biases,
+        diagnostics={}, provenance={},
+    )
+
+    artifact.save(tmp_path / "a-b")
+
+    loaded = MapperArtifact.load(tmp_path / "a-b")
+    assert torch.equal(loaded.key_weights[1], transposed)

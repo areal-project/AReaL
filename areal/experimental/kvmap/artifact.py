@@ -146,18 +146,19 @@ class MapperArtifact:
             )
         tensors = {}
         for layer in range(self.contract.target_num_layers):
-            # clone: safetensors refuses tensors that share storage, and the identity artifact does
+            # fresh contiguous copies: safetensors refuses shared storage (the identity artifact) and
+            # non-contiguous views (the solver's outputs)
             tensors[f"key_weight.{layer}"] = (
-                self.key_weights[layer].to(torch.float32).clone()
+                self.key_weights[layer].to(torch.float32).clone(memory_format=torch.contiguous_format)
             )
             tensors[f"key_bias.{layer}"] = (
-                self.key_biases[layer].to(torch.float32).clone()
+                self.key_biases[layer].to(torch.float32).clone(memory_format=torch.contiguous_format)
             )
             tensors[f"value_weight.{layer}"] = (
-                self.value_weights[layer].to(torch.float32).clone()
+                self.value_weights[layer].to(torch.float32).clone(memory_format=torch.contiguous_format)
             )
             tensors[f"value_bias.{layer}"] = (
-                self.value_biases[layer].to(torch.float32).clone()
+                self.value_biases[layer].to(torch.float32).clone(memory_format=torch.contiguous_format)
             )
         meta = {
             "format_version": ARTIFACT_FORMAT_VERSION,
