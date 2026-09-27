@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from areal.experimental.openai import InteractionWithTokenLogpReward
 
 RID_CACHE_SIZE = 128
+RID_CACHE_CONCURRENCY_FACTOR = 4  # pins survive well past the in-flight window
 
 logger = logging.getLogger("RemoteInfEngine")
 
@@ -547,6 +548,11 @@ class RemoteInfEngine(InferenceEngine):
         self.config = config
         self.backend = backend
 
+        # A resumed segment must reach the server that holds its retained KV pages, so the
+        # rid pin must outlive every in-flight rollout; the fixed floor alone is smaller than
+        # the default max_concurrent_rollouts and evicted live pins.
+        concurrent = self.config.max_concurrent_rollouts or self.config.consumer_batch_size
+        self.rid_cache_size = max(RID_CACHE_SIZE, RID_CACHE_CONCURRENCY_FACTOR * concurrent)
         self.rid_to_address = {}
         # Maintain the addresses for the recent 128 requests
         self.rid_queue = []
@@ -1092,7 +1098,7 @@ class RemoteInfEngine(InferenceEngine):
             server_addr = self.rid_to_address[req.rid]
         else:
             server_addr = self.choose_server()
-            if len(self.rid_queue) >= RID_CACHE_SIZE:
+            if len(self.rid_queue) >= self.rid_cache_size:
                 # Remove the oldest entry if cache is full
                 oldest_rid = self.rid_queue.pop(0)
                 self.rid_to_address.pop(oldest_rid, None)
