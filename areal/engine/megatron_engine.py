@@ -116,6 +116,7 @@ from areal.models.mcore.registry import (
     make_mcore_model,
     unwrap_to_gpt_model,
 )
+from areal.models.mcore.vision_checkpoint import checkpoint_qwen3_5_vision_blocks
 from areal.models.mcore.vocab_parallel_head import (
     ChunkedLMHeadOutput,
     chunked_lm_head_logprobs_entropy,
@@ -648,6 +649,13 @@ class MegatronEngine(TrainEngine):
                     is_critic=self.config.is_critic,
                     use_lora=self.config.use_lora,
                 )
+                if self.config.gradient_checkpointing:
+                    vision_blocks = checkpoint_qwen3_5_vision_blocks(models)
+                    if vision_blocks:
+                        self.logger.info(
+                            "Enabled activation checkpointing for %d Qwen3.5 vision blocks",
+                            vision_blocks,
+                        )
 
         self.model = _MegatronModelList(models)
         _warn_if_areal_lm_head_entropy_is_nondifferentiable(

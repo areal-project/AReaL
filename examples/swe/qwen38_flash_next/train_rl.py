@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
@@ -115,6 +116,68 @@ def configure_training_rpc(scheduler):
     return scheduler
 
 
+def run_actor_only_replay(config, snapshot_path: Path) -> None:
+    """Run one saved advantage batch through the actor without inference."""
+    from examples.swe.qwen38_flash_next.batch_snapshot import load_batch_snapshot
+
+    from areal.api import FinetuneSpec
+    from areal.api.alloc_mode import ModelAllocation
+    from areal.engine import MegatronPPOActor
+    from areal.infra.scheduler.slurm import SlurmScheduler
+    from areal.utils import logging
+
+    if config.total_train_steps != 1 or config.recover.mode not in ("off", "disabled"):
+        raise ValueError("Actor-only replay requires one step and recovery disabled")
+    if config.evaluator.eval_before_train:
+        raise ValueError("Actor-only replay cannot run evaluation")
+    payload = load_batch_snapshot(snapshot_path)
+    metadata = payload["metadata"]
+    if metadata.get("method") != "compute_advantages":
+        raise ValueError("Actor-only replay requires compute_advantages output")
+    if metadata.get("model_path") != config.tokenizer_path:
+        raise ValueError("Actor-only replay model path differs from snapshot")
+    if metadata.get("allocation_mode") != config.allocation_mode:
+        raise ValueError("Actor-only replay allocation differs from snapshot")
+    if metadata.get("n_samples") != config.gconfig.n_samples:
+        raise ValueError("Actor-only replay sample count differs from snapshot")
+    batch = payload["batch"]
+    if not isinstance(batch, list) or not batch:
+        raise ValueError("Actor-only replay requires a nonempty advantage batch")
+
+    scheduler = configure_training_rpc(
+        SlurmScheduler(
+            exp_config=config,
+            container_mounts=os.environ["QWEN_MOUNTS"],
+            startup_timeout=86400,
+        )
+    )
+    actor = MegatronPPOActor.as_controller(config.actor, scheduler)
+    actor.create_process_group(
+        parallel_strategy=ModelAllocation.from_str(
+            config.actor.backend, name="actor"
+        ).parallel
+    )
+    started = time.monotonic()
+    try:
+        actor.initialize(
+            addr=None,
+            ft_spec=FinetuneSpec(
+                total_train_epochs=1,
+                dataset_size=config.train_dataset.batch_size,
+                train_batch_size=config.train_dataset.batch_size,
+            ),
+            role="actor",
+        )
+        actor.ppo_update(batch)
+        actor.step_lr_scheduler()
+        actor.get_device_stats().log("actor-only replay update")
+        logging.getLogger("RLTrainer").info(
+            "PPO update completed in %.1fs", time.monotonic() - started
+        )
+    finally:
+        actor.destroy()
+
+
 def select_arena_dataset(dataset, selected: list[str]):
     """Use explicit Env versions for both training and evaluation selections."""
     from datasets import Dataset
@@ -180,6 +243,16 @@ def main(profile, args):
     from areal.infra.scheduler.slurm import SlurmScheduler
 
     config, _ = load_expr_config(args, SWEPPOConfig)
+    actor_only_snapshot = os.environ.get("QWEN_ACTOR_ONLY_REPLAY_PATH")
+    if actor_only_snapshot:
+        if evaluation_only:
+            raise ValueError("Actor-only replay is not an evaluation mode")
+        if os.environ.get("QWEN_BATCH_REPLAY_PATH") or os.environ.get(
+            "QWEN_BATCH_REPLAY_PATHS"
+        ):
+            raise ValueError("Choose either actor-only or rollout batch replay")
+        run_actor_only_replay(config, Path(actor_only_snapshot))
+        return
     selection_file = os.environ.get("QWEN_ARENA_TASK_IDS_FILE")
     selected = json.loads(Path(selection_file).read_text()) if selection_file else None
     if evaluation_only:
