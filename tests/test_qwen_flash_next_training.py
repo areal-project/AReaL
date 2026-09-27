@@ -336,7 +336,24 @@ def test_qwen_training_rejects_runtime_host_ple_even_when_env_disabled(
     layer.ple.ple_embedding.host_table = torch.ones(8, 2, requires_grad=True)
 
     with pytest.raises(NotImplementedError, match="host table has no backward path"):
-        _configure_qwen4_exp_parameters(model)
+        _configure_qwen4_exp_parameters(model, freeze_ple_table=False)
+
+
+def test_qwen_training_accepts_frozen_host_ple(qwen_model_with_embeddings):
+    model, layer = qwen_model_with_embeddings
+    table = layer.ple.ple_embedding
+    del table.ngram_embedding
+    table.cpu_offload = True
+    table.host_table = torch.ones(8, 2)
+
+    frozen = _configure_qwen4_exp_parameters(model, freeze_ple_table=True)
+
+    assert not table.host_table.requires_grad
+    assert model.language_model.embedding.word_embeddings.weight.requires_grad
+    assert all(
+        parameter.requires_grad for parameter in layer.ple.value_proj.parameters()
+    )
+    assert not any("ngram_embedding" in name for name in frozen)
 
 
 def test_qwen_freeze_ple_table_keeps_small_parameters_trainable(
