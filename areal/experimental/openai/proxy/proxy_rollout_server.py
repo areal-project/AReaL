@@ -717,11 +717,15 @@ def set_reward(
 
     completions = session_data.completions
     if interaction_id is None:
-        # Take the last interaction id
+        # Assign only to a completed interaction.
         if len(completions) == 0:
             logger.error(f"No interactions in session {session_id}")
             raise HTTPException(status_code=400, detail="No interactions in session")
-        interaction_id = completions.last_interaction_id
+        try:
+            completions.set_last_reward(reward)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"message": "success"}
     elif interaction_id not in completions:
         requested_interaction_id = interaction_id
         interaction_id = session_data.stream_completion_aliases.get(

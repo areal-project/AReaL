@@ -380,7 +380,7 @@ async def _set_reward(
             http_session, url=url, payload=payload, headers=headers
         )
     except aiohttp.ClientResponseError as e:
-        if e.status == 400:
+        if e.status == 400 and interaction_id is not None:
             logger.error(f"[error code {e.status}] Error setting reward: {e.message}")
         else:
             raise e
