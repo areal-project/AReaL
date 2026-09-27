@@ -42,6 +42,14 @@ from areal.utils.network import format_host_for_url
 logger = getLogger("SGLangRemote")
 
 
+
+def _weight_version_field(meta: WeightUpdateMeta) -> dict[str, str]:
+    """SGLang records the policy version with the weights so KV retention can pair source and target versions."""
+    version = getattr(meta, "version", None)
+    if version is None:
+        return {}
+    return {"weight_version": str(version)}
+
 class SGLangBackend:
     """SGLang-specific backend implementation for remote inference."""
 
@@ -232,6 +240,7 @@ class SGLangBackend:
                         payload={
                             "model_path": str(meta.path),
                             "abort_all_requests": True,
+                            **_weight_version_field(meta),
                         },
                     )
                 ]
@@ -260,6 +269,7 @@ class SGLangBackend:
                         "shapes": [pspec.shape for pspec in param_specs],
                         "group_name": meta.nccl_group_name,
                         "abort_all_requests": True,
+                        **_weight_version_field(meta),
                     },
                 )
             ]

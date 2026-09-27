@@ -1105,6 +1105,7 @@ class RemoteInfEngine(InferenceEngine):
         # Deal with rollout interruption
         stop_reason = None
         ori_max_new_tokens = gconfig.max_new_tokens
+        segment_index = 0
         while (
             stop_reason not in ["stop", "tool_calls", "length"]
             and len(accumulated_output_tokens) < ori_max_new_tokens
@@ -1169,6 +1170,15 @@ class RemoteInfEngine(InferenceEngine):
             if gen_result.routed_experts is not None:
                 accumulated_routed_experts.append(gen_result.routed_experts)
 
+            # Every segment after the first re-sends prompt + partial output, and
+            # the server prefills that whole prefix again under the current
+            # weights. Record the prefix length so rebuild work is measurable.
+            if segment_index > 0:
+                stats_tracker.get("rollout").scalar(
+                    resume_prefix_len=len(req.input_ids)
+                )
+            segment_index += 1
+
             # Record speculative-decoding acceptance metrics from SGLang
             # meta_info. Recorded per generation segment (partial rollout may
             # issue multiple /generate calls); exported as a segment-level mean.
@@ -1189,6 +1199,8 @@ class RemoteInfEngine(InferenceEngine):
                 len(gen_result.output_tokens),
                 len(req.input_ids),
             )
+
+        stats_tracker.get("rollout").scalar(generation_segments=segment_index)
 
         # Final abort handling
         if stop_reason == "abort":
