@@ -4,7 +4,6 @@
 import json
 import os
 import sys
-import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
@@ -116,66 +115,15 @@ def configure_training_rpc(scheduler):
     return scheduler
 
 
-def run_actor_only_replay(config, snapshot_path: Path) -> None:
-    """Run one saved advantage batch through the actor without inference."""
-    from examples.swe.qwen38_flash_next.batch_snapshot import load_batch_snapshot
+def replay_only_workflow():
+    """Return a workflow that fails closed if replay ever attempts generation."""
+    from areal.api.workflow_api import RolloutWorkflow
 
-    from areal.api import FinetuneSpec
-    from areal.api.alloc_mode import ModelAllocation
-    from areal.engine import MegatronPPOActor
-    from areal.infra.scheduler.slurm import SlurmScheduler
-    from areal.utils import logging
+    class ReplayOnlyWorkflow(RolloutWorkflow):
+        async def arun_episode(self, engine, data):
+            raise RuntimeError("Diagnostic replay must not generate rollouts")
 
-    if config.total_train_steps != 1 or config.recover.mode not in ("off", "disabled"):
-        raise ValueError("Actor-only replay requires one step and recovery disabled")
-    if config.evaluator.eval_before_train:
-        raise ValueError("Actor-only replay cannot run evaluation")
-    payload = load_batch_snapshot(snapshot_path)
-    metadata = payload["metadata"]
-    if metadata.get("method") != "compute_advantages":
-        raise ValueError("Actor-only replay requires compute_advantages output")
-    if metadata.get("model_path") != config.tokenizer_path:
-        raise ValueError("Actor-only replay model path differs from snapshot")
-    if metadata.get("allocation_mode") != config.allocation_mode:
-        raise ValueError("Actor-only replay allocation differs from snapshot")
-    if metadata.get("n_samples") != config.gconfig.n_samples:
-        raise ValueError("Actor-only replay sample count differs from snapshot")
-    batch = payload["batch"]
-    if not isinstance(batch, list) or not batch:
-        raise ValueError("Actor-only replay requires a nonempty advantage batch")
-
-    scheduler = configure_training_rpc(
-        SlurmScheduler(
-            exp_config=config,
-            container_mounts=os.environ["QWEN_MOUNTS"],
-            startup_timeout=86400,
-        )
-    )
-    actor = MegatronPPOActor.as_controller(config.actor, scheduler)
-    actor.create_process_group(
-        parallel_strategy=ModelAllocation.from_str(
-            config.actor.backend, name="actor"
-        ).parallel
-    )
-    started = time.monotonic()
-    try:
-        actor.initialize(
-            addr=None,
-            ft_spec=FinetuneSpec(
-                total_train_epochs=1,
-                dataset_size=config.train_dataset.batch_size,
-                train_batch_size=config.train_dataset.batch_size,
-            ),
-            role="actor",
-        )
-        actor.ppo_update(batch)
-        actor.step_lr_scheduler()
-        actor.get_device_stats().log("actor-only replay update")
-        logging.getLogger("RLTrainer").info(
-            "PPO update completed in %.1fs", time.monotonic() - started
-        )
-    finally:
-        actor.destroy()
+    return ReplayOnlyWorkflow
 
 
 def select_arena_dataset(dataset, selected: list[str]):
@@ -243,16 +191,6 @@ def main(profile, args):
     from areal.infra.scheduler.slurm import SlurmScheduler
 
     config, _ = load_expr_config(args, SWEPPOConfig)
-    actor_only_snapshot = os.environ.get("QWEN_ACTOR_ONLY_REPLAY_PATH")
-    if actor_only_snapshot:
-        if evaluation_only:
-            raise ValueError("Actor-only replay is not an evaluation mode")
-        if os.environ.get("QWEN_BATCH_REPLAY_PATH") or os.environ.get(
-            "QWEN_BATCH_REPLAY_PATHS"
-        ):
-            raise ValueError("Choose either actor-only or rollout batch replay")
-        run_actor_only_replay(config, Path(actor_only_snapshot))
-        return
     selection_file = os.environ.get("QWEN_ARENA_TASK_IDS_FILE")
     selected = json.loads(Path(selection_file).read_text()) if selection_file else None
     if evaluation_only:
@@ -279,10 +217,18 @@ def main(profile, args):
         if evaluation_only:
             raise ValueError("Batch replay is not an evaluation mode")
         validate_diagnostic_replay(config, len(replay_paths))
-    dataset, streams = get_arena_mixture_dataset(
-        config.econfig, size_multiple=config.train_dataset.batch_size
-    )
-    if selection_file:
+    if replay_paths:
+        from datasets import Dataset
+
+        dataset = Dataset.from_list(
+            [{"prompt": ""} for _ in range(config.train_dataset.batch_size)]
+        )
+        streams = []
+    else:
+        dataset, streams = get_arena_mixture_dataset(
+            config.econfig, size_multiple=config.train_dataset.batch_size
+        )
+    if selection_file and not replay_paths:
         if len(streams) != 1:
             raise ValueError("Task selection requires exactly one Arena stream")
         dataset = select_arena_dataset(dataset, selected)
@@ -308,6 +254,9 @@ def main(profile, args):
         timeout=config.econfig.timeout,
         reject_terminal_task_failures=not evaluation_only,
     )
+    if replay_paths:
+        workflow = replay_only_workflow()
+        kwargs = {}
 
     class RecipeTrainer(PPOTrainer):
         def _init_scheduler(self):
@@ -360,6 +309,7 @@ def main(profile, args):
                     replay_paths,
                     {
                         "model_path": config.tokenizer_path,
+                        "allocation_mode": config.allocation_mode,
                         "n_samples": config.gconfig.n_samples,
                     },
                 )
