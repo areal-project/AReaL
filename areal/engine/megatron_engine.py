@@ -154,10 +154,12 @@ from areal.utils.hf_utils import (
 )
 from areal.utils.lock import DistributedLock
 from areal.utils.lr_scheduler import get_num_warmup_steps
+from areal.utils.moe_metrics import MoEMetrics
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.seeding import get_seed
+from areal.utils.training_metrics import export_training_metrics, record_training_batch
 from areal.v2.weight_update.awex.delta_config import DTERuntimeConfig
 
 if TYPE_CHECKING:
@@ -727,6 +729,17 @@ class MegatronEngine(TrainEngine):
         self._mark_duplicated_params()
         self._create_optimizer(ft_spec)
         self._set_optimizer_grad_scale_func()
+
+        from megatron.core.transformer.moe.router import TopKRouter
+
+        self._moe_metrics = MoEMetrics()
+        for part in self.model:
+            routers = [
+                (str(module.layer_number - 1), module)
+                for module in part.modules()
+                if isinstance(module, TopKRouter) and not module.is_mtp_layer
+            ]
+            self._moe_metrics.attach(part, routers, lambda output: output[1].sum(dim=0))
         self._initialized = True
 
     def _finalize_model_grads(self, *args: Any, **kwargs: Any) -> None:
@@ -981,6 +994,8 @@ class MegatronEngine(TrainEngine):
         return self._cpu_group
 
     def destroy(self):
+        if hasattr(self, "_moe_metrics"):
+            self._moe_metrics.close()
         self._initialized = False
         self.process_group_initialized = False
         # Drain any pending async checkpoint saves before tearing down process
@@ -1569,69 +1584,69 @@ class MegatronEngine(TrainEngine):
         self._ensure_ready()
         if self._weight_residency is not None:
             self._weight_residency.ensure_grad_buffers()
-        self.optimizer_zero_grad()
-
         input_batched, _ = self._normalize_batch_input(input_)
+        with record_training_batch(self, input_batched, self.hf_config):
+            self.optimizer_zero_grad()
 
-        # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(
-            tensor_container_to(input_batched, "cpu"), allow_transport_padding=True
-        )
+            # Step 1: Prepare micro-batches
+            mb_list = self._prepare_mb_list(
+                tensor_container_to(input_batched, "cpu"), allow_transport_padding=True
+            )
 
-        # Step 2: Select the normalization path from the model's effective config.
-        # Megatron Core requires a 3-tuple loss callback when per-token loss is
-        # enabled. It accumulates the provided token counts and normalizes all
-        # gradients, including MoE auxiliary losses, in finalize_model_grads.
-        # Preserve the existing 2-tuple/manual-normalization path for every model
-        # that does not explicitly enable calculate_per_token_loss.
-        model_config = get_model_config(self.model[0])
-        per_token_loss = model_config.calculate_per_token_loss
-        if per_token_loss:
-            # MCore applies the optimizer loss scale configured during engine
-            # initialization to both the main loss and auxiliary losses.
-            total_loss_weight = None
-            loss_multiplier = 1.0
-        else:
-            # Use DP+CP group: after CP all-gather each rank computes the
-            # full-sequence loss, so all_gather's backward (reduce_scatter) sums
-            # cp_size identical gradients. Including CP in the weight all-reduce
-            # introduces a matching factor in the denominator.
-            total_loss_weight = compute_total_loss_weight(
+            # Step 2: Select the normalization path from the model's effective config.
+            # Megatron Core requires a 3-tuple loss callback when per-token loss is
+            # enabled. It accumulates the provided token counts and normalizes all
+            # gradients, including MoE auxiliary losses, in finalize_model_grads.
+            # Preserve the existing 2-tuple/manual-normalization path for every model
+            # that does not explicitly enable calculate_per_token_loss.
+            model_config = get_model_config(self.model[0])
+            per_token_loss = model_config.calculate_per_token_loss
+            if per_token_loss:
+                # MCore applies the optimizer loss scale configured during engine
+                # initialization to both the main loss and auxiliary losses.
+                total_loss_weight = None
+                loss_multiplier = 1.0
+            else:
+                # Use DP+CP group: after CP all-gather each rank computes the
+                # full-sequence loss, so all_gather's backward (reduce_scatter) sums
+                # cp_size identical gradients. Including CP in the weight all-reduce
+                # introduces a matching factor in the denominator.
+                total_loss_weight = compute_total_loss_weight(
+                    mb_list,
+                    loss_weight_fn,
+                    mpu.get_data_parallel_group(with_context_parallel=True),
+                    device=self.device,
+                )
+                loss_multiplier = mpu.get_data_parallel_world_size() * len(mb_list)
+
+            def process_output(
+                output: torch.Tensor, inputs: dict[str, Any]
+            ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+                return self._compute_logprobs_and_loss(
+                    output,
+                    inputs,
+                    loss_fn,
+                    loss_weight_fn,
+                    total_loss_weight,
+                    loss_multiplier=loss_multiplier,
+                    per_token_loss=per_token_loss,
+                )
+
+            self.forward_backward_batch(
                 mb_list,
-                loss_weight_fn,
-                mpu.get_data_parallel_group(with_context_parallel=True),
-                device=self.device,
-            )
-            loss_multiplier = mpu.get_data_parallel_world_size() * len(mb_list)
-
-        def process_output(
-            output: torch.Tensor, inputs: dict[str, Any]
-        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-            return self._compute_logprobs_and_loss(
-                output,
-                inputs,
-                loss_fn,
-                loss_weight_fn,
-                total_loss_weight,
-                loss_multiplier=loss_multiplier,
-                per_token_loss=per_token_loss,
+                process_output,
+                forward_only=False,
             )
 
-        self.forward_backward_batch(
-            mb_list,
-            process_output,
-            forward_only=False,
-        )
+            # Step 4: Optimizer step
+            stats = self.optimizer_step()
+            stats["num_micro_batches"] = len(mb_list.mbs)
 
-        # Step 4: Optimizer step
-        stats = self.optimizer_step()
-        stats["num_micro_batches"] = len(mb_list.mbs)
-
-        # Step 5: Surface the auxiliary MTP loss for logging (if enabled).
-        mtp_loss = self._collect_mtp_loss(len(mb_list.mbs))
-        if mtp_loss is not None:
-            stats["mtp_loss"] = mtp_loss
-        return stats
+            # Step 5: Surface the auxiliary MTP loss for logging (if enabled).
+            mtp_loss = self._collect_mtp_loss(len(mb_list.mbs))
+            if mtp_loss is not None:
+                stats["mtp_loss"] = mtp_loss
+            return stats
 
     def _collect_mtp_loss(self, num_microbatches: int) -> float | None:
         """Reduce and return the per-microbatch Multi-Token-Prediction loss.
@@ -1783,6 +1798,18 @@ class MegatronEngine(TrainEngine):
                 reduce_group=self.data_parallel_group,
                 key_sync_group=key_sync_group,
             )
+            data.update(
+                self._moe_metrics.export(
+                    reduce_group=mpu.get_tensor_and_data_parallel_group(
+                        with_context_parallel=True
+                    ),
+                    pp_group=mpu.get_pipeline_model_parallel_group(),
+                    replicas=1
+                    if self.tf_config.sequence_parallel
+                    else mpu.get_tensor_model_parallel_world_size(),
+                )
+            )
+            data.update(export_training_metrics(self))
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             # Some log info only exist in last pipeline rank
             data_list = [data]
