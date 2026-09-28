@@ -103,3 +103,43 @@ def test_vlm_sft_loss_mask_includes_full_answer_and_eos(
         if include_in_loss
     ]
     assert trained_token_ids == expected_token_ids
+
+
+class _FakeQwenVLProcessor(_FakeProcessor):
+    def __call__(self, **kwargs):
+        return {
+            **super().__call__(**kwargs),
+            "image_grid_thw": torch.tensor([[1, 2, 2]]),
+        }
+
+
+@pytest.mark.parametrize(
+    ("module", "loader"),
+    [
+        (geometry3k, geometry3k.get_geometry3k_sft_dataset),
+        (clevr_count_70k, clevr_count_70k.get_clevr_count_70k_sft_dataset),
+    ],
+)
+def test_vlm_sft_image_grid_thw_keeps_one_row_per_image(monkeypatch, module, loader):
+    """image_grid_thw stays [num_images, 3], as Qwen-VL vision towers expect."""
+    dataset = Dataset.from_list(
+        [
+            {
+                "images": [Image.new("RGB", (4, 4))],
+                "problem": "<image>question",
+                "answer": "answer",
+            }
+        ]
+    )
+    monkeypatch.setattr(module, "load_dataset", lambda **kwargs: dataset)
+    monkeypatch.setattr(module, "convert_image", lambda image, *args: image)
+    if module is clevr_count_70k:
+        monkeypatch.setattr(module.os, "cpu_count", lambda: 1)
+
+    sample = loader(
+        path="unused",
+        split="train",
+        processor=_FakeQwenVLProcessor(add_bos_by_default=False),
+    )[0]
+
+    assert sample["multi_modal_input"][0]["image_grid_thw"] == [[1, 2, 2]]
