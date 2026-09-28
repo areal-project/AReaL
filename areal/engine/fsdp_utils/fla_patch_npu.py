@@ -255,14 +255,11 @@ def _expand_shared_gdn_conv1d_bias(
     if bias.shape[0] == 1:
         return bias.expand(local_dim).contiguous()
     raise ValueError(
-        f"conv1d bias dim ({bias.shape[0]}) must be 1 or local GDN dim "
-        f"({local_dim})."
+        f"conv1d bias dim ({bias.shape[0]}) must be 1 or local GDN dim ({local_dim})."
     )
 
 
-def _as_gdn_triton_conv1d_weight(
-    weight: torch.Tensor, local_dim: int
-) -> torch.Tensor:
+def _as_gdn_triton_conv1d_weight(weight: torch.Tensor, local_dim: int) -> torch.Tensor:
     if weight.ndim == 3:
         if weight.shape[0] == local_dim:
             return weight.squeeze(1).transpose(-1, -2).contiguous()

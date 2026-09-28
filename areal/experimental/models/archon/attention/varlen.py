@@ -15,6 +15,9 @@ __all__ = ["varlen_attn", "VarlenAttentionWrapper"]
 # NPU npu_fusion_attention pre_tockens/next_tockens upper bound (INT32 max ~2.1B).
 _MAX_SEQ_TOKENS = 2147483647
 
+# NPU npu_fusion_attention with sparse_mode=3 (rightDownCausal) requires a fixed mask size of 2048.
+_NPU_SPARSE3_MASK_SIZE = 2048
+
 
 def _is_npu_device(tensor: torch.Tensor) -> bool:
     """Check if tensor is on NPU device."""
@@ -33,18 +36,49 @@ def _cu_seqlens_to_actual(cu_seqlens: torch.Tensor) -> list[int]:
 
 def _get_npu_sparse_config(
     is_causal: bool,
+    actual_seq_qlen,
+    actual_seq_kvlen,
     max_q: int,
     max_k: int,
     device: torch.device,
 ) -> tuple[torch.Tensor | None, int]:
     """Return (atten_mask, sparse_mode) for NPU varlen attention.
 
-    When is_causal=True, builds an explicit bool causal mask and uses sparse_mode=1
-    (allMask). When False, returns (None, 0) for default (no mask) behavior.
+    Branches:
+        is_causal=False
+            No mask; sparse_mode=0 (default).
+
+        actual_seq_qlen == actual_seq_kvlen
+            Standard causal attention: q and k share the same cu_seqlens.
+            Build an explicit causal mask and use sparse_mode=1 (allMask).
+
+        len(actual_seq_qlen) == 1 and len(actual_seq_kvlen) == 1  (DTA-only)
+            A single long sequence (> 2048), with q and k having different
+            cu_seqlens. Build an explicit right-down aligned causal mask
+            and use sparse_mode=1 (allMask).
+
+        Otherwise
+            Multiple sequences with length <= 2048, and q and k having
+            different cu_seqlens. Use sparse_mode=3 (rightDownCausal),
+            which requires atten_mask to have shape (S, S), (1, S, S) or
+            (1, 1, S, S) with S fixed at 2048.
     """
-    if is_causal:
-        return _make_causal_mask_npu(max_q, max_k, device), 1
-    return None, 0
+    if not is_causal:
+        return None, 0
+    elif actual_seq_qlen == actual_seq_kvlen:
+        return _make_causal_mask_npu(max_q, max_k, 0, device), 1
+    elif len(actual_seq_qlen) == 1 and len(actual_seq_kvlen) == 1:
+        return _make_causal_mask_npu(max_q, max_k, max_k - max_q, device), 1
+    else:
+        if max_q <= _NPU_SPARSE3_MASK_SIZE and max_k <= _NPU_SPARSE3_MASK_SIZE:
+            return _make_causal_mask_npu(
+                _NPU_SPARSE3_MASK_SIZE, _NPU_SPARSE3_MASK_SIZE, 0, device
+            ), 3
+        raise ValueError(
+            f"torch_npu.npu_fusion_attention sparse_mode=3 does not support "
+            f"right-down causal for length > {_NPU_SPARSE3_MASK_SIZE}; "
+            f"got max_q={max_q}, max_k={max_k}."
+        )
 
 
 # ── Custom Op: Forward ───────────────────────────────────────────────
@@ -115,6 +149,7 @@ def _varlen_attn(
 def _make_causal_mask_npu(
     max_q: int,
     max_k: int,
+    off_set: int,
     device: torch.device,
 ) -> torch.Tensor | None:
     """Build a bool causal mask for npu_fusion_attention varlen mode.
@@ -123,13 +158,13 @@ def _make_causal_mask_npu(
     For causal attention, the upper triangle is masked (1), lower triangle is kept (0).
 
     In varlen mode, the mask shape is [maxSq, maxSkv] (SS format) and is applied
-    per-sequence: each sequence uses the top-left Lq x Lkv submatrix where L is the
-    sequence length. Sequence isolation is handled by actual_seq_qlen/kvlen, not the mask.
+    per-sequence: each sequence uses the top-left Lq x Lkv submatrix (offset by off_set)
+    where L is the sequence length. Sequence isolation is handled by actual_seq_qlen/kvlen,
+    not the mask.
 
-    Returns None for non-causal attention (no mask needed).
     """
     return torch.triu(
-        torch.ones(max_q, max_k, dtype=torch.bool, device=device), diagonal=1
+        torch.ones(max_q, max_k, dtype=torch.bool, device=device), diagonal=off_set + 1
     )
 
 
@@ -162,7 +197,7 @@ def _varlen_attn_npu(
     actual_seq_kvlen = _cu_seqlens_to_actual(cu_seq_k)
 
     atten_mask, sparse_mode = _get_npu_sparse_config(
-        is_causal, max_q, max_k, query.device
+        is_causal, actual_seq_qlen, actual_seq_kvlen, max_q, max_k, query.device
     )
 
     output, softmax_max, softmax_sum, _, seed, offset, _ = (
@@ -322,7 +357,7 @@ def _varlen_attn_backward_npu(
     actual_seq_kvlen = _cu_seqlens_to_actual(cu_seq_k)
 
     atten_mask, sparse_mode = _get_npu_sparse_config(
-        is_causal, max_q, max_k, query.device
+        is_causal, actual_seq_qlen, actual_seq_kvlen, max_q, max_k, query.device
     )
 
     dq, dk, dv, _, _ = torch_npu.npu_fusion_attention_grad(
@@ -515,6 +550,7 @@ class VarlenAttentionWrapper(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         tree_attn_meta: TreeAttentionMeta | None = None,
+        cu_seqlens_k: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute attention with varlen_attn.
 
@@ -547,17 +583,24 @@ class VarlenAttentionWrapper(nn.Module):
         v_3d = v.squeeze(0).transpose(0, 1).contiguous()
 
         # Ensure cu_seqlens is int32 (required by flash_attn)
-        cu_seqlens_i32 = cu_seqlens.to(torch.int32)
+        cu_seqlens_q_i32 = cu_seqlens.to(torch.int32)
 
-        # Call varlen_attn (self-attention: q and k have same cu_seqlens)
+        if cu_seqlens_k is None:
+            cu_seqlens_k_i32 = cu_seqlens_q_i32
+        else:
+            cu_seqlens_k_i32 = cu_seqlens_k.to(torch.int32)
+
+        max_q = int(torch.diff(cu_seqlens_q_i32).max().item())
+        max_k = int(torch.diff(cu_seqlens_k_i32).max().item())
+
         out = varlen_attn(
             q_3d,
             k_3d,
             v_3d,
-            cu_seqlens_i32,
-            cu_seqlens_i32,
-            max_seqlen,
-            max_seqlen,
+            cu_seqlens_q_i32,
+            cu_seqlens_k_i32,
+            max_q,
+            max_k,
             is_causal=True,
             scale=scale,
         )

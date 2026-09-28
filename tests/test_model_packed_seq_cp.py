@@ -128,7 +128,7 @@ def test_forward_result_reassembles_cp_local_logprobs():
     """Forward-only inference restores CP-local logprobs to global order."""
     engine = object.__new__(megatron_engine_module.MegatronEngine)
     engine.config = SimpleNamespace(is_critic=False)
-    engine.enable_tree_training = False
+    engine.tree_training_mode = "disabled"
 
     output = torch.randn(4, 8)
     local_labels = torch.arange(4)

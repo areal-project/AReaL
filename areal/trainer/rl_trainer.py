@@ -55,6 +55,7 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.awex_runtime import prepare_awex_runtime
+from areal.utils.data import unpack_groups_to_sequences
 from areal.utils.dataloader import create_dataloader
 from areal.utils.environ import is_single_controller
 from areal.utils.evaluator import Evaluator
@@ -571,6 +572,17 @@ class PPOTrainer:
             ]
             per_teacher_logps = [future.result() for future in futures]
         per_teacher_logps = RTensor.localize(per_teacher_logps)
+        if self.config.actor.packing_algorithm == "dta":
+            for teacher_logps in per_teacher_logps:
+                assert isinstance(teacher_logps, list), (
+                    "teacher_logps must return list under DTA, "
+                    f"got {type(teacher_logps)}"
+                )
+                assert len(teacher_logps) == len(rollout_batch), (
+                    "teacher_logps length mismatch under DTA: "
+                    f"len(rollout_batch)={len(rollout_batch)}, "
+                    f"len(teacher_logps)={len(teacher_logps)}"
+                )
         log_weights = torch.log(
             torch.tensor(
                 self.teacher_mixture_weights,
@@ -578,14 +590,17 @@ class PPOTrainer:
                 device=per_teacher_logps[0][0].device,
             )
         )
+        if self.config.actor.packing_algorithm == "dta":
+            weight_view = log_weights[:, None]  # [T, 1]
+        else:
+            weight_view = log_weights[:, None, None]  # [T, 1, 1]
+
         for traj_idx, traj in enumerate(rollout_batch):
             stacked = torch.stack(
                 [teacher_logps[traj_idx] for teacher_logps in per_teacher_logps],
                 dim=0,
             )
-            traj["teacher_logp"] = torch.logsumexp(
-                stacked + log_weights[:, None, None], dim=0
-            )
+            traj["teacher_logp"] = torch.logsumexp(stacked + weight_view, dim=0)
             self._set_distillation_fields(traj)
 
     def _assign_domain_teacher_logps(self, rollout_batch: list[dict[str, Any]]) -> None:
@@ -621,6 +636,16 @@ class PPOTrainer:
             for teacher_idx, future in futures.items():
                 teacher_logps = RTensor.localize(future.result())
                 traj_indices = teacher_to_traj_indices[teacher_idx]
+                if self.config.actor.packing_algorithm == "dta":
+                    assert isinstance(teacher_logps, list), (
+                        "teacher_logps must return list under DTA, "
+                        f"got {type(teacher_logps)}"
+                    )
+                    assert len(teacher_logps) == len(traj_indices), (
+                        "teacher_logps length mismatch under DTA: "
+                        f"len(traj_indices)={len(traj_indices)}, "
+                        f"len(teacher_logps)={len(teacher_logps)}"
+                    )
                 for traj_idx, teacher_logp in zip(
                     traj_indices,
                     teacher_logps,
@@ -794,6 +819,9 @@ class PPOTrainer:
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
                 )
+                if config.actor.packing_algorithm == "dta":
+                    rollout_batch = RTensor.localize(rollout_batch)
+                    rollout_batch = unpack_groups_to_sequences(rollout_batch)
             if self._should_offload_rollout:
                 self._offload_rollout()
 
@@ -809,6 +837,15 @@ class PPOTrainer:
                     ),
                 ):
                     values = self.critic.compute_values(rollout_batch)
+                    if config.actor.packing_algorithm == "dta":
+                        assert isinstance(values, list), (
+                            f"values must return list under DTA, got {type(values)}"
+                        )
+                        assert len(values) == len(rollout_batch), (
+                            "values length mismatch under DTA: "
+                            f"len(rollout_batch)={len(rollout_batch)}, "
+                            f"len(values)={len(values)}"
+                        )
                     for traj, v in zip(rollout_batch, values):
                         traj["values"] = v
                     self.critic.get_device_stats().log("critic values")
@@ -826,6 +863,16 @@ class PPOTrainer:
                     ),
                 ):
                     ref_logps = self.ref.compute_logp(rollout_batch)
+                    if config.actor.packing_algorithm == "dta":
+                        assert isinstance(ref_logps, list), (
+                            "ref_logps must return list under DTA, "
+                            f"got {type(ref_logps)}"
+                        )
+                        assert len(ref_logps) == len(rollout_batch), (
+                            "ref_logps length mismatch under DTA: "
+                            f"len(rollout_batch)={len(rollout_batch)}, "
+                            f"len(ref_logps)={len(ref_logps)}"
+                        )
                     for traj, logp in zip(rollout_batch, ref_logps):
                         traj["ref_logp"] = logp
                     self.ref.get_device_stats().log("ref logp")
@@ -859,6 +906,16 @@ class PPOTrainer:
                     ),
                 ):
                     prox_logps = self.actor.compute_logp(rollout_batch)
+                    if config.actor.packing_algorithm == "dta":
+                        assert isinstance(prox_logps, list), (
+                            "prox_logps must return list under DTA, "
+                            f"got {type(prox_logps)}"
+                        )
+                        assert len(prox_logps) == len(rollout_batch), (
+                            "prox_logps length mismatch under DTA: "
+                            f"len(rollout_batch)={len(rollout_batch)}, "
+                            f"len(prox_logps)={len(prox_logps)}"
+                        )
                     for traj, logp in zip(rollout_batch, prox_logps):
                         traj["prox_logp"] = logp
                     self.actor.get_device_stats().log("recompute logp")
