@@ -45,18 +45,26 @@ def _recurrent_kernel(q, k, v, g, beta, *, initial_state, cu_seqlens_cpu, **kwar
 
 
 @pytest.mark.parametrize(
-    ("fork_depth", "nested", "expected_calls"),
-    [(7, False, 1), (8, False, 2), (9, False, 2), (7, True, 2)],
+    ("fork_depth", "branch_case", "expected_calls"),
+    [
+        (7, "single", 1),
+        (8, "single", 2),
+        (9, "single", 2),
+        (7, "nested", 2),
+        (8, "stacked_boundaries", 2),
+    ],
 )
 def test_tree_gdn_matches_independent_sequences_and_gradients(
-    fork_depth, nested, expected_calls
+    fork_depth, branch_case, expected_calls
 ):
     prefix = list(range(1, fork_depth + 1))
-    sequences = (
-        [prefix + [101, 102, 103], prefix + [101, 102, 201], prefix + [301]]
-        if nested
-        else [prefix + [101, 102], prefix + [201, 202]]
-    )
+    if branch_case == "stacked_boundaries":
+        middle = list(range(20, 29))
+        sequences = [prefix + middle + [101], prefix + middle + [201], prefix + [301]]
+    elif branch_case == "nested":
+        sequences = [prefix + [101, 102, 103], prefix + [101, 102, 201], prefix + [301]]
+    else:
+        sequences = [prefix + [101, 102], prefix + [201, 202]]
     trie = _trie(sequences)
     plan = plan_linear_attention(trie, chunk_size=8)
     torch.manual_seed(7)
