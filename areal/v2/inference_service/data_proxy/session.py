@@ -68,12 +68,15 @@ class SetRewardRequest(BaseModel):
 class ExportTrajectoriesRequest(BaseModel):
     """Request to export trajectories for one or more sessions.
 
-    All sessions are exported and merged into a single interactions dict.
-    ``group_id`` is optional metadata used by the gateway for router cleanup;
-    the data proxy itself does not use it.
+    ``session_ids`` owns cleanup for the whole group. ``export_session_ids`` may
+    select a successful subset for training while the remaining sessions are
+    still removed. ``group_id`` is optional metadata used by the gateway for
+    router cleanup; the data proxy itself does not use it.
     """
 
     session_ids: list[str]
+    export_session_ids: list[str] | None = None
+    min_usable_group_size: int = 1
     group_id: str | None = None
     trajectory_id: int | None = None
     discount: float = 1.0

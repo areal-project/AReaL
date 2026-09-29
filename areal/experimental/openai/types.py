@@ -357,6 +357,8 @@ def normalize_group_rewards(
 
 def normalize_logical_rollout_rewards(
     results: list[dict[str, InteractionWithTokenLogpReward] | None],
+    *,
+    use_std: bool = True,
 ) -> bool:
     """Normalize row rewards against one explicit or equal-row rollout reference."""
     if not results or any(not result for result in results):
@@ -390,7 +392,7 @@ def normalize_logical_rollout_rewards(
     std = (
         rewards.std(unbiased=False) if len(references) > 1 else rewards.new_tensor(1.0)
     )
-    scale = torch.where(std <= 1e-8, 1.0, std + 1e-8)
+    scale = torch.where(std <= 1e-8, 1.0, std + 1e-8) if use_std else 1.0
     row_rewards = torch.tensor(
         [v.reward for result in results for v in result.values()], dtype=torch.float32
     )

@@ -63,9 +63,6 @@ actor:
 LoRA、critic、FSDP 包装及 MoE router expert-bias 更新。MTP 训练仍不支持分块 LM-head loss。
 训练需要完整的主干前向计算。设置 `mtp_only: false` 则保留默认的联合训练行为。
 
-使用 `qwen3_5` 架构的 Qwen GDN 混合模型，需要 Megatron-Core >=0.18.2 和 Megatron-Bridge >=0.5.1 才能使用
-packed THD 与 CP。 在这些版本上，AReaL 将 MTP 标签和回答 mask 与每条 packed 序列的 CP 分片对齐。 旧版运行时保留 padded
-路径并要求 `CP=1`。仓库默认依赖版本不会自动升级；仅更换配置不能让旧版本支持 THD/CP。 Dense Qwen 的 EP 为 1。
-
-针对部分 Megatron-Core 版本的 MTP 完整重计算兼容补丁支持缺省 padding mask； 如果上游 checkpoint 实现无法传递非空 padding
-mask，则显式报错，不会静默丢弃 mask。
+原生 MTP 训练要求 Megatron-Core >=0.19.0 和 Megatron-Bridge >=0.6.0。在该版本组合中，Megatron-Core
+从布局对齐后的 input IDs 派生 MTP targets，AReaL 则将回答 mask 与每条 packed 序列的 CP 分片对齐。 模型自主管理的 Qwen
+THD forward 会在多模态 embedding 融合后，将最终 CP 切分交给 Megatron-Bridge。 Dense Qwen 的 EP 为 1。

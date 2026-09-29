@@ -396,6 +396,7 @@ def test_mcore_distributed_optimizer_dp1_preserves_step_and_sync_order(
     monkeypatch,
 ) -> None:
     """MCore's real DP-shard and step path matches AdamW and syncs last."""
+    pytest.importorskip("transformer_engine")
 
     class _RankOneGroup:
         @staticmethod

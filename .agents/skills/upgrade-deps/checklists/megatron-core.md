@@ -1,17 +1,25 @@
 ---
 package: megatron-core
 github: NVIDIA/Megatron-LM
-branch_template: core_r${VERSION}
+branch_template: core_v${VERSION}
 upstream_paths:
   - megatron/core/parallel_state.py
   - megatron/core/distributed/
   - megatron/core/optimizer/
   - megatron/core/optimizer_param_scheduler.py
   - megatron/core/pipeline_parallel/
+  - megatron/core/tensor_parallel/
   - megatron/core/transformer/transformer_config.py
   - megatron/core/transformer/pipeline_parallel_layer_layout.py
+  - megatron/core/transformer/multi_token_prediction.py
+  - megatron/core/transformer/multi_latent_attention.py
+  - megatron/core/transformer/spec_utils.py
+  - megatron/core/transformer/transformer_block.py
+  - megatron/core/transformer/transformer_layer.py
   - megatron/core/dist_checkpointing/
+  - megatron/core/dist_checkpointing/mapping.py
   - megatron/core/dist_checkpointing/serialization.py
+  - megatron/core/dist_checkpointing/strategies/async_utils.py
   - megatron/core/dist_checkpointing/strategies/fully_parallel.py
   - megatron/core/fp8_utils.py
   - megatron/core/models/gpt/
@@ -32,29 +40,55 @@ upstream_paths:
 | `areal/engine/megatron_utils/pipeline_parallel.py`       | `TransformerConfig`, `PipelineParallelLayerLayout`                                                                                                                                                               |
 | `areal/engine/megatron_utils/packed_context_parallel.py` | `PackedSeqParams`, `parallel_state`                                                                                                                                                                              |
 | `areal/engine/megatron_utils/fp8/tensor_helper.py`       | `fp8_utils.is_float8tensor`                                                                                                                                                                                      |
+| `areal/engine/megatron_utils/deterministic.py`           | `AttnBackend` enum for deterministic attention selection                                                                                                                                                         |
+| `areal/engine/megatron_utils/weight_residency.py`        | `DistributedDataParallel` flat-buffer residency (`buffers`, `expert_parallel_buffers`)                                                                                                                           |
 
 ### Secondary (model / infra layer)
 
-| File                                              | Imports / Usage                                                                                                                                                                                        |
-| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `areal/models/mcore/registry.py`                  | `GPTModel`, `DDP`, `TransformerConfig`, `parallel_state`, `AutoConfig`                                                                                                                                 |
-| `areal/models/mcore/bailing_moe.py`               | `MLATransformerConfig`, `LayerType`, `ModuleSpec`, `SelfAttention`, `AttnMaskType`, `TransformerLayer`, `TransformerLayerSubmodules`, `TransformerBlockSubmodules`, `apply_rotary_pos_emb`, rope_utils |
-| `areal/models/mcore/tree_attn/module_megatron.py` | `TransformerConfig`, `SelfAttention`, `AttnMaskType`, layer specs                                                                                                                                      |
-| `areal/models/mcore/lightning_attention.py`       | `parallel_state`, `apply_rotary_pos_emb`, `MegatronModule`, `ModuleSpec`, `build_module`                                                                                                               |
-| `areal/models/mcore/bailing_moe_bridge.py`        | `MLATransformerConfig`, `AttnBackend`                                                                                                                                                                  |
-| `areal/models/mcore/common.py`                    | `TransformerConfig`                                                                                                                                                                                    |
-| `areal/models/mcore/qwen3.py`                     | `gpt_layer_specs`, `TransformerConfig`                                                                                                                                                                 |
+| File                                              | Imports / Usage                                                                                              |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `areal/models/mcore/registry.py`                  | `GPTModel`, `DDP`, `TransformerConfig`, `parallel_state`, tensor-parallel utilities                          |
+| `areal/models/mcore/bailing_moe.py`               | `MLATransformerConfig`, layer specs/builders, transformer blocks, TE/torch/fused norms                       |
+| `areal/models/mcore/bailing_v3.py`                | `MLATransformerConfig`, layer specs/builders, transformer blocks, TE/TP linears, TE/torch/fused norms        |
+| `areal/models/mcore/bailing_v3_bridge.py`         | `MLATransformerConfig`, `AttnBackend`, `parallel_state`                                                      |
+| `areal/models/mcore/bailing_v3_mla.py`            | `MLASelfAttention`, `build_module`, TE/TP column-parallel linear                                             |
+| `areal/models/mcore/lightning_attention.py`       | `parallel_state`, `apply_rotary_pos_emb`, `MegatronModule`, `ModuleSpec`, `build_module`, checkpoint helpers |
+| `areal/models/mcore/kda_attention.py`             | Sharded checkpoint types, `PackedSeqParams`, TP mappings/RNG, transformer module/spec/checkpoint helpers     |
+| `areal/models/mcore/hf_load.py`                   | `parallel_state`, `fp8_utils.is_float8tensor`                                                                |
+| `areal/models/mcore/hf_save.py`                   | `parallel_state`, `fp8_utils.is_float8tensor`                                                                |
+| `areal/models/mcore/vocab_parallel_head.py`       | Tensor-parallel layers and collectives                                                                       |
+| `areal/models/tree_attn/module_megatron.py`       | `PackedSeqParams`, `TransformerConfig`, `SelfAttention`, `AttnMaskType`, transformer layer/block specs       |
+| `areal/models/mcore/bailing_moe_bridge.py`        | `MLATransformerConfig`, `AttnBackend`                                                                        |
+| `areal/models/mcore/common.py`                    | `TransformerConfig`                                                                                          |
+| `areal/models/mcore/qwen3.py`                     | `gpt_layer_specs`, `TransformerConfig`                                                                       |
+| `areal/v2/weight_update/awex/delta_detect.py`     | Lazy `parallel_state` access for Megatron delta ownership                                                    |
+| `areal/v2/weight_update/awex/megatron_adapter.py` | Lazy `parallel_state` access for AWEX Megatron rank/group handling                                           |
 
 ### Tertiary (tests, infra)
 
-| File                                                | Imports / Usage                                |
-| --------------------------------------------------- | ---------------------------------------------- |
-| `areal/infra/workflow_executor.py`                  | conditional `parallel_state` for DP world size |
-| `tests/test_estimate_num_params.py`                 | `parallel_state`, `tensor_parallel`            |
-| `tests/fp8/engine_utils.py`                         | `parallel_state`                               |
-| `tests/fp8/model_hooks.py`                          | `parallel_state`                               |
-| `tests/fp8/test_fp8_rmsnorm.py`                     | `fp8_utils`, `get_model_config`                |
-| `tests/torchrun/run_megatron_engine_distributed.py` | `parallel_state`                               |
+| File                                                | Imports / Usage                                                   |
+| --------------------------------------------------- | ----------------------------------------------------------------- |
+| `areal/infra/workflow_executor.py`                  | conditional `parallel_state` for DP world size                    |
+| `tests/test_estimate_num_params.py`                 | `parallel_state`, `tensor_parallel`                               |
+| `tests/fp8/engine_utils.py`                         | `parallel_state`                                                  |
+| `tests/fp8/model_hooks.py`                          | `parallel_state`                                                  |
+| `tests/fp8/test_fp8_rmsnorm.py`                     | `fp8_utils`, `get_model_config`                                   |
+| `tests/torchrun/run_megatron_engine_distributed.py` | `parallel_state`                                                  |
+| `tests/test_megatron_engine_vlm.py`                 | `GPTModel` unwrapping and VLM engine contracts                    |
+| `tests/test_megatron_lm_head.py`                    | TP layers, `TransformerConfig`, `Float16Module`, PP helpers       |
+| `tests/test_reassemble_cp_logprobs.py`              | Conditional `megatron.core` availability                          |
+| `tests/torchrun/run_vocab_parallel.py`              | `parallel_state`, `ColumnParallelLinear`, `TransformerConfig`     |
+| `areal/tools/validation_base.py`                    | Megatron package/import metadata validation                       |
+| `areal/tools/validate_docker_installation.py`       | Megatron package and submodule smoke imports                      |
+| `tests/test_bailing_v3_hf_load.py`                  | Stubbed `parallel_state` and FP8 import contracts                 |
+| `tests/test_bailing_v3_kda_cp_helpers.py`           | Stubbed KDA checkpoint, packed-sequence, TP, and transformer APIs |
+| `tests/test_bailing_v3_nccl.py`                     | Conditional real MCore integration                                |
+| `tests/test_deterministic_prebuild.py`              | Conditional `AttnBackend` integration                             |
+| `tests/test_megatron_async_save.py`                 | Stubbed async distributed-checkpoint contracts                    |
+| `tests/test_megatron_bridge_deterministic.py`       | Conditional MCore bridge-provider integration                     |
+| `tests/test_megatron_engine.py`                     | Megatron engine integration and package version reporting         |
+| `tests/test_megatron_transport.py`                  | Conditional Megatron engine transport integration                 |
+| `tests/torchrun/run_mopd_teacher_residency.py`      | Patched MCore DDP flat-buffer residency                           |
 
 ______________________________________________________________________
 
@@ -449,17 +483,21 @@ ______________________________________________________________________
 **Source:** `megatron/core/tensor_parallel/`
 
 Called in `areal/engine/megatron_engine.py` and
-`areal/models/mcore/lightning_attention.py`:
+`areal/models/mcore/lightning_attention.py`; extended by
+`areal/models/mcore/vocab_parallel_head.py`:
 
 ```python
 tensor_parallel.model_parallel_cuda_manual_seed(seed)
 tensor_parallel.gather_from_sequence_parallel_region(output)
 tensor_parallel.get_cuda_rng_tracker()
+linear_with_areal_output(..., gtp_remat_size=gtp_remat_size)
 ```
 
 **Check:** Verify these functions still exist with same signatures.
 `model_parallel_cuda_manual_seed` is called once at init;
-`gather_from_sequence_parallel_region` is in hot path.
+`gather_from_sequence_parallel_region` is in hot path. Keep the custom LM-head autograd
+function's forward/backward arity aligned with
+`LinearWithGradAccumulationAndAsyncCommunication`, including `gtp_remat_size`.
 
 ______________________________________________________________________
 
@@ -524,9 +562,131 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_ro
 # Also various rope_utils for extended RoPE (YaRN, etc.)
 ```
 
-**Check:** Verify `apply_rotary_pos_emb` signature (`t`, `freqs`). This function is
-heavily patched in `bailing_moe.py` — confirm the base implementation hasn't changed in
-ways that break the patches.
+**Check:** Verify `apply_rotary_pos_emb` signature (`t`, `freqs`) and the optional MLA
+rotary arguments. MCore 0.19 owns THD+CP frequency selection; AReaL must not reinstall
+the removed global MLA RoPE workaround.
+
+______________________________________________________________________
+
+### 19. Async distributed-checkpoint request and queue internals
+
+**Source:** `megatron/core/dist_checkpointing/strategies/async_utils.py`
+
+Used in `areal/engine/megatron_utils/checkpointer.py`:
+
+```python
+from megatron.core.dist_checkpointing.strategies.async_utils import (
+    AsyncCallsQueue,
+    AsyncRequest,
+)
+
+save_kwargs["async_strategy"] = "mcore"
+async_request = dist_checkpointing.save(**save_kwargs)
+queue = AsyncCallsQueue()
+queue.schedule_async_request(async_request)
+```
+
+The checkpoint manager also validates and clears the retained tensor payload through the
+private `AsyncRequest.async_fn_args` write-bucket layout after D2H staging.
+
+**Check:** Confirm `AsyncRequest` and `AsyncCallsQueue` import paths and methods. Verify
+`dist_checkpointing.save(..., async_strategy="mcore")` still returns an `AsyncRequest`,
+and audit the exact `async_fn_args` / write-bucket payload structure before retaining
+the private-reference cleanup optimization.
+
+______________________________________________________________________
+
+### 20. MTP model, loss, and metrics APIs
+
+**Source:** `megatron/core/models/gpt/gpt_model.py` and
+`megatron/core/transformer/multi_token_prediction.py`
+
+Configured in `areal/models/mcore/registry.py`, forwarded by
+`areal/engine/megatron_utils/packed_context_parallel.py`, and collected in
+`areal/engine/megatron_engine.py`:
+
+```python
+provider.mtp_detach_heads = True
+model(..., labels=None, loss_mask=mtp_loss_mask)
+MTPLossLoggingHelper.reduce_metrics_in_tracker()
+loss = MTPLossLoggingHelper.tracker["loss_values"]
+MTPLossLoggingHelper.clean_metrics_in_tracker()
+```
+
+**Check:** Verify `GPTModel.forward` forwards `input_ids` and `loss_mask` to native
+`process_mtp_loss` when `labels=None`; `mtp_detach_heads` must isolate both hidden state
+and tied/untied output weights. Verify the `MTPLossLoggingHelper` tracker keys and
+reduce/clean method names. These are semi-private contracts and changed in 0.19.
+
+______________________________________________________________________
+
+### 21. MLA configuration, attention backend, and layer-layout helpers
+
+**Source:** `megatron/core/transformer/multi_latent_attention.py`,
+`megatron/core/transformer/enums.py`, `transformer_block.py`, and `transformer_layer.py`
+
+Used by the Bailing model family and pipeline layout helpers:
+
+```python
+from megatron.core.transformer.multi_latent_attention import (
+    MLASelfAttention,
+    MLATransformerConfig,
+)
+from megatron.core.transformer.enums import AttnBackend, LayerType
+from megatron.core.transformer.transformer_block import get_num_layers_to_build
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+```
+
+**Check:** Confirm imports and constructor signatures, enum members used by AReaL, and
+the helper return types. Verify `MLASelfAttention` still exposes the overridable methods
+consumed by `bailing_v3_mla.py`.
+
+______________________________________________________________________
+
+### 22. Custom attention module and sharded-state helpers
+
+**Source:** `megatron/core/dist_checkpointing/mapping.py`,
+`megatron/core/tensor_parallel/mappings.py`, and `megatron/core/transformer/`
+
+Used by `areal/models/mcore/kda_attention.py` and the custom attention modules:
+
+```python
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_tensor_model_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.utils import (
+    make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
+)
+```
+
+**Check:** Verify import paths, factory/dataclass fields, TP collective signatures, and
+the sharded-state helper inputs/returns. Confirm the optional
+`PackedSeqParamsWithSeqidx` import remains safely absent or compatible upstream.
+
+______________________________________________________________________
+
+### 23. `Float16Module` and pipeline-stage helpers
+
+**Source:** `megatron/core/transformer/module.py` and
+`megatron/core/pipeline_parallel/utils.py`
+
+Exercised in `tests/test_megatron_lm_head.py` to preserve output casting:
+
+```python
+model = Float16Module(config, module)
+output = model(fp32_output=False)
+```
+
+The test also patches `is_pp_first_stage`, `is_pp_last_stage`, `is_vp_first_stage`, and
+`is_vp_last_stage` with their process-group/stage arguments.
+
+**Check:** Verify the `Float16Module` constructor/forward pass-through behavior and the
+pipeline helper signatures so the AReAL LM-head output override is still propagated.
 
 ______________________________________________________________________
 

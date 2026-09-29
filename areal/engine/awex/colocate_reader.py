@@ -33,6 +33,8 @@ from typing import Any
 import torch
 
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
+from areal.engine.awex.metadata import serialize_metadata_gc
+from areal.engine.awex.parallel import resolve_scheduler_parallel_attr
 
 # Must run before any awex import: awex.models.registry auto-imports model
 # modules at module load, and the BailingMoe module's transitive megatron import
@@ -228,6 +230,7 @@ class _SingleInstanceMetaResolver(ParamMetaResolver):
     def get_model_arch_name(self) -> str:
         return self._model_arch_name
 
+    @serialize_metadata_gc
     def get_parameters_meta(self):
         return self._build_params_meta()
 
@@ -290,15 +293,7 @@ class AwexColocateReader:
         dp_size = int(getattr(server_args, "dp_size", 1))
 
         def rank_attr(name: str) -> int | None:
-            for obj in (
-                scheduler,
-                getattr(scheduler, "ps", None),
-                getattr(scheduler, "tp_worker", None),
-            ):
-                value = getattr(obj, name, None) if obj is not None else None
-                if value is not None:
-                    return int(value)
-            return None
+            return resolve_scheduler_parallel_attr(scheduler, name)
 
         tp_rank = rank_attr("tp_rank")
         if tp_rank is None and self._instance_local_rank is not None:

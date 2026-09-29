@@ -245,6 +245,9 @@ class MegatronWeightResidency:
                 continue
             for tensor, device in self._ordinary_optimizer_restores.get(index, []):
                 tensor.data = tensor.data.to(device, non_blocking=True)
+        torch.cuda.synchronize()
+        self._ordinary_optimizer_restores.clear()
+        self._optimizer_residency_plan = None
         logger.info("Restored managed and ordinary optimizer state")
 
     def _release_ordinary_optimizer(
@@ -253,15 +256,9 @@ class MegatronWeightResidency:
         """Mirror AWEX's original ordinary Megatron optimizer migration."""
         restores: list[tuple[torch.Tensor, torch.device]] = []
 
-        def move_tensor(tensor: torch.Tensor, description: str) -> None:
+        def move_tensor(tensor: torch.Tensor) -> None:
             if not tensor.data.is_cuda:
                 return
-            if type(tensor) is not torch.Tensor:
-                raise TypeError(
-                    "AWEX ordinary optimizer migration supports only plain "
-                    f"Tensor values, got {type(tensor).__module__}."
-                    f"{type(tensor).__qualname__} for {description}"
-                )
             device = tensor.device
             tensor.data = tensor.data.to("cpu", non_blocking=True)
             restores.append((tensor, device))
@@ -271,7 +268,7 @@ class MegatronWeightResidency:
             tensors = group if isinstance(group, list) else [group]
             for tensor in tensors:
                 if tensor is not None:
-                    move_tensor(tensor, "legacy FP32 main parameter")
+                    move_tensor(tensor)
 
         base_optimizer = entry.base_optimizer
         if base_optimizer is None:
@@ -292,7 +289,7 @@ class MegatronWeightResidency:
             ):
                 value = param_state.get(key)
                 if isinstance(value, torch.Tensor):
-                    move_tensor(value, f"optimizer state {key}")
+                    move_tensor(value)
         return restores
 
     def _purge_te_cache(self) -> None:

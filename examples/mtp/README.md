@@ -4,17 +4,16 @@
 embedding, and output head. The model directory must contain the native MTP weights and
 matching configuration. The dense Qwen model uses EP=1.
 
-MTP-only configuration validation requires loaded cuDNN >=9.19.0, Megatron-Core
+MTP-only configuration validation requires loaded cuDNN >=9.19.0, Megatron-Core 0.19.0
+or newer, and Megatron-Bridge 0.6.0 or newer. It rejects missing or older runtimes
+before model initialization, including an older cuDNN library loaded by PyTorch.
 
-> =0.18.2, and Megatron-Bridge >=0.5.1. It rejects missing or older runtimes before
-> model initialization, including an older cuDNN library loaded by PyTorch.
+Requirements for Qwen GDN packed THD, CP, and native MTP training: Megatron-Core 0.19.0
+or newer and Megatron-Bridge 0.6.0 or newer, with their compatible CUDA/Transformer
+Engine/Transformers runtime. Supply model and dataset paths through environment
+variables.
 
-Requirements for Qwen GDN packed THD and CP: Megatron-Core >=0.18.2 and Megatron-Bridge
-\>=0.5.1, with their compatible CUDA/Transformer Engine/Transformers runtime. Repository
-default dependency pins are older; do not use them for this THD recipe. Supply model and
-dataset paths through environment variables.
-
-The actual 27B MTP-only smoke test uses Megatron-Core 0.18.2, Megatron-Bridge 0.5.1,
+The actual 27B MTP-only smoke test uses Megatron-Core 0.19.0, Megatron-Bridge 0.6.0,
 PyTorch 2.9.1 (CUDA 12.9), Transformer Engine 2.14.1, and cuDNN 9.19.0.56. The same test
 with cuDNN 9.16.0.29 produced nonfinite attention gradients; use the validated cuDNN
 version and verify the loaded libraries before training. A newer Python package alone

@@ -29,6 +29,7 @@ from areal.experimental.openai.client import ArealOpenAI
 from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
     concat_string_interactions,
+    concat_tensor_interactions,
     normalize_group_rewards,
 )
 from areal.infra.rpc.guard.data_blueprint import (
@@ -38,7 +39,7 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import serialize_value
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
-from areal.utils.data import concat_padded_tensors, is_multi_modal_key
+from areal.utils.data import is_multi_modal_key
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.seeding import derive_deterministic_seed
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
@@ -914,6 +915,21 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 status_code=400,
                 detail="session_ids must be a non-empty list",
             )
+        export_session_ids = (
+            body.session_ids
+            if body.export_session_ids is None
+            else body.export_session_ids
+        )
+        if body.min_usable_group_size < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="min_usable_group_size must be positive",
+            )
+        if not set(export_session_ids).issubset(body.session_ids):
+            raise HTTPException(
+                status_code=400,
+                detail="export_session_ids must be a subset of session_ids",
+            )
 
         prm_runner = app.state.prm_runner
         if config.prm.enabled and config.prm.scorers and prm_runner is None:
@@ -935,14 +951,19 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
         owned_sessions: dict[str, SessionData] = {}
         try:
-            # Claim every ready trajectory before the first scoring await. A
-            # concurrent/retried export must not consume part of the same group.
+            # Retain ownership of the full group, including members excluded from
+            # export, so cleanup cannot remove a replacement session after scoring.
             for sid in body.session_ids:
                 session = store.get_session(sid)
+                if session is not None:
+                    owned_sessions[sid] = session
+            # Claim every ready trajectory before the first scoring await. A
+            # concurrent/retried export must not consume part of the same group.
+            for sid in export_session_ids:
+                session = owned_sessions.get(sid)
                 if session is None:
                     grouped_interactions.append(None)
                     continue
-                owned_sessions[sid] = session
                 try:
                     _, interactions = session.export_trajectory(
                         discount=body.discount,
@@ -991,7 +1012,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     tasks = [
                         scoring.create_task(score_session(sid, interactions))
                         for sid, interactions in zip(
-                            body.session_ids, grouped_interactions, strict=True
+                            export_session_ids, grouped_interactions, strict=True
                         )
                     ]
                 rejected = False
@@ -1008,6 +1029,21 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 if rejected:
                     grouped_interactions = []
 
+            usable_interactions = [
+                interactions for interactions in grouped_interactions if interactions
+            ]
+            if (
+                grouped_interactions
+                and len(usable_interactions) < body.min_usable_group_size
+            ):
+                logger.warning(
+                    "Trajectory export dropped a group with %d usable sessions; "
+                    "minimum is %d",
+                    len(usable_interactions),
+                    body.min_usable_group_size,
+                )
+                grouped_interactions = []
+
             # Scorers see original outcome rewards, just as in v1. Keep v2's
             # existing group normalization; process token rewards are untouched.
             if (
@@ -1015,6 +1051,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 and body.reward_normalization
                 and len(body.session_ids) > 1
             ):
+                if body.export_session_ids is not None:
+                    grouped_interactions = usable_interactions
                 if not normalize_group_rewards(grouped_interactions):
                     logger.warning(
                         "Reward normalization dropped an incomplete group (%d sessions)",
@@ -1023,14 +1061,19 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     grouped_interactions = []
 
             merged: dict[str, InteractionWithTokenLogpReward] = {}
-            for interactions in grouped_interactions:
-                if interactions is not None:
-                    merged.update(interactions)
+            for rollout_index, interactions in enumerate(
+                interactions for interactions in grouped_interactions if interactions
+            ):
+                last_interaction = interactions[next(reversed(interactions))]
+                for interaction in interactions.values():
+                    interaction.rollout_index = rollout_index
+                    interaction.rollout_reward = last_interaction.reward
+                merged.update(interactions)
 
-            if all(v.has_tensor_data for v in merged.values()):
-                traj = concat_padded_tensors(
-                    [v.to_tensor_dict() for v in merged.values()]
-                )
+            if not merged:
+                traj = {}
+            elif all(v.has_tensor_data for v in merged.values()):
+                traj = concat_tensor_interactions(merged)
                 traj = _remotize_trajectory(traj, node_addr=config.serving_addr)
             else:
                 traj = concat_string_interactions(merged)
