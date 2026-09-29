@@ -100,7 +100,11 @@ configuration above. Full-attention layers use the tree mask. Gated DeltaNet lay
 ancestor-aware convolution and a compact state-replay plan. The actor's chunked LM-head
 loss remains enabled (`enable_chunked_logits=true`, `lm_head_loss_chunk_size=1024`);
 distinct rollout labels can share a compact logit row. The current Megatron Bridge path
-supports text-only Qwen3.5 batches and no context parallelism.
+supports text-only Qwen3.5 batches and no context parallelism. Public FLA exports only
+the final state of each packed sequence. For nested forks that need an intermediate
+state, this adapter packs an additional state-only prefix in the same call. It preserves
+the planner's call depth but may repeat linear-attention core work beyond the paper's
+selective-state kernel bound.
 
 With the model and dataset environment variables set as above, run:
 
@@ -117,21 +121,26 @@ both comparison runs: the installed Megatron-Core 0.17.0 does not meet this bran
 Qwen3.5 staged optimizer compatibility guard. Both runs used seed 1, one eight-L20X
 node, three PPO updates, eight prompts per step, two samples per prompt, and at most 128
 generated tokens. All three PPO and AWEX weight updates completed in both runs. W&B
-project: `wht_tree_training`.
+project: `wht_tree_training`
+([baseline](http://8.150.1.98:8080/sct-test/wht_tree_training/runs/wht_tree_training_baseline-qwen35-20260929_train),
+[HARTS](http://8.150.1.98:8080/sct-test/wht_tree_training/runs/wht_tree_training_harts-qwen35-roundstate-v2-20260929_train)).
 
 | Measure                                                    |  Baseline |    HARTS |
 | ---------------------------------------------------------- | --------: | -------: |
-| Mean actor training step, steps 2–3                        |    7.81 s |   4.90 s |
-| Actor input tokens / actor training time, steps 2–3        |     611/s |    996/s |
-| Total training time, three steps                           |  883.18 s | 862.25 s |
-| GPU used at PPO-update checkpoint, highest of three steps  | 100.51 GB | 96.05 GB |
-| Compact tree tokens / original tokens, mean of three steps |         — |    0.688 |
+| Mean actor training step, steps 2–3                        |    7.81 s |   3.76 s |
+| Actor input tokens / actor training time, steps 2–3        |     611/s |  1,314/s |
+| Total training time, three steps                           |  883.18 s | 936.20 s |
+| AWEX weight-update time, sum of three steps                |  708.67 s | 848.57 s |
+| GPU used at PPO-update checkpoint, highest of three steps  | 100.51 GB | 96.00 GB |
+| Compact tree tokens / original tokens, mean of three steps |         — |    0.686 |
 
-The actor training step is 1.59× faster on the two post-compilation steps, and actor
-input-token throughput for those steps is 1.63× higher. Total training time is only 2.4%
-lower because AWEX weight exchange dominates this short run. The memory row is an
-update-checkpoint reading, not a peak across all phases. Generated samples and rewards
-differed between runs despite the shared seed; these measurements validate the execution
-path and give a short-run performance comparison, not convergence or statistical
-significance. The current trie grouping uses AReaL's existing first-fit packing rather
-than the paper's data-parallel-aware scheduler.
+The actor training step is 2.08× faster on the two post-compilation steps, and actor
+input-token throughput for those steps is 2.15× higher. Total training time is 6.0%
+higher in this run because AWEX weight exchange took about 140 seconds longer. The
+earlier HARTS revision took 862.25 seconds end to end with the same configuration,
+showing that this short-run total is sensitive to weight-exchange variation. The memory
+row is an update-checkpoint reading, not a peak across all phases. Generated samples and
+rewards differed between runs despite the shared seed; these measurements validate the
+execution path and give a short-run performance comparison, not convergence or
+statistical significance. The current trie grouping uses AReaL's existing first-fit
+packing rather than the paper's data-parallel-aware scheduler.
