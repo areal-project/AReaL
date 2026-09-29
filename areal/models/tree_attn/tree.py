@@ -289,6 +289,7 @@ def build_packed_tree_batch(
     pad_to_maximum: bool = True,
     dp_group: dist.ProcessGroup | None = None,
     parallel_size: int = 1,
+    compact_padding: bool = False,
 ) -> MicroBatchList:
     """Build a MicroBatchList from input data using greedy trie packing.
 
@@ -315,6 +316,10 @@ def build_packed_tree_batch(
         Product of parallelism dimensions (e.g. TP, SP) that require
         BLOCK_SIZE alignment. The actual alignment is
         ``math.lcm(BLOCK_SIZE, parallel_size)``.
+    compact_padding : bool, default=False
+        Pad each trie only to the next aligned block instead of the full
+        micro-batch capacity. This keeps Q/K/V and MoE work proportional to
+        the number of distinct tree tokens.
 
     Returns
     -------
@@ -417,7 +422,11 @@ def build_packed_tree_batch(
 
     for trie, num_tokens in zip(tries, num_tokens_list):
         # Compute padded size based on padding options
-        padded_size = max_tokens_per_tree if pad_to_maximum else num_tokens
+        padded_size = (
+            max(block_align, math.ceil(num_tokens / block_align) * block_align)
+            if compact_padding
+            else max_tokens_per_tree
+        )
 
         # Pack input_ids
         with trace_scope("tree_attn.pack_input_ids"):

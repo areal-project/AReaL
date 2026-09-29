@@ -130,6 +130,12 @@ from areal.models.tree_attn.functional import (
     merge_packed_tree_results,
     tree_semantic_rows,
 )
+from areal.models.tree_attn.harts_plan import plan_linear_attention
+from areal.models.tree_attn.harts_runtime import (
+    patch_qwen35_tree_model,
+    register_tree_mask,
+    unregister_tree_masks,
+)
 from areal.models.tree_attn.module import (
     build_tree_attn_kwargs,
     patch_bridge_for_tree_training,
@@ -246,15 +252,12 @@ def _warn_if_areal_lm_head_entropy_is_nondifferentiable(
 def _validate_areal_lm_head_compatibility(
     enable_chunked_logits: bool,
     *,
-    enable_tree_training: bool,
     npu_available: bool,
 ) -> None:
     if not enable_chunked_logits:
         return
     if npu_available:
         raise NotImplementedError("AReaL LM Head does not support NPU training")
-    if enable_tree_training:
-        raise NotImplementedError("AReaL LM Head does not support tree training")
 
 
 def _map_chunked_lm_head_output(
@@ -403,7 +406,6 @@ class MegatronEngine(TrainEngine):
         self.enable_tree_training: bool = self.config.enable_tree_training
         _validate_areal_lm_head_compatibility(
             self.mcore_config.enable_chunked_logits,
-            enable_tree_training=self.enable_tree_training,
             npu_available=is_npu_available,
         )
         # FP8 configuration
@@ -566,20 +568,25 @@ class MegatronEngine(TrainEngine):
             self.sequence_packing_mode = resolve_sequence_packing_mode(
                 self.hf_config.model_type, self.bridge_cls
             )
+            if self.enable_tree_training and self.bridge_cls == "megatron-bridge":
+                self.sequence_packing_mode = SequencePackingMode.PADDED
             self.use_model_packed_seq = (
                 self.sequence_packing_mode == SequencePackingMode.MODEL_THD
             )
-            validate_model_packed_seq_dependencies(
-                self.hf_config.model_type,
-                self.bridge_cls,
-                self.parallel_strategy.context_parallel_size,
-            )
+            if self.use_model_packed_seq:
+                validate_model_packed_seq_dependencies(
+                    self.hf_config.model_type,
+                    self.bridge_cls,
+                    self.parallel_strategy.context_parallel_size,
+                )
             # ``PADDED`` is the input-routing fallback for every VLM without a
             # model-owned THD contract. ``use_padded_seq`` is narrower: it
             # enables Qwen3.5/GDN-specific dense-mask and LM-head semantics.
             self.use_padded_seq = requires_padded_seq(
                 self.hf_config.model_type, self.bridge_cls
             )
+            if self.enable_tree_training and self.bridge_cls == "megatron-bridge":
+                self.use_padded_seq = True
             if self.is_vision_model:
                 if (
                     self.parallel_strategy.context_parallel_size > 1
@@ -644,7 +651,6 @@ class MegatronEngine(TrainEngine):
                     is_critic=self.config.is_critic,
                     use_lora=self.config.use_lora,
                 )
-
         self.model = _MegatronModelList(models)
         _warn_if_areal_lm_head_entropy_is_nondifferentiable(
             self.logger,
@@ -659,6 +665,14 @@ class MegatronEngine(TrainEngine):
 
         with self.device:
             self._load_model_from_hf(self.config.path)
+        if self.enable_tree_training and self.bridge_cls == "megatron-bridge":
+            if not self.use_padded_seq:
+                raise NotImplementedError(
+                    "Megatron-Bridge tree training currently requires Qwen3.5 "
+                    "padded text input."
+                )
+            for model in self.model:
+                patch_qwen35_tree_model(model)
 
         # NOTE: Clear high_precision_init_val for FP8 parameters.
         #
@@ -916,10 +930,6 @@ class MegatronEngine(TrainEngine):
             )
 
         elif self.bridge_cls == "megatron-bridge":
-            if self.enable_tree_training:
-                raise NotImplementedError(
-                    "Tree training is not supported with bridge_type='megatron-bridge'."
-                )
             self.bridge = MegatronBridgeAutoBridge.from_hf_pretrained(
                 self.config.path,
                 trust_remote_code=True,
@@ -1341,6 +1351,7 @@ class MegatronEngine(TrainEngine):
         gather_cp_output: bool = False,
     ) -> None:
         self._ensure_ready()
+        tree_mask_pointers: list[int] = []
         validate_transport_padding(
             mb_list,
             has_internal_objectives=bool(self.tf_config.num_moe_experts)
@@ -1387,6 +1398,14 @@ class MegatronEngine(TrainEngine):
                     )
                     mb_input.padded_mb.update(tree_kwargs)
                     tree_attn_keys = list(tree_kwargs.keys())
+                    if self.bridge_cls == "megatron-bridge":
+                        tree_mask_pointers.append(
+                            register_tree_mask(
+                                tree_kwargs["attention_mask"],
+                                trie_node,
+                                plan_linear_attention(trie_node, chunk_size=64),
+                            )
+                        )
 
             cp_size = mpu.get_context_parallel_world_size()
             # CP-local forward keeps the vocabulary logits sharded by sequence.
@@ -1602,15 +1621,18 @@ class MegatronEngine(TrainEngine):
                 data_iterator = [iter(mb_list) for _ in range(len(self.model))]
             else:
                 data_iterator = iter(mb_list)
-            forward_backward_func(
-                forward_step_func=forward_step,
-                data_iterator=data_iterator,
-                model=self.model if len(self.model) > 1 else self.model[0],
-                num_microbatches=len(mb_list),
-                seq_length=mb_list.max_seqlen,  # no use when input_shapes was set
-                micro_batch_size=1,  # no use when input_shapes was set
-                forward_only=forward_only,
-            )
+            try:
+                forward_backward_func(
+                    forward_step_func=forward_step,
+                    data_iterator=data_iterator,
+                    model=self.model if len(self.model) > 1 else self.model[0],
+                    num_microbatches=len(mb_list),
+                    seq_length=mb_list.max_seqlen,  # no use when input_shapes was set
+                    micro_batch_size=1,  # no use when input_shapes was set
+                    forward_only=forward_only,
+                )
+            finally:
+                unregister_tree_masks(tree_mask_pointers)
 
     def train_batch(
         self,
@@ -3161,12 +3183,27 @@ class MegatronEngine(TrainEngine):
             assert cp_size == 1, (
                 "Context parallelism is not supported in tree training."
             )
+            if has_multi_modal_tensors(input_) or any(
+                key in _VLM_FORWARD_KEYS
+                and torch.is_tensor(value)
+                and value.numel() > 0
+                for key, value in input_.items()
+            ):
+                raise NotImplementedError(
+                    "Tree training does not support vision inputs"
+                )
+            input_ = {
+                key: value
+                for key, value in input_.items()
+                if not _is_multi_modal_payload_key(key)
+            }
             mb_list = build_packed_tree_batch(
                 input_,
                 mb_spec=self.config.mb_spec,
                 pad_to_maximum=self.config.pad_to_maximum,
                 dp_group=self.data_parallel_group,
                 parallel_size=tp_size,
+                compact_padding=self.bridge_cls == "megatron-bridge",
             )
             recommended_min_n_mbs = 2 * pp_size if pp_size > 1 else 1
             self.logger.info(

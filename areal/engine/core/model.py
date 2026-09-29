@@ -149,9 +149,11 @@ def validate_model_packed_seq_dependencies(
 
 def supports_model_packed_seq(model_type: str, bridge_type: str) -> bool:
     """Whether the bridge model owns BSHD-to-THD packing internally."""
-    return bridge_type == "megatron-bridge" and (
-        is_qwen3_vl_model(model_type) or model_type in ("qwen3_5", "qwen3_5_moe")
-    )
+    if bridge_type != "megatron-bridge":
+        return False
+    if model_type in ("qwen3_5", "qwen3_5_moe"):
+        return supports_gdn_packed_seq()
+    return is_qwen3_vl_model(model_type)
 
 
 def resolve_sequence_packing_mode(
