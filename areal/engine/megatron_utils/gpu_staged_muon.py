@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""MCore 0.17 layer-wise Muon with CPU-authoritative optimizer state.
+"""MCore 0.19 layer-wise Muon with CPU-authoritative optimizer state.
 
 The official Muon builder remains responsible for parameter classification and
 ``LayerWiseDistributedOptimizer.shard_params`` ownership.  Only after that
@@ -36,7 +36,7 @@ from areal.engine.megatron_utils.staged_optimizer_runtime import (
     StagedOptimizerRuntime,
 )
 
-_SUPPORTED_MEGATRON_CORE_VERSION = "0.17.0"
+_SUPPORTED_MEGATRON_CORE_VERSION = "0.19.0"
 _SUPPORTED_EMERGING_OPTIMIZERS_VERSION = "0.3.0"
 _EMPTY_MUON_LEAF = object()
 _MUON_CHECKPOINT_SCHEMA_VERSION = 2
@@ -54,12 +54,12 @@ def _require_muon_checkpoint_versions() -> tuple[str, str]:
         eo_version = importlib.metadata.version("emerging-optimizers")
     except importlib.metadata.PackageNotFoundError as error:
         raise RuntimeError(
-            "Muon checkpoint requires megatron-core 0.17.0 and "
+            "Muon checkpoint requires megatron-core 0.19.0 and "
             "emerging-optimizers 0.3.0"
         ) from error
     if mcore_version != _SUPPORTED_MEGATRON_CORE_VERSION:
         raise RuntimeError(
-            f"Muon checkpoint requires megatron-core 0.17.0, found {mcore_version}"
+            f"Muon checkpoint requires megatron-core 0.19.0, found {mcore_version}"
         )
     if eo_version != _SUPPORTED_EMERGING_OPTIMIZERS_VERSION:
         raise RuntimeError(
@@ -953,8 +953,8 @@ def _make_layerwise_leaf_class():
 
 
 @torch.no_grad()
-def _allgather_mcore017_layerwise_params_empty_safe(self: Any) -> None:
-    """MCore 0.17 all-gather that permits an empty first owner shard."""
+def _allgather_layerwise_params_empty_safe(self: Any) -> None:
+    """All-gather layer-wise parameters when the first owner shard is empty."""
 
     def _allgather(params_list: list[list[torch.Tensor]], group: Any) -> None:
         first_param = next(
@@ -1016,7 +1016,7 @@ def get_megatron_optimizer_with_dist_muon(
     version = importlib.metadata.version("megatron-core")
     if version != _SUPPORTED_MEGATRON_CORE_VERSION:
         raise RuntimeError(
-            f"distributed Muon supports megatron-core 0.17.0 exactly, found {version}"
+            f"distributed Muon supports megatron-core 0.19.0 exactly, found {version}"
         )
     if mcore_config.optimizer != "dist_muon":
         raise ValueError("distributed Muon requires optimizer='dist_muon'")
@@ -1047,10 +1047,8 @@ def get_megatron_optimizer_with_dist_muon(
         raise TypeError(
             "official Muon builder did not return LayerWiseDistributedOptimizer"
         )
-    optimizer.allgather_params = (
-        _allgather_mcore017_layerwise_params_empty_safe.__get__(
-            optimizer, type(optimizer)
-        )
+    optimizer.allgather_params = _allgather_layerwise_params_empty_safe.__get__(
+        optimizer, type(optimizer)
     )
     return optimizer
 
@@ -1170,7 +1168,7 @@ def _validate_muon_checkpoint_cartesian_topology(
     *,
     group_sizes: Mapping[str, int],
 ) -> None:
-    """Prove that metadata is exactly MCore 0.17's two WORLD rank spaces."""
+    """Prove that metadata has the two required WORLD rank spaces."""
     from megatron.core.parallel_state import RankGenerator
 
     world_size = len(participants)
@@ -1257,7 +1255,7 @@ def _validate_muon_checkpoint_cartesian_topology(
         normalized_expected = sorted(tuple(members) for members in expected)
         if actual_groups[name] != normalized_expected:
             raise ValueError(
-                f"Muon checkpoint {name} topology does not match MCore 0.17 "
+                f"Muon checkpoint {name} topology does not match the expected "
                 f"rank layout: expected={normalized_expected!r}, "
                 f"actual={actual_groups[name]!r}"
             )
@@ -1910,6 +1908,8 @@ def _make_staged_layerwise_class():
 
         def __init__(self, official: Any, leaves: list[Any]) -> None:
             self.pg_collection = official.pg_collection
+            self.dp_cp = official.dp_cp
+            self.expt_dp = official.expt_dp
             self.dp_cp_params_list = official.dp_cp_params_list
             self.expt_dp_params_list = official.expt_dp_params_list
             self._staged_owner_schema = {
@@ -1917,10 +1917,12 @@ def _make_staged_layerwise_class():
                 "expert": _freeze_owner_schema("expert", self.expt_dp_params_list),
             }
             self._staged_leaves = tuple(leaves)
-            self.async_allgather = False
+            self.overlap_param_gather = official.overlap_param_gather
+            self.use_buffer_param_sync = official.use_buffer_param_sync
             self._checkpoint_parameter_names: dict[torch.Tensor, str] | None = None
             self._checkpoint_algorithm: dict[str, Any] | None = None
             ChainedOptimizer.__init__(self, leaves)
+            self.model_chunks = official.model_chunks
             self._checkpoint_process_group: Any | None = None
 
         def bind_managed_checkpoint_process_group(self, group: Any) -> None:
@@ -2888,7 +2890,7 @@ def _make_staged_layerwise_class():
 
         @torch.no_grad()
         def allgather_params(self) -> None:
-            """MCore 0.17 all-gather with empty owner shards handled safely."""
+            """All-gather with empty owner shards handled safely."""
             validated = self._validate_owner_metadata()
             for domain, params_list, group in (
                 ("dense", self.dp_cp_params_list, self.pg_collection.dp_cp),
@@ -3183,7 +3185,7 @@ def _validate_official_ownership(
     else:
         if not expert_list_required:
             raise RuntimeError(
-                "official expt_dp owner list must be None for MCore 0.17: "
+                "official expt_dp owner list must be None here: "
                 f"dp_cp_size={dp_size}, expt_dp_size={expt_size}, "
                 f"expert_param_count={len(expected_expert)}"
             )
@@ -3297,7 +3299,7 @@ def _validate_muon_parallel_topology(
         group_metadata[name] = _group_size_and_rank(group, name=name)
 
     expected_muon = tuple(
-        param for param in expected_params if _is_mcore017_muon_parameter(param)
+        param for param in expected_params if _is_muon_parameter(param)
     )
     expected_ids = {id(param) for param in expected_muon}
     parameter_ordinals = {
@@ -3311,10 +3313,10 @@ def _validate_muon_parallel_topology(
                 "official Muon optimizer and LayerWise wrapper use different "
                 "process-group collections"
             )
-        if optimizer.mode != tp_mode:
+        if optimizer.tp_mode != tp_mode:
             raise RuntimeError(
                 "official Muon TP mode does not match staged configuration: "
-                f"official={optimizer.mode!r}, staged={tp_mode!r}"
+                f"official={optimizer.tp_mode!r}, staged={tp_mode!r}"
             )
         for group_index, param_group in enumerate(optimizer.param_groups):
             is_expert = param_group.get("is_expert_parallel")
@@ -3460,8 +3462,8 @@ def _validate_muon_parallel_topology(
     _require_dp_schema_consensus("expert", "expt_dp", official.expt_dp_params_list)
 
 
-def _is_mcore017_muon_parameter(param: torch.Tensor) -> bool:
-    """Pinned copy of MCore 0.17's Muon predicate for its empty-Muon edge."""
+def _is_muon_parameter(param: torch.Tensor) -> bool:
+    """Match MCore's Muon predicate for the empty-Muon edge."""
     return (
         not getattr(param, "is_embedding_or_output_parameter", False)
         and param.ndim == 2
@@ -3479,7 +3481,7 @@ def get_megatron_optimizer_with_gpu_staged_muon(
     version = importlib.metadata.version("megatron-core")
     if version != _SUPPORTED_MEGATRON_CORE_VERSION:
         raise RuntimeError(
-            f"GPU-staged Muon supports megatron-core 0.17.0 exactly, found {version}"
+            f"GPU-staged Muon supports megatron-core 0.19.0 exactly, found {version}"
         )
     if mcore_config.use_distributed_optimizer:
         raise ValueError("staged Muon uses official layer-wise ownership, not dist-opt")
@@ -3538,18 +3540,16 @@ def get_megatron_optimizer_with_gpu_staged_muon(
     from megatron.core.optimizer import (
         get_megatron_optimizer as get_scalar_optimizer,
     )
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
     from megatron.core.optimizer.layer_wise_optimizer import (
         LayerWiseDistributedOptimizer,
     )
-    from megatron.core.optimizer.muon import (
-        TensorParallelMuon,
-        get_megatron_muon_optimizer,
-    )
+    from megatron.core.optimizer.muon import get_megatron_muon_optimizer
     from megatron.core.optimizer.optimizer import FP32Optimizer
 
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
-            "MCore 0.17 Muon requires its optional emerging-optimizers backend; "
+            "MCore 0.19 Muon requires its optional emerging-optimizers backend; "
             "the staged factory will not substitute a different algorithm"
         )
     eo_version = importlib.metadata.version("emerging-optimizers")
@@ -3606,7 +3606,7 @@ def get_megatron_optimizer_with_gpu_staged_muon(
     build_config.overlap_param_gather = False
     build_config.overlap_param_gather_with_optimizer_step = False
 
-    has_muon_parameters = any(_is_mcore017_muon_parameter(p) for p in trainable)
+    has_muon_parameters = any(_is_muon_parameter(p) for p in trainable)
     if has_muon_parameters:
         official = get_megatron_muon_optimizer(
             build_config,
@@ -3616,11 +3616,9 @@ def get_megatron_optimizer_with_gpu_staged_muon(
             pg_collection=pg_collection,
         )
     else:
-        # MCore 0.17 constructs TensorParallelMuon before it checks whether the
-        # official Muon class is empty, and torch.optim rejects an empty input.
-        # For this exact edge, use MCore's normal Adam param-group builder and
-        # the official layer-wise sharder.  The predicate above is the pinned
-        # MCore 0.17 predicate and includes the embedding/output exclusion.
+        # Keep an explicit empty Muon leaf in the staged chain when the model
+        # has only scalar-optimizer parameters. Build its scalar owner groups
+        # through MCore and the official layer-wise sharder.
         resolved_pg_collection = (
             pg_collection
             if pg_collection is not None
@@ -3639,26 +3637,25 @@ def get_megatron_optimizer_with_gpu_staged_muon(
             resolved_pg_collection,
             init_state_fn_list=None,
             model_chunks=None,
-            async_allgather=False,
         )
 
     if type(official) is not LayerWiseDistributedOptimizer:
         raise TypeError(
             "official Muon builder did not return LayerWiseDistributedOptimizer"
         )
-    if official.async_allgather:
+    if official.overlap_param_gather or official.use_buffer_param_sync:
         raise RuntimeError("staged Muon MVP requires synchronous official all-gather")
     _validate_official_ownership(official, trainable)
 
     official_bases = []
     for official_leaf in official.chained_optimizers:
-        if type(official_leaf) is not FP32Optimizer:
-            raise TypeError(
-                "unsupported official Muon wrapper before staged ownership bind: "
-                f"{type(official_leaf).__name__}"
-            )
-        base = official_leaf.optimizer
-        if official_leaf.is_stub_optimizer:
+        if isinstance(official_leaf, FP32Optimizer):
+            base = official_leaf.optimizer
+            is_stub = official_leaf.is_stub_optimizer
+        else:
+            base = official_leaf
+            is_stub = False
+        if is_stub:
             if base is not None or official_leaf.param_groups:
                 raise RuntimeError("malformed official empty scalar optimizer leaf")
             official_bases.append(None)
@@ -3758,7 +3755,7 @@ def get_megatron_optimizer_with_gpu_staged_muon(
         checkpoint_parameter_names,
         algorithm={
             "momentum": mcore_config.muon_momentum,
-            "use_nesterov": mcore_config.muon_use_nesterov,
+            "use_nesterov": mcore_config.muon_nesterov,
             "fp32_matmul_prec": mcore_config.muon_fp32_matmul_prec,
             "coefficient_type": mcore_config.muon_coefficient_type,
             "num_ns_steps": mcore_config.muon_num_ns_steps,

@@ -83,7 +83,7 @@ def _make_config() -> OptimizerConfig:
         decoupled_weight_decay=True,
         muon_scalar_optimizer="adam",
         muon_momentum=0.82,
-        muon_use_nesterov=True,
+        muon_nesterov=True,
         muon_split_qkv=False,
         muon_fp32_matmul_prec="highest",
         muon_num_ns_steps=3,

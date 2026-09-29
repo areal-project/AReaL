@@ -22,7 +22,7 @@ from areal.engine.megatron_utils.staged_optimizer_runtime import (
     StagedOptimizerRuntime,
 )
 
-_SUPPORTED_MEGATRON_CORE_VERSION = "0.17.0"
+_SUPPORTED_MEGATRON_CORE_VERSION = "0.19.0"
 _FOREACH_MIN_ACTIVE_PARTS = 32
 
 _PARAM_GROUP_OWNERSHIP_KEYS = (

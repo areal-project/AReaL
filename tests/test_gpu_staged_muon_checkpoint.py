@@ -38,7 +38,7 @@ def _metadata(rank: int) -> dict:
         )
     return {
         "schema_version": 2,
-        "megatron_core_version": "0.17.0",
+        "megatron_core_version": "0.19.0",
         "emerging_optimizers_version": "0.3.0",
         "topology": {"world_size": 2, "global_rank": rank, "groups": groups},
         "algorithm": {},

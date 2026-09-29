@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from megatron.core.optimizer.muon import TensorParallelMuon
+from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
 
 from areal.engine.megatron_utils.gpu_staged_muon import (
     GPUStagedMuon,
@@ -172,8 +172,8 @@ def test_muon_steps_match_official_tensor_parallel_muon(
     baseline_params = [torch.nn.Parameter(value.float()) for value in initial]
     kwargs = {
         "lr": 0.03,
-        "momentum_beta": 0.8,
-        "use_nesterov": use_nesterov,
+        "momentum": 0.8,
+        "nesterov": use_nesterov,
         "weight_decay": 0.02,
         "use_decoupled_weight_decay": True,
         "fp32_matmul_prec": "highest",
@@ -181,7 +181,7 @@ def test_muon_steps_match_official_tensor_parallel_muon(
         "num_ns_steps": 3,
         "scale_mode": "spectral",
         "extra_scale_factor": 1.0,
-        "mode": "duplicated",
+        "tp_mode": "duplicated",
     }
     baseline = TensorParallelMuon(baseline_params, **kwargs)
     staged = GPUStagedMuon(
@@ -189,7 +189,7 @@ def test_muon_steps_match_official_tensor_parallel_muon(
             {
                 "params": staged_params,
                 "lr": kwargs["lr"],
-                "momentum": kwargs["momentum_beta"],
+                "momentum": kwargs["momentum"],
                 "weight_decay": kwargs["weight_decay"],
             }
         ],
@@ -250,13 +250,13 @@ def test_muon_checkpoint_resume_matches_official_tensor_parallel_muon() -> None:
     initial = torch.randn(6, 5, device="cuda", dtype=torch.bfloat16)
     kwargs = {
         "lr": 0.02,
-        "momentum_beta": 0.85,
-        "use_nesterov": True,
+        "momentum": 0.85,
+        "nesterov": True,
         "weight_decay": 0.03,
         "use_decoupled_weight_decay": True,
         "fp32_matmul_prec": "highest",
         "num_ns_steps": 3,
-        "mode": "duplicated",
+        "tp_mode": "duplicated",
     }
     baseline_param = torch.nn.Parameter(initial.float())
     baseline = TensorParallelMuon([baseline_param], **kwargs)
@@ -268,7 +268,7 @@ def test_muon_checkpoint_resume_matches_official_tensor_parallel_muon() -> None:
                 {
                     "params": [param],
                     "lr": kwargs["lr"],
-                    "momentum": kwargs["momentum_beta"],
+                    "momentum": kwargs["momentum"],
                     "weight_decay": kwargs["weight_decay"],
                 }
             ],
@@ -459,7 +459,7 @@ def test_muon_topology_accepts_explicit_expert_partition_metadata() -> None:
     )
     optimizer = SimpleNamespace(
         pg_collection=pg_collection,
-        mode="duplicated",
+        tp_mode="duplicated",
         param_groups=[{"params": [param], "is_expert_parallel": True}],
     )
     official = SimpleNamespace(pg_collection=pg_collection)

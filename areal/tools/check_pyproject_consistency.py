@@ -37,6 +37,8 @@ ESCAPABLE_PACKAGES: frozenset[str] = frozenset(
         "torchvision",
         "sglang",
         "vllm",
+        "flashinfer-cubin",
+        "flashinfer-python",
         "nvidia-cudnn-cu12",
         "openai",
         "soundfile",

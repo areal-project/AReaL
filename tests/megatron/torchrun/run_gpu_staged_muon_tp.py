@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
-from megatron.core.optimizer.muon import TensorParallelMuon
+from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
 
 from areal.engine.megatron_utils.gpu_staged_muon import (
     GPUStagedMuon,
@@ -85,17 +85,22 @@ def _run_case(
         param.expert_tp = expert_tp
         param.is_qkv = split_qkv
 
-    pg_collection = SimpleNamespace(tp=tp_group, expt_tp=expt_tp_group)
+    pg_collection = SimpleNamespace(
+        tp=tp_group,
+        expt_tp=expt_tp_group,
+        gtp_remat=None,
+        expt_gtp_remat=None,
+    )
     kwargs = {
         "lr": 0.025,
-        "momentum_beta": 0.82,
-        "use_nesterov": True,
+        "momentum": 0.82,
+        "nesterov": True,
         "weight_decay": 0.015,
         "use_decoupled_weight_decay": True,
         "fp32_matmul_prec": "highest",
         "num_ns_steps": 3,
         "pg_collection": pg_collection,
-        "mode": "duplicated",
+        "tp_mode": "duplicated",
         "split_qkv": split_qkv,
         "is_qkv_fn": lambda param: getattr(param, "is_qkv", False),
         "qkv_split_shapes": (4, 2, 2) if split_qkv else None,
@@ -110,7 +115,7 @@ def _run_case(
             {
                 "params": [staged_param],
                 "lr": kwargs["lr"],
-                "momentum": kwargs["momentum_beta"],
+                "momentum": kwargs["momentum"],
                 "weight_decay": kwargs["weight_decay"],
                 "is_expert_parallel": expert_tp,
             }

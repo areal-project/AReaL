@@ -76,6 +76,7 @@ LOGGER_COLORS_EXACT = {
     # Dataset - green
     "Dataset": "light_green",
     "CLEVR70KDataset": "light_green",
+    "ViRL39KDataset": "light_green",
     # Trainers - green
     "RLTrainer": "light_green",
     "SFTTrainer": "light_green",

@@ -134,7 +134,7 @@ def _fp32_lm_head_forward_impl(
     Casting the operands here keeps the matmul and the bias add in fp32 while
     leaving the rest of the model in its configured dtype.
 
-    Mirrors ``ColumnParallelLinear`` from megatron-core, verified against 0.17.0.
+    Mirrors ``ColumnParallelLinear`` from megatron-core, verified against 0.19.0.
     The collective helpers gained a ``group`` keyword in newer releases, so the
     calls fall back to the positional form when it is absent.
 
@@ -145,7 +145,7 @@ def _fp32_lm_head_forward_impl(
     conditions or the collective signatures, this reimplementation drifts
     silently; ``_enable_fp32_lm_head_forward`` therefore steps aside when the
     installed megatron-core exposes a native ``ColumnParallelLinearFP32``
-    (absent as of 0.17.0).
+    (absent as of 0.19.0).
     """
     if sequence_parallel:
         try:
@@ -490,6 +490,9 @@ def make_mcore_model(
                 # Weight of the auxiliary MTP loss; consumed by Megatron-Core's
                 # process_mtp_loss via config.mtp_loss_scaling_factor.
                 provider.mtp_loss_scaling_factor = mcore_config.mtp_loss_scaling_factor
+                # MCore 0.19 natively isolates the auxiliary MTP head from the
+                # backbone, embedding, and tied or untied LM head.
+                provider.mtp_detach_heads = True
         elif has_mtp:
             logger.warning(
                 "Dropping MTP head (mtp_num_layers=%s -> None); not used in RL and not "

@@ -8,6 +8,10 @@ from mathruler.grader import extract_boxed_content
 from PIL import Image
 from PIL.Image import Image as ImageObject
 
+from areal.utils import logging
+
+logger = logging.getLogger("ViRL39KDataset")
+
 
 def convert_image(
     image: ImageObject,
@@ -64,6 +68,20 @@ def get_virl39k_rl_dataset(
         img_folder_path = os.path.dirname(path)
         if not os.path.isdir(os.path.join(img_folder_path, "images")):
             raise ValueError(f"images folder not found at {img_folder_path}")
+
+    # extract_boxed_content returns the literal "None" when a reference has no
+    # closing brace (e.g. an unbalanced `\left\{`). Such a gold answer would
+    # match every reply without a boxed answer, so drop these rows.
+    num_rows = len(dataset)
+    dataset = dataset.filter(
+        lambda answer: extract_boxed_content(answer) != "None",
+        input_columns="answer",
+    )
+    if len(dataset) < num_rows:
+        logger.warning(
+            f"Dropped {num_rows - len(dataset)} ViRL39K rows whose boxed "
+            "answer could not be extracted."
+        )
 
     def process(example):
         problem = example["question"]

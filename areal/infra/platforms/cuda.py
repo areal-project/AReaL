@@ -69,12 +69,20 @@ class CudaPlatform(Platform):
 
             pynvml.nvmlInit()
             nvml_initialized = True
-            handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
+            # CUDA ordinals are relative to CUDA_VISIBLE_DEVICES, while NVML
+            # indices are physical. Single-GPU workers all have local_rank=0.
+            # Resolve through CUDA's device UUID so each worker binds to its GPU.
+            device_uuid = str(torch.cuda.get_device_properties(local_rank).uuid)
+            # PyTorch exposes the bare UUID; NVML expects its device prefix.
+            if not device_uuid.startswith(("GPU-", "MIG-")):
+                device_uuid = f"GPU-{device_uuid}"
+            handle = pynvml.nvmlDeviceGetHandleByUUID(device_uuid)
             pynvml.nvmlDeviceSetCpuAffinity(handle)
             cpu_set = os.sched_getaffinity(0)
             logger.info(
-                "Set NUMA affinity for GPU %s: bound to %s CPU cores.",
+                "Set NUMA affinity for CUDA device %s (%s): bound to %s CPU cores.",
                 local_rank,
+                device_uuid,
                 len(cpu_set),
             )
         except ImportError:

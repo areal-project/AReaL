@@ -34,6 +34,10 @@ class DataProxyConfig:
     prm: PRMConfig = field(default_factory=PRMConfig)
 
     def __post_init__(self) -> None:
+        if self.prm.enabled and self.prm.scorers and self.prm.error_policy != "reject":
+            raise ValueError(
+                "PRM keep_original error policy is only supported by the v1 proxy"
+            )
         if (
             self.prm.enabled
             and self.prm.scorers
