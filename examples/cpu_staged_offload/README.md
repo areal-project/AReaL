@@ -91,3 +91,47 @@ peaks were essentially unchanged, with the staged run peaking during AWEX exchan
 These short runs validate execution and memory use, not convergence or multi-node
 behavior. Optimizer staging also requires substantial pinned host memory; the validation
 node had 1.5 TiB of RAM.
+
+## HARTS tree training for Qwen3.5
+
+`dapo-math_grpo_qwen3_5_harts.yaml` enables trie sharing during actor training. It keeps
+the same Qwen3.5 model, DAPO Math data, and Megatron/SGLang parallel layout as the
+configuration above. Full-attention layers use the tree mask. Gated DeltaNet layers use
+ancestor-aware convolution and a compact state-replay plan. The actor's chunked LM-head
+loss remains enabled (`enable_chunked_logits=true`, `lm_head_loss_chunk_size=1024`);
+distinct rollout labels can share a compact logit row. The current Megatron Bridge path
+supports text-only Qwen3.5 batches and no context parallelism.
+
+With the model and dataset environment variables set as above, run:
+
+```bash
+export AREAL_PROXY_ADMIN_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python examples/cpu_staged_offload/dapo-math_rl_cpu_staged.py \
+  --config examples/cpu_staged_offload/dapo-math_grpo_qwen3_5_harts.yaml \
+  trial_name=harts actor.megatron.cpu_staged_offload.enabled=false
+```
+
+For the comparison baseline, use `dapo-math_grpo_qwen3_5_cpu_staged.yaml` with the same
+command-line override and a different `trial_name`. CPU staged offload was disabled in
+both comparison runs: the installed Megatron-Core 0.17.0 does not meet this branch's
+Qwen3.5 staged optimizer compatibility guard. Both runs used seed 1, one eight-L20X
+node, three PPO updates, eight prompts per step, two samples per prompt, and at most 128
+generated tokens. All three PPO and AWEX weight updates completed in both runs. W&B
+project: `wht_tree_training`.
+
+| Measure                                                    |  Baseline |    HARTS |
+| ---------------------------------------------------------- | --------: | -------: |
+| Mean actor training step, steps 2–3                        |    7.81 s |   4.90 s |
+| Actor input tokens / actor training time, steps 2–3        |     611/s |    996/s |
+| Total training time, three steps                           |  883.18 s | 862.25 s |
+| GPU used at PPO-update checkpoint, highest of three steps  | 100.51 GB | 96.05 GB |
+| Compact tree tokens / original tokens, mean of three steps |         — |    0.688 |
+
+The actor training step is 1.59× faster on the two post-compilation steps, and actor
+input-token throughput for those steps is 1.63× higher. Total training time is only 2.4%
+lower because AWEX weight exchange dominates this short run. The memory row is an
+update-checkpoint reading, not a peak across all phases. Generated samples and rewards
+differed between runs despite the shared seed; these measurements validate the execution
+path and give a short-run performance comparison, not convergence or statistical
+significance. The current trie grouping uses AReaL's existing first-fit packing rather
+than the paper's data-parallel-aware scheduler.
