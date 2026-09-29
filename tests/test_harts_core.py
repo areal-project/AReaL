@@ -40,10 +40,19 @@ def _recurrent_kernel(q, k, v, g, beta, *, initial_state, cu_seqlens_cpu, **kwar
     return torch.stack(outputs).unsqueeze(0), torch.stack(final_states)
 
 
-@pytest.mark.parametrize("fork_depth", [7, 8, 9])
-def test_tree_gdn_matches_independent_sequences_and_gradients(fork_depth):
+@pytest.mark.parametrize(
+    ("fork_depth", "nested", "expected_calls"),
+    [(7, False, 1), (8, False, 2), (9, False, 2), (7, True, 2)],
+)
+def test_tree_gdn_matches_independent_sequences_and_gradients(
+    fork_depth, nested, expected_calls
+):
     prefix = list(range(1, fork_depth + 1))
-    sequences = [prefix + [101, 102], prefix + [201, 202]]
+    sequences = (
+        [prefix + [101, 102, 103], prefix + [101, 102, 201], prefix + [301]]
+        if nested
+        else [prefix + [101, 102], prefix + [201, 202]]
+    )
     trie = _trie(sequences)
     plan = plan_linear_attention(trie, chunk_size=8)
     torch.manual_seed(7)
@@ -64,7 +73,7 @@ def test_tree_gdn_matches_independent_sequences_and_gradients(fork_depth):
         return _recurrent_kernel(*args, **kwargs)
 
     actual = run_linear_attention_plan(*inputs, plan, counted_kernel)
-    assert calls == (1 if fork_depth == 7 else 2)
+    assert calls == expected_calls
     tree_rows = []
     independent = []
     for sequence_id in trie.all_sequence_ids:
