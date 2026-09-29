@@ -6,7 +6,11 @@ import torch
 from areal.api.cli_args import MicroBatchSpec
 from areal.models.tree_attn.harts_core import run_linear_attention_plan
 from areal.models.tree_attn.harts_plan import plan_linear_attention
-from areal.models.tree_attn.harts_runtime import weighted_router_stats
+from areal.models.tree_attn.harts_runtime import (
+    _TOKEN_MULTIPLICITY,
+    TreeTopKRouter,
+    weighted_router_stats,
+)
 from areal.models.tree_attn.tree import _greedy_build_tries, build_packed_tree_batch
 
 
@@ -120,6 +124,24 @@ def test_router_multiplicity_matches_unpacked_trajectory_statistics():
     ]
     expected_grad = torch.autograd.grad(expected_scores.sum(), scores)[0]
     torch.testing.assert_close(actual_grad, expected_grad)
+
+
+def test_tree_expert_bias_counts_semantic_tokens_once():
+    class Router:
+        enable_expert_bias = True
+        local_tokens_per_expert = torch.zeros(2)
+
+    router = Router()
+    routing_map = torch.tensor([[True, False], [False, True], [True, False]])
+    padding_mask = torch.tensor([[False], [True], [False]])
+    token = _TOKEN_MULTIPLICITY.set(torch.tensor([3.0, 2.0, 1.0]))
+    try:
+        TreeTopKRouter._apply_expert_bias(router, routing_map, padding_mask)
+        with torch.no_grad():
+            TreeTopKRouter._apply_expert_bias(router, routing_map, padding_mask)
+    finally:
+        _TOKEN_MULTIPLICITY.reset(token)
+    torch.testing.assert_close(router.local_tokens_per_expert, torch.tensor([4.0, 0.0]))
 
 
 def test_compact_tree_padding_uses_distinct_tokens_not_capacity():

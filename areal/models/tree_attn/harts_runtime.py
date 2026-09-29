@@ -156,6 +156,18 @@ def weighted_router_stats(
     return weighted_scores, counts, multiplicity.sum()
 
 
+def _local_tree_multiplicity(
+    router: TopKRouter, multiplicity: torch.Tensor, local_rows: int
+) -> torch.Tensor:
+    if multiplicity.numel() == local_rows:
+        return multiplicity
+    tp_size = router.tp_group.size()
+    if multiplicity.numel() != local_rows * tp_size:
+        raise ValueError("tree multiplicity does not match router token layout")
+    rank = router.tp_group.rank()
+    return multiplicity[rank * local_rows : (rank + 1) * local_rows]
+
+
 class TreeTopKRouter(TopKRouter):
     """Weight Qwen3.5 global auxiliary routing loss by trajectory multiplicity."""
 
@@ -176,13 +188,9 @@ class TreeTopKRouter(TopKRouter):
             switch_load_balancing_loss_func,
         )
 
-        local_rows = scores_for_aux_loss.shape[0]
-        if multiplicity.numel() != local_rows:
-            tp_size = self.tp_group.size()
-            if multiplicity.numel() != local_rows * tp_size:
-                raise ValueError("tree multiplicity does not match router token layout")
-            rank = self.tp_group.rank()
-            multiplicity = multiplicity[rank * local_rows : (rank + 1) * local_rows]
+        multiplicity = _local_tree_multiplicity(
+            self, multiplicity, scores_for_aux_loss.shape[0]
+        )
         weighted_scores, counts, local_tokens = weighted_router_stats(
             scores_for_aux_loss, routing_map, multiplicity
         )
@@ -210,6 +218,23 @@ class TreeTopKRouter(TopKRouter):
             valid_token_count=local_tokens,
         )
 
+    def _apply_expert_bias(
+        self, routing_map: torch.Tensor, padding_mask: torch.Tensor | None = None
+    ) -> None:
+        multiplicity = _TOKEN_MULTIPLICITY.get()
+        if multiplicity is None:
+            return TopKRouter._apply_expert_bias(self, routing_map, padding_mask)
+        if self.enable_expert_bias and torch.is_grad_enabled():
+            multiplicity = _local_tree_multiplicity(
+                self, multiplicity, routing_map.shape[0]
+            )
+            with torch.no_grad():
+                if padding_mask is not None:
+                    routing_map = routing_map & (~padding_mask)
+                self.local_tokens_per_expert += (
+                    routing_map.float() * multiplicity[:, None]
+                ).sum(dim=0)
+
 
 def patch_qwen35_tree_model(model: torch.nn.Module) -> None:
     """Replace only GDN and full-attention cores; preserve checkpoint keys."""
@@ -220,12 +245,17 @@ def patch_qwen35_tree_model(model: torch.nn.Module) -> None:
         elif type(module) is TransformerLayer:
             module.forward = MethodType(TreeTransformerLayer.forward, module)
         elif type(module) is TopKRouter:
+            if module.config.moe_expert_capacity_factor is not None:
+                raise ValueError("tree routing requires no token dropping")
             if module.get_aux_loss_coeff("aux_loss") or module.get_aux_loss_coeff(
                 "seq_aux_loss"
             ):
                 raise ValueError("tree routing supports global auxiliary loss only")
             module._apply_global_aux_loss = MethodType(
                 TreeTopKRouter._apply_global_aux_loss, module
+            )
+            module._apply_expert_bias = MethodType(
+                TreeTopKRouter._apply_expert_bias, module
             )
         elif isinstance(module, SelfAttention):
             old = module.core_attention
