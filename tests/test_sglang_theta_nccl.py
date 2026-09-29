@@ -25,6 +25,9 @@ def launched_servers(monkeypatch):
         return SimpleNamespace(pid=1)
 
     monkeypatch.setattr(sglang_remote.subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        sglang_remote, "find_free_ports", lambda *_args, **_kwargs: [19001]
+    )
     return calls
 
 
@@ -70,6 +73,8 @@ def test_launch_selects_native_theta_only_without_awex(
         "8",
         "--port",
         "30000",
+        "--nccl-port",
+        "19001",
     ]
     assert backend.get_health_check_request().endpoint == (
         "/model_info" if awex else "/health"

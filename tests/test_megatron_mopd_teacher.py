@@ -373,7 +373,13 @@ def test_awex_eval_restores_servers_before_eval_and_commits_all_stats(monkeypatc
         "continue",
     ]
     events.append("evaluate")
-    trainer._export_stats_then_restore_awex_rollout(0, 9, 9, prepared_stats=stats)
+    trainer._export_stats_then_restore_awex_rollout(
+        0,
+        9,
+        9,
+        actor_stats_before_exchange={"actor_before_exchange": 4.0},
+        prepared_stats=stats,
+    )
 
     assert events == [
         "actor",
@@ -390,6 +396,7 @@ def test_awex_eval_restores_servers_before_eval_and_commits_all_stats(monkeypatc
             9,
             9,
             {
+                "actor_before_exchange": 4.0,
                 "actor": 1.0,
                 "train_rollout": 1.0,
                 "eval_rollout": 1.0,

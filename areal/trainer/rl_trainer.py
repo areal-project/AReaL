@@ -725,19 +725,25 @@ class PPOTrainer:
         epoch: int,
         epoch_step: int,
         global_step: int,
+        actor_stats_before_exchange: dict[str, float] | None = None,
         prepared_stats: dict[str, Any] | None = None,
     ) -> None:
         """Commit prepared evaluation stats, or export then restore AWEX KV."""
         if prepared_stats is not None:
+            stats = dict(actor_stats_before_exchange or {})
+            stats.update(prepared_stats)
             if self.eval_rollout is not None:
-                prepared_stats.update(self.eval_rollout.export_stats())
+                stats.update(self.eval_rollout.export_stats())
             # Eval and clear-batch timings were recorded after the early actor
             # export. Drain only local CPU statistics, not another GPU RPC.
-            prepared_stats.update(stats_tracker.export_all())
-            self._commit_stats(epoch, epoch_step, global_step, prepared_stats)
+            stats.update(stats_tracker.export_all())
+            self._commit_stats(epoch, epoch_step, global_step, stats)
             return
         self._export_and_commit_stats(
-            epoch=epoch, epoch_step=epoch_step, global_step=global_step
+            epoch=epoch,
+            epoch_step=epoch_step,
+            global_step=global_step,
+            actor_stats_before_exchange=actor_stats_before_exchange,
         )
         if self.eval_rollout is None:
             self._restore_awex_rollout_after_stats()
@@ -1178,6 +1184,17 @@ class PPOTrainer:
                     global_step=global_step,
                 )
 
+            # Actor statistics contain detached per-token CUDA clones until
+            # export(reset=True).  In AWEX colocation those clones otherwise
+            # survive through weight exchange and overlap SGLang's resumed
+            # weights by several GiB.  Aggregate them to Python scalars before
+            # the ownership handoff, then carry the scalars to the normal
+            # end-of-step commit point.  A post-exchange export still collects
+            # controller/update timing recorded after this boundary.
+            actor_stats_before_exchange = None
+            if self._is_v1_awex_colocate(config):
+                actor_stats_before_exchange = self.actor.export_stats()
+
             # pause inference for updating weights, save, and evaluation
             self.rollout.pause()
 
@@ -1281,6 +1298,7 @@ class PPOTrainer:
                     epoch=epoch,
                     epoch_step=step,
                     global_step=global_step,
+                    actor_stats_before_exchange=actor_stats_before_exchange,
                     prepared_stats=prepared_stats,
                 )
 
@@ -1923,9 +1941,16 @@ class PPOTrainer:
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
-    def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
+    def _export_and_commit_stats(
+        self,
+        epoch: int,
+        epoch_step: int,
+        global_step: int,
+        actor_stats_before_exchange: dict[str, float] | None = None,
+    ):
         # Upload statistics to the logger (e.g., wandb)
-        stats = self.actor.export_stats()
+        stats = dict(actor_stats_before_exchange or {})
+        stats.update(self.actor.export_stats())
         stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
