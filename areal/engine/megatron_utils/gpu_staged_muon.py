@@ -1018,8 +1018,13 @@ def get_megatron_optimizer_with_dist_muon(
         raise RuntimeError(
             f"distributed Muon supports megatron-core 0.19.0 exactly, found {version}"
         )
-    if mcore_config.optimizer != "dist_muon":
-        raise ValueError("distributed Muon requires optimizer='dist_muon'")
+    if (
+        mcore_config.optimizer != "muon"
+        or not mcore_config.use_layer_wise_distributed_optimizer
+    ):
+        raise ValueError(
+            "distributed Muon requires the MCore layer-wise Muon optimizer"
+        )
     if mcore_config.use_distributed_optimizer:
         raise ValueError("distributed Muon does not use Megatron dist-opt")
     if mcore_config.muon_scalar_optimizer != "adam":
@@ -1029,18 +1034,16 @@ def get_megatron_optimizer_with_dist_muon(
     if mcore_config.use_precision_aware_optimizer:
         raise ValueError("distributed Muon does not support precision-aware optimizer")
 
+    from megatron.core.optimizer import get_megatron_optimizer
     from megatron.core.optimizer.layer_wise_optimizer import (
         LayerWiseDistributedOptimizer,
     )
-    from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 
     build_config = copy.copy(mcore_config)
-    optimizer = get_megatron_muon_optimizer(
+    optimizer = get_megatron_optimizer(
         build_config,
         model,
-        config_overrides=None,
         use_gloo_process_groups=True,
-        layer_wise_distributed_optimizer=True,
         pg_collection=pg_collection,
     )
     if type(optimizer) is not LayerWiseDistributedOptimizer:
@@ -3485,8 +3488,11 @@ def get_megatron_optimizer_with_gpu_staged_muon(
         )
     if mcore_config.use_distributed_optimizer:
         raise ValueError("staged Muon uses official layer-wise ownership, not dist-opt")
-    if mcore_config.optimizer != "dist_muon":
-        raise ValueError("staged Muon requires optimizer='dist_muon'")
+    if (
+        mcore_config.optimizer != "muon"
+        or not mcore_config.use_layer_wise_distributed_optimizer
+    ):
+        raise ValueError("staged Muon requires the MCore layer-wise Muon optimizer")
     if mcore_config.muon_scalar_optimizer != "adam":
         raise ValueError("staged Muon requires AdamW for scalar parameters")
     if not mcore_config.decoupled_weight_decay:
@@ -3536,16 +3542,12 @@ def get_megatron_optimizer_with_gpu_staged_muon(
 
     from megatron.core.optimizer import (
         HAVE_EMERGING_OPTIMIZERS,
-    )
-    from megatron.core.optimizer import (
-        get_megatron_optimizer as get_scalar_optimizer,
+        get_megatron_optimizer,
     )
     from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
     from megatron.core.optimizer.layer_wise_optimizer import (
         LayerWiseDistributedOptimizer,
     )
-    from megatron.core.optimizer.muon import get_megatron_muon_optimizer
-    from megatron.core.optimizer.optimizer import FP32Optimizer
 
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
@@ -3607,37 +3609,12 @@ def get_megatron_optimizer_with_gpu_staged_muon(
     build_config.overlap_param_gather_with_optimizer_step = False
 
     has_muon_parameters = any(_is_muon_parameter(p) for p in trainable)
-    if has_muon_parameters:
-        official = get_megatron_muon_optimizer(
-            build_config,
-            model,
-            use_gloo_process_groups=False,
-            layer_wise_distributed_optimizer=True,
-            pg_collection=pg_collection,
-        )
-    else:
-        # Keep an explicit empty Muon leaf in the staged chain when the model
-        # has only scalar-optimizer parameters. Build its scalar owner groups
-        # through MCore and the official layer-wise sharder.
-        resolved_pg_collection = (
-            pg_collection
-            if pg_collection is not None
-            else ProcessGroupCollection.use_mpu_process_groups()
-        )
-        build_config.optimizer = "adam"
-        scalar_chain = get_scalar_optimizer(
-            build_config,
-            model,
-            use_gloo_process_groups=False,
-            pg_collection=resolved_pg_collection,
-        )
-        official = LayerWiseDistributedOptimizer(
-            list(scalar_chain.chained_optimizers),
-            build_config,
-            resolved_pg_collection,
-            init_state_fn_list=None,
-            model_chunks=None,
-        )
+    official = get_megatron_optimizer(
+        build_config,
+        model,
+        use_gloo_process_groups=False,
+        pg_collection=pg_collection,
+    )
 
     if type(official) is not LayerWiseDistributedOptimizer:
         raise TypeError(
@@ -3647,24 +3624,13 @@ def get_megatron_optimizer_with_gpu_staged_muon(
         raise RuntimeError("staged Muon MVP requires synchronous official all-gather")
     _validate_official_ownership(official, trainable)
 
-    official_bases = []
-    for official_leaf in official.chained_optimizers:
-        if isinstance(official_leaf, FP32Optimizer):
-            base = official_leaf.optimizer
-            is_stub = official_leaf.is_stub_optimizer
-        else:
-            base = official_leaf
-            is_stub = False
-        if is_stub:
-            if base is not None or official_leaf.param_groups:
-                raise RuntimeError("malformed official empty scalar optimizer leaf")
-            official_bases.append(None)
-            continue
-        if base is None:
-            raise RuntimeError("official non-stub Muon leaf has no base optimizer")
+    # MCore 0.19 shards the raw Muon/Adam optimizers before wrapping BF16
+    # leaves. The copied build config disables that wrapper so these leaves
+    # expose the official rank-local parameter groups without GPU master state.
+    official_bases = list(official.chained_optimizers)
+    for base in official_bases:
         if _has_materialized_parameter_state(base):
             raise RuntimeError("official Muon leaf allocated state before staged bind")
-        official_bases.append(base)
     muon_leaf_count = sum(
         isinstance(base, TensorParallelMuon) for base in official_bases
     )

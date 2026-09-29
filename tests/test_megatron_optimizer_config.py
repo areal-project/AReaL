@@ -345,7 +345,8 @@ def test_cpu_staged_dist_muon_selects_layerwise_factory(monkeypatch) -> None:
     assert config.use_distributed_optimizer is False
     assert config.use_precision_aware_optimizer is False
     assert config.main_grads_dtype is torch.float32
-    assert config.optimizer == "dist_muon"
+    assert config.optimizer == "muon"
+    assert config.use_layer_wise_distributed_optimizer is True
     assert config.muon_momentum == 0.91
     assert config.muon_nesterov is True
     assert config.muon_num_ns_steps == 4
@@ -383,7 +384,8 @@ def test_native_dist_muon_selects_official_layerwise_factory(monkeypatch) -> Non
     )
 
     assert captured["model"] is engine.model
-    assert captured["config"].optimizer == "dist_muon"
+    assert captured["config"].optimizer == "muon"
+    assert captured["config"].use_layer_wise_distributed_optimizer is True
     assert captured["config"].use_distributed_optimizer is False
 
 

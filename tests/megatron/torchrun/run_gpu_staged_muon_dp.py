@@ -13,12 +13,13 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
-from megatron.core.optimizer.muon import get_megatron_muon_optimizer
+from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 from areal.engine.megatron_utils.gpu_staged_muon import (
     GPUStagedMuonConfig,
+    get_megatron_optimizer_with_dist_muon,
     get_megatron_optimizer_with_gpu_staged_muon,
 )
 
@@ -50,6 +51,30 @@ class _TinyMuonModel(torch.nn.Module):
             self.experts_weight.partition_stride = 1
 
 
+class _SingleParamModel(torch.nn.Module):
+    def __init__(self, initial: torch.Tensor, *, expert: bool, tp_size: int) -> None:
+        super().__init__()
+        name = "experts_weight" if expert else "bias"
+        param = torch.nn.Parameter(initial.clone())
+        setattr(self, name, param)
+        if expert:
+            param.allreduce = False
+            if tp_size > 1:
+                param.partition_dim = 0
+                param.partition_stride = 1
+        self.config = SimpleNamespace(
+            num_attention_heads=4,
+            num_query_groups=2,
+            kv_channels=2,
+            context_parallel_size=1,
+        )
+        self.ddp_config = SimpleNamespace(
+            use_megatron_fsdp=False,
+            use_distributed_optimizer=False,
+            num_distributed_optimizer_instances=1,
+        )
+
+
 def _make_pg_collection() -> ProcessGroupCollection:
     return ProcessGroupCollection.use_mpu_process_groups(
         required_pgs=[
@@ -69,7 +94,8 @@ def _make_pg_collection() -> ProcessGroupCollection:
 
 def _make_config() -> OptimizerConfig:
     return OptimizerConfig(
-        optimizer="dist_muon",
+        optimizer="muon",
+        use_layer_wise_distributed_optimizer=True,
         lr=0.02,
         min_lr=0.0,
         weight_decay=0.015,
@@ -124,11 +150,10 @@ def _run_dp2_outer(tp_size: int) -> None:
     )
     baseline_config = _make_config()
     baseline_build_config = copy.copy(baseline_config)
-    baseline = get_megatron_muon_optimizer(
+    baseline = get_megatron_optimizer(
         baseline_build_config,
         [baseline_model],
         use_gloo_process_groups=False,
-        layer_wise_distributed_optimizer=True,
         pg_collection=pg_collection,
     )
 
@@ -171,6 +196,51 @@ def _run_dp2_outer(tp_size: int) -> None:
             dist.all_gather(replicas, staged_param.detach(), group=pg_collection.dp)
             for replica in replicas[1:]:
                 torch.testing.assert_close(replica, replicas[0], rtol=0.0, atol=0.0)
+
+    _run_single_param_case(pg_collection, tp_size, expert=False)
+    _run_single_param_case(pg_collection, tp_size, expert=True)
+
+
+def _run_single_param_case(
+    pg_collection: ProcessGroupCollection, tp_size: int, *, expert: bool
+) -> None:
+    """Cover scalar-only staging and the native all-expert gather edge."""
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    generator = torch.Generator(device=device).manual_seed(20260915 + tp_rank)
+    shape = (4, 4) if expert else (4,)
+    initial = torch.randn(
+        shape, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    staged_model = _SingleParamModel(initial, expert=expert, tp_size=tp_size)
+    baseline_model = _SingleParamModel(initial, expert=expert, tp_size=tp_size)
+    staged = get_megatron_optimizer_with_gpu_staged_muon(
+        _make_config(),
+        [staged_model],
+        GPUStagedMuonConfig(buffer_count=1, slot_size_mb=1),
+        pg_collection=pg_collection,
+    )
+    baseline = get_megatron_optimizer_with_dist_muon(
+        _make_config(), [baseline_model], pg_collection=pg_collection
+    )
+    expected_kinds = ["muon"] if expert else ["muon", "scalar_adamw"]
+    assert [leaf.optimizer.optimizer_kind for leaf in staged.chained_optimizers] == (
+        expected_kinds
+    )
+    if expert:
+        assert staged.dp_cp_params_list is not None
+        assert all(not owner for owner in staged.dp_cp_params_list)
+    staged_param = next(staged_model.parameters())
+    baseline_param = next(baseline_model.parameters())
+    for step in range(2):
+        grad = torch.randn(
+            shape, generator=generator, device=device, dtype=torch.bfloat16
+        )
+        staged_param.main_grad = grad.mul(step + 1)
+        baseline_param.main_grad = staged_param.main_grad.clone()
+        assert baseline.step()[0]
+        assert staged.step()[0]
+        torch.testing.assert_close(staged_param, baseline_param, rtol=4e-3, atol=4e-3)
 
 
 def main() -> None:

@@ -2277,7 +2277,7 @@ class MegatronEngine(TrainEngine):
         )
         # Make megatron optimizer config
         mcore_opt_config = MCoreOptimizerConfig(
-            optimizer=self.optimizer_config.type,
+            optimizer="muon" if use_dist_muon else self.optimizer_config.type,
             lr=self.optimizer_config.lr,
             min_lr=self.optimizer_config.min_lr_ratio * self.optimizer_config.lr,
             weight_decay=self.optimizer_config.weight_decay,
@@ -2287,6 +2287,7 @@ class MegatronEngine(TrainEngine):
             adam_beta2=self.optimizer_config.beta2,
             adam_eps=self.optimizer_config.eps,
             use_distributed_optimizer=use_distributed_optimizer,
+            use_layer_wise_distributed_optimizer=use_dist_muon,
             params_dtype=self.dtype,
             clip_grad=self.optimizer_config.gradient_clipping,
             fp8_recipe=(self.fp8_config.recipe if self.enable_fp8 else None),
