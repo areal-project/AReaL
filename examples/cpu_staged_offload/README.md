@@ -100,11 +100,13 @@ configuration above. Full-attention layers use the tree mask. Gated DeltaNet lay
 ancestor-aware convolution and a compact state-replay plan. The actor's chunked LM-head
 loss remains enabled (`enable_chunked_logits=true`, `lm_head_loss_chunk_size=1024`);
 distinct rollout labels can share a compact logit row. The current Megatron Bridge path
-supports text-only Qwen3.5 batches and no context parallelism. Public FLA exports only
-the final state of each packed sequence. For nested forks that need an intermediate
-state, this adapter packs an additional state-only prefix in the same call. It preserves
-the planner's call depth but may repeat linear-attention core work beyond the paper's
-selective-state kernel bound.
+supports text-only Qwen3.5 batches and no context parallelism. A global planner groups
+trajectories by shared prefixes, assigns synchronized tree slots to DP replicas, and
+exchanges the CPU rows needed by each replica before Megatron packing. Public FLA
+exports only the final state of each packed sequence. For nested forks that need an
+intermediate state, this adapter packs an additional state-only prefix in the same call.
+It preserves the planner's call depth but may repeat linear-attention core work beyond
+the paper's selective-state kernel bound.
 
 With the model and dataset environment variables set as above, run:
 
@@ -123,24 +125,23 @@ node, three PPO updates, eight prompts per step, two samples per prompt, and at 
 generated tokens. All three PPO and AWEX weight updates completed in both runs. W&B
 project: `wht_tree_training`
 ([baseline](http://8.150.1.98:8080/sct-test/wht_tree_training/runs/wht_tree_training_baseline-qwen35-20260929_train),
-[HARTS](http://8.150.1.98:8080/sct-test/wht_tree_training/runs/wht_tree_training_harts-qwen35-roundstate-v2-20260929_train)).
+[HARTS with global scheduling](http://8.150.1.98:8080/sct-test/wht_tree_training/runs/wht_tree_training_harts-qwen35-global-dp-20260930_train)).
 
 | Measure                                                    |  Baseline |    HARTS |
 | ---------------------------------------------------------- | --------: | -------: |
-| Mean actor training step, steps 2–3                        |    7.81 s |   3.76 s |
-| Actor input tokens / actor training time, steps 2–3        |     611/s |  1,314/s |
-| Total training time, three steps                           |  883.18 s | 936.20 s |
-| AWEX weight-update time, sum of three steps                |  708.67 s | 848.57 s |
-| GPU used at PPO-update checkpoint, highest of three steps  | 100.51 GB | 96.00 GB |
-| Compact tree tokens / original tokens, mean of three steps |         — |    0.686 |
+| Mean actor training step, steps 2–3                        |    7.81 s |   4.44 s |
+| Actor input tokens / actor training time, steps 2–3        |     611/s |    996/s |
+| Total training time, three steps                           |  883.18 s | 899.21 s |
+| AWEX weight-update time, sum of three steps                |  708.67 s | 800.57 s |
+| GPU used at PPO-update checkpoint, highest of three steps  | 100.51 GB | 97.20 GB |
+| Compact tree tokens / original tokens, mean of three steps |         — |    0.687 |
 
-The actor training step is 2.08× faster on the two post-compilation steps, and actor
-input-token throughput for those steps is 2.15× higher. Total training time is 6.0%
-higher in this run because AWEX weight exchange took about 140 seconds longer. The
-earlier HARTS revision took 862.25 seconds end to end with the same configuration,
-showing that this short-run total is sensitive to weight-exchange variation. The memory
-row is an update-checkpoint reading, not a peak across all phases. Generated samples and
-rewards differed between runs despite the shared seed; these measurements validate the
-execution path and give a short-run performance comparison, not convergence or
-statistical significance. The current trie grouping uses AReaL's existing first-fit
-packing rather than the paper's data-parallel-aware scheduler.
+The actor training step is 1.76× faster on the two post-compilation steps, and actor
+input-token throughput is 1.63× higher. Total training time is 1.8% higher; AWEX weight
+exchange took 91.90 seconds longer. An earlier HARTS run without global scheduling
+measured 3.76 seconds per actor step and 936.20 seconds end to end, so this short-run
+comparison is sensitive to the sampled trajectories and weight-exchange variation. The
+memory row is an update-checkpoint reading, not a peak across all phases. Generated
+samples and rewards differed between runs despite the shared seed; these measurements
+validate execution and give a short-run performance comparison, not convergence or
+statistical significance.
