@@ -678,9 +678,71 @@ class ArenaStreamAgentWorkflow:
         )
 
     @classmethod
-    def _is_core_model_zero_failure(cls, raw: Any, receipt: Any) -> bool:
-        """Require the native receipt to confirm a trainable model failure."""
+    def _core_context_zero_failure_message(cls, raw: Any) -> str | None:
+        """Validate an agent context guard before treating it as a zero reward."""
+        if not isinstance(raw, dict):
+            return None
+        outcome = raw.get("outcome")
+        harness = raw.get("harness")
+        if not isinstance(outcome, dict) or not isinstance(harness, dict):
+            return None
+        details = outcome.get("details")
+        if (
+            outcome.get("code") != "LLM_CONTEXT_WINDOW_EXCEEDED"
+            or outcome.get("class") != "agent"
+            or outcome.get("source") != "core_context_budget"
+            or not isinstance(details, dict)
+            or set(details)
+            != {
+                "byteLimit",
+                "byteLimitExceeded",
+                "bytes",
+                "compactionEnabled",
+                "estimatedTokens",
+                "tokenLimit",
+                "tokenLimitExceeded",
+            }
+            or cls._gameagent_outcome_code(raw) != outcome["code"]
+            or harness.get("phase") != "agent"
+            or harness.get("result_status") != "ERROR"
+            or type(harness.get("exit_code")) is not int
+            or harness["exit_code"] != 1
+            or raw.get("failure") is not None
+            or harness.get("summary")
+            != "GAMEAGENT_OUTCOME_CODE=LLM_CONTEXT_WINDOW_EXCEEDED "
+            "GAMEAGENT_OUTCOME_CLASS=agent"
+        ):
+            return None
+        for key in ("byteLimit", "bytes", "estimatedTokens", "tokenLimit"):
+            if type(details[key]) is not int or details[key] <= 0:
+                return None
+        for key in (
+            "byteLimitExceeded",
+            "compactionEnabled",
+            "tokenLimitExceeded",
+        ):
+            if type(details[key]) is not bool:
+                return None
+        byte_exceeded = details["bytes"] > details["byteLimit"]
+        token_exceeded = details["estimatedTokens"] >= details["tokenLimit"]
+        if (
+            details["compactionEnabled"]
+            or details["byteLimitExceeded"] != byte_exceeded
+            or details["tokenLimitExceeded"] != token_exceeded
+            or not (byte_exceeded or token_exceeded)
+        ):
+            return None
+        return (
+            "context window limit exceeded: compaction is disabled "
+            f"({details['bytes']} bytes / {details['estimatedTokens']} estimated tokens)"
+        )
+
+    @classmethod
+    def _is_core_agent_zero_failure(cls, raw: Any, receipt: Any) -> bool:
+        """Require a matching native receipt for model or context exhaustion."""
         message = cls._core_model_zero_failure_message(raw)
+        if message is None:
+            message = cls._core_context_zero_failure_message(raw)
         if message is None or not isinstance(receipt, dict):
             return False
         if (
@@ -961,7 +1023,7 @@ class ArenaStreamAgentWorkflow:
             result_format == "gameagent"
             and result is not None
             and result.score == 0.0
-            and cls._is_core_model_zero_failure(raw, error.harness_result)
+            and cls._is_core_agent_zero_failure(raw, error.harness_result)
         ):
             return True
         detail = raw.get("error")
