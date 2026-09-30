@@ -1041,6 +1041,63 @@ def test_core_context_budget_exhaustion_keeps_zero_with_matching_native_receipt(
     )
 
 
+def test_context_budget_failure_fetches_native_receipt_before_classification(
+    monkeypatch,
+):
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
+    monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
+    workflow = ArenaStreamAgentWorkflow(
+        econfig={
+            "arena_base_url": "https://arena.example",
+            "arena_streams": [{"name": "a", "stream_id": "stream-a"}],
+        }
+    )
+    error = _core_context_failure_error()
+    receipt = error.harness_result
+    error.harness_result = None
+    fetched = []
+
+    async def register(**_kwargs):
+        return "https://arena.example/api", "model-a"
+
+    async def launch(**kwargs):
+        kwargs["on_launch_success"](error.task_id)
+        raise error
+
+    async def get_receipt(task_id, **_kwargs):
+        fetched.append(task_id)
+        return receipt
+
+    async def delete(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(workflow.client, "register_llm_proxy_async", register)
+    monkeypatch.setattr(workflow.client, "launch_one_task_result", launch)
+    monkeypatch.setattr(workflow.client, "get_harness_result_async", get_receipt)
+    monkeypatch.setattr(workflow.client, "delete_llm_proxy_async", delete)
+
+    with pytest.raises(ArenaTaskFailedError) as caught:
+        asyncio.run(
+            workflow.run(
+                {
+                    "arena_stream_name": "a",
+                    "stream_id": "stream-a",
+                    "data_id": "data-a",
+                },
+                base_url="http://rollout-proxy",
+                api_key="session-key",
+            )
+        )
+
+    assert fetched == [error.task_id]
+    assert (
+        workflow.classify_proxy_failure(
+            caught.value, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

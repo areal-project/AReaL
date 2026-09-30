@@ -1554,6 +1554,8 @@ class ArenaStreamAgentWorkflow:
                         self._harness_result_format(exc.result.raw) == "native-runner"
                         or self._core_model_zero_failure_message(exc.result.raw)
                         is not None
+                        or self._core_context_zero_failure_message(exc.result.raw)
+                        is not None
                     ):
                         try:
                             exc.harness_result = (
