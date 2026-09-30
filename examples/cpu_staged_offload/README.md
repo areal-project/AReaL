@@ -145,3 +145,48 @@ memory row is an update-checkpoint reading, not a peak across all phases. Genera
 samples and rewards differed between runs despite the shared seed; these measurements
 validate execution and give a short-run performance comparison, not convergence or
 statistical significance.
+
+### Twenty-step long-output comparison
+
+The longer comparison used Qwen3.5-35B-A3B-Base and DAPO Math 17K on one node with eight
+L20X GPUs. Both runs completed 20 PPO and AWEX updates with seed 1, 32 prompts per step,
+16 samples per prompt, rollout concurrency 32, rollout queue size 512, and consumer
+batch size 32. The input limit was 2048 tokens, the generation limit was 20480 tokens,
+and the request token limit was 32767. SGLang used a context limit of 32768 tokens and
+`max_running_requests=32` per TP2 server; the actor used `max_tokens_per_mb=32768`. The
+request cap per server was needed after an earlier uncapped baseline attempt ran out of
+SGLang memory at step 4. CPU staged offload was disabled in both completed runs. Chunked
+LM-head loss stayed enabled in both (`enable_chunked_logits=true`,
+`lm_head_loss_chunk_size=1024`). HARTS enabled tree training and used
+`pad_to_maximum=true`, while the baseline disabled tree training and used
+`pad_to_maximum=false`.
+
+W&B project: `wht_tree_training`
+([baseline](http://8.150.1.98:8080/sct-test/wht_tree_training/runs/wht_tree_training_baseline-qwen35-long-sg32-c32-b32-s16-20step-20260930_train),
+[HARTS](http://8.150.1.98:8080/sct-test/wht_tree_training/runs/wht_tree_training_harts-qwen35-long-sg32-c32-b32-s16-20step-20260930_train)).
+
+| Measure                                                |   Baseline |      HARTS |
+| ------------------------------------------------------ | ---------: | ---------: |
+| Completed updates; trajectories per update             |    20; 512 |    20; 512 |
+| Mean prompt tokens                                     |        154 |        154 |
+| Mean generated tokens                                  |       9258 |       9240 |
+| No-EOS ratio, mean                                     |      18.9% |      19.0% |
+| Mean actor training step                               |   156.94 s |   470.92 s |
+| Actor input tokens / actor training time, steps 2–20   |   30,876/s |   10,263/s |
+| Mean rollout time                                      |   395.16 s |   401.79 s |
+| AWEX weight-update time, sum of 20 steps               |  5722.09 s |  5814.93 s |
+| Total training time                                    | 17011.21 s | 23511.31 s |
+| GPU used at PPO-update checkpoint, highest of 20 steps |  123.65 GB |  133.33 GB |
+| Compact tree tokens / original tokens, mean            |          — |      0.989 |
+| Rollout controller timeout events (3600 s)             |          0 |          6 |
+
+The baseline processed actor input tokens 3.01 times faster, and HARTS took 38.2% longer
+end to end. In these sampled long answers, the compact tree retained 98.9% of original
+tokens, so prefix sharing was small. HARTS also requires the different padding setting
+above; this run does not isolate its cost from the tree execution cost. Six
+rollout-controller timeout events occurred on HARTS; affected trajectories were
+rejected, while every completed training batch still contained 512 trajectories. Both
+runs exited successfully and synced to W&B. Mean generated tokens are mean sequence
+length minus mean prompt length. The GPU readings are PPO-update checkpoints, not
+all-phase peaks. These runs measure execution and throughput on one node, not
+convergence or multi-node behavior.
