@@ -842,18 +842,26 @@ def dpo_pair_logratios(
 
 
 def dpo_preference_loss(
-    logits: torch.Tensor, *, beta: float, loss_type: str = "sigmoid"
+    logits: torch.Tensor,
+    *,
+    beta: float,
+    loss_type: str = "sigmoid",
+    simpo_gamma: float = 0.5,
 ) -> torch.Tensor:
     """Per-pair preference loss from DPO log-ratio logits.
 
     For ``"sigmoid"``, ``logits`` is the un-normalized pair delta.
     For ``"ipo"``, ``logits`` must be **per-token averaged** (length-normalized)
     before being passed here, matching trl's confirmed-with-authors convention.
+    For ``"simpo"``, ``logits`` is the per-token length-normalized difference in policy
+    log-probabilities, with target reward margin ``simpo_gamma`` applied (Meng et al. 2024).
     """
     if loss_type == "sigmoid":
         return -torch.nn.functional.logsigmoid(beta * logits.float())
     if loss_type == "ipo":
         return (logits.float() - 1.0 / (2.0 * beta)) ** 2
+    if loss_type == "simpo":
+        return -torch.nn.functional.logsigmoid(beta * logits.float() - simpo_gamma)
     raise ValueError(f"Unsupported DPO loss_type: {loss_type!r}")
 
 
