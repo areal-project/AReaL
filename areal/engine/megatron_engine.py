@@ -1639,6 +1639,7 @@ class MegatronEngine(TrainEngine):
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        tree_groups: list[list[int]] | None = None,
     ) -> dict[str, float]:
         self._ensure_ready()
         if self._weight_residency is not None:
@@ -1649,7 +1650,9 @@ class MegatronEngine(TrainEngine):
 
         # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(
-            tensor_container_to(input_batched, "cpu"), allow_transport_padding=True
+            tensor_container_to(input_batched, "cpu"),
+            allow_transport_padding=True,
+            tree_groups=tree_groups,
         )
 
         # Step 2: Select the normalization path from the model's effective config.
@@ -3173,6 +3176,7 @@ class MegatronEngine(TrainEngine):
         input_: dict[str, Any],
         *,
         allow_transport_padding: bool = False,
+        tree_groups: list[list[int]] | None = None,
     ) -> MicroBatchList:
         assert "attention_mask" in input_ and "input_ids" in input_
         # Parallel sizes
@@ -3204,6 +3208,7 @@ class MegatronEngine(TrainEngine):
                 dp_group=self.data_parallel_group,
                 parallel_size=tp_size,
                 compact_padding=self.bridge_cls == "megatron-bridge",
+                group_indices=tree_groups,
             )
             recommended_min_n_mbs = 2 * pp_size if pp_size > 1 else 1
             self.logger.info(

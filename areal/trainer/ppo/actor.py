@@ -11,6 +11,7 @@ from areal.api.cli_args import MOPDLossConfig, PPOActorConfig, RejectionSampling
 from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
+from areal.models.tree_attn.harts_schedule import schedule_tree_training_batch
 from areal.trainer.mopd.loss import compose_mopd_loss
 from areal.trainer.mopd.targets import aggregate_mopd_targets
 from areal.trainer.ppo.gae import (
@@ -822,6 +823,15 @@ class PPOActor:
             current_version = self.engine.get_version()
 
             for mb in mb_inputs:
+                tree_groups = None
+                if getattr(self.engine, "enable_tree_training", False) and hasattr(
+                    self.engine, "bridge_cls"
+                ):
+                    mb, tree_groups = schedule_tree_training_batch(
+                        mb,
+                        self.engine.config.mb_spec.max_tokens_per_mb,
+                        self.engine.data_parallel_group,
+                    )
                 train_stat = self.engine.train_batch(
                     mb,
                     loss_fn=functools.partial(
@@ -842,6 +852,7 @@ class PPOActor:
                         mopd_loss_config=self._mopd_loss_config,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                    **({"tree_groups": tree_groups} if tree_groups is not None else {}),
                 )
                 stats_tracker.scalar(**train_stat)
 

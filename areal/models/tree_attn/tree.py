@@ -290,6 +290,7 @@ def build_packed_tree_batch(
     dp_group: dist.ProcessGroup | None = None,
     parallel_size: int = 1,
     compact_padding: bool = False,
+    group_indices: list[list[int]] | None = None,
 ) -> MicroBatchList:
     """Build a MicroBatchList from input data using greedy trie packing.
 
@@ -364,8 +365,11 @@ def build_packed_tree_batch(
             f"parallel_size={parallel_size}) when pad_to_maximum=True."
         )
 
-    # Build tries using greedy packing
-    tries, num_tokens_list = _greedy_build_tries(data, max_tokens_per_tree)
+    tries, num_tokens_list = (
+        _greedy_build_tries(data, max_tokens_per_tree)
+        if group_indices is None
+        else _build_grouped_tries(data, group_indices, max_tokens_per_tree)
+    )
 
     # Synchronize number of trees across dp_group.
     if dist.is_initialized():
@@ -542,6 +546,27 @@ def _greedy_build_tries(
     num_tokens_list = [f["nodes"] for f in forests]
 
     return tries, num_tokens_list
+
+
+def _build_grouped_tries(
+    data: dict[str, Any], groups: list[list[int]], capacity: int
+) -> tuple[list[TrieNode], list[int]]:
+    """Build tries in the microbatch-slot order chosen by HARTS."""
+    sequences = _extract_sequences(data)
+    if sorted(row for group in groups for row in group) != list(range(len(sequences))):
+        raise ValueError("tree groups must cover each trajectory exactly once")
+    tries = []
+    counts = []
+    for tree_id, rows in enumerate(groups):
+        root = _BuildNode(tree_id, -1, -1)
+        nodes: list[_BuildNode] = []
+        for row in rows:
+            _insert_sequence(root, nodes, sequences[row], tree_id, row)
+        if len(nodes) > capacity:
+            raise ValueError("planned tree exceeds microbatch capacity")
+        tries.append(_compress_trie(root))
+        counts.append(len(nodes))
+    return tries, counts
 
 
 def _extract_sequences(data: dict[str, Any]) -> list[list[int]]:
