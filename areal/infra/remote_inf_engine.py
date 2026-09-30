@@ -553,6 +553,7 @@ class RemoteInfEngine(InferenceEngine):
         self.addresses = []
         self.server_idx = 0
 
+        self.partial_rollout_buffer: dict[str, dict[str, Any]] = {}
         self._version = 0
 
         self.lock = Lock()
@@ -1085,6 +1086,7 @@ class RemoteInfEngine(InferenceEngine):
         accumulated_output_tokens = []
         accumulated_output_logprobs = []
         accumulated_versions = []
+        generation_segments = []
         accumulated_routed_experts: list[np.ndarray] = []
 
         # A single "rid" shares the same server to allow KV cache reuse
@@ -1159,6 +1161,13 @@ class RemoteInfEngine(InferenceEngine):
                         "Please use a MoE model to get routed_experts information."
                     )
 
+            generation_segments.append(
+                (
+                    len(accumulated_output_tokens),
+                    len(accumulated_output_tokens) + len(gen_result.output_tokens),
+                    request_version,
+                )
+            )
             # Update accumulated outputs
             accumulated_output_tokens.extend(gen_result.output_tokens)
             accumulated_output_logprobs.extend(gen_result.output_logprobs)
@@ -1190,6 +1199,29 @@ class RemoteInfEngine(InferenceEngine):
                 len(req.input_ids),
             )
 
+            if (
+                self.config.enable_partial_rollout
+                and stop_reason == "abort"
+                and len(accumulated_output_tokens) < ori_max_new_tokens
+            ):
+                # Keep the coroutine (and its workflow/group) alive while the
+                # explicit buffer owns the context needed for resubmission.
+                self.partial_rollout_buffer[req.rid] = {
+                    "request": req,
+                    "output_tokens": accumulated_output_tokens,
+                    "output_logprobs": accumulated_output_logprobs,
+                    "output_versions": accumulated_versions,
+                    "generation_segments": generation_segments,
+                }
+                try:
+                    while (
+                        self.get_version() <= request_version
+                        or self.workflow_executor.is_paused()
+                    ):
+                        await asyncio.sleep(0.05)
+                finally:
+                    self.partial_rollout_buffer.pop(req.rid, None)
+
         # Final abort handling
         if stop_reason == "abort":
             # If stop_reason is "abort", the only reason we exit the loop is
@@ -1213,6 +1245,7 @@ class RemoteInfEngine(InferenceEngine):
             output_tokens=accumulated_output_tokens,
             output_logprobs=accumulated_output_logprobs,
             output_versions=accumulated_versions,
+            generation_segments=generation_segments,
             stop_reason=stop_reason,
             latency=latency,
             ttft=latency,  # Simplified for non-streaming

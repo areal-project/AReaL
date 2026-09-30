@@ -83,6 +83,9 @@ class ModelResponse:
     # MoE routing (only populated when return_routed_experts=True)
     routed_experts: np.ndarray | None = None
 
+    # Half-open output-token boundaries (start, end, policy version), per request.
+    generation_segments: list[tuple[int, int, int]] = field(default_factory=list)
+
     @property
     def input_len(self) -> int:
         return len(self.input_tokens)

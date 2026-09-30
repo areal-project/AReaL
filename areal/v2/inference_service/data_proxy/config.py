@@ -19,6 +19,7 @@ class DataProxyConfig:
     resubmit_wait: float = 0.5  # seconds between is_paused polls
     admin_api_key: str = "areal-admin-key"  # admin key for authentication
     callback_server_addr: str = ""
+    enable_partial_rollout: bool = False
     deterministic_sampling: bool = False
     # Resolved serving address (host:port) used as node_addr for RTensor shards.
     # Set at startup by __main__.py after the host is resolved.

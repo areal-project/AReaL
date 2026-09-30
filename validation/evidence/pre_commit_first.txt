@@ -1,0 +1,29 @@
+clang-format.........................................(no files to check)Skipped
+check yaml...............................................................Passed
+fix end of files.........................................................Passed
+trim trailing whitespace.................................................Passed
+Check for large files....................................................Passed
+Check JSON files.........................................................Passed
+Detect private keys......................................................Passed
+mdformat.................................................................Failed
+- hook id: mdformat
+- files were modified by this hook
+Run Linter Check (Ruff)..................................................Failed
+- hook id: ruff
+- files were modified by this hook
+Run Formatter (Ruff).....................................................Failed
+- hook id: ruff-format
+- files were modified by this hook
+nbstripout - Strip notebook output.......................................Passed
+Check pyproject.toml consistency.........................................Passed
+Regenerate uv lockfiles..................................................Failed
+- hook id: uv-lock
+- files were modified by this hook
+  × Failed to download `megatron-bridge @
+  ├─▶ Failed to extract archive: megatron_bridge-0.6.0-py3-none-any.whl
+  ╰─▶ Failed to download distribution due to network timeout. Try increasing
+Generate CLI documentation...............................................Failed
+- hook id: generate-cli-docs
+- files were modified by this hook
+Check SPDX license header................................................Passed
+Format CODEOWNERS........................................................Passed

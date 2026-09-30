@@ -1,0 +1,17 @@
+["/opt/.venv/bin/python", "-m", "pre_commit", "run", "--files", "areal/api/cli_args.py", "areal/api/io_struct.py", "areal/infra/remote_inf_engine.py", "areal/trainer/ppo/actor.py", "areal/trainer/ppo/critic.py", "areal/trainer/ppo/masking.py", "areal/utils/data.py", "areal/v2/inference_service/controller/controller.py", "areal/v2/inference_service/data_proxy/__main__.py", "areal/v2/inference_service/data_proxy/app.py", "areal/v2/inference_service/data_proxy/config.py", "areal/v2/inference_service/inf_bridge.py", "docs/en/algorithms/partial_rollout.md", "docs/en/cli_reference.md", "docs/zh/cli_reference.md", "scripts/rsi_gsm8k_analyze.py", "scripts/rsi_gsm8k_validate.py", "scripts/rsi_gsm8k_validate.sh", "tests/test_partial_rollout_versions.py", "tests/v2/inference_service/test_inf_bridge.py", "validation/README.md", "validation/environment.json", "validation/evidence/disabled.yaml", "validation/evidence/disabled_metrics.txt", "validation/evidence/enabled.yaml", "validation/evidence/enabled_metrics.txt", "validation/evidence/normalization_214.txt", "validation/evidence/pre_commit_first.txt", "validation/evidence/pytest_51.txt", "validation/evidence/pytest_55.txt", "validation/evidence/pytest_56.txt", "validation/evidence/pytest_initial.txt", "validation/evidence/regression_270.txt", "validation/evidence/training_summary.json"]
+clang-format.........................................(no files to check)Skipped
+check yaml...............................................................Passed
+fix end of files.........................................................Passed
+trim trailing whitespace.................................................Passed
+Check for large files....................................................Passed
+Check JSON files.........................................................Passed
+Detect private keys......................................................Passed
+mdformat.................................................................Passed
+Run Linter Check (Ruff)..................................................Passed
+Run Formatter (Ruff).....................................................Passed
+nbstripout - Strip notebook output...................(no files to check)Skipped
+Check pyproject.toml consistency.....................(no files to check)Skipped
+Regenerate uv lockfiles..............................(no files to check)Skipped
+Generate CLI documentation...............................................Passed
+Check SPDX license header................................................Passed
+Format CODEOWNERS....................................(no files to check)Skipped

@@ -1,0 +1,17 @@
+(AReaL) 20260930-11:32:14.882 StatsLogger INFO: Epoch 1/1 Step 1/934 Train step 1/934 done.
+│ ppo_actor/final_reward/min             │ -7.0711e-01 │ ppo_actor/train_infer/ratio_outside_1.5       │  3.0414e-04 │ ppo_actor/update/grad_norm                      │  2.4941e+00 │ ppo_actor/usable_group_size/min                              │  2.0000e+00 │
+(AReaL) 20260930-11:32:16.891 StatsLogger INFO: Epoch 1/1 Step 2/934 Train step 2/934 done.
+│ ppo_actor/final_reward/min             │ -7.0711e-01 │ ppo_actor/train_infer/ratio_outside_1.5       │  1.4081e-03 │ ppo_actor/update/grad_norm                      │  1.9818e+00 │ ppo_actor/usable_group_size/min                              │  2.0000e+00 │
+(AReaL) 20260930-11:32:19.002 StatsLogger INFO: Epoch 1/1 Step 3/934 Train step 3/934 done.
+│ ppo_actor/final_reward/min             │ -7.0711e-01 │ ppo_actor/train_infer/ratio_outside_1.5       │  6.4264e-03 │ ppo_actor/update/grad_norm                      │  1.9282e+00 │ ppo_actor/usable_group_size/min                              │  2.0000e+00 │
+(AReaL) 20260930-11:32:21.198 StatsLogger INFO: Epoch 1/1 Step 4/934 Train step 4/934 done.
+│ ppo_actor/final_reward/min             │ -7.0711e-01 │ ppo_actor/train_infer/ratio_outside_1.5       │  1.5431e-02 │ ppo_actor/update/grad_norm                      │  1.8896e+00 │ ppo_actor/usable_group_size/min                              │  2.0000e+00 │
+(AReaL) 20260930-11:32:23.600 StatsLogger INFO: Epoch 1/1 Step 5/934 Train step 5/934 done.
+│ ppo_actor/final_reward/min             │ -7.0711e-01 │ ppo_actor/train_infer/ratio_outside_1.5       │  2.3158e-02 │ ppo_actor/update/grad_norm                      │  1.4235e+00 │ ppo_actor/usable_group_size/min                              │  2.0000e+00 │
+(AReaL) 20260930-11:32:25.319 StatsLogger INFO: Epoch 1/1 Step 6/934 Train step 6/934 done.
+│ ppo_actor/final_reward/min             │ -7.0711e-01 │ ppo_actor/train_infer/ratio_outside_1.5       │  1.7763e-02 │ ppo_actor/update/grad_norm                      │  1.9564e+00 │ ppo_actor/usable_group_size/min                              │  2.0000e+00 │
+(AReaL) 20260930-11:32:27.003 StatsLogger INFO: Epoch 1/1 Step 7/934 Train step 7/934 done.
+│ ppo_actor/incorrect_seq_len/min        │  1.9200e+02 │ ppo_actor/train_infer/rollout_nll             │  2.4709e-01 │ ppo_actor/update/grad_norm                      │  1.9784e+00 │ ppo_actor/update/vocab_min_logits/avg                        │ -1.6828e+01 │
+(AReaL) 20260930-11:32:28.701 StatsLogger INFO: Epoch 1/1 Step 8/934 Train step 8/934 done.
+│ ppo_actor/final_reward/min             │ -7.0711e-01 │ ppo_actor/train_infer/ratio_outside_1.5       │  6.8557e-03 │ ppo_actor/update/grad_norm                      │  1.5848e+00 │ ppo_actor/usable_group_size/min                              │  2.0000e+00 │
+(AReaL) 20260930-11:32:29.758 StatsLogger INFO: Training completes! Total time elapsed 67.77.

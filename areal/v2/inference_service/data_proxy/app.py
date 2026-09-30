@@ -240,6 +240,7 @@ def _create_inf_bridge(
         request_timeout=config.request_timeout,
         max_resubmit_retries=config.max_resubmit_retries,
         resubmit_wait=config.resubmit_wait,
+        enable_partial_rollout=config.enable_partial_rollout,
     )
 
 

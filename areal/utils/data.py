@@ -2152,8 +2152,15 @@ class Normalization:
         reduce_group=None,
         group_sizes: list[int] | None = None,
         group_member_counts: list[int] | None = None,
+        synchronize_empty: bool = False,
     ) -> torch.Tensor:
-        if loss_mask is not None and loss_mask.sum().item() == 0:
+        # A locally empty rank must still enter batch-normalization collectives
+        # when its peers have actions. Preserve the legacy opt-out behavior.
+        if (
+            not synchronize_empty
+            and loss_mask is not None
+            and loss_mask.sum().item() == 0
+        ):
             return x.float()
         mean, scale = self.affine_parameters(
             x,

@@ -1,0 +1,7 @@
+["/opt/.venv/bin/python", "-m", "pytest", "-q", "tests/test_partial_rollout_versions.py", "tests/test_ppo_actor_truncation.py", "tests/infra/test_remote_inf_engine.py", "tests/v2/inference_service/test_inf_bridge.py", "tests/test_adv_norm_config.py", "tests/test_reward_norm_variable_group.py"]
+........................................................................ [ 26%]
+........................................................................ [ 53%]
+........................................................................ [ 80%]
+......................................................                   [100%]
+270 passed in 37.51s
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute

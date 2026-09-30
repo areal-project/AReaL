@@ -19,6 +19,7 @@ from areal.trainer.ppo.gae import (
     _compute_turn_level_gae,
 )
 from areal.trainer.ppo.lambda_fn import resolve_gae_lambda_fn
+from areal.trainer.ppo.masking import has_global_loss_tokens
 from areal.trainer.ppo.stats import infer_token_denominator, log_train_inference_stats
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
@@ -333,12 +334,43 @@ class PPOActor:
             raise RuntimeError("prepare_mopd_batch is only valid for pure distillation")
         if "mopd_teacher_logp_sum" not in data:
             raise RuntimeError("Pure MOPD distillation requires teacher targets")
+        self._mask_stale_tokens(data)
         loss_mask = torch.roll(data["loss_mask"].float(), shifts=-1, dims=-1)
         behavior_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
         data["mopd_behavior_logprobs"] = (behavior_logp * loss_mask).detach()
         data["logprobs"] = behavior_logp * loss_mask
         data["loss_mask"] = loss_mask
         return data
+
+    def _mask_stale_tokens(self, data: dict[str, Any]) -> None:
+        """Mask in token coordinates, before shifting to prediction positions."""
+        if not self.config.mask_stale_tokens:
+            return
+        versions = data.get("versions")
+        original = data["loss_mask"].bool()
+        if versions is None or versions.shape != original.shape:
+            raise ValueError("Stale-token masking requires token-aligned versions")
+        torch._assert_async(
+            torch.all(~original | (versions >= 0)),
+            "Generated tokens must have non-negative policy versions",
+        )
+        stale = original & (
+            self.engine.get_version() - versions > self.config.max_token_version_gap
+        )
+        tracker = stats_tracker.get()
+        tracker.denominator(
+            stale_generated_tokens=original,
+            stale_masked_tokens=stale,
+            stale_partially_masked_trajectories=stale.any(dim=-1)
+            & (original & ~stale).any(dim=-1),
+        )
+        tracker.stat(
+            denominator="stale_generated_tokens",
+            reduce_type=ReduceType.AVG,
+            stale_masked_ratio=stale.float(),
+        )
+        data["stale_token_mask"] = stale
+        data["loss_mask"] = data["loss_mask"].masked_fill(stale, 0)
 
     def _compute_advantages(
         self,
@@ -419,6 +451,7 @@ class PPOActor:
             else:
                 reward_score = self.reward_norm(reward_score, group_sizes=group_sizes)
 
+        self._mask_stale_tokens(data)
         token_loss_mask = data["loss_mask"].bool()
         loss_mask = token_loss_mask.float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -585,6 +618,10 @@ class PPOActor:
             advantages = self.adv_norm(
                 advantages,
                 loss_mask,
+                synchronize_empty=self.config.mask_stale_tokens,
+                reduce_group=self.engine.data_parallel_group
+                if self.config.mask_stale_tokens
+                else None,
                 group_sizes=group_sizes,
                 group_member_counts=meta.logical_group_sizes
                 if meta is not None
@@ -611,6 +648,9 @@ class PPOActor:
                 advantages = advantages + token_advantages
 
         # Store data in the dict.
+        if self.config.mask_stale_tokens:
+            advantages = advantages.masked_fill(~loss_mask.bool(), 0)
+            data["returns"] = data["returns"].masked_fill(~loss_mask.bool(), 0)
         data["advantages"] = advantages
         data["kl_rewards"] = kl_rewards
         # ``rewards`` contains every signal consumed by GAE, including folded
@@ -822,6 +862,15 @@ class PPOActor:
             current_version = self.engine.get_version()
 
             for mb in mb_inputs:
+                if self.config.mask_stale_tokens:
+                    has_tokens = has_global_loss_tokens(
+                        mb["loss_mask"], self.engine.cpu_group
+                    )
+                    stats_tracker.scalar(
+                        stale_empty_minibatch_fraction=float(not has_tokens)
+                    )
+                    if not has_tokens:
+                        continue
                 train_stat = self.engine.train_batch(
                     mb,
                     loss_fn=functools.partial(

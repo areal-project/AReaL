@@ -1,0 +1,17 @@
+["/opt/.venv/bin/python", "-m", "pre_commit", "run", "--all-files"]
+clang-format.........................................(no files to check)Skipped
+check yaml...............................................................Passed
+fix end of files.........................................................Passed
+trim trailing whitespace.................................................Passed
+Check for large files....................................................Passed
+Check JSON files.........................................................Passed
+Detect private keys......................................................Passed
+mdformat.................................................................Passed
+Run Linter Check (Ruff)..................................................Passed
+Run Formatter (Ruff).....................................................Passed
+nbstripout - Strip notebook output.......................................Passed
+Check pyproject.toml consistency.........................................Passed
+Regenerate uv lockfiles..................................................Passed
+Generate CLI documentation...............................................Passed
+Check SPDX license header................................................Passed
+Format CODEOWNERS........................................................Passed

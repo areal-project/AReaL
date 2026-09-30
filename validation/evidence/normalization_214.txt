@@ -1,0 +1,6 @@
+["/opt/.venv/bin/python", "-m", "pytest", "-q", "tests/test_adv_norm_config.py", "tests/test_reward_norm_variable_group.py"]
+........................................................................ [ 33%]
+........................................................................ [ 67%]
+......................................................................   [100%]
+214 passed in 17.22s
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute

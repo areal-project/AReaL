@@ -674,3 +674,37 @@ class TestVLLMBridgeBackend:
         assert bridge._send_request.call_count == 3
         assert resp.stop_reason == "length"
         assert len(resp.output_tokens) == 3  # 1 token per retry
+
+
+@pytest.mark.asyncio
+async def test_partial_rollout_buffers_until_new_policy_version():
+    """A delayed abort response keeps its serving version and resumes its context."""
+    bridge = InfBridge(
+        SGLangBridgeBackend(),
+        "http://localhost:30000",
+        PauseState(),
+        enable_partial_rollout=True,
+        resubmit_wait=0.001,
+    )
+    req = _make_request(input_ids=[1, 2], max_new_tokens=4)
+    responses = [
+        _make_sglang_response([(-0.1, 3), (-0.2, 4)], "abort"),
+        _make_sglang_response([(-0.3, 5)], "stop"),
+    ]
+    bridge._send_request = AsyncMock(side_effect=responses)
+    try:
+        task = asyncio.create_task(bridge.agenerate(req))
+        for _ in range(100):
+            if req.rid in bridge.partial_rollout_buffer:
+                break
+            await asyncio.sleep(0.001)
+        assert req.rid in bridge.partial_rollout_buffer
+        assert not task.done()
+        bridge.set_version(2)
+        response = await asyncio.wait_for(task, timeout=2)
+        assert response.output_tokens == [3, 4, 5]
+        assert response.output_versions == [0, 0, 2]
+        assert response.generation_segments == [(0, 2, 0), (2, 3, 2)]
+        assert not bridge.partial_rollout_buffer
+    finally:
+        await bridge.aclose()

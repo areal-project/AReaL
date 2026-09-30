@@ -489,6 +489,8 @@ class RolloutControllerV2:
                 "--engine-max-tokens",
                 str(agent_cfg.engine_max_tokens),
             ]
+        if cfg.enable_partial_rollout:
+            data_proxy_base_cmd.append("--enable-partial-rollout")
         if cfg.deterministic_sampling:
             data_proxy_base_cmd.append("--deterministic-sampling")
         for preprocessor_path in agent_cfg.message_preprocessors:

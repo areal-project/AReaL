@@ -59,6 +59,7 @@ def main():
         "--callback-server-addr",
         default="",
     )
+    parser.add_argument("--enable-partial-rollout", action="store_true")
     parser.add_argument(
         "--deterministic-sampling",
         action="store_true",
@@ -119,6 +120,7 @@ def main():
         admin_api_key=args.admin_api_key,
         callback_server_addr=args.callback_server_addr,
         deterministic_sampling=args.deterministic_sampling,
+        enable_partial_rollout=args.enable_partial_rollout,
         serving_addr=format_hostport(serving_host, args.port),
         tool_call_parser=args.tool_call_parser,
         reasoning_parser=args.reasoning_parser,

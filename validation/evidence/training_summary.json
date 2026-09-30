@@ -1,0 +1,157 @@
+{
+  "disabled": {
+    "steps": [
+      {
+        "step": 1,
+        "ppo_actor/update/grad_norm": 2.4941
+      },
+      {
+        "step": 2,
+        "ppo_actor/update/grad_norm": 1.9818
+      },
+      {
+        "step": 3,
+        "ppo_actor/update/grad_norm": 1.9282
+      },
+      {
+        "step": 4,
+        "ppo_actor/update/grad_norm": 1.8896
+      },
+      {
+        "step": 5,
+        "ppo_actor/update/grad_norm": 1.4235
+      },
+      {
+        "step": 6,
+        "ppo_actor/update/grad_norm": 1.9564
+      },
+      {
+        "step": 7,
+        "ppo_actor/update/grad_norm": 1.9784
+      },
+      {
+        "step": 8,
+        "ppo_actor/update/grad_norm": 1.5848
+      }
+    ],
+    "generated_training_tokens": null,
+    "masked_training_tokens": null,
+    "masked_training_ratio": null,
+    "partially_masked_training_trajectories": null,
+    "dumped_records_including_unconsumed": 148,
+    "mixed_version_dumped_records_including_unconsumed": 42,
+    "mixed_version_dump_example": {
+      "file": "disabled/logs/root/partial-rollout-validation/disabled/rollout/7/72.jsonl",
+      "head_version": 5,
+      "tail_version": 7,
+      "version_rle": [
+        [
+          5,
+          77
+        ],
+        [
+          6,
+          64
+        ],
+        [
+          7,
+          14
+        ]
+      ]
+    }
+  },
+  "enabled": {
+    "steps": [
+      {
+        "step": 1,
+        "ppo_actor/update/grad_norm": 2.8272,
+        "stale_generated_tokens": 2528.0,
+        "stale_masked_ratio": 0.0,
+        "stale_masked_tokens": 0.0,
+        "stale_partially_masked_trajectories": 0.0,
+        "ppo_actor/update/stale_empty_minibatch_fraction": 0.0
+      },
+      {
+        "step": 2,
+        "ppo_actor/update/grad_norm": 2.0104,
+        "stale_generated_tokens": 3856.0,
+        "stale_masked_ratio": 0.0,
+        "stale_masked_tokens": 0.0,
+        "stale_partially_masked_trajectories": 0.0,
+        "ppo_actor/update/stale_empty_minibatch_fraction": 0.0
+      },
+      {
+        "step": 3,
+        "ppo_actor/update/stale_empty_minibatch_fraction": 1.0,
+        "stale_generated_tokens": 4036.0,
+        "stale_masked_ratio": 1.0,
+        "stale_masked_tokens": 4036.0,
+        "stale_partially_masked_trajectories": 0.0
+      },
+      {
+        "step": 4,
+        "ppo_actor/update/stale_empty_minibatch_fraction": 1.0,
+        "stale_generated_tokens": 4183.0,
+        "stale_masked_ratio": 1.0,
+        "stale_masked_tokens": 4183.0,
+        "stale_partially_masked_trajectories": 0.0
+      },
+      {
+        "step": 5,
+        "ppo_actor/update/stale_empty_minibatch_fraction": 1.0,
+        "stale_generated_tokens": 3865.0,
+        "stale_masked_ratio": 1.0,
+        "stale_masked_tokens": 3865.0,
+        "stale_partially_masked_trajectories": 0.0
+      },
+      {
+        "step": 6,
+        "ppo_actor/update/stale_empty_minibatch_fraction": 0.0,
+        "ppo_actor/update/grad_norm": 0.0,
+        "stale_generated_tokens": 3691.0,
+        "stale_masked_ratio": 0.99268,
+        "stale_masked_tokens": 3664.0,
+        "stale_partially_masked_trajectories": 1.0
+      },
+      {
+        "step": 7,
+        "ppo_actor/update/grad_norm": 2.4892,
+        "stale_generated_tokens": 3121.0,
+        "stale_masked_ratio": 0.0,
+        "stale_masked_tokens": 0.0,
+        "stale_partially_masked_trajectories": 0.0,
+        "ppo_actor/update/stale_empty_minibatch_fraction": 0.0
+      },
+      {
+        "step": 8,
+        "ppo_actor/update/grad_norm": 2.7023,
+        "stale_generated_tokens": 4343.0,
+        "stale_masked_ratio": 0.53788,
+        "stale_masked_tokens": 2336.0,
+        "stale_partially_masked_trajectories": 14.0,
+        "ppo_actor/update/stale_empty_minibatch_fraction": 0.0
+      }
+    ],
+    "generated_training_tokens": 29623,
+    "masked_training_tokens": 18084,
+    "masked_training_ratio": 0.6104715930189379,
+    "partially_masked_training_trajectories": 15,
+    "dumped_records_including_unconsumed": 188,
+    "mixed_version_dumped_records_including_unconsumed": 63,
+    "mixed_version_dump_example": {
+      "file": "enabled/logs/root/partial-rollout-validation/enabled/rollout/6/61.jsonl",
+      "head_version": 5,
+      "tail_version": 6,
+      "version_rle": [
+        [
+          5,
+          145
+        ],
+        [
+          6,
+          41
+        ]
+      ]
+    }
+  }
+}

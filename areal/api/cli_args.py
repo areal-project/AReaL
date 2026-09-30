@@ -1780,6 +1780,19 @@ class RejectionSamplingConfig:
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
+    mask_stale_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": "Mask stale generated tokens before advantage/loss computation."
+        },
+    )
+    max_token_version_gap: int = field(
+        default=1,
+        metadata={
+            "help": "Non-negative maximum train minus generation version gap; only strictly older tokens are masked."
+        },
+    )
+
     # Core PPO/GRPO Parameters
     ppo_n_minibatches: int = field(
         default=4,
@@ -2033,6 +2046,12 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if (
+            isinstance(self.max_token_version_gap, bool)
+            or not isinstance(self.max_token_version_gap, int)
+            or self.max_token_version_gap < 0
+        ):
+            raise ValueError("max_token_version_gap must be a non-negative integer")
         if isinstance(self.gae_lambda, bool) or not isinstance(
             self.gae_lambda, int | float | str
         ):
@@ -2835,6 +2854,12 @@ class InferenceEngineConfig:
     consumer_batch_size: int = field(
         default=1,
         metadata={"help": "Batch size for consuming rollouts from the queue."},
+    )
+    enable_partial_rollout: bool = field(
+        default=False,
+        metadata={
+            "help": "Buffer aborted generations until a newer policy version is available."
+        },
     )
     max_head_offpolicyness: int = field(
         default=0,

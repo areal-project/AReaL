@@ -1,0 +1,11 @@
+{
+  "job_id": 972320,
+  "image": "/storage/openpsi/images/areal-dev-20260508.sif",
+  "python": "/opt/.venv/bin/python",
+  "binds": [
+    "/storage"
+  ],
+  "model": "/storage/openpsi/models/Qwen__Qwen2.5-1.5B-Instruct",
+  "dataset": "/storage/openpsi/data/openai__gsm8k",
+  "phase": "training"
+}

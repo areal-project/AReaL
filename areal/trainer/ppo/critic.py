@@ -10,6 +10,7 @@ from areal.api.cli_args import PPOCriticConfig
 from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
+from areal.trainer.ppo.masking import has_global_loss_tokens
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import stats_tracker
 from areal.utils.data import (
@@ -47,6 +48,7 @@ class PPOCritic:
         batched_call(self._ppo_update, data, unpack=False)
 
     def _ppo_update(self, data: dict[str, Any]) -> None:
+        mask_stale_tokens = "stale_token_mask" in data
         ########## Logging code starts ##########
         scalars = dict(
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
@@ -62,6 +64,7 @@ class PPOCritic:
             "versions",
             "is_truncated",
             "token_rewards",
+            "stale_token_mask",
         ]:
             data.pop(key, None)
 
@@ -75,6 +78,10 @@ class PPOCritic:
             group=self.engine.data_parallel_group,
         )
         for mb in mb_inputs:
+            if mask_stale_tokens and not has_global_loss_tokens(
+                mb["loss_mask"], self.engine.cpu_group
+            ):
+                continue
             train_stat = self.engine.train_batch(
                 mb,
                 loss_fn=functools.partial(

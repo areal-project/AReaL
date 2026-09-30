@@ -10,6 +10,7 @@ translates between ModelRequest / raw JSON and endpoint-specific payloads.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import time
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -56,6 +57,10 @@ class InfBridge:
         Sleep duration (seconds) between pause-state polls.
     version:
         Initial weight version.
+    enable_partial_rollout:
+        Buffer aborted requests until a newer version is published. Enabled
+        requests continue until completion or cancellation rather than exhausting
+        the legacy resubmit retry limit.
     """
 
     def __init__(
@@ -67,6 +72,7 @@ class InfBridge:
         max_resubmit_retries: int = 20,
         resubmit_wait: float = 0.5,
         version: int = 0,
+        enable_partial_rollout: bool = False,
     ) -> None:
         self.backend = backend
         self.backend_addr = backend_addr.rstrip("/")
@@ -74,6 +80,8 @@ class InfBridge:
         self.request_timeout = request_timeout
         self.max_resubmit_retries = max_resubmit_retries
         self.resubmit_wait = resubmit_wait
+        self.enable_partial_rollout = enable_partial_rollout
+        self.partial_rollout_buffer: dict[str, dict[str, Any]] = {}
         self._version = version
         self._client = httpx.AsyncClient(timeout=request_timeout)
 
@@ -192,12 +200,18 @@ class InfBridge:
         accumulated_tokens: list[int] = []
         accumulated_logprobs: list[float] = []
         accumulated_versions: list[int] = []
+        generation_segments: list[tuple[int, int, int]] = []
         stop_reason: _StopReason | None = None
         final_routed_experts: np.ndarray | None = None
 
         t0 = time.monotonic()
 
-        for _attempt in range(self.max_resubmit_retries):
+        attempts = (
+            itertools.count()
+            if self.enable_partial_rollout
+            else range(self.max_resubmit_retries)
+        )
+        for _attempt in attempts:
             # Wait while paused (weight update in progress)
             while await self.pause_state.is_paused():
                 await asyncio.sleep(self.resubmit_wait)
@@ -216,12 +230,24 @@ class InfBridge:
                 remaining,
             )
 
+            request_version = self._version
             data = await self._send_request(http_req)
             result = self.backend.parse_generation_response(data)
 
+            # Pin the serving version before awaiting the HTTP response.
+            segment_version = (
+                request_version if self.enable_partial_rollout else self._version
+            )
+            generation_segments.append(
+                (
+                    len(accumulated_tokens),
+                    len(accumulated_tokens) + len(result.output_tokens),
+                    segment_version,
+                )
+            )
             accumulated_tokens.extend(result.output_tokens)
             accumulated_logprobs.extend(result.output_logprobs)
-            accumulated_versions.extend([self._version] * len(result.output_tokens))
+            accumulated_versions.extend([segment_version] * len(result.output_tokens))
             stop_reason = cast(_StopReason, result.stop_reason)
 
             if result.routed_experts is not None:
@@ -251,6 +277,23 @@ class InfBridge:
                 stop_reason = "length"
                 break
 
+            if self.enable_partial_rollout:
+                self.partial_rollout_buffer[req.rid] = {
+                    "request": req,
+                    "output_tokens": accumulated_tokens,
+                    "output_logprobs": accumulated_logprobs,
+                    "output_versions": accumulated_versions,
+                    "generation_segments": generation_segments,
+                }
+                try:
+                    while (
+                        self._version <= request_version
+                        or await self.pause_state.is_paused()
+                    ):
+                        await asyncio.sleep(self.resubmit_wait)
+                finally:
+                    self.partial_rollout_buffer.pop(req.rid, None)
+
             # stop_reason == "abort" → continue loop (resubmit)
             logger.debug(
                 "Abort detected, resubmit attempt %d, accumulated %d tokens",
@@ -269,6 +312,7 @@ class InfBridge:
             output_tokens=accumulated_tokens,
             output_logprobs=accumulated_logprobs,
             output_versions=accumulated_versions,
+            generation_segments=generation_segments,
             stop_reason=stop_reason,
             tokenizer=req.tokenizer,
             latency=latency,
