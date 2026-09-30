@@ -47,6 +47,14 @@ _GAMEAGENT_MODEL_FAILURE_CODES = {
     "AGENT_MAX_TURNS_EXCEEDED",
     "AUTONOMOUS_INCOMPLETE_NO_SHIP",
 }
+_CORE_MODEL_ZERO_FAILURE_MESSAGES = {
+    ("LLM_RESPONSE_FAILED", "empty_completion"): (
+        "model stopped without visible output or tool calls"
+    ),
+    ("LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED", "provider_length_stop"): (
+        "model stopped with reason: length"
+    ),
+}
 _CLAUDE_AGENT_ERROR_MARKER = "harness: agent phase error: claude reported error:"
 _CLAUDE_LIFECYCLE_RECORD_PATTERN = re.compile(
     r"\n(?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? )?"
@@ -637,6 +645,76 @@ class ArenaStreamAgentWorkflow:
             return None
         return codes[0] if len(set(codes)) == 1 else None
 
+    @classmethod
+    def _core_model_zero_failure_message(cls, raw: Any) -> str | None:
+        """Identify a model-origin terminal failure in Arena's runner envelope."""
+        if not isinstance(raw, dict):
+            return None
+        outcome = raw.get("outcome")
+        harness = raw.get("harness")
+        if not isinstance(outcome, dict) or not isinstance(harness, dict):
+            return None
+        if (
+            outcome.get("class") != "agent"
+            or outcome.get("source") != "core_model"
+            or not isinstance(outcome.get("details"), dict)
+            or set(outcome["details"]) != {"reason"}
+            or not isinstance(outcome["details"]["reason"], str)
+            or cls._gameagent_outcome_code(raw) != outcome.get("code")
+            or harness.get("phase") != "agent"
+            or harness.get("result_status") != "ERROR"
+            or type(harness.get("exit_code")) is not int
+            or harness["exit_code"] != 1
+            or raw.get("failure") is not None
+        ):
+            return None
+        code = outcome["code"]
+        if harness.get("summary") != (
+            f"GAMEAGENT_OUTCOME_CODE={code} GAMEAGENT_OUTCOME_CLASS=agent"
+        ):
+            return None
+        return _CORE_MODEL_ZERO_FAILURE_MESSAGES.get(
+            (code, outcome["details"]["reason"])
+        )
+
+    @classmethod
+    def _is_core_model_zero_failure(cls, raw: Any, receipt: Any) -> bool:
+        """Require the native receipt to confirm a trainable model failure."""
+        message = cls._core_model_zero_failure_message(raw)
+        if message is None or not isinstance(receipt, dict):
+            return False
+        if (
+            receipt.get("implementation") != "rust-core-runtime"
+            or receipt.get("status") != "ERROR"
+            or type(receipt.get("exit_code")) is not int
+            or receipt["exit_code"] != 1
+            or receipt.get("turn_statuses") != ["failed"]
+            or receipt.get("delivery") is not None
+            or receipt.get("summary") != raw["harness"]["summary"]
+        ):
+            return False
+        errors = receipt.get("error")
+        if (
+            not isinstance(errors, list)
+            or len(errors) != 1
+            or not isinstance(errors[0], dict)
+            or errors[0].get("message") != message
+        ):
+            return False
+        expected = raw["outcome"]
+        for outcome in (
+            errors[0].get("outcome"),
+            receipt.get("raw", {}).get("outcome")
+            if isinstance(receipt.get("raw"), dict)
+            else None,
+        ):
+            if not isinstance(outcome, dict) or any(
+                outcome.get(field) != expected.get(field)
+                for field in ("code", "class", "source", "details")
+            ):
+                return False
+        return True
+
     @staticmethod
     def _harness_result_format(
         raw: Any,
@@ -879,6 +957,13 @@ class ArenaStreamAgentWorkflow:
             return (
                 context_overflow and cls._is_runner_context_failure(raw)
             ) or cls._is_runner_model_failure(raw, error.harness_result)
+        if (
+            result_format == "gameagent"
+            and result is not None
+            and result.score == 0.0
+            and cls._is_core_model_zero_failure(raw, error.harness_result)
+        ):
+            return True
         detail = raw.get("error")
         if detail is not None and not isinstance(detail, str):
             return False
@@ -1403,10 +1488,10 @@ class ArenaStreamAgentWorkflow:
                 _record_arena_metrics(**{"arena/call_success": 0.0})
                 if exc.result is not None:
                     self._task_result.set(exc.result)
-                    if (
-                        exc.status == "HARNESS_FAILED"
-                        and self._harness_result_format(exc.result.raw)
-                        == "native-runner"
+                    if exc.status == "HARNESS_FAILED" and (
+                        self._harness_result_format(exc.result.raw) == "native-runner"
+                        or self._core_model_zero_failure_message(exc.result.raw)
+                        is not None
                     ):
                         try:
                             exc.harness_result = (

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -864,6 +865,117 @@ def test_gameagent_failure_uses_model_attribution(code, encoding, interaction_co
         else "unknown_failure_reject"
     )
     assert disposition == expected
+
+
+def _core_model_failure_error(
+    code: str, reason: str, message: str
+) -> ArenaTaskFailedError:
+    outcome = {
+        "code": code,
+        "class": "agent",
+        "source": "core_model",
+        "details": {"reason": reason},
+    }
+    summary = f"GAMEAGENT_OUTCOME_CODE={code} GAMEAGENT_OUTCOME_CLASS=agent"
+    error = ArenaTaskFailedError(
+        task_id="task-1",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task-1",
+            status="HARNESS_FAILED",
+            score=0.0,
+            raw={
+                "error": "harness: running setup hook (timeout=10m0s)\n" + summary,
+                "harness": {
+                    "phase": "agent",
+                    "result_status": "ERROR",
+                    "exit_code": 1,
+                    "summary": summary,
+                },
+                "outcome": outcome,
+            },
+        ),
+    )
+    error.harness_result = {
+        "implementation": "rust-core-runtime",
+        "status": "ERROR",
+        "exit_code": 1,
+        "turn_statuses": ["failed"],
+        "delivery": None,
+        "summary": summary,
+        "error": [{"message": message, "outcome": outcome.copy()}],
+        "raw": {"outcome": outcome.copy()},
+    }
+    return error
+
+
+@pytest.mark.parametrize(
+    "code,reason,message",
+    [
+        (
+            "LLM_RESPONSE_FAILED",
+            "empty_completion",
+            "model stopped without visible output or tool calls",
+        ),
+        (
+            "LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED",
+            "provider_length_stop",
+            "model stopped with reason: length",
+        ),
+    ],
+)
+def test_core_model_failure_with_matching_native_receipt_keeps_zero(
+    code, reason, message
+):
+    error = _core_model_failure_error(code, reason, message)
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=0
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_receipt",
+        "wrong_receipt_message",
+        "wrong_receipt_outcome",
+        "infrastructure_outcome",
+        "missing_arena_score",
+    ],
+)
+def test_core_model_failure_rejects_missing_or_conflicting_evidence(mutation):
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "model stopped without visible output or tool calls",
+    )
+    if mutation == "missing_receipt":
+        error.harness_result = None
+    elif mutation == "wrong_receipt_message":
+        error.harness_result["error"][0]["message"] = "model service unavailable"
+    elif mutation == "wrong_receipt_outcome":
+        error.harness_result["error"][0]["outcome"]["class"] = "infrastructure"
+    elif mutation == "infrastructure_outcome":
+        error.result.raw["outcome"]["class"] = "infrastructure"
+    else:
+        error.result = replace(error.result, score=None)
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
 
 
 @pytest.mark.parametrize(
