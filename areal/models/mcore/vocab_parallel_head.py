@@ -198,6 +198,15 @@ class _LinearWithNativeOutput(
             output = output + bias
         return output
 
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        gradients = (
+            mcore_layers.LinearWithGradAccumulationAndAsyncCommunication.backward(
+                ctx, grad_output
+            )
+        )
+        return (*gradients, None)  # AReaL forward adds gtp_remat_size.
+
 
 class _LinearWithFrozenNativeOutput(mcore_layers.LinearWithFrozenWeight):
     """AReaL TP linear that skips wgrad for a frozen weight."""
@@ -296,9 +305,12 @@ class _LinearWithFp32Output(
             ).view(ctx.output_shape)
         else:
             grad_output = grad_output.view(ctx.output_shape).to(dtype=weight.dtype)
-        return mcore_layers.LinearWithGradAccumulationAndAsyncCommunication.backward(
-            ctx, grad_output
+        gradients = (
+            mcore_layers.LinearWithGradAccumulationAndAsyncCommunication.backward(
+                ctx, grad_output
+            )
         )
+        return (*gradients, None)  # AReaL forward adds gtp_remat_size.
 
 
 class _LinearWithFrozenFp32Output(mcore_layers.LinearWithFrozenWeight):
@@ -602,6 +614,7 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
         tp_group: dist.ProcessGroup | None,
         logit_scale: float,
         fp32_operands: bool,
+        semantic_rows: torch.Tensor | None,
     ) -> tuple[torch.Tensor, ...]:
         from areal.utils.functional.vocab_parallel_kernels import (
             fused_exp_sum_inplace,
@@ -632,7 +645,7 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
             fp32_operands=fp32_operands,
         )
         labels_1d = labels.reshape(-1)
-        if input_2d.size(0) != labels_1d.numel():
+        if semantic_rows is None and input_2d.size(0) != labels_1d.numel():
             raise ValueError(
                 "LM Head hidden leading dimensions must match labels: "
                 f"got {tuple(total_input.shape)} and {tuple(labels.shape)}"
@@ -646,13 +659,36 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
         )
 
         num_tokens = input_2d.size(0)
+        mapped = semantic_rows is not None
+        if mapped and semantic_rows.numel() != labels_1d.numel():
+            raise ValueError("semantic_rows must match the number of labels")
+        semantic_groups = []
+        if mapped:
+            rows_cpu = semantic_rows.to("cpu")
+            positions_by_chunk = [[] for _ in range(math.ceil(num_tokens / chunk_size))]
+            rows_by_chunk = [[] for _ in positions_by_chunk]
+            for position, row in enumerate(rows_cpu.tolist()):
+                chunk_idx = row // chunk_size
+                positions_by_chunk[chunk_idx].append(position)
+                rows_by_chunk[chunk_idx].append(row - chunk_idx * chunk_size)
+            for positions, local_rows in zip(
+                positions_by_chunk, rows_by_chunk, strict=True
+            ):
+                semantic_groups.append(
+                    (
+                        torch.tensor(positions, dtype=torch.long, device=input_.device),
+                        torch.tensor(
+                            local_rows, dtype=torch.long, device=input_.device
+                        ),
+                    )
+                )
         output_tensors = [
-            torch.empty(num_tokens, dtype=torch.float32, device=input_.device)
+            torch.empty(labels_1d.numel(), dtype=torch.float32, device=input_.device)
             for _ in range(6)
         ]
         logprobs, entropy, vocab_min, vocab_max, vocab_mean, vocab_norm = output_tensors
-        row_maxes = torch.empty_like(logprobs)
-        sum_exps = torch.empty_like(logprobs)
+        row_maxes = torch.empty(num_tokens, dtype=torch.float32, device=input_.device)
+        sum_exps = torch.empty_like(row_maxes)
         workspace_rows = min(chunk_size, num_tokens)
         partial_reduction = torch.empty(
             (2, workspace_rows, vocab_tile_count(partition_vocab_size)),
@@ -664,7 +700,7 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
         )
         inv_temperature = 1.0 / temperature
 
-        for start in range(0, num_tokens, chunk_size):
+        for chunk_idx, start in enumerate(range(0, num_tokens, chunk_size)):
             end = min(start + chunk_size, num_tokens)
             rows = end - start
             input_chunk = input_2d[start:end]
@@ -676,22 +712,34 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
                 compute_bias,
                 logit_scale,
             )
-            chunk_targets = local_targets[start:end]
+            if mapped:
+                semantic_positions, local_rows = semantic_groups[chunk_idx]
+                chunk_targets = local_targets[semantic_positions]
+                output_positions = semantic_positions
+                stats_rows = local_rows
+            else:
+                chunk_targets = local_targets[start:end]
+                output_positions = slice(start, end)
+                stats_rows = slice(None)
 
-            vocab_min[start:end] = logits.min(dim=-1).values
-            vocab_max[start:end] = logits.max(dim=-1).values
-            vocab_mean[start:end] = logits.mean(dim=-1)
-            vocab_norm[start:end] = torch.linalg.vector_norm(logits, dim=-1)
+            vocab_min[output_positions] = logits.min(dim=-1).values[stats_rows]
+            vocab_max[output_positions] = logits.max(dim=-1).values[stats_rows]
+            vocab_mean[output_positions] = logits.mean(dim=-1)[stats_rows]
+            vocab_norm[output_positions] = torch.linalg.vector_norm(logits, dim=-1)[
+                stats_rows
+            ]
 
             logits_max = logits.max(dim=-1).values
             _all_reduce_if_needed(logits_max, dist.ReduceOp.MAX, tp_group)
             row_maxes[start:end] = logits_max
 
-            row_indices = torch.arange(rows, device=input_.device)
+            row_indices = (
+                local_rows if mapped else torch.arange(rows, device=input_.device)
+            )
             predicted_logits = logits[
                 row_indices, chunk_targets.clamp_min(0)
             ].masked_fill_(chunk_targets < 0, 0.0)
-            predicted_logits.sub_(logits_max).mul_(inv_temperature)
+            predicted_logits.sub_(logits_max[row_indices]).mul_(inv_temperature)
             predicted_logits.masked_fill_(chunk_targets < 0, 0.0)
 
             partial_sums = partial_reduction[0, :rows]
@@ -704,18 +752,25 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
                 inv_temperature,
             )
             reduced = reduced_values[:, :rows]
-            reduced[0].copy_(predicted_logits)
             reduced[1].copy_(partial_sums.sum(dim=-1))
             reduced[2].copy_(partial_weighted_sums.sum(dim=-1))
             if rows < workspace_rows:
                 reduced_values[:, rows:].zero_()
-            _all_reduce_if_needed(reduced_values, dist.ReduceOp.SUM, tp_group)
+            if mapped:
+                _all_reduce_if_needed(reduced_values[1:3], dist.ReduceOp.SUM, tp_group)
+                if predicted_logits.numel():
+                    _all_reduce_if_needed(predicted_logits, dist.ReduceOp.SUM, tp_group)
+            else:
+                reduced[0].copy_(predicted_logits)
+                _all_reduce_if_needed(reduced_values, dist.ReduceOp.SUM, tp_group)
 
             sum_exp = reduced[1]
             sum_exps[start:end] = sum_exp
             log_sum_exp = sum_exp.log()
-            logprobs[start:end] = reduced[0] - log_sum_exp
-            entropy[start:end] = log_sum_exp - reduced[2] / sum_exp
+            logprobs[output_positions] = (
+                predicted_logits if mapped else reduced[0]
+            ) - log_sum_exp[stats_rows]
+            entropy[output_positions] = (log_sum_exp - reduced[2] / sum_exp)[stats_rows]
 
         saved_bias = (
             bias
@@ -754,6 +809,8 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
         ctx.logit_scale = logit_scale
         ctx.fp32_operands = fp32_operands
         ctx.input_shape = input_.shape
+        ctx.semantic_groups = semantic_groups
+        ctx.mapped = mapped
         ctx.set_materialize_grads(False)
         ctx.mark_non_differentiable(
             entropy, vocab_min, vocab_max, vocab_mean, vocab_norm
@@ -828,7 +885,7 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
             weight.main_grad = ctx.main_grad
 
         num_tokens = input_2d.size(0)
-        for start in range(0, num_tokens, ctx.chunk_size):
+        for chunk_idx, start in enumerate(range(0, num_tokens, ctx.chunk_size)):
             end = min(start + ctx.chunk_size, num_tokens)
             input_chunk = input_2d[start:end]
             compute_input_chunk = (
@@ -840,15 +897,51 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
                 compute_bias,
                 ctx.logit_scale,
             )
-            fused_logits_backward_inplace(
-                logits,
-                row_maxes[start:end],
-                sum_exps[start:end],
-                local_targets[start:end],
-                (grad_logprobs_1d[start:end] if grad_logprobs_1d is not None else None),
-                1.0 / ctx.temperature,
-                ctx.logit_scale,
-            )
+            if ctx.mapped:
+                positions, local_rows = ctx.semantic_groups[chunk_idx]
+                semantic_grad = (
+                    grad_logprobs_1d[positions]
+                    if grad_logprobs_1d is not None
+                    else torch.zeros_like(positions, dtype=torch.float32)
+                )
+                row_grad = torch.zeros(end - start, device=logits.device).index_add_(
+                    0, local_rows, semantic_grad
+                )
+                fused_logits_backward_inplace(
+                    logits,
+                    row_maxes[start:end],
+                    sum_exps[start:end],
+                    torch.full(
+                        (end - start,),
+                        -1,
+                        device=logits.device,
+                        dtype=local_targets.dtype,
+                    ),
+                    row_grad,
+                    1.0 / ctx.temperature,
+                    ctx.logit_scale,
+                )
+                targets = local_targets[positions]
+                owned = targets >= 0
+                logits.index_put_(
+                    (local_rows[owned], targets[owned]),
+                    semantic_grad[owned] / ctx.temperature * ctx.logit_scale,
+                    accumulate=True,
+                )
+            else:
+                fused_logits_backward_inplace(
+                    logits,
+                    row_maxes[start:end],
+                    sum_exps[start:end],
+                    local_targets[start:end],
+                    (
+                        grad_logprobs_1d[start:end]
+                        if grad_logprobs_1d is not None
+                        else None
+                    ),
+                    1.0 / ctx.temperature,
+                    ctx.logit_scale,
+                )
             if ctx.fp32_operands:
                 grad_input_2d[start:end].copy_(torch.mm(logits, compute_weight))
                 dlogits = logits
@@ -961,6 +1054,7 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -970,6 +1064,7 @@ def chunked_lm_head_logprobs_entropy(
     weight: torch.Tensor,
     labels: torch.Tensor,
     *,
+    semantic_rows: torch.Tensor | None = None,
     temperature: float,
     chunk_size: int,
     logit_scale: float = 1.0,
@@ -1004,6 +1099,7 @@ def chunked_lm_head_logprobs_entropy(
         output_layer.tp_group,
         logit_scale,
         output_layer.fp32_operands,
+        semantic_rows,
     )
     return ChunkedLMHeadOutput(*values)
 

@@ -654,6 +654,53 @@ def test_direct_fp32_end_to_end_precision_matches_native_megatron_areal():
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for chunked LM Head")
+def test_chunked_lm_head_shared_rows_preserves_fork_label_gradients():
+    """Chunked projection accumulates distinct semantic targets per compact row."""
+    torch.manual_seed(17)
+    hidden = torch.randn(7, 1, 16, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(32, 16, dtype=torch.bfloat16, device="cuda")
+    semantic_rows = torch.tensor([0, 1, 1, 2, 3, 3, 6])
+    labels = torch.tensor([2, 3, 4, 5, 6, 7, 8], device="cuda")
+    loss_weights = torch.randn(7, device="cuda")
+
+    chunked_hidden = hidden.clone().requires_grad_()
+    chunked_weight = weight.clone().requires_grad_()
+    output = _ChunkedVocabParallelLMHead.apply(
+        chunked_hidden,
+        chunked_weight,
+        None,
+        labels,
+        0.8,
+        3,
+        False,
+        False,
+        False,
+        None,
+        1.0,
+        True,
+        semantic_rows,
+    )
+    (output[0] * loss_weights).sum().backward()
+
+    reference_hidden = hidden.clone().requires_grad_()
+    reference_weight = weight.clone().requires_grad_()
+    logits = torch.matmul(
+        reference_hidden.float().squeeze(1), reference_weight.float().t()
+    )
+    log_softmax = (logits[semantic_rows] / 0.8).log_softmax(dim=-1)
+    expected = log_softmax.gather(1, labels[:, None]).squeeze(1)
+    (expected * loss_weights).sum().backward()
+
+    torch.testing.assert_close(output[0], expected, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(
+        chunked_hidden.grad, reference_hidden.grad, rtol=2e-3, atol=2e-3
+    )
+    torch.testing.assert_close(
+        chunked_weight.grad, reference_weight.grad, rtol=2e-3, atol=2e-3
+    )
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for chunked LM Head")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("temperature", [0.7, 1.0])
 @pytest.mark.parametrize("fp32_operands", [False, True])
@@ -701,6 +748,7 @@ def test_chunked_lm_head_matches_full_fused_path(
         None,
         logit_scale,
         fp32_operands,
+        None,
     )
     assert compute_weight_calls == 1
 
@@ -800,6 +848,7 @@ def test_chunked_lm_head_accumulates_fp32_main_grad():
         None,
         1.0,
         True,
+        None,
     )
     reference_outputs[0].sum().backward()
 
@@ -816,6 +865,7 @@ def test_chunked_lm_head_accumulates_fp32_main_grad():
         None,
         1.0,
         True,
+        None,
     )
     replacement_main_grad = torch.zeros_like(captured_main_grad)
     weight.main_grad = replacement_main_grad
@@ -857,6 +907,7 @@ def test_chunked_fp32_lm_head_rejects_non_fp32_main_grad():
         None,
         1.0,
         True,
+        None,
     )
 
     with pytest.raises(RuntimeError, match="require an FP32 main_grad"):

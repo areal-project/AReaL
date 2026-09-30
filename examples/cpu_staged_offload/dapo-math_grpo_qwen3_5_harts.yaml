@@ -1,0 +1,9 @@
+defaults:
+  - dapo-math_grpo_qwen3_5_cpu_staged
+  - _self_
+
+experiment_name: dapo-math-grpo-qwen3.5-35b-a3b-harts
+
+actor:
+  enable_tree_training: true
+  pad_to_maximum: true
