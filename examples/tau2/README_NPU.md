@@ -134,7 +134,7 @@ Before running the benchmark:
 
 ```yaml
 actor:
-  enable_tree_training: false
+  tree_training_mode: disabled
 
 vllm:
   enforce_eager: true
