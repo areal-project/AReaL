@@ -696,9 +696,13 @@ def configure_state_from_args(state: GuardState, args: argparse.Namespace) -> st
     Returns the ``bind_host`` address for werkzeug (may differ from
     ``state.server_host`` when binding to ``0.0.0.0`` / ``::``).
     """
-    from areal.utils.network import gethostip
+    from areal.utils.network import forced_host_ip, gethostip
 
     bind_host = args.host
+    forced = forced_host_ip()
+    if forced is not None and bind_host in ("0.0.0.0", "::"):
+        # AREAL_FORCE_HOST_IP keeps the guard off every other interface.
+        bind_host = forced
     if bind_host == "0.0.0.0":
         host_ip = gethostip()
         if ":" in host_ip:

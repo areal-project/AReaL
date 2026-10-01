@@ -17,6 +17,7 @@ import torch
 
 from areal.experimental.kvmap.apply import DenseCache, translate_cache
 from areal.experimental.kvmap.artifact import META_FILE, MapperArtifact
+from areal.experimental.kvmap.fast import StackedMapper
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -31,6 +32,7 @@ class MapperBridge:
         self.registry = registry
         self.model_layout = model_layout
         self._handles: dict[tuple[int, int], MapperHandle] = {}
+        self._stacked: dict[tuple[int, int, str], StackedMapper | None] = {}
 
     def artifact_directory(
         self, source_version: int, target_version: int
@@ -63,7 +65,15 @@ class MapperBridge:
         values: list[torch.Tensor],
         positions: torch.Tensor,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Map pool-layout tensors: each ``[tokens, kv_heads, head_dim]`` in, same shapes out."""
+        """Map pool-layout tensors: each ``[tokens, kv_heads, head_dim]`` in, same shapes out.
+
+        ``positions`` may concatenate several requests, so one call can serve every request that
+        resumes after a weight update. Same-layer artifacts take the stacked fast path.
+        """
+        stacked = self._stacked_mapper(handle, keys[0].device)
+        if stacked is not None:
+            new_keys, new_values = stacked.translate(keys=torch.stack(keys), values=torch.stack(values), positions=positions)
+            return list(new_keys.unbind(0)), list(new_values.unbind(0))
         source = DenseCache(
             keys=tuple(k.permute(1, 0, 2).unsqueeze(0) for k in keys),
             values=tuple(v.permute(1, 0, 2).unsqueeze(0) for v in values),
@@ -77,6 +87,16 @@ class MapperBridge:
         return [k[0].permute(1, 0, 2).contiguous() for k in target.keys], [
             v[0].permute(1, 0, 2).contiguous() for v in target.values
         ]
+
+    def _stacked_mapper(self, handle: MapperHandle, device: torch.device) -> StackedMapper | None:
+        """Return the prepared fast mapper for this pair and device, or None when the artifact is not same-layer."""
+        key = (handle.source_version, handle.target_version, str(device))
+        if key not in self._stacked:
+            try:
+                self._stacked[key] = StackedMapper(handle.artifact, device=device)
+            except ValueError:
+                self._stacked[key] = None
+        return self._stacked[key]
 
     def _assert_layout(self, artifact: MapperArtifact) -> None:
         expected = {

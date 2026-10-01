@@ -45,6 +45,7 @@ from areal.infra.utils.launcher import (
     get_thread_env_vars,
 )
 from areal.infra.utils.proc import kill_process_tree, run_with_streaming_logs
+from areal.utils.network import default_bind_host
 from areal.utils import logging, name_resolve, names
 from areal.utils.fs import validate_shared_path
 from areal.utils.network import (
@@ -367,7 +368,7 @@ class LocalScheduler(Scheduler):
                 "-m",
                 module_path,
                 "--host",
-                "0.0.0.0",
+                default_bind_host(),
                 "--port",
                 str(forked_port),
                 "--experiment-name",

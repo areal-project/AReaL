@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import random
 import socket
 from ipaddress import ip_address
@@ -9,9 +10,33 @@ def gethostname():
     return socket.gethostname()
 
 
+FORCE_HOST_IP_ENV = "AREAL_FORCE_HOST_IP"
+BIND_ALL_INTERFACES = "0.0.0.0"
+
+
+def forced_host_ip() -> str | None:
+    """Return the address every AReaL service must bind and advertise, when the operator set one.
+
+    ``AREAL_FORCE_HOST_IP=127.0.0.1`` keeps a single-node run entirely on loopback, so no service
+    is reachable from other hosts or users (a shared login node, for example).
+    """
+    value = os.environ.get(FORCE_HOST_IP_ENV)
+    if value is None or value == "":
+        return None
+    ip_address(value)  # a malformed address is a configuration error, raised here
+    return value
+
+
+def default_bind_host() -> str:
+    """Bind address for services that otherwise listen on all interfaces."""
+    return forced_host_ip() or BIND_ALL_INTERFACES
+
+
 def gethostip(probe_host: str = "8.8.8.8", probe_port: int = 80) -> str:
     """
     Find the local IP address for outbound route to `probe_host:probe_port`.
+
+    When ``AREAL_FORCE_HOST_IP`` is set, that address is returned without probing.
 
     Args:
         probe_host: Remote address used to trigger route selection.
@@ -23,6 +48,9 @@ def gethostip(probe_host: str = "8.8.8.8", probe_port: int = 80) -> str:
     Raises:
         RuntimeError: If no suitable address can be determined
     """
+    forced = forced_host_ip()
+    if forced is not None:
+        return forced
     try:
         hostname = socket.gethostname()
         infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_DGRAM)
