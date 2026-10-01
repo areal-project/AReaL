@@ -140,34 +140,20 @@ class SelfAdaptationWorkflow(RolloutWorkflow):
             data,
         )
 
-        stats_tracker.get(workflow_context.stat_scope()).scalar(
-            reward=reward
-        )
+        stats_tracker.get(workflow_context.stat_scope()).scalar(reward=reward)
 
         # ---------------------------------------------------------
         # Build trajectory
         # ---------------------------------------------------------
         sequence = response.input_tokens + response.output_tokens
 
-        logprobs = (
-            [0.0] * response.input_len
-            + response.output_logprobs
-        )
+        logprobs = [0.0] * response.input_len + response.output_logprobs
 
-        loss_mask = (
-            [0] * response.input_len
-            + [1] * response.output_len
-        )
+        loss_mask = [0] * response.input_len + [1] * response.output_len
 
-        versions = (
-            [-1] * response.input_len
-            + response.output_versions
-        )
+        versions = [-1] * response.input_len + response.output_versions
 
-        turn_ids = (
-            [-1] * response.input_len
-            + [0] * response.output_len
-        )
+        turn_ids = [-1] * response.input_len + [0] * response.output_len
 
         trajectory = {
             "input_ids": torch.tensor(
@@ -198,14 +184,10 @@ class SelfAdaptationWorkflow(RolloutWorkflow):
                 reward,
                 dtype=torch.float32,
             ),
-
             "is_truncated": torch.tensor(
                 response.stop_reason == "length",
                 dtype=torch.bool,
             ),
         }
 
-        return {
-            key: value.unsqueeze(0)
-            for key, value in trajectory.items()
-        }
+        return {key: value.unsqueeze(0) for key, value in trajectory.items()}
