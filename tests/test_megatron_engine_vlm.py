@@ -504,6 +504,101 @@ class TestPackedContextParallelForward:
         assert "fp32_output" not in model.call_args.kwargs
 
 
+class TestMegatronForwardBatchContextParallel:
+    pytestmark = [
+        pytest.mark.gpu,
+        pytest.mark.npu,
+        pytest.mark.usefixtures("megatron_engine_dependencies"),
+    ]
+
+    def test_forward_batch_keeps_cp_logits_local(self, monkeypatch):
+        from areal.engine import megatron_engine
+        from areal.engine.megatron_engine import MegatronEngine
+
+        engine = MagicMock(spec=MegatronEngine)
+        input_batched = {
+            "input_ids": torch.tensor([[1, 2]]),
+            "attention_mask": torch.tensor([[1, 1]]),
+        }
+        engine._normalize_batch_input.return_value = (input_batched, None)
+        mb_list = MagicMock()
+        mb_list.to.return_value = mb_list
+        engine._prepare_mb_list.return_value = mb_list
+        engine.device = torch.device("cpu")
+        call_kwargs = {}
+
+        def capture_forward_backward(*_args, **kwargs):
+            call_kwargs.update(kwargs)
+
+        engine.forward_backward_batch.side_effect = capture_forward_backward
+        monkeypatch.setattr(
+            megatron_engine,
+            "pack_tensor_dict",
+            lambda _input: {"cu_seqlens": torch.tensor([0, 2])},
+        )
+        monkeypatch.setattr(
+            megatron_engine.mpu, "is_pipeline_last_stage", lambda: False
+        )
+        monkeypatch.setattr(
+            megatron_engine.mpu, "get_pipeline_model_parallel_last_rank", lambda: 0
+        )
+        monkeypatch.setattr(
+            megatron_engine.mpu, "get_pipeline_model_parallel_group", lambda: None
+        )
+        monkeypatch.setattr(
+            megatron_engine, "broadcast_tensor", lambda value, **_kwargs: value
+        )
+
+        MegatronEngine.forward_batch(engine, input_batched)
+
+        assert call_kwargs["forward_only"] is True
+        assert call_kwargs["gather_cp_output"] is False
+
+    def test_chunked_forward_result_reassembles_cp_scalars(self, monkeypatch):
+        from areal.engine import megatron_engine
+        from areal.engine.megatron_engine import MegatronEngine
+        from areal.models.mcore.vocab_parallel_head import ChunkedLMHeadOutput
+
+        engine = object.__new__(MegatronEngine)
+        engine.config = MagicMock(is_critic=False)
+        engine.enable_tree_training = False
+        local_logprobs = torch.tensor([1.0, 2.0])
+        output = ChunkedLMHeadOutput(
+            local_logprobs,
+            *(torch.zeros_like(local_logprobs) for _ in range(5)),
+        )
+        padded_cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+        old_cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
+        inputs = {
+            "_cp_padded_cu_seqlens": padded_cu_seqlens,
+            "_cp_padding_length": 1,
+            "_cp_old_cu_seqlens": old_cu_seqlens,
+        }
+        reassembled = torch.tensor([10.0, 11.0, 12.0, 13.0])
+        expected = torch.tensor([10.0, 11.0, 12.0])
+
+        def fake_reassemble(values, cu_seqlens):
+            assert values is local_logprobs
+            assert cu_seqlens is padded_cu_seqlens
+            return reassembled
+
+        def fake_unpad(values, padding_length, cu_seqlens, original_cu_seqlens):
+            assert values is reassembled
+            assert padding_length == 1
+            assert cu_seqlens is padded_cu_seqlens
+            assert original_cu_seqlens is old_cu_seqlens
+            return expected
+
+        monkeypatch.setattr(
+            megatron_engine, "reassemble_cp_packed_logprobs", fake_reassemble
+        )
+        monkeypatch.setattr(megatron_engine, "unpad_logits", fake_unpad)
+
+        result = MegatronEngine._compute_forward_result(engine, output, inputs)
+
+        assert result is expected
+
+
 class TestPrepareMbListRebindCallerSafety:
     """Verify _prepare_mb_list rebinds mb_list.data to a filtered copy so the
     caller's input dict survives across repeated forward() calls.

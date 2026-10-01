@@ -1443,12 +1443,9 @@ class MegatronEngine(TrainEngine):
                     tree_attn_keys = list(tree_kwargs.keys())
 
             cp_size = mpu.get_context_parallel_world_size()
-            # forward_batch (compute_logp / compute_values) passes
-            # gather_cp_output=True so CP-local outputs are gathered back to the
-            # full sequence length inside forward. This matches downstream
-            # labels / output_seqlens and fixes split_with_sizes mismatches when
-            # compute_logp runs with CP > 1. Train/eval keeps the default False
-            # value, so the CP-local loss path (_cp_local_labels) is unchanged.
+            # CP-local forward keeps the vocabulary logits sharded by sequence.
+            # Consumers reconstruct token scalars only; gathering logits here
+            # creates the full-vocabulary CP memory spike MOPD must avoid.
             cp_local = cp_size > 1 and not gather_cp_output
 
             model_vp_stage = getattr(model, "vp_stage", 0)
@@ -1803,7 +1800,7 @@ class MegatronEngine(TrainEngine):
             return None
 
         self.forward_backward_batch(
-            mb_list, process_output, forward_only=True, gather_cp_output=True
+            mb_list, process_output, forward_only=True, gather_cp_output=False
         )
 
         # Step 4: Aggregate, reorder, and broadcast outputs
@@ -3977,7 +3974,7 @@ class MegatronEngine(TrainEngine):
             )
         if not self.config.is_critic:
             if isinstance(output, ChunkedLMHeadOutput):
-                return output.logprobs
+                return self._reassemble_cp_forward_scalars(output.logprobs, inputs)
             if self.enable_tree_training:
                 logprobs = _gather_packed_tree_logprobs(
                     output,
@@ -3991,7 +3988,6 @@ class MegatronEngine(TrainEngine):
                 )
                 return logprobs
             cp_local_labels = inputs.get("_cp_local_labels")
-            cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
             if cp_local_labels is not None:
                 labels = cp_local_labels
             else:
@@ -4005,27 +4001,26 @@ class MegatronEngine(TrainEngine):
                 else None,
                 chunk_size=self.config.logprobs_chunk_size,
             )
-            if cp_padded_cu_seqlens is not None:
-                logprobs = reassemble_cp_packed_logprobs(logprobs, cp_padded_cu_seqlens)
-                logprobs = unpad_logits(
-                    logprobs,
-                    inputs.get("_cp_padding_length", 0),
-                    cp_padded_cu_seqlens,
-                    inputs.get("_cp_old_cu_seqlens"),
-                )
-            return logprobs
+            return self._reassemble_cp_forward_scalars(logprobs, inputs)
         else:
             values = output.squeeze(-1)
-            cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
-            if cp_padded_cu_seqlens is not None:
-                values = reassemble_cp_packed_logprobs(values, cp_padded_cu_seqlens)
-                values = unpad_logits(
-                    values,
-                    inputs.get("_cp_padding_length", 0),
-                    cp_padded_cu_seqlens,
-                    inputs.get("_cp_old_cu_seqlens"),
-                )
-            return values
+            return self._reassemble_cp_forward_scalars(values, inputs)
+
+    @staticmethod
+    def _reassemble_cp_forward_scalars(
+        local_values: torch.Tensor, inputs: dict[str, Any]
+    ) -> torch.Tensor:
+        """Reassemble CP token scalars without ever gathering vocabulary logits."""
+        padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
+        if padded_cu_seqlens is None:
+            return local_values
+        values = reassemble_cp_packed_logprobs(local_values, padded_cu_seqlens)
+        return unpad_logits(
+            values,
+            inputs.get("_cp_padding_length", 0),
+            padded_cu_seqlens,
+            inputs.get("_cp_old_cu_seqlens"),
+        )
 
 
 # =============================================================================
