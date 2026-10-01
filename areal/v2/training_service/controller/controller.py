@@ -359,6 +359,8 @@ class GatewayTrainController:
                 "areal.v2.training_service.data_proxy",
                 "--worker-addrs",
                 ",".join(self._worker_addrs),
+                "--request-timeout",
+                str(cfg.request_timeout),
                 "--admin-api-key",
                 cfg.admin_api_key,
                 "--log-level",
