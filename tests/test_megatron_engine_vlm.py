@@ -457,6 +457,48 @@ class TestPackedContextParallelForward:
                 npu_available=npu_available,
             )
 
+    @pytest.mark.parametrize(
+        (
+            "model_type",
+            "is_vision_model",
+            "use_padded_seq",
+            "use_model_packed_seq",
+            "has_vision_inputs",
+            "expected",
+        ),
+        [
+            ("qwen3", False, False, False, False, True),
+            ("qwen3_5", True, False, True, False, True),
+            ("qwen3_5_moe", True, False, True, False, True),
+            ("qwen3_5", True, True, False, False, True),
+            ("qwen3_5", True, False, True, True, False),
+            ("qwen3_5", True, False, False, False, False),
+            ("qwen3_vl", True, False, True, False, False),
+        ],
+    )
+    def test_chunked_lm_head_layout_support_is_payload_and_family_specific(
+        self,
+        model_type,
+        is_vision_model,
+        use_padded_seq,
+        use_model_packed_seq,
+        has_vision_inputs,
+        expected,
+    ):
+        """Only text-only Qwen3.5-family model-owned THD bypasses VLM rejection."""
+        from areal.engine.megatron_engine import _supports_chunked_lm_head_layout
+
+        assert (
+            _supports_chunked_lm_head_layout(
+                model_type=model_type,
+                is_vision_model=is_vision_model,
+                use_padded_seq=use_padded_seq,
+                use_model_packed_seq=use_model_packed_seq,
+                has_vision_inputs=has_vision_inputs,
+            )
+            is expected
+        )
+
     @pytest.mark.parametrize("fp32_output", [False, True])
     def test_forwards_explicit_fp32_output(self, monkeypatch, fp32_output):
         from areal.engine.megatron_utils import packed_context_parallel

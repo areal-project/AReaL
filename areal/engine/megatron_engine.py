@@ -250,6 +250,23 @@ def _validate_areal_lm_head_compatibility(
         raise NotImplementedError("AReaL LM Head does not support tree training")
 
 
+def _supports_chunked_lm_head_layout(
+    *,
+    model_type: str,
+    is_vision_model: bool,
+    use_padded_seq: bool,
+    use_model_packed_seq: bool,
+    has_vision_inputs: bool,
+) -> bool:
+    if has_vision_inputs:
+        return False
+    if not is_vision_model or use_padded_seq:
+        return True
+    # Qwen3.5/Qwen3.6 checkpoints use the Qwen3.5 model types. Their
+    # model-owned THD output remains token-aligned for text-only batches.
+    return use_model_packed_seq and is_qwen3_5_model(model_type)
+
+
 def _map_chunked_lm_head_output(
     output: ChunkedLMHeadOutput,
     fn: Callable[[torch.Tensor], torch.Tensor],
@@ -1462,12 +1479,17 @@ class MegatronEngine(TrainEngine):
             has_vision_inputs = any(
                 _is_multi_modal_payload_key(key) for key in mb_input.padded_mb
             )
-            if use_chunked_lm_head and (
-                has_vision_inputs or (self.is_vision_model and not self.use_padded_seq)
+            if use_chunked_lm_head and not _supports_chunked_lm_head_layout(
+                model_type=self.hf_config.model_type,
+                is_vision_model=self.is_vision_model,
+                use_padded_seq=self.use_padded_seq,
+                use_model_packed_seq=self.use_model_packed_seq,
+                has_vision_inputs=has_vision_inputs,
             ):
                 raise NotImplementedError(
-                    "chunked LM Head loss does not support vision inputs; padded "
-                    "BSHD is supported only for text-only models such as Qwen3.5"
+                    "chunked LM Head loss does not support vision inputs or this "
+                    "VLM sequence layout; text-only Qwen3.5/Qwen3.6 model-owned "
+                    "THD is supported"
                 )
 
             output = packed_context_parallel_forward(
