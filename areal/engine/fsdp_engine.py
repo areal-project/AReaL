@@ -2110,6 +2110,7 @@ class FSDPEngine(TrainEngine):
 
         inputs.pop("turn_ids", None)
         inputs.pop("is_truncated", None)
+        inputs.pop("m2_loss_mask", None)
 
         ctx = FSDPTrainContext(
             model_inputs=inputs,

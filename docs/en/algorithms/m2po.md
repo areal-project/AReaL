@@ -45,6 +45,25 @@ For more details:
 
 ## Example Usage
 
+### Microbatch accumulation
+
+By default, M2PO selects its mask separately inside each engine microbatch. The
+recommended `examples/math/gsm8k_m2po.yaml` keeps this behavior with its
+`fsdp:d4p1t1` actor. Changing the microbatch partition can change the selected mask.
+
+Set `actor.m2po_optimizer_minibatch: true` to select the mask once per optimizer
+minibatch, before the engine splits it into microbatches. This option is disabled
+by default. It requires `actor.m2_threshold`, data parallel size 1, and cached
+proximal log-probabilities (`actor.prox_logp_method: recompute` or `metrics`). Only
+the opt-in path rejects other data parallel sizes or proximal approximation modes
+before the optimizer update; it does not implement selection across DP ranks.
+
+With this option, engine weights use the retained token count, preserving the
+current unsplit implementation's normalization by retained tokens (`K`). This
+differs from the original-token denominator (`N`) in the equation above.
+Tensor, pipeline, and sequence parallelism are separate from the DP restriction
+and have not been validated for this path.
+
 We recommend changing the parameters in the configuration file
 (`examples/math/gsm8k_m2po.yaml`).
 
