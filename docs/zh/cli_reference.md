@@ -84,6 +84,7 @@ python3 train.py --config path/to/config.yaml actor.lr=1e-4 seed=42
 - [MOPDTeacher Specification](section-mopd-teacher)
 - [MegatronEngine Configuration](section-megatron-engine)
 - [MemoryProfiler Configuration](section-memory-profiler)
+- [OPSA Configuration](section-opsa)
 - [PRMAdvantageShaping Configuration](section-prm-advantage-shaping)
 - [PRM Configuration](section-prm)
 - [PRMScorer Configuration](section-prm-scorer)
@@ -417,6 +418,7 @@ Configuration for PPO actor model, a subclass of a TrainEngine.
 | `gae_lambda_kwargs`             | `dict`                                                          | `{}`                   | Keyword arguments passed to a custom gae_lambda function. Ignored when gae_lambda is a float.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `gae_timestep_unit`             | string                                                          | `"token"`              | Timestep unit used by GAE. 'token' preserves standard token-level GAE; 'turn' applies discount and lambda once per generated turn. **Choices:** `token`, `turn`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `adv_norm`                      | [`NormConfig`](section-norm) \| None                            | `None`                 | Normalization configuration for advantages.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `opsa`                          | [`OPSAConfig`](section-opsa) \| None                            | `None`                 | Optional reward-free On-Policy Self-Adaptation configuration.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `token_rewards_as_adv`          | boolean                                                         | `True`                 | How per-token process rewards in 'token_rewards' enter the objective. True (default): shape advantages after GAE and advantage normalization according to rollout.agent.prm.advantage_shaping, keeping process rewards out of returns. False: add one uniform reward at each turn boundary before GAE, propagating it to preceding tokens and critic returns; this mode is incompatible with GVPO and process-weighted shaping.                                                                                                                                                                                                                       |
 | `min_usable_group_size`         | integer \| None                                                 | `None`                 | Minimum usable rollout slots a prompt group must keep to stay trainable when some slots fail or are filtered. None derives the minimum from reward_norm/adv_norm: 2 when either uses group statistics (1 for a singleton target group), else 1.                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `kl_ctl`                        | float                                                           | `0.1`                  | KL divergence coefficient                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
@@ -1306,6 +1308,21 @@ entries for torch.cuda.memory.\_record_memory_history.
 | --------------- | --------------- | -------- | ------------------------------------------------- |
 | `profile_steps` | list of integer | *list*   | List of global steps to capture memory snapshots. |
 | `max_entries`   | integer         | `100000` | Max entries for memory history ring buffer.       |
+
+(section-opsa)=
+
+## OPSA Configuration
+
+Configuration for On-Policy Self-Adaptation (OPSA).
+
+OPSA (Section 4.2 of `Does On-Policy Distillation Really Distill?`) suppresses the
+lowest-probability sampled tokens without task rewards or a teacher. The selected
+fraction is evaluated independently for every response, and its negative advantage is
+scaled by token entropy.
+
+| Parameter              | Type  | Default | Description                                                               |
+| ---------------------- | ----- | ------- | ------------------------------------------------------------------------- |
+| `lowest_logp_fraction` | float | `0.2`   | Fraction of valid response tokens with the lowest rollout logp to update. |
 
 (section-prm-advantage-shaping)=
 
