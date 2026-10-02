@@ -248,4 +248,3 @@ scheduler.type=local
 ```
 
 For distributed environments, configure the scheduler and worker resources according to the AReaL deployment.
-

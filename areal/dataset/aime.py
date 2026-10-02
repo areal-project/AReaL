@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+
 from datasets import load_dataset
+
 
 def get_aime_sft_dataset(
     path: str,
@@ -13,7 +15,7 @@ def get_aime_sft_dataset(
         data_files={
             "train": os.path.join(path, "train.parquet"),
             "test": os.path.join(path, "test.parquet"),
-        }
+        },
     )
 
     dataset = dataset[split]
@@ -46,7 +48,7 @@ def get_aime_rl_dataset(
         data_files={
             "train": os.path.join(path, "train.parquet"),
             "test": os.path.join(path, "test.parquet"),
-        }
+        },
     )
 
     dataset = dataset[split]

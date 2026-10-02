@@ -39,27 +39,17 @@ def main(args: list[str]) -> None:
         temperature=0.7,
     )
 
-
     with PPOTrainer(
         config,
         train_dataset=train_dataset,
         valid_dataset=valid_dataset,
     ) as trainer:
-
         trainer.train(
-            workflow=(
-                "areal.workflow.self_adaptation."
-                "SelfAdaptationWorkflow"
-            ),
+            workflow=("areal.workflow.self_adaptation.SelfAdaptationWorkflow"),
             workflow_kwargs=workflow_kwargs,
-
-            eval_workflow=(
-                "areal.workflow.self_adaptation."
-                "SelfAdaptationWorkflow"
-            ),
+            eval_workflow=("areal.workflow.self_adaptation.SelfAdaptationWorkflow"),
             eval_workflow_kwargs=eval_workflow_kwargs,
         )
-
 
 
 if __name__ == "__main__":
