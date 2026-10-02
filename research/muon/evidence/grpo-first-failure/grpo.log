@@ -1,0 +1,704 @@
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:52:57.280 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:52:57.281 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:52:57.283 FileSystemUtils WARNING: name_resolve.nfs_record_root '/tmp/areal/name_resolve' is not on a network filesystem. This may cause issues in distributed training where all nodes need access to the same files. Consider using NFS, Lustre, or other shared storage.
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:52:57.284 NameResolve INFO: No such name resolve path: /tmp/areal/name_resolve/root/gsm8k-grpo-megatron-muon/trial0
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:52:57.285 LocalScheduler INFO: LocalScheduler initialized with GPU devices: [0, 1, 2, 3, 4, 5, 6, 7], log directory: /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo/logs/root/gsm8k-grpo-megatron-muon/trial0
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:53:10.562 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:53:10.566 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:11.000 LocalScheduler INFO: Creating 1 workers for role 'data-data' (strategy: SchedulingStrategyType.separation, colocate_with: None)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:11.001 LauncherUtils INFO: Auto-setting thread env vars to 1: OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS, VECLIB_MAXIMUM_THREADS, NUMEXPR_NUM_THREADS
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:11.001 LocalScheduler INFO: Starting worker data-data/0 (attempt 1/3): /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/bin/python -m areal.infra.rpc.guard --port 13543 --experiment-name gsm8k-grpo-megatron-muon --trial-name trial0 --role data-data --worker-index 0 --name-resolve-type nfs --nfs-record-root /tmp/areal/name_resolve --etcd3-addr localhost:2379 --fileroot /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:11.105 LocalScheduler INFO: Worker data-data/0 started (PID: 500454, GPUs: [], ports: [13543, 17694])
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:11.106 LocalScheduler INFO: Successfully created 1 workers for role 'data-data'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:18.843 Guard INFO: Starting Guard on 33.214.152.224:13543 for worker data-data/0
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:18.880 LocalScheduler INFO: Configuration successfully on worker 'data-data/0'
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:18.882 LocalScheduler INFO: All 1 workers for role 'data-data' are ready
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:18.883 DataController INFO: RPCGuard workers ready: ['data-data/0']
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:18.887 Guard INFO: Forking new worker process for role 'data-worker' index 0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:18.887 Guard INFO: Forked worker logs will be written to: /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo/logs/root/gsm8k-grpo-megatron-muon/trial0/data-worker.log
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:18.889 Guard INFO: Forked worker for role 'data-worker' index 0 spawned (pid=500572)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:18.889 Guard INFO: Forking new worker process for role 'data-router' index 0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:18.890 Guard INFO: Forked worker logs will be written to: /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo/logs/root/gsm8k-grpo-megatron-muon/trial0/data-router.log
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:18.891 Guard INFO: Forked worker for role 'data-router' index 0 spawned (pid=500576)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:27.004 DataRouter INFO: DataRouter starting
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:27.028 DataController INFO: data-router is ready at http://33.214.152.224:11662/health
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:53:27.780 PlatformInit INFO: No supported accelerator detected. Initializing CPU platform.
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:27.831 DataController INFO: data-worker is ready at http://33.214.152.224:28120/health
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:27.832 DataController INFO: DataWorkers: ['http://33.214.152.224:28120']
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:27.832 DataController INFO: Router: http://33.214.152.224:11662
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:27.834 DataRouter INFO: Worker registered: http://33.214.152.224:28120 (total=1)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:27.835 DataController INFO: Registered DataWorker http://33.214.152.224:28120 in router
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:27.836 Guard INFO: Forking new worker process for role 'data-gateway' index 0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:27.837 Guard INFO: Forked worker logs will be written to: /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo/logs/root/gsm8k-grpo-megatron-muon/trial0/data-gateway.log
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:27.838 Guard INFO: Forked worker for role 'data-gateway' index 0 spawned (pid=500630)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:35.870 DataController INFO: data-gateway is ready at http://33.214.152.224:11466/health
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:35.871 DataController INFO: Gateway: http://33.214.152.224:11466
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:35.871 DataController INFO: DataController initialized with 1 workers
+Map:   0%|          | 0/24 [00:00<?, ? examples/s]Map: 100%|██████████| 24/24 [00:00<00:00, 3145.83 examples/s]
+Filter:   0%|          | 0/24 [00:00<?, ? examples/s]Filter: 100%|██████████| 24/24 [00:00<00:00, 1554.05 examples/s]
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:37.929 DataGatewayAuth INFO: Generated API key for dataset gsm8k-grpo-megatron-muon_trial0_train
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:37.930 DataController INFO: Registered dataset gsm8k-grpo-megatron-muon_trial0_train: total_samples=24, workers=1
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:37.931 RDataset INFO: RDataset connected: id=gsm8k-grpo-megatron-muon_trial0_train, total_samples=24
+Map:   0%|          | 0/4 [00:00<?, ? examples/s]Map: 100%|██████████| 4/4 [00:00<00:00, 1571.93 examples/s]
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:37.978 DataGatewayAuth INFO: Generated API key for dataset gsm8k-grpo-megatron-muon_trial0_valid
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:37.979 DataController INFO: Registered dataset gsm8k-grpo-megatron-muon_trial0_valid: total_samples=4, workers=1
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:37.979 RDataset INFO: RDataset connected: id=gsm8k-grpo-megatron-muon_trial0_valid, total_samples=4
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:37.980 TrainController INFO: Creating workers via scheduler...
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:37.980 LocalScheduler INFO: Creating 2 workers for role 'actor' (strategy: SchedulingStrategyType.separation, colocate_with: None)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:37.980 LauncherUtils INFO: Auto-setting thread env vars to 8: OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS, VECLIB_MAXIMUM_THREADS, NUMEXPR_NUM_THREADS
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:37.981 LocalScheduler INFO: Starting worker actor/0 (attempt 1/3): python3 -m areal.infra.rpc.rpc_server --port 16790 --experiment-name gsm8k-grpo-megatron-muon --trial-name trial0 --role actor --worker-index 0 --name-resolve-type nfs --nfs-record-root /tmp/areal/name_resolve --etcd3-addr localhost:2379 --fileroot /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:38.085 LocalScheduler INFO: Worker actor/0 started (PID: 500934, GPUs: [0], ports: [16790, 20707])
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:38.087 LauncherUtils INFO: Auto-setting thread env vars to 8: OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS, VECLIB_MAXIMUM_THREADS, NUMEXPR_NUM_THREADS
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:38.088 LocalScheduler INFO: Starting worker actor/1 (attempt 1/3): python3 -m areal.infra.rpc.rpc_server --port 19789 --experiment-name gsm8k-grpo-megatron-muon --trial-name trial0 --role actor --worker-index 1 --name-resolve-type nfs --nfs-record-root /tmp/areal/name_resolve --etcd3-addr localhost:2379 --fileroot /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:38.192 LocalScheduler INFO: Worker actor/1 started (PID: 500940, GPUs: [1], ports: [19789, 26067])
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:38.194 LocalScheduler INFO: Successfully created 2 workers for role 'actor'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:46.837 SyncRPCServer INFO: Werkzeug log level: WARNING
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:46.837 SyncRPCServer INFO: Werkzeug log level: WARNING
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:46.838 Guard INFO: Starting Guard on 33.214.152.224:16790 for worker actor/0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:46.838 Guard INFO: Starting Guard on 33.214.152.224:19789 for worker actor/0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:46.869 EngineBP INFO: Engine thread started
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:46.869 EngineBP INFO: Engine thread initialized
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:53:47.746 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:53:47.746 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:47.748 LocalScheduler INFO: Configuration successfully on worker 'actor/0'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:47.755 EngineBP INFO: Engine thread started
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:47.756 EngineBP INFO: Engine thread initialized
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:53:48.595 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:53:48.595 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:48.596 LocalScheduler INFO: Configuration successfully on worker 'actor/1'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:48.597 TrainController INFO: Workers created: ['actor/0', 'actor/1']
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:48.597 TrainController INFO: Waiting for workers to be ready...
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:53:48.601 LocalScheduler INFO: All 2 workers for role 'actor' are ready
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:48.601 TrainController INFO: Workers ready: ['actor/0', 'actor/1']
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:48.601 TrainController INFO: Distributed training: MASTER_ADDR=33.214.152.224, MASTER_PORT=20707
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:48.602 TrainController INFO: Creating engines on workers...
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:48.603 Guard INFO: Updated 5 environment variables
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:53:48.603 Guard INFO: Updated 5 environment variables
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:53:58.887 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:53:58.889 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:53:59.932 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:53:59.934 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.300 PPOActor INFO: ======================================================================
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.300 PPOActor INFO: PPOActor Configuration
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.301 PPOActor INFO: ======================================================================
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.301 PPOActor INFO: Mode: Decoupled PPO (off-policy)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.301 PPOActor INFO:   log_p_behave (π_behave): FROM INFERENCE (behavior policy)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.301 PPOActor INFO:   Proximal policy (π_prox): RECOMPUTED via forward pass (standard decoupled PPO)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.301 PPOActor INFO:   log_p_theta (π_θ): TRAINING FORWARD PASS (current policy)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.301 PPOActor INFO:   Rejection sampling: level=token, metric=ratio, action=mask, upper=5.0
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.301 PPOActor INFO: ======================================================================
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.301 PPOActor INFO: Training Parameters:
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.301 PPOActor INFO:   importance_sampling_level: token
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.301 PPOActor INFO:   adv_norm: NormConfig(mean_level='batch', mean_leave1out=False, std_level='batch', std_unbiased=True, eps=1e-05, group_size=1)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.301 PPOActor INFO:   reward_norm: NormConfig(mean_level='group', mean_leave1out=False, std_level='group', std_unbiased=True, eps=1e-05, group_size=2)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.302 PPOActor INFO:   gae_lambda: 1.0
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.302 PPOActor INFO:   gae_timestep_unit: token
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.302 PPOActor INFO:   eps_clip: 0.4
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:00.302 PPOActor INFO: ======================================================================
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:00.302 EngineBP INFO: Engine 'actor/0' (class: areal.engine.megatron_engine.MegatronPPOActor) instantiated successfully
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.321 PPOActor INFO: ======================================================================
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.321 PPOActor INFO: PPOActor Configuration
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.322 PPOActor INFO: ======================================================================
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.322 PPOActor INFO: Mode: Decoupled PPO (off-policy)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.322 PPOActor INFO:   log_p_behave (π_behave): FROM INFERENCE (behavior policy)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.322 PPOActor INFO:   Proximal policy (π_prox): RECOMPUTED via forward pass (standard decoupled PPO)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.322 PPOActor INFO:   log_p_theta (π_θ): TRAINING FORWARD PASS (current policy)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.322 PPOActor INFO:   Rejection sampling: level=token, metric=ratio, action=mask, upper=5.0
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.322 PPOActor INFO: ======================================================================
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.322 PPOActor INFO: Training Parameters:
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.322 PPOActor INFO:   importance_sampling_level: token
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.322 PPOActor INFO:   adv_norm: NormConfig(mean_level='batch', mean_leave1out=False, std_level='batch', std_unbiased=True, eps=1e-05, group_size=1)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.323 PPOActor INFO:   reward_norm: NormConfig(mean_level='group', mean_leave1out=False, std_level='group', std_unbiased=True, eps=1e-05, group_size=2)
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.323 PPOActor INFO:   gae_lambda: 1.0
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.323 PPOActor INFO:   gae_timestep_unit: token
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.323 PPOActor INFO:   eps_clip: 0.4
+[36m[1;38;2;180;140;80m(AReaL)[0m [36m20261001-17:54:01.323 PPOActor INFO: ======================================================================
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:01.323 EngineBP INFO: Engine 'actor/1' (class: areal.engine.megatron_engine.MegatronPPOActor) instantiated successfully
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:01.325 TrainController INFO: Engines created on all workers!
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:01.326 TrainController INFO: Calling engine initialization...
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:03.180 CUDAPlatform INFO: Set NUMA affinity for CUDA device 0 (GPU-f83cca64-c22f-61fd-a52c-727e576442df): bound to 96 CPU cores.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:03.190 CUDAPlatform INFO: Set NUMA affinity for CUDA device 0 (GPU-26620a54-fee7-5b4b-3cb0-d370c8e9f0f0): bound to 96 CPU cores.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:03.687 [MegatronEngine Rank 0] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new features. Please reference the migration guide `docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:03.690 [MegatronEngine Rank 1] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 0): 1543714304
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:04.655 [MegatronEngine Rank 0] INFO: Model parameter count: 1543.71M, pp_stage=0, vpp_chunks=1
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:04.655 [MegatronEngine Rank 1] INFO: Model parameter count: 1543.71M, pp_stage=0, vpp_chunks=1
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:04.825 TrainController INFO: All engines are initialized!
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:04.825 TrainController INFO: Identifying DP head workers...
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:04.832 TrainController INFO: TrainController initialization complete
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:04.848 RolloutController INFO: Creating workers via scheduler...
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:04.848 LocalScheduler INFO: Creating 2 workers for role 'rollout' (strategy: SchedulingStrategyType.separation, colocate_with: None)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:04.849 LauncherUtils INFO: Auto-setting thread env vars to 8: OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS, VECLIB_MAXIMUM_THREADS, NUMEXPR_NUM_THREADS
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:04.849 LocalScheduler INFO: Starting worker rollout/0 (attempt 1/3): python3 -m areal.infra.rpc.rpc_server --port 21680 --experiment-name gsm8k-grpo-megatron-muon --trial-name trial0 --role rollout --worker-index 0 --name-resolve-type nfs --nfs-record-root /tmp/areal/name_resolve --etcd3-addr localhost:2379 --fileroot /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:04.953 LocalScheduler INFO: Worker rollout/0 started (PID: 501589, GPUs: [2], ports: [21680, 27026])
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:04.954 LauncherUtils INFO: Auto-setting thread env vars to 8: OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS, VECLIB_MAXIMUM_THREADS, NUMEXPR_NUM_THREADS
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:04.954 LocalScheduler INFO: Starting worker rollout/1 (attempt 1/3): python3 -m areal.infra.rpc.rpc_server --port 15547 --experiment-name gsm8k-grpo-megatron-muon --trial-name trial0 --role rollout --worker-index 1 --name-resolve-type nfs --nfs-record-root /tmp/areal/name_resolve --etcd3-addr localhost:2379 --fileroot /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:05.059 LocalScheduler INFO: Worker rollout/1 started (PID: 501595, GPUs: [3], ports: [15547, 32182])
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:05.059 LocalScheduler INFO: Successfully created 2 workers for role 'rollout'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:12.750 SyncRPCServer INFO: Werkzeug log level: WARNING
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:12.750 SyncRPCServer INFO: Werkzeug log level: WARNING
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:12.751 Guard INFO: Starting Guard on 33.214.152.224:21680 for worker rollout/0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:12.751 Guard INFO: Starting Guard on 33.214.152.224:15547 for worker rollout/0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:12.831 EngineBP INFO: Engine thread started
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:12.831 EngineBP INFO: Engine thread initialized
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:13.675 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:13.675 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:13.677 LocalScheduler INFO: Configuration successfully on worker 'rollout/0'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:13.685 EngineBP INFO: Engine thread started
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:13.685 EngineBP INFO: Engine thread initialized
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:14.558 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:14.559 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:14.560 LocalScheduler INFO: Configuration successfully on worker 'rollout/1'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:14.560 RolloutController INFO: Workers created: ['rollout/0', 'rollout/1']
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:14.561 RolloutController INFO: Waiting for workers to be ready...
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:14.564 LocalScheduler INFO: All 2 workers for role 'rollout' are ready
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:14.565 RolloutController INFO: Workers ready: ['rollout/0', 'rollout/1']
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:14.565 RolloutController INFO: Creating engines...
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:14.574 EngineBP INFO: Engine 'rollout/1' (class: areal.engine.sglang_remote.RemoteSGLangEngine) instantiated successfully
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:14.574 EngineBP INFO: Engine 'rollout/0' (class: areal.engine.sglang_remote.RemoteSGLangEngine) instantiated successfully
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:14.575 RolloutController INFO: Engine created on all workers!
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:14.575 RolloutController INFO: Calling engine initialization...
+No HuggingFace chat template found
+No HuggingFace chat template found
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Multi-thread loading shards:   0% Completed | 0/1 [00:00<?, ?it/s]Multi-thread loading shards:   0% Completed | 0/1 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 1/1 [00:00<00:00,  1.37it/s]Multi-thread loading shards: 100% Completed | 1/1 [00:00<00:00,  1.36it/s]Multi-thread loading shards: 100% Completed | 1/1 [00:00<00:00,  1.37it/s]Multi-thread loading shards: 100% Completed | 1/1 [00:00<00:00,  1.36it/s]
+
+  0%|          | 0/36 [00:00<?, ?it/s]Capturing batches (bs=256 avail_mem=52.28 GB):   0%|          | 0/36 [00:00<?, ?it/s]  0%|          | 0/36 [00:00<?, ?it/s]Capturing batches (bs=256 avail_mem=53.40 GB):   0%|          | 0/36 [00:00<?, ?it/s]2026-10-01 17:54:42,322 - CUTE_DSL - WARNING - [handle_import_error] - Unexpected error during package walk: cutlass.cute.experimental
+2026-10-01 17:54:42,322 - CUTE_DSL - WARNING - [handle_import_error] - Unexpected error during package walk: cutlass.cute.experimental
+Capturing batches (bs=256 avail_mem=53.40 GB):   3%|▎         | 1/36 [00:01<00:38,  1.11s/it]Capturing batches (bs=248 avail_mem=53.25 GB):   3%|▎         | 1/36 [00:01<00:38,  1.11s/it]Capturing batches (bs=256 avail_mem=52.28 GB):   3%|▎         | 1/36 [00:01<00:39,  1.13s/it]Capturing batches (bs=248 avail_mem=52.14 GB):   3%|▎         | 1/36 [00:01<00:39,  1.13s/it]Capturing batches (bs=240 avail_mem=53.25 GB):   3%|▎         | 1/36 [00:01<00:38,  1.11s/it]Capturing batches (bs=240 avail_mem=52.13 GB):   3%|▎         | 1/36 [00:01<00:39,  1.13s/it]Capturing batches (bs=232 avail_mem=53.24 GB):   3%|▎         | 1/36 [00:01<00:38,  1.11s/it]Capturing batches (bs=232 avail_mem=52.13 GB):   3%|▎         | 1/36 [00:01<00:39,  1.13s/it]Capturing batches (bs=224 avail_mem=53.24 GB):   3%|▎         | 1/36 [00:01<00:38,  1.11s/it]Capturing batches (bs=224 avail_mem=52.12 GB):   3%|▎         | 1/36 [00:01<00:39,  1.13s/it]Capturing batches (bs=224 avail_mem=53.24 GB):  14%|█▍        | 5/36 [00:01<00:05,  5.22it/s]Capturing batches (bs=216 avail_mem=53.23 GB):  14%|█▍        | 5/36 [00:01<00:05,  5.22it/s]Capturing batches (bs=224 avail_mem=52.12 GB):  14%|█▍        | 5/36 [00:01<00:06,  5.12it/s]Capturing batches (bs=216 avail_mem=52.12 GB):  14%|█▍        | 5/36 [00:01<00:06,  5.12it/s]Capturing batches (bs=208 avail_mem=53.23 GB):  14%|█▍        | 5/36 [00:01<00:05,  5.22it/s]Capturing batches (bs=208 avail_mem=52.11 GB):  14%|█▍        | 5/36 [00:01<00:06,  5.12it/s]Capturing batches (bs=200 avail_mem=53.22 GB):  14%|█▍        | 5/36 [00:01<00:05,  5.22it/s]Capturing batches (bs=200 avail_mem=52.11 GB):  14%|█▍        | 5/36 [00:01<00:06,  5.12it/s]Capturing batches (bs=200 avail_mem=53.22 GB):  22%|██▏       | 8/36 [00:01<00:03,  8.57it/s]Capturing batches (bs=192 avail_mem=53.22 GB):  22%|██▏       | 8/36 [00:01<00:03,  8.57it/s]Capturing batches (bs=200 avail_mem=52.11 GB):  22%|██▏       | 8/36 [00:01<00:03,  8.42it/s]Capturing batches (bs=192 avail_mem=52.10 GB):  22%|██▏       | 8/36 [00:01<00:03,  8.42it/s]Capturing batches (bs=184 avail_mem=53.21 GB):  22%|██▏       | 8/36 [00:01<00:03,  8.57it/s]Capturing batches (bs=184 avail_mem=52.09 GB):  22%|██▏       | 8/36 [00:01<00:03,  8.42it/s]Capturing batches (bs=176 avail_mem=53.21 GB):  22%|██▏       | 8/36 [00:01<00:03,  8.57it/s]Capturing batches (bs=176 avail_mem=52.09 GB):  22%|██▏       | 8/36 [00:01<00:03,  8.42it/s]Capturing batches (bs=176 avail_mem=53.21 GB):  31%|███       | 11/36 [00:01<00:02, 12.03it/s]Capturing batches (bs=168 avail_mem=53.20 GB):  31%|███       | 11/36 [00:01<00:02, 12.03it/s]Capturing batches (bs=176 avail_mem=52.09 GB):  31%|███       | 11/36 [00:01<00:02, 11.80it/s]Capturing batches (bs=168 avail_mem=52.08 GB):  31%|███       | 11/36 [00:01<00:02, 11.80it/s]Capturing batches (bs=160 avail_mem=53.20 GB):  31%|███       | 11/36 [00:01<00:02, 12.03it/s]Capturing batches (bs=160 avail_mem=52.08 GB):  31%|███       | 11/36 [00:01<00:02, 11.80it/s]Capturing batches (bs=152 avail_mem=53.19 GB):  31%|███       | 11/36 [00:01<00:02, 12.03it/s]Capturing batches (bs=152 avail_mem=52.07 GB):  31%|███       | 11/36 [00:01<00:02, 11.80it/s]Capturing batches (bs=152 avail_mem=53.19 GB):  39%|███▉      | 14/36 [00:01<00:01, 15.20it/s]Capturing batches (bs=144 avail_mem=53.19 GB):  39%|███▉      | 14/36 [00:01<00:01, 15.20it/s]Capturing batches (bs=152 avail_mem=52.07 GB):  39%|███▉      | 14/36 [00:01<00:01, 15.06it/s]Capturing batches (bs=144 avail_mem=52.07 GB):  39%|███▉      | 14/36 [00:01<00:01, 15.06it/s]Capturing batches (bs=136 avail_mem=53.18 GB):  39%|███▉      | 14/36 [00:01<00:01, 15.20it/s]Capturing batches (bs=136 avail_mem=52.07 GB):  39%|███▉      | 14/36 [00:01<00:01, 15.06it/s]Capturing batches (bs=128 avail_mem=53.18 GB):  39%|███▉      | 14/36 [00:01<00:01, 15.20it/s]Capturing batches (bs=128 avail_mem=52.06 GB):  39%|███▉      | 14/36 [00:01<00:01, 15.06it/s]Capturing batches (bs=128 avail_mem=53.18 GB):  47%|████▋     | 17/36 [00:01<00:01, 17.72it/s]Capturing batches (bs=120 avail_mem=53.17 GB):  47%|████▋     | 17/36 [00:01<00:01, 17.72it/s]Capturing batches (bs=128 avail_mem=52.06 GB):  47%|████▋     | 17/36 [00:01<00:01, 17.73it/s]Capturing batches (bs=120 avail_mem=52.06 GB):  47%|████▋     | 17/36 [00:01<00:01, 17.73it/s]Capturing batches (bs=112 avail_mem=53.17 GB):  47%|████▋     | 17/36 [00:01<00:01, 17.72it/s]Capturing batches (bs=112 avail_mem=52.05 GB):  47%|████▋     | 17/36 [00:01<00:01, 17.73it/s]Capturing batches (bs=104 avail_mem=53.16 GB):  47%|████▋     | 17/36 [00:01<00:01, 17.72it/s]Capturing batches (bs=104 avail_mem=52.04 GB):  47%|████▋     | 17/36 [00:01<00:01, 17.73it/s]Capturing batches (bs=96 avail_mem=53.16 GB):  47%|████▋     | 17/36 [00:01<00:01, 17.72it/s] Capturing batches (bs=104 avail_mem=52.04 GB):  56%|█████▌    | 20/36 [00:01<00:00, 20.37it/s]Capturing batches (bs=96 avail_mem=52.04 GB):  56%|█████▌    | 20/36 [00:01<00:00, 20.37it/s] Capturing batches (bs=96 avail_mem=53.16 GB):  58%|█████▊    | 21/36 [00:01<00:00, 20.92it/s]Capturing batches (bs=88 avail_mem=53.15 GB):  58%|█████▊    | 21/36 [00:01<00:00, 20.92it/s]Capturing batches (bs=88 avail_mem=52.03 GB):  56%|█████▌    | 20/36 [00:01<00:00, 20.37it/s]Capturing batches (bs=80 avail_mem=53.15 GB):  58%|█████▊    | 21/36 [00:01<00:00, 20.92it/s]Capturing batches (bs=80 avail_mem=52.03 GB):  56%|█████▌    | 20/36 [00:01<00:00, 20.37it/s]Capturing batches (bs=72 avail_mem=53.14 GB):  58%|█████▊    | 21/36 [00:01<00:00, 20.92it/s]Capturing batches (bs=80 avail_mem=52.03 GB):  64%|██████▍   | 23/36 [00:01<00:00, 22.26it/s]Capturing batches (bs=72 avail_mem=52.02 GB):  64%|██████▍   | 23/36 [00:01<00:00, 22.26it/s]Capturing batches (bs=72 avail_mem=53.14 GB):  67%|██████▋   | 24/36 [00:01<00:00, 22.55it/s]Capturing batches (bs=64 avail_mem=53.14 GB):  67%|██████▋   | 24/36 [00:01<00:00, 22.55it/s]Capturing batches (bs=64 avail_mem=52.02 GB):  64%|██████▍   | 23/36 [00:01<00:00, 22.26it/s]Capturing batches (bs=56 avail_mem=53.13 GB):  67%|██████▋   | 24/36 [00:01<00:00, 22.55it/s]Capturing batches (bs=56 avail_mem=52.01 GB):  64%|██████▍   | 23/36 [00:01<00:00, 22.26it/s]Capturing batches (bs=48 avail_mem=53.13 GB):  67%|██████▋   | 24/36 [00:01<00:00, 22.55it/s]Capturing batches (bs=56 avail_mem=52.01 GB):  72%|███████▏  | 26/36 [00:01<00:00, 23.86it/s]Capturing batches (bs=48 avail_mem=52.01 GB):  72%|███████▏  | 26/36 [00:01<00:00, 23.86it/s]Capturing batches (bs=48 avail_mem=53.13 GB):  75%|███████▌  | 27/36 [00:02<00:00, 24.06it/s]Capturing batches (bs=40 avail_mem=53.12 GB):  75%|███████▌  | 27/36 [00:02<00:00, 24.06it/s]Capturing batches (bs=40 avail_mem=52.00 GB):  72%|███████▏  | 26/36 [00:02<00:00, 23.86it/s]Capturing batches (bs=32 avail_mem=53.12 GB):  75%|███████▌  | 27/36 [00:02<00:00, 24.06it/s]Capturing batches (bs=32 avail_mem=52.00 GB):  72%|███████▏  | 26/36 [00:02<00:00, 23.86it/s]Capturing batches (bs=24 avail_mem=53.11 GB):  75%|███████▌  | 27/36 [00:02<00:00, 24.06it/s]Capturing batches (bs=32 avail_mem=52.00 GB):  81%|████████  | 29/36 [00:02<00:00, 24.93it/s]Capturing batches (bs=24 avail_mem=51.99 GB):  81%|████████  | 29/36 [00:02<00:00, 24.93it/s]Capturing batches (bs=24 avail_mem=53.11 GB):  83%|████████▎ | 30/36 [00:02<00:00, 25.18it/s]Capturing batches (bs=16 avail_mem=53.11 GB):  83%|████████▎ | 30/36 [00:02<00:00, 25.18it/s]Capturing batches (bs=16 avail_mem=51.99 GB):  81%|████████  | 29/36 [00:02<00:00, 24.93it/s]Capturing batches (bs=12 avail_mem=53.10 GB):  83%|████████▎ | 30/36 [00:02<00:00, 25.18it/s]Capturing batches (bs=12 avail_mem=51.98 GB):  81%|████████  | 29/36 [00:02<00:00, 24.93it/s]Capturing batches (bs=8 avail_mem=53.10 GB):  83%|████████▎ | 30/36 [00:02<00:00, 25.18it/s] Capturing batches (bs=12 avail_mem=51.98 GB):  89%|████████▉ | 32/36 [00:02<00:00, 23.20it/s]Capturing batches (bs=8 avail_mem=51.98 GB):  89%|████████▉ | 32/36 [00:02<00:00, 23.20it/s] Capturing batches (bs=8 avail_mem=53.10 GB):  92%|█████████▏| 33/36 [00:02<00:00, 23.03it/s]Capturing batches (bs=4 avail_mem=53.09 GB):  92%|█████████▏| 33/36 [00:02<00:00, 23.03it/s]Capturing batches (bs=4 avail_mem=51.97 GB):  89%|████████▉ | 32/36 [00:02<00:00, 23.20it/s]Capturing batches (bs=2 avail_mem=53.09 GB):  92%|█████████▏| 33/36 [00:02<00:00, 23.03it/s]Capturing batches (bs=2 avail_mem=51.97 GB):  89%|████████▉ | 32/36 [00:02<00:00, 23.20it/s]Capturing batches (bs=1 avail_mem=53.08 GB):  92%|█████████▏| 33/36 [00:02<00:00, 23.03it/s]Capturing batches (bs=1 avail_mem=51.96 GB):  89%|████████▉ | 32/36 [00:02<00:00, 23.20it/s]Capturing batches (bs=1 avail_mem=53.08 GB): 100%|██████████| 36/36 [00:02<00:00, 15.29it/s]
+Capturing batches (bs=1 avail_mem=51.96 GB): 100%|██████████| 36/36 [00:02<00:00, 26.41it/s]Capturing batches (bs=1 avail_mem=51.96 GB): 100%|██████████| 36/36 [00:02<00:00, 15.18it/s]
+Disable piecewise CUDA graph because the capture size is not set
+Disable piecewise CUDA graph because the capture size is not set
+Failed to get yes/no token IDs dynamically: 'NoneType' object has no attribute 'encode'
+Using fallback token IDs for yes/no (9693/2152)
+Failed to get yes/no token IDs dynamically: 'NoneType' object has no attribute 'encode'
+Using fallback token IDs for yes/no (9693/2152)
+[92m[1;38;2;180;140;80m(AReaL)[0m [92m20261001-17:54:49.641 InferenceTargets INFO: sglang metrics targets written to /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo/logs/root/gsm8k-grpo-megatron-muon/trial0/sglang_targets.json (2 groups, role=rollout, source=separation)
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:49.645 [RemoteInfEngine Rank 1] INFO: Get server addresses from the local subprocess.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:49.645 [RemoteInfEngine Rank 1] INFO: Waiting for server ready...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:49.647 [RemoteInfEngine Rank 0] INFO: Get server addresses from the local subprocess.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:49.647 [RemoteInfEngine Rank 0] INFO: Waiting for server ready...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:50.647 [RemoteInfEngine Rank 1] INFO: Servers are all ready!
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:50.650 [RemoteInfEngine Rank 0] INFO: Servers are all ready!
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:50.652 RolloutController INFO: All engines are initialized...
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:50.658 RolloutController INFO: Callback server started on 33.214.152.224:16601
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:50.677 RolloutController INFO: Creating workers via scheduler...
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:50.678 LocalScheduler INFO: Creating 2 workers for role 'eval-rollout' (strategy: SchedulingStrategyType.colocation, colocate_with: rollout)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:50.682 Guard INFO: Forking new worker process for role 'eval-rollout' index 0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:50.682 Guard INFO: Forking new worker process for role 'eval-rollout' index 1
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:50.682 Guard INFO: Forked worker logs will be written to: /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo/logs/root/gsm8k-grpo-megatron-muon/trial0/eval-rollout.log
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:50.683 Guard INFO: Forked worker logs will be written to: /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo/logs/root/gsm8k-grpo-megatron-muon/trial0/eval-rollout.log
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:50.683 Guard INFO: Forked worker for role 'eval-rollout' index 0 spawned (pid=502292)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:50.684 Guard INFO: Forked worker for role 'eval-rollout' index 1 spawned (pid=502293)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:58.601 SyncRPCServer INFO: Werkzeug log level: WARNING
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:58.601 SyncRPCServer INFO: Werkzeug log level: WARNING
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:58.602 Guard INFO: Starting Guard on 33.214.152.224:13364 for worker eval-rollout/0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:58.602 Guard INFO: Starting Guard on 33.214.152.224:13698 for worker eval-rollout/0
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:58.702 LocalScheduler INFO: Forked worker eval-rollout/0 created at 33.214.152.224:13364 (pid=502292) from rollout/0
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:58.702 LocalScheduler INFO: Forked worker eval-rollout/1 created at 33.214.152.224:13698 (pid=502293) from rollout/1
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:58.703 LocalScheduler INFO: Role 'eval-rollout' forked from 'rollout': created 2 new worker processes
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:58.710 EngineBP INFO: Engine thread started
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:58.710 EngineBP INFO: Engine thread initialized
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:59.528 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:54:59.528 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:54:59.529 LocalScheduler INFO: Configuration successfully on worker 'eval-rollout/0'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:59.536 EngineBP INFO: Engine thread started
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:54:59.537 EngineBP INFO: Engine thread initialized
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:00.361 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:00.361 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:00.362 LocalScheduler INFO: Configuration successfully on worker 'eval-rollout/1'
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:00.363 LocalScheduler INFO: Role 'eval-rollout' colocated with 'rollout': reusing workers ['eval-rollout/0', 'eval-rollout/1']
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:00.363 RolloutController INFO: Workers created: ['eval-rollout/0', 'eval-rollout/1']
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:00.363 RolloutController INFO: Waiting for workers to be ready...
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:00.373 LocalScheduler INFO: All 2 workers for role 'eval-rollout' are ready
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:00.373 RolloutController INFO: Workers ready: ['eval-rollout/0', 'eval-rollout/1']
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:00.373 RolloutController INFO: Creating engines...
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:00.383 EngineBP INFO: Engine 'eval-rollout/0' (class: areal.engine.sglang_remote.RemoteSGLangEngine) instantiated successfully
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:00.385 EngineBP INFO: Engine 'eval-rollout/1' (class: areal.engine.sglang_remote.RemoteSGLangEngine) instantiated successfully
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:00.385 RolloutController INFO: Engine created on all workers!
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:00.386 RolloutController INFO: Calling engine initialization...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:00.389 [RemoteInfEngine Rank 0] INFO: Get server addresses from the `addr` argument.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:00.389 [RemoteInfEngine Rank 1] INFO: Get server addresses from the `addr` argument.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:00.389 [RemoteInfEngine Rank 0] INFO: Waiting for server ready...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:00.389 [RemoteInfEngine Rank 1] INFO: Waiting for server ready...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:01.393 [RemoteInfEngine Rank 0] INFO: Servers are all ready!
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:01.393 [RemoteInfEngine Rank 1] INFO: Servers are all ready!
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:01.395 RolloutController INFO: All engines are initialized...
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:01.400 RolloutController INFO: Callback server started on 33.214.152.224:10222
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:01.407 [MegatronEngine Rank 0] INFO: Initializing weight update group: type=xccl init_method=tcp://33.214.152.224:15138 group=update_weight_group_0
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:01.413 [RemoteInfEngine Rank 1] INFO: Initializing weight update group: group=update_weight_group_0, addresses=['33.214.152.224:16549']
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:01.413 [RemoteInfEngine Rank 0] INFO: Initializing weight update group: group=update_weight_group_0, addresses=['33.214.152.224:24984']
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:01.418 [RemoteInfEngine Rank 1] INFO: Initialized NCCL group for distributed weight update for update_weight_group_0.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:01.418 [RemoteInfEngine Rank 0] INFO: Initialized NCCL group for distributed weight update for update_weight_group_0.
+swanlab: SwanLab run disabled, the data will not be saved or uploaded.
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:55:02.322 Recover WARNING: Resume info not found under /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo/checkpoints/root/gsm8k-grpo-megatron-muon/trial0. This should not be a resumed experiment!
+[92m[1;38;2;180;140;80m(AReaL)[0m [92m20261001-17:55:02.323 PerfTracer INFO: Configured global PerfTracer: enabled=False, session_tracing=False, rank=0, role=master
+[92m[1;38;2;180;140;80m(AReaL)[0m [92m20261001-17:55:02.327 PerfTracer INFO: Configured global PerfTracer: enabled=False, session_tracing=False, rank=1, role=actor
+[92m[1;38;2;180;140;80m(AReaL)[0m [92m20261001-17:55:02.327 PerfTracer INFO: Configured global PerfTracer: enabled=False, session_tracing=False, rank=0, role=actor
+[92m[1;38;2;180;140;80m(AReaL)[0m [92m20261001-17:55:02.329 PerfTracer INFO: Configured global PerfTracer: enabled=False, session_tracing=False, rank=0, role=rollout
+[92m[1;38;2;180;140;80m(AReaL)[0m [92m20261001-17:55:02.329 PerfTracer INFO: Configured global PerfTracer: enabled=False, session_tracing=False, rank=1, role=rollout
+[92m[1;38;2;180;140;80m(AReaL)[0m [92m20261001-17:55:02.332 PerfTracer INFO: Configured global PerfTracer: enabled=False, session_tracing=False, rank=0, role=eval-rollout
+[92m[1;38;2;180;140;80m(AReaL)[0m [92m20261001-17:55:02.332 PerfTracer INFO: Configured global PerfTracer: enabled=False, session_tracing=False, rank=1, role=eval-rollout
+[92m[1;38;2;180;140;80m(AReaL)[0m [92m20261001-17:55:02.845 RLTrainer INFO: Initializing proxy workers for AgentWorkflow support
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:02.863 Guard INFO: Forking new worker process for role 'proxy-rollout' index 1
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:02.863 Guard INFO: Forking new worker process for role 'proxy-rollout' index 0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:02.864 Guard INFO: Forked worker logs will be written to: /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo/logs/root/gsm8k-grpo-megatron-muon/trial0/proxy-rollout.log
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:02.864 Guard INFO: Forked worker logs will be written to: /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-035e3317b83ce56a74e49b5a/grpo/logs/root/gsm8k-grpo-megatron-muon/trial0/proxy-rollout.log
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:02.865 Guard INFO: Forked worker for role 'proxy-rollout' index 1 spawned (pid=502593)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:02.865 Guard INFO: Forked worker for role 'proxy-rollout' index 0 spawned (pid=502594)
+[92m17:55:10 - LiteLLM:WARNING[0m: get_model_cost_map.py:271 - LiteLLM: Failed to fetch remote model cost map from https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json: [Errno 104] Connection reset by peer. Falling back to local backup.
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:12.023 ProxyRolloutServer INFO: Starting proxy rollout server on 33.214.152.224:14698 for worker proxy-rollout/1
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:12.393 LocalScheduler INFO: Forked worker proxy-rollout/1 created at 33.214.152.224:14698 (pid=502593) from rollout/1
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:13.097 ProxyRolloutServer INFO: Starting proxy rollout server on 33.214.152.224:23418 for worker proxy-rollout/0
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:13.393 LocalScheduler INFO: Forked worker proxy-rollout/0 created at 33.214.152.224:23418 (pid=502594) from rollout/0
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:13.395 LocalScheduler INFO: Role 'proxy-rollout' forked from 'rollout': created 2 new worker processes
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:14.113 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:14.113 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:14.114 LocalScheduler INFO: Configuration successfully on worker 'proxy-rollout/0'
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:14.814 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:14.814 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:14.815 LocalScheduler INFO: Configuration successfully on worker 'proxy-rollout/1'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:14.816 RolloutController INFO: Proxy workers forked: ['proxy-rollout/0', 'proxy-rollout/1']
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:14.820 LocalScheduler INFO: All 2 workers for role 'proxy-rollout' are ready
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:14.820 RolloutController INFO: Proxy workers: ['proxy-rollout/0', 'proxy-rollout/1']
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:14.831 RolloutController INFO: Proxy engines created
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:14.972 [RemoteInfEngine Rank 5d58b19f56ac4ae5bb26a8dca6b1632d] INFO: Get server addresses from the `addr` argument.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:14.972 [RemoteInfEngine Rank fbacdc559a474fe694f6e494e3991912] INFO: Get server addresses from the `addr` argument.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:14.972 [RemoteInfEngine Rank 5d58b19f56ac4ae5bb26a8dca6b1632d] INFO: Waiting for server ready...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:14.972 [RemoteInfEngine Rank fbacdc559a474fe694f6e494e3991912] INFO: Waiting for server ready...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:15.975 [RemoteInfEngine Rank 5d58b19f56ac4ae5bb26a8dca6b1632d] INFO: Servers are all ready!
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:15.976 [RemoteInfEngine Rank fbacdc559a474fe694f6e494e3991912] INFO: Servers are all ready!
+Exception in ASGI application
+Traceback (most recent call last):
+  File "/opt/.venv/lib/python3.12/site-packages/uvicorn/protocols/http/h11_impl.py", line 403, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/applications.py", line 1139, in __call__
+    await super().__call__(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/applications.py", line 107, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 186, in __call__
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 716, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 736, in app
+    await route.handle(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 290, in handle
+    await self.app(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 120, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 106, in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 430, in app
+    raw_response = await run_endpoint_function(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 316, in run_endpoint_function
+    return await dependant.call(**values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/experimental/openai/proxy/proxy_rollout_server.py", line 481, in call_engine_method
+    _setup_openai_client()
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/experimental/openai/proxy/proxy_rollout_server.py", line 402, in _setup_openai_client
+    validate_admin_api_key(
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/utils/http.py", line 96, in validate_admin_api_key
+    raise RuntimeError(
+RuntimeError: Refusing to start server on non-loopback host '33.214.152.224' with the default admin API key ('areal-admin-key'). Set 'AgentConfig.admin_api_key' to a unique secret, or set AREAL_ALLOW_DEFAULT_ADMIN_KEY=1 to acknowledge the risk in a trusted environment.
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:55:16.959 LocalScheduler WARNING: Method 'initialize' failed on worker 'proxy-rollout/0' (attempt 1/3): Unexpected error: 500, message='Attempt to decode JSON with unexpected mimetype: text/plain; charset=utf-8', url='http://33.214.152.224:23418/call'. Retrying in 1.0s...
+Exception in ASGI application
+Traceback (most recent call last):
+  File "/opt/.venv/lib/python3.12/site-packages/uvicorn/protocols/http/h11_impl.py", line 403, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/applications.py", line 1139, in __call__
+    await super().__call__(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/applications.py", line 107, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 186, in __call__
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 716, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 736, in app
+    await route.handle(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 290, in handle
+    await self.app(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 120, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 106, in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 430, in app
+    raw_response = await run_endpoint_function(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 316, in run_endpoint_function
+    return await dependant.call(**values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/experimental/openai/proxy/proxy_rollout_server.py", line 481, in call_engine_method
+    _setup_openai_client()
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/experimental/openai/proxy/proxy_rollout_server.py", line 402, in _setup_openai_client
+    validate_admin_api_key(
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/utils/http.py", line 96, in validate_admin_api_key
+    raise RuntimeError(
+RuntimeError: Refusing to start server on non-loopback host '33.214.152.224' with the default admin API key ('areal-admin-key'). Set 'AgentConfig.admin_api_key' to a unique secret, or set AREAL_ALLOW_DEFAULT_ADMIN_KEY=1 to acknowledge the risk in a trusted environment.
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:55:16.960 LocalScheduler WARNING: Method 'initialize' failed on worker 'proxy-rollout/1' (attempt 1/3): Unexpected error: 500, message='Attempt to decode JSON with unexpected mimetype: text/plain; charset=utf-8', url='http://33.214.152.224:14698/call'. Retrying in 1.0s...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:17.978 [RemoteInfEngine Rank b369555dfc634cbd95494a455a3359af] INFO: Get server addresses from the `addr` argument.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:17.978 [RemoteInfEngine Rank b369555dfc634cbd95494a455a3359af] INFO: Waiting for server ready...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:17.978 [RemoteInfEngine Rank 9fc55327ed4549a381ecd9237bebceeb] INFO: Get server addresses from the `addr` argument.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:17.978 [RemoteInfEngine Rank 9fc55327ed4549a381ecd9237bebceeb] INFO: Waiting for server ready...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:18.980 [RemoteInfEngine Rank b369555dfc634cbd95494a455a3359af] INFO: Servers are all ready!
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:18.982 [RemoteInfEngine Rank 9fc55327ed4549a381ecd9237bebceeb] INFO: Servers are all ready!
+Exception in ASGI application
+Traceback (most recent call last):
+  File "/opt/.venv/lib/python3.12/site-packages/uvicorn/protocols/http/h11_impl.py", line 403, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/applications.py", line 1139, in __call__
+    await super().__call__(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/applications.py", line 107, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 186, in __call__
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 716, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 736, in app
+    await route.handle(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 290, in handle
+    await self.app(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 120, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 106, in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 430, in app
+    raw_response = await run_endpoint_function(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 316, in run_endpoint_function
+    return await dependant.call(**values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/experimental/openai/proxy/proxy_rollout_server.py", line 481, in call_engine_method
+    _setup_openai_client()
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/experimental/openai/proxy/proxy_rollout_server.py", line 402, in _setup_openai_client
+    validate_admin_api_key(
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/utils/http.py", line 96, in validate_admin_api_key
+    raise RuntimeError(
+RuntimeError: Refusing to start server on non-loopback host '33.214.152.224' with the default admin API key ('areal-admin-key'). Set 'AgentConfig.admin_api_key' to a unique secret, or set AREAL_ALLOW_DEFAULT_ADMIN_KEY=1 to acknowledge the risk in a trusted environment.
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:55:19.004 LocalScheduler WARNING: Method 'initialize' failed on worker 'proxy-rollout/1' (attempt 2/3): Unexpected error: 500, message='Attempt to decode JSON with unexpected mimetype: text/plain; charset=utf-8', url='http://33.214.152.224:14698/call'. Retrying in 2.0s...
+Exception in ASGI application
+Traceback (most recent call last):
+  File "/opt/.venv/lib/python3.12/site-packages/uvicorn/protocols/http/h11_impl.py", line 403, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/applications.py", line 1139, in __call__
+    await super().__call__(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/applications.py", line 107, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 186, in __call__
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 716, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 736, in app
+    await route.handle(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 290, in handle
+    await self.app(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 120, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 106, in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 430, in app
+    raw_response = await run_endpoint_function(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 316, in run_endpoint_function
+    return await dependant.call(**values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/experimental/openai/proxy/proxy_rollout_server.py", line 481, in call_engine_method
+    _setup_openai_client()
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/experimental/openai/proxy/proxy_rollout_server.py", line 402, in _setup_openai_client
+    validate_admin_api_key(
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/utils/http.py", line 96, in validate_admin_api_key
+    raise RuntimeError(
+RuntimeError: Refusing to start server on non-loopback host '33.214.152.224' with the default admin API key ('areal-admin-key'). Set 'AgentConfig.admin_api_key' to a unique secret, or set AREAL_ALLOW_DEFAULT_ADMIN_KEY=1 to acknowledge the risk in a trusted environment.
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:55:19.014 LocalScheduler WARNING: Method 'initialize' failed on worker 'proxy-rollout/0' (attempt 2/3): Unexpected error: 500, message='Attempt to decode JSON with unexpected mimetype: text/plain; charset=utf-8', url='http://33.214.152.224:23418/call'. Retrying in 2.0s...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:21.024 [RemoteInfEngine Rank 5dd7263ecd1f483d9fa55433e9db454f] INFO: Get server addresses from the `addr` argument.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:21.024 [RemoteInfEngine Rank 5dd7263ecd1f483d9fa55433e9db454f] INFO: Waiting for server ready...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:21.030 [RemoteInfEngine Rank adfee0833ded46d88156c24ee9999b9b] INFO: Get server addresses from the `addr` argument.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:21.031 [RemoteInfEngine Rank adfee0833ded46d88156c24ee9999b9b] INFO: Waiting for server ready...
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:22.027 [RemoteInfEngine Rank 5dd7263ecd1f483d9fa55433e9db454f] INFO: Servers are all ready!
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:55:22.034 [RemoteInfEngine Rank adfee0833ded46d88156c24ee9999b9b] INFO: Servers are all ready!
+Exception in ASGI application
+Traceback (most recent call last):
+  File "/opt/.venv/lib/python3.12/site-packages/uvicorn/protocols/http/h11_impl.py", line 403, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/applications.py", line 1139, in __call__
+    await super().__call__(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/applications.py", line 107, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 186, in __call__
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 716, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 736, in app
+    await route.handle(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/routing.py", line 290, in handle
+    await self.app(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 120, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 106, in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 430, in app
+    raw_response = await run_endpoint_function(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 316, in run_endpoint_function
+    return await dependant.call(**values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/experimental/openai/proxy/proxy_rollout_server.py", line 481, in call_engine_method
+    _setup_openai_client()
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/experimental/openai/proxy/proxy_rollout_server.py", line 402, in _setup_openai_client
+    validate_admin_api_key(
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/utils/http.py", line 96, in validate_admin_api_key
+    raise RuntimeError(
+RuntimeError: Refusing to start server on non-loopback host '33.214.152.224' with the default admin API key ('areal-admin-key'). Set 'AgentConfig.admin_api_key' to a unique secret, or set AREAL_ALLOW_DEFAULT_ADMIN_KEY=1 to acknowledge the risk in a trusted environment.
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:22.060 LocalScheduler INFO: Removing forked role 'proxy-rollout' (managed by parent worker)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.067 ProcUtils INFO: Sending SIGTERM to process 502594 and 3 children
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.067 ProcUtils INFO: Sending SIGTERM to process 502593 and 3 children
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.241 ProcUtils INFO: Successfully cleaned up process tree for PID 502594
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.241 Guard INFO: Killed forked worker proxy-rollout/0 (pid=502594)
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:22.242 LocalScheduler INFO: Killed forked worker proxy-rollout/0 (pid=502594)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.344 ProcUtils INFO: Successfully cleaned up process tree for PID 502593
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.345 Guard INFO: Killed forked worker proxy-rollout/1 (pid=502593)
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:22.345 LocalScheduler INFO: Killed forked worker proxy-rollout/1 (pid=502593)
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:55:22.346 RLTrainer ERROR: Training failed with exception: Failed to call method 'initialize' on worker 'proxy-rollout/1': Unexpected error: 500, message='Attempt to decode JSON with unexpected mimetype: text/plain; charset=utf-8', url='http://33.214.152.224:14698/call' (after 3 attempts)
+Traceback (most recent call last):
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/examples/math/gsm8k_rl.py", line 38, in main
+    trainer.train(
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/trainer/rl_trainer.py", line 902, in train
+    self._ensure_proxy_started()
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/trainer/rl_trainer.py", line 2098, in _ensure_proxy_started
+    self.rollout.start_proxy()
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/controller/rollout_controller.py", line 618, in start_proxy
+    run_async_task(self._async_start_proxy)
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/utils/concurrent.py", line 83, in run_async_task
+    return asyncio.run(func(*args, **kwargs))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/runners.py", line 194, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/controller/rollout_controller.py", line 676, in _async_start_proxy
+    await asyncio.gather(*init_tasks)
+  File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/scheduler/local.py", line 1774, in async_call_engine
+    raise EngineCallError(
+areal.infra.scheduler.exceptions.EngineCallError: Failed to call method 'initialize' on worker 'proxy-rollout/1': Unexpected error: 500, message='Attempt to decode JSON with unexpected mimetype: text/plain; charset=utf-8', url='http://33.214.152.224:14698/call' (after 3 attempts)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.356 DataController INFO: Unregistered dataset gsm8k-grpo-megatron-muon_trial0_train
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.359 DataController INFO: Unregistered dataset gsm8k-grpo-megatron-muon_trial0_valid
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.406 ProcUtils INFO: Sending SIGTERM to process 500572 and 3 children
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.407 ProcUtils INFO: Sending SIGTERM to process 500630 and 3 children
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.410 ProcUtils INFO: Sending SIGTERM to process 500576 and 3 children
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.563 ProcUtils INFO: Successfully cleaned up process tree for PID 500630
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.563 Guard INFO: Killed forked worker data-gateway/0 (pid=500630)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.564 DataController INFO: Killed forked service data-gateway/0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.605 ProcUtils INFO: Successfully cleaned up process tree for PID 500576
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.605 Guard INFO: Killed forked worker data-router/0 (pid=500576)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.606 DataController INFO: Killed forked service data-router/0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.622 ProcUtils INFO: Successfully cleaned up process tree for PID 500572
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.622 Guard INFO: Killed forked worker data-worker/0 (pid=500572)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.623 DataController INFO: Killed forked service data-worker/0
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:22.623 LocalScheduler INFO: Deleting 1 workers for role 'data-data'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:22.630 ProcUtils INFO: Sending SIGTERM to process 500454 and 3 children
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:24.498 ProcUtils INFO: Successfully cleaned up process tree for PID 500454
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:24.498 LocalScheduler INFO: Successfully deleted workers for role 'data-data'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:24.499 DataController INFO: Workers deleted for role: data-data
+[92m[1;38;2;180;140;80m(AReaL)[0m [92m20261001-17:55:24.499 StatsLogger INFO: Training completes! Total time elapsed 23.08.
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:25.393 RolloutController INFO: Stopping callback server...
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:25.832 LocalScheduler INFO: Removing forked role 'eval-rollout' (managed by parent worker)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:25.839 ProcUtils INFO: Sending SIGTERM to process 502293 and 3 children
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:25.839 ProcUtils INFO: Sending SIGTERM to process 502292 and 3 children
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:26.824 ProcUtils INFO: Successfully cleaned up process tree for PID 502292
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:26.824 Guard INFO: Killed forked worker eval-rollout/0 (pid=502292)
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:26.824 LocalScheduler INFO: Killed forked worker eval-rollout/0 (pid=502292)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:26.877 ProcUtils INFO: Successfully cleaned up process tree for PID 502293
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:26.877 Guard INFO: Killed forked worker eval-rollout/1 (pid=502293)
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:26.878 LocalScheduler INFO: Killed forked worker eval-rollout/1 (pid=502293)
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:26.878 RolloutController INFO: Workers deleted
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:26.895 RolloutController INFO: Stopping callback server...
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:27.324 ProcUtils INFO: Sending SIGTERM to process 501685 and 3 children
+SIGTERM received. signum=None frame=None. Draining requests and shutting down...
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:27.360 ProcUtils INFO: Sending SIGTERM to process 501684 and 3 children
+SIGTERM received. signum=None frame=None. Draining requests and shutting down...
+Subprocess scheduler_0 (pid=501823) crashed with exit code -15. Triggering SIGQUIT for cleanup...
+SIGQUIT received. signum=None, frame=None. It usually means one child failed.
+Subprocess detokenizer (pid=501831) crashed with exit code -15. Triggering SIGQUIT for cleanup...
+SIGQUIT received. signum=None, frame=None. It usually means one child failed.
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:27.892 ProcUtils INFO: Successfully cleaned up process tree for PID 501684
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:27.920 ProcUtils INFO: Successfully cleaned up process tree for PID 501685
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:27.921 LocalScheduler INFO: Deleting 2 workers for role 'rollout'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:27.938 ProcUtils INFO: Sending SIGTERM to process 501595 and 3 children
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:27.938 ProcUtils INFO: Sending SIGTERM to process 501589 and 3 children
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:28.919 ProcUtils INFO: Successfully cleaned up process tree for PID 501595
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:28.951 ProcUtils INFO: Successfully cleaned up process tree for PID 501589
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:28.951 LocalScheduler INFO: Successfully deleted workers for role 'rollout'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:28.951 RolloutController INFO: Workers deleted
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:28.952 TrainController INFO: Destroying TrainController...
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:28.952 TrainController INFO: Destroying engines on all workers...
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:31.818 TrainController INFO: Engines destroyed
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:31.818 TrainController INFO: Deleting all workers (reverse rank order)...
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:31.818 LocalScheduler INFO: Deleting 2 workers for role 'actor'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:31.833 ProcUtils INFO: Sending SIGTERM to process 500940 and 3 children
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:31.833 ProcUtils INFO: Sending SIGTERM to process 500934 and 3 children
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:55:34.835 ProcUtils WARNING: Force killing 1 processes that didn't terminate gracefully
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:55:34.835 ProcUtils WARNING: Force killing 1 processes that didn't terminate gracefully
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:35.028 ProcUtils INFO: Successfully cleaned up process tree for PID 500934
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:35.090 ProcUtils INFO: Successfully cleaned up process tree for PID 500940
+[34m[1;38;2;180;140;80m(AReaL)[0m [34m20261001-17:55:35.091 LocalScheduler INFO: Successfully deleted workers for role 'actor'
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:35.091 TrainController INFO: Workers deleted
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:55:35.094 TrainController INFO: TrainController destroyed
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/examples/math/gsm8k_rl.py", line 47, in <module>
+[rank0]:     main(sys.argv[1:])
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/examples/math/gsm8k_rl.py", line 38, in main
+[rank0]:     trainer.train(
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/trainer/rl_trainer.py", line 902, in train
+[rank0]:     self._ensure_proxy_started()
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/trainer/rl_trainer.py", line 2098, in _ensure_proxy_started
+[rank0]:     self.rollout.start_proxy()
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/controller/rollout_controller.py", line 618, in start_proxy
+[rank0]:     run_async_task(self._async_start_proxy)
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/utils/concurrent.py", line 83, in run_async_task
+[rank0]:     return asyncio.run(func(*args, **kwargs))
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/usr/lib/python3.12/asyncio/runners.py", line 194, in run
+[rank0]:     return runner.run(main)
+[rank0]:            ^^^^^^^^^^^^^^^^
+[rank0]:   File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
+[rank0]:     return self._loop.run_until_complete(task)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/controller/rollout_controller.py", line 676, in _async_start_proxy
+[rank0]:     await asyncio.gather(*init_tasks)
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-035e3317b83ce56a74e49b5a/workspace/areal/infra/scheduler/local.py", line 1774, in async_call_engine
+[rank0]:     raise EngineCallError(
+[rank0]: areal.infra.scheduler.exceptions.EngineCallError: Failed to call method 'initialize' on worker 'proxy-rollout/1': Unexpected error: 500, message='Attempt to decode JSON with unexpected mimetype: text/plain; charset=utf-8', url='http://33.214.152.224:14698/call' (after 3 attempts)

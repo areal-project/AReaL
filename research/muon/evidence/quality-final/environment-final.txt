@@ -1,0 +1,2 @@
+{'torch': '2.9.1+cu129', 'megatron-core': '0.19.0', 'emerging-optimizers': '0.3.0', 'transformer-engine': '2.14.1+27de67e1', 'nvidia-cudnn-cu12': '9.16.0.29', 'sglang': '0.5.10.post1', 'mbridge': '0.15.1'}
+CUDA 12.9 cuDNN 91600 NCCL (2, 27, 5)

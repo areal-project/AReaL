@@ -1,0 +1,8 @@
+.....................................................ss.............     [100%]
+=============================== warnings summary ===============================
+../../../../../../opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36
+  /opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+    _warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+66 passed, 2 skipped, 1 warning in 33.30s

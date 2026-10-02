@@ -1,0 +1,993 @@
+{
+  "rank": 0,
+  "backend": "megatron:d2p1t1",
+  "model": "/storage/openpsi/models/Qwen__Qwen2.5-1.5B-Instruct",
+  "muon_path": "replicated native TensorParallelMuon with Adam fallback",
+  "gradient_sync": "Megatron DDP all-reduce",
+  "groups": {
+    "TensorParallelMuon": [
+      "module.module.decoder.layers.0.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.0.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.0.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.0.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.1.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.1.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.1.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.1.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.2.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.2.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.2.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.2.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.3.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.3.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.3.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.3.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.4.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.4.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.4.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.4.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.5.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.5.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.5.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.5.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.6.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.6.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.6.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.6.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.7.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.7.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.7.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.7.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.8.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.8.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.8.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.8.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.9.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.9.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.9.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.9.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.10.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.10.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.10.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.10.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.11.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.11.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.11.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.11.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.12.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.12.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.12.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.12.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.13.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.13.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.13.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.13.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.14.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.14.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.14.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.14.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.15.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.15.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.15.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.15.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.16.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.16.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.16.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.16.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.17.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.17.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.17.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.17.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.18.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.18.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.18.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.18.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.19.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.19.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.19.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.19.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.20.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.20.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.20.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.20.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.21.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.21.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.21.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.21.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.22.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.22.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.22.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.22.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.23.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.23.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.23.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.23.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.24.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.24.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.24.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.24.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.25.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.25.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.25.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.25.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.26.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.26.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.26.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.26.mlp.linear_fc2.weight",
+      "module.module.decoder.layers.27.self_attention.linear_proj.weight",
+      "module.module.decoder.layers.27.self_attention.linear_qkv.weight",
+      "module.module.decoder.layers.27.mlp.linear_fc1.weight",
+      "module.module.decoder.layers.27.mlp.linear_fc2.weight"
+    ],
+    "FusedAdam": [
+      "module.module.embedding.word_embeddings.weight",
+      "module.module.decoder.layers.0.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.0.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.0.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.1.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.1.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.1.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.2.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.2.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.2.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.3.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.3.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.3.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.4.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.4.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.4.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.5.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.5.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.5.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.6.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.6.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.6.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.7.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.7.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.7.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.8.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.8.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.8.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.9.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.9.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.9.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.10.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.10.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.10.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.11.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.11.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.11.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.12.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.12.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.12.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.13.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.13.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.13.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.14.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.14.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.14.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.15.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.15.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.15.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.16.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.16.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.16.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.17.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.17.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.17.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.18.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.18.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.18.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.19.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.19.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.19.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.20.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.20.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.20.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.21.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.21.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.21.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.22.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.22.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.22.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.23.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.23.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.23.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.24.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.24.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.24.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.25.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.25.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.25.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.26.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.26.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.26.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.layers.27.self_attention.linear_qkv.layer_norm_weight",
+      "module.module.decoder.layers.27.self_attention.linear_qkv.bias",
+      "module.module.decoder.layers.27.mlp.linear_fc1.layer_norm_weight",
+      "module.module.decoder.final_layernorm.weight"
+    ]
+  },
+  "parameter_shapes": {
+    "module.module.embedding.word_embeddings.weight": [
+      151936,
+      1536
+    ],
+    "module.module.decoder.layers.0.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.0.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.0.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.0.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.0.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.0.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.0.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.1.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.1.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.1.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.1.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.1.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.1.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.1.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.2.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.2.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.2.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.2.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.2.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.2.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.2.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.3.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.3.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.3.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.3.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.3.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.3.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.3.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.4.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.4.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.4.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.4.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.4.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.4.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.4.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.5.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.5.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.5.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.5.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.5.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.5.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.5.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.6.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.6.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.6.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.6.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.6.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.6.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.6.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.7.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.7.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.7.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.7.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.7.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.7.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.7.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.8.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.8.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.8.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.8.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.8.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.8.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.8.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.9.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.9.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.9.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.9.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.9.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.9.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.9.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.10.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.10.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.10.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.10.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.10.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.10.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.10.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.11.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.11.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.11.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.11.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.11.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.11.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.11.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.12.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.12.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.12.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.12.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.12.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.12.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.12.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.13.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.13.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.13.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.13.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.13.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.13.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.13.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.14.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.14.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.14.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.14.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.14.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.14.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.14.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.15.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.15.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.15.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.15.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.15.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.15.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.15.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.16.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.16.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.16.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.16.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.16.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.16.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.16.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.17.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.17.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.17.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.17.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.17.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.17.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.17.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.18.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.18.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.18.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.18.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.18.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.18.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.18.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.19.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.19.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.19.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.19.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.19.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.19.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.19.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.20.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.20.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.20.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.20.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.20.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.20.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.20.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.21.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.21.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.21.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.21.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.21.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.21.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.21.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.22.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.22.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.22.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.22.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.22.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.22.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.22.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.23.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.23.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.23.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.23.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.23.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.23.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.23.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.24.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.24.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.24.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.24.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.24.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.24.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.24.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.25.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.25.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.25.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.25.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.25.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.25.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.25.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.26.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.26.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.26.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.26.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.26.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.26.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.26.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.layers.27.self_attention.linear_proj.weight": [
+      1536,
+      1536
+    ],
+    "module.module.decoder.layers.27.self_attention.linear_qkv.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.27.self_attention.linear_qkv.weight": [
+      2048,
+      1536
+    ],
+    "module.module.decoder.layers.27.self_attention.linear_qkv.bias": [
+      2048
+    ],
+    "module.module.decoder.layers.27.mlp.linear_fc1.layer_norm_weight": [
+      1536
+    ],
+    "module.module.decoder.layers.27.mlp.linear_fc1.weight": [
+      17920,
+      1536
+    ],
+    "module.module.decoder.layers.27.mlp.linear_fc2.weight": [
+      1536,
+      8960
+    ],
+    "module.module.decoder.final_layernorm.weight": [
+      1536
+    ]
+  },
+  "metrics": [
+    {
+      "update_successful": 1.0,
+      "grad_norm": 59.69038391113281,
+      "lr": 0.001,
+      "num_micro_batches": 1,
+      "loss": 12.83257007598877,
+      "scheduler_steps": 1
+    },
+    {
+      "update_successful": 1.0,
+      "grad_norm": 27.222736358642578,
+      "lr": 0.0009000000000000001,
+      "num_micro_batches": 1,
+      "loss": 9.721263885498047,
+      "scheduler_steps": 2
+    },
+    {
+      "update_successful": 1.0,
+      "grad_norm": 201.18682861328125,
+      "lr": 0.0008,
+      "num_micro_batches": 1,
+      "loss": 3.498396396636963,
+      "scheduler_steps": 3
+    },
+    {
+      "update_successful": 1.0,
+      "grad_norm": 25.0095157623291,
+      "lr": 0.0007,
+      "num_micro_batches": 1,
+      "loss": 1.4484198093414307,
+      "scheduler_steps": 4
+    },
+    {
+      "update_successful": 1.0,
+      "grad_norm": 25.0095157623291,
+      "lr": 0.0007,
+      "num_micro_batches": 1,
+      "loss": 1.4484198093414307,
+      "scheduler_steps": 4
+    }
+  ],
+  "state_restored": true,
+  "fourth_update_identical": true,
+  "initial_muon_sha256": "71cd54cb6cb45567e12bab28bfdf637843f0d76551f95260bad49c4743f092ca",
+  "step3_muon_sha256": "5dbc4165a9fc865f4191a27554eceb14a9e74503546cbb17cf12932675763d3f",
+  "muon_momentum_tensors": 112,
+  "step3_optimizer_sha256": "def43752e33158ab5527029f8ba7e014f48961cf58c2a2b508d600d16bd577ca",
+  "step4_optimizer_sha256": "fc435106cb6989410307d40869a9fae34513d6ac34b10f2b3b283a0c516b6440",
+  "step3_scheduler": {
+    "max_lr": 0.001,
+    "lr_warmup_steps": 0,
+    "num_steps": 3,
+    "lr_decay_style": "linear",
+    "lr_decay_steps": 10,
+    "min_lr": 0.0,
+    "start_wd": 0.01,
+    "end_wd": 0.01,
+    "wd_incr_style": "constant",
+    "wd_incr_steps": 10
+  },
+  "step4_scheduler": {
+    "max_lr": 0.001,
+    "lr_warmup_steps": 0,
+    "num_steps": 4,
+    "lr_decay_style": "linear",
+    "lr_decay_steps": 10,
+    "min_lr": 0.0,
+    "start_wd": 0.01,
+    "end_wd": 0.01,
+    "wd_incr_style": "constant",
+    "wd_incr_steps": 10
+  }
+}

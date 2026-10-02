@@ -1,0 +1,311 @@
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:33.726 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:33.727 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:33.729 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:33.729 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:33.906 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:33.906 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:33.906 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:33.906 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank [Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 00 is connected to 
+0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[1;38;2;180;140;80m(AReaL)[0m 20261003-00:16:35.409 [MegatronEngine Rank 0] WARNING: Seed not set, using default seed 42.
+[1;38;2;180;140;80m(AReaL)[0m 20261003-00:16:35.409 [MegatronEngine Rank 1] WARNING: Seed not set, using default seed 42.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:35.729 CUDAPlatform INFO: Set NUMA affinity for CUDA device 1 (GPU-4b3cec1a-f5a1-bbd5-a36e-ddb0d23c89ac): bound to 96 CPU cores.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:35.746 CUDAPlatform INFO: Set NUMA affinity for CUDA device 0 (GPU-142f3136-e75e-eece-fc73-6be42ac414ac): bound to 96 CPU cores.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:36.237 [MegatronEngine Rank 0] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new features. Please reference the migration guide `docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:36.258 [MegatronEngine Rank 1] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 0): 1543714304
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:37.872 [MegatronEngine Rank 0] INFO: Model parameter count: 1543.71M, pp_stage=0, vpp_chunks=1
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:37.872 [MegatronEngine Rank 1] INFO: Model parameter count: 1543.71M, pp_stage=0, vpp_chunks=1
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:44.433 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:44.433 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:16:48.740 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 14.50, memory reserved (GB): 16.30, device memory used/total (GB): 19.21/139.81 | host RssAnon: 1982MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:16:48.740 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 14.50, memory reserved (GB): 16.30, device memory used/total (GB): 19.21/139.81 | host RssAnon: 1985MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:16:49.207 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 14.50, memory reserved (GB): 14.85, device memory used/total (GB): 17.75/139.81 | host RssAnon: 1982MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:16:49.208 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 14.50, memory reserved (GB): 14.85, device memory used/total (GB): 17.75/139.81 | host RssAnon: 1985MB, RssShmem: 24MB
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:53.022 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:53.023 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:57.603 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:16:57.603 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+WARNING:megatron.core.dist_checkpointing.strategies.torch:MCore's async save is deprecated and will be removed in the future releases. Please, use NVRx async solution by setting `async_strategy` to `nvrx`.
+WARNING:megatron.core.dist_checkpointing.strategies.torch:MCore's async save is deprecated and will be removed in the future releases. Please, use NVRx async solution by setting `async_strategy` to `nvrx`.
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:17:36.396 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:17:36.398 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:17:36.602 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:17:36.604 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:17:50.156 MegatronCheckpointer INFO: [Rank 0] Released checkpoint host cache: reserved_bytes=10083655695->0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:17:50.213 MegatronCheckpointer INFO: [Rank 1] Released checkpoint host cache: reserved_bytes=10118549519->0
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:17:50.217 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:17:50.217 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/state_dict_loader.py:160: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/state_dict_loader.py:160: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/utils.py:457: UserWarning: The argument order of load has been changed. Please check the document to avoid future breakages.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/utils.py:457: UserWarning: The argument order of load has been changed. Please check the document to avoid future breakages.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:18:17.769 MegatronCheckpointer INFO: [Rank 0] Loaded sharded model checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch0/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:18:17.818 MegatronCheckpointer INFO: [Rank 1] Loaded sharded model checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch0/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:18:17.831 MegatronCheckpointer INFO: [Rank 0] Loaded optimizer checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch0/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:18:17.831 MegatronCheckpointer INFO: [Rank 0] Loaded LR scheduler checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch0/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:18:17.832 MegatronCheckpointer INFO: [Rank 0] Loaded RNG states from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch0/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:18:17.839 MegatronCheckpointer INFO: [Rank 1] Loaded optimizer checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch0/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:18:17.839 MegatronCheckpointer INFO: [Rank 1] Loaded LR scheduler checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch0/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:18:17.839 MegatronCheckpointer INFO: [Rank 1] Loaded RNG states from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch0/checkpoint-step3
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:18:35.504 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:18:35.504 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+.[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.258 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.258 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.260 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.260 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.375 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.377 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.437 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.437 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.438 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.438 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.462 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.464 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.548 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.549 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : [Gloo] Rank 1
+0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.653 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:26.653 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[Gloo] Rank [Gloo] Rank 1 is connected to 01 peer ranks.  is connected to Expected number of connected peer ranks is : 11
+ peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0[Gloo] Rank  is connected to 11 peer ranks. Expected number of connected peer ranks is :  is connected to 11 peer ranks. 
+Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 1 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 2 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 3 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank [Gloo] Rank 01 is connected to  is connected to 11 peer ranks.  peer ranks. Expected number of connected peer ranks is : Expected number of connected peer ranks is : 11
+
+[Gloo] Rank 0[Gloo] Rank  is connected to 1 peer ranks. 1Expected number of connected peer ranks is :  is connected to 11
+ peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 2 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 1 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 3 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[1;38;2;180;140;80m(AReaL)[0m 20261003-00:19:29.106 [MegatronEngine Rank 3] WARNING: Seed not set, using default seed 42.
+[1;38;2;180;140;80m(AReaL)[0m 20261003-00:19:29.106 [MegatronEngine Rank 1] WARNING: Seed not set, using default seed 42.
+[1;38;2;180;140;80m(AReaL)[0m 20261003-00:19:29.117 [MegatronEngine Rank 0] WARNING: Seed not set, using default seed 42.
+[1;38;2;180;140;80m(AReaL)[0m 20261003-00:19:29.117 [MegatronEngine Rank 2] WARNING: Seed not set, using default seed 42.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:29.904 CUDAPlatform INFO: Set NUMA affinity for CUDA device 3 (GPU-5925d357-a578-9e58-4bb4-67adb54e4cda): bound to 96 CPU cores.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:29.910 CUDAPlatform INFO: Set NUMA affinity for CUDA device 1 (GPU-4b3cec1a-f5a1-bbd5-a36e-ddb0d23c89ac): bound to 96 CPU cores.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:29.921 CUDAPlatform INFO: Set NUMA affinity for CUDA device 2 (GPU-ab998871-5159-5620-c933-3c78ff6b53e9): bound to 96 CPU cores.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:29.921 CUDAPlatform INFO: Set NUMA affinity for CUDA device 0 (GPU-142f3136-e75e-eece-fc73-6be42ac414ac): bound to 96 CPU cores.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:30.422 [MegatronEngine Rank 2] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:30.437 [MegatronEngine Rank 3] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+/opt/.venv/lib/python3.12/site-packages/transformer_engine/pytorch/module/base.py:1166: UserWarning: To guarantee overlapping TP and SP collectives with the backwardGEMMs, set environment variable CUDA_DEVICE_MAX_CONNECTIONS = 1
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/transformer_engine/pytorch/module/base.py:1166: UserWarning: To guarantee overlapping TP and SP collectives with the backwardGEMMs, set environment variable CUDA_DEVICE_MAX_CONNECTIONS = 1
+  warnings.warn(
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:30.498 [MegatronEngine Rank 1] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:30.523 [MegatronEngine Rank 0] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new features. Please reference the migration guide `docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`
+/opt/.venv/lib/python3.12/site-packages/transformer_engine/pytorch/module/base.py:1166: UserWarning: To guarantee overlapping TP and SP collectives with the backwardGEMMs, set environment variable CUDA_DEVICE_MAX_CONNECTIONS = 1
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/transformer_engine/pytorch/module/base.py:1166: UserWarning: To guarantee overlapping TP and SP collectives with the backwardGEMMs, set environment variable CUDA_DEVICE_MAX_CONNECTIONS = 1
+  warnings.warn(
+ > number of parameters on (tensor, pipeline) model parallel rank (1, 0): 771900928
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 0): 771900928
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:31.715 [MegatronEngine Rank 2] INFO: Model parameter count: 771.90M, pp_stage=0, vpp_chunks=1
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:31.715 [MegatronEngine Rank 3] INFO: Model parameter count: 771.90M, pp_stage=0, vpp_chunks=1
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:31.715 [MegatronEngine Rank 1] INFO: Model parameter count: 771.90M, pp_stage=0, vpp_chunks=1
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:31.722 [MegatronEngine Rank 0] INFO: Model parameter count: 771.90M, pp_stage=0, vpp_chunks=1
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:35.492 [MegatronEngine Rank 2] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:35.493 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:35.505 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:35.506 [MegatronEngine Rank 3] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/tensor_parallel/layers.py:848: UserWarning: When using sequence parallelism it is recommended to set the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for maximum speedup
+  warnings.warn(
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/tensor_parallel/layers.py:848: UserWarning: When using sequence parallelism it is recommended to set the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for maximum speedup
+  warnings.warn(
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/tensor_parallel/layers.py:848: UserWarning: When using sequence parallelism it is recommended to set the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for maximum speedup
+  warnings.warn(
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/tensor_parallel/layers.py:848: UserWarning: When using sequence parallelism it is recommended to set the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for maximum speedup
+  warnings.warn(
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:19:36.759 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 7.29, memory reserved (GB): 8.43, device memory used/total (GB): 11.95/139.81 | host RssAnon: 2148MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:19:36.761 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 7.29, memory reserved (GB): 8.43, device memory used/total (GB): 11.95/139.81 | host RssAnon: 2145MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:19:36.784 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 7.29, memory reserved (GB): 8.43, device memory used/total (GB): 11.95/139.81 | host RssAnon: 2143MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:19:36.789 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 7.29, memory reserved (GB): 8.43, device memory used/total (GB): 11.95/139.81 | host RssAnon: 2138MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:19:36.789 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 7.29, memory reserved (GB): 7.70, device memory used/total (GB): 11.22/139.81 | host RssAnon: 2148MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:19:36.790 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 7.29, memory reserved (GB): 7.70, device memory used/total (GB): 11.22/139.81 | host RssAnon: 2145MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:19:36.795 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 7.29, memory reserved (GB): 7.70, device memory used/total (GB): 11.22/139.81 | host RssAnon: 2143MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:19:36.796 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 7.29, memory reserved (GB): 7.70, device memory used/total (GB): 11.22/139.81 | host RssAnon: 2138MB, RssShmem: 24MB
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:39.128 [MegatronEngine Rank 2] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:39.128 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:39.139 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:39.139 [MegatronEngine Rank 3] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:41.045 [MegatronEngine Rank 2] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:41.045 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:41.046 [MegatronEngine Rank 3] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:19:41.046 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+WARNING:megatron.core.dist_checkpointing.strategies.torch:MCore's async save is deprecated and will be removed in the future releases. Please, use NVRx async solution by setting `async_strategy` to `nvrx`.
+WARNING:megatron.core.dist_checkpointing.strategies.torch:MCore's async save is deprecated and will be removed in the future releases. Please, use NVRx async solution by setting `async_strategy` to `nvrx`.
+WARNING:megatron.core.dist_checkpointing.strategies.torch:MCore's async save is deprecated and will be removed in the future releases. Please, use NVRx async solution by setting `async_strategy` to `nvrx`.
+WARNING:megatron.core.dist_checkpointing.strategies.torch:MCore's async save is deprecated and will be removed in the future releases. Please, use NVRx async solution by setting `async_strategy` to `nvrx`.
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:11.679 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:11.679 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:11.680 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:11.680 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:11.681 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:11.682 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:11.682 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:11.682 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:21.074 MegatronCheckpointer INFO: [Rank 3] Released checkpoint host cache: reserved_bytes=5058732047->0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:21.089 MegatronCheckpointer INFO: [Rank 1] Released checkpoint host cache: reserved_bytes=5041553423->0
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:21.094 [MegatronEngine Rank 3] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:21.095 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:21.102 MegatronCheckpointer INFO: [Rank 2] Released checkpoint host cache: reserved_bytes=5059739663->0
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:21.127 MegatronCheckpointer INFO: [Rank 0] Released checkpoint host cache: reserved_bytes=5042180111->0
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:21.131 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:21.131 [MegatronEngine Rank 2] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/state_dict_loader.py:160: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/state_dict_loader.py:160: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/state_dict_loader.py:160: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/state_dict_loader.py:160: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/utils.py:457: UserWarning: The argument order of load has been changed. Please check the document to avoid future breakages.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/utils.py:457: UserWarning: The argument order of load has been changed. Please check the document to avoid future breakages.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/utils.py:457: UserWarning: The argument order of load has been changed. Please check the document to avoid future breakages.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/utils.py:457: UserWarning: The argument order of load has been changed. Please check the document to avoid future breakages.
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.373 MegatronCheckpointer INFO: [Rank 2] Loaded sharded model checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.384 MegatronCheckpointer INFO: [Rank 2] Loaded optimizer checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.384 MegatronCheckpointer INFO: [Rank 2] Loaded LR scheduler checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.384 MegatronCheckpointer INFO: [Rank 2] Loaded RNG states from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.389 MegatronCheckpointer INFO: [Rank 1] Loaded sharded model checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.389 MegatronCheckpointer INFO: [Rank 0] Loaded sharded model checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.389 MegatronCheckpointer INFO: [Rank 3] Loaded sharded model checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.394 MegatronCheckpointer INFO: [Rank 1] Loaded optimizer checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.394 MegatronCheckpointer INFO: [Rank 1] Loaded LR scheduler checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.394 MegatronCheckpointer INFO: [Rank 0] Loaded optimizer checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.394 MegatronCheckpointer INFO: [Rank 1] Loaded RNG states from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.395 MegatronCheckpointer INFO: [Rank 0] Loaded LR scheduler checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.395 MegatronCheckpointer INFO: [Rank 0] Loaded RNG states from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.396 MegatronCheckpointer INFO: [Rank 3] Loaded optimizer checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.396 MegatronCheckpointer INFO: [Rank 3] Loaded LR scheduler checkpoint from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261003-00:20:36.396 MegatronCheckpointer INFO: [Rank 3] Loaded RNG states from /tmp/pytest-of-root/pytest-3/test_muon_three_updates_and_ch1/checkpoint-step3
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:45.350 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:45.350 [MegatronEngine Rank 2] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:45.386 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261003-00:20:45.386 [MegatronEngine Rank 3] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+.
+2 passed in 304.16s (0:05:04)

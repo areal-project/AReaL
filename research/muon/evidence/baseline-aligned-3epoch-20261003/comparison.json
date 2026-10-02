@@ -1,0 +1,70 @@
+{
+  "adamw": {
+    "optimizer": "adamw",
+    "updates": 3,
+    "nonzero_gradient_steps": 3,
+    "task_reward_by_epoch": [
+      0.6875,
+      0.72656,
+      0.67383
+    ],
+    "evaluation_reward_by_epoch": [
+      0.875,
+      1.0,
+      0.9375
+    ],
+    "train_step_seconds_by_epoch": [
+      11.239,
+      8.2835,
+      8.6926
+    ],
+    "mean_train_step_seconds": 9.405033333333334,
+    "wall_seconds": 320.0,
+    "peak_actor_gpu_memory_mib": 77984,
+    "peak_rollout_gpu_memory_mib": 119443,
+    "peak_per_gpu_memory_mib": {
+      "0": 77550,
+      "1": 77984,
+      "2": 74330,
+      "3": 66964,
+      "4": 119429,
+      "5": 119373,
+      "6": 119443,
+      "7": 119157
+    }
+  },
+  "muon": {
+    "optimizer": "muon",
+    "updates": 3,
+    "nonzero_gradient_steps": 3,
+    "task_reward_by_epoch": [
+      0.69238,
+      0.74512,
+      0.66797
+    ],
+    "evaluation_reward_by_epoch": [
+      0.875,
+      0.8125,
+      0.875
+    ],
+    "train_step_seconds_by_epoch": [
+      10.437,
+      8.4193,
+      9.5679
+    ],
+    "mean_train_step_seconds": 9.474733333333333,
+    "wall_seconds": 312.0,
+    "peak_actor_gpu_memory_mib": 79926,
+    "peak_rollout_gpu_memory_mib": 119327,
+    "peak_per_gpu_memory_mib": {
+      "0": 79926,
+      "1": 78628,
+      "2": 78642,
+      "3": 77938,
+      "4": 118685,
+      "5": 119289,
+      "6": 119327,
+      "7": 119087
+    }
+  }
+}

@@ -287,15 +287,19 @@ class MegatronCheckpointManager:
         use_checkpoint_opt_param_scheduler: bool = False,
         use_dist_checkpointing: bool = True,
         async_save: bool = False,
+        allow_replicated_optimizer: bool = False,
     ):
         self.model = model
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
 
         self.use_distributed_optimizer = use_distributed_optimizer
-        assert self.use_distributed_optimizer, (
-            "MegatronCheckpointManager now only support distributed optimizer"
-        )
+        if not self.use_distributed_optimizer and not allow_replicated_optimizer:
+            raise ValueError(
+                "Replicated optimizer checkpointing requires explicit opt-in"
+            )
+        if allow_replicated_optimizer and not use_dist_checkpointing:
+            raise ValueError("Replicated optimizer requires sharded checkpointing")
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
         self.rank = torch.distributed.get_rank()
         self.use_dist_checkpointing = use_dist_checkpointing
@@ -440,7 +444,11 @@ class MegatronCheckpointManager:
             optimizer_sharded_states = self.optimizer.sharded_state_dict(
                 state_dict,
                 is_loading=is_loading,
-                metadata={"distrib_optim_sharding_type": "dp_reshardable"},
+                **(
+                    {"metadata": {"distrib_optim_sharding_type": "dp_reshardable"}}
+                    if self.use_distributed_optimizer
+                    else {}
+                ),
             )
             state_dict["optimizer"] = optimizer_sharded_states
 

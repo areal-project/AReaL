@@ -1,0 +1,18 @@
+clang-format.........................................(no files to check)Skipped
+check yaml...............................................................Passed
+fix end of files.........................................................Passed
+trim trailing whitespace.................................................Passed
+Check for large files....................................................Passed
+Check JSON files.........................................................Passed
+Detect private keys......................................................Passed
+mdformat.................................................................Failed
+- hook id: mdformat
+- files were modified by this hook
+Run Linter Check (Ruff)..................................................Passed
+Run Formatter (Ruff).....................................................Passed
+nbstripout - Strip notebook output.......................................Passed
+Check pyproject.toml consistency.........................................Passed
+Regenerate uv lockfiles..................................................Passed
+Generate CLI documentation...............................................Passed
+Check SPDX license header................................................Passed
+Format CODEOWNERS........................................................Passed

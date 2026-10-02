@@ -84,6 +84,7 @@ from areal.engine.megatron_utils.megatron import (
     remove_padding,
 )
 from areal.engine.megatron_utils.megatron_lora import get_vllm_lora_target_modules
+from areal.engine.megatron_utils.muon import muon_config_kwargs, validate_muon_config
 from areal.engine.megatron_utils.packed_context_parallel import (
     _VLM_FORWARD_KEYS,
     _is_multi_modal_payload_key,
@@ -354,6 +355,7 @@ class MegatronEngine(TrainEngine):
     )
 
     def __init__(self, config: TrainEngineConfig):
+        validate_muon_config(config)
         self.config = config
         self.hf_config: PretrainedConfig
         self.tf_config: TransformerConfig
@@ -389,6 +391,12 @@ class MegatronEngine(TrainEngine):
         self._weight_residency: MegatronWeightResidency | None = None
         self._awex_publisher: AwexWeightPublisher | None = None
         self._dte_runtime_config = DTERuntimeConfig.from_env()
+        if (
+            self.optimizer_config is not None
+            and self.optimizer_config.type == "muon"
+            and self._dte_runtime_config.enabled
+        ):
+            raise ValueError("Muon does not support AdamW DTE delta weight transfer")
         self._warned_unbounded_microbatch = False
         self.enable_tree_training: bool = self.config.enable_tree_training
         _validate_areal_lm_head_compatibility(
@@ -2115,7 +2123,8 @@ class MegatronEngine(TrainEngine):
         assert self.optimizer_config.type in [
             "adam",
             "sgd",
-        ], "Only AdamW/sgd optimizer is supported in this engine."
+            "muon",
+        ], "Only AdamW, SGD, and Muon optimizers are supported in this engine."
         if self.optimizer_config.type == "sgd":
             self.logger.warning(
                 "Using the 'sgd' optimizer with Megatron may be less stable. Consider using the 'adam' (AdamW) optimizer for improved stability."
@@ -2143,6 +2152,7 @@ class MegatronEngine(TrainEngine):
         # Make megatron optimizer config
         mcore_opt_config = MCoreOptimizerConfig(
             optimizer=self.optimizer_config.type,
+            **muon_config_kwargs(self.optimizer_config),
             lr=self.optimizer_config.lr,
             min_lr=self.optimizer_config.min_lr_ratio * self.optimizer_config.lr,
             weight_decay=self.optimizer_config.weight_decay,
@@ -2202,7 +2212,8 @@ class MegatronEngine(TrainEngine):
         )
         self.lr_scheduler = lr_scheduler
 
-        # MegatronCheckpointManager now only support distributed optimizer which lora does not support
+        # Muon uses native replicated optimizer sharded_state_dict support.
+        # LoRA checkpointing continues to use its separate adapter path.
         if not self.config.use_lora:
             self.checkpointer = MegatronCheckpointManager(
                 model=self.model,
@@ -2211,6 +2222,7 @@ class MegatronEngine(TrainEngine):
                 use_distributed_optimizer=use_distributed_optimizer,
                 use_checkpoint_opt_param_scheduler=self.mcore_config.use_checkpoint_opt_param_scheduler,
                 async_save=self.mcore_config.async_save,
+                allow_replicated_optimizer=self.optimizer_config.type == "muon",
             )
 
     def _check_rollout_engine_connected(self) -> None:

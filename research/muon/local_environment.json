@@ -1,0 +1,6 @@
+{
+  "venv": "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env",
+  "model": "/storage/openpsi/models/Qwen__Qwen2.5-1.5B-Instruct",
+  "source_repository": "/storage/openpsi/users/fenghui/projects/AReaL",
+  "base_commit": "2fad2d0e308fe631e70e971b97188ad5c5cc03cb"
+}

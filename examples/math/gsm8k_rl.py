@@ -11,12 +11,12 @@ def main(args):
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
 
     train_dataset = get_custom_dataset(
-        split="train",
+        split=config.train_dataset.split,
         dataset_config=config.train_dataset,
         tokenizer=tokenizer,
     )
     valid_dataset = get_custom_dataset(
-        split="test",
+        split=config.valid_dataset.split,
         dataset_config=config.valid_dataset,
         tokenizer=tokenizer,
     )

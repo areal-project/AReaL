@@ -158,6 +158,7 @@ kernels = [
     "kernels==0.12.2",
 ]
 megatron = [
+    "emerging-optimizers==0.3.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
     "megatron-core==0.19.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
     "mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@310e8fb; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "megatron-bridge==0.6.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",

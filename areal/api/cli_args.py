@@ -399,8 +399,9 @@ class OptimizerConfig:
         metadata={
             "help": "Optimizer type. For FSDP Engine, adam_bf16 enables memory-efficient BF16 optimizer states. "
             "For Megatron Engine, adam_bf16 requires dtype=bfloat16 and is automatically converted to adam "
-            "with precision-aware optimizer enabled.",
-            "choices": ["adam", "sgd", "adam_bf16"],
+            "with precision-aware optimizer enabled. Muon uses native Megatron Muon with "
+            "Adam for non-matrix parameters and requires replicated DDP optimizer states.",
+            "choices": ["adam", "sgd", "adam_bf16", "muon"],
         },
     )
     lr: float = field(default=1e-3, metadata={"help": "Learning rate"})
@@ -408,19 +409,19 @@ class OptimizerConfig:
     beta1: float = field(
         default=0.9,
         metadata={
-            "help": "Adam beta1 parameter. Only effective when optimizer_type is adam/adam_bf16"
+            "help": "Adam beta1 parameter. Used by adam/adam_bf16 and the scalar Adam fallback for Muon"
         },
     )
     beta2: float = field(
         default=0.999,
         metadata={
-            "help": "Adam beta2 parameter. Only effective when optimizer_type is adam/adam_bf16"
+            "help": "Adam beta2 parameter. Used by adam/adam_bf16 and the scalar Adam fallback for Muon"
         },
     )
     eps: float = field(
         default=1e-8,
         metadata={
-            "help": "Adam epsilon parameter. Only effective when optimizer_type is adam/adam_bf16"
+            "help": "Adam epsilon parameter. Used by adam/adam_bf16 and the scalar Adam fallback for Muon"
         },
     )
     min_lr_ratio: float = field(
@@ -470,7 +471,82 @@ class OptimizerConfig:
         default=1.0, metadata={"help": "Gradient clipping threshold"}
     )
 
+    # Megatron Core native Muon; excluded parameters retain Adam settings above.
+    muon_momentum: float = field(
+        default=0.95, metadata={"help": "Muon momentum in [0, 1)."}
+    )
+    muon_split_qkv: bool = field(
+        default=True, metadata={"help": "Orthogonalize Q, K and V separately."}
+    )
+    muon_nesterov: bool = field(
+        default=False, metadata={"help": "Use Nesterov momentum in Muon."}
+    )
+    muon_scale_mode: str = field(
+        default="spectral", metadata={"help": "Native Muon update scaling mode."}
+    )
+    muon_fp32_matmul_prec: str = field(
+        default="medium",
+        metadata={
+            "help": "Muon matrix multiplication precision: highest, high, or medium."
+        },
+    )
+    muon_coefficient_type: str = field(
+        default="quintic",
+        metadata={
+            "help": "Newton-Schulz coefficients supported by emerging-optimizers."
+        },
+    )
+    muon_num_ns_steps: int = field(
+        default=5, metadata={"help": "Positive number of Newton-Schulz iterations."}
+    )
+    muon_tp_mode: str = field(
+        default="blockwise",
+        metadata={"help": "Muon TP mode: blockwise, duplicated, or distributed."},
+    )
+    muon_extra_scale_factor: float = field(
+        default=1.0, metadata={"help": "Positive finite multiplier of the Muon update."}
+    )
+
     def __post_init__(self) -> None:
+        if self.type == "muon":
+            if self.muon_scale_mode not in (
+                "shape_scaling",
+                "spectral",
+                "unit_rms_norm",
+            ):
+                raise ValueError(
+                    "muon_scale_mode must be shape_scaling, spectral, or unit_rms_norm"
+                )
+            if self.muon_coefficient_type not in (
+                "simple",
+                "quintic",
+                "polar_express",
+                "aol",
+            ):
+                raise ValueError(
+                    "muon_coefficient_type must be simple, quintic, polar_express, or aol"
+                )
+            if not 0 <= self.muon_momentum < 1:
+                raise ValueError("muon_momentum must be in [0, 1)")
+            if (
+                isinstance(self.muon_num_ns_steps, bool)
+                or not isinstance(self.muon_num_ns_steps, int)
+                or self.muon_num_ns_steps < 1
+            ):
+                raise ValueError("muon_num_ns_steps must be a positive integer")
+            if (
+                not math.isfinite(self.muon_extra_scale_factor)
+                or self.muon_extra_scale_factor <= 0
+            ):
+                raise ValueError("muon_extra_scale_factor must be positive and finite")
+            if self.muon_tp_mode not in ("blockwise", "duplicated", "distributed"):
+                raise ValueError(
+                    "muon_tp_mode must be blockwise, duplicated, or distributed"
+                )
+            if self.muon_fp32_matmul_prec not in ("highest", "high", "medium"):
+                raise ValueError(
+                    "muon_fp32_matmul_prec must be highest, high, or medium"
+                )
         if (
             self.warmup_steps is not None
             and self.warmup_steps_proportion != self.DEFAULT_WARMUP_STEPS_PROPORTION

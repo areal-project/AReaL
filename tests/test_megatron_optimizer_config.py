@@ -348,3 +348,44 @@ def test_scheduler_rejects_megatron_only_boundaries_before_optimizer_creation(
 
     with pytest.raises(ValueError, match=match):
         engine._create_optimizer(ft_spec)
+
+
+@pytest.mark.parametrize("kind", ["adam", "sgd", "muon"])
+def test_optimizer_factory_maps_muon_and_preserves_adam_sgd(monkeypatch, kind):
+    """Factory forwards native options and selects matching checkpoint semantics."""
+    from unittest.mock import Mock
+
+    options = dict(
+        muon_momentum=0.8,
+        muon_num_ns_steps=7,
+        muon_split_qkv=False,
+        muon_nesterov=True,
+        muon_scale_mode="shape_scaling",
+        muon_fp32_matmul_prec="highest",
+        muon_coefficient_type="simple",
+        muon_tp_mode="duplicated",
+        muon_extra_scale_factor=1.2,
+    )
+    engine = _make_test_engine(OptimizerConfig(type=kind, **options))
+    engine.logger = Mock()
+    engine.mcore_config.ddp.use_distributed_optimizer = kind != "muon"
+    factory = Mock(return_value=object())
+    checkpointer = Mock()
+    monkeypatch.setattr(megatron_engine_module, "get_megatron_optimizer", factory)
+    monkeypatch.setattr(megatron_engine_module, "OptimizerParamScheduler", Mock())
+    monkeypatch.setattr(
+        megatron_engine_module, "MegatronCheckpointManager", checkpointer
+    )
+    engine._create_optimizer(
+        FinetuneSpec(total_train_epochs=1, dataset_size=4, train_batch_size=1)
+    )
+    mapped = factory.call_args.args[0]
+    assert mapped.optimizer == kind
+    assert mapped.use_distributed_optimizer is (kind != "muon")
+    assert checkpointer.call_args.kwargs["allow_replicated_optimizer"] is (
+        kind == "muon"
+    )
+    if kind == "muon":
+        for name, value in options.items():
+            assert getattr(mapped, name) == value
+        assert not mapped.use_layer_wise_distributed_optimizer

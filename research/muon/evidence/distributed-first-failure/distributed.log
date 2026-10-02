@@ -1,0 +1,531 @@
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:31.752 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:31.755 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:31.763 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:31.765 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:32.223 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:32.223 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:32.239 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:32.239 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank [Gloo] Rank 01 is connected to  is connected to 11 peer ranks.  peer ranks. Expected number of connected peer ranks is : Expected number of connected peer ranks is : 11
+
+[Gloo] Rank [Gloo] Rank 10 is connected to 1 is connected to  peer ranks. 1Expected number of connected peer ranks is :  peer ranks. 1Expected number of connected peer ranks is : 1
+
+[Gloo] Rank 0[Gloo] Rank  is connected to 0 peer ranks. 0Expected number of connected peer ranks is :  is connected to 00 peer ranks. 
+Expected number of connected peer ranks is : 0
+[Gloo] Rank [Gloo] Rank 0 is connected to 1 peer ranks. 1Expected number of connected peer ranks is :  is connected to 11 peer ranks. 
+Expected number of connected peer ranks is : 1
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:36:34.174 [MegatronEngine Rank 1] WARNING: Seed not set, using default seed 42.
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:36:34.174 [MegatronEngine Rank 0] WARNING: Seed not set, using default seed 42.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:34.513 CUDAPlatform INFO: Set NUMA affinity for CUDA device 0 (GPU-26620a54-fee7-5b4b-3cb0-d370c8e9f0f0): bound to 96 CPU cores.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:34.513 CUDAPlatform INFO: Set NUMA affinity for CUDA device 1 (GPU-f83cca64-c22f-61fd-a52c-727e576442df): bound to 96 CPU cores.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:35.037 [MegatronEngine Rank 1] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:35.040 [MegatronEngine Rank 0] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new features. Please reference the migration guide `docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 0): 1543714304
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:36.524 [MegatronEngine Rank 1] INFO: Model parameter count: 1543.71M, pp_stage=0, vpp_chunks=1
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:36.524 [MegatronEngine Rank 0] INFO: Model parameter count: 1543.71M, pp_stage=0, vpp_chunks=1
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:40.356 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:40.356 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:36:48.214 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 14.50, memory reserved (GB): 16.32, device memory used/total (GB): 46.38/139.81 | host RssAnon: 2006MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:36:48.227 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 14.50, memory reserved (GB): 14.76, device memory used/total (GB): 44.82/139.81 | host RssAnon: 2006MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:36:48.311 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 14.50, memory reserved (GB): 16.32, device memory used/total (GB): 45.27/139.81 | host RssAnon: 2007MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:36:48.321 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 14.50, memory reserved (GB): 14.76, device memory used/total (GB): 43.71/139.81 | host RssAnon: 2007MB, RssShmem: 24MB
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:52.351 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:52.351 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:56.233 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:36:56.233 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-cf6b7366e7083f54966d4ecb/workspace/tests/torchrun/run_megatron_muon.py", line 187, in <module>
+[rank0]:     main()
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-cf6b7366e7083f54966d4ecb/workspace/tests/torchrun/run_megatron_muon.py", line 142, in main
+[rank0]:     engine.checkpointer.save_checkpoint(checkpoint)
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-cf6b7366e7083f54966d4ecb/workspace/areal/engine/megatron_utils/checkpointer.py", line 597, in save_checkpoint
+[rank0]:     async_save_request = save_dist_checkpointing(
+[rank0]:                          ^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-cf6b7366e7083f54966d4ecb/workspace/areal/engine/megatron_utils/checkpointer.py", line 208, in save_dist_checkpointing
+[rank0]:     async_save_request = dist_checkpointing.save(**save_kwargs)
+[rank0]:                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/dist_checkpointing/serialization.py", line 420, in save
+[rank0]:     if next(checkpoint_dir_path.iterdir(), None) is not None:
+[rank0]:        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/usr/lib/python3.12/pathlib.py", line 1058, in iterdir
+[rank0]:     for name in os.listdir(self):
+[rank0]:                 ^^^^^^^^^^^^^^^^
+[rank0]: FileNotFoundError: [Errno 2] No such file or directory: '/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-cf6b7366e7083f54966d4ecb/distributed/test_muon_three_updates_and_ch0/checkpoint-step3'
+[rank0]:[W1001 17:37:17.925279489 ProcessGroupNCCL.cpp:1524] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+W1001 17:37:22.066000 485776 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 485845 closing signal SIGTERM
+E1001 17:37:22.433000 485776 torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: 1) local_rank: 0 (pid: 485844) of binary: /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/bin/python
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 940, in <module>
+    main()
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 293, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+tests/torchrun/run_megatron_muon.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-10-01_17:37:22
+  host      : gpulingjun033214152224.et15
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 485844)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
+F
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.180 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.180 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.180 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.180 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.182 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.182 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.182 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.183 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.370 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.370 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.370 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.370 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.370 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.370 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.372 PlatformInit INFO: Detected CUDA device: NVIDIA L20X
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:44.372 PlatformInit INFO: Initializing CUDA platform (NVIDIA).
+[Gloo] Rank [Gloo] Rank 10 is connected to  is connected to 11 peer ranks.  peer ranks. Expected number of connected peer ranks is : Expected number of connected peer ranks is : 11
+
+[Gloo] Rank [Gloo] Rank 1 is connected to 10 peer ranks.  is connected to Expected number of connected peer ranks is : 11 peer ranks. 
+Expected number of connected peer ranks is : 1
+[Gloo] Rank [Gloo] Rank 0 is connected to [Gloo] Rank 11 peer ranks. 1 is connected to  is connected to 1Expected number of connected peer ranks is : [Gloo] Rank 10 peer ranks.  is connected to 11 peer ranks. 
+Expected number of connected peer ranks is :  peer ranks. 1Expected number of connected peer ranks is : Expected number of connected peer ranks is : 
+11
+
+[Gloo] Rank 1 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 0 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 2 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3[Gloo] Rank 
+3 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank [Gloo] Rank 01 is connected to  is connected to 11 peer ranks.  peer ranks. Expected number of connected peer ranks is : Expected number of connected peer ranks is : 11
+
+[Gloo] Rank [Gloo] Rank 1 is connected to 10 peer ranks.  is connected to Expected number of connected peer ranks is : 11 peer ranks. 
+Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 0 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 2 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 3 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:37:48.253 [MegatronEngine Rank 1] WARNING: Seed not set, using default seed 42.
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:37:48.253 [MegatronEngine Rank 3] WARNING: Seed not set, using default seed 42.
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:37:48.257 [MegatronEngine Rank 2] WARNING: Seed not set, using default seed 42.
+[1;38;2;180;140;80m(AReaL)[0m 20261001-17:37:48.257 [MegatronEngine Rank 0] WARNING: Seed not set, using default seed 42.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:48.904 CUDAPlatform INFO: Set NUMA affinity for CUDA device 2 (GPU-625815bc-4277-2f05-334d-073d7687c08d): bound to 96 CPU cores.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:48.945 CUDAPlatform INFO: Set NUMA affinity for CUDA device 1 (GPU-f83cca64-c22f-61fd-a52c-727e576442df): bound to 96 CPU cores.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:48.958 CUDAPlatform INFO: Set NUMA affinity for CUDA device 3 (GPU-3370c529-c9b2-0e22-df39-8dc84083c4cc): bound to 96 CPU cores.
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:48.960 CUDAPlatform INFO: Set NUMA affinity for CUDA device 0 (GPU-26620a54-fee7-5b4b-3cb0-d370c8e9f0f0): bound to 96 CPU cores.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:49.416 [MegatronEngine Rank 2] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:49.462 [MegatronEngine Rank 3] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+/opt/.venv/lib/python3.12/site-packages/transformer_engine/pytorch/module/base.py:1166: UserWarning: To guarantee overlapping TP and SP collectives with the backwardGEMMs, set environment variable CUDA_DEVICE_MAX_CONNECTIONS = 1
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/transformer_engine/pytorch/module/base.py:1166: UserWarning: To guarantee overlapping TP and SP collectives with the backwardGEMMs, set environment variable CUDA_DEVICE_MAX_CONNECTIONS = 1
+  warnings.warn(
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:49.544 [MegatronEngine Rank 0] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new features. Please reference the migration guide `docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `qwen2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/transformer/transformer_config.py:2415: UserWarning: full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.
+  warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:49.555 [MegatronEngine Rank 1] INFO: Using mbridge to create models and hf model save/load in MegatronEngine.
+/opt/.venv/lib/python3.12/site-packages/transformer_engine/pytorch/module/base.py:1166: UserWarning: To guarantee overlapping TP and SP collectives with the backwardGEMMs, set environment variable CUDA_DEVICE_MAX_CONNECTIONS = 1
+  warnings.warn(
+/opt/.venv/lib/python3.12/site-packages/transformer_engine/pytorch/module/base.py:1166: UserWarning: To guarantee overlapping TP and SP collectives with the backwardGEMMs, set environment variable CUDA_DEVICE_MAX_CONNECTIONS = 1
+  warnings.warn(
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 0): 771900928
+ > number of parameters on (tensor, pipeline) model parallel rank (1, 0): 771900928
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:50.829 [MegatronEngine Rank 0] INFO: Model parameter count: 771.90M, pp_stage=0, vpp_chunks=1
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:50.829 [MegatronEngine Rank 2] INFO: Model parameter count: 771.90M, pp_stage=0, vpp_chunks=1
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:50.976 [MegatronEngine Rank 3] INFO: Model parameter count: 771.90M, pp_stage=0, vpp_chunks=1
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:50.978 [MegatronEngine Rank 1] INFO: Model parameter count: 771.90M, pp_stage=0, vpp_chunks=1
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/models/mimo/config/base_configs.py:12: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+  class MimoModelConfig:
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:53.251 [MegatronEngine Rank 3] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:53.251 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:53.260 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:53.260 [MegatronEngine Rank 2] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/tensor_parallel/layers.py:848: UserWarning: When using sequence parallelism it is recommended to set the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for maximum speedup
+  warnings.warn(
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/tensor_parallel/layers.py:848: UserWarning: When using sequence parallelism it is recommended to set the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for maximum speedup
+  warnings.warn(
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/tensor_parallel/layers.py:848: UserWarning: When using sequence parallelism it is recommended to set the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for maximum speedup
+  warnings.warn(
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/tensor_parallel/layers.py:848: UserWarning: When using sequence parallelism it is recommended to set the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for maximum speedup
+  warnings.warn(
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:37:54.692 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 7.29, memory reserved (GB): 8.43, device memory used/total (GB): 42.00/139.81 | host RssAnon: 2137MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:37:54.692 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 7.29, memory reserved (GB): 8.43, device memory used/total (GB): 40.90/139.81 | host RssAnon: 2140MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:37:54.693 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 7.29, memory reserved (GB): 8.43, device memory used/total (GB): 45.94/139.81 | host RssAnon: 2146MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:37:54.693 IOStruct INFO: Memory-Usage before first gradient synchronization: memory allocated (GB): 7.29, memory reserved (GB): 8.43, device memory used/total (GB): 43.72/139.81 | host RssAnon: 2140MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:37:54.707 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 7.29, memory reserved (GB): 7.70, device memory used/total (GB): 41.27/139.81 | host RssAnon: 2137MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:37:54.708 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 7.29, memory reserved (GB): 7.70, device memory used/total (GB): 40.17/139.81 | host RssAnon: 2140MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:37:54.708 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 7.29, memory reserved (GB): 7.70, device memory used/total (GB): 45.21/139.81 | host RssAnon: 2146MB, RssShmem: 24MB
+[37m[1;38;2;180;140;80m(AReaL)[0m [37m20261001-17:37:54.708 IOStruct INFO: Memory-Usage after reclaiming gradient sync cache: memory allocated (GB): 7.29, memory reserved (GB): 7.70, device memory used/total (GB): 43.00/139.81 | host RssAnon: 2140MB, RssShmem: 24MB
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:56.939 [MegatronEngine Rank 3] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:56.939 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:56.944 [MegatronEngine Rank 2] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:56.944 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:58.865 [MegatronEngine Rank 2] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:58.865 [MegatronEngine Rank 0] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:58.903 [MegatronEngine Rank 1] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:37:58.903 [MegatronEngine Rank 3] INFO: #microbatch: 1, microbatch #tokens: [128], aligned to: [128], padded to: [256], padding lengths: [128].
+/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-cf6b7366e7083f54966d4ecb/workspace/tests/torchrun/run_megatron_muon.py", line 187, in <module>
+[rank0]:     main()
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-cf6b7366e7083f54966d4ecb/workspace/tests/torchrun/run_megatron_muon.py", line 142, in main
+[rank0]:     engine.checkpointer.save_checkpoint(checkpoint)
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-cf6b7366e7083f54966d4ecb/workspace/areal/engine/megatron_utils/checkpointer.py", line 597, in save_checkpoint
+[rank0]:     async_save_request = save_dist_checkpointing(
+[rank0]:                          ^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-inputs/job-cf6b7366e7083f54966d4ecb/workspace/areal/engine/megatron_utils/checkpointer.py", line 208, in save_dist_checkpointing
+[rank0]:     async_save_request = dist_checkpointing.save(**save_kwargs)
+[rank0]:                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/lib/python3.12/site-packages/megatron/core/dist_checkpointing/serialization.py", line 420, in save
+[rank0]:     if next(checkpoint_dir_path.iterdir(), None) is not None:
+[rank0]:        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/usr/lib/python3.12/pathlib.py", line 1058, in iterdir
+[rank0]:     for name in os.listdir(self):
+[rank0]:                 ^^^^^^^^^^^^^^^^
+[rank0]: FileNotFoundError: [Errno 2] No such file or directory: '/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-cf6b7366e7083f54966d4ecb/distributed/test_muon_three_updates_and_ch1/checkpoint-step3'
+[rank0]:[W1001 17:38:09.664079548 ProcessGroupNCCL.cpp:1524] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+W1001 17:38:13.990000 488779 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 488855 closing signal SIGTERM
+W1001 17:38:13.991000 488779 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 488856 closing signal SIGTERM
+W1001 17:38:13.992000 488779 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 488857 closing signal SIGTERM
+E1001 17:38:15.136000 488779 torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: 1) local_rank: 0 (pid: 488854) of binary: /storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/bin/python
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 940, in <module>
+    main()
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/.venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 293, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+tests/torchrun/run_megatron_muon.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-10-01_17:38:13
+  host      : gpulingjun033214152224.et15
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 488854)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
+F
+=================================== FAILURES ===================================
+________ test_muon_three_updates_and_checkpoint_fourth_update_match[1] _________
+
+tmp_path = PosixPath('/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-cf6b7366e7083f54966d4ecb/distributed/test_muon_three_updates_and_ch0')
+tp = 1
+
+    @pytest.mark.slow
+    @pytest.mark.multi_gpu
+    @pytest.mark.parametrize("tp", [1, 2])
+    def test_muon_three_updates_and_checkpoint_fourth_update_match(tmp_path, tp):
+        """Exercise native Muon via the real engine and checkpoint manager on DP/TP."""
+        model = os.environ.get("AREAL_MUON_TEST_MODEL")
+        if not model:
+            pytest.skip("Set AREAL_MUON_TEST_MODEL to a local Qwen2.5 model")
+        if torch.cuda.device_count() < 2 * tp:
+            pytest.skip(f"DP2/TP{tp} requires {2 * tp} GPUs")
+>       subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                f"--nproc_per_node={2 * tp}",
+                "tests/torchrun/run_megatron_muon.py",
+                "--model",
+                model,
+                "--backend",
+                f"megatron:d2p1t{tp}",
+                "--output",
+                str(tmp_path),
+            ],
+            check=True,
+            timeout=1800,
+        )
+
+tests/test_megatron_muon_distributed.py:21: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+input = None, capture_output = False, timeout = 1800, check = True
+popenargs = (['/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_...on', '-m', 'torch.distributed.run', '--standalone', '--nproc_per_node=2', 'tests/torchrun/run_megatron_muon.py', ...],)
+kwargs = {}
+process = <Popen: returncode: 1 args: ['/storage/openpsi/users/fenghui/projects/AReaL-...>
+stdout = None, stderr = None, retcode = 1
+
+    def run(*popenargs,
+            input=None, capture_output=False, timeout=None, check=False, **kwargs):
+        """Run command with arguments and return a CompletedProcess instance.
+    
+        The returned instance will have attributes args, returncode, stdout and
+        stderr. By default, stdout and stderr are not captured, and those attributes
+        will be None. Pass stdout=PIPE and/or stderr=PIPE in order to capture them,
+        or pass capture_output=True to capture both.
+    
+        If check is True and the exit code was non-zero, it raises a
+        CalledProcessError. The CalledProcessError object will have the return code
+        in the returncode attribute, and output & stderr attributes if those streams
+        were captured.
+    
+        If timeout is given, and the process takes too long, a TimeoutExpired
+        exception will be raised.
+    
+        There is an optional argument "input", allowing you to
+        pass bytes or a string to the subprocess's stdin.  If you use this argument
+        you may not also use the Popen constructor's "stdin" argument, as
+        it will be used internally.
+    
+        By default, all communication is in bytes, and therefore any "input" should
+        be bytes, and the stdout and stderr will be bytes. If in text mode, any
+        "input" should be a string, and stdout and stderr will be strings decoded
+        according to locale encoding, or by "encoding" if set. Text mode is
+        triggered by setting any of text, encoding, errors or universal_newlines.
+    
+        The other arguments are the same as for the Popen constructor.
+        """
+        if input is not None:
+            if kwargs.get('stdin') is not None:
+                raise ValueError('stdin and input arguments may not both be used.')
+            kwargs['stdin'] = PIPE
+    
+        if capture_output:
+            if kwargs.get('stdout') is not None or kwargs.get('stderr') is not None:
+                raise ValueError('stdout and stderr arguments may not be used '
+                                 'with capture_output.')
+            kwargs['stdout'] = PIPE
+            kwargs['stderr'] = PIPE
+    
+        with Popen(*popenargs, **kwargs) as process:
+            try:
+                stdout, stderr = process.communicate(input, timeout=timeout)
+            except TimeoutExpired as exc:
+                process.kill()
+                if _mswindows:
+                    # Windows accumulates the output in a single blocking
+                    # read() call run on child threads, with the timeout
+                    # being done in a join() on those threads.  communicate()
+                    # _after_ kill() is required to collect that and add it
+                    # to the exception.
+                    exc.stdout, exc.stderr = process.communicate()
+                else:
+                    # POSIX _communicate already populated the output so
+                    # far into the TimeoutExpired exception.
+                    process.wait()
+                raise
+            except:  # Including KeyboardInterrupt, communicate handled that.
+                process.kill()
+                # We don't call process.wait() as .__exit__ does that for us.
+                raise
+            retcode = process.poll()
+            if check and retcode:
+>               raise CalledProcessError(retcode, process.args,
+                                         output=stdout, stderr=stderr)
+E               subprocess.CalledProcessError: Command '['/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/bin/python', '-m', 'torch.distributed.run', '--standalone', '--nproc_per_node=2', 'tests/torchrun/run_megatron_muon.py', '--model', '/storage/openpsi/models/Qwen__Qwen2.5-1.5B-Instruct', '--backend', 'megatron:d2p1t1', '--output', '/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-cf6b7366e7083f54966d4ecb/distributed/test_muon_three_updates_and_ch0']' returned non-zero exit status 1.
+
+/usr/lib/python3.12/subprocess.py:571: CalledProcessError
+________ test_muon_three_updates_and_checkpoint_fourth_update_match[2] _________
+
+tmp_path = PosixPath('/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-cf6b7366e7083f54966d4ecb/distributed/test_muon_three_updates_and_ch1')
+tp = 2
+
+    @pytest.mark.slow
+    @pytest.mark.multi_gpu
+    @pytest.mark.parametrize("tp", [1, 2])
+    def test_muon_three_updates_and_checkpoint_fourth_update_match(tmp_path, tp):
+        """Exercise native Muon via the real engine and checkpoint manager on DP/TP."""
+        model = os.environ.get("AREAL_MUON_TEST_MODEL")
+        if not model:
+            pytest.skip("Set AREAL_MUON_TEST_MODEL to a local Qwen2.5 model")
+        if torch.cuda.device_count() < 2 * tp:
+            pytest.skip(f"DP2/TP{tp} requires {2 * tp} GPUs")
+>       subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                f"--nproc_per_node={2 * tp}",
+                "tests/torchrun/run_megatron_muon.py",
+                "--model",
+                model,
+                "--backend",
+                f"megatron:d2p1t{tp}",
+                "--output",
+                str(tmp_path),
+            ],
+            check=True,
+            timeout=1800,
+        )
+
+tests/test_megatron_muon_distributed.py:21: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+input = None, capture_output = False, timeout = 1800, check = True
+popenargs = (['/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_...on', '-m', 'torch.distributed.run', '--standalone', '--nproc_per_node=4', 'tests/torchrun/run_megatron_muon.py', ...],)
+kwargs = {}
+process = <Popen: returncode: 1 args: ['/storage/openpsi/users/fenghui/projects/AReaL-...>
+stdout = None, stderr = None, retcode = 1
+
+    def run(*popenargs,
+            input=None, capture_output=False, timeout=None, check=False, **kwargs):
+        """Run command with arguments and return a CompletedProcess instance.
+    
+        The returned instance will have attributes args, returncode, stdout and
+        stderr. By default, stdout and stderr are not captured, and those attributes
+        will be None. Pass stdout=PIPE and/or stderr=PIPE in order to capture them,
+        or pass capture_output=True to capture both.
+    
+        If check is True and the exit code was non-zero, it raises a
+        CalledProcessError. The CalledProcessError object will have the return code
+        in the returncode attribute, and output & stderr attributes if those streams
+        were captured.
+    
+        If timeout is given, and the process takes too long, a TimeoutExpired
+        exception will be raised.
+    
+        There is an optional argument "input", allowing you to
+        pass bytes or a string to the subprocess's stdin.  If you use this argument
+        you may not also use the Popen constructor's "stdin" argument, as
+        it will be used internally.
+    
+        By default, all communication is in bytes, and therefore any "input" should
+        be bytes, and the stdout and stderr will be bytes. If in text mode, any
+        "input" should be a string, and stdout and stderr will be strings decoded
+        according to locale encoding, or by "encoding" if set. Text mode is
+        triggered by setting any of text, encoding, errors or universal_newlines.
+    
+        The other arguments are the same as for the Popen constructor.
+        """
+        if input is not None:
+            if kwargs.get('stdin') is not None:
+                raise ValueError('stdin and input arguments may not both be used.')
+            kwargs['stdin'] = PIPE
+    
+        if capture_output:
+            if kwargs.get('stdout') is not None or kwargs.get('stderr') is not None:
+                raise ValueError('stdout and stderr arguments may not be used '
+                                 'with capture_output.')
+            kwargs['stdout'] = PIPE
+            kwargs['stderr'] = PIPE
+    
+        with Popen(*popenargs, **kwargs) as process:
+            try:
+                stdout, stderr = process.communicate(input, timeout=timeout)
+            except TimeoutExpired as exc:
+                process.kill()
+                if _mswindows:
+                    # Windows accumulates the output in a single blocking
+                    # read() call run on child threads, with the timeout
+                    # being done in a join() on those threads.  communicate()
+                    # _after_ kill() is required to collect that and add it
+                    # to the exception.
+                    exc.stdout, exc.stderr = process.communicate()
+                else:
+                    # POSIX _communicate already populated the output so
+                    # far into the TimeoutExpired exception.
+                    process.wait()
+                raise
+            except:  # Including KeyboardInterrupt, communicate handled that.
+                process.kill()
+                # We don't call process.wait() as .__exit__ does that for us.
+                raise
+            retcode = process.poll()
+            if check and retcode:
+>               raise CalledProcessError(retcode, process.args,
+                                         output=stdout, stderr=stderr)
+E               subprocess.CalledProcessError: Command '['/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/bin/python', '-m', 'torch.distributed.run', '--standalone', '--nproc_per_node=4', 'tests/torchrun/run_megatron_muon.py', '--model', '/storage/openpsi/models/Qwen__Qwen2.5-1.5B-Instruct', '--backend', 'megatron:d2p1t2', '--output', '/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/execution-outputs/job-cf6b7366e7083f54966d4ecb/distributed/test_muon_three_updates_and_ch1']' returned non-zero exit status 1.
+
+/usr/lib/python3.12/subprocess.py:571: CalledProcessError
+=========================== short test summary info ============================
+FAILED tests/test_megatron_muon_distributed.py::test_muon_three_updates_and_checkpoint_fourth_update_match[1]
+FAILED tests/test_megatron_muon_distributed.py::test_muon_three_updates_and_checkpoint_fourth_update_match[2]
+2 failed in 140.76s (0:02:20)

@@ -1,0 +1,4 @@
+# Preserve the selected verification logs alongside the source artifact.
+!evidence/**/*.log
+evidence/baseline-aligned-3epoch-*/adamw/results/
+evidence/baseline-aligned-3epoch-*/muon/results/

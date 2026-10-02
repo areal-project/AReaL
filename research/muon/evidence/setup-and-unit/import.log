@@ -1,0 +1,6 @@
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/bin/python 3.12.3 (main, Mar  3 2026, 12:15:18) [GCC 13.3.0]
+[('torch', '2.9.1+cu129'), ('megatron-core', '0.19.0'), ('emerging-optimizers', '0.3.0'), ('megatron-bridge', '0.6.0'), ('transformers', '5.3.0'), ('sglang', '0.5.10.post1')]
+/opt/.venv/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is not tested with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:31:13.259 TreeAttentionFSDP INFO: Compiled torch flex attention. Options: {'epilogue_fusion': True, 'max_autotune': False, 'shape_padding': True, 'trace.enabled': False, 'triton.cudagraphs': False}, dynamic: True
+[96m[1;38;2;180;140;80m(AReaL)[0m [96m20261001-17:31:13.261 TreeAttentionFSDP INFO: Using block mask in flex attention, block size: 128

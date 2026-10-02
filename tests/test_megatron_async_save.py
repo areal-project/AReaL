@@ -601,3 +601,18 @@ def test_host_cleanup_failure_preserves_published_save(
 
     publish.assert_called_once_with()
     empty_cache.assert_called_once_with()
+
+
+def test_replicated_optimizer_template_omits_distributed_sharding_metadata(
+    patched_checkpointer,
+):
+    """Muon full-parameter states must not request byte-sharded Adam metadata."""
+    _, manager, _ = patched_checkpointer
+    manager.use_distributed_optimizer = False
+    with patch("torch.distributed.barrier"):
+        state = manager.generate_state_dict(
+            with_model=False, with_optimizer=True, with_rng=False, is_loading=True
+        )
+    kwargs = manager.optimizer.sharded_state_dict.call_args.kwargs
+    assert kwargs == {"is_loading": True}
+    assert "optimizer" in state

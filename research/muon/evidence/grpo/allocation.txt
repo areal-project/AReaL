@@ -1,0 +1,2 @@
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+            972320       all fh-debug     root  R 2-09:53:56      1 slurmd-3
