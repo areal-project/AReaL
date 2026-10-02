@@ -1,7 +1,6 @@
 # OPSA Implementation in AReaL
 
-[OPSA (On-Policy Self-Adaptation)]((https://arxiv.org/abs/2608.31046)) is an RL post-training method that uses the model's own generation behavior to adapt the policy optimization process. In particular, OPSA uses token-level policy information to identify tokens where the model's behavior provides a useful learning signal, allowing the optimization to focus on more informative parts of generated responses.
-
+[OPSA (On-Policy Self-Adaptation)](<(https://arxiv.org/abs/2608.31046)>) is an RL post-training method that uses the model's own generation behavior to adapt the policy optimization process. In particular, OPSA uses token-level policy information to identify tokens where the model's behavior provides a useful learning signal, allowing the optimization to focus on more informative parts of generated responses.
 
 # How OPSA Works
 
@@ -34,45 +33,42 @@ The optimization decreases the probability of undesirable low-probability tokens
 Conceptually:
 
 Current policy
-      │
-      ▼
+│
+▼
 Generate response
-      │
-      ▼
+│
+▼
 Compute token probabilities / entropy
-      │
-      ▼
+│
+▼
 Identify high-entropy positions
-      │
-      ▼
+│
+▼
 Construct entropy-adaptive
 negative advantages
-      │
-      ▼
+│
+▼
 Suppress low-probability tail tokens
-      │
-      ▼
+│
+▼
 Redistribute probability mass
 toward head tokens
-      │
-      ▼
+│
+▼
 Updated policy
 
 Unlike OPD, OPSA does not require a teacher model or teacher-generated token-level targets. It uses information already available from the policy itself to construct the training signal.
 
-
 This implementation integrates OPSA into the AReaL training pipeline and provides:
 
-* OPSA-based RL training workflow
-* Support for **DAPO-Math-17k** as the training dataset
-* Support for **AIME 2024** as a validation/evaluation dataset
-* Dataset preprocessing scripts for converting datasets into the format expected by AReaL
-* Integration with AReaL's rollout and training infrastructure
-* Configurable batch size, sequence length, rollout settings, and optimization parameters
-
+- OPSA-based RL training workflow
+- Support for **DAPO-Math-17k** as the training dataset
+- Support for **AIME 2024** as a validation/evaluation dataset
+- Dataset preprocessing scripts for converting datasets into the format expected by AReaL
+- Integration with AReaL's rollout and training infrastructure
+- Configurable batch size, sequence length, rollout settings, and optimization parameters
 
 # Dataset Preparation
-
 
 The OPSA training pipeline expects datasets in Parquet format with the following columns:
 
@@ -217,6 +213,7 @@ def main():
 if __name__ == "__main__":
     main()
 ```
+
 Run:
 
 ```bash
@@ -227,7 +224,7 @@ python prepare_aime24.py
 
 Update the dataset paths in `examples/distillation/opsa.yaml` to point to the locations of your processed datasets.
 
----
+______________________________________________________________________
 
 # Running OPSA Training
 
