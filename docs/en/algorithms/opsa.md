@@ -1,76 +1,75 @@
 # OPSA Implementation in AReaL
 
-[OPSA (On-Policy Self-Adaptation)](<(https://arxiv.org/abs/2608.31046)>) is an RL post-training method that uses the model's own generation behavior to adapt the policy optimization process. In particular, OPSA uses token-level policy information to identify tokens where the model's behavior provides a useful learning signal, allowing the optimization to focus on more informative parts of generated responses.
+[OPSA (On-Policy Self-Adaptation)](<(https://arxiv.org/abs/2608.31046)>) is an RL
+post-training method that uses the model's own generation behavior to adapt the policy
+optimization process. In particular, OPSA uses token-level policy information to
+identify tokens where the model's behavior provides a useful learning signal, allowing
+the optimization to focus on more informative parts of generated responses.
 
 # How OPSA Works
 
-OPSA (On-Policy Self-Adaptation) is a supervision-free alternative to on-policy distillation (OPD). The key observation behind OPSA is that the improvement from OPD mainly comes from suppressing low-probability ("tail") tokens, rather than from the teacher's token-level supervision.
+OPSA (On-Policy Self-Adaptation) is a supervision-free alternative to on-policy
+distillation (OPD). The key observation behind OPSA is that the improvement from OPD
+mainly comes from suppressing low-probability ("tail") tokens, rather than from the
+teacher's token-level supervision.
 
 The main idea is:
 
 - Generate responses with the current policy
 
-The current model generates responses on-policy, just as in standard RL or on-policy distillation.
+The current model generates responses on-policy, just as in standard RL or on-policy
+distillation.
 
 - Compute token-level policy information
 
-For each generated token, OPSA computes the model's token-level probability information, including its entropy.
+For each generated token, OPSA computes the model's token-level probability information,
+including its entropy.
 
 - Identify uncertain tokens
 
-High-entropy positions indicate that the model is more uncertain about which token to generate. OPSA uses this uncertainty to determine where stronger learning signals should be applied.
+High-entropy positions indicate that the model is more uncertain about which token to
+generate. OPSA uses this uncertainty to determine where stronger learning signals should
+be applied.
 
 - Construct self-adaptive negative advantages
 
-Instead of obtaining token-level supervision from a teacher model, OPSA constructs negative advantages based on token entropy.
+Instead of obtaining token-level supervision from a teacher model, OPSA constructs
+negative advantages based on token entropy.
 
-Higher-entropy positions receive stronger learning signals, while the resulting optimization suppresses low-probability tail tokens.
+Higher-entropy positions receive stronger learning signals, while the resulting
+optimization suppresses low-probability tail tokens.
 
 - Suppress tail tokens and redistribute probability mass
 
-The optimization decreases the probability of undesirable low-probability tokens while redistributing probability mass toward the model's higher-probability ("head") tokens.
+The optimization decreases the probability of undesirable low-probability tokens while
+redistributing probability mass toward the model's higher-probability ("head") tokens.
 
 Conceptually:
 
-Current policy
-│
-▼
-Generate response
-│
-▼
-Compute token probabilities / entropy
-│
-▼
-Identify high-entropy positions
-│
-▼
-Construct entropy-adaptive
-negative advantages
-│
-▼
-Suppress low-probability tail tokens
-│
-▼
-Redistribute probability mass
-toward head tokens
-│
-▼
+Current policy => Generate response => Compute token probabilities / entropy => Identify
+high-entropy positions => Construct entropy-adaptive negative advantages => Suppress
+low-probability tail tokens => Redistribute probability mass toward head tokens =>
 Updated policy
 
-Unlike OPD, OPSA does not require a teacher model or teacher-generated token-level targets. It uses information already available from the policy itself to construct the training signal.
+Unlike OPD, OPSA does not require a teacher model or teacher-generated token-level
+targets. It uses information already available from the policy itself to construct the
+training signal.
 
 This implementation integrates OPSA into the AReaL training pipeline and provides:
 
 - OPSA-based RL training workflow
 - Support for **DAPO-Math-17k** as the training dataset
 - Support for **AIME 2024** as a validation/evaluation dataset
-- Dataset preprocessing scripts for converting datasets into the format expected by AReaL
+- Dataset preprocessing scripts for converting datasets into the format expected by
+  AReaL
 - Integration with AReaL's rollout and training infrastructure
-- Configurable batch size, sequence length, rollout settings, and optimization parameters
+- Configurable batch size, sequence length, rollout settings, and optimization
+  parameters
 
 # Dataset Preparation
 
-The OPSA training pipeline expects datasets in Parquet format with the following columns:
+The OPSA training pipeline expects datasets in Parquet format with the following
+columns:
 
 - question
 - answer
@@ -86,7 +85,9 @@ The original dataset is available at:
 
 https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k
 
-The original DAPO-Math-17k dataset contains the problem prompt in prompt and the ground-truth answer in reward_model. The following script extracts the required fields and saves them as a Parquet file.
+The original DAPO-Math-17k dataset contains the problem prompt in prompt and the
+ground-truth answer in reward_model. The following script extracts the required fields
+and saves them as a Parquet file.
 
 ```python
 import pandas as pd
@@ -152,7 +153,9 @@ The AIME 2024 dataset is available at:
 
 https://huggingface.co/datasets/HuggingFaceH4/aime_2024
 
-The original dataset uses problem for the problem statement. The following script renames it to question, keeps the required answer column, and saves the dataset as Parquet.
+The original dataset uses problem for the problem statement. The following script
+renames it to question, keeps the required answer column, and saves the dataset as
+Parquet.
 
 ```python
 import os
@@ -222,7 +225,8 @@ python prepare_aime24.py
 
 # Dataset Configuration
 
-Update the dataset paths in `examples/distillation/opsa.yaml` to point to the locations of your processed datasets.
+Update the dataset paths in `examples/distillation/opsa.yaml` to point to the locations
+of your processed datasets.
 
 ______________________________________________________________________
 
@@ -236,7 +240,8 @@ python examples/distillation/opsa.py \
     scheduler.type=local
 ```
 
-Depending on the AReaL version and cluster configuration, the scheduler configuration can be changed accordingly.
+Depending on the AReaL version and cluster configuration, the scheduler configuration
+can be changed accordingly.
 
 For example, for a local setup:
 
@@ -244,4 +249,5 @@ For example, for a local setup:
 scheduler.type=local
 ```
 
-For distributed environments, configure the scheduler and worker resources according to the AReaL deployment.
+For distributed environments, configure the scheduler and worker resources according to
+the AReaL deployment.
