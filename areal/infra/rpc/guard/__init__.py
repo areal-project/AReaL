@@ -10,11 +10,12 @@ The Guard is the base process management layer shared between:
 Typical usage::
 
     from areal.infra.rpc.guard import GuardState, create_app, run_server
+    from areal.utils.network import default_bind_host
 
     state = GuardState()
     app = create_app(state)
     # Optionally register additional blueprints
-    run_server(state, app, bind_host="0.0.0.0", port=0)
+    run_server(state, app, bind_host=default_bind_host(), port=0)
 """
 
 from .app import (

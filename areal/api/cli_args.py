@@ -2356,6 +2356,17 @@ class SGLangConfig:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
+    # KV retention across weight updates (experimental; needs the kv-retain SGLang fork).
+    # Off by default: the server frees an aborted request's pages and the client re-prefills.
+    # None means "do not pass the flag", so a stock SGLang without these flags still starts.
+    kv_retain_on_abort: bool = False
+    kv_migration_mode: str | None = None  # rebuild | reuse | map (server default: rebuild)
+    kv_mapper_module: str | None = None
+    kv_mapper_registry: str | None = None
+    kv_max_migration_depth: int | None = None  # server default: 1
+    kv_retain_max_tokens: int | None = None
+    kv_retain_ttl_s: float | None = None
+    kv_event_log: str | None = None
     mm_attention_backend: str | None = None
     enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
@@ -2848,6 +2859,15 @@ class InferenceEngineConfig:
         default=False,
         metadata={
             "help": "Whether to output verbose tracing messages for each generation request."
+        },
+    )
+    kv_mapper_wait_s: float = field(
+        default=0.0,
+        metadata={
+            "help": "After publishing version j, wait up to this many seconds for the KV mapper "
+            "artifact v<j-1>-v<j> to appear in sglang.kv_mapper_registry before resuming "
+            "rollouts, so resumed requests can use it. 0 disables the wait; the wait is "
+            "recorded as timeperf/mapper_wait. Requires sglang.kv_migration_mode=map."
         },
     )
     deterministic_sampling: bool = field(

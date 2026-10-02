@@ -43,7 +43,7 @@ from areal.infra.utils.inference_targets import write_inference_targets
 from areal.utils import logging, perf_tracer
 from areal.utils.data import cycle_dataloader
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.network import find_free_ports, format_hostport, gethostip
+from areal.utils.network import find_free_ports, format_hostport, gethostip, default_bind_host
 from areal.utils.perf_tracer import trace_perf
 
 from ..staleness_manager import StalenessManager
@@ -743,7 +743,7 @@ class RolloutController:
             try:
                 config = uvicorn.Config(
                     app,
-                    host="0.0.0.0",
+                    host=default_bind_host(),
                     port=self._proxy_gateway_port,
                     log_level="warning",
                     access_log=False,

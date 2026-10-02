@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from areal.experimental.openai import InteractionWithTokenLogpReward
 
 RID_CACHE_SIZE = 128
+RID_CACHE_CONCURRENCY_FACTOR = 4  # pins survive well past the in-flight window
 
 logger = logging.getLogger("RemoteInfEngine")
 
@@ -547,6 +548,11 @@ class RemoteInfEngine(InferenceEngine):
         self.config = config
         self.backend = backend
 
+        # A resumed segment must reach the server that holds its retained KV pages, so the
+        # rid pin must outlive every in-flight rollout; the fixed floor alone is smaller than
+        # the default max_concurrent_rollouts and evicted live pins.
+        concurrent = self.config.max_concurrent_rollouts or self.config.consumer_batch_size
+        self.rid_cache_size = max(RID_CACHE_SIZE, RID_CACHE_CONCURRENCY_FACTOR * concurrent)
         self.rid_to_address = {}
         # Maintain the addresses for the recent 128 requests
         self.rid_queue = []
@@ -1092,7 +1098,7 @@ class RemoteInfEngine(InferenceEngine):
             server_addr = self.rid_to_address[req.rid]
         else:
             server_addr = self.choose_server()
-            if len(self.rid_queue) >= RID_CACHE_SIZE:
+            if len(self.rid_queue) >= self.rid_cache_size:
                 # Remove the oldest entry if cache is full
                 oldest_rid = self.rid_queue.pop(0)
                 self.rid_to_address.pop(oldest_rid, None)
@@ -1105,6 +1111,7 @@ class RemoteInfEngine(InferenceEngine):
         # Deal with rollout interruption
         stop_reason = None
         ori_max_new_tokens = gconfig.max_new_tokens
+        segment_index = 0
         while (
             stop_reason not in ["stop", "tool_calls", "length"]
             and len(accumulated_output_tokens) < ori_max_new_tokens
@@ -1169,6 +1176,15 @@ class RemoteInfEngine(InferenceEngine):
             if gen_result.routed_experts is not None:
                 accumulated_routed_experts.append(gen_result.routed_experts)
 
+            # Every segment after the first re-sends prompt + partial output, and
+            # the server prefills that whole prefix again under the current
+            # weights. Record the prefix length so rebuild work is measurable.
+            if segment_index > 0:
+                stats_tracker.get("rollout").scalar(
+                    resume_prefix_len=len(req.input_ids)
+                )
+            segment_index += 1
+
             # Record speculative-decoding acceptance metrics from SGLang
             # meta_info. Recorded per generation segment (partial rollout may
             # issue multiple /generate calls); exported as a segment-level mean.
@@ -1189,6 +1205,8 @@ class RemoteInfEngine(InferenceEngine):
                 len(gen_result.output_tokens),
                 len(req.input_ids),
             )
+
+        stats_tracker.get("rollout").scalar(generation_segments=segment_index)
 
         # Final abort handling
         if stop_reason == "abort":
