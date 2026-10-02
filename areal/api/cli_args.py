@@ -1777,6 +1777,32 @@ class RejectionSamplingConfig:
 
 
 @dataclass
+class OPSAConfig:
+    """Configuration for On-Policy Self-Adaptation (OPSA).
+
+    OPSA (Section 4.2 of ``Does On-Policy Distillation Really Distill?``)
+    suppresses the lowest-probability sampled tokens without task rewards or a
+    teacher. The selected fraction is evaluated independently for every
+    response, and its negative advantage is scaled by token entropy.
+    """
+
+    lowest_logp_fraction: float = field(
+        default=0.2,
+        metadata={
+            "help": "Fraction of valid response tokens with the lowest rollout logp to update."
+        },
+    )
+
+    def __post_init__(self):
+        """Validate OPSA settings."""
+        if not 0 < self.lowest_logp_fraction <= 1:
+            raise ValueError(
+                "opsa.lowest_logp_fraction must be in (0, 1], got "
+                f"{self.lowest_logp_fraction}"
+            )
+
+
+@dataclass
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
@@ -1875,6 +1901,13 @@ class PPOActorConfig(TrainEngineConfig):
     adv_norm: NormConfig | None = field(
         default=None, metadata={"help": "Normalization configuration for advantages."}
     )
+    opsa: OPSAConfig | None = field(
+        default=None,
+        metadata={
+            "help": "Optional reward-free On-Policy Self-Adaptation configuration."
+        },
+    )
+
     token_rewards_as_adv: bool = field(
         default=True,
         metadata={
@@ -2124,6 +2157,16 @@ class PPOActorConfig(TrainEngineConfig):
                 "    metric: ratio\n"
                 "    upper: 5.0"
             )
+
+        if self.opsa is not None:
+            if self.use_decoupled_loss:
+                raise ValueError("OPSA requires use_decoupled_loss=False")
+            if self.use_sapo_loss or self.use_cispo_loss:
+                raise ValueError("OPSA cannot be combined with SAPO or CISPO")
+            if self.importance_sampling_level != "token":
+                raise ValueError("OPSA only supports importance_sampling_level='token'")
+            if self.m2_threshold is not None or self.rejection_sampling is not None:
+                raise ValueError("OPSA cannot be combined with token filtering")
 
         # Validate SAPO configuration
         if self.use_sapo_loss:

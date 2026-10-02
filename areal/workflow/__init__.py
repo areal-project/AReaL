@@ -4,12 +4,14 @@ __all__ = [
     "RLVRWorkflow",
     "MultiTurnWorkflow",
     "VisionRLVRWorkflow",
+    "SelfAdaptationWorkflow",
 ]
 
 _LAZY_IMPORTS = {
     "RLVRWorkflow": "areal.workflow.rlvr",
     "MultiTurnWorkflow": "areal.workflow.multi_turn",
     "VisionRLVRWorkflow": "areal.workflow.vision_rlvr",
+    "SelfAdaptationWorkflow": "areal.workflow.self_adaptation",
 }
 
 
