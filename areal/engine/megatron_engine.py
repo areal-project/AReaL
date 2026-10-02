@@ -242,10 +242,9 @@ def _validate_areal_lm_head_compatibility(
     enable_tree_training: bool,
     npu_available: bool,
 ) -> None:
+    del npu_available
     if not enable_chunked_logits:
         return
-    if npu_available:
-        raise NotImplementedError("AReaL LM Head does not support NPU training")
     if enable_tree_training:
         raise NotImplementedError("AReaL LM Head does not support tree training")
 

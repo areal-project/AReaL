@@ -1,7 +1,17 @@
+# ruff: noqa: E402
+
 import os
 
 import torch
 import torch.distributed as dist
+
+try:
+    from areal.utils.torch_npu_compat import import_mindspeed_adaptor
+
+    import_mindspeed_adaptor()
+except ImportError:
+    pass
+
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer import TransformerConfig
