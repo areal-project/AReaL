@@ -17,6 +17,7 @@ def _make_test_engine(optimizer_config: OptimizerConfig):
     engine.optimizer_config = optimizer_config
     engine.config = SimpleNamespace(use_lora=False)
     engine.mcore_config = MegatronEngineConfig()
+    engine.bridge_cls = None
     engine.model = [object()]
     engine.dtype = torch.bfloat16
     engine.enable_fp8 = False
@@ -187,6 +188,7 @@ def test_precision_aware_optimizer_fields_are_applied_before_validation(
     )
     engine.optimizer_config = OptimizerConfig(type="adam")
     engine.config = SimpleNamespace(use_lora=False)
+    engine.bridge_cls = None
     engine.mcore_config = MegatronEngineConfig(
         use_precision_aware_optimizer=True,
         main_grads_dtype="bfloat16",

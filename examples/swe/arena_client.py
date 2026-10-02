@@ -298,6 +298,8 @@ class ArenaOpenAPIClient:
         "CANCELLED",
         "COLLECT_FAILED",
         "EVAL_FAILED",
+        # The result endpoint may expose a grader ERROR even for a DONE task.
+        "ERROR",
         "FAILED",
         "HARNESS_FAILED",
         "NO_OUTPUT",

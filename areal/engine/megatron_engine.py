@@ -368,6 +368,7 @@ class MegatronEngine(TrainEngine):
         self.bridge = None
         self.process_group_initialized = False
         self._initialized = False
+        self._has_finalized_model_grads = False
         self.rollout_engine: InferenceEngine | None = None
         self.rollout_coordinator: DistRolloutCoordinator | None = None
         self.weight_update_group_initialized: bool = False
@@ -722,11 +723,27 @@ class MegatronEngine(TrainEngine):
             ]
             if len(self.model) == 1:
                 model_config.param_sync_func = model_config.param_sync_func[0]
-        model_config.finalize_model_grads_func = finalize_model_grads
+        model_config.finalize_model_grads_func = self._finalize_model_grads
         self._mark_duplicated_params()
         self._create_optimizer(ft_spec)
         self._set_optimizer_grad_scale_func()
         self._initialized = True
+
+    def _finalize_model_grads(self, *args: Any, **kwargs: Any) -> None:
+        if not self._has_finalized_model_grads:
+            # With non-overlapped reduction, the first gradient collective runs
+            # after the whole batch. Variable-length microbatches may have filled
+            # the allocator cache by then. NCCL allocates outside that cache and
+            # cannot reclaim it on OOM, even when most reserved memory is unused.
+            self.get_device_stats().log(
+                "before first gradient synchronization", rank=None
+            )
+            current_platform.empty_cache()
+            self.get_device_stats().log(
+                "after reclaiming gradient sync cache", rank=None
+            )
+        finalize_model_grads(*args, **kwargs)
+        self._has_finalized_model_grads = True
 
     def _set_optimizer_grad_scale_func(self) -> None:
         """Use one optimizer loss scale for the main and auxiliary losses.
@@ -1040,6 +1057,7 @@ class MegatronEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.rollout_batch(
@@ -1049,6 +1067,7 @@ class MegatronEngine(TrainEngine):
             group_size=group_size,
             min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
 
@@ -1063,6 +1082,7 @@ class MegatronEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
@@ -1074,6 +1094,7 @@ class MegatronEngine(TrainEngine):
             min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
 

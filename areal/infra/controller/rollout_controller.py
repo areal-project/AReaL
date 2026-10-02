@@ -156,6 +156,7 @@ class _RemoteRolloutTaskInput:
     min_usable_group_size: int = 1
     proxy_addr: str | None = None
     reward_normalization: bool = False
+    reward_normalization_use_std: bool = True
     drop_incomplete_group: bool = False
 
 
@@ -1098,6 +1099,7 @@ class RolloutController:
                     callback_addr=f"http://{self.callback_addr}/callback/rollout_complete",
                     proxy_addr=proxy_addr,
                     reward_normalization=pending_task.reward_normalization,
+                    reward_normalization_use_std=pending_task.reward_normalization_use_std,
                     drop_incomplete_group=pending_task.drop_incomplete_group,
                 )
 
@@ -1169,6 +1171,7 @@ class RolloutController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> int:
         validate_rollout_group_sizes(group_size, min_usable_group_size)
 
@@ -1197,6 +1200,7 @@ class RolloutController:
             min_usable_group_size=min_usable_group_size,
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
 
@@ -1229,6 +1233,7 @@ class RolloutController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         perf_tracer.instant(
             "rollout_controller.rollout_batch",
@@ -1244,6 +1249,7 @@ class RolloutController:
                 group_size=group_size,
                 min_usable_group_size=min_usable_group_size,
                 reward_normalization=reward_normalization,
+                reward_normalization_use_std=reward_normalization_use_std,
                 drop_incomplete_group=drop_incomplete_group,
             )
         results = self.wait(count=len(data))
@@ -1262,6 +1268,7 @@ class RolloutController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> list[dict[str, Any]]:
         """Prepare a batch with controlled staleness.
 
@@ -1292,6 +1299,7 @@ class RolloutController:
                         group_size=group_size,
                         min_usable_group_size=min_usable_group_size,
                         reward_normalization=reward_normalization,
+                        reward_normalization_use_std=reward_normalization_use_std,
                         drop_incomplete_group=drop_incomplete_group,
                     )
 
