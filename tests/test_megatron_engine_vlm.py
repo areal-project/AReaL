@@ -427,8 +427,8 @@ class TestPackedContextParallelForward:
         [
             (False, True, True, None),
             (True, False, False, None),
+            (True, False, True, None),
             (True, True, False, "tree training"),
-            (True, False, True, "NPU training"),
         ],
     )
     def test_areal_lm_head_rejects_unsupported_training_modes(

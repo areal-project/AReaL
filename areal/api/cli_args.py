@@ -956,9 +956,9 @@ class MegatronEngineConfig:
     enable_chunked_logits: bool = field(
         default=False,
         metadata={
-            "help": "Enable AReaL's CUDA-only chunked-logits path by replacing "
+            "help": "Enable AReaL's accelerator chunked-logits path by replacing "
             "Megatron's native output layer with the vocab-parallel LM Head. "
-            "NPU and tree training are unsupported."
+            "Tree training is unsupported."
         },
     )
     entropy_requires_grad: bool = field(
