@@ -1,0 +1,94 @@
+{
+  "adamw": {
+    "updates": 87,
+    "steps_per_epoch": 29,
+    "epochs": [
+      {
+        "epoch": 1,
+        "updates": 29,
+        "training_correct": 24153,
+        "training_answers": 29696,
+        "training_reward": 0.8133418642241379,
+        "evaluation_reward": 0.75853,
+        "mean_train_step_seconds": 9.042493103448278,
+        "min_grad_norm": 0.2171,
+        "max_grad_norm": 0.38413,
+        "last_lr": 3e-06
+      },
+      {
+        "epoch": 2,
+        "updates": 29,
+        "training_correct": 25909,
+        "training_answers": 29696,
+        "training_reward": 0.8724744073275862,
+        "evaluation_reward": 0.77293,
+        "mean_train_step_seconds": 8.989968965517242,
+        "min_grad_norm": 0.24982,
+        "max_grad_norm": 0.33783,
+        "last_lr": 3e-06
+      },
+      {
+        "epoch": 3,
+        "updates": 29,
+        "training_correct": 26480,
+        "training_answers": 29696,
+        "training_reward": 0.8917025862068966,
+        "evaluation_reward": 0.77862,
+        "mean_train_step_seconds": 8.95911724137931,
+        "min_grad_norm": 0.30621,
+        "max_grad_norm": 0.39195,
+        "last_lr": 3e-06
+      }
+    ],
+    "mean_train_step_seconds": 8.99719310344828,
+    "wall_seconds": 1990.0,
+    "peak_actor_gpu_memory_mib": 97950,
+    "peak_rollout_gpu_memory_mib": 134723
+  },
+  "muon": {
+    "updates": 87,
+    "steps_per_epoch": 29,
+    "epochs": [
+      {
+        "epoch": 1,
+        "updates": 29,
+        "training_correct": 24282,
+        "training_answers": 29696,
+        "training_reward": 0.8176858836206896,
+        "evaluation_reward": 0.76308,
+        "mean_train_step_seconds": 9.275344827586206,
+        "min_grad_norm": 0.21436,
+        "max_grad_norm": 0.3895,
+        "last_lr": 3e-06
+      },
+      {
+        "epoch": 2,
+        "updates": 29,
+        "training_correct": 25810,
+        "training_answers": 29696,
+        "training_reward": 0.869140625,
+        "evaluation_reward": 0.76573,
+        "mean_train_step_seconds": 9.494375862068965,
+        "min_grad_norm": 0.23784,
+        "max_grad_norm": 0.52157,
+        "last_lr": 3e-06
+      },
+      {
+        "epoch": 3,
+        "updates": 29,
+        "training_correct": 25570,
+        "training_answers": 29696,
+        "training_reward": 0.8610587284482759,
+        "evaluation_reward": 0.77047,
+        "mean_train_step_seconds": 9.536989655172414,
+        "min_grad_norm": 0.28439,
+        "max_grad_norm": 0.34499,
+        "last_lr": 3e-06
+      }
+    ],
+    "mean_train_step_seconds": 9.43557011494253,
+    "wall_seconds": 1943.0,
+    "peak_actor_gpu_memory_mib": 91124,
+    "peak_rollout_gpu_memory_mib": 130165
+  }
+}

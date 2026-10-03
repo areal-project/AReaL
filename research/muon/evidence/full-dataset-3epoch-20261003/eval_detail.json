@@ -1,0 +1,129 @@
+{
+  "questions": 1319,
+  "samples_per_question": 4,
+  "epochs": {
+    "1": {
+      "adamw": {
+        "correct_per_question_histogram": {
+          "0": 157,
+          "1": 98,
+          "2": 103,
+          "3": 146,
+          "4": 815
+        },
+        "correct_answers": 4002,
+        "total_answers": 5276,
+        "mean_reward": 0.7585291887793784,
+        "pass_at_4": 0.8809704321455648,
+        "all_4_correct": 0.6178923426838514
+      },
+      "muon": {
+        "correct_per_question_histogram": {
+          "0": 150,
+          "1": 104,
+          "2": 92,
+          "3": 154,
+          "4": 819
+        },
+        "correct_answers": 4026,
+        "total_answers": 5276,
+        "mean_reward": 0.7630780894617134,
+        "pass_at_4": 0.8862774829416225,
+        "all_4_correct": 0.6209249431387415
+      },
+      "paired_question_difference": {
+        "-4": 6,
+        "-3": 19,
+        "-2": 49,
+        "-1": 130,
+        "0": 884,
+        "1": 156,
+        "2": 53,
+        "3": 17,
+        "4": 5
+      }
+    },
+    "2": {
+      "adamw": {
+        "correct_per_question_histogram": {
+          "0": 152,
+          "1": 86,
+          "2": 93,
+          "3": 146,
+          "4": 842
+        },
+        "correct_answers": 4078,
+        "total_answers": 5276,
+        "mean_reward": 0.7729340409401061,
+        "pass_at_4": 0.8847611827141774,
+        "all_4_correct": 0.6383623957543594
+      },
+      "muon": {
+        "correct_per_question_histogram": {
+          "0": 162,
+          "1": 91,
+          "2": 90,
+          "3": 135,
+          "4": 841
+        },
+        "correct_answers": 4040,
+        "total_answers": 5276,
+        "mean_reward": 0.7657316148597423,
+        "pass_at_4": 0.8771796815769523,
+        "all_4_correct": 0.6376042456406369
+      },
+      "paired_question_difference": {
+        "-4": 11,
+        "-3": 31,
+        "-2": 64,
+        "-1": 125,
+        "0": 867,
+        "1": 129,
+        "2": 61,
+        "3": 23,
+        "4": 8
+      }
+    },
+    "3": {
+      "adamw": {
+        "correct_per_question_histogram": {
+          "0": 163,
+          "1": 78,
+          "2": 84,
+          "3": 114,
+          "4": 880
+        },
+        "correct_answers": 4108,
+        "total_answers": 5276,
+        "mean_reward": 0.778620166793025,
+        "pass_at_4": 0.8764215314632298,
+        "all_4_correct": 0.6671721000758151
+      },
+      "muon": {
+        "correct_per_question_histogram": {
+          "0": 160,
+          "1": 93,
+          "2": 84,
+          "3": 124,
+          "4": 858
+        },
+        "correct_answers": 4065,
+        "total_answers": 5276,
+        "mean_reward": 0.770470053070508,
+        "pass_at_4": 0.8786959818043972,
+        "all_4_correct": 0.6504927975739196
+      },
+      "paired_question_difference": {
+        "-4": 19,
+        "-3": 28,
+        "-2": 58,
+        "-1": 110,
+        "0": 907,
+        "1": 105,
+        "2": 53,
+        "3": 24,
+        "4": 15
+      }
+    }
+  }
+}

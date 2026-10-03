@@ -1,0 +1,2 @@
+/storage/openpsi/users/fenghui/projects/AReaL-RSI/.rsi/research-lab/runs/research_58654ea421ca4619/agents/research_ce92f6a2a491b52e7fd5b227/muon-env/bin/python 3.12.3 (main, Mar  3 2026, 12:15:18) [GCC 13.3.0]
+{'torch': '2.9.1+cu129', 'megatron-core': '0.19.0', 'emerging-optimizers': '0.3.0', 'sglang': '0.5.10.post1', 'transformers': '5.3.0'}
