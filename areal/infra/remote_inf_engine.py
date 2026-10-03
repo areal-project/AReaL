@@ -1617,8 +1617,34 @@ class RemoteInfEngine(InferenceEngine):
             if get_pause_requests is not None
             else [self.backend.get_pause_request()]
         )
-        for pause_req in pause_requests:
-            self._run_request_on_all_servers(pause_req)
+        pause_logger = getattr(self, "logger", logger)
+        for stage, pause_req in enumerate(pause_requests, start=1):
+            started = time.monotonic()
+            mode = (pause_req.payload or {}).get("mode", "default")
+            pause_logger.info(
+                "Inference pause stage %d/%d (%s) started",
+                stage,
+                len(pause_requests),
+                mode,
+            )
+            try:
+                self._run_request_on_all_servers(pause_req)
+            except Exception:
+                pause_logger.exception(
+                    "Inference pause stage %d/%d (%s) failed after %.1fs",
+                    stage,
+                    len(pause_requests),
+                    mode,
+                    time.monotonic() - started,
+                )
+                raise
+            pause_logger.info(
+                "Inference pause stage %d/%d (%s) completed in %.1fs",
+                stage,
+                len(pause_requests),
+                mode,
+                time.monotonic() - started,
+            )
 
         # The above http request may require some time to be scheduled and executed.
         # The following line waits until all requests are indeed dropped.

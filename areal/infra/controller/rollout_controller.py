@@ -1417,7 +1417,11 @@ class RolloutController:
         await self._collective_rpc_async("pause_generation")
 
     def pause_generation_sync(self):
-        self._collective_rpc("pause_generation", http_timeout=120.0)
+        # SGLang first aborts in-flight requests, then pauses the scheduler;
+        # the worker also waits for pause_grace_period before returning.
+        # A short RPC timeout retries the same pause while the
+        # first call is still running and queues work behind the stalled call.
+        self._collective_rpc("pause_generation", http_timeout=600.0, max_retries=1)
 
     async def continue_generation(self):
         await self._collective_rpc_async("continue_generation")
