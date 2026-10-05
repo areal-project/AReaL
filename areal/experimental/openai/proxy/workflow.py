@@ -315,11 +315,9 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         )
 
         if not interactions:
-            logger.warning(
-                "Task %s exported no usable interactions; trajectory will be rejected.",
-                task_id,
+            raise RuntimeError(
+                f"Agent session for task {task_id} produced no complete interactions"
             )
-            return None
 
         self._set_individual_rollout_reward(interactions)
         _log_interaction_reward_metrics(interactions, data)
