@@ -234,11 +234,12 @@ class PPOActor:
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
+        behavior_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
         # Apply the mask to log probabilities.
         if data.get("prox_logp") is not None:
             log_train_inference_stats(
                 data["prox_logp"],
-                torch.roll(data["logprobs"], shifts=-1, dims=-1),
+                behavior_logp,
                 loss_mask.bool(),
             )
         if not self.config.use_decoupled_loss and self.config.recompute_logprob:
@@ -249,9 +250,13 @@ class PPOActor:
                     "prox_logp is None but recompute_logprob=True. "
                     "This indicates compute_logp() was skipped incorrectly."
                 )
+            # Preserve the inference-engine log probabilities before standard PPO
+            # replaces them with the trainer-side recomputation.
+            behavior_logp *= loss_mask
+            data["behavior_logp"] = behavior_logp
             old_logp = data["logprobs"] = prox_logp_value
         else:
-            old_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
+            old_logp = behavior_logp
             if not self.config.use_decoupled_loss:
                 # prox logp not available, use inferenced logp
                 data["prox_logp"] = old_logp
@@ -669,6 +674,23 @@ def grpo_loss_fn(
         with stats_tracker.disable_scope():
             log_train_inference_stats(prox_logp, old_logp, denominator_mask)
 
+    # Compare sampled-token probabilities from the rollout behavior policy and
+    # the exact proximal policy before M2PO or rollout correction changes the
+    # valid mask. Reuse obtains the proximal value from the detached training
+    # forward rather than from prox_logp_gt.
+    behavior_logp = input_data.get("behavior_logp")
+    if behavior_logp is None and use_decoupled_loss:
+        behavior_logp = old_logp
+    metric_prox_logp = prox_logp_gt
+    if prox_logp_method == PROX_LOGP_METHOD_REUSE:
+        metric_prox_logp = prox_logp
+    rollout_probs_diff = None
+    if behavior_logp is not None and metric_prox_logp is not None:
+        rollout_probs_diff = torch.abs(
+            torch.exp(metric_prox_logp.detach().float())
+            - torch.exp(behavior_logp.detach().float())
+        )
+
     # Apply M2PO masking if threshold is set
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
@@ -787,6 +809,15 @@ def grpo_loss_fn(
         clipped_tokens=stat["clip_mask"],
         dual_clipped_tokens=stat["dual_clip_mask"],
     )
+
+    if rollout_probs_diff is not None:
+        stats_tracker.denominator(
+            rollout_probs_diff_tokens=denominator_mask,
+        )
+        stats_tracker.stat(
+            rollout_probs_diff=rollout_probs_diff,
+            denominator="rollout_probs_diff_tokens",
+        )
 
     if rkl_stat is not None:
         stats_tracker.stat(
