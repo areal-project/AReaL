@@ -1,0 +1,53 @@
+defaults:
+  - dapo-math_grpo_qwen3_5_cpu_staged
+  - _self_
+
+experiment_name: tau3-qwen3.5-harts-smoke
+trial_name: baseline
+total_train_steps: 1
+
+gconfig:
+  n_samples: 2
+  max_new_tokens: 512
+  max_tokens: 32767
+
+rollout:
+  max_concurrent_rollouts: 4
+  queue_size: 8
+  agent:
+    tool_call_parser: qwen3_coder
+    reasoning_parser: qwen3
+    chat_template_type: hf
+    engine_max_tokens: ${gconfig.max_tokens}
+    export_style: individual
+
+actor:
+  path: ${oc.env:QWEN3_5_35B_A3B_BASE_MODEL_PATH,Qwen/Qwen3.5-35B-A3B-Base}
+  mb_spec:
+    max_tokens_per_mb: 32768
+  megatron:
+    cpu_staged_offload:
+      enabled: false
+  enable_tree_training: false
+  pad_to_maximum: false
+
+sglang:
+  context_length: 32768
+  max_running_requests: 8
+
+train_dataset:
+  path: tau3/airline/train
+  batch_size: 4
+  max_length: 1024
+
+valid_dataset: null
+
+econfig:
+  domain: airline
+  max_steps: 20
+  solo_mode: false
+  user_llm_base_url: ${oc.env:TAU3_USER_BASE_URL}
+  user_llm: ${oc.env:TAU3_USER_MODEL,gpt-6-luna}
+  user_llm_args:
+    temperature: 0.0
+    max_tokens: 128
