@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from numbers import Real
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -321,6 +321,29 @@ class ArenaOpenAPIClient:
             api_token=api_token,
         )
         self.llm_api_key = llm_api_key or os.getenv("ARENA_LLM_API_KEY", "")
+        self.llm_base_url = (
+            os.getenv("ARENA_LLM_BASE_URL", "") or f"{self.base_url}/api"
+        ).rstrip("/")
+        try:
+            target = urlsplit(self.llm_base_url)
+            valid_target = (
+                target.scheme in {"http", "https"}
+                and bool(target.hostname)
+                and target.username is None
+                and target.password is None
+                and not target.query
+                and not target.fragment
+                and not any(char.isspace() for char in self.llm_base_url)
+            )
+            # Accessing port validates its syntax and range.
+            target.port
+        except ValueError:
+            valid_target = False
+        if not valid_target:
+            raise ValueError(
+                "Arena LLM base URL must be an absolute HTTP(S) URL without "
+                "credentials, query or fragment; check ARENA_LLM_BASE_URL"
+            )
         self.timeout = timeout
         self.poll_interval = poll_interval
         self.request_retries = request_retries
@@ -660,7 +683,7 @@ class ArenaOpenAPIClient:
                 "LLM registration response returned an unexpected model_name: "
                 f"{registered_model_id!r}"
             )
-        return f"{self.base_url}/api", registered_model_id
+        return self.llm_base_url, registered_model_id
 
     async def register_llm_proxy_async(
         self,
@@ -697,6 +720,37 @@ class ArenaOpenAPIClient:
         )
         registration = _response_json(response)
         return self._registered_llm_target(registration, model_name)
+
+    async def renew_llm_proxy_async(
+        self,
+        model_name: str,
+        *,
+        client: httpx.AsyncClient,
+        timeout: float = 180.0,
+    ) -> bool:
+        """Refresh a live route's idle lease without changing its configuration.
+
+        Arena's empty PATCH preserves the route and updates updated_at, which
+        excludes it from dynamic-model GC. GET alone does not renew this lease.
+        A missing route returns False so its owner can restore the same alias.
+        """
+        if not model_name.startswith("stream-areal-"):
+            raise ValueError("Arena model_name must start with 'stream-areal-'")
+        response = await self._async_request(
+            client,
+            "PATCH",
+            f"{self.base_url}/openapi/v1/llm/models/{quote(model_name, safe='')}",
+            headers=self._headers,
+            json={},
+            timeout=timeout,
+        )
+        if response.status_code == 404:
+            return False
+        payload = _response_json(response)
+        model = payload.get("data", payload) if isinstance(payload, Mapping) else None
+        if not isinstance(model, Mapping) or model.get("model_name") != model_name:
+            raise ArenaAPIError("LLM lease renewal returned an unexpected model_name")
+        return True
 
     async def llm_proxy_exists_async(
         self,

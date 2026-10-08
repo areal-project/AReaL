@@ -7,7 +7,6 @@ from dataclasses import asdict
 
 import swanlab
 import torch.distributed as dist
-import trackio
 import wandb
 from tensorboardX import SummaryWriter
 
@@ -19,6 +18,7 @@ from areal.utils.printing import tabulate_stats
 from areal.version import version_info
 
 logger = logging.getLogger("StatsLogger", "system")
+trackio = None
 
 
 class StatsLogger:
@@ -99,6 +99,11 @@ class StatsLogger:
         self._trackio_enabled = False
         trackio_config = self.config.trackio
         if trackio_config.mode != "disabled":
+            global trackio
+            if trackio is None:
+                import trackio as trackio_module
+
+                trackio = trackio_module
             trackio.init(
                 project=trackio_config.project or self.config.experiment_name,
                 name=trackio_config.name or self.config.trial_name,
