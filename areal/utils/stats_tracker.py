@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -310,6 +311,7 @@ class DistributedStatsTracker:
         op: dist.ReduceOp | None = None,
     ) -> torch.Tensor:
         """Reduce a scalar on a device supported by the process-group backend."""
+        backend = None
         try:
             backend = str(dist.get_backend(group)).lower()
             if backend == "gloo":
@@ -324,6 +326,11 @@ class DistributedStatsTracker:
             device = None
         if device is not None and tensor.device.type != device:
             tensor = tensor.to(device)
+        # MegatronAdaptor's global double bypass does not write its copy back.
+        if tensor.dtype == torch.float64 and (
+            backend == "hccl" or "megatron_adaptor" in sys.modules
+        ):
+            tensor = tensor.float()
         if op is None:
             dist.all_reduce(tensor, group=group)
         else:

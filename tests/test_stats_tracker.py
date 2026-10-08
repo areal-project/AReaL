@@ -1,3 +1,5 @@
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -51,6 +53,83 @@ def test_compact_stats_cannot_reuse_a_normal_stat_key():
     compact_tracker.denominator(valid=mask)
     with pytest.raises(ValueError, match="compact stats"):
         compact_tracker.stat(denominator="valid", value=torch.ones(1))
+
+
+@pytest.mark.parametrize(
+    "backend,adaptor_loaded", [("hccl", False), ("gloo", True), ("nccl", True)]
+)
+@pytest.mark.parametrize("local_value,remote_value", [(1.0, 9.0), (9.0, 1.0)])
+def test_compact_stats_double_bypass_preserves_reduced_values(
+    backend, adaptor_loaded, local_value, remote_value, monkeypatch
+):
+    """The adaptor reduces a float32 copy without writing float64 inputs back."""
+    monkeypatch.setattr(
+        "areal.utils.stats_tracker.current_platform",
+        SimpleNamespace(communication_backend="gloo", device_type="cpu"),
+    )
+    tracker = DistributedStatsTracker()
+    mask = torch.tensor([True])
+    tracker.stat_compact(
+        mask, ReduceType.AVG_MIN_MAX, value=torch.tensor([local_value])
+    )
+    tracker.stat_compact(mask, ReduceType.SUM, count=torch.ones(1))
+
+    def all_reduce(tensor, *, group, op=None):
+        if tensor.dtype == torch.float64:
+            tensor = tensor.float()
+        # The other rank has three samples, each with remote_value.
+        if op == dist.ReduceOp.MIN:
+            tensor.fill_(min(local_value, remote_value))
+        elif op == dist.ReduceOp.MAX:
+            tensor.fill_(max(local_value, remote_value))
+        elif tensor.numel() == 2:
+            tensor.add_(tensor.new_tensor([3 * remote_value, 3.0]))
+        else:
+            tensor.add_(3.0)
+
+    monkeypatch.setattr(dist, "get_backend", lambda group: backend)
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    if adaptor_loaded:
+        monkeypatch.setitem(
+            sys.modules, "megatron_adaptor", ModuleType("megatron_adaptor")
+        )
+    else:
+        monkeypatch.delitem(sys.modules, "megatron_adaptor", raising=False)
+    group = object()
+
+    result = tracker.export(key="value", reduce_group=group)
+    result.update(tracker.export(key="count", reduce_group=group))
+
+    assert result == {
+        "value/avg": (local_value + 3 * remote_value) / 4,
+        "value/min": 1.0,
+        "value/max": 9.0,
+        "count": 4.0,
+    }
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl"])
+def test_all_reduce_non_hccl_preserves_float64(backend, monkeypatch):
+    monkeypatch.setattr(
+        "areal.utils.stats_tracker.current_platform",
+        SimpleNamespace(communication_backend="gloo", device_type="cpu"),
+    )
+    tracker = DistributedStatsTracker()
+    tensor = torch.tensor([1e40], dtype=torch.float64)
+
+    def all_reduce(tensor, *, group):
+        assert tensor.dtype == torch.float64
+        tensor.mul_(2)
+
+    monkeypatch.setattr(dist, "get_backend", lambda group: backend)
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    monkeypatch.delitem(sys.modules, "megatron_adaptor", raising=False)
+
+    result = tracker._all_reduce(tensor, group=object())
+
+    torch.testing.assert_close(
+        result, torch.tensor([2e40], dtype=torch.float64), rtol=0, atol=0
+    )
 
 
 def test_export_uses_key_sync_group_for_missing_per_key_stat():
