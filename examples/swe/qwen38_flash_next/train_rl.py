@@ -312,6 +312,7 @@ def main(profile, args):
                         "allocation_mode": config.allocation_mode,
                         "n_samples": config.gconfig.n_samples,
                     },
+                    worker_profile=os.environ["QWEN_AB_ARM"],
                 )
             # Capture wraps replay, so its artifacts describe the supplied batch.
             with replay, capture:

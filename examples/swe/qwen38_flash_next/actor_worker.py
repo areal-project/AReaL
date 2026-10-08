@@ -31,6 +31,13 @@ def main():
 
     import areal.engine.megatron_engine as engine
 
+    if os.environ.get("QWEN_BATCH_REPLAY_PATH") or os.environ.get(
+        "QWEN_BATCH_REPLAY_PATHS"
+    ):
+        from examples.swe.qwen38_flash_next.batch_snapshot import load_diagnostic_replay
+
+        engine.MegatronEngine.load_diagnostic_replay = load_diagnostic_replay
+
     optimizer_config = engine.MCoreOptimizerConfig
     bridge_adapter = engine.MCoreBridgeAdapter
 
