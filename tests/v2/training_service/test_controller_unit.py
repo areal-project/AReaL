@@ -154,6 +154,16 @@ class TestGatewayTrainControllerInitialization:
 
         mock_set_env.assert_awaited_once()
         assert mock_async_fork.await_count == 5
+        data_proxy_cmd = next(
+            item.kwargs["raw_cmd"]
+            for item in mock_async_fork.await_args_list
+            if item.kwargs["role"] == "data-proxy"
+        )
+        timeout_index = data_proxy_cmd.index("--request-timeout")
+        assert (
+            float(data_proxy_cmd[timeout_index + 1])
+            == controller.config.request_timeout
+        )
         mock_sync_fork.assert_not_called()
         assert mock_create_engine.await_count == 2
         assert mock_call_engine.await_count == 4
