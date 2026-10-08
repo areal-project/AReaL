@@ -574,6 +574,7 @@ class RolloutController:
                                 worker_id=worker.id,
                                 method="destroy",
                                 engine_name=self._proxy_engine_name(rank),
+                                http_timeout=60.0,
                             )
                             for rank, worker in enumerate(self.proxy_workers)
                         ]

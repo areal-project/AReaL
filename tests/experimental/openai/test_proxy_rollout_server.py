@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -159,6 +160,42 @@ async def test_export_restores_session_and_interaction_metadata(
     legacy_payload = response.json()["interactions"]
     legacy_payload["turn"].pop("metadata", None)
     assert deserialize_interactions(legacy_payload)["turn"].metadata == {}
+
+
+@pytest.mark.asyncio
+async def test_export_keeps_control_rpc_responsive_during_serialization(monkeypatch):
+    """Large trajectory exports must not block the proxy control plane."""
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_serialize(interactions, *, tensor_store=None):
+        started.set()
+        assert release.wait(timeout=3)
+        return {}
+
+    monkeypatch.setattr(srv, "serialize_interactions", slow_serialize)
+    monkeypatch.setattr(srv, "_engine", SimpleNamespace(pause=lambda: None))
+    session = SessionData(session_id="slow-export", metadata={})
+    session.finish()
+    srv._session_cache[session.session_id] = session
+
+    async with _client() as client:
+        export_task = asyncio.create_task(
+            client.post(
+                "/export_trajectories",
+                headers=_admin_headers(),
+                json={"session_id": session.session_id},
+            )
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 3)
+            response = await asyncio.wait_for(
+                client.post("/call", json={"method": "pause"}), timeout=0.5
+            )
+            assert response.status_code == 200
+        finally:
+            release.set()
+            await export_task
 
 
 class _Request:

@@ -795,7 +795,8 @@ async def _prepare_prompt(
         input_ids = (
             processed_prompt.input_ids
             if processed_prompt is not None
-            else apply_chat_template(
+            else await asyncio.to_thread(
+                apply_chat_template,
                 tokenizer,
                 tokenizer_messages,
                 tools=tools,
@@ -823,7 +824,8 @@ async def _prepare_prompt(
     if chat_template_type != "concat":
         raise RuntimeError(f"Unsupported chat_template_type {chat_template_type}")
 
-    input_ids, cutoff, parent_prefix_len = _concat_prompt_token_ids_with_parent(
+    input_ids, cutoff, parent_prefix_len = await asyncio.to_thread(
+        _concat_prompt_token_ids_with_parent,
         concat_messages,
         parent,
         tokenizer,
