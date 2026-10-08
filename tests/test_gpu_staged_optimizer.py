@@ -408,12 +408,18 @@ def test_mcore_distributed_optimizer_dp1_preserves_step_and_sync_order(
             return 1
 
     class _ModelChunk:
-        def __init__(self, ddp_config):
+        def __init__(self, ddp_config, bucket):
             self.ddp_config = ddp_config
+            self.bucket_groups = [SimpleNamespace(buckets=[bucket])]
+            self.expert_parallel_bucket_groups = []
             self.expected_param = None
             self.param_sync_count = 0
 
-        def start_param_sync(self) -> None:
+        def _start_bucket_group_param_sync(
+            self, bucket_group, force_sync: bool
+        ) -> None:
+            assert bucket_group is self.bucket_groups[0]
+            assert force_sync is False
             assert self.expected_param is not None
             torch.testing.assert_close(
                 model_param, self.expected_param, rtol=0.0, atol=0.0
@@ -451,6 +457,7 @@ def test_mcore_distributed_optimizer_dp1_preserves_step_and_sync_order(
         param_data=model_param.detach(),
         offset=0,
         numel_unpadded=model_param.numel(),
+        params_list=[model_param],
     )
     buffer = SimpleNamespace(
         param_dtype=torch.bfloat16,
@@ -458,9 +465,10 @@ def test_mcore_distributed_optimizer_dp1_preserves_step_and_sync_order(
         buckets=[bucket],
         param_index_map={model_param: (0, model_param.numel(), 0)},
         data_parallel_group=group,
+        num_optimizer_shards=None,
         params=[model_param],
     )
-    model_chunk = _ModelChunk(ddp_config)
+    model_chunk = _ModelChunk(ddp_config, bucket)
     config = MCoreOptimizerConfig(
         optimizer="adam",
         lr=adam_kwargs["lr"],
@@ -773,19 +781,24 @@ def _compatible_mcore_config() -> SimpleNamespace:
     )
 
 
-def test_builder_concurrency_never_mutates_global_adam(monkeypatch) -> None:
+@pytest.mark.parametrize("with_overrides", [False, True])
+def test_builder_concurrency_never_mutates_global_adam(
+    monkeypatch, with_overrides: bool
+) -> None:
     """Concurrent staged/staged and staged/ordinary builds leave Adam untouched."""
     import megatron.core.optimizer as mcore_optimizer
 
     from areal.engine.megatron_utils import gpu_staged_optimizer as staged_module
 
     original_adam = mcore_optimizer.Adam
+    overrides = {object(): object()} if with_overrides else None
 
     def run_pair(staged_flags: tuple[bool, bool]) -> None:
         barrier = threading.Barrier(2)
 
-        def fake_builder(config, model):
+        def fake_builder(config, model, **kwargs):
             del config, model
+            assert kwargs.get("config_overrides") is overrides
             barrier.wait(timeout=5)
             return object()
 
@@ -803,9 +816,10 @@ def test_builder_concurrency_never_mutates_global_adam(monkeypatch) -> None:
                     _compatible_mcore_config(),
                     [object()],
                     GPUStagedAdamWConfig(buffer_count=1, bucket_size_mb=1),
+                    config_overrides=overrides,
                 )
             return mcore_optimizer.get_megatron_optimizer(
-                _compatible_mcore_config(), [object()]
+                _compatible_mcore_config(), [object()], config_overrides=overrides
             )
 
         with ThreadPoolExecutor(max_workers=2) as executor:
