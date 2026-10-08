@@ -965,6 +965,8 @@ def get_megatron_optimizer_with_gpu_staged_adamw(
     mcore_config: Any,
     model: list[Any],
     staged_config: GPUStagedAdamWConfig,
+    *,
+    config_overrides: dict[Any, Any] | None = None,
 ) -> Any:
     """Build through MCore, then bind CPU slabs to its final DP-local shards."""
     _check_megatron_compatibility()
@@ -996,7 +998,12 @@ def get_megatron_optimizer_with_gpu_staged_adamw(
     # establish process groups and DP-local parameter shards, then replace only
     # the resulting wrapper instances.  The module-global Adam class is never
     # read-modify-written, so staged and ordinary builders can run concurrently.
-    optimizer = mcore_optimizer.get_megatron_optimizer(mcore_config, model)
+    optimizer_kwargs = (
+        {"config_overrides": config_overrides} if config_overrides is not None else {}
+    )
+    optimizer = mcore_optimizer.get_megatron_optimizer(
+        mcore_config, model, **optimizer_kwargs
+    )
     replaced = _replace_metadata_optimizers_with_staged_adamw(
         optimizer, mcore_config, staged_config
     )

@@ -1,0 +1,114 @@
+# Qwen3.8 Flash Next full-model SFT smoke. Three nodes, TP8/PP3/EP8, CP1.
+# Set MODEL_PATH, SFT_DATASET, FILERoot, AREAL_DIR and MCORE_BRIDGE_ROOT.
+experiment_name: ${oc.env:EXPERIMENT_NAME,"qwen38-flash-next-sft"}
+trial_name: ${oc.env:TRIAL_NAME,"first-step"}
+seed: 1
+tokenizer_path: ${actor.path}
+total_train_epochs: 1
+total_train_steps: ${oc.env:TOTAL_TRAIN_STEPS,3}
+enable_offload: false
+cluster:
+  n_nodes: ${oc.env:N_NODES,3}
+  n_gpus_per_node: 8
+  fileroot: ${oc.env:FILERoot}
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${cluster.fileroot}/name_resolve
+allocation_mode: "megatron:(attn:d${oc.env:ATTN_DP_SIZE,1}p${oc.env:PP_SIZE,3}t${oc.env:TP_SIZE,8}c${oc.env:CP_SIZE,1}|ffn:d${oc.env:FFN_DP_SIZE,1}p${oc.env:PP_SIZE,3}e${oc.env:EP_SIZE,8})"
+scheduler:
+  type: null
+actor:
+  backend: ${allocation_mode}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${oc.env:MODEL_PATH}
+  init_from_scratch: false
+  dtype: bfloat16
+  gradient_checkpointing: true
+  mb_spec:
+    n_mbs: 1
+    n_mbs_divisor: 1
+    max_tokens_per_mb: ${oc.env:MAX_TOKENS_PER_MB,16384}
+  optimizer:
+    type: adam
+    lr: 2e-5
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+  megatron:
+    bridge_type: mcore-bridge
+    freeze_ple_table: true
+    enable_mtp: false
+    # Fuse expert-output permutation/merge to avoid the reproduced nondeterministic
+    # BF16 atomic scatter accumulation; cross-engine numerics remain unverified.
+    moe_permute_fusion: true
+    language_model_only: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    ddp:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+      grad_reduce_in_fp32: true
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 100
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        AREAL_DIR: ${oc.env:AREAL_DIR}
+        MCORE_BRIDGE_ROOT: ${oc.env:MCORE_BRIDGE_ROOT}
+        PLE_CPU_OFFLOAD: "0"
+        PYTHONPATH: ${oc.env:MCORE_BRIDGE_ROOT}/src:${oc.env:AREAL_DIR}
+        CUDA_DEVICE_MAX_CONNECTIONS: "1"
+        TOKENIZERS_PARALLELISM: "false"
+train_dataset:
+  batch_size: 1
+  shuffle: false
+  pin_memory: true
+  num_workers: 2
+  drop_last: true
+  path: ${oc.env:SFT_DATASET}
+  type: sft
+  max_length: ${oc.env:MAX_LENGTH,16384}
+valid_dataset: null
+swe:
+  filter_errors: true
+  pre_split: false
+  num_proc: 8
+  parse_tool_call_args: true
+  cleanup_processed_dataset: false
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_steps: null
+  freq_epochs: null
+  freq_secs: null
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_steps: null
+  freq_epochs: null
+  freq_secs: null
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_steps: null
+  freq_epochs: null
+  freq_secs: null
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled

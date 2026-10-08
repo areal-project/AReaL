@@ -28,13 +28,20 @@ class _ModelChunk:
         ddp_config: SimpleNamespace,
         param_buffer: torch.Tensor,
         expected: list[torch.Tensor],
+        bucket: SimpleNamespace,
     ) -> None:
         self.ddp_config = ddp_config
+        self.bucket_groups = [SimpleNamespace(buckets=[bucket])]
+        self.expert_parallel_bucket_groups = []
         self.param_buffer = param_buffer
         self.expected = expected
         self.param_sync_count = 0
 
-    def start_param_sync(self) -> None:
+    def _start_bucket_group_param_sync(
+        self, bucket_group: SimpleNamespace, force_sync: bool
+    ) -> None:
+        assert bucket_group is self.bucket_groups[0]
+        assert force_sync is False
         rank = dist.get_rank()
         shard_numel = self.param_buffer.numel() // dist.get_world_size()
         local_shard = self.param_buffer.narrow(0, rank * shard_numel, shard_numel)
@@ -89,6 +96,7 @@ def _run_dp2() -> None:
         param_data=param_buffer,
         offset=0,
         numel_unpadded=param_buffer.numel(),
+        params_list=model_params,
     )
     buffer = SimpleNamespace(
         param_dtype=torch.bfloat16,
@@ -97,10 +105,11 @@ def _run_dp2() -> None:
         param_index_map={first: (0, 19, 0), second: (19, 64, 0)},
         data_parallel_group=dist.group.WORLD,
         data_parallel_world_size=dist.get_world_size(),
+        num_optimizer_shards=None,
         ddp_config=ddp_config,
         params=model_params,
     )
-    model_chunk = _ModelChunk(ddp_config, param_buffer, baseline_params)
+    model_chunk = _ModelChunk(ddp_config, param_buffer, baseline_params, bucket)
     config = OptimizerConfig(
         optimizer="adam",
         lr=adam_kwargs["lr"],

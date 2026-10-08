@@ -1011,6 +1011,7 @@ def get_megatron_optimizer_with_dist_muon(
     model: list[Any],
     *,
     pg_collection: Any | None = None,
+    config_overrides: dict[Any, Any] | None = None,
 ) -> Any:
     """Build MCore's native layer-wise Muon without mutating caller config."""
     version = importlib.metadata.version("megatron-core")
@@ -1045,6 +1046,7 @@ def get_megatron_optimizer_with_dist_muon(
         model,
         use_gloo_process_groups=True,
         pg_collection=pg_collection,
+        config_overrides=config_overrides,
     )
     if type(optimizer) is not LayerWiseDistributedOptimizer:
         raise TypeError(
@@ -3479,6 +3481,7 @@ def get_megatron_optimizer_with_gpu_staged_muon(
     staged_config: GPUStagedMuonConfig,
     *,
     pg_collection: Any | None = None,
+    config_overrides: dict[Any, Any] | None = None,
 ) -> Any:
     """Run official classification/ownership, then bind staged rank-local state."""
     version = importlib.metadata.version("megatron-core")
@@ -3614,6 +3617,7 @@ def get_megatron_optimizer_with_gpu_staged_muon(
         model,
         use_gloo_process_groups=False,
         pg_collection=pg_collection,
+        config_overrides=config_overrides,
     )
 
     if type(official) is not LayerWiseDistributedOptimizer:

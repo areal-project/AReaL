@@ -13,8 +13,15 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
-from megatron.core.optimizer import get_megatron_optimizer
-from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.optimizer import (
+    get_megatron_optimizer,
+    get_standard_config_overrides,
+)
+from megatron.core.optimizer.optimizer_config import OptimizerConfig, ParamKey
+from megatron.core.optimizer_param_scheduler import (
+    OptimizerParamScheduler,
+    ParamGroupOverride,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 from areal.engine.megatron_utils.gpu_staged_muon import (
@@ -56,6 +63,7 @@ class _SingleParamModel(torch.nn.Module):
         super().__init__()
         name = "experts_weight" if expert else "bias"
         param = torch.nn.Parameter(initial.clone())
+        param.no_weight_decay = True
         setattr(self, name, param)
         if expert:
             param.allreduce = False
@@ -214,15 +222,38 @@ def _run_single_param_case(
     )
     staged_model = _SingleParamModel(initial, expert=expert, tp_size=tp_size)
     baseline_model = _SingleParamModel(initial, expert=expert, tp_size=tp_size)
+    overrides = get_standard_config_overrides(_make_config())
+    overrides[ParamKey(attr="no_weight_decay")] = ParamGroupOverride(wd_mult=0.0)
     staged = get_megatron_optimizer_with_gpu_staged_muon(
         _make_config(),
         [staged_model],
         GPUStagedMuonConfig(buffer_count=1, slot_size_mb=1),
         pg_collection=pg_collection,
+        config_overrides=dict(overrides),
     )
     baseline = get_megatron_optimizer_with_dist_muon(
-        _make_config(), [baseline_model], pg_collection=pg_collection
+        _make_config(),
+        [baseline_model],
+        pg_collection=pg_collection,
+        config_overrides=dict(overrides),
     )
+    config = _make_config()
+    for optimizer in (baseline, staged):
+        assert all(group["wd_mult"] == 0.0 for group in optimizer.param_groups)
+        OptimizerParamScheduler(
+            optimizer,
+            init_lr=0.0,
+            max_lr=config.lr,
+            min_lr=config.min_lr,
+            lr_warmup_steps=0,
+            lr_decay_steps=2,
+            lr_decay_style="constant",
+            start_wd=config.weight_decay,
+            end_wd=config.weight_decay,
+            wd_incr_steps=2,
+            wd_incr_style="constant",
+        )
+        assert all(group["weight_decay"] == 0.0 for group in optimizer.param_groups)
     expected_kinds = ["muon"] if expert else ["muon", "scalar_adamw"]
     assert [leaf.optimizer.optimizer_kind for leaf in staged.chained_optimizers] == (
         expected_kinds

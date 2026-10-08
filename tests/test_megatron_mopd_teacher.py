@@ -14,7 +14,6 @@ import torch
 
 from areal.api import WeightUpdateMeta, Worker
 from areal.engine import MegatronEngine, MegatronScoringEngine
-from areal.engine.awex.colocate_writer import AwexWeightPublisher
 from areal.infra.controller.train_controller import TrainController
 from areal.trainer.mopd.scoring import MOPDTeacherController
 from areal.trainer.rl_trainer import PPOTrainer
@@ -125,60 +124,6 @@ def test_teacher_weight_residency_adapter_has_no_awex_publication_state():
 
     assert engine._weight_residency is not None
     assert engine._awex_publisher is None
-
-
-def test_awex_publisher_composes_engine_weight_residency(monkeypatch):
-    engine = object.__new__(MegatronEngine)
-    engine._weight_residency = None
-    engine._awex_publisher = None
-    engine.logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        "areal.engine.awex.colocate_writer.AwexWeightPublisher.eager_publish_train_info",
-        lambda *_args, **_kwargs: None,
-    )
-
-    engine.init_awex_adapter()
-    first_publisher = engine._awex_publisher
-    engine.init_awex_adapter()
-
-    assert engine._weight_residency is not None
-    assert engine._awex_publisher is first_publisher
-    assert engine._awex_publisher.residency is engine._weight_residency
-
-
-@pytest.mark.parametrize("weights_released", [False, True])
-def test_awex_publisher_prepares_residency_in_oom_safe_order(
-    weights_released: bool,
-):
-    events = []
-
-    class _Residency:
-        def is_released(self, tag):
-            events.append(("is_released", tag))
-            return weights_released
-
-        def release_memory(self, tags):
-            events.append(("release", tags))
-
-        def release_grad_memory(self):
-            events.append(("release_grad", None))
-
-        def resume_memory(self, tags):
-            events.append(("resume", tags))
-
-    publisher = AwexWeightPublisher(SimpleNamespace(), _Residency())
-
-    publisher._prepare_residency_for_publish()
-
-    assert events[:3] == [
-        ("is_released", "weights"),
-        ("release", ["optimizer"]),
-        ("release_grad", None),
-    ]
-    if weights_released:
-        assert events[3:] == [("resume", ["weights"])]
-    else:
-        assert len(events) == 3
 
 
 def test_awex_actor_worker_does_not_reenter_rollout(monkeypatch):

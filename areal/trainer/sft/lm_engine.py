@@ -27,6 +27,7 @@ class LMEngine:
 
     def _train_lm(self, data: dict[str, Any]) -> None:
         self.engine.train()
+        data["input_token_loss_mask"] = data["loss_mask"].bool()
         data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
         stage_batch_for_engine(data, self.engine)
         stats = self.engine.train_batch(
@@ -43,6 +44,7 @@ class LMEngine:
 
     def _evaluate_lm(self, data: dict[str, Any]) -> None:
         self.engine.eval()
+        data["input_token_loss_mask"] = data["loss_mask"].bool()
         data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
         stage_batch_for_engine(data, self.engine)
         self.engine.eval_batch(
