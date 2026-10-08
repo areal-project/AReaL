@@ -1417,7 +1417,8 @@ async def export_trajectories(
     await session_data.wait_for_finish()
 
     # Export interactions
-    interactions = session_data.export_interactions(
+    interactions = await asyncio.to_thread(
+        session_data.export_interactions,
         discount=request.discount,
         style=request.style,
         drop_retry_orphans=request.drop_retry_orphans,
@@ -1470,7 +1471,11 @@ async def export_trajectories(
         if tensor_reference_group_id is not None
         else None
     )
-    serialized = serialize_interactions(interactions, tensor_store=tensor_store)
+    # Large tree exports can spend substantial CPU time in token conversion.
+    # Keep the event loop responsive to pause/destroy control RPCs meanwhile.
+    serialized = await asyncio.to_thread(
+        serialize_interactions, interactions, tensor_store=tensor_store
+    )
     return ExportTrajectoriesResponse(
         interactions=serialized,
         tensor_reference_group_id=tensor_reference_group_id,

@@ -504,14 +504,39 @@ class RolloutController:
             ]
             await asyncio.gather(*tasks)
         else:
-            # Separation path: each rollout server gets its own SLURM-isolated GPUs,
-            # so we must NOT override base_gpu_id (SLURM already sets
-            # CUDA_VISIBLE_DEVICES per worker). Use the collective launch + addr-less
-            # initialize that the verified disaggregated baseline relies on; the
-            # worker discovers its server address via name_resolve.
-            self.server_infos = await self._collective_rpc_async(
-                "launch_server", server_args=server_args
-            )
+            # Separation path: each rollout server gets isolated GPUs. Ordinary
+            # servers use the collective launch; workers discover their address
+            # through name_resolve. AWEX also needs a unique rank base per server.
+            if server_args.get("awex_colocate_mode"):
+                # AWEX's infer transfer ranks span every server. A collective
+                # launch gives each isolated TP server the same local ranks,
+                # so supply a distinct dense base to each server. The backend
+                # resolves its physical base_gpu_id from CUDA_VISIBLE_DEVICES.
+                slots_per_node = max(
+                    1,
+                    getattr(self.scheduler, "n_gpus_per_node", 8)
+                    // self._gpus_per_server,
+                )
+                self.server_infos = await asyncio.gather(
+                    *[
+                        self.scheduler.async_call_engine(
+                            worker_id=worker.id,
+                            method="launch_server",
+                            engine_name=self._engine_name(rank),
+                            server_args={
+                                **server_args,
+                                "base_gpu_id": (rank % slots_per_node)
+                                * self._gpus_per_server,
+                                "_awex_gpus_per_server": self._gpus_per_server,
+                            },
+                        )
+                        for rank, worker in enumerate(self.workers)
+                    ]
+                )
+            else:
+                self.server_infos = await self._collective_rpc_async(
+                    "launch_server", server_args=server_args
+                )
             await asyncio.to_thread(self._write_inference_targets, "separation")
             tasks = [
                 self.scheduler.async_call_engine(
@@ -549,6 +574,7 @@ class RolloutController:
                                 worker_id=worker.id,
                                 method="destroy",
                                 engine_name=self._proxy_engine_name(rank),
+                                http_timeout=60.0,
                             )
                             for rank, worker in enumerate(self.proxy_workers)
                         ]

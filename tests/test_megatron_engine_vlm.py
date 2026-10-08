@@ -1006,21 +1006,18 @@ class TestPackedContextParallelForward:
     @pytest.mark.parametrize(
         (
             "enable_chunked_logits",
-            "enable_tree_training",
             "npu_available",
             "error_match",
         ),
         [
-            (False, True, True, None),
-            (True, False, False, None),
-            (True, True, False, "tree training"),
-            (True, False, True, "NPU training"),
+            (False, True, None),
+            (True, False, None),
+            (True, True, "NPU training"),
         ],
     )
     def test_areal_lm_head_rejects_unsupported_training_modes(
         self,
         enable_chunked_logits,
-        enable_tree_training,
         npu_available,
         error_match,
     ):
@@ -1031,7 +1028,6 @@ class TestPackedContextParallelForward:
         if error_match is None:
             _validate_areal_lm_head_compatibility(
                 enable_chunked_logits,
-                enable_tree_training=enable_tree_training,
                 npu_available=npu_available,
             )
             return
@@ -1039,7 +1035,6 @@ class TestPackedContextParallelForward:
         with pytest.raises(NotImplementedError, match=error_match):
             _validate_areal_lm_head_compatibility(
                 enable_chunked_logits,
-                enable_tree_training=enable_tree_training,
                 npu_available=npu_available,
             )
 

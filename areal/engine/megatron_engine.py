@@ -128,6 +128,13 @@ from areal.models.tree_attn.functional import (
     gather_packed_tree_logprobs_entropy,
     gather_packed_tree_vocab_stats,
     merge_packed_tree_results,
+    tree_semantic_rows,
+)
+from areal.models.tree_attn.harts_plan import plan_linear_attention
+from areal.models.tree_attn.harts_runtime import (
+    patch_qwen35_tree_model,
+    register_tree_mask,
+    unregister_tree_masks,
 )
 from areal.models.tree_attn.module import (
     build_tree_attn_kwargs,
@@ -245,15 +252,12 @@ def _warn_if_areal_lm_head_entropy_is_nondifferentiable(
 def _validate_areal_lm_head_compatibility(
     enable_chunked_logits: bool,
     *,
-    enable_tree_training: bool,
     npu_available: bool,
 ) -> None:
     if not enable_chunked_logits:
         return
     if npu_available:
         raise NotImplementedError("AReaL LM Head does not support NPU training")
-    if enable_tree_training:
-        raise NotImplementedError("AReaL LM Head does not support tree training")
 
 
 def _map_chunked_lm_head_output(
@@ -402,7 +406,6 @@ class MegatronEngine(TrainEngine):
         self.enable_tree_training: bool = self.config.enable_tree_training
         _validate_areal_lm_head_compatibility(
             self.mcore_config.enable_chunked_logits,
-            enable_tree_training=self.enable_tree_training,
             npu_available=is_npu_available,
         )
         # FP8 configuration
@@ -565,20 +568,25 @@ class MegatronEngine(TrainEngine):
             self.sequence_packing_mode = resolve_sequence_packing_mode(
                 self.hf_config.model_type, self.bridge_cls
             )
+            if self.enable_tree_training and self.bridge_cls == "megatron-bridge":
+                self.sequence_packing_mode = SequencePackingMode.PADDED
             self.use_model_packed_seq = (
                 self.sequence_packing_mode == SequencePackingMode.MODEL_THD
             )
-            validate_model_packed_seq_dependencies(
-                self.hf_config.model_type,
-                self.bridge_cls,
-                self.parallel_strategy.context_parallel_size,
-            )
+            if self.use_model_packed_seq:
+                validate_model_packed_seq_dependencies(
+                    self.hf_config.model_type,
+                    self.bridge_cls,
+                    self.parallel_strategy.context_parallel_size,
+                )
             # ``PADDED`` is the input-routing fallback for every VLM without a
             # model-owned THD contract. ``use_padded_seq`` is narrower: it
             # enables Qwen3.5/GDN-specific dense-mask and LM-head semantics.
             self.use_padded_seq = requires_padded_seq(
                 self.hf_config.model_type, self.bridge_cls
             )
+            if self.enable_tree_training and self.bridge_cls == "megatron-bridge":
+                self.use_padded_seq = True
             if self.is_vision_model:
                 if (
                     self.parallel_strategy.context_parallel_size > 1
@@ -643,7 +651,6 @@ class MegatronEngine(TrainEngine):
                     is_critic=self.config.is_critic,
                     use_lora=self.config.use_lora,
                 )
-
         self.model = _MegatronModelList(models)
         _warn_if_areal_lm_head_entropy_is_nondifferentiable(
             self.logger,
@@ -658,6 +665,14 @@ class MegatronEngine(TrainEngine):
 
         with self.device:
             self._load_model_from_hf(self.config.path)
+        if self.enable_tree_training and self.bridge_cls == "megatron-bridge":
+            if not self.use_padded_seq:
+                raise NotImplementedError(
+                    "Megatron-Bridge tree training currently requires Qwen3.5 "
+                    "padded text input."
+                )
+            for model in self.model:
+                patch_qwen35_tree_model(model)
 
         # NOTE: Clear high_precision_init_val for FP8 parameters.
         #
@@ -915,10 +930,6 @@ class MegatronEngine(TrainEngine):
             )
 
         elif self.bridge_cls == "megatron-bridge":
-            if self.enable_tree_training:
-                raise NotImplementedError(
-                    "Tree training is not supported with bridge_type='megatron-bridge'."
-                )
             self.bridge = MegatronBridgeAutoBridge.from_hf_pretrained(
                 self.config.path,
                 trust_remote_code=True,
@@ -1340,6 +1351,7 @@ class MegatronEngine(TrainEngine):
         gather_cp_output: bool = False,
     ) -> None:
         self._ensure_ready()
+        tree_mask_pointers: list[int] = []
         validate_transport_padding(
             mb_list,
             has_internal_objectives=bool(self.tf_config.num_moe_experts)
@@ -1366,9 +1378,8 @@ class MegatronEngine(TrainEngine):
             cu_seqlens = mb_input.padded_mb.get("cu_seqlens", None)
 
             # Lazily create tree attention metadata just before forward.
-            # dense_mask=True because Megatron's gradient checkpointing uses
-            # save_for_backward() which can only save torch.Tensor objects;
-            # BlockMask is recreated inside PytorchFlexAttention.forward().
+            # Megatron checkpointing saves tensors, so use a compact tensor
+            # descriptor and recreate BlockMask inside attention.forward().
             tree_attn_keys: list[str] = []
             if self.enable_tree_training:
                 trie_node = mb_input.padded_mb.get("trie_node", None)
@@ -1382,10 +1393,18 @@ class MegatronEngine(TrainEngine):
                         trie_node,
                         padded_size,
                         mb_input.padded_mb["input_ids"].device,
-                        dense_mask=True,
+                        compact_mask=True,
                     )
                     mb_input.padded_mb.update(tree_kwargs)
                     tree_attn_keys = list(tree_kwargs.keys())
+                    if self.bridge_cls == "megatron-bridge":
+                        tree_mask_pointers.append(
+                            register_tree_mask(
+                                tree_kwargs["attention_mask"],
+                                trie_node,
+                                plan_linear_attention(trie_node, chunk_size=64),
+                            )
+                        )
 
             cp_size = mpu.get_context_parallel_world_size()
             # CP-local forward keeps the vocabulary logits sharded by sequence.
@@ -1401,7 +1420,6 @@ class MegatronEngine(TrainEngine):
                 self.mcore_config.lm_head_loss_chunk_size > 0
                 and self.mcore_config.enable_chunked_logits
                 and not self.config.is_critic
-                and not self.enable_tree_training
                 and is_pipeline_last_stage
             )
             has_vision_inputs = any(
@@ -1459,8 +1477,19 @@ class MegatronEngine(TrainEngine):
             )
 
             if use_chunked_lm_head:
-                padded_lm_head = self.use_padded_seq and cu_seqlens is not None
-                if padded_lm_head:
+                padded_lm_head = (
+                    not self.enable_tree_training
+                    and self.use_padded_seq
+                    and cu_seqlens is not None
+                )
+                semantic_rows = None
+                if self.enable_tree_training:
+                    semantic_rows, labels, _ = tree_semantic_rows(
+                        mb_input.padded_mb["trie_node"],
+                        mb_input.padded_mb["input_ids"],
+                        rows_on_cpu=True,
+                    )
+                elif padded_lm_head:
                     labels = _padded_lm_head_labels(
                         mb_input.padded_mb["input_ids"],
                         cu_seqlens,
@@ -1470,14 +1499,15 @@ class MegatronEngine(TrainEngine):
                     rolled_ids = torch.roll(
                         mb_input.padded_mb["input_ids"], shifts=-1, dims=-1
                     )
-                if not padded_lm_head and cp_size > 1 and cu_seqlens is not None:
-                    labels = split_packed_seqs_for_context_parallel(
-                        rolled_ids, mb_input.padded_mb["cu_seqlens"]
-                    )
-                elif not padded_lm_head and rolled_ids.ndim == 2:
-                    labels = rolled_ids.transpose(0, 1).contiguous()
-                elif not padded_lm_head:
-                    labels = rolled_ids
+                if not self.enable_tree_training and not padded_lm_head:
+                    if cp_size > 1 and cu_seqlens is not None:
+                        labels = split_packed_seqs_for_context_parallel(
+                            rolled_ids, mb_input.padded_mb["cu_seqlens"]
+                        )
+                    elif rolled_ids.ndim == 2:
+                        labels = rolled_ids.transpose(0, 1).contiguous()
+                    else:
+                        labels = rolled_ids
 
                 gpt_model = unwrap_to_gpt_model(model)
                 output_layer = gpt_model.output_layer
@@ -1495,6 +1525,7 @@ class MegatronEngine(TrainEngine):
                     output,
                     output_weight,
                     labels,
+                    semantic_rows=semantic_rows,
                     temperature=self.config.temperature,
                     chunk_size=self.mcore_config.lm_head_loss_chunk_size,
                     logit_scale=logit_scale,
@@ -1517,7 +1548,7 @@ class MegatronEngine(TrainEngine):
                             tensor, padded_cu_seqlens
                         ),
                     )
-                if not cp_local:
+                if not cp_local and not self.enable_tree_training:
                     output = _map_chunked_lm_head_output(
                         output,
                         lambda tensor: unpad_logits(
@@ -1589,21 +1620,25 @@ class MegatronEngine(TrainEngine):
                 data_iterator = [iter(mb_list) for _ in range(len(self.model))]
             else:
                 data_iterator = iter(mb_list)
-            forward_backward_func(
-                forward_step_func=forward_step,
-                data_iterator=data_iterator,
-                model=self.model if len(self.model) > 1 else self.model[0],
-                num_microbatches=len(mb_list),
-                seq_length=mb_list.max_seqlen,  # no use when input_shapes was set
-                micro_batch_size=1,  # no use when input_shapes was set
-                forward_only=forward_only,
-            )
+            try:
+                forward_backward_func(
+                    forward_step_func=forward_step,
+                    data_iterator=data_iterator,
+                    model=self.model if len(self.model) > 1 else self.model[0],
+                    num_microbatches=len(mb_list),
+                    seq_length=mb_list.max_seqlen,  # no use when input_shapes was set
+                    micro_batch_size=1,  # no use when input_shapes was set
+                    forward_only=forward_only,
+                )
+            finally:
+                unregister_tree_masks(tree_mask_pointers)
 
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        tree_groups: list[list[int]] | None = None,
     ) -> dict[str, float]:
         self._ensure_ready()
         if self._weight_residency is not None:
@@ -1614,7 +1649,9 @@ class MegatronEngine(TrainEngine):
 
         # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(
-            tensor_container_to(input_batched, "cpu"), allow_transport_padding=True
+            tensor_container_to(input_batched, "cpu"),
+            allow_transport_padding=True,
+            tree_groups=tree_groups,
         )
 
         # Step 2: Select the normalization path from the model's effective config.
@@ -3138,6 +3175,7 @@ class MegatronEngine(TrainEngine):
         input_: dict[str, Any],
         *,
         allow_transport_padding: bool = False,
+        tree_groups: list[list[int]] | None = None,
     ) -> MicroBatchList:
         assert "attention_mask" in input_ and "input_ids" in input_
         # Parallel sizes
@@ -3148,12 +3186,28 @@ class MegatronEngine(TrainEngine):
             assert cp_size == 1, (
                 "Context parallelism is not supported in tree training."
             )
+            if has_multi_modal_tensors(input_) or any(
+                key in _VLM_FORWARD_KEYS
+                and torch.is_tensor(value)
+                and value.numel() > 0
+                for key, value in input_.items()
+            ):
+                raise NotImplementedError(
+                    "Tree training does not support vision inputs"
+                )
+            input_ = {
+                key: value
+                for key, value in input_.items()
+                if not _is_multi_modal_payload_key(key)
+            }
             mb_list = build_packed_tree_batch(
                 input_,
                 mb_spec=self.config.mb_spec,
                 pad_to_maximum=self.config.pad_to_maximum,
                 dp_group=self.data_parallel_group,
                 parallel_size=tp_size,
+                compact_padding=self.bridge_cls == "megatron-bridge",
+                group_indices=tree_groups,
             )
             recommended_min_n_mbs = 2 * pp_size if pp_size > 1 else 1
             self.logger.info(
@@ -3287,7 +3341,7 @@ class MegatronEngine(TrainEngine):
             connected_output = (
                 output.logprobs if isinstance(output, ChunkedLMHeadOutput) else output
             )
-            loss = connected_output.mean() * 0.0
+            loss = connected_output.sum() * 0.0
             if per_token_loss:
                 return self._build_per_token_loss_output(
                     loss, local_weight, loss_multiplier
@@ -3306,7 +3360,12 @@ class MegatronEngine(TrainEngine):
                 if trie_node is None or not trie_node.all_sequence_ids:
                     # Return zero loss that maintains gradient connection to output
                     # This ensures backward() works correctly for distributed synchronization
-                    loss = output.mean() * 0.0
+                    connected_output = (
+                        output.logprobs
+                        if isinstance(output, ChunkedLMHeadOutput)
+                        else output
+                    )
+                    loss = connected_output.sum() * 0.0
                     if per_token_loss:
                         return self._build_per_token_loss_output(
                             loss, local_weight, loss_multiplier
@@ -3317,23 +3376,31 @@ class MegatronEngine(TrainEngine):
                 # unpack vocab stats from tree structure back to per-sequence format.
                 # This is necessary because the logits are in packed tree format where
                 # multiple sequences share prefix positions.
-                vocab_min_logits, vocab_max_logits = gather_packed_tree_vocab_stats(
-                    output, trie_node
-                )
-                # Tree training only supports packed min/max vocab stats; mean/norm
-                # would need per-sequence unpacking, so leave them unset.
-                vocab_mean_logits = None
-                vocab_norm_logits = None
-                logprobs, entropy = gather_packed_tree_logprobs_entropy(
-                    output,
-                    trie_node,
-                    inputs["input_ids"],
-                    temperature=self.config.temperature,
-                    tp_group=mpu.get_tensor_model_parallel_group()
-                    if mpu.get_tensor_model_parallel_world_size() > 1
-                    else None,
-                    chunk_size=self.config.logprobs_chunk_size,
-                )
+                if isinstance(output, ChunkedLMHeadOutput):
+                    (
+                        logprobs,
+                        entropy,
+                        vocab_min_logits,
+                        vocab_max_logits,
+                        vocab_mean_logits,
+                        vocab_norm_logits,
+                    ) = output
+                else:
+                    vocab_min_logits, vocab_max_logits = gather_packed_tree_vocab_stats(
+                        output, trie_node
+                    )
+                    vocab_mean_logits = None
+                    vocab_norm_logits = None
+                    logprobs, entropy = gather_packed_tree_logprobs_entropy(
+                        output,
+                        trie_node,
+                        inputs["input_ids"],
+                        temperature=self.config.temperature,
+                        tp_group=mpu.get_tensor_model_parallel_group()
+                        if mpu.get_tensor_model_parallel_world_size() > 1
+                        else None,
+                        chunk_size=self.config.logprobs_chunk_size,
+                    )
             else:
                 cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
                 if isinstance(output, ChunkedLMHeadOutput):
@@ -3488,6 +3555,14 @@ class MegatronEngine(TrainEngine):
             )
         if not self.config.is_critic:
             if isinstance(output, ChunkedLMHeadOutput):
+                if self.enable_tree_training:
+                    _, _, slices = tree_semantic_rows(
+                        inputs["trie_node"], inputs["input_ids"]
+                    )
+                    return {
+                        sequence_id: output.logprobs[span]
+                        for sequence_id, span in slices.items()
+                    }
                 return output.logprobs
             if self.enable_tree_training:
                 logprobs = _gather_packed_tree_logprobs(

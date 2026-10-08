@@ -1,0 +1,23 @@
+defaults:
+  - dapo-math_grpo_qwen3_5_tau3_perf
+  - _self_
+
+experiment_name: tau3-qwen3.5-harts-stress
+total_train_epochs: 10
+total_train_steps: 10
+
+gconfig:
+  n_samples: 16
+
+rollout:
+  max_concurrent_rollouts: 32
+  queue_size: 512
+
+sglang:
+  max_running_requests: 32
+
+train_dataset:
+  batch_size: 32
+
+econfig:
+  episode_timeout_seconds: 3600.0

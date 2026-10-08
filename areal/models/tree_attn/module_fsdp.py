@@ -35,6 +35,9 @@ _flex_attention = torch.compile(
     dynamic=_FLEX_DYNAMIC,
     options=_TORCH_COMPILE_OPTIONS,
 )
+# Dynamic compilation fuses block classification without materializing an
+# int64 N×N reduction. At 64k tokens that temporary alone would need 32 GiB.
+_compiled_create_block_mask = torch.compile(create_block_mask, dynamic=True)
 logger.info("Using block mask in flex attention, block size: %d", BLOCK_SIZE)
 
 
@@ -82,6 +85,45 @@ def create_block_mask_from_dense(
         _compile=False,
     )
     return block_mask
+
+
+def create_block_mask_from_compact(
+    descriptor: torch.Tensor,
+    seq_len: int,
+    device: torch.device,
+) -> BlockMask:
+    """Create a tree BlockMask from per-token preorder/subtree intervals."""
+    preorder = descriptor[:, 0]
+    subtree_end = descriptor[:, 1]
+
+    def ancestor_mask(
+        batch: torch.Tensor,
+        head: torch.Tensor,
+        q_idx: torch.Tensor,
+        k_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        del batch, head
+        q_preorder = preorder[q_idx]
+        k_preorder = preorder[k_idx]
+        k_subtree_end = subtree_end[k_idx]
+        return (
+            (q_preorder >= 0)
+            & (k_preorder >= 0)
+            & (k_idx <= q_idx)
+            & (k_preorder <= q_preorder)
+            & (q_preorder < k_subtree_end)
+        )
+
+    create = create_block_mask if device.type == "cpu" else _compiled_create_block_mask
+    return create(
+        ancestor_mask,
+        B=1,
+        H=1,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        BLOCK_SIZE=BLOCK_SIZE,
+        device=device,
+    )
 
 
 def _tree_attn_fwd_func(

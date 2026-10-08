@@ -303,6 +303,38 @@ class TestRolloutControllerInitialization:
 
         controller.destroy()
 
+    def test_awex_separated_tp_servers_get_distinct_transfer_rank_bases(self):
+        config = create_test_config(backend="sglang:d4t2p1")
+        scheduler = MockScheduler()
+        scheduler.n_gpus_per_node = 8
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+
+        controller.initialize(
+            role="rollout",
+            server_args={"awex_colocate_mode": True, "base_gpu_id": 0},
+        )
+
+        launch_calls = [
+            call for call in scheduler.engine_calls if call[1] == "launch_server"
+        ]
+        assert len(launch_calls) == 4
+        assert [call[3]["server_args"]["base_gpu_id"] for call in launch_calls] == [
+            0,
+            2,
+            4,
+            6,
+        ]
+        assert all(
+            call[3]["server_args"]["_awex_gpus_per_server"] == 2
+            for call in launch_calls
+        )
+
+        controller.destroy()
+
     def test_initialize_nonfork_colocation_without_third_port_fails(self):
         """A reused actor worker must not silently reuse its train TCPStore."""
         config = create_test_config(

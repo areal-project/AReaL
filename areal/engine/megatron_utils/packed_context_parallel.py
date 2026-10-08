@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -549,7 +549,7 @@ def packed_context_parallel_forward(
     # length total_len) — they don't match the 2D [B, S] input. Let mcore
     # compute the default torch.arange positions per row; padding positions
     # are masked out by attention_mask.
-    if dense_mask_text_forward:
+    if dense_mask_text_forward and "trie_node" not in input_:
         position_ids = None
 
     # MTP training: convert the supervision mask to the exact layout used by
@@ -579,7 +579,13 @@ def packed_context_parallel_forward(
         }
         if fp32_output is not None:
             model_kwargs["fp32_output"] = fp32_output
-        with _hidden_states_output(model, return_hidden_states):
+        if dense_mask_text_forward and "trie_node" in input_:
+            from areal.models.tree_attn.harts_runtime import qwen35_tree_positions
+
+            rope_context = qwen35_tree_positions(position_ids)
+        else:
+            rope_context = nullcontext()
+        with rope_context, _hidden_states_output(model, return_hidden_states):
             output = model(**model_kwargs)
     except Exception as e:
         raise RuntimeError(

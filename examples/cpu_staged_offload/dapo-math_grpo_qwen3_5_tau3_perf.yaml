@@ -1,0 +1,15 @@
+defaults:
+  - dapo-math_grpo_qwen3_5_tau3
+  - _self_
+
+total_train_steps: 2
+
+gconfig:
+  max_new_tokens: 20480
+  max_tokens: 32767
+
+train_dataset:
+  max_length: 2048
+
+memory_profiler:
+  profile_steps: []
