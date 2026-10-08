@@ -17,7 +17,11 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from areal.models.tree_attn.causal_conv import tree_causal_conv1d
 from areal.models.tree_attn.harts_core import run_linear_attention_plan
 from areal.models.tree_attn.harts_plan import LinearAttentionPlan
-from areal.models.tree_attn.module_megatron import PytorchFlexAttention
+from areal.models.tree_attn.module_megatron import (
+    PytorchFlexAttention,
+    register_tree_block_mask,
+    unregister_tree_block_masks,
+)
 from areal.models.tree_attn.tree import TrieNode
 
 _TREE_MASKS: dict[int, tuple[TrieNode, LinearAttentionPlan, torch.Tensor]] = {}
@@ -35,12 +39,18 @@ def register_tree_mask(
     for node in trie.nodes:
         multiplicity[node.start_idx : node.end_idx + 1] = len(node.sequence_ids)
     _TREE_MASKS[pointer] = trie, plan, multiplicity
+    register_tree_block_mask(mask)
     return pointer
 
 
 def unregister_tree_masks(pointers: list[int]) -> None:
+    unregister_tree_block_masks(pointers)
     for pointer in pointers:
-        _TREE_MASKS.pop(pointer, None)
+        metadata = _TREE_MASKS.pop(pointer, None)
+        if metadata is not None:
+            trie = metadata[0]
+            if hasattr(trie, "_causal_conv_ancestry_cache"):
+                del trie._causal_conv_ancestry_cache
 
 
 class TreeGatedDeltaNet(GatedDeltaNet):

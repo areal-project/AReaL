@@ -190,3 +190,36 @@ runs exited successfully and synced to W&B. Mean generated tokens are mean seque
 length minus mean prompt length. The GPU readings are PPO-update checkpoints, not
 all-phase peaks. These runs measure execution and throughput on one node, not
 convergence or multi-node behavior.
+
+### Fixed-input actor benchmark for shared-prefix workloads
+
+`benchmark_harts_actor.py` compares Megatron actor training on identical synthetic
+Qwen3.5 trajectories, excluding rollout and AWEX. Each of 16 trajectories has the same
+6,000-token prefix and a distinct 1,000-token suffix; only suffix tokens contribute to
+the loss. HARTS packs 22,000 of the original 112,000 tokens (ratio 0.196). The actor
+uses the eight-GPU `megatron:(attn:d4p1t2c1|ffn:d1e8)` allocation, 32,768-token
+microbatch limit, and chunked LM-head loss with 1,024-token chunks in both modes.
+
+```bash
+OMP_NUM_THREADS=8 torchrun --nproc_per_node=8 \
+  examples/cpu_staged_offload/benchmark_harts_actor.py \
+  --model-path "$MODEL_PATH" --warmup 1 --repeats 3
+OMP_NUM_THREADS=8 torchrun --nproc_per_node=8 \
+  examples/cpu_staged_offload/benchmark_harts_actor.py \
+  --model-path "$MODEL_PATH" --tree --warmup 1 --repeats 3
+```
+
+The benchmark reports the maximum rank time after GPU synchronization. Its first step
+warms up model kernels and compilation; measured steps are steady-state training
+updates. On one eight-L20X node with Qwen3.5-35B-A3B-Base, the three measured updates on
+2026-10-02 gave these median times after the tree convolution was fused:
+
+| Median time per update | Baseline |   HARTS | Baseline / HARTS |
+| ---------------------- | -------: | ------: | ---------------: |
+| Full actor train step  |  8.855 s | 4.579 s |            1.93× |
+| Forward and backward   |  8.710 s | 3.940 s |            2.21× |
+
+Shared prefixes in real rollouts may be shorter or less frequent. The earlier 20-step
+DAPO Math comparison above retained 98.9% of tokens after packing, so it measures a
+different workload and predates the fused tree convolution. This fixed-input benchmark
+does not measure rollout, AWEX weight exchange, or end-to-end training throughput.

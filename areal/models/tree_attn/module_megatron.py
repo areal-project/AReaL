@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import weakref
 from contextlib import contextmanager
 
 import torch
@@ -20,6 +21,7 @@ from torch.nn.attention.flex_attention import BlockMask
 from areal.models.tree_attn.constants import USE_TRITON_TREE_ATTN
 from areal.models.tree_attn.module_fsdp import (
     _flex_attention,
+    create_block_mask_from_compact,
     create_block_mask_from_dense,
 )
 from areal.models.tree_attn.triton_kernel import (
@@ -30,6 +32,39 @@ from areal.models.tree_attn.triton_kernel import (
 from areal.utils import logging
 
 logger = logging.getLogger("TreeAttentionMegatron")
+
+# Megatron recomputation passes the same tensor mask through every attention
+# layer. A BlockMask's mask_mod captures that mask tensor, so retain at most
+# one converted mask; old microbatches can recreate theirs if PP interleaves.
+_TREE_BLOCK_MASKS: dict[
+    int, tuple[weakref.ReferenceType[torch.Tensor], BlockMask | None]
+] = {}
+
+
+def register_tree_block_mask(mask: torch.Tensor) -> None:
+    _TREE_BLOCK_MASKS[mask.data_ptr()] = (weakref.ref(mask), None)
+
+
+def unregister_tree_block_masks(pointers: list[int]) -> None:
+    for pointer in pointers:
+        _TREE_BLOCK_MASKS.pop(pointer, None)
+
+
+def _block_mask_from_tensor(mask: torch.Tensor) -> BlockMask:
+    pointer = mask.data_ptr()
+    entry = _TREE_BLOCK_MASKS.get(pointer)
+    if entry is not None and entry[0]() is not None and entry[1] is not None:
+        return entry[1]
+    if mask.dtype == torch.int32 and mask.ndim == 2 and mask.shape[1] == 2:
+        block_mask = create_block_mask_from_compact(mask, mask.shape[0], mask.device)
+    else:
+        block_mask = create_block_mask_from_dense(mask, mask.shape[0], mask.device)
+    if entry is not None:
+        for other_pointer, (mask_ref, _) in _TREE_BLOCK_MASKS.items():
+            if other_pointer != pointer:
+                _TREE_BLOCK_MASKS[other_pointer] = (mask_ref, None)
+        _TREE_BLOCK_MASKS[pointer] = (weakref.ref(mask), block_mask)
+    return block_mask
 
 
 class PytorchFlexAttention(torch.nn.Module):
@@ -128,10 +163,7 @@ class PytorchFlexAttention(torch.nn.Module):
                 )
 
             if isinstance(attention_mask, torch.Tensor):
-                seq_len = attention_mask.shape[0]
-                block_mask = create_block_mask_from_dense(
-                    attention_mask, seq_len, attention_mask.device
-                )
+                block_mask = _block_mask_from_tensor(attention_mask)
             elif isinstance(attention_mask, BlockMask):
                 block_mask = attention_mask
             else:

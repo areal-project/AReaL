@@ -143,17 +143,17 @@ def run_linear_attention_plan(
     states: dict[int, torch.Tensor] = {}
     output_rows: list[int] = []
     output_pieces: list[torch.Tensor] = []
-    zero_state = torch.zeros(
-        (query.shape[2], key.shape[-1], value.shape[-1]),
-        device=query.device,
-        dtype=torch.float32,
-    )
+    zero_state = None
 
     for call in calls:
         indices: list[int] = []
         offsets = [0]
         initial_states = []
         semantic_positions: list[int] = []
+        needs_final_state = any(
+            sequence.boundary_token is not None for sequence in call
+        )
+        needs_initial_state = any(sequence.source is not None for sequence in call)
         for sequence in call:
             if sequence.source is not None and sequence.source not in states:
                 raise ValueError("linear-attention round needs an unavailable state")
@@ -162,9 +162,17 @@ def run_linear_attention_plan(
                 offsets[-1] + position for position in sequence.semantic_positions
             )
             offsets.append(len(indices))
-            initial_states.append(
-                zero_state if sequence.source is None else states[sequence.source]
-            )
+            if needs_initial_state:
+                if sequence.source is None:
+                    if zero_state is None:
+                        zero_state = torch.zeros(
+                            (query.shape[2], key.shape[-1], value.shape[-1]),
+                            device=query.device,
+                            dtype=torch.float32,
+                        )
+                    initial_states.append(zero_state)
+                else:
+                    initial_states.append(states[sequence.source])
             output_rows.extend(sequence.semantic_rows)
 
         rows = torch.tensor(indices, device=query.device, dtype=torch.long)
@@ -175,8 +183,8 @@ def run_linear_attention_plan(
         ]
         core_output, final_states = kernel(
             *packed,
-            initial_state=torch.stack(initial_states),
-            output_final_state=True,
+            initial_state=torch.stack(initial_states) if needs_initial_state else None,
+            output_final_state=needs_final_state,
             cu_seqlens=cu_seqlens,
             cu_seqlens_cpu=cu_seqlens_cpu,
             use_qk_l2norm_in_kernel=False,
@@ -189,6 +197,7 @@ def run_linear_attention_plan(
             )
         for sequence_idx, sequence in enumerate(call):
             if sequence.boundary_token is not None:
+                assert final_states is not None
                 states[sequence.boundary_token] = final_states[sequence_idx]
 
     if output_pieces:

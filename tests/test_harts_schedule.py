@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 
 from areal.api.cli_args import MicroBatchSpec
+from areal.models.tree_attn import harts_schedule
 from areal.models.tree_attn.harts_schedule import (
     _reorder_received,
     plan_tree_schedule,
@@ -20,6 +21,20 @@ def _compact_work(sequences, rows):
         sequence[:end] for sequence in ordered for end in range(1, len(sequence) + 1)
     }
     return len(prefixes)
+
+
+def test_prefix_costs_range_lcp_matches_direct_prefixes():
+    """Range-minimum LCP queries preserve exact insertion and group costs."""
+    sequences = [(a, b, c) for a in range(4) for b in range(3) for c in range(2)]
+    sequences += [(0, 0), (0, 0), (3, 2, 1)]
+    costs = harts_schedule._PrefixCosts(sequences)
+
+    for left in range(len(sequences)):
+        for right in range(len(sequences)):
+            expected = harts_schedule._lcp(sequences[left], sequences[right])
+            assert costs.shared(left, right) == expected
+    for rows in ([0, 1, 2, 3], [0, 24, 25], [7, 18, 26]):
+        assert costs.group(rows) == _compact_work(sequences, rows)
 
 
 def test_tree_schedule_groups_shared_prefixes_and_balances_slots():
@@ -74,6 +89,76 @@ def test_tree_schedule_large_search_covers_each_row_once():
         for replica in plan.slots
         for slot in replica
     )
+
+
+def test_tree_schedule_large_batch_runs_paper_greedy_candidates(monkeypatch):
+    """Large batches still consider all eight trie-aware greedy placements."""
+    sequences = [[i // 16] * 24 + [i] for i in range(1024)]
+    original = harts_schedule._greedy_partition
+    policies = []
+
+    def record_greedy_search(costs, capacity, order, policy):
+        policies.append(policy)
+        return original(costs, capacity, order, policy)
+
+    monkeypatch.setattr(harts_schedule, "_greedy_partition", record_greedy_search)
+    plan = plan_tree_schedule(sequences, capacity=128, dp_size=4)
+    costs = harts_schedule._PrefixCosts([tuple(sequence) for sequence in sequences])
+    natural = harts_schedule._natural_partition(costs, 128)
+    balanced = harts_schedule._balanced_natural_partition(natural, 4)
+    previous = harts_schedule._candidate_schedule(costs, balanced, 4)
+
+    assert policies == ["best_fit", "max_shared"] * 4
+    assert (
+        plan.compact_work,
+        plan.slot_work,
+        plan.max_replica_work,
+    ) <= (
+        previous.compact_work,
+        previous.slot_work,
+        previous.max_replica_work,
+    )
+    assert len({len(replica) for replica in plan.slots}) == 1
+    rows = [row for replica in plan.slots for slot in replica for row in slot]
+    assert sorted(rows) == list(range(len(sequences)))
+    assert all(
+        _compact_work(sequences, slot) <= 128
+        for replica in plan.slots
+        for slot in replica
+    )
+
+
+def test_tree_schedule_large_batch_samples_at_most_32_targets():
+    """The large-input target range always keeps its endpoints."""
+    targets = list(range(4, 404, 4))
+
+    selected = harts_schedule._sample_targets(targets)
+
+    assert selected[0] == targets[0]
+    assert selected[-1] == targets[-1]
+    assert len(selected) == 32
+    assert selected[:16] == targets[:16]
+
+
+def test_tree_schedule_large_batch_prefers_shallow_prefix_split():
+    """Sampled-K search avoids duplicating a long branch during DP alignment."""
+    sequences = [
+        [task + 10] * 30 + [0 if sample < 4 else 1] * 50 + [sample + 100]
+        for task in range(39)
+        for sample in range(16)
+    ]
+    costs = harts_schedule._PrefixCosts([tuple(sequence) for sequence in sequences])
+    natural = harts_schedule._natural_partition(costs, 160)
+    previous_groups = harts_schedule._balanced_natural_partition(natural, 4)
+    previous = harts_schedule._candidate_schedule(costs, previous_groups, 4)
+
+    plan = plan_tree_schedule(sequences, capacity=160, dp_size=4)
+
+    assert previous.compact_work == 5774
+    assert plan.compact_work == 5724
+    groups = [set(group) for replica in plan.slots for group in replica]
+    assert set(range(4)) in groups
+    assert set(range(4, 16)) in groups
 
 
 def test_tree_schedule_preserves_row_labels_through_packed_microbatches():

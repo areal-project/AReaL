@@ -440,24 +440,12 @@ def build_packed_tree_batch(
                 padded_size,
             )
 
-        # Build dense attention mask (temporary, for position_ids computation)
-        with trace_scope("tree_attn.build_attention_mask"):
-            attention_mask = _build_attention_mask(
-                trie,
-                padded_size,
-                mask_template.device,
-            )
-
-        # Compute position_ids (needs dense attention_mask)
+        # A token's position is its depth in the trie. Avoid materializing the
+        # quadratic attention mask solely to count its true entries by row.
         with trace_scope("tree_attn.get_position_ids"):
-            position_ids = get_packed_tree_position_ids(
-                input_ids,
-                attention_mask,
+            position_ids = get_packed_tree_position_ids_from_trie(
+                trie, padded_size, input_ids.device
             )
-
-        # Release dense attention mask memory after position_ids are computed
-        # Block mask will be lazily created in forward_backward_batch
-        del attention_mask
 
         # Pack extra data
         with trace_scope("tree_attn.pack_extra_data"):
@@ -776,6 +764,22 @@ def get_packed_tree_position_ids(
     return position_ids.unsqueeze(0)
 
 
+def get_packed_tree_position_ids_from_trie(
+    trie: TrieNode, padded_size: int, device: torch.device
+) -> torch.Tensor:
+    """Generate packed position IDs from trie depth in linear token work."""
+    position_ids = torch.zeros((1, padded_size), dtype=torch.long, device=device)
+    end_depths: dict[int, int] = {}
+    for node in trie.nodes:
+        parent = node.ancestors[-1] if node.ancestors else None
+        depth = end_depths[parent.start_idx] if parent is not None else 0
+        position_ids[0, node.start_idx : node.end_idx + 1] = torch.arange(
+            depth, depth + node.num_tokens, dtype=torch.long, device=device
+        )
+        end_depths[node.start_idx] = depth + node.num_tokens
+    return position_ids
+
+
 @trace_perf("tree_attn.build_block_mask_from_trie")
 def build_block_mask_from_trie(
     trie: TrieNode,
@@ -863,6 +867,34 @@ def build_attention_mask_from_trie(
     return attention_mask
 
 
+@trace_perf("tree_attn.build_compact_attention_mask_from_trie")
+def build_compact_attention_mask_from_trie(
+    trie: TrieNode,
+    padded_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Encode token ancestry in O(sequence length) checkpointable storage.
+
+    Each token stores its compressed node's preorder index and the exclusive
+    end of that node's subtree. A key can be attended by a query when the key
+    precedes the query and its subtree contains the query's node. Padding has
+    preorder index -1, so it cannot participate in attention.
+    """
+    descriptor = torch.full((padded_size, 2), -1, dtype=torch.int32)
+    nodes = trie.nodes
+    subtree_ends = [len(nodes)] * len(nodes)
+    active: list[int] = []
+    for index, node in enumerate(nodes):
+        depth = len(node.ancestors)
+        while active and len(nodes[active[-1]].ancestors) >= depth:
+            subtree_ends[active.pop()] = index
+        active.append(index)
+    for index, node in enumerate(nodes):
+        descriptor[node.start_idx : node.end_idx + 1, 0] = index
+        descriptor[node.start_idx : node.end_idx + 1, 1] = subtree_ends[index]
+    return descriptor.to(device=device, non_blocking=True)
+
+
 @trace_perf("tree_attn.build_triton_attn_data_from_trie")
 def build_triton_attn_data_from_trie(
     trie: TrieNode,
@@ -915,6 +947,7 @@ def build_tree_attn_kwargs(
     device: torch.device,
     *,
     dense_mask: bool = False,
+    compact_mask: bool = False,
 ) -> dict[str, Any]:
     """Build tree attention kwargs dict for HF model forwarding.
 
@@ -932,10 +965,26 @@ def build_tree_attn_kwargs(
     dense_mask : bool, default=False
         If True, the non-Triton path returns a dense ``attention_mask`` tensor
         (for Megatron, which needs tensors for gradient checkpointing).
-        If False, returns a ``tree_block_mask`` BlockMask (for FSDP).
+        Otherwise, the default returns a ``tree_block_mask`` BlockMask (for FSDP).
+    compact_mask : bool, default=False
+        Return a compact tensor ``attention_mask`` for Megatron checkpointing;
+        cannot be combined with ``dense_mask``.
     """
-    if USE_TRITON_TREE_ATTN and TRITON_AVAILABLE and not dense_mask:
+    if dense_mask and compact_mask:
+        raise ValueError("dense_mask and compact_mask cannot both be enabled")
+    if (
+        USE_TRITON_TREE_ATTN
+        and TRITON_AVAILABLE
+        and not dense_mask
+        and not compact_mask
+    ):
         return {"tree_triton_data": build_triton_attn_data_from_trie(trie, padded_size)}
+    if compact_mask:
+        return {
+            "attention_mask": build_compact_attention_mask_from_trie(
+                trie, padded_size, device
+            )
+        }
     if dense_mask:
         return {
             "attention_mask": build_attention_mask_from_trie(trie, padded_size, device)

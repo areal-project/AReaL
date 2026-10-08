@@ -1378,9 +1378,8 @@ class MegatronEngine(TrainEngine):
             cu_seqlens = mb_input.padded_mb.get("cu_seqlens", None)
 
             # Lazily create tree attention metadata just before forward.
-            # dense_mask=True because Megatron's gradient checkpointing uses
-            # save_for_backward() which can only save torch.Tensor objects;
-            # BlockMask is recreated inside PytorchFlexAttention.forward().
+            # Megatron checkpointing saves tensors, so use a compact tensor
+            # descriptor and recreate BlockMask inside attention.forward().
             tree_attn_keys: list[str] = []
             if self.enable_tree_training:
                 trie_node = mb_input.padded_mb.get("trie_node", None)
@@ -1394,7 +1393,7 @@ class MegatronEngine(TrainEngine):
                         trie_node,
                         padded_size,
                         mb_input.padded_mb["input_ids"].device,
-                        dense_mask=True,
+                        compact_mask=True,
                     )
                     mb_input.padded_mb.update(tree_kwargs)
                     tree_attn_keys = list(tree_kwargs.keys())
