@@ -71,7 +71,7 @@ class AgentRequest:
     message: str                              # Current user message
     session_key: str                          # Session identifier
     run_id: str                               # Unique run identifier
-    history: list[dict[str, str]]             # Prior conversation turns
+    history: list[dict[str, Any]]             # Prior conversation turns
     queue_mode: QueueMode = QueueMode.COLLECT
     metadata: dict[str, Any] = field(default_factory=dict)
 ```
@@ -90,9 +90,63 @@ class AgentResponse:
 ```python
 class EventEmitter(Protocol):
     async def emit_delta(self, text: str) -> None: ...
-    async def emit_tool_call(self, name: str, args: str) -> None: ...
-    async def emit_tool_result(self, name: str, result: str) -> None: ...
+    async def emit_tool_call(
+        self,
+        name: str,
+        args: str,
+        *,
+        call_id: str | None = None,
+        message_id: str | None = None,
+    ) -> None: ...
+    async def emit_tool_result(
+        self, name: str, result: str, *, call_id: str | None = None
+    ) -> None: ...
 ```
+
+These methods **report** tool activity; the harness still executes tools and manages its
+own within-run model/tool loop. On the structured `AgentResponse` path, DataProxy uses
+the events to build cross-request history for agents that consume `request.history`.
+This is not the inference service's training-trajectory capture.
+
+Pass the harness's `call_id` on both the call and its result. To preserve multiple calls
+from **one assistant reply**, also pass the same `message_id` for those calls:
+
+```python
+await emitter.emit_tool_call(
+    "search", '{"q":"A"}', call_id="call-a", message_id="reply-1"
+)
+await emitter.emit_tool_call(
+    "search", '{"q":"B"}', call_id="call-b", message_id="reply-1"
+)
+# Results can arrive in either order.
+await emitter.emit_tool_result("search", "result B", call_id="call-b")
+await emitter.emit_tool_result("search", "result A", call_id="call-a")
+```
+
+The next request's history contains **one** assistant message with both tool calls,
+followed by the two tool results in their reported order. Call IDs are preserved in the
+Worker's events, history (`id` / `tool_call_id`), Responses output (`call_id`), and
+WebSocket tool-call events (`toolCall.callId`).
+
+- IDs are opaque, non-empty strings. Call IDs must be unique within a run. Each
+  assistant reply must have its own message ID within that run; a harness can assign
+  local reply IDs if its SDK does not provide them.
+- Emit all calls for a message before its results or calls from another message. A
+  message group cannot be reopened across either boundary. Text deltas do not define
+  message boundaries and are not reconstructed as intermediate assistant messages.
+- Both new arguments are optional. Existing two-argument serial reporting still works:
+  the Worker generates missing call IDs and matches a result without an ID only when
+  exactly one same-name call is pending. Without `message_id`, each call remains a
+  separate assistant message; adjacent calls are never implicitly grouped.
+- For structured responses, unknown/duplicate IDs, mismatched tool names, ambiguous
+  results and reopened groups fail the turn with a structured Worker error (HTTP 500).
+  Validation happens after `run` returns. DataProxy leaves prior history unchanged,
+  including not appending the failed turn's user message. The service does not retry the
+  agent: tools may already have caused side effects.
+- Call-only reporting remains supported for observability, but a partial event log is
+  not necessarily a replayable conversation. Agents relying on managed history should
+  report all calls and results. Raw `StreamResponse` turns bypass this normalization and
+  keep no DataProxy history.
 
 ## HTTP APIs
 

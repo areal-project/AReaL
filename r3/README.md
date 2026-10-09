@@ -93,6 +93,7 @@ Rejected path:
 - vLLM rollout with `return_routed_experts=true`.
 - Non-Megatron actor backends.
 - Non-MoE actor models.
+- MTP layers or the `mcore-bridge` backend.
 - Vision workflow, tree training, or padded-sequence Megatron training.
 - Effective Megatron `moe_router_fusion=True`; native replay needs the unfused router
   path.

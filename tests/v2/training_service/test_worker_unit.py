@@ -2,14 +2,134 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from areal.api import TrainEngine
+from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.v2.training_service.worker.config import TrainWorkerConfig
 
 MODULE = "areal.v2.training_service.worker.app"
+
+
+@pytest.mark.parametrize("is_vision_model", [None, False, True])
+def test_execute_compute_uses_cpu_group_for_streaming_method(
+    monkeypatch, is_vision_model
+):
+    """Only vision-capable CPU-staged engines opt into alias broadcasts."""
+    import areal.v2.training_service.worker.app as worker_app
+
+    engine = SimpleNamespace(
+        cpu_staged_rpc_methods=frozenset({"train_batch"}),
+        is_offload=False,
+        cpu_model_parallel_group="cpu_group",
+        context_and_model_parallel_group="accelerator_group",
+        data_parallel_world_size=2,
+        current_data_parallel_head=lambda: 3,
+        train_batch=lambda *args, **kwargs: (args, kwargs),
+    )
+    if is_vision_model is not None:
+        engine.is_vision_model = is_vision_model
+    monkeypatch.setattr(worker_app, "_engine", engine)
+    monkeypatch.setattr(
+        worker_app, "_submit_to_engine_thread", lambda _name, func: func()
+    )
+
+    with (
+        patch(
+            f"{MODULE}.tensor_container_to",
+            side_effect=lambda value, device: value,
+        ) as to,
+        patch(
+            f"{MODULE}.broadcast_tensor_container", side_effect=lambda value, **_: value
+        ) as broadcast,
+    ):
+        worker_app._execute_compute(
+            "train_batch", ["args"], {"key": "value"}, require_broadcast=True
+        )
+
+    assert to.call_args_list == [call(["args"], "cpu"), call({"key": "value"}, "cpu")]
+    assert broadcast.call_args_list == [
+        call(
+            ["args"],
+            src_rank=3,
+            group="cpu_group",
+            preserve_tensor_aliases=is_vision_model is True,
+        ),
+        call(
+            {"key": "value"},
+            src_rank=3,
+            group="cpu_group",
+            preserve_tensor_aliases=is_vision_model is True,
+        ),
+    ]
+
+
+def test_execute_compute_uses_accelerator_group_for_unstaged_method(monkeypatch):
+    """Vision capability alone must not enable the CPU-only alias protocol."""
+    import areal.v2.training_service.worker.app as worker_app
+
+    engine = SimpleNamespace(
+        cpu_staged_rpc_methods=frozenset({"train_batch"}),
+        is_offload=False,
+        cpu_model_parallel_group="cpu_group",
+        context_and_model_parallel_group="accelerator_group",
+        data_parallel_world_size=2,
+        current_data_parallel_head=lambda: 1,
+        is_vision_model=True,
+        unlisted_method=lambda *args, **kwargs: (args, kwargs),
+    )
+    monkeypatch.setattr(worker_app, "_engine", engine)
+    monkeypatch.setattr(
+        worker_app, "_submit_to_engine_thread", lambda _name, func: func()
+    )
+
+    with (
+        patch.object(
+            worker_app,
+            "current_platform",
+            SimpleNamespace(current_device=lambda: "cuda:1"),
+        ),
+        patch(
+            f"{MODULE}.tensor_container_to",
+            side_effect=lambda value, device: value,
+        ) as to,
+        patch(
+            f"{MODULE}.broadcast_tensor_container", side_effect=lambda value, **_: value
+        ) as broadcast,
+    ):
+        worker_app._execute_compute("unlisted_method", [], {}, require_broadcast=True)
+
+    assert to.call_args_list == [call([], "cuda:1"), call({}, "cuda:1")]
+    assert all(
+        item.kwargs["group"] == "accelerator_group" for item in broadcast.call_args_list
+    )
+    assert all(
+        item.kwargs["preserve_tensor_aliases"] is False
+        for item in broadcast.call_args_list
+    )
+
+
+def test_execute_compute_requires_cpu_group_for_streaming_method(monkeypatch):
+    import areal.v2.training_service.worker.app as worker_app
+
+    engine = SimpleNamespace(
+        cpu_staged_rpc_methods=frozenset({"train_batch"}),
+        cpu_model_parallel_group=None,
+        context_and_model_parallel_group="accelerator_group",
+        data_parallel_world_size=2,
+        current_data_parallel_head=lambda: 0,
+        train_batch=lambda: None,
+    )
+    monkeypatch.setattr(worker_app, "_engine", engine)
+    monkeypatch.setattr(
+        worker_app, "_submit_to_engine_thread", lambda _name, func: func()
+    )
+    with pytest.raises(RuntimeError, match="cpu_model_parallel_group is None"):
+        worker_app._execute_compute("train_batch", [], {}, require_broadcast=True)
 
 
 @pytest.fixture(autouse=True)
@@ -51,6 +171,111 @@ def client():
         )
     )
     return app.test_client()
+
+
+@pytest.mark.parametrize(
+    "initialized,is_head,should_store",
+    [(True, False, False), (True, True, True), (False, False, True)],
+)
+@pytest.mark.parametrize(
+    "endpoint,method_name",
+    [
+        ("/train_batch", "train_batch"),
+        ("/ppo/actor/compute_advantages", "compute_advantages"),
+        ("/ppo/actor/update", "ppo_update"),
+    ],
+)
+def test_compute_endpoint_only_stores_collectable_results(
+    client, monkeypatch, initialized, is_head, should_store, endpoint, method_name
+):
+    """Non-head ranks participate in compute without leaking discarded shards."""
+    import areal.v2.training_service.worker.app as worker_app
+
+    engine = MagicMock(spec=TrainEngine)
+    engine.initialized = initialized
+    engine.is_data_parallel_head.return_value = is_head
+    engine.cpu_staged_rpc_methods = ()
+    engine.context_and_model_parallel_group = None
+    engine.data_parallel_world_size = 1
+    compute = MagicMock(return_value={"value": 1})
+    setattr(engine, method_name, compute)
+    monkeypatch.setattr(worker_app, "_engine", engine)
+    monkeypatch.setattr(worker_app, "_submit_to_engine_thread", lambda _name, fn: fn())
+    monkeypatch.setattr(
+        worker_app, "current_platform", SimpleNamespace(current_device=lambda: "cpu")
+    )
+    store = MagicMock(side_effect=lambda result, **_: result)
+    monkeypatch.setattr(RTensor, "remotize", store)
+
+    response = client.post(endpoint, json={"args": [], "kwargs": {}})
+
+    assert response.status_code == 200
+    compute.assert_called_once_with()
+    if not initialized:
+        engine.is_data_parallel_head.assert_not_called()
+    assert store.call_count == int(should_store)
+    assert deserialize_value(response.get_json()["result"]) == (
+        {"value": 1} if should_store else None
+    )
+
+
+@pytest.mark.parametrize("cpu_staged", [True, False])
+def test_compute_endpoint_fetches_shared_images_once_only_for_cpu_staging(
+    client, monkeypatch, cpu_staged
+):
+    """Megatron preserves wire aliases; unstaged engines retain legacy behavior."""
+    import torch
+
+    import areal.v2.training_service.worker.app as worker_app
+    from areal.infra.rpc import rtensor
+
+    image = torch.ones((4, 3), dtype=torch.float32)
+    remote = RTensor(
+        shard=rtensor.TensorShardInfo(shard_id="image", node_addr="test.invalid"),
+        data=torch.empty_like(image, device="meta"),
+    )
+    backend = MagicMock()
+    backend.fetch.side_effect = lambda shards: [image.clone() for _ in shards]
+    monkeypatch.setattr(rtensor, "get_backend", lambda: backend)
+    monkeypatch.setattr(rtensor, "_fetch_buffer", {})
+    captured = {}
+
+    def train_batch(batch):
+        captured["images"] = [
+            item["pixel_values"] for item in batch["multi_modal_input"]
+        ]
+
+    engine = SimpleNamespace(
+        cpu_staged_rpc_methods={"train_batch"} if cpu_staged else set(),
+        cpu_model_parallel_group="cpu-group",
+        context_and_model_parallel_group="other-group",
+        data_parallel_world_size=1,
+        current_data_parallel_head=lambda: 0,
+        train_batch=train_batch,
+    )
+    monkeypatch.setattr(worker_app, "_engine", engine)
+    monkeypatch.setattr(worker_app, "_submit_to_engine_thread", lambda _name, fn: fn())
+    monkeypatch.setattr(
+        worker_app, "current_platform", SimpleNamespace(current_device=lambda: "cpu")
+    )
+    monkeypatch.setattr(
+        worker_app, "broadcast_tensor_container", lambda value, **_: value
+    )
+    payload = {
+        "multi_modal_input": [{"pixel_values": remote}, {"pixel_values": remote}]
+    }
+
+    response = client.post(
+        "/train_batch", json={"args": serialize_value([payload]), "kwargs": {}}
+    )
+
+    assert response.status_code == 200, response.get_json()
+    backend.fetch.assert_called_once()
+    assert len(backend.fetch.call_args.args[0]) == (1 if cpu_staged else 2)
+    first, second = captured["images"]
+    assert (first is second) == cpu_staged
+    torch.testing.assert_close(first, image, rtol=0, atol=0)
+    torch.testing.assert_close(second, image, rtol=0, atol=0)
 
 
 class TestWorkerEngineCreation:

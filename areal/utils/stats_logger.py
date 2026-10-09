@@ -7,17 +7,19 @@ from dataclasses import asdict
 
 import swanlab
 import torch.distributed as dist
-import trackio
 import wandb
 from tensorboardX import SummaryWriter
 
 from areal.api import FinetuneSpec
 from areal.api.cli_args import BaseExperimentConfig, StatsLoggerConfig
 from areal.utils import logging
+from areal.utils.config_utils import redact_sensitive_config
+from areal.utils.moe_metrics import split_expert_load_metrics
 from areal.utils.printing import tabulate_stats
 from areal.version import version_info
 
 logger = logging.getLogger("StatsLogger", "system")
+trackio = None
 
 
 class StatsLogger:
@@ -52,7 +54,7 @@ class StatsLogger:
         if suffix == "timestamp":
             suffix = time.strftime("%Y_%m_%d_%H_%M_%S")
 
-        exp_config_dict = asdict(self.exp_config)
+        exp_config_dict = redact_sensitive_config(asdict(self.exp_config))
         exp_config_dict["version_info"] = {
             "commit_id": version_info.commit,
             "branch": version_info.branch,
@@ -98,6 +100,11 @@ class StatsLogger:
         self._trackio_enabled = False
         trackio_config = self.config.trackio
         if trackio_config.mode != "disabled":
+            global trackio
+            if trackio is None:
+                import trackio as trackio_module
+
+                trackio = trackio_module
             trackio.init(
                 project=trackio_config.project or self.config.experiment_name,
                 name=trackio_config.name or self.config.trial_name,
@@ -148,13 +155,23 @@ class StatsLogger:
             item = {k: v for k, v in item.items() if not k.endswith("__count")}
 
             logger.info(f"Stats ({i + 1}/{len(data)}):")
-            self.print_stats(item)
-            wandb.log(item, step=log_step + i)
+            scalar_item, expert_rows = split_expert_load_metrics(item)
+            self.print_stats(scalar_item)
+            wandb_item = dict(scalar_item)
+            if expert_rows:
+                # W&B's run-media Table limit defaults to 10,000 rows, below
+                # Qwen3.5's 40 x 256 experts. Preserve every expert in snapshots.
+                wandb.Table.MAX_ROWS = max(wandb.Table.MAX_ROWS, len(expert_rows))
+                wandb_item["moe_balance/expert_loads"] = wandb.Table(
+                    columns=["layer", "expert", "tokens", "load_percent"],
+                    data=expert_rows,
+                )
+            wandb.log(wandb_item, step=log_step + i)
             swanlab.log(item, step=log_step + i)
             if getattr(self, "_trackio_enabled", False):
                 trackio.log(item, step=log_step + i)
             if self.summary_writer is not None:
-                for key, val in item.items():
+                for key, val in scalar_item.items():
                     self.summary_writer.add_scalar(f"{key}", val, log_step + i)
         self._last_commit_step = log_step + len(data) - 1
 

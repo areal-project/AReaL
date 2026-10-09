@@ -180,3 +180,13 @@ class RolloutCallback:
         This is synchronous as it should complete before returning control.
         """
         self._post("/callback/continue_generation")
+
+    def onload(self, tags: list[str] | None = None) -> None:
+        """Callback to controller to resume memory occupation on inference side."""
+        payload = {"tags": tags} if tags else {}
+        self._post("/callback/onload", payload)
+
+    def offload(self, tags: list[str] | None = None) -> None:
+        """Callback to controller to release memory occupation on inference side."""
+        payload = {"tags": tags} if tags else {}
+        self._post("/callback/offload", payload)

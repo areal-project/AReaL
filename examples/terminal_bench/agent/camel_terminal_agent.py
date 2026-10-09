@@ -11,13 +11,12 @@ from pathlib import Path
 from agent_rl_config import TaskTimeouts
 from camel.messages import BaseMessage
 from camel.toolkits import FunctionTool, TerminalToolkit
-from transformers import PreTrainedTokenizerFast
-
 from terminal_bench.handlers.trial_handler import TrialHandler
 from terminal_bench.parsers.base_parser import UnitTestStatus
 from terminal_bench.parsers.parser_factory import ParserFactory
 from terminal_bench.terminal.docker_compose_manager import DockerComposeManager
 from terminal_bench.terminal.terminal import Terminal
+from transformers import PreTrainedTokenizerFast
 
 from areal.experimental.camel.openai_model import AReaLOpenAICompatibleModel
 from areal.utils.perf_tracer import (

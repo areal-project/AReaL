@@ -11,6 +11,7 @@ from areal.v2.agent_service.types import (
     AgentResponse,
     AgentRunnable,
     EventEmitter,
+    StreamResponse,
 )
 from areal.v2.agent_service.worker.app import (
     _CollectingEmitter,
@@ -69,6 +70,63 @@ class TestWorkerHealth:
 
 class TestWorkerRun:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("run_id", ["", "reused"])
+    async def test_legacy_ids_match_and_are_unique_across_runs(self, run_id):
+        """Legacy serial events get matching IDs independent of the run ID."""
+        async with _make_client(_ToolAgent) as client:
+            ids = []
+            for _ in range(2):
+                response = await client.post("/run", json={"run_id": run_id})
+                assert response.status_code == 200
+                call, result, _ = response.json()["events"]
+                assert call["call_id"] == result["call_id"]
+                ids.append(call["call_id"])
+            assert ids[0] != ids[1]
+
+    @pytest.mark.asyncio
+    async def test_invalid_events_fail_after_agent_returns(self):
+        """Invalid associations fail after the harness completes its run."""
+        completed = []
+
+        class Agent:
+            async def run(self, request, *, emitter):
+                await emitter.emit_tool_call("search", "{}")
+                await emitter.emit_tool_call("search", "{}")
+                await emitter.emit_tool_result("search", "ambiguous")
+                completed.append(True)
+                return AgentResponse(summary="done")
+
+        async with _make_client(Agent) as client:
+            response = await client.post("/run", json={})
+        assert completed == [True]
+        assert response.status_code == 500
+        assert response.json()["error"]["type"] == "ValueError"
+        assert "ambiguous" in response.json()["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_passthrough_ignores_invalid_collected_events(self):
+        """Raw responses bypass structured event validation entirely."""
+
+        class Agent:
+            async def run(self, request, *, emitter):
+                await emitter.emit_tool_result("search", "no matching call")
+
+                async def body():
+                    yield b'{"raw":true}'
+
+                return StreamResponse(
+                    status_code=201,
+                    headers={"content-type": "application/json", "x-upstream": "ok"},
+                    body=body(),
+                )
+
+        async with _make_client(Agent) as client:
+            response = await client.post("/run", json={})
+        assert response.status_code == 201
+        assert response.content == b'{"raw":true}'
+        assert response.headers["x-upstream"] == "ok"
+
+    @pytest.mark.asyncio
     async def test_echo(self):
         async with _make_client(_EchoAgent) as client:
             resp = await client.post(
@@ -117,6 +175,35 @@ class TestWorkerRun:
 
 
 class TestCollectingEmitter:
+    @pytest.mark.asyncio
+    async def test_explicit_ids_are_collected_unchanged(self):
+        """IDs supplied by the harness are opaque, optional keyword arguments."""
+        emitter = _CollectingEmitter()
+        assert (
+            await emitter.emit_tool_call(
+                "search", "{}", call_id="sdk-call", message_id="sdk-message"
+            )
+            is None
+        )
+        assert (
+            await emitter.emit_tool_result("search", "ok", call_id="sdk-call") is None
+        )
+        assert emitter.events == [
+            {
+                "type": "tool_call",
+                "name": "search",
+                "args": "{}",
+                "call_id": "sdk-call",
+                "message_id": "sdk-message",
+            },
+            {
+                "type": "tool_result",
+                "name": "search",
+                "result": "ok",
+                "call_id": "sdk-call",
+            },
+        ]
+
     @pytest.mark.asyncio
     async def test_collects_all_event_types(self):
         e = _CollectingEmitter()

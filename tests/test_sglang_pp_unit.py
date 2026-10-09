@@ -819,3 +819,13 @@ class TestArchonPPSizeMismatchValidation:
         # Should not raise.
         aws._init_per_pp_weight_update_groups(state, meta, engine, gen_pp_size)
         assert state.group_names == ["update_weight_group_0"]
+
+
+def test_pause_requests_abort_before_in_place_pause():
+    requests = SGLangBackend().get_pause_requests()
+
+    assert [request.endpoint for request in requests] == [
+        "/pause_generation",
+        "/pause_generation",
+    ]
+    assert [request.payload for request in requests] == [{}, {"mode": "in_place"}]

@@ -1,5 +1,8 @@
 # SWE-bench RL training with AReaL-SWEAgent
 
+For Arena-hosted single- or multi-Stream training, see
+[Arena integration](README_arena.md).
+
 This example runs SWE-bench coding-agent RL (GRPO) in AReaL. The actual agent loop,
 sandboxing and reward computation live in a **separate repository**,
 [AReaL-SWEAgent](https://github.com/areal-project/AReaL-SWEAgent): for each SWE-bench
@@ -85,6 +88,63 @@ python -m examples.swe.train_swe_rl --config examples/swe/qwen3_30b_a3b_grpo.yam
 With `scheduler.type=slurm`, AReaL launches the rollout / actor / proxy workers; each
 rollout calls into AReaL-SWEAgent, which runs the agent in a sandbox and returns the
 reward.
+
+### Bailing V3 with NCCL weight updates
+
+Use [bailing_v3_grpo.yaml](bailing_v3_grpo.yaml) for **separate training and rollout
+GPUs**, with the v1 controllers and `actor.weight_update_mode: xccl`. On CUDA, this uses
+NCCL to broadcast HF-layout tensors directly to SGLang. It does not use the AWEX
+colocation plugin or the AWEX V3 converter.
+
+The example starts from the Flash V3 parallel layout: eight 8-GPU actor nodes
+(`attn:d4p2t4c2|ffn:d4p2e8`) and eight separate 8-GPU rollout nodes (`d8t8p1`), for 128
+GPUs total. Adapt the topology and worker resource requests to your checkpoint and
+cluster. The two-step, 16K-token settings are an integration starting point, not a
+throughput benchmark.
+
+Set these environment variables before launching:
+
+```bash
+export V3_MODEL=/path/to/Bailing-V3
+export SWE_RL_DATASET=/path/to/swe_bench_rl.jsonl
+export AREAL_ROOT=/path/to/AReaL
+export SWE_AGENT_ROOT=/path/to/AReaL-SWEAgent
+export AREAL_SHARED_ROOT=/path/to/shared/areal-data
+export V3_ACTOR_IMAGE=/path/to/actor.sif
+export V3_ROLLOUT_IMAGE=/path/to/rollout.sif
+export THETA_SGLANG_ROOT=/path/to/pinned/sglang/python
+export SWE_RL_ADMIN_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+# Configure AENV_SYSTEM_URL and sandbox dependencies as described below.
+python -m examples.swe.train_swe_rl --config examples/swe/bailing_v3_grpo.yaml
+```
+
+Pin the SGLang source to
+[`1743a69fbeb48f1e2d1daa2f7963a82074fce0b9`](https://github.com/dingzhiqiang/sglang/commit/1743a69fbeb48f1e2d1daa2f7963a82074fce0b9),
+based on the public Theta-derived Ling V3 runtime. Its RoPE/FA3 compatibility fixes are
+independent of the weight transport. Prepare a rollout image with the fork's matching
+Python and kernel dependencies; AReaL's default SGLang/Transformers pins are different,
+so setting `PYTHONPATH` alone is insufficient. Keep actor and rollout environments
+separate and make AReaL and the agent checkout importable in both.
+
+`AREAL_SGLANG_FORK=theta` in the rollout worker environment selects the native
+`sglang.launch_server` entrypoint. The initial support envelope is BF16, no inference
+quantization, no training LoRA, no speculative decoding/MTP, inference PP=1 and SGLang
+attention-DP=1. Rollout replicas (`d8` above) are separate servers and are distinct from
+SGLang's internal `dp_size`. Training PP/TP/EP are handled by AReaL's existing gather
+and broadcast groups. V2 controllers use a different weight-update path; retain the
+explicit `_version: v1` in this example.
+
+Before broadcasting, AReaL aborts/drains requests and pauses scheduler execution. The
+native receiver loads each HF tensor bucket, refreshes derived MLA weights and flushes
+old caches before generation resumes. Low-rank MLA input projections must arrive
+together in one bucket; the V3 sender preserves that pairing.
+
+Before production use, run two RL steps and compare the receiver weights with the
+corresponding exported HF tensors, including each inference TP shard. Check
+temperature-zero generation and log probabilities after updates, and verify that the
+checkpoint EOS token matches its chat-template turn terminator. CPU conversion and
+protocol tests do not replace a GPU/NCCL run; this combined public stack still requires
+that end-to-end validation.
 
 ## 6. Set up the AEnvironment backend
 
@@ -188,3 +248,35 @@ AReaL itself:
 The concrete agent behaviour — system prompt, `cli_flags`, tool allow-list,
 thinking-token budgets — lives entirely in the AReaL-SWEAgent cc config; see that
 repository for the available `cc_agent_config` values and their fields.
+
+### Failure rewards
+
+No additional protocol configuration is required. For `HARNESS_FAILED` tasks, the
+adapter first identifies the result family from reserved fields or recognizable Harness
+error markers, then applies only that family's admission rules. Unknown or conflicting
+formats are rejected. Invalid native fields still identify a native receipt: a failed
+native validation can never fall through to GameAgent or Claude handling.
+
+- Native version-1 receipts must prove healthy execution and export, account for every
+  run terminal, and attribute every failed run to `RUNTIME_EXECUTION_FAILED` with
+  `DSH_PUBLIC_ANSWER_MISSING` / `public_answer_missing`.
+- GameAgent accepts `AGENT_MAX_TURNS_EXCEEDED` and `AUTONOMOUS_INCOMPLETE_NO_SHIP`.
+  Structured outcomes and log markers must agree; malformed fields cannot fall back to
+  text. Response failures and run/response timeouts do not establish model attribution.
+- Legacy Claude requires its explicit agent-phase error envelope and a recognized
+  context-limit or turn-limit error. If its error detail is empty, a typed context
+  overflow recorded by the AReaL proxy may provide the missing attribution. Unknown
+  nonempty errors, service faults, and truncated startup logs are rejected. Subsequent
+  collect logs are separate from the error detail and must end in a matching repeated
+  terminal error; truncated collect logs cannot establish safe recovery.
+
+An earlier overflow never overrides an invalid receipt, conflicting outcome, explicit
+infrastructure fault, or system terminal status. `TIMEOUT` and `NO_OUTPUT` alone remain
+ambiguous and are not recovered. The proxy must have recorded model interactions, must
+not have reported a service error, and must successfully export usable trajectories
+before any recovered zero-reward sample enters training. Successful tasks retain their
+normal score handling.
+
+For concat exports, missing branch rewards are not inferred from a scalar episode
+reward. Explicit branch rewards and per-completion reward maps retain their existing
+semantics.

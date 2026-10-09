@@ -5,6 +5,7 @@ from typing import Any
 import torch
 
 from areal.api import TrainEngine
+from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.utils import logging, stats_tracker
@@ -42,6 +43,12 @@ class RWEngine:
     def __init__(self, engine: TrainEngine):
         self.engine = engine
 
+    def _stats_device(self, data: dict[str, Any]) -> torch.device:
+        engine_device = getattr(self.engine, "device", None)
+        if engine_device is not None:
+            return engine_device
+        return data["cu_seqlens"].device
+
     @trace_perf("rw_engine.train_rw", category="compute")
     @stats_tracker.scope_func_wrapper("rw")
     def train_rw(self, data: list[dict[str, Any]]) -> None:
@@ -50,8 +57,9 @@ class RWEngine:
     def _train_rw(self, data: dict[str, Any]) -> None:
         """Train on a batch (reward model)."""
         if _rw_loss_weight(data) == 0:
-            _log_empty_rw_stats(data["cu_seqlens"].device)
+            _log_empty_rw_stats(self._stats_device(data))
         self.engine.train()
+        stage_batch_for_engine(data, self.engine)
         stats = self.engine.train_batch(
             input_=data,
             loss_fn=compute_rw_loss,
@@ -66,8 +74,9 @@ class RWEngine:
 
     def _evaluate_rw(self, data: dict[str, Any]) -> None:
         if _rw_loss_weight(data) == 0:
-            _log_empty_rw_stats(data["cu_seqlens"].device)
+            _log_empty_rw_stats(self._stats_device(data))
         self.engine.eval()
+        stage_batch_for_engine(data, self.engine)
         self.engine.eval_batch(
             input_=data,
             loss_fn=compute_rw_loss,

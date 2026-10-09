@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
@@ -76,6 +76,37 @@ class TestInferenceEngineConfigForInferenceService:
         cfg = InferenceEngineConfig(backend="sglang:d1")
         assert cfg.dump_to_file is False
 
+    def test_deterministic_sampling_with_offpolicy_head_warns(self):
+        with patch("areal.api.cli_args.logger") as mock_logger:
+            InferenceEngineConfig(
+                backend="sglang:d1",
+                deterministic_sampling=True,
+                max_head_offpolicyness=1,
+            )
+
+        mock_logger.warning.assert_called_once()
+        assert "task-to-weight-version" in mock_logger.warning.call_args.args[0]
+
+    def test_deterministic_sampling_onpolicy_does_not_warn(self):
+        with patch("areal.api.cli_args.logger") as mock_logger:
+            InferenceEngineConfig(
+                backend="sglang:d1",
+                deterministic_sampling=True,
+                max_head_offpolicyness=0,
+            )
+
+        mock_logger.warning.assert_not_called()
+
+    def test_nondeterministic_sampling_with_offpolicy_head_does_not_warn(self):
+        with patch("areal.api.cli_args.logger") as mock_logger:
+            InferenceEngineConfig(
+                backend="sglang:d1",
+                deterministic_sampling=False,
+                max_head_offpolicyness=1,
+            )
+
+        mock_logger.warning.assert_not_called()
+
 
 # =============================================================================
 # RolloutControllerV2 — workflow resolution helpers
@@ -95,6 +126,10 @@ class TestControllerWorkflowResolution:
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
+            agent=AgentConfig(
+                agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
+                drop_retry_orphans=True,
+            ),
         )
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -109,11 +144,16 @@ class TestControllerWorkflowResolution:
         assert resolved.controller is controller
         assert resolved.agent is None
         assert resolved.timeout == 3.0
+        assert resolved.drop_retry_orphans is True
 
     def test_resolve_workflow_agent_class_creates_offline_workflow(self):
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
+            agent=AgentConfig(
+                agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
+                drop_retry_orphans=True,
+            ),
         )
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -131,6 +171,67 @@ class TestControllerWorkflowResolution:
         assert isinstance(resolved, InferenceServiceWorkflow)
         assert resolved.agent is not None
         assert isinstance(resolved.agent, MockAgent)
+        assert resolved.drop_retry_orphans is True
+
+    @pytest.mark.parametrize("prm_enabled", [False, True])
+    def test_online_workflow_uses_configured_prm_export_settings(self, prm_enabled):
+        """Completed online trajectories use concat for PRM; disabled defaults stay unchanged."""
+        from areal.api.cli_args import PRMConfig, PRMScorerConfig
+
+        controller = RolloutControllerV2(
+            config=InferenceEngineConfig(
+                backend="sglang:d1",
+                _version="v2",
+                agent=AgentConfig(
+                    agent_cls_path="areal.experimental.openai.proxy.online_agent._OnlineAgent",
+                    chat_template_type="concat",
+                    export_style="concat",
+                    turn_discount=0.75,
+                    prm=PRMConfig(
+                        enabled=prm_enabled,
+                        scorers=[PRMScorerConfig(path="unused.Scorer")],
+                    ),
+                ),
+            ),
+            scheduler=_make_scheduler(),
+        )
+        resolved = controller._resolve_workflow(None)
+        assert resolved.export_style == ("concat" if prm_enabled else "individual")
+        assert resolved.discount == (0.75 if prm_enabled else 1.0)
+
+        overridden = controller._resolve_workflow(
+            None, workflow_kwargs={"export_style": "concat", "discount": 0.5}
+        )
+        assert overridden.export_style == "concat"
+        assert overridden.discount == 0.5
+
+    def test_resolve_workflow_forwards_group_policy(self):
+        controller = RolloutControllerV2(
+            config=InferenceEngineConfig(
+                backend="sglang:d1",
+                admin_api_key="test-admin-key",
+            ),
+            scheduler=MagicMock(n_gpus_per_node=8),
+        )
+        controller._gateway_addr = "http://test:8080"
+
+        class MockAgent:
+            async def run(self, data, **kwargs):
+                return 1.0
+
+        resolved = controller._resolve_workflow(
+            MockAgent,
+            group_size=2,
+            reward_normalization=True,
+            drop_incomplete_group=True,
+            min_usable_group_size=2,
+        )
+
+        assert isinstance(resolved, InferenceServiceWorkflow)
+        assert resolved.group_size == 2
+        assert resolved.reward_normalization is True
+        assert resolved.drop_incomplete_group is True
+        assert resolved.min_usable_group_size == 2
 
     def test_resolve_should_accept_fn_none(self):
         assert RolloutControllerV2._resolve_should_accept_fn(None) is None
@@ -141,7 +242,11 @@ class TestControllerWorkflowResolution:
 
     def test_resolve_workflow_with_agent_class(self):
         """Test _resolve_workflow wraps agent-like classes in InferenceServiceWorkflow."""
-        cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
+        cfg = InferenceEngineConfig(
+            backend="sglang:d1",
+            admin_api_key="test-key",
+            serialize_group_samples=True,
+        )
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
         controller._gateway_addr = "http://test:8080"
@@ -157,6 +262,7 @@ class TestControllerWorkflowResolution:
         assert isinstance(resolved, InferenceServiceWorkflow)
         assert resolved.agent is not None
         assert hasattr(resolved, "arun_episode")
+        assert resolved.serialize_group_samples is True
 
     def test_resolve_workflow_agent_class_without_gateway_raises(self):
         controller = RolloutControllerV2(
@@ -257,6 +363,44 @@ class TestRolloutControllerV2APISurface:
 
 
 class TestRolloutControllerV2Construction:
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    @pytest.mark.parametrize("api_url", ["https://upstream.invalid/v1", ""])
+    def test_external_prm_rejected_before_allocating_resources(self, version, api_url):
+        """Direct v2 callers can set api_url after the PPO config was validated."""
+        from areal.api.cli_args import PPOConfig, PRMScorerConfig
+
+        config = PPOConfig()
+        config.rollout._version = version
+        config.rollout.agent.prm.scorers = [PRMScorerConfig(path="unused.Scorer")]
+        config.rollout.agent.export_style = "concat"
+        config.rollout.agent.chat_template_type = "concat"
+        config.__post_init__()
+        config.rollout.api_url = api_url
+        scheduler = _make_scheduler()
+
+        with patch(
+            "areal.v2.inference_service.controller.controller.httpx.Client"
+        ) as client:
+            with pytest.raises(ValueError, match="PRM.*api_url.*token-backed"):
+                RolloutControllerV2(config=config.rollout, scheduler=scheduler)
+
+        client.assert_not_called()
+        assert scheduler.mock_calls == []
+
+    @pytest.mark.parametrize("inactive", ["disabled", "empty"])
+    def test_external_mode_accepts_inactive_prm(self, inactive):
+        """Disabled and empty PRM configurations keep the external-model path."""
+        from areal.api.cli_args import PRMScorerConfig
+
+        cfg = InferenceEngineConfig(api_url="https://upstream.invalid/v1")
+        if inactive == "disabled":
+            cfg.agent.prm.enabled = False
+            cfg.agent.prm.scorers = [PRMScorerConfig(path="unused.Scorer")]
+
+        controller = RolloutControllerV2(config=cfg, scheduler=_make_scheduler())
+        assert controller.rollout_alloc is None
+        controller._sync_client.close()
+
     def test_admin_api_key_none_raises(self):
         cfg = InferenceEngineConfig(backend="sglang:d1")
         cfg.admin_api_key = ""
@@ -357,11 +501,16 @@ class TestRolloutControllerV2Construction:
         controller.config_perf_tracer()
         controller.save_perf_tracer()
 
+    @pytest.mark.parametrize("deterministic_sampling", [False, True])
+    @pytest.mark.parametrize("prm_enabled", [False, True])
     @pytest.mark.asyncio
-    async def test_async_initialize_passes_data_proxy_runtime_options(
-        self,
+    async def test_async_initialize_passes_config_to_data_proxy(
+        self, deterministic_sampling, prm_enabled
     ):
-        from areal.api.cli_args import SchedulingSpec
+        import json
+        from dataclasses import asdict
+
+        from areal.api.cli_args import PRMConfig, PRMScorerConfig, SchedulingSpec
         from areal.api.io_struct import LocalInfServerInfo
 
         worker = MagicMock()
@@ -374,11 +523,29 @@ class TestRolloutControllerV2Construction:
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             tokenizer_path="mock-tokenizer",
+            _version="v2",
             request_timeout=15.0,
             return_routed_experts=True,
+            deterministic_sampling=deterministic_sampling,
             agent=AgentConfig(
                 agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
                 set_reward_finish_timeout=7.5,
+                message_preprocessors=[
+                    "examples.swe.preprocessors.StripAnthropicBillingHeader",
+                    "examples.swe.preprocessors.StripAllSystemReminders",
+                ],
+                prefix_matcher="examples.swe.prefix_matchers.swe_prefix_matcher",
+                chat_template_type="concat",
+                prm=PRMConfig(
+                    enabled=prm_enabled,
+                    scorers=[
+                        PRMScorerConfig(
+                            path="examples.prm.scorers.LengthBudgetScorer",
+                            weight=0.5,
+                            kwargs={"max_output_tokens": 32},
+                        )
+                    ],
+                ),
             ),
             scheduling_spec=(
                 SchedulingSpec(
@@ -417,6 +584,9 @@ class TestRolloutControllerV2Construction:
         ]
         assert len(data_proxy_calls) == 1
         data_proxy_cmd = data_proxy_calls[0].kwargs["raw_cmd"]
+        # Pre-existing SGLang servers still use token-backed inference, not api_url.
+        backend_arg = data_proxy_cmd.index("--backend-addr")
+        assert data_proxy_cmd[backend_arg + 1] == "http://127.0.0.1:30000"
         assert "--set-reward-finish-timeout" in data_proxy_cmd
         assert "7.5" in data_proxy_cmd
         assert "--callback-server-addr" in data_proxy_cmd
@@ -426,6 +596,20 @@ class TestRolloutControllerV2Construction:
         assert "27" in data_proxy_cmd
         assert "--r3-topk" in data_proxy_cmd
         assert "8" in data_proxy_cmd
+        assert ("--deterministic-sampling" in data_proxy_cmd) is deterministic_sampling
+        assert data_proxy_cmd.count("--message-preprocessor") == 2
+        first = data_proxy_cmd.index("--message-preprocessor")
+        second = data_proxy_cmd.index("--message-preprocessor", first + 1)
+        assert data_proxy_cmd[first + 1].endswith("StripAnthropicBillingHeader")
+        assert data_proxy_cmd[second + 1].endswith("StripAllSystemReminders")
+        matcher = data_proxy_cmd.index("--prefix-matcher")
+        assert data_proxy_cmd[matcher + 1] == (
+            "examples.swe.prefix_matchers.swe_prefix_matcher"
+        )
+        assert ("--prm-config" in data_proxy_cmd) is prm_enabled
+        if prm_enabled:
+            encoded = data_proxy_cmd[data_proxy_cmd.index("--prm-config") + 1]
+            assert json.loads(encoded) == asdict(cfg.agent.prm)
 
 
 class TestOnlineCallbackFlow:
@@ -541,13 +725,161 @@ class TestOnlineCallbackFlow:
 
 
 class TestInferenceServiceWorkflow:
-    @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
+    async def _run_offline_group(
+        self,
+        *,
+        serialize_group_samples: bool,
+        failing_member: int | None = None,
+        drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
+    ):
+        active = 0
+        max_active = 0
+        start_order: list[int] = []
+        all_started = asyncio.Event()
+
+        class MockAgent:
+            async def run(self, data, **kwargs):
+                del data
+                nonlocal active, max_active
+                member_index = int(kwargs["api_key"].rsplit("-", 1)[1])
+                start_order.append(member_index)
+                active += 1
+                max_active = max(max_active, active)
+                try:
+                    if serialize_group_samples:
+                        await asyncio.sleep(0)
+                    else:
+                        if active == 4:
+                            all_started.set()
+                        await asyncio.wait_for(all_started.wait(), timeout=1.0)
+                    if member_index == failing_member:
+                        raise RuntimeError(f"member {member_index} failed")
+                    return float(member_index)
+                finally:
+                    active -= 1
+
+        controller = MagicMock()
+        controller.get_version.return_value = 3
+        workflow = InferenceServiceWorkflow(
+            controller=controller,
+            agent=MockAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            group_size=4,
+            serialize_group_samples=serialize_group_samples,
+            drop_incomplete_group=drop_incomplete_group,
+            min_usable_group_size=min_usable_group_size,
+        )
+        sessions = [(f"task-42-{i}", f"session-key-{i}") for i in range(4)]
+        workflow._start_session = AsyncMock(return_value=("grp-test-42", sessions))
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value={"chatcmpl-1": MagicMock(reward=1.0)}
+        )
+
+        tracker = MagicMock()
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch(
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
+            ) as mock_st,
+        ):
+            mock_http_session = AsyncMock()
+            mock_wf_ctx.get_aiohttp_session = AsyncMock(return_value=mock_http_session)
+            mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+            mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+            mock_wf_ctx.stat_scope.return_value = "rollout"
+            mock_st.get.return_value = tracker
+
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        successful_session_ids = [
+            session_id
+            for index, (session_id, _) in enumerate(sessions)
+            if index != failing_member
+        ]
+        discard_group = (failing_member is not None and drop_incomplete_group) or len(
+            successful_session_ids
+        ) < min_usable_group_size
+        export_kwargs = {
+            "group_id": "grp-test-42",
+            "discard_trajectory": discard_group,
+        }
+        if not discard_group:
+            export_kwargs.update(
+                export_session_ids=successful_session_ids,
+                min_usable_group_size=(
+                    len(sessions) if drop_incomplete_group else min_usable_group_size
+                ),
+            )
+        workflow._export_interactions.assert_awaited_once_with(
+            mock_http_session,
+            [session_id for session_id, _ in sessions],
+            **export_kwargs,
+        )
+        return result, max_active, start_order, tracker, workflow
+
     @pytest.mark.asyncio
-    async def test_online_mode_waits_on_controller(self):
-        mock_interaction = MagicMock(reward=1.0)
+    async def test_export_interactions_forwards_drop_retry_orphans(self):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            drop_retry_orphans=True,
+        )
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json = AsyncMock(return_value={"traj": {}})
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=response)
+        context.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post = MagicMock(return_value=context)
+
+        result = await workflow._export_interactions(session, ["session-1"])
+
+        assert result == {}
+        assert session.post.call_args.kwargs["json"]["drop_retry_orphans"] is True
+
+    @pytest.mark.asyncio
+    async def test_export_interactions_forwards_reward_normalization(self):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            reward_normalization=True,
+        )
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json = AsyncMock(return_value={"traj": {}})
+        response_context = MagicMock()
+        response_context.__aenter__ = AsyncMock(return_value=response)
+        response_context.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post.return_value = response_context
+
+        result = await workflow._export_interactions(session, ["session-1"])
+
+        assert result == {}
+        assert session.post.call_args.kwargs["json"]["reward_normalization"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("session_id", ["sess-1", "__hitl__"])
+    async def test_online_mode_waits_on_controller(self, session_id):
+        import torch
+
+        from areal.infra.rpc.serialization import serialize_value
+
+        trajectory = {
+            "input_ids": torch.tensor([[1, 2]]),
+            "rewards": torch.tensor([1.0]),
+        }
         controller = MagicMock()
         controller.wait_for_online_trajectory = AsyncMock(
-            return_value={"session_id": "sess-1", "trajectory_id": 7}
+            return_value={"session_id": session_id, "trajectory_id": 7}
         )
 
         workflow = InferenceServiceWorkflow(
@@ -565,18 +897,12 @@ class TestInferenceServiceWorkflow:
             patch(
                 "areal.v2.inference_service.controller.workflow.stats_tracker"
             ) as mock_st,
-            patch(
-                "areal.v2.inference_service.controller.workflow.deserialize_interactions"
-            ) as mock_deserialize,
         ):
-            mock_deserialize.return_value = {"chatcmpl-1": mock_interaction}
-
-            # _run_online uses ``async with http_session.post(...)`` directly,
-            # so the mock must support the async context-manager protocol.
+            # Keep the real export deserializer; only mock the HTTP transport.
             mock_response = MagicMock()
             mock_response.raise_for_status = MagicMock()
             mock_response.json = AsyncMock(
-                return_value={"interactions": {"chatcmpl-1": {}}}
+                return_value={"traj": serialize_value(trajectory)}
             )
 
             mock_cm = MagicMock()
@@ -587,16 +913,23 @@ class TestInferenceServiceWorkflow:
             mock_http_session.post = MagicMock(return_value=mock_cm)
 
             mock_wf_ctx.get_aiohttp_session = AsyncMock(return_value=mock_http_session)
+            mock_wf_ctx.get.return_value.is_eval = False
             mock_wf_ctx.stat_scope.return_value = "rollout"
             mock_st.get.return_value = MagicMock()
 
             result = await workflow.arun_episode(engine=MagicMock(), data={})
 
         assert result is not None
-        assert "chatcmpl-1" in result
+        for key, expected in trajectory.items():
+            torch.testing.assert_close(result[key], expected, rtol=0, atol=0)
         controller.wait_for_online_trajectory.assert_awaited_once_with(timeout=3.0)
         mock_http_session.post.assert_called_once()
-        mock_deserialize.assert_called_once_with({"chatcmpl-1": {}})
+        payload = mock_http_session.post.call_args.kwargs["json"]
+        assert payload["session_ids"] == [session_id]
+        assert payload["trajectory_id"] == 7
+        assert payload["is_eval"] is False
+        assert payload["remove_session"] is (session_id != "__hitl__")
+        mock_st.get.return_value.scalar.assert_called_once_with(reward=1.0)
 
     @pytest.mark.asyncio
     async def test_offline_mode_runs_agent(self):
@@ -643,7 +976,207 @@ class TestInferenceServiceWorkflow:
         workflow._start_session.assert_awaited_once()
         workflow._set_last_reward.assert_awaited_once()
         workflow._export_interactions.assert_awaited_once_with(
-            mock_http_session, ["sess-1"], group_id="grp-test-1"
+            mock_http_session,
+            ["sess-1"],
+            group_id="grp-test-1",
+            discard_trajectory=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_offline_mode_assigns_each_interaction_reward(self):
+        class StepRewardAgent:
+            async def run(self, data, **kwargs):
+                return {"turn-1": -0.25, "turn-2": 1.0}
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=StepRewardAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        workflow._start_session = AsyncMock(
+            return_value=("grp-test-1", [("sess-1", "sess-api-key-1")])
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value={"turn-1": MagicMock(), "turn-2": MagicMock()}
+        )
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as context,
+            patch("areal.v2.inference_service.controller.workflow.stats_tracker"),
+        ):
+            context.get_aiohttp_session = AsyncMock(return_value=AsyncMock())
+            context.get.return_value = MagicMock(task_id=42)
+            context.get_httpx_client = AsyncMock(return_value=MagicMock())
+            context.stat_scope.return_value = "rollout"
+
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        assert result is not None
+        # A single request carries every step reward so the data proxy applies
+        # them all before finalizing the trajectory once.
+        assert workflow._set_last_reward.await_args_list == [
+            call(
+                context.get_aiohttp_session.return_value,
+                1.0,
+                "sess-api-key-1",
+                rewards={"turn-1": -0.25, "turn-2": 1.0},
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_type", [RuntimeError, httpx.ConnectError])
+    @pytest.mark.parametrize("failure_stage", ["agent", "reward"])
+    async def test_offline_failure_discards_export_without_fallback_reward(
+        self, error_type, failure_stage
+    ):
+        """Agent/reward failures discard all sessions without a zero-reward retry."""
+
+        class FailingAgent:
+            async def run(self, data, **kwargs):
+                if failure_stage == "agent":
+                    raise error_type("agent failed")
+                return 1.0
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=FailingAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            group_size=2,
+            reward_normalization=True,
+        )
+        workflow._start_session = AsyncMock(
+            return_value=(
+                "grp-test-1",
+                [("sess-1", "key-1"), ("sess-2", "key-2")],
+            )
+        )
+        workflow._set_last_reward = AsyncMock(
+            side_effect=error_type("reward write failed")
+        )
+        workflow._export_interactions = AsyncMock(return_value={})
+
+        with patch(
+            "areal.v2.inference_service.controller.workflow.workflow_context"
+        ) as context:
+            context.get_aiohttp_session = AsyncMock(return_value=AsyncMock())
+            context.get.return_value = MagicMock(task_id=42)
+            context.get_httpx_client = AsyncMock(return_value=MagicMock())
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        assert result is None
+        if failure_stage == "agent":
+            workflow._set_last_reward.assert_not_awaited()
+        else:
+            assert workflow._set_last_reward.await_count == 2
+            workflow._set_last_reward.assert_has_awaits(
+                [
+                    call(
+                        context.get_aiohttp_session.return_value,
+                        1.0,
+                        "key-1",
+                        rewards=None,
+                    ),
+                    call(
+                        context.get_aiohttp_session.return_value,
+                        1.0,
+                        "key-2",
+                        rewards=None,
+                    ),
+                ],
+                any_order=True,
+            )
+        workflow._export_interactions.assert_awaited_once_with(
+            context.get_aiohttp_session.return_value,
+            ["sess-1", "sess-2"],
+            group_id="grp-test-1",
+            discard_trajectory=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_offline_group_is_concurrent_by_default(self):
+        result, max_active, start_order, tracker, _ = await self._run_offline_group(
+            serialize_group_samples=False,
+        )
+
+        assert result is not None
+        assert max_active == 4
+        assert sorted(start_order) == [0, 1, 2, 3]
+        assert tracker.scalar.call_args_list == [
+            call(reward=0.0),
+            call(reward=1.0),
+            call(reward=2.0),
+            call(reward=3.0),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_offline_group_serial_flag_preserves_within_group_order(self):
+        result, max_active, start_order, tracker, _ = await self._run_offline_group(
+            serialize_group_samples=True,
+        )
+
+        assert result is not None
+        assert max_active == 1
+        assert start_order == [0, 1, 2, 3]
+        assert tracker.scalar.call_args_list == [
+            call(reward=0.0),
+            call(reward=1.0),
+            call(reward=2.0),
+            call(reward=3.0),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            "serialize_group_samples",
+            "drop_incomplete_group",
+            "min_usable_group_size",
+            "is_trainable",
+        ),
+        [
+            (False, False, 1, True),
+            (True, False, 1, True),
+            (True, True, 1, False),
+            (True, False, 4, False),
+        ],
+    )
+    async def test_offline_group_failure_respects_policy_without_fallback_reward(
+        self,
+        serialize_group_samples,
+        drop_incomplete_group,
+        min_usable_group_size,
+        is_trainable,
+    ):
+        """Failed members skip fallback rewards and follow the group policy."""
+        (
+            result,
+            max_active,
+            start_order,
+            tracker,
+            workflow,
+        ) = await self._run_offline_group(
+            serialize_group_samples=serialize_group_samples,
+            failing_member=1,
+            drop_incomplete_group=drop_incomplete_group,
+            min_usable_group_size=min_usable_group_size,
+        )
+
+        assert (result is not None) is is_trainable
+        assert max_active == (1 if serialize_group_samples else 4)
+        assert start_order == [0, 1, 2, 3]
+        assert workflow._set_last_reward.await_count == 3
+        assert {
+            (args.args[1], args.args[2])
+            for args in workflow._set_last_reward.await_args_list
+        } == {(0.0, "session-key-0"), (2.0, "session-key-2"), (3.0, "session-key-3")}
+        assert tracker.scalar.call_args_list == (
+            [call(reward=0.0), call(reward=2.0), call(reward=3.0)]
+            if is_trainable
+            else []
         )
 
 
@@ -741,9 +1274,12 @@ class TestMultiNodeConfig:
         assert len(data_proxy_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_async_initialize_multinode_fork_path(self):
+    async def test_async_initialize_multinode_fork_path(self, monkeypatch):
         """Exercise the full multi-node fork path (server_infos=None)."""
         from areal.api.cli_args import SchedulingSpec
+
+        monkeypatch.setenv("TRITON_CACHE_DIR", "/tmp/controller-triton-dir")
+        monkeypatch.setenv("TRITON_CACHE_PATH", "/tmp/controller-triton-path")
 
         worker0 = MagicMock()
         worker0.ip = "10.0.0.1"
@@ -771,6 +1307,7 @@ class TestMultiNodeConfig:
 
         # Track async client .post calls to /alloc_ports and /fork
         alloc_port_counter = 0
+        alloc_calls = []
         fork_calls = []
 
         async def mock_async_post(url, json=None, timeout=None):
@@ -780,10 +1317,13 @@ class TestMultiNodeConfig:
             resp.raise_for_status = MagicMock()
             if "/alloc_ports" in url:
                 alloc_port_counter += 1
+                alloc_calls.append(json)
+                port_count = json["count"]
+                first_port = 30000 + 2 * alloc_port_counter
                 resp.json.return_value = {
                     "status": "success",
                     "host": url.split("//")[1].split(":")[0],
-                    "ports": [30000 + alloc_port_counter],
+                    "ports": list(range(first_port, first_port + port_count)),
                 }
             elif "/fork" in url:
                 fork_calls.append(json)
@@ -821,9 +1361,13 @@ class TestMultiNodeConfig:
         job = create_call.kwargs.get("job") or create_call.args[0]
         assert job.replicas == 2
 
-        # Async client .post calls for inf server fork:
-        # 1 rendezvous alloc (nnodes_per_instance > 1) + 2 node allocs + 2 forks = 5
-        assert alloc_port_counter == 3  # 1 rendezvous + 2 per-node
+        # One owner-bound reservation per inference worker. The head reserves
+        # both its HTTP port and the distributed rendezvous port.
+        assert alloc_port_counter == 2
+        assert alloc_calls == [
+            {"count": 2, "role": "inf-server", "worker_index": 0},
+            {"count": 1, "role": "inf-server", "worker_index": 1},
+        ]
         assert len(fork_calls) == 2  # 1 per node in the group
 
         # Verify fork payloads have correct worker_index and role
@@ -831,6 +1375,19 @@ class TestMultiNodeConfig:
         assert fork_calls[0]["worker_index"] == 0
         assert fork_calls[1]["role"] == "inf-server"
         assert fork_calls[1]["worker_index"] == 1
+
+        cache_dirs = [fc["env"]["TRITON_CACHE_DIR"] for fc in fork_calls]
+        cache_paths = [fc["env"]["TRITON_CACHE_PATH"] for fc in fork_calls]
+        assert all(
+            path.startswith("/tmp/controller-triton-dir/inf-server-")
+            for path in cache_dirs
+        )
+        assert all(
+            path.startswith("/tmp/controller-triton-path/inf-server-")
+            for path in cache_paths
+        )
+        assert len(set(cache_dirs)) == 2
+        assert len(set(cache_paths)) == 2
 
         # Verify dist_init_addr propagated to fork commands
         for fc in fork_calls:
@@ -842,3 +1399,67 @@ class TestMultiNodeConfig:
             c for c in mock_fork.call_args_list if c.kwargs.get("role") == "data-proxy"
         ]
         assert len(data_proxy_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_fork_inf_servers_failure_releases_owned_ports(self):
+        worker = MagicMock()
+        worker.ip = "10.0.0.1"
+        worker.worker_ports = [18000]
+
+        cfg = InferenceEngineConfig(
+            tokenizer_path="mock-tokenizer",
+            backend="sglang:d1",
+        )
+        controller = RolloutControllerV2(
+            config=cfg, scheduler=MagicMock(n_gpus_per_node=8)
+        )
+        requests = []
+
+        async def mock_async_post(url, json=None, timeout=None):
+            requests.append((url, json))
+            resp = MagicMock()
+            if url.endswith("/alloc_ports"):
+                resp.json.return_value = {
+                    "status": "success",
+                    "host": "10.0.0.1",
+                    "ports": [30000],
+                }
+            elif url.endswith("/fork"):
+                resp.raise_for_status.side_effect = RuntimeError("fork failed")
+            return resp
+
+        mock_async_client = AsyncMock()
+        mock_async_client.post = mock_async_post
+
+        with (
+            patch.object(
+                controller, "_get_async_client", return_value=mock_async_client
+            ),
+            patch(
+                "areal.api.cli_args.SGLangConfig.build_cmd_from_args",
+                return_value=["python", "-m", "sglang.launch_server"],
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="fork failed"):
+                await controller._async_fork_inf_servers(
+                    cfg=cfg,
+                    alloc=None,
+                    inf_backend="sglang",
+                    inf_workers=[worker],
+                    dp_size=1,
+                    nnodes_per_instance=1,
+                    worker_env={},
+                    server_args=None,
+                )
+
+        assert requests[0] == (
+            "http://10.0.0.1:18000/alloc_ports",
+            {"count": 1, "role": "inf-server", "worker_index": 0},
+        )
+        assert [url.rsplit("/", 1)[-1] for url, _ in requests[-2:]] == [
+            "kill_forked_worker",
+            "release_ports",
+        ]
+        assert controller._inf_addrs == []
+        assert controller._server_infos == []
+        assert controller._forked_services == []

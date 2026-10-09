@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
-
 import torch
 
 from areal.api.cli_args import PPOActorConfig
@@ -74,7 +72,11 @@ def test_compute_logp_logs_rollout_train_r3_metrics():
     result = actor._compute_logp(data)
 
     torch.testing.assert_close(result, train_logp, rtol=0, atol=0)
+    # Compact diagnostics retain scalar sufficient statistics, not token arrays.
+    tracker = stats_tracker.DEFAULT_TRACKER
+    assert "compute_logp/r3/rollout_train_k3_kl" in tracker.compact_keys
     exported = stats_tracker.export(reset=True)
+    assert exported["compute_logp/r3/n_valid_tokens"] == 2.0
     delta = torch.tensor([0.2, -0.4], dtype=torch.float32)
     assert exported["compute_logp/r3/enabled"] == 1.0
     torch.testing.assert_close(
@@ -145,17 +147,22 @@ def test_compute_logp_logs_r3_disabled_for_rollout_train_metrics():
     assert exported["compute_logp/r3/enabled"] == 0.0
 
 
-def test_split_r3_minibatches_follows_forward_indices():
+def test_split_r3_minibatches_reorders_rows_and_skips_transport_dummy():
     actor = PPOActor(PPOActorConfig(), _FakeR3Engine())
     routed = torch.arange(3 * 4 * 2 * 2).reshape(3, 4, 2, 2)
     valid = torch.tensor([True, False, True])
-    mb_inputs = SimpleNamespace(
-        forward_indices=[2, 0, 1],
-        mbs=[
-            {"input_ids": torch.ones(2, 4)},
-            {"input_ids": torch.ones(1, 4)},
-        ],
-    )
+    mb_inputs = [
+        {
+            "input_ids": torch.ones(2, 4),
+            "_r3_row_indices": torch.tensor([[2] * 4, [0] * 4]),
+        },
+        {"input_ids": torch.ones(1, 4), "_r3_row_indices": torch.tensor([[1] * 4])},
+        {
+            "input_ids": torch.ones(1, 1),
+            "_transport_dummy": True,
+            "_r3_row_indices": torch.zeros(1, 1, dtype=torch.long),
+        },
+    ]
 
     r3_mbs = actor._split_r3_minibatches(routed, valid, mb_inputs)
 
@@ -163,3 +170,32 @@ def test_split_r3_minibatches_follows_forward_indices():
     torch.testing.assert_close(r3_mbs[0][1], valid[[2, 0]], rtol=0, atol=0)
     torch.testing.assert_close(r3_mbs[1][0], routed[[1]], rtol=0, atol=0)
     torch.testing.assert_close(r3_mbs[1][1], valid[[1]], rtol=0, atol=0)
+
+    assert r3_mbs[2] == (None, None)
+    assert all("_r3_row_indices" not in mb for mb in mb_inputs)
+
+
+def test_split_r3_minibatches_real_splitter_preserves_variable_length_rows():
+    """The balanced PPO split must carry each row's original routing."""
+    from areal.utils.data import split_training_batch_into_microbatches
+
+    actor = PPOActor(PPOActorConfig(), _FakeR3Engine())
+    routed = torch.arange(4 * 6 * 2 * 2).reshape(4, 6, 2, 2)
+    valid = torch.tensor([True, False, True, True])
+    row_ids = torch.arange(4, dtype=torch.long).unsqueeze(1).expand(-1, 6)
+    data = {
+        "input_ids": row_ids.clone(),
+        "attention_mask": torch.arange(6).unsqueeze(0)
+        < torch.tensor([6, 1, 4, 2]).unsqueeze(1),
+        "_r3_row_indices": row_ids,
+    }
+    minibatches = split_training_batch_into_microbatches(data, n_mbs=3)
+    r3_minibatches = actor._split_r3_minibatches(routed, valid, minibatches)
+    seen = []
+    for mb, (routes, validity) in zip(minibatches, r3_minibatches, strict=True):
+        indices = mb["input_ids"][:, 0]
+        seen.extend(indices.tolist())
+        torch.testing.assert_close(routes, routed[indices], rtol=0, atol=0)
+        torch.testing.assert_close(validity, valid[indices], rtol=0, atol=0)
+        assert "_r3_row_indices" not in mb
+    assert sorted(seen) == [0, 1, 2, 3]

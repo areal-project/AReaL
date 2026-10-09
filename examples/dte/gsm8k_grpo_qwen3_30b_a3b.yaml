@@ -1,0 +1,209 @@
+defaults:
+  - ../math/gsm8k_grpo_megatron@_global_
+  - _self_
+
+experiment_name: gsm8k-grpo-qwen3-30b-a3b-dte
+trial_name: trial0
+
+seed: 42
+# Separation keeps the actor parameters and AdamW moments resident so DTE can
+# reconstruct the pre-step weights.
+enable_offload: false
+total_train_epochs: 10
+total_train_steps: 20
+tokenizer_path: ${actor.path}
+
+# Training and rollout are scheduled on separate 8-GPU allocations.
+cluster:
+  n_nodes: 2
+  n_gpus_per_node: 8
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+scheduler:
+  type: null
+
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 2048
+  max_tokens: 3072
+  greedy: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 1000000
+
+rollout:
+  _version: v2
+  backend: "sglang:d2t4p1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  setup_timeout: 43200
+  request_timeout: 7200
+  workers_ready_timeout: 43200
+  pause_grace_period: 30
+  max_concurrent_rollouts: 64
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 8
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  scheduling_strategy:
+    type: separation
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: false
+  agent:
+    mode: inline
+    export_style: individual
+    turn_discount: 1.0
+
+actor:
+  _version: v2
+  backend: "megatron:(attn:d2p1t4|ffn:d1p1e8)"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3-30B-A3B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 6144
+    n_mbs_divisor: 1
+  optimizer:
+    type: adam
+    lr: 3e-6
+    weight_decay: 0.003
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: true
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+    moe_router_bias_update_rate: 0.0
+  eps_clip: 0.4
+  eps_clip_higher: null
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: false
+  prox_logp_method: reuse_train_logp
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  weight_update_mode: awex
+  enable_delta_weight_update: true
+  weight_update_delta_method: adamw
+  weight_update_anchor_interval: 20
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 64
+      image: /path/to/areal.sif
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        # These values match the effective defaults and make the optimized
+        # separation path visible to readers of this standalone example.
+        DTE_STREAMING_RECONSTRUCT: "1"
+        DTE_DELTA_P2P_COALESCE: "1"
+        DTE_INVERSION_ALLREDUCE_WINDOW_MB: "512"
+        DTE_INVERSION_COMPUTE_ON_CPU: "0"
+
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: ${actor.mb_spec.max_tokens_per_mb}
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  max_running_requests: null
+  context_length: 32768
+  mem_fraction_static: 0.65
+  cuda_graph_max_bs: 16
+
+train_dataset:
+  batch_size: 8
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: openai/gsm8k
+  type: rl
+  max_length: 1024
+
+valid_dataset:
+  batch_size: 8
+  pin_memory: true
+  num_workers: 4
+  path: openai/gsm8k
+  type: rl
+
+saver:
+  mode: auto
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+evaluator:
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  enabled: false

@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler, Worker
 
 logger = logging.getLogger("DataController")
+_CACHE_ATTEMPT_ID_KEY = "_areal_cache_attempt_id"
 
 
 class DataController:
@@ -331,6 +333,12 @@ class DataController:
         """
         self._ensure_initialized()
 
+        worker_dataset_kwargs = dict(dataset_kwargs or {})
+        # Reserved coordination state is generated per registration and
+        # overwritten here so caller-provided dataset kwargs cannot make a new
+        # launcher consume another launcher's cache-build failure marker.
+        worker_dataset_kwargs[_CACHE_ATTEMPT_ID_KEY] = uuid.uuid4().hex
+
         payload = {
             "dataset_id": dataset_id,
             "dataset_path": dataset_path,
@@ -340,7 +348,7 @@ class DataController:
             "max_length": max_length,
             "shuffle": shuffle,
             "drop_last": drop_last,
-            "dataset_kwargs": dataset_kwargs or {},
+            "dataset_kwargs": worker_dataset_kwargs,
         }
 
         from areal.infra.utils.concurrent import run_async_task
@@ -413,20 +421,28 @@ class DataController:
 
     async def _async_clear_batches(self) -> None:
         async def _clear_one(session: aiohttp.ClientSession, addr: str) -> None:
-            try:
-                async with session.delete(
-                    f"{addr}/data/clear",
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    resp.raise_for_status()
-            except Exception:
-                logger.debug("Failed to clear batches on %s", addr)
+            async with session.delete(
+                f"{addr}/data/clear",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
 
         async with aiohttp.ClientSession(trust_env=False) as session:
-            await asyncio.gather(
-                *(_clear_one(session, addr) for addr in self._worker_addrs),
+            clear_requests = list(self._worker_addrs)
+            results = await asyncio.gather(
+                *(_clear_one(session, addr) for addr in clear_requests),
                 return_exceptions=True,
             )
+            for addr, result in zip(clear_requests, results, strict=True):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                if isinstance(result, BaseException):
+                    logger.warning(
+                        "Failed to clear batches on data worker %s: %s: %s",
+                        addr,
+                        type(result).__name__,
+                        result,
+                    )
 
     # -- Destroy -----------------------------------------------------------
 
@@ -489,7 +505,7 @@ class DataController:
     ) -> tuple[str, int]:
         async with session.post(
             f"{guard_addr}/alloc_ports",
-            json={"count": 1},
+            json={"count": 1, "role": role, "worker_index": worker_index},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             resp.raise_for_status()
@@ -499,21 +515,33 @@ class DataController:
 
         cmd = list(raw_cmd) + ["--host", host, "--port", str(port)]
 
-        async with session.post(
-            f"{guard_addr}/fork",
-            json={
-                "role": role,
-                "worker_index": worker_index,
-                "raw_cmd": cmd,
-            },
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            resp.raise_for_status()
+        try:
+            async with session.post(
+                f"{guard_addr}/fork",
+                json={
+                    "role": role,
+                    "worker_index": worker_index,
+                    "raw_cmd": cmd,
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                resp.raise_for_status()
 
-        self._forked_services.append((guard_addr, role, worker_index))
+            self._forked_services.append((guard_addr, role, worker_index))
 
-        addr = f"http://{format_hostport(host, port)}"
-        await self._async_wait_for_service(session, f"{addr}{health_path}", role)
+            addr = f"http://{format_hostport(host, port)}"
+            await self._async_wait_for_service(session, f"{addr}{health_path}", role)
+        except BaseException:
+            for endpoint in ("kill_forked_worker", "release_ports"):
+                try:
+                    async with session.post(
+                        f"{guard_addr}/{endpoint}",
+                        json={"role": role, "worker_index": worker_index},
+                    ):
+                        pass
+                except Exception:
+                    pass
+            raise
 
         return host, port
 

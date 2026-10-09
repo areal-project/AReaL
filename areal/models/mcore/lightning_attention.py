@@ -194,33 +194,35 @@ def _build_zigzag_undo_indices(
     Supports both packed sequences (per-sequence zigzag via cu_seqlens) and
     fixed-length BSHD format (cu_seqlens=None -> single global sequence).
     """
-    indices = torch.empty(total_len, dtype=torch.long, device=device)
-    t_per_cp = total_len // cp_size
+    indices = torch.arange(total_len, dtype=torch.long, device=device)
+    if cp_size <= 1:
+        return indices
 
     if cu_seqlens is None:
-        seq_bounds = [(0, total_len)]
+        cu = torch.tensor([0, total_len], dtype=torch.long, device=device)
     else:
-        seq_bounds = [
-            (cu_seqlens[i].item(), cu_seqlens[i + 1].item())
-            for i in range(cu_seqlens.shape[0] - 1)
-        ]
+        cu = cu_seqlens.to(device=device, dtype=torch.long)
+    lens = cu[1:] - cu[:-1]
+    if bool(((lens % (2 * cp_size)) != 0).any()):
+        raise ValueError(
+            f"Packed sequence lengths {lens.tolist()} must be divisible by "
+            f"2*CP={2 * cp_size} for CP zigzag reorder."
+        )
 
-    for cu_start, cu_end in seq_bounds:
-        seq_len = cu_end - cu_start
-        chunk = seq_len // (2 * cp_size)
-        cu_s = cu_start // cp_size
-
-        for j in range(cp_size):
-            block_start = j * t_per_cp + cu_s
-            base = torch.arange(chunk, device=device)
-
-            dst_front = cu_start + j * chunk
-            indices[dst_front : dst_front + chunk] = block_start + base
-
-            dst_back = cu_start + seq_len - (j + 1) * chunk
-            indices[dst_back : dst_back + chunk] = block_start + chunk + base
-
-    return indices
+    t_per_cp = total_len // cp_size
+    # Fully vectorized (no per-sequence GPU->CPU sync): canonical position p
+    # in sequence i with offset o and zigzag chunk size c falls in chunk
+    # k = o // c — rank k's front half for k < cp, rank 2*cp-1-k's mirrored
+    # back half otherwise.
+    seq = torch.searchsorted(cu, indices, right=True) - 1
+    o = indices - cu[seq]
+    c = (lens // (2 * cp_size))[seq]
+    cu_s = (cu[:-1] // cp_size)[seq]
+    k = o // c
+    j = o % c
+    front = k < cp_size
+    rank = torch.where(front, k, 2 * cp_size - 1 - k)
+    return rank * t_per_cp + cu_s + torch.where(front, j, j + c)
 
 
 def _build_zigzag_redo_indices(undo_indices: torch.Tensor) -> torch.Tensor:
@@ -228,6 +230,37 @@ def _build_zigzag_redo_indices(undo_indices: torch.Tensor) -> torch.Tensor:
     redo = torch.empty_like(undo_indices)
     redo[undo_indices] = torch.arange(len(undo_indices), device=undo_indices.device)
     return redo
+
+
+def _get_zigzag_undo_redo_indices(
+    total_len: int,
+    cp_size: int,
+    cu_seqlens: torch.Tensor | None,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build (or fetch cached) zigzag undo/redo index pairs.
+
+    The permutation only depends on (total_len, cp_size, cu_seqlens), which
+    are identical for every attention layer — and every recompute replay —
+    of the same microbatch, so cache on the cu_seqlens tensor object instead
+    of rebuilding per layer.
+    """
+    key = (int(total_len), int(cp_size), str(device))
+    cache = (
+        getattr(cu_seqlens, "_zigzag_idx_cache", None)
+        if cu_seqlens is not None
+        else None
+    )
+    if cache is not None and key in cache:
+        return cache[key]
+    undo = _build_zigzag_undo_indices(total_len, cp_size, cu_seqlens, device)
+    redo = _build_zigzag_redo_indices(undo)
+    if cu_seqlens is not None:
+        if cache is None:
+            cache = {}
+            cu_seqlens._zigzag_idx_cache = cache
+        cache[key] = (undo, redo)
+    return undo, redo
 
 
 @dataclass
@@ -657,7 +690,7 @@ class LightningSelfAttention(MegatronModule):
             full_seq_len = query.shape[0]
 
             # Undo zigzag: restore sequential token order for linear attention
-            undo_idx = _build_zigzag_undo_indices(
+            undo_idx, redo_idx = _get_zigzag_undo_redo_indices(
                 full_seq_len, cp_size, cu_seqlens, query.device
             )
             query = query[undo_idx]
@@ -673,7 +706,6 @@ class LightningSelfAttention(MegatronModule):
             )
 
             # Redo zigzag: restore zigzag order for all-to-all
-            redo_idx = _build_zigzag_redo_indices(undo_idx)
             attn_output = attn_output[redo_idx]
 
             # All-to-all: [S, B, H_local/CP, D] -> [S/CP, B, H_local, D]

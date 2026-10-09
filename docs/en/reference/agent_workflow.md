@@ -12,9 +12,9 @@ learning.
 1. Read the [`RolloutWorkflow` reference](../reference/rollout_workflow.md) first, as
    agent workflows are built on top of `RolloutWorkflow`.
 
-1. **Scheduler compatibility**: Agent workflows are supported on `local` and `slurm`
-   schedulers only. The `ray` scheduler is incompatible with the HTTP proxy
-   architecture.
+1. **Scheduler compatibility**: Agent workflows are supported on the `local`, `slurm`,
+   and `ray` schedulers. Proxy servers are forked as HTTP worker processes colocated
+   with their rollout workers.
 
 ## Overview
 
@@ -562,6 +562,11 @@ The `ArealOpenAI` class extends `AsyncOpenAI` for direct engine integration:
 | ------------ | -------------------------------------------------------------------------------------------------------------------- |
 | `individual` | Returns all interactions as separate entries. Trajectories may share prefixes.                                       |
 | `concat`     | Builds conversation tree, returns only leaf nodes. Only valid for linear conversations with matched token sequences. |
+
+`individual` exports several samples per episode, which on grouped rollouts
+(`n_samples >= 2`) is incompatible with group-relative normalization and raises a
+non-retryable `WorkflowContractError`; see the
+[grouped-rollout contract](rollout_workflow.md#grouped-rollout).
 
 ## Public API
 

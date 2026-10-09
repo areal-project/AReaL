@@ -172,8 +172,105 @@ def test_process_tool_calls_qwen3_coder_xml_parameters_without_sglang():
     assert "I'll inspect the repository." in new_text
 
 
-def test_qwen3_coder_xml_empty_args_returns_no_parse():
-    text = "<tool_call>\n<function=Bash>\n</function>\n</tool_call>"
+def test_qwen3_coder_repairs_declared_tool_mislabeled_as_parameter():
+    """Replay the malformed outer tag observed in a Qwen3.8 Arena failure."""
+    tools: list[ChatCompletionToolParam] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "Skill",
+                "description": "Invoke a skill.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "skill": {"type": "string"},
+                        "args": {"type": "string"},
+                    },
+                    "required": ["skill"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "mcp__harness__prepare_dependencies",
+                "description": "Prepare dependencies.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"project_dir": {"type": "string"}},
+                },
+            },
+        },
+    ]
+    text = (
+        "<tool_call>\n"
+        "<parameter=Skill>\n"
+        "<parameter=skill>\nthreejs-modeling-rigid-prop\n</parameter>\n"
+        "<parameter=args>\nbuild a weather station\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>\n"
+        "<tool_call>\n"
+        "<parameter=mcp__harness__prepare_dependencies>\n"
+        "<parameter=project_dir>\ngame\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+
+    tool_calls, new_text, finish_reason = parser_module.process_tool_calls(
+        text=text,
+        tools=tools,
+        tool_call_parser="qwen3_coder",
+        reasoning_parser="qwen3",
+        finish_reason="stop",
+        use_responses=False,
+        tokenizer=object(),
+    )
+
+    assert finish_reason == "tool_calls"
+    assert new_text == "\n"
+    assert tool_calls is not None
+    assert [call.function.name for call in tool_calls] == [
+        "Skill",
+        "mcp__harness__prepare_dependencies",
+    ]
+    assert json.loads(tool_calls[0].function.arguments) == {
+        "skill": "threejs-modeling-rigid-prop",
+        "args": "build a weather station",
+    }
+    assert json.loads(tool_calls[1].function.arguments) == {"project_dir": "game"}
+
+
+def test_qwen3_coder_does_not_repair_unknown_mislabeled_tool():
+    text = (
+        "<tool_call>\n"
+        "<parameter=UnknownTool>\n"
+        "<parameter=value>\nunsafe guess\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+
+    tool_calls, new_text, finish_reason = (
+        parser_module._process_tool_calls_qwen3_coder_xml(
+            text=text,
+            tools=QWEN3_CODER_TOOLS,
+            finish_reason="stop",
+        )
+    )
+
+    assert tool_calls is None
+    assert new_text == text
+    assert finish_reason == "stop"
+
+
+def test_qwen3_coder_xml_empty_args_returns_no_partial_parse():
+    text = (
+        "<tool_call>\n"
+        "<function=Bash>\n"
+        "<parameter=command>\npwd\n</parameter>\n"
+        "</function>\n"
+        "<function=Write>\n</function>\n"
+        "</tool_call>"
+    )
 
     tool_calls, new_text, finish_reason = (
         parser_module._process_tool_calls_qwen3_coder_xml(
@@ -207,6 +304,91 @@ def test_qwen3_coder_xml_literal_closing_tag_is_not_silently_truncated():
     assert tool_calls is None
     assert new_text == text
     assert finish_reason == "stop"
+
+
+@pytest.mark.sglang
+@pytest.mark.parametrize("reasoning_parser", ["", None], ids=["empty", "none"])
+def test_process_tool_calls_without_reasoning_parser_returns_plain_text(
+    reasoning_parser: str | None,
+):
+    """An empty reasoning parser disables reasoning extraction on CPU."""
+    pytest.importorskip(
+        "sglang.srt.function_call.function_call_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+    pytest.importorskip(
+        "sglang.srt.parser.reasoning_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+    text = "The task is complete."
+
+    tool_calls, new_text, finish_reason = parser_module.process_tool_calls(
+        text=text,
+        tools=QWEN3_CODER_TOOLS,
+        tool_call_parser="qwen3_coder",
+        reasoning_parser=reasoning_parser,
+        finish_reason="stop",
+        use_responses=False,
+        tokenizer=object(),
+    )
+
+    assert tool_calls is None
+    assert new_text == text
+    assert finish_reason == "stop"
+
+
+@pytest.mark.sglang
+def test_process_tool_calls_invalid_reasoning_parser_reports_config_key():
+    """Invalid parser names identify the exact rollout configuration field."""
+    pytest.importorskip(
+        "sglang.srt.function_call.function_call_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+    pytest.importorskip(
+        "sglang.srt.parser.reasoning_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"rollout\.openai\.reasoning_parser='not-a-parser'.*qwen3_coder",
+    ):
+        parser_module.process_tool_calls(
+            text="The task is complete.",
+            tools=QWEN3_CODER_TOOLS,
+            tool_call_parser="qwen3_coder",
+            reasoning_parser="not-a-parser",
+            finish_reason="stop",
+            use_responses=False,
+            tokenizer=object(),
+        )
+
+
+@pytest.mark.sglang
+def test_process_tool_calls_invalid_tool_parser_reports_config_key():
+    """Invalid tool parser names identify the exact rollout config field."""
+    pytest.importorskip(
+        "sglang.srt.function_call.function_call_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+    pytest.importorskip(
+        "sglang.srt.parser.reasoning_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"rollout\.openai\.tool_call_parser='not-a-parser'.*qwen3_coder",
+    ):
+        parser_module.process_tool_calls(
+            text="The task is complete.",
+            tools=QWEN3_CODER_TOOLS,
+            tool_call_parser="not-a-parser",
+            reasoning_parser=None,
+            finish_reason="stop",
+            use_responses=False,
+            tokenizer=object(),
+        )
 
 
 @pytest.mark.sglang

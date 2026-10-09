@@ -7,11 +7,11 @@ the OpenAI chat-completions protocol.
 
 > **See also**
 >
-> - [Agentic RL tutorial](../../docs/tutorial/agentic_rl.md) — background on how AReaL
->   trains agents
-> - [Custom agent workflows](../../docs/customization/agent.md) — how to integrate your
->   own agent framework
-> - [Agent workflow reference](../../docs/reference/agent_workflow.md) — internal
+> - [Agentic RL tutorial](../../docs/en/tutorial/agentic_rl.md) — background on how
+>   AReaL trains agents
+> - [Custom agent workflows](../../docs/en/customization/agent.md) — how to integrate
+>   your own agent framework
+> - [Agent workflow reference](../../docs/en/reference/agent_workflow.md) — internal
 >   architecture details
 
 **Disclaimer**: RL-finetuned models may exhibit unexpected behaviors. Please ensure
@@ -66,9 +66,9 @@ Take note of the gateway address — you will need it for all subsequent steps.
 > You can modify `examples/openclaw/config.yaml` to suit your setup. Command-line
 > arguments override values in the YAML file, and all options are parsed into the
 > dataclasses defined in `areal/api/cli_args.py`. See the
-> [CLI reference](../../docs/cli_reference.md) for a full description of each field and
-> the [allocation mode reference](../../docs/reference/alloc_mode.md) for GPU layout
-> options.
+> [CLI reference](../../docs/en/cli_reference.md) for a full description of each field
+> and the [allocation mode reference](../../docs/en/reference/alloc_mode.md) for GPU
+> layout options.
 
 ### 3. Set up ZeroClaw (agent runtime)
 
@@ -216,12 +216,12 @@ or reload.
 
 In other words, your agent improves silently as you continue to collect episodes. For
 details on asynchronous training and staleness control, see our
-[code walkthrough](../../docs/tutorial/gsm8k_grpo.md) and
+[code walkthrough](../../docs/en/tutorial/gsm8k_grpo.md) and
 [paper](https://arxiv.org/abs/2505.24298).
 
 ## Next steps
 
 - Try the all-in-one demo with key reuse:
   `python demo_lifecycle.py http://<gateway> --admin-key <key>`
-- Explore the full [quickstart tutorial](../../docs/tutorial/quickstart.md) for
+- Explore the full [quickstart tutorial](../../docs/en/tutorial/quickstart.md) for
   dataset-driven RL training

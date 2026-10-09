@@ -59,6 +59,31 @@ class StripAllSystemReminders:
         return messages
 
 
+class MergeSystemMessages:
+    """Merge all system messages into one leading message.
+
+    Anthropic requests may contain multiple system content blocks.  Some
+    adapters translate those blocks into separate OpenAI system messages,
+    while Qwen chat templates accept exactly one system message at index zero.
+    Coalescing the translated blocks preserves their order and keeps the
+    remaining conversation unchanged.
+    """
+
+    def __call__(self, messages: list[dict]) -> list[dict]:
+        system_messages = [msg for msg in messages if msg.get("role") == "system"]
+        if not system_messages:
+            return messages
+
+        merged = dict(system_messages[0])
+        contents = [
+            content
+            for msg in system_messages
+            if isinstance((content := msg.get("content")), str) and content
+        ]
+        merged["content"] = "\n\n".join(contents)
+        return [merged, *(msg for msg in messages if msg.get("role") != "system")]
+
+
 class StripAnthropicCacheFields:
     """Strip Anthropic-specific fields that are not preserved in stored output."""
 

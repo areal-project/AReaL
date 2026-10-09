@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from areal.api.cli_args import PRMConfig
 
 
 @dataclass
@@ -17,6 +19,7 @@ class DataProxyConfig:
     resubmit_wait: float = 0.5  # seconds between is_paused polls
     admin_api_key: str = "areal-admin-key"  # admin key for authentication
     callback_server_addr: str = ""
+    deterministic_sampling: bool = False
     # Resolved serving address (host:port) used as node_addr for RTensor shards.
     # Set at startup by __main__.py after the host is resolved.
     serving_addr: str = ""
@@ -31,3 +34,18 @@ class DataProxyConfig:
     return_routed_experts: bool = False
     r3_num_moe_layers: int | None = None
     r3_topk: int | None = None
+    message_preprocessors: tuple[str, ...] = ()
+    prefix_matcher: str | None = None
+    prm: PRMConfig = field(default_factory=PRMConfig)
+
+    def __post_init__(self) -> None:
+        if self.prm.enabled and self.prm.scorers and self.prm.error_policy != "reject":
+            raise ValueError(
+                "PRM keep_original error policy is only supported by the v1 proxy"
+            )
+        if (
+            self.prm.enabled
+            and self.prm.scorers
+            and self.chat_template_type != "concat"
+        ):
+            raise ValueError("PRM scorers require chat_template_type='concat'")

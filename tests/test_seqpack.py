@@ -221,13 +221,15 @@ class TestBalancedGreedyPartition:
         for g in groups:
             assert len(g) == expected_size
 
-    def test_raises_on_non_divisible(self):
-        """Test error when n is not divisible by K."""
+    def test_non_divisible_uses_nearly_equal_group_sizes(self):
+        """Test ragged partition cardinalities differ by at most one."""
         nums = [1, 2, 3, 4, 5]
         K = 2
 
-        with pytest.raises(ValueError, match="must be divisible by K"):
-            balanced_greedy_partition(nums, K)
+        groups = balanced_greedy_partition(nums, K)
+
+        assert sorted(len(group) for group in groups) == [2, 3]
+        assert sorted(index for group in groups for index in group) == list(range(5))
 
     def test_raises_on_too_few_items(self):
         """Test error when n < K."""

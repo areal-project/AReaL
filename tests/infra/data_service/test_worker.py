@@ -156,6 +156,48 @@ class TestDatasetLoading:
         assert data["steps_per_epoch"] > 0
         assert data["dataset_size"] == 20
 
+    async def test_load_dataset_passes_configured_worker_topology(self):
+        config = DataWorkerConfig(
+            host="127.0.0.1",
+            port=0,
+            rank=1,
+            world_size=2,
+            dataloader_num_workers=0,
+        )
+        with patch(
+            "areal.infra.data_service.worker.app._get_custom_dataset"
+        ) as mock_get:
+            mock_get.return_value = _make_mock_dataset(20)
+            app = create_worker_app(config)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    "/datasets/load",
+                    json=_load_payload(
+                        dataset_kwargs={
+                            "custom_option": "kept",
+                            "data_worker_rank": 99,
+                            "data_worker_world_size": 100,
+                            "cache_rank": 98,
+                            "cache_world_size": 101,
+                            "cache_attempt_id": "spoofed-public-attempt",
+                            "_areal_cache_attempt_id": "controller-attempt",
+                        }
+                    ),
+                )
+
+        assert response.status_code == 200
+        kwargs = mock_get.call_args.kwargs
+        assert kwargs["data_worker_rank"] == 1
+        assert kwargs["data_worker_world_size"] == 2
+        assert kwargs["custom_option"] == "kept"
+        assert "cache_rank" not in kwargs
+        assert "cache_world_size" not in kwargs
+        assert "cache_attempt_id" not in kwargs
+        assert kwargs["data_worker_cache_attempt_id"] == "controller-attempt"
+
     async def test_load_dataset_duplicate_409(self, loaded_client: httpx.AsyncClient):
         resp = await loaded_client.post("/datasets/load", json=_load_payload())
         assert resp.status_code == 409

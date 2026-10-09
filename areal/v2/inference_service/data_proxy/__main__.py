@@ -7,7 +7,9 @@ from __future__ import annotations
 import argparse
 
 import uvicorn
+from pydantic import TypeAdapter
 
+from areal.api.cli_args import PRMConfig
 from areal.infra.utils.http import (
     get_default_uvicorn_kwargs,
     validate_admin_api_key,
@@ -58,6 +60,11 @@ def main():
         default="",
     )
     parser.add_argument(
+        "--deterministic-sampling",
+        action="store_true",
+        help="Derive stable per-session request seeds.",
+    )
+    parser.add_argument(
         "--tool-call-parser",
         default="qwen",
     )
@@ -89,6 +96,20 @@ def main():
         type=int,
         default=None,
     )
+    parser.add_argument(
+        "--message-preprocessor",
+        action="append",
+        default=[],
+    )
+    parser.add_argument(
+        "--prefix-matcher",
+        default=None,
+    )
+    parser.add_argument(
+        "--prm-config",
+        default="{}",
+        help="JSON-encoded PRMConfig for complete concat trajectory scoring.",
+    )
     args, _ = parser.parse_known_args()
 
     validate_admin_api_key(args.host, args.admin_api_key)
@@ -111,6 +132,7 @@ def main():
         set_reward_finish_timeout=args.set_reward_finish_timeout,
         admin_api_key=args.admin_api_key,
         callback_server_addr=args.callback_server_addr,
+        deterministic_sampling=args.deterministic_sampling,
         serving_addr=format_hostport(serving_host, args.port),
         tool_call_parser=args.tool_call_parser,
         reasoning_parser=args.reasoning_parser,
@@ -119,6 +141,9 @@ def main():
         return_routed_experts=args.return_routed_experts,
         r3_num_moe_layers=args.r3_num_moe_layers,
         r3_topk=args.r3_topk,
+        message_preprocessors=tuple(args.message_preprocessor),
+        prefix_matcher=args.prefix_matcher,
+        prm=TypeAdapter(PRMConfig).validate_json(args.prm_config),
     )
     suppress_http_loggers()
     app = create_app(config)

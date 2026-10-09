@@ -147,6 +147,7 @@ class Scheduler(abc.ABC):
         role: str,
         target_role: str,
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Fork new worker processes from existing workers.
 
@@ -163,6 +164,8 @@ class Scheduler(abc.ABC):
             Custom module path to run instead of the default rpc_server.
             If specified, the forked process runs this module (e.g.,
             "areal.experimental.openai.proxy.proxy_rollout_server").
+        env_vars : list[dict[str, str]], optional
+            Per-worker environment overrides for the forked role.
 
         Returns
         -------

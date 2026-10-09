@@ -2,6 +2,7 @@
 
 from __future__ import annotations  # noqa
 
+import asyncio
 import json
 import os
 import random
@@ -34,15 +35,19 @@ from .workflow_context import WorkflowContext
 from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
     concat_string_interactions,
+    concat_tensor_interactions,
 )
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
-from areal.utils.data import concat_padded_tensors, cycle_dataloader
+from areal.utils.data import RolloutGroup, cycle_dataloader
 from areal.utils.perf_tracer import trace_perf, trace_session_event
 from logging import Logger
 
 if TYPE_CHECKING:
     from .remote_inf_engine import RemoteInfEngine
+
+
+_REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS = 5.0
 
 
 def check_trajectory_format(
@@ -238,10 +243,51 @@ class _RolloutTaskInput:
     is_eval: bool = False
 
 
-@dataclass
+@dataclass(frozen=True)
 class _RolloutResult:
     task_id: int
     trajectory: dict[str, Any]
+
+
+class WorkflowContractError(ValueError):
+    """Raised when a workflow violates a non-retryable output contract."""
+
+
+def validate_rollout_group_sizes(group_size: int, min_usable_group_size: int) -> None:
+    if group_size < 1:
+        raise ValueError(f"group_size must be >= 1, got {group_size}")
+    if not 1 <= min_usable_group_size <= group_size:
+        raise ValueError(
+            "min_usable_group_size must be between 1 and group_size "
+            f"({group_size}), got {min_usable_group_size}"
+        )
+
+
+@dataclass(frozen=True)
+class WorkflowContractFailure:
+    message: str
+
+
+WorkflowTaskResult = _RolloutResult | WorkflowContractFailure
+
+
+def get_workflow_result_error(
+    result: WorkflowTaskResult,
+) -> WorkflowContractError | None:
+    if isinstance(result, WorkflowContractFailure):
+        return WorkflowContractError(result.message)
+    return None
+
+
+def unwrap_workflow_result(
+    result: WorkflowTaskResult | None,
+) -> _RolloutResult | None:
+    if result is None:
+        return None
+    error = get_workflow_result_error(result)
+    if error is not None:
+        raise error
+    return result
 
 
 # Batch size for fetching from the async task runner
@@ -251,6 +297,13 @@ _SHUTDOWN_TIMEOUT_SECONDS = 2.0
 # Timeout for "wait" and "wait_for_task" if timeout parameter is None
 _DEFAULT_WAIT_TIMEOUT_SECONDS = float(7 * 24 * 3600)
 
+# Dynamic collection is declared stalled only when BOTH hold: this many
+# consecutive rounds added zero trainable groups, and the streak lasted at
+# least this long. Requiring both keeps fast legitimate all-reject bursts
+# (e.g. a staleness flush after a weight update) from aborting the run.
+MAX_CONSECUTIVE_EMPTY_ROLLOUT_ROUNDS = 8
+ROLLOUT_COLLECTION_STALL_TIMEOUT_SECONDS = 1800.0
+
 
 class WithTaskID(Protocol):
     task_id: int
@@ -258,6 +311,27 @@ class WithTaskID(Protocol):
 
 TInput = TypeVar("TInput", bound=WithTaskID)
 TResult = TypeVar("TResult")
+
+
+def _select_results(
+    drained: list,
+    count: int,
+    deterministic: bool,
+) -> tuple[list, list]:
+    """Order drained results, then split them into (selected, pending).
+
+    Normally results are taken oldest-first and the returned batch is
+    shuffled to avoid systematic ordering bias. Under deterministic sampling,
+    completed results are ordered by task ID and are not shuffled.
+    """
+    if deterministic:
+        drained.sort(key=lambda x: x.task_id)
+    else:
+        drained.sort(key=lambda x: x.create_time)
+    selected, pending = drained[:count], drained[count:]
+    if not deterministic:
+        random.shuffle(selected)
+    return selected, pending
 
 
 class BatchTaskDispatcher(Generic[TInput, TResult]):
@@ -279,6 +353,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         task_factory: Callable[[TInput], Callable[[], Awaitable[TResult | None]]],
         staleness_manager: StalenessManager,
         enable_tracing: bool = False,
+        terminal_error_fn: Callable[[TResult], Exception | None] | None = None,
+        deterministic_order: bool = False,
     ):
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
@@ -287,6 +363,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self.task_factory = task_factory
         self.staleness_manager = staleness_manager
         self.enable_tracing = enable_tracing
+        self.terminal_error_fn = terminal_error_fn
+        self.deterministic_order = deterministic_order
         self.logger: Logger
 
         # Unbounded deques for producer/consumer pattern
@@ -562,6 +640,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         -------
         list[TResult | None]
             List of task results, None for rejected tasks.
+
         """
         if count <= 0:
             raise ValueError(f"count must be positive, got {count}")
@@ -571,7 +650,12 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             timeout = _DEFAULT_WAIT_TIMEOUT_SECONDS
 
         with self._result_cv:
-            while len(self._pending_results) < count:
+            while True:
+                terminal_error = self._pop_terminal_error_locked()
+                if terminal_error is not None:
+                    raise terminal_error
+                if len(self._pending_results) >= count:
+                    break
                 self._check_thread_exception()
 
                 elapsed = time.perf_counter() - start_time
@@ -589,8 +673,11 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             drained: list[TimedResult[TResult]] = list(self._pending_results.values())
             self._pending_results.clear()
 
-        drained.sort(key=lambda x: x.create_time)
-        selected, pending = drained[:count], drained[count:]
+        selected, pending = _select_results(
+            drained,
+            count,
+            self.deterministic_order,
+        )
         with self._result_cv:
             if pending:
                 for result in pending:
@@ -599,12 +686,14 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             for r in selected:
                 self._active_task_ids.discard(r.task_id)
 
-        random.shuffle(selected)
-
         return [r.data for r in selected]
 
     def wait_for_task(
-        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+        self,
+        task_id: int,
+        timeout: float | None = None,
+        raise_timeout: bool = True,
+        raise_terminal_error: bool = True,
     ) -> TResult | None:
         """Wait for a specific task result by task_id."""
         start_time = time.perf_counter()
@@ -615,7 +704,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             if task_id not in self._active_task_ids:
                 raise ValueError(f"Task {task_id} is never submitted.")
 
-            while task_id not in self._pending_results:
+            while True:
+                if raise_terminal_error:
+                    terminal_error = self._pop_terminal_error_locked(task_id)
+                    if terminal_error is not None:
+                        raise terminal_error
+                if task_id in self._pending_results:
+                    break
                 self._check_thread_exception()
 
                 elapsed = time.perf_counter() - start_time
@@ -631,6 +726,27 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             self._active_task_ids.remove(task_id)
             self._result_cv.notify_all()
             return found_result.data
+
+    def _pop_terminal_error_locked(
+        self, task_id: int | None = None
+    ) -> Exception | None:
+        if self.terminal_error_fn is None:
+            return None
+        task_ids = (
+            [task_id] if task_id is not None else list(self._pending_results.keys())
+        )
+        for pending_task_id in task_ids:
+            result = self._pending_results.get(pending_task_id)
+            if result is None or result.data is None:
+                continue
+            error = self.terminal_error_fn(result.data)
+            if error is None:
+                continue
+            self._pending_results.pop(pending_task_id)
+            self._active_task_ids.discard(pending_task_id)
+            self._result_cv.notify_all()
+            return error
+        return None
 
     def active_submit_and_wait(
         self,
@@ -766,7 +882,6 @@ class WorkflowExecutor:
 
         self.config = config
         self.inference_engine = inference_engine
-
         # Use provided staleness manager or create a default one
         # The manager will be properly initialized in initialize()
         self._staleness_manager = staleness_manager
@@ -776,7 +891,7 @@ class WorkflowExecutor:
 
         # Dispatcher will be initialized in initialize() after staleness_manager is ready
         self._dispatcher: (
-            BatchTaskDispatcher[_RolloutTaskInput, _RolloutResult] | None
+            BatchTaskDispatcher[_RolloutTaskInput, WorkflowTaskResult] | None
         ) = None
 
         self._task_id_generator = TaskIdGenerator()
@@ -911,13 +1026,12 @@ class WorkflowExecutor:
         traj: dict[str, Any] | None,
         task_id: int,
         is_eval: bool,
+        sample_metadata: list[dict[str, Any]] | None = None,
     ) -> tuple[bool, str]:
         if traj is None:
             return False, "trajectory is None"
 
         try:
-            traj = RTensor.localize(traj)
-
             dump_dir = self._get_dump_dir(is_eval)
             if dump_dir is None:
                 return False, "dump dir is empty"
@@ -925,6 +1039,28 @@ class WorkflowExecutor:
             tokenizer = self._get_tokenizer()
             if tokenizer is None:
                 return False, "tokenizer not configured"
+
+            # Dump only consumed fields, never vision payloads. localize mutates
+            # RTensor.data, so copy the wrappers as well as the container: the
+            # original training trajectory must remain reference-only for RPC.
+            dump_fields = (
+                "input_ids",
+                "rewards",
+                "loss_mask",
+                "attention_mask",
+                "versions",
+                "original_rewards",
+            )
+            dump_input = {}
+            for key in dump_fields:
+                if key in traj:
+                    value = traj[key]
+                    dump_input[key] = (
+                        RTensor(shard=value.shard, data=value.data)
+                        if isinstance(value, RTensor)
+                        else value
+                    )
+            traj = RTensor.localize(dump_input)
 
             # Extract tensors
             input_ids = traj.get("input_ids")
@@ -964,6 +1100,12 @@ class WorkflowExecutor:
 
             # Handle batched trajectories
             batch_size = input_ids.shape[0]
+            if sample_metadata is not None and len(sample_metadata) != batch_size:
+                return (
+                    False,
+                    "sample metadata count does not match trajectory batch size: "
+                    f"{len(sample_metadata)} != {batch_size}",
+                )
 
             file_path = os.path.join(version_dir, f"{task_id}.jsonl")
             async with aiofiles.open(file_path, "a") as f:
@@ -1004,6 +1146,24 @@ class WorkflowExecutor:
                     }
                     if split["segments"] is not None:
                         record["segments"] = split["segments"]
+                    if sample_metadata is not None and sample_metadata[i]:
+                        metadata = sample_metadata[i]
+                        record["metadata"] = metadata
+                        # Promote stable Arena join fields so rollout and
+                        # arena_results shards can be joined directly without
+                        # parsing nested metadata or relying on row order.
+                        for key in (
+                            "session_id",
+                            "arena_task_id",
+                            "arena_status",
+                            "harness_outcome_code",
+                        ):
+                            if key in metadata:
+                                record[key] = metadata[key]
+
+                    original_rewards = traj.get("original_rewards")
+                    if original_rewards is not None:
+                        record["original_reward"] = original_rewards[i].item()
 
                     await f.write(json.dumps(record) + "\n")
             return True, ""
@@ -1057,11 +1217,13 @@ class WorkflowExecutor:
 
         # Create and initialize the dispatcher
         qsize = self.config.queue_size or self.max_concurrent_rollouts * 16
-        self._dispatcher = BatchTaskDispatcher[_RolloutTaskInput, _RolloutResult](
+        self._dispatcher = BatchTaskDispatcher[_RolloutTaskInput, WorkflowTaskResult](
             max_queue_size=qsize,
             task_factory=self._create_workflow_task,
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
+            terminal_error_fn=get_workflow_result_error,
+            deterministic_order=getattr(self.config, "deterministic_sampling", False),
         )
 
         # Initialize the dispatcher's async task runner
@@ -1101,9 +1263,42 @@ class WorkflowExecutor:
             f"rejected: {stats.rejected}."
         )
 
+    async def _clear_rejected_trajectory(self, traj: dict[str, Any] | None) -> None:
+        """Best-effort cleanup for remote shards that will not reach training."""
+        shards_by_node = RTensor.collect_shards(traj)
+        if not shards_by_node:
+            return
+
+        async def _clear_node(node_addr: str, shard_ids: list[Any]) -> None:
+            await asyncio.wait_for(
+                RTensor.clear_node(node_addr, shard_ids),
+                timeout=_REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
+            )
+
+        results = await asyncio.gather(
+            *(
+                _clear_node(node_addr, shard_ids)
+                for node_addr, shard_ids in shards_by_node.items()
+            ),
+            return_exceptions=True,
+        )
+        for node_addr, result in zip(shards_by_node, results):
+            if isinstance(result, TimeoutError):
+                self.logger.warning(
+                    "Timed out after %.1fs clearing rejected trajectory shards on %s",
+                    _REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
+                    node_addr,
+                )
+            elif isinstance(result, BaseException):
+                self.logger.warning(
+                    "Failed to clear rejected trajectory shards on %s: %s",
+                    node_addr,
+                    result,
+                )
+
     def _create_workflow_task(
         self, pending_task: _RolloutTaskInput
-    ) -> Callable[[], Awaitable[_RolloutResult | None]]:
+    ) -> Callable[[], Awaitable[WorkflowTaskResult | None]]:
         """Wrapper to create an async function that will be executed by AsyncTaskRunner.
 
         This is a synchronous function that returns an async function, which allows
@@ -1121,7 +1316,7 @@ class WorkflowExecutor:
             filtering/validation.
         """
 
-        async def _execute_workflow() -> _RolloutResult | None:
+        async def _execute_workflow() -> WorkflowTaskResult | None:
             """Execute workflow.arun_episode and apply AReaL-specific logic."""
             task_id = pending_task.task_id
 
@@ -1135,26 +1330,38 @@ class WorkflowExecutor:
 
             manager = self.staleness_manager
             traj: dict[str, Any] | None = None
+            trajectory_metadata: list[dict[str, Any]] | None = None
             should_accept_fn = pending_task.should_accept_fn
             should_accept: bool | None = None
             reason: str | None = None
 
             try:
-                traj = await pending_task.workflow.arun_episode(
-                    self.inference_engine, pending_task.data
-                )
+                workflow_data = pending_task.data
+                if workflow_data is not None:
+                    traj = await pending_task.workflow.arun_episode(
+                        self.inference_engine, workflow_data
+                    )
 
                 # Trajectory format checking
                 if self.config.check_trajectory_format and traj is not None:
+                    format_data = (
+                        {
+                            k: v
+                            for k, v in traj.items()
+                            if k not in {"rollout_reward", "rollout_group"}
+                        }
+                        if "input_ids" in traj
+                        else traj
+                    )
                     check_trajectory_format(
-                        traj,
+                        format_data,
                         expected_keys=self._expected_trajectory_keys,
                         logger=self.logger,
                     )
                     # Track expected keys for consistency checking
                     if isinstance(traj, dict) and "input_ids" in traj:
                         if self._expected_trajectory_keys is None:
-                            self._expected_trajectory_keys = set(traj.keys())
+                            self._expected_trajectory_keys = set(format_data.keys())
                             self.logger.info(
                                 "Trajectory format check: tracking keys %s",
                                 self._expected_trajectory_keys,
@@ -1167,14 +1374,35 @@ class WorkflowExecutor:
                 if isinstance(traj, dict) and all(
                     isinstance(v, InteractionWithTokenLogpReward) for v in traj.values()
                 ):
+                    if self.config.dump_to_file:
+                        # rollout_post hooks currently only augment the tensor
+                        # dict. They must preserve batch row order so this
+                        # side-channel stays aligned with concatenated branches.
+                        trajectory_metadata = [
+                            dict(v.metadata or {}) for v in traj.values()
+                        ]
                     if all(v.has_tensor_data for v in traj.values()):
-                        traj = concat_padded_tensors(
-                            [v.to_tensor_dict() for v in traj.values()]
-                        )
+                        try:
+                            traj = concat_tensor_interactions(traj)
+                        except (TypeError, ValueError) as exc:
+                            raise WorkflowContractError(str(exc)) from exc
                     else:
                         traj = concat_string_interactions(traj)
 
                 assert traj is None or isinstance(traj, dict), traj
+                if traj is not None and "input_ids" in traj:
+                    try:
+                        rows = traj["input_ids"].shape[0]
+                        group = traj.get("rollout_group")
+                        if group is None:
+                            group = RolloutGroup((rows,), (traj.get("rollout_reward"),))
+                        if not isinstance(group, RolloutGroup):
+                            raise ValueError("rollout_group must be a RolloutGroup")
+                        group = group.validate_rows(rows)
+                        traj = {k: v for k, v in traj.items() if k != "rollout_reward"}
+                        traj["rollout_group"] = group
+                    except (TypeError, ValueError) as exc:
+                        raise WorkflowContractError(str(exc)) from exc
 
                 if traj is None:
                     should_accept_traj = False
@@ -1191,7 +1419,10 @@ class WorkflowExecutor:
                 # Dump trajectory to file
                 if self.config.dump_to_file:
                     dump_success, dump_reason = await self._dump_trajectory(
-                        traj, task_id, pending_task.is_eval
+                        traj,
+                        task_id,
+                        pending_task.is_eval,
+                        sample_metadata=trajectory_metadata,
                     )
                     if not dump_success:
                         self.logger.warning(
@@ -1225,8 +1456,23 @@ class WorkflowExecutor:
                     self.logger.info(
                         f"Finish but reject rollout. {self._rollout_stats()}",
                     )
+                await self._clear_rejected_trajectory(traj)
                 return None
 
+            except WorkflowContractError as exc:
+                manager.on_rollout_rejected()
+                stats_tracker.get("rollout").scalar(rejected=1)
+                trace_session_event(
+                    "mark_finalized",
+                    task_id=task_id,
+                    status="failed",
+                    reason="workflow_contract_error",
+                )
+                if self.logger is not None:
+                    self.logger.error(
+                        "Workflow contract violation: %s", exc, exc_info=True
+                    )
+                return WorkflowContractFailure(message=str(exc))
             except Exception as exc:  # pragma: no cover - workflow execution errors
                 manager.on_rollout_rejected()
                 stats_tracker.get("rollout").scalar(rejected=1)
@@ -1240,6 +1486,7 @@ class WorkflowExecutor:
                     self.logger.error(
                         "Workflow execution failed: %s", exc, exc_info=True
                     )
+                await self._clear_rejected_trajectory(traj)
                 return None
 
         return _execute_workflow
@@ -1285,7 +1532,10 @@ class WorkflowExecutor:
         See :meth:`~areal.api.engine_api.InferenceEngine.wait` for parameters.
         """
         # Delegate to dispatcher and extract trajectories
-        results = self.dispatcher.wait_results(count, timeout, raise_timeout)
+        results = [
+            unwrap_workflow_result(result)
+            for result in self.dispatcher.wait_results(count, timeout, raise_timeout)
+        ]
         # Log and trace
         if self.config.enable_rollout_tracing:
             self.logger.info("Rollout results are ready!")
@@ -1318,11 +1568,24 @@ class WorkflowExecutor:
         --------
         :meth:`~areal.api.engine_api.InferenceEngine.wait_for_task`
         """
-        result = self.dispatcher.wait_for_task(task_id, timeout, raise_timeout)
+        result = unwrap_workflow_result(
+            self.dispatcher.wait_for_task(task_id, timeout, raise_timeout)
+        )
 
         if result is not None and self.config.enable_rollout_tracing:
             self.logger.info(f"Task {task_id} completed successfully")
         return result.trajectory if result is not None else None
+
+    def _wait_for_task_result(
+        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+    ) -> WorkflowTaskResult | None:
+        """Return the raw task result for controller-to-worker transport."""
+        return self.dispatcher.wait_for_task(
+            task_id,
+            timeout,
+            raise_timeout,
+            raise_terminal_error=False,
+        )
 
     @trace_perf("workflow_executor.rollout_batch", category="scheduler")
     def rollout_batch(
@@ -1412,9 +1675,14 @@ class WorkflowExecutor:
 
         # Delegate to dispatcher
         assert dataloader.batch_size is not None
-        results = self.dispatcher.active_submit_and_wait(
-            self.data_generator, batch_size=dataloader.batch_size, dynamic_bs=dynamic_bs
-        )
+        results = [
+            unwrap_workflow_result(result)
+            for result in self.dispatcher.active_submit_and_wait(
+                self.data_generator,
+                batch_size=dataloader.batch_size,
+                dynamic_bs=dynamic_bs,
+            )
+        ]
 
         # Return list of trajectory dicts (filter out None)
         return [r.trajectory for r in results if r is not None]
@@ -1448,7 +1716,9 @@ class WorkflowExecutor:
         return manager
 
     @property
-    def dispatcher(self) -> BatchTaskDispatcher[_RolloutTaskInput, _RolloutResult]:
+    def dispatcher(
+        self,
+    ) -> BatchTaskDispatcher[_RolloutTaskInput, WorkflowTaskResult]:
         """Get the task dispatcher, ensuring initialization has been called."""
         if self._dispatcher is None:
             raise RuntimeError(

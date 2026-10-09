@@ -168,3 +168,47 @@ def test_initialize_r3_router_replay_rejects_effective_moe_router_fusion():
 
     with pytest.raises(R3Error, match="moe_router_fusion=True"):
         engine._initialize_r3_router_replay()
+
+
+def test_prepare_r3_forward_context_transport_padding_keeps_routing_aligned():
+    """Transport rows must not borrow a real sample's expert choices."""
+    routed = torch.ones(1, 4, 2, 2, dtype=torch.int32)
+    engine = _fake_engine(routed)
+    mb_list = SimpleNamespace(
+        forward_indices=[1, 0],
+        transport_dummy_count=1,
+        mbs=[{"cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32)}],
+        group_lens=[8],
+        padding_lengths=[0],
+        padded_to_lengths=[8],
+    )
+    context = engine._prepare_r3_forward_context(mb_list)
+    assert context["routed_mbs"][0].device.type == "cpu"
+    torch.testing.assert_close(context["routed_mbs"][0][1], routed[0], rtol=0, atol=0)
+    torch.testing.assert_close(
+        context["valid_mbs"][0],
+        torch.tensor([False, True]),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_finish_r3_forward_only_releases_native_backward_queue():
+    """Logprob microbatches must not retain targets for an unused backward."""
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from areal.engine.r3.discovery import NativeRouterReplayRef
+    from areal.engine.r3.orchestration import set_router_replay_action
+
+    replay = RouterReplay()
+    ref = NativeRouterReplayRef(0, "router", torch.nn.Identity(), replay)
+    try:
+        replay.set_target_indices(torch.ones(4, 2, dtype=torch.long))
+        set_router_replay_action([ref], "REPLAY_FORWARD")
+        engine = object.__new__(MegatronEngine)
+        engine._finish_r3_microbatch_replay([ref], "replay", forward_only=True)
+        assert replay.replay_backward_list == []
+        assert replay.target_topk_idx is None
+        assert replay.router_replay_action is None
+    finally:
+        replay.clear_global_router_replay_instances()

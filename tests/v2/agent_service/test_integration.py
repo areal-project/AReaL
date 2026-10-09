@@ -10,6 +10,7 @@ import json
 from unittest.mock import patch
 
 import pytest
+from fastapi.testclient import TestClient
 
 from areal.v2.agent_service.auth import DEFAULT_ADMIN_API_KEY, admin_headers
 from areal.v2.agent_service.data_proxy.app import create_data_proxy_app
@@ -309,6 +310,168 @@ class TestRouterIntegration:
 
 class TestToolCallFlow:
     @pytest.mark.asyncio
+    async def test_distinct_replies_and_reused_reply_ids_across_turns_stay_separate(
+        self,
+    ):
+        """Message grouping is per reply and scoped to one Worker invocation."""
+
+        class Agent:
+            async def run(self, request, *, emitter):
+                for message_id in ("reply-1", "reply-2"):
+                    call_id = f"{request.message}-{message_id}"
+                    await emitter.emit_tool_call(
+                        "search", "{}", call_id=call_id, message_id=message_id
+                    )
+                    await emitter.emit_tool_result("search", call_id, call_id=call_id)
+                return AgentResponse()
+
+        worker_transport = httpx.ASGITransport(app=_make_worker_app(Agent))
+        proxy_app = create_data_proxy_app(DataProxyConfig(worker_addr="http://worker"))
+        patched_post, patched_send = _worker_patches(worker_transport)
+        with (
+            patch.object(httpx.AsyncClient, "post", patched_post),
+            patch.object(httpx.AsyncClient, "send", patched_send),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+            ) as client:
+                for message in ("first", "second"):
+                    response = await client.post(
+                        "/session/s1/turn",
+                        json={"message": message, "run_id": "reused"},
+                    )
+                    assert response.status_code == 200
+                history = (await client.get("/session/s1/history")).json()["history"]
+
+        assert [message["role"] for message in history] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ] * 2
+        calls = [
+            message["tool_calls"] for message in history if "tool_calls" in message
+        ]
+        assert all(len(batch) == 1 for batch in calls)
+        assert [batch[0]["id"] for batch in calls] == [
+            "first-reply-1",
+            "first-reply-2",
+            "second-reply-1",
+            "second-reply-2",
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("grouped", [True, False])
+    async def test_parallel_calls_preserve_ids_and_explicit_message_boundaries(
+        self, grouped
+    ):
+        """Next-request history preserves IDs, grouping and result arrival order."""
+
+        class Agent:
+            async def run(self, request, *, emitter):
+                if request.message == "inspect":
+                    return AgentResponse(metadata={"history": request.history})
+                for call_id in ("a", "b"):
+                    await emitter.emit_tool_call(
+                        "search",
+                        json.dumps({"q": call_id}),
+                        call_id=call_id,
+                        message_id="reply-1" if grouped else None,
+                    )
+                for call_id in ("b", "a"):
+                    await emitter.emit_tool_result(
+                        "search", f"result-{call_id}", call_id=call_id
+                    )
+                return AgentResponse(summary="done")
+
+        worker_transport = httpx.ASGITransport(app=_make_worker_app(Agent))
+        proxy_app = create_data_proxy_app(DataProxyConfig(worker_addr="http://worker"))
+        patched_post, patched_send = _worker_patches(worker_transport)
+        with (
+            patch.object(httpx.AsyncClient, "post", patched_post),
+            patch.object(httpx.AsyncClient, "send", patched_send),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+            ) as client:
+                response = await client.post("/session/s1/turn", json={"message": "go"})
+                assert response.status_code == 200
+                events = response.json()["events"]
+                assert [event["call_id"] for event in events] == ["a", "b", "b", "a"]
+                stored = (await client.get("/session/s1/history")).json()["history"]
+                response = await client.post(
+                    "/session/s1/turn", json={"message": "inspect"}
+                )
+                assert response.status_code == 200
+                assert response.json()["metadata"]["history"] == stored
+
+        calls = [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "search", "arguments": json.dumps({"q": call_id})},
+            }
+            for call_id in ("a", "b")
+        ]
+        assistant_messages = [
+            {"role": "assistant", "content": None, "tool_calls": batch}
+            for batch in ([calls] if grouped else [[call] for call in calls])
+        ]
+        assert stored == [
+            {"role": "user", "content": "go"},
+            *assistant_messages,
+            {"role": "tool", "tool_call_id": "b", "content": "result-b"},
+            {"role": "tool", "tool_call_id": "a", "content": "result-a"},
+            {"role": "assistant", "content": "done"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_results_leave_history_unchanged_without_retry(self):
+        """A bad structured turn cannot append even its user message or rerun tools."""
+        runs = []
+
+        class Agent:
+            async def run(self, request, *, emitter):
+                runs.append(request.message)
+                if request.message == "invalid":
+                    await emitter.emit_tool_call("search", '{"q":"a"}')
+                    await emitter.emit_tool_call("search", '{"q":"b"}')
+                    await emitter.emit_tool_result("search", "ambiguous")
+                return AgentResponse(
+                    summary="done", metadata={"history": request.history}
+                )
+
+        worker_transport = httpx.ASGITransport(app=_make_worker_app(Agent))
+        proxy_app = create_data_proxy_app(DataProxyConfig(worker_addr="http://worker"))
+        patched_post, patched_send = _worker_patches(worker_transport)
+        with (
+            patch.object(httpx.AsyncClient, "post", patched_post),
+            patch.object(httpx.AsyncClient, "send", patched_send),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+            ) as client:
+                response = await client.post(
+                    "/session/s1/turn", json={"message": "valid"}
+                )
+                assert response.status_code == 200
+                before = (await client.get("/session/s1/history")).json()["history"]
+                response = await client.post(
+                    "/session/s1/turn", json={"message": "invalid"}
+                )
+                assert response.status_code == 500
+                assert response.json()["error"]["type"] == "ValueError"
+                after = (await client.get("/session/s1/history")).json()["history"]
+                assert after == before
+                response = await client.post(
+                    "/session/s1/turn", json={"message": "next"}
+                )
+                assert response.status_code == 200
+                assert response.json()["metadata"]["history"] == before
+        assert runs == ["valid", "invalid", "next"]
+
+    @pytest.mark.asyncio
     async def test_tool_events_through_proxy(self):
         worker_app = _make_worker_app(_ToolAgent)
         worker_transport = httpx.ASGITransport(app=worker_app)
@@ -340,6 +503,9 @@ class TestToolCallFlow:
                 tool_msgs = [m for m in history if m.get("role") == "tool"]
                 assert len(tool_msgs) > 0
                 assert "tool_call_id" in tool_msgs[0]
+                assert events[0]["call_id"] == events[1]["call_id"]
+                assert history[1]["tool_calls"][0]["id"] == events[0]["call_id"]
+                assert tool_msgs[0]["tool_call_id"] == events[0]["call_id"]
 
 
 class TestArealInference:
@@ -549,6 +715,49 @@ class TestWorkerRunStream:
             assert resp.json()["summary"] == "structured"
 
 
+class TestGatewayToolEvents:
+    def test_websocket_forwards_tool_call_id(self):
+        """The Gateway must pass event IDs into the WebSocket frame builder."""
+
+        async def post(self, url, **kwargs):
+            if str(url).endswith("/route"):
+                data = {"data_proxy_addr": "http://proxy"}
+            else:
+                assert str(url).endswith("/turn")
+                data = {
+                    "summary": "done",
+                    "events": [
+                        {
+                            "type": "tool_call",
+                            "name": "search",
+                            "args": "{}",
+                            "call_id": "sdk-a",
+                        }
+                    ],
+                }
+            return httpx.Response(200, json=data, request=httpx.Request("POST", url))
+
+        app = create_gateway_app(GatewayConfig(router_addr="http://router"))
+        with patch.object(httpx.AsyncClient, "post", post), TestClient(app) as client:
+            with client.websocket_connect(f"/ws?token={DEFAULT_ADMIN_API_KEY}") as ws:
+                ws.send_json(
+                    {
+                        "type": "req",
+                        "id": "r1",
+                        "method": "agent",
+                        "params": {"sessionKey": "s1", "message": "go"},
+                    }
+                )
+                assert ws.receive_json()["payload"]["status"] == "accepted"
+                event = ws.receive_json()
+                assert event["payload"]["toolCall"] == {
+                    "name": "search",
+                    "args": "{}",
+                    "callId": "sdk-a",
+                }
+                assert ws.receive_json()["payload"]["status"] == "complete"
+
+
 class TestGatewayHealth:
     @pytest.mark.asyncio
     async def test_health(self):
@@ -745,6 +954,32 @@ class TestBridgeBuildOutputItems:
 
     def test_empty_result_yields_no_items(self):
         assert OpenResponsesBridge._build_output_items({}) == []
+
+    @pytest.mark.asyncio
+    async def test_call_id_preserved_in_output_and_sse(self):
+        """Both public response modes retain the normalized tool call ID."""
+        items = OpenResponsesBridge._build_output_items(
+            {
+                "events": [
+                    {
+                        "type": "tool_call",
+                        "name": "search",
+                        "args": "{}",
+                        "call_id": "sdk-a",
+                    }
+                ]
+            }
+        )
+        assert items[0]["call_id"] == "sdk-a"
+        raw = b"".join(
+            [
+                chunk
+                async for chunk in OpenResponsesBridge._responses_sse(
+                    "r", "model", items, {}
+                )
+            ]
+        )
+        assert _parse_sse(raw)[-1]["response"]["output"][0]["call_id"] == "sdk-a"
 
 
 def _parse_sse(raw: bytes) -> list[dict]:

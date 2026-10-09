@@ -20,6 +20,7 @@ from ..types import (
     AgentRunnable,
     StreamResponse,
 )
+from .events import normalize_tool_events
 
 logger = logging.getLogger("AgentWorker")
 
@@ -31,11 +32,32 @@ class _CollectingEmitter:
     async def emit_delta(self, text: str) -> None:
         self.events.append({"type": "delta", "text": text})
 
-    async def emit_tool_call(self, name: str, args: str) -> None:
-        self.events.append({"type": "tool_call", "name": name, "args": args})
+    async def emit_tool_call(
+        self,
+        name: str,
+        args: str,
+        *,
+        call_id: str | None = None,
+        message_id: str | None = None,
+    ) -> None:
+        event = {"type": "tool_call", "name": name, "args": args}
+        if call_id is not None:
+            event["call_id"] = call_id
+        if message_id is not None:
+            event["message_id"] = message_id
+        self.events.append(event)
 
-    async def emit_tool_result(self, name: str, result: str) -> None:
-        self.events.append({"type": "tool_result", "name": name, "result": result})
+    async def emit_tool_result(
+        self,
+        name: str,
+        result: str,
+        *,
+        call_id: str | None = None,
+    ) -> None:
+        event = {"type": "tool_result", "name": name, "result": result}
+        if call_id is not None:
+            event["call_id"] = call_id
+        self.events.append(event)
 
 
 def create_worker_app(
@@ -101,6 +123,10 @@ def create_worker_app(
             response: AgentResponse | StreamResponse = await agent.run(
                 request, emitter=emitter
             )
+            if not isinstance(response, StreamResponse):
+                # Validate outside the harness so caught emitter errors cannot
+                # publish a successful turn with partially invalid history.
+                events = normalize_tool_events(emitter.events)
         except Exception as exc:
             logger.exception("Agent run failed (session=%s)", request.session_key)
             return JSONResponse(
@@ -127,6 +153,6 @@ def create_worker_app(
                 media_type=response.headers.get("content-type"),
             )
 
-        return {**asdict(response), "events": emitter.events}
+        return {**asdict(response), "events": events}
 
     return app

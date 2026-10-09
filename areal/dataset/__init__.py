@@ -1,8 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import os
+import re
 from typing import TYPE_CHECKING, Optional
 
 from areal.api.cli_args import _DatasetConfig
+from areal.dataset.mopd import (
+    ROUTE_METADATA_KEY,
+    DatasetRoute,
+    MOPDDataset,
+    RoutedDataset,
+    get_mopd_dataset,
+    get_routed_dataset,
+)
 from areal.utils import logging
 
 if TYPE_CHECKING:
@@ -19,9 +30,36 @@ VALID_DATASETS = [
     "virl39k",
     "hh-rlhf",
     "torl_data",
+    "swe_sft",
 ]
 
 logger = logging.getLogger("Dataset")
+
+# Matches "swe" only as a path token delimited by /, _, -, or . (e.g.
+# "swe_data/", "swe-bench", "my_swe.jsonl") so that paths merely containing
+# the trigram (e.g. "answer_sft", "/home/swetha/") fall through to the
+# generic load-from-disk fallback instead of the SWE trajectory pipeline.
+_SWE_PATH_PATTERN = re.compile(r"(?:^|[/_\-.])swe(?:[/_\-.]|$)")
+_SWE_SFT_ARTIFACT_MARKER = ".areal_swe_sft.json"
+_SWE_SFT_ARTIFACT_FORMAT = "areal.swe_sft.pretokenized"
+_SWE_SFT_ARTIFACT_VERSION = 1
+
+
+def _is_swe_sft_artifact(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    try:
+        with open(
+            os.path.join(path, _SWE_SFT_ARTIFACT_MARKER), encoding="utf-8"
+        ) as marker:
+            metadata = json.load(marker)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("format") == _SWE_SFT_ARTIFACT_FORMAT
+        and metadata.get("version") == _SWE_SFT_ARTIFACT_VERSION
+    )
 
 
 def _get_custom_dataset(
@@ -31,6 +69,9 @@ def _get_custom_dataset(
     max_length: int | None = None,
     tokenizer: Optional["PreTrainedTokenizerFast"] = None,
     processor: Optional["ProcessorMixin"] = None,
+    data_worker_rank: int | None = None,
+    data_worker_world_size: int | None = None,
+    data_worker_cache_attempt_id: str | None = None,
     **kwargs,
 ) -> "Dataset":
     if "gsm8k" in path and type == "sft":
@@ -133,6 +174,21 @@ def _get_custom_dataset(
             max_length=max_length,
             **kwargs,
         )
+    elif (
+        _SWE_PATH_PATTERN.search(path.lower()) or _is_swe_sft_artifact(path)
+    ) and type == "sft":
+        from .swe_sft import get_swe_sft_dataset
+
+        return get_swe_sft_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            cache_rank=data_worker_rank,
+            cache_world_size=data_worker_world_size,
+            cache_attempt_id=data_worker_cache_attempt_id,
+            **kwargs,
+        )
     else:
         # Fallback: try loading as a generic HuggingFace dataset from disk.
         # This supports arbitrary datasets saved via dataset.save_to_disk().
@@ -171,6 +227,20 @@ def get_custom_dataset(
 ) -> "Dataset | RDataset":
     from areal.utils.environ import is_single_controller
 
+    if dataset_config is not None and dataset_config.sources:
+        return get_routed_dataset(
+            dataset_config,
+            tokenizer=tokenizer,
+            processor=processor,
+        )
+    if dataset_config is not None and (
+        not isinstance(dataset_config.path, str)
+        or not dataset_config.path.strip()
+        or not isinstance(dataset_config.type, str)
+        or not dataset_config.type.strip()
+    ):
+        raise ValueError("dataset_config.path and dataset_config.type are required")
+
     if (
         is_single_controller()
         and dataset_config is not None
@@ -178,12 +248,14 @@ def get_custom_dataset(
     ):
         from areal.infra.data_service.rdataset import RDataset
 
+        dataset_kwargs = dict(getattr(dataset_config, "dataset_kwargs", None) or {})
+        dataset_kwargs.update(kwargs)
         return RDataset(
             path=dataset_config.path,
             type=dataset_config.type,
             split=split,
             max_length=dataset_config.max_length,
-            dataset_kwargs=getattr(dataset_config, "dataset_kwargs", None),
+            dataset_kwargs=dataset_kwargs,
         )
 
     if dataset_config is not None:
@@ -207,6 +279,12 @@ def get_custom_dataset(
 
 
 __all__ = [
+    "ROUTE_METADATA_KEY",
+    "DatasetRoute",
+    "MOPDDataset",
+    "RoutedDataset",
     "VALID_DATASETS",
     "get_custom_dataset",
+    "get_mopd_dataset",
+    "get_routed_dataset",
 ]

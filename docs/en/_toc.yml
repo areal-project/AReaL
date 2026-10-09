@@ -38,10 +38,12 @@ parts:
     - file: algorithms/grpo_series
     - file: algorithms/m2po
     - file: algorithms/prox_approx
+    - file: algorithms/prm
   - caption: Reference
     chapters:
     - file: reference/checkpointing
     - file: reference/metrics_tracking
+    - file: reference/moe_visualization
     - file: reference/alloc_mode
     - file: reference/lora
     - file: reference/bridge_backend

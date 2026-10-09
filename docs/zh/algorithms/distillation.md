@@ -86,7 +86,7 @@ teacher:
 本地调度器示例命令：
 
 ```bash
-python3 examples/math/gsm8k_rl.py --config examples/distillation/gsm8k_grpo_distill.yaml scheduler.type=local experiment_name=gsm8k-grpo-distillation trial_name=trial0
+python3 examples/math/gsm8k_rl.py --config examples/distillation/gsm8k_grpo_distill_mode_trainEngine.yaml scheduler.type=local experiment_name=gsm8k-grpo-distillation trial_name=trial0
 ```
 
 ## 结果

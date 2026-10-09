@@ -245,6 +245,12 @@ class TestFactoryHelpers:
         frame = make_tool_call_event("run-1", "read_file", "/tmp/x")
         assert frame.tool_call == {"name": "read_file", "args": "/tmp/x"}
 
+    def test_tool_call_id_survives_frame_roundtrip(self):
+        """The optional call ID is retained in WebSocket events."""
+        frame = make_tool_call_event("run-1", "search", "{}", call_id="sdk-a")
+        parsed = parse_frame(serialize_frame(frame))
+        assert parsed.tool_call == {"name": "search", "args": "{}", "callId": "sdk-a"}
+
 
 class TestGenerateRunId:
     def test_format(self):

@@ -58,7 +58,7 @@ actor:
     packing_algorithm: ffd
   optimizer:
     type: adam
-    lr: 1.70e-5
+    lr: 6.00e-6
     weight_decay: 0.017
     beta1: 0.9
     beta2: 0.999

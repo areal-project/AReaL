@@ -53,6 +53,24 @@ class _NoOpSession:
         pass
 
 
+@pytest.mark.asyncio
+async def test_dispatch_timeout_includes_exception_type_and_limit():
+    """Timeouts with an empty string representation must remain actionable."""
+    dispatcher = Dispatcher(
+        topology=WorkerTopology(), request_timeout=42.0, _session=_NoOpSession()
+    )
+    error = TimeoutError()
+
+    async def timeout():
+        raise error
+
+    with pytest.raises(
+        RuntimeError, match=r"TimeoutError: .*request_timeout=42.0s"
+    ) as exc_info:
+        await dispatcher._gather_validated([timeout()], ["http://worker"])
+    assert exc_info.value.__cause__ is error
+
+
 class _CapturingSession:
     def __init__(self, *, post_handler=None):
         self.captured_payloads: list[dict[str, Any]] = []
@@ -499,8 +517,14 @@ class TestDispatcherParityWithTrainController:
             }
         )
 
-        with pytest.raises(ValueError, match="divisible by K"):
-            await dispatcher.dispatch("/train_batch").post(body)
+        result_bytes = await dispatcher.dispatch("/train_batch").post(body)
+        result_payload = orjson.loads(result_bytes)
+        merged = deserialize_value(result_payload["result"])
+
+        assert merged == [5, 11, 7]
+        assert sorted(
+            len(payload["args"][0]) for payload in session.captured_payloads
+        ) == [1, 2]
 
     @pytest.mark.asyncio
     async def test_dispatch_post_pads_eval_routes_only(self):

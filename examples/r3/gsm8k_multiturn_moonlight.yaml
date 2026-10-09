@@ -94,6 +94,7 @@ actor:
   megatron:
     bridge_type: megatron-bridge
     enable_router_replay: true
+    moe_router_fusion: false
   scheduling_spec:
     - task_type: worker
       cpu: 8

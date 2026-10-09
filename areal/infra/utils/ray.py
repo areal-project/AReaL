@@ -59,4 +59,17 @@ def ray_resource_type():
     if torch.cuda.is_available():
         return "GPU"
 
-    return "CPU"
+    return _cluster_accelerator_type() or "CPU"
+
+
+def _cluster_accelerator_type() -> str | None:
+    # The driver may sit on a device-free node (e.g. a CPU-only head pod) while
+    # accelerators live on remote workers, so local probing is not conclusive.
+    if not ray.is_initialized():
+        return None
+
+    resources = ray.cluster_resources()
+    for device in ("NPU", "GPU"):
+        if resources.get(device, 0):
+            return device
+    return None

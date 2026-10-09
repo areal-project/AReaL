@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from openai.types.responses.response import Response
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_text import ResponseOutputText
@@ -104,6 +105,18 @@ def test_set_reward(mock_interaction):
     assert cache["1"].reward == 10.0
 
 
+def test_set_reward_updates_cached_reward_tensors():
+    cache = InteractionCache()
+    cache["1"] = InteractionWithTokenLogpReward(_cache={"rewards": torch.tensor([0.0])})
+
+    cache.set_reward("1", 3.0)
+
+    torch.testing.assert_close(cache["1"]._cache["rewards"], torch.tensor([3.0]))
+    torch.testing.assert_close(
+        cache["1"]._cache["original_rewards"], torch.tensor([3.0])
+    )
+
+
 def test_set_last_reward(mock_interaction):
     cache = InteractionCache()
     cache["1"] = mock_interaction(id="1")
@@ -132,6 +145,26 @@ def test_export_with_reward_discount(mock_interaction):
     assert ordered_cache["3"].reward == pytest.approx(10.0)
     assert ordered_cache["2"].reward == pytest.approx(9.0)
     assert ordered_cache["1"].reward == pytest.approx(8.1)
+
+
+def test_concat_reward_discount_does_not_mix_sibling_outcomes(mock_interaction):
+    """Concat leaves retain branch-local rewards regardless of insertion order."""
+    root = mock_interaction(id="root", reward=0.25)
+    leaf_a = mock_interaction(id="leaf-a", reward=1.0)
+    leaf_b = mock_interaction(id="leaf-b", reward=2.0)
+    leaf_a.parent = root
+    leaf_b.parent = root
+    cache = InteractionCache.from_dict(
+        {"root": root, "leaf-a": leaf_a, "leaf-b": leaf_b}
+    )
+
+    exported = cache.export_interactions(style="concat", reward_discount=0.5)
+
+    assert list(exported) == ["leaf-a", "leaf-b"]
+    assert root.reward == pytest.approx(0.25)
+    assert leaf_a.reward == pytest.approx(1.0)
+    assert leaf_b.reward == pytest.approx(2.0)
+    assert cache._apply_reward_discount_called is False
 
 
 def test_export_triggers_reward_discount_once(mock_interaction):

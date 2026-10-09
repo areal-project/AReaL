@@ -31,6 +31,7 @@ from areal.utils.dataloader import EvalDistributedSampler
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 
 logger = logging.getLogger("DataWorker")
+_CACHE_ATTEMPT_ID_KEY = "_areal_cache_attempt_id"
 
 
 def _identity_collate(samples: list[Any]) -> list[Any]:
@@ -111,6 +112,15 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
                     body.tokenizer_or_processor_path
                 )
 
+            dataset_kwargs = dict(body.dataset_kwargs)
+            # Worker topology belongs to DataWorkerConfig, not to a client
+            # request. Remove spoofed values before forwarding user options.
+            dataset_kwargs.pop("data_worker_rank", None)
+            dataset_kwargs.pop("data_worker_world_size", None)
+            dataset_kwargs.pop("cache_rank", None)
+            dataset_kwargs.pop("cache_world_size", None)
+            dataset_kwargs.pop("cache_attempt_id", None)
+            cache_attempt_id = dataset_kwargs.pop(_CACHE_ATTEMPT_ID_KEY, None)
             _dataset = _get_custom_dataset(
                 path=body.dataset_path,
                 type=body.dataset_type,
@@ -118,7 +128,10 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
                 max_length=body.max_length,
                 tokenizer=_tokenizer,
                 processor=_processor,
-                **body.dataset_kwargs,
+                data_worker_rank=config.rank,
+                data_worker_world_size=config.world_size,
+                data_worker_cache_attempt_id=cache_attempt_id,
+                **dataset_kwargs,
             )
 
             _sampler_cls = (
