@@ -595,6 +595,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             )
             raise agent_error
 
+        reward_assignment_error: aiohttp.ClientResponseError | None = None
         if proxy_client.context_overflow or failure_disposition == "model_failure_zero":
             logger.warning(
                 "Recovering model failure with reward 0: context_overflow=%s, "
@@ -614,7 +615,14 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                     None,
                 )
                 return None
-            await proxy_client.set_last_reward(0.0)
+            try:
+                await proxy_client.set_last_reward(0.0)
+            except aiohttp.ClientResponseError as exc:
+                if exc.status != 400:
+                    raise
+                # The session may contain only unfinished requests. Export
+                # determines whether there is a usable trajectory to reject.
+                reward_assignment_error = exc
         else:
             stats_tracker.get(workflow_context.stat_scope()).scalar(
                 context_overflow=0.0,
@@ -628,6 +636,9 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             drop_retry_orphans=self.drop_retry_orphans,
             is_eval=workflow_context.get().is_eval,
         )
+
+        if reward_assignment_error is not None and interactions:
+            raise reward_assignment_error
 
         if not interactions:
             logger.warning(
