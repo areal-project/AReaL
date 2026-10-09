@@ -7,7 +7,12 @@ from typing import Any
 import torch
 
 from areal.api import TrainEngine
-from areal.api.cli_args import MOPDLossConfig, PPOActorConfig, RejectionSamplingConfig
+from areal.api.cli_args import (
+    MOPDLossConfig,
+    OPSAConfig,
+    PPOActorConfig,
+    RejectionSamplingConfig,
+)
 from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
@@ -54,6 +59,115 @@ from areal.v2.training_service.controller.controller import (
 )
 
 logger = logging.getLogger("PPOActor")
+
+
+def opsa_loss_fn(
+    logprobs: torch.Tensor,
+    rollout_logprobs: torch.Tensor,
+    entropy: torch.Tensor,
+    loss_mask: torch.Tensor,
+    lowest_logp_fraction: float,
+    rewards: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute the reward-free OPSA objective from Eq. 5.
+
+    The rollout log probabilities choose the lowest-logp tokens for each
+    response. Entropy from the current student forward pass is detached before
+    forming the adaptive negative advantages, so gradients flow only through
+    the selected sampled-token log probabilities.
+    """
+    if logprobs.shape != rollout_logprobs.shape or logprobs.shape != entropy.shape:
+        raise ValueError(
+            "OPSA logprobs, rollout_logprobs, and entropy must share a shape"
+        )
+    if logprobs.shape != loss_mask.shape or logprobs.ndim not in (1, 2):
+        raise ValueError("OPSA requires matching 1D packed or 2D padded tensors")
+    if logprobs.ndim == 2 and cu_seqlens is not None:
+        raise ValueError("OPSA cu_seqlens is only valid for 1D packed tensors")
+    if cu_seqlens is not None and cu_seqlens.ndim != 1:
+        raise ValueError("OPSA cu_seqlens must be a 1D tensor")
+
+    if logprobs.ndim == 2:
+        response_logprobs = tuple(logprobs.unbind(dim=0))
+        response_rollout_logprobs = tuple(rollout_logprobs.unbind(dim=0))
+        response_entropies = tuple(entropy.unbind(dim=0))
+        response_masks = tuple(loss_mask.bool().unbind(dim=0))
+    elif cu_seqlens is None:
+        response_logprobs = (logprobs,)
+        response_rollout_logprobs = (rollout_logprobs,)
+        response_entropies = (entropy,)
+        response_masks = (loss_mask.bool(),)
+    else:
+        # torch.tensor_split requires tensor split indices to be on CPU.
+        split_indices = cu_seqlens[1:-1].to(device="cpu", dtype=torch.long)
+        response_logprobs = tuple(torch.tensor_split(logprobs, split_indices))
+        response_rollout_logprobs = tuple(
+            torch.tensor_split(rollout_logprobs, split_indices)
+        )
+        response_entropies = tuple(torch.tensor_split(entropy, split_indices))
+        response_masks = tuple(torch.tensor_split(loss_mask.bool(), split_indices))
+
+    selected_masks = []
+    response_advantages = []
+    for response_logp, response_rollout_logp, response_entropy, response_mask in zip(
+        response_logprobs,
+        response_rollout_logprobs,
+        response_entropies,
+        response_masks,
+        strict=True,
+    ):
+        selected_mask = torch.zeros_like(response_mask)
+        advantages = torch.zeros_like(response_logp)
+        valid_indices = response_mask.nonzero(as_tuple=True)[0]
+        if valid_indices.numel() == 0:
+            selected_masks.append(selected_mask)
+            response_advantages.append(advantages)
+            continue
+        count = max(1, math.ceil(valid_indices.numel() * lowest_logp_fraction))
+        selected_indices = valid_indices[
+            response_rollout_logp[valid_indices].topk(count, largest=False).indices
+        ]
+        selected_entropy = response_entropy[selected_indices].detach()
+        entropy_range = selected_entropy.max() - selected_entropy.min()
+        entropy_offset = torch.where(
+            entropy_range > 0,
+            (selected_entropy - selected_entropy.min()) / entropy_range,
+            torch.zeros_like(selected_entropy),
+        )
+        advantages[selected_indices] = -0.5 - 0.5 * entropy_offset
+        selected_mask[selected_indices] = True
+        selected_masks.append(selected_mask)
+        response_advantages.append(advantages)
+
+    if logprobs.ndim == 2:
+        selected_mask = torch.stack(selected_masks)
+        advantages = torch.stack(response_advantages)
+    else:
+        selected_mask = torch.cat(selected_masks)
+        advantages = torch.cat(response_advantages)
+
+    if rewards is not None:
+        rewards = rewards.to(device=advantages.device, dtype=advantages.dtype)
+
+        reward_mask = (rewards > 0).unsqueeze(-1)
+
+        advantages = advantages * reward_mask
+        selected_mask = selected_mask & reward_mask.bool()
+
+    selected_count = selected_mask.count_nonzero().clamp(min=1)
+    per_token_loss = -advantages * logprobs
+    loss = (per_token_loss * selected_mask).sum() / selected_count
+    zero = torch.zeros_like(selected_mask)
+    return loss, {
+        "loss": per_token_loss.detach(),
+        "importance_weight": torch.ones_like(logprobs),
+        "approx_kl": (logprobs - rollout_logprobs).detach(),
+        "clip_mask": zero,
+        "dual_clip_mask": zero,
+        "opsa_selected_mask": selected_mask,
+        "opsa_advantages": advantages.detach(),
+    }
 
 
 def _group_training_metrics(
@@ -370,6 +484,8 @@ class PPOActor:
             )
 
         bs = data["input_ids"].shape[0]
+        if self.config.opsa is not None:
+            return self._prepare_opsa_batch(data)
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
         )
@@ -630,6 +746,19 @@ class PPOActor:
 
         return data
 
+    def _prepare_opsa_batch(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Align rollout log probabilities for the reward-free OPSA objective."""
+        loss_mask = torch.roll(data["loss_mask"].float(), shifts=-1, dims=-1)
+        old_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1) * loss_mask
+        zeros = torch.zeros_like(old_logp)
+        data["advantages"] = zeros
+        data["returns"] = zeros
+        data["kl_rewards"] = zeros
+        data["tot_rewards"] = zeros
+        data["loss_mask"] = loss_mask
+        data["logprobs"] = old_logp
+        return data
+
     def _compute_gae_lambda(
         self,
         loss_mask: torch.Tensor,
@@ -843,6 +972,7 @@ class PPOActor:
                         sapo_tau_pos=self.config.sapo_tau_pos,
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_cispo_loss=self.config.use_cispo_loss,
+                        opsa_config=self.config.opsa,
                         use_decoupled_loss=self.config.use_decoupled_loss,
                         mopd_loss_config=self._mopd_loss_config,
                     ),
@@ -1048,6 +1178,7 @@ def grpo_loss_fn(
     use_sapo_loss: bool = False,
     sapo_tau_pos: float = 1.0,
     sapo_tau_neg: float = 1.05,
+    opsa_config: OPSAConfig | None = None,
     use_cispo_loss: bool = False,
     use_decoupled_loss: bool = False,
     mopd_loss_config: MOPDLossConfig | None = None,
@@ -1122,80 +1253,95 @@ def grpo_loss_fn(
 
     old_logp = input_data["logprobs"]
     advantages = input_data["advantages"]
-    prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
     entropy = entropy.detach()
+    prox_logp_gt = None
 
-    if ProxLogpMethod(prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP:
-        prox_logp_gt = logprobs.detach()
-
-    # Resolve proximal log-probabilities based on method
-    prox_logp = _resolve_proximal_logp(
-        prox_logp_gt=prox_logp_gt,
-        prox_logp_method=prox_logp_method,
-        old_logp=old_logp,
-        logprobs=logprobs.detach(),
-        versions=input_data.get("versions"),
-        current_version=current_version,
-    )
-
-    # Apply M2PO masking if threshold is set
-    if m2_threshold is not None:
-        loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
-
-    # Use CISPO, SAPO, or PPO loss
-    if use_cispo_loss:
-        if use_sapo_loss:
-            raise ValueError(
-                "CISPO and SAPO are mutually exclusive surrogates. "
-                "Set at most one of use_cispo_loss / use_sapo_loss."
-            )
-        if importance_sampling_level != "token":
-            raise ValueError(
-                "CISPO only supports importance_sampling_level='token'. "
-                "Sequence-level (GSPO-style) CISPO has no published surrogate."
-            )
-        loss, stat = cispo_loss_fn(
+    # OPSA directly optimizes selected sampled-token log probabilities rather
+    # than using PPO's reward-derived surrogate.
+    if opsa_config is not None:
+        loss, stat = opsa_loss_fn(
             logprobs=logprobs,
-            proximal_logprobs=prox_logp,
-            advantages=advantages,
-            eps_clip=eps_clip,
-            eps_clip_higher=eps_clip_higher,
+            rollout_logprobs=old_logp,
+            entropy=entropy,
             loss_mask=loss_mask,
-            old_logprobs=old_logp,
-            rejection_sampling=rejection_sampling,
-            cu_seqlens=input_data.get("cu_seqlens"),
-        )
-    elif use_sapo_loss:
-        if use_decoupled_loss:
-            raise ValueError(
-                "SAPO is not compatible with `use_decoupled_loss=True`. "
-                "Please set `actor.use_decoupled_loss=false` in your configuration."
-            )
-        loss, stat = sapo_loss_fn(
-            logprobs=logprobs,
-            old_logprobs=old_logp,
-            advantages=advantages,
-            tau_pos=sapo_tau_pos,
-            tau_neg=sapo_tau_neg,
-            loss_mask=loss_mask,
-            importance_sampling_level=importance_sampling_level,
+            lowest_logp_fraction=opsa_config.lowest_logp_fraction,
             cu_seqlens=input_data.get("cu_seqlens"),
         )
     else:
-        loss, stat = ppo_actor_loss_fn(
-            logprobs=logprobs,
-            old_logprobs=old_logp,
-            advantages=advantages,
-            eps_clip=eps_clip,
-            eps_clip_higher=eps_clip_higher,
-            loss_mask=loss_mask,
-            c_clip=c_clip,
-            proximal_logprobs=prox_logp,
-            rejection_sampling=rejection_sampling,
-            importance_sampling_level=importance_sampling_level,
-            cu_seqlens=input_data.get("cu_seqlens"),
+        prox_logp_gt = input_data.get("prox_logp")
+        if ProxLogpMethod(prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP:
+            prox_logp_gt = logprobs.detach()
+
+        # Resolve proximal log-probabilities based on method
+        prox_logp = _resolve_proximal_logp(
+            prox_logp_gt=prox_logp_gt,
+            prox_logp_method=prox_logp_method,
+            old_logp=old_logp,
+            logprobs=logprobs.detach(),
+            versions=input_data.get("versions"),
+            current_version=current_version,
         )
+
+        # Apply M2PO masking if threshold is set
+        if m2_threshold is not None:
+            loss_mask = _apply_m2po_masking(
+                old_logp, prox_logp, loss_mask, m2_threshold
+            )
+
+        # Use CISPO, SAPO, or PPO loss
+        if use_cispo_loss:
+            if use_sapo_loss:
+                raise ValueError(
+                    "CISPO and SAPO are mutually exclusive surrogates. "
+                    "Set at most one of use_cispo_loss / use_sapo_loss."
+                )
+            if importance_sampling_level != "token":
+                raise ValueError(
+                    "CISPO only supports importance_sampling_level='token'. "
+                    "Sequence-level (GSPO-style) CISPO has no published surrogate."
+                )
+            loss, stat = cispo_loss_fn(
+                logprobs=logprobs,
+                proximal_logprobs=prox_logp,
+                advantages=advantages,
+                eps_clip=eps_clip,
+                eps_clip_higher=eps_clip_higher,
+                loss_mask=loss_mask,
+                old_logprobs=old_logp,
+                rejection_sampling=rejection_sampling,
+                cu_seqlens=input_data.get("cu_seqlens"),
+            )
+        elif use_sapo_loss:
+            if use_decoupled_loss:
+                raise ValueError(
+                    "SAPO is not compatible with `use_decoupled_loss=True`. "
+                    "Please set `actor.use_decoupled_loss=false` in your configuration."
+                )
+            loss, stat = sapo_loss_fn(
+                logprobs=logprobs,
+                old_logprobs=old_logp,
+                advantages=advantages,
+                tau_pos=sapo_tau_pos,
+                tau_neg=sapo_tau_neg,
+                loss_mask=loss_mask,
+                importance_sampling_level=importance_sampling_level,
+                cu_seqlens=input_data.get("cu_seqlens"),
+            )
+        else:
+            loss, stat = ppo_actor_loss_fn(
+                logprobs=logprobs,
+                old_logprobs=old_logp,
+                advantages=advantages,
+                eps_clip=eps_clip,
+                eps_clip_higher=eps_clip_higher,
+                loss_mask=loss_mask,
+                c_clip=c_clip,
+                proximal_logprobs=prox_logp,
+                rejection_sampling=rejection_sampling,
+                importance_sampling_level=importance_sampling_level,
+                cu_seqlens=input_data.get("cu_seqlens"),
+            )
 
     # M2 is part of the shared training-validity contract. Behavioral
     # rejection may narrow the MOPD numerator further, while its denominator
@@ -1288,9 +1434,6 @@ def grpo_loss_fn(
     stats_tracker.stat(
         importance_weight=stat["importance_weight"],
         approx_kl=stat["approx_kl"],
-        new_logp=logprobs.detach(),
-        old_logp=old_logp,
-        entropy=entropy.float(),
         actor_loss=stat["loss"],
         clip_ratio=stat["clip_mask"].float(),
         dual_clip_ratio=stat["dual_clip_mask"].float(),
@@ -1298,6 +1441,29 @@ def grpo_loss_fn(
         logp_abs_diff=logp_diff.abs(),
         denominator="n_valid_tokens",
     )
+
+    if opsa_config is None:
+        stats_tracker.stat(
+            new_logp=logprobs.detach(),
+            old_logp=old_logp,
+            entropy=entropy.float(),
+            denominator="n_valid_tokens",
+        )
+    else:
+        opsa_selected_mask = stat["opsa_selected_mask"]
+        opsa_advantages = stat["opsa_advantages"]
+
+        stats_tracker.denominator(
+            n_opsa_tokens=opsa_selected_mask,
+        )
+
+        stats_tracker.stat(
+            advantages=opsa_advantages,
+            new_logp=logprobs.detach() * opsa_selected_mask,
+            old_logp=old_logp * opsa_selected_mask,
+            entropy=entropy.float() * opsa_selected_mask,
+            denominator="n_opsa_tokens",
+        )
 
     if "behave_imp_weight" in stat:
         stats_tracker.denominator(unclipped_behave_tokens=stat["behave_mask"])

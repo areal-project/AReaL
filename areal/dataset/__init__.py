@@ -31,6 +31,7 @@ VALID_DATASETS = [
     "hh-rlhf",
     "torl_data",
     "swe_sft",
+    "aime",
 ]
 
 logger = logging.getLogger("Dataset")
@@ -88,6 +89,26 @@ def _get_custom_dataset(
         from .gsm8k import get_gsm8k_rl_dataset
 
         return get_gsm8k_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "aime" in path and type == "sft":
+        from .aime import get_aime_sft_dataset
+
+        return get_aime_sft_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "aime" in path and type == "rl":
+        from .aime import get_aime_rl_dataset
+
+        return get_aime_rl_dataset(
             path=path,
             split=split,
             tokenizer=tokenizer,
