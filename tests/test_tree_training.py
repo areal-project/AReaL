@@ -1,7 +1,11 @@
+import gc
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 import torch
+from torch.distributed.tensor import DTensor
 
 from tests.utils import get_model_path
 
@@ -26,6 +30,13 @@ logger = logging.getLogger("TreeTraining Test")
 MODEL_PATH = get_model_path(
     "/storage/openpsi/models/Qwen__Qwen3-0.6B/", "Qwen/Qwen3-0.6B"
 )
+
+
+@pytest.fixture(autouse=True)
+def release_engine_cycles() -> Iterator[None]:
+    yield
+    gc.collect()
+    current_platform.empty_cache()
 
 
 def mock_tree_input(
@@ -105,6 +116,13 @@ def mock_tree_input(
     }
 
 
+def _cpu_snapshot(tensor: torch.Tensor) -> torch.Tensor:
+    # These tests use world size 1, so the local DTensor contains every value.
+    if isinstance(tensor, DTensor):
+        tensor = tensor.to_local()
+    return tensor.detach().to(device="cpu", copy=True)
+
+
 def _collect_gradients(
     engine: FSDPEngine | MegatronEngine | ArchonEngine,
 ) -> dict[str, torch.Tensor]:
@@ -113,21 +131,21 @@ def _collect_gradients(
     if isinstance(engine, FSDPEngine):
         for name, param in engine.model.named_parameters():
             if param.grad is not None:
-                grads[name] = param.grad.clone()
+                grads[name] = _cpu_snapshot(param.grad)
     elif isinstance(engine, ArchonEngine):
         for model in engine.model_parts:
             for name, param in model.named_parameters():
                 if param.grad is not None:
-                    grads[name] = param.grad.clone()
+                    grads[name] = _cpu_snapshot(param.grad)
     else:
         # Megatron engine
         for model in engine.model:
             for name, param in model.named_parameters():
                 # Megatron stores gradients in main_grad attribute
                 if hasattr(param, "main_grad") and param.main_grad is not None:
-                    grads[name] = param.main_grad.clone()
+                    grads[name] = _cpu_snapshot(param.main_grad)
                 elif param.grad is not None:
-                    grads[name] = param.grad.clone()
+                    grads[name] = _cpu_snapshot(param.grad)
     return grads
 
 
@@ -138,16 +156,16 @@ def _collect_parameters(
     params = {}
     if isinstance(engine, FSDPEngine):
         for name, param in engine.model.named_parameters():
-            params[name] = param.data.clone()
+            params[name] = _cpu_snapshot(param)
     elif isinstance(engine, ArchonEngine):
         for model in engine.model_parts:
             for name, param in model.named_parameters():
-                params[name] = param.data.clone()
+                params[name] = _cpu_snapshot(param)
     else:
         # Megatron engine
         for model in engine.model:
             for name, param in model.named_parameters():
-                params[name] = param.data.clone()
+                params[name] = _cpu_snapshot(param)
     return params
 
 
@@ -164,6 +182,7 @@ def _check_nan_params(params: dict[str, torch.Tensor], label: str) -> list[str]:
     return nan_params
 
 
+@contextmanager
 def _create_engine(
     engine_type: str,
     enable_tree_training: bool = False,
@@ -171,8 +190,10 @@ def _create_engine(
     experiment_name: str = "test",
     max_tokens_per_mb: int = 256,
     n_mbs: int | None = None,
-) -> FSDPEngine | MegatronEngine | ArchonEngine:
-    """Create and initialize an engine of the specified type."""
+) -> Iterator[FSDPEngine | MegatronEngine | ArchonEngine]:
+    """Initialize one engine and always release its process groups and patches."""
+    gc.collect()
+    current_platform.empty_cache()
     os.environ.update(
         {
             "WORLD_SIZE": "1",
@@ -207,11 +228,19 @@ def _create_engine(
 
     alloc_mode = ModelAllocation.from_str("fsdp:d1p1t1")
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=8)
-    engine.create_process_group(alloc_mode.parallel)
-    engine.initialize(addr=None, ft_spec=ft_spec, parallel_strategy=alloc_mode.parallel)
-    logger.info(f"{engine_type.upper()} Model initialized: {engine.model}")
-
-    return engine
+    try:
+        engine.create_process_group(alloc_mode.parallel)
+        engine.initialize(
+            addr=None, ft_spec=ft_spec, parallel_strategy=alloc_mode.parallel
+        )
+        logger.info(f"{engine_type.upper()} Model initialized: {engine.model}")
+        yield engine
+    finally:
+        try:
+            engine.destroy()
+        finally:
+            if engine_type == "fsdp" and enable_tree_training:
+                restore_patch_fsdp_for_tree_training()
 
 
 # ===================== Forward Test =====================
@@ -233,27 +262,24 @@ def test_tree_training_forward(engine_type, tree_attn_backend):
     areal.models.tree_attn.module_archon.USE_TRITON_TREE_ATTN = use_triton
     # Create baseline engine
     inputs = mock_tree_input()
-    baseline_engine = _create_engine(engine_type, port="7777")
-    baseline_engine.eval()
-    logprob_baseline = baseline_engine.forward_batch(
-        input_=inputs,
-        aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
-    )
-    baseline_engine.destroy()
+    with _create_engine(engine_type, port="7777") as baseline_engine:
+        baseline_engine.eval()
+        logprob_baseline = baseline_engine.forward_batch(
+            input_=inputs,
+            aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
+        )
+    del baseline_engine
 
     # Create tree training engine
     inputs = mock_tree_input()
-    tree_engine = _create_engine(
+    with _create_engine(
         engine_type,
         enable_tree_training=True,
         port="7778",
-    )
-    tree_engine.eval()
-    logprob_tree = tree_engine.forward_batch(input_=inputs)
-    tree_engine.destroy()
-
-    if engine_type == "fsdp":
-        restore_patch_fsdp_for_tree_training()
+    ) as tree_engine:
+        tree_engine.eval()
+        logprob_tree = tree_engine.forward_batch(input_=inputs)
+    del tree_engine
 
     # Check if results match with detailed error reporting
     # The tolerance values are high due to precision problems introduced
@@ -324,53 +350,50 @@ def test_tree_training_forward_backward(engine_type, tree_attn_backend):
     areal.models.tree_attn.module_archon.USE_TRITON_TREE_ATTN = use_triton
     inputs = mock_tree_input()
     # Create baseline engine
-    baseline_engine = _create_engine(engine_type, port="7777")
-    baseline_engine.train()
-    _ = baseline_engine.train_batch(
-        inputs,
-        loss_fn=loss_fn,
-        loss_weight_fn=loss_weight_fn,
-    )
+    with _create_engine(engine_type, port="7777") as baseline_engine:
+        baseline_engine.train()
+        _ = baseline_engine.train_batch(
+            inputs,
+            loss_fn=loss_fn,
+            loss_weight_fn=loss_weight_fn,
+        )
 
-    # Collect baseline gradients and parameters
-    baseline_grads = _collect_gradients(baseline_engine)
-    baseline_params = _collect_parameters(baseline_engine)
-    logger.info(
-        f"Collected {len(baseline_grads)} gradients from baseline {engine_type.upper()} engine"
-    )
-    logger.info(
-        f"Collected {len(baseline_params)} parameters from baseline {engine_type.upper()} engine"
-    )
-    baseline_engine.destroy()
+        # Collect baseline gradients and parameters
+        baseline_grads = _collect_gradients(baseline_engine)
+        baseline_params = _collect_parameters(baseline_engine)
+        logger.info(
+            f"Collected {len(baseline_grads)} gradients from baseline {engine_type.upper()} engine"
+        )
+        logger.info(
+            f"Collected {len(baseline_params)} parameters from baseline {engine_type.upper()} engine"
+        )
+    del baseline_engine
 
     # Create tree training engine
     inputs = mock_tree_input()
-    tree_engine = _create_engine(
+    with _create_engine(
         engine_type,
         enable_tree_training=True,
         port="7778",
         experiment_name="test_tree",
-    )
-    tree_engine.train()
-    _ = tree_engine.train_batch(
-        inputs,
-        loss_fn=loss_fn,
-        loss_weight_fn=loss_weight_fn,
-    )
+    ) as tree_engine:
+        tree_engine.train()
+        _ = tree_engine.train_batch(
+            inputs,
+            loss_fn=loss_fn,
+            loss_weight_fn=loss_weight_fn,
+        )
 
-    if engine_type == "fsdp":
-        restore_patch_fsdp_for_tree_training()
-
-    # Collect tree training gradients and parameters
-    tree_grads = _collect_gradients(tree_engine)
-    tree_params = _collect_parameters(tree_engine)
-    logger.info(
-        f"Collected {len(tree_grads)} gradients from tree training {engine_type.upper()} engine"
-    )
-    logger.info(
-        f"Collected {len(tree_params)} parameters from tree training {engine_type.upper()} engine"
-    )
-    tree_engine.destroy()
+        # Collect tree training gradients and parameters
+        tree_grads = _collect_gradients(tree_engine)
+        tree_params = _collect_parameters(tree_engine)
+        logger.info(
+            f"Collected {len(tree_grads)} gradients from tree training {engine_type.upper()} engine"
+        )
+        logger.info(
+            f"Collected {len(tree_params)} parameters from tree training {engine_type.upper()} engine"
+        )
+    del tree_engine
 
     # ========== Compare gradients ==========
     baseline_keys = set(baseline_grads.keys())

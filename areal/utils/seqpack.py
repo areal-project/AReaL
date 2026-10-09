@@ -231,6 +231,41 @@ def _ffd_allocate(
     return group_indices
 
 
+def padded_allocate(
+    values: list[int], capacity: int, min_groups: int, n_groups_divisor: int = 1
+) -> list[list[int]]:
+    """Group nearby lengths subject to ``max(lengths) * group_size`` capacity.
+
+    Split the largest padded groups when more microbatches are required by the
+    pipeline or another data-parallel rank. Splitting preserves the budget.
+    """
+    if any(v > capacity for v in values):
+        raise RuntimeError(f"Values {values} is larger than capacity {capacity}")
+    groups: list[list[int]] = []
+    for idx in sorted(range(len(values)), key=lambda i: values[i], reverse=True):
+        if not groups or values[groups[-1][0]] * (len(groups[-1]) + 1) > capacity:
+            groups.append([idx])
+        else:
+            groups[-1].append(idx)
+    target = (
+        math.ceil(max(len(groups), min_groups) / n_groups_divisor) * n_groups_divisor
+    )
+    if target > len(values):
+        raise RuntimeError(
+            f"Cannot allocate {len(values)} values into {target} non-empty groups."
+        )
+    while len(groups) < target:
+        idx = max(
+            (i for i, g in enumerate(groups) if len(g) > 1),
+            key=lambda i: values[groups[i][0]] * len(groups[i]),
+        )
+        group = groups[idx]
+        midpoint = len(group) // 2
+        groups[idx] = group[:midpoint]
+        groups.append(group[midpoint:])
+    return groups
+
+
 def ffd_allocate(
     values: list[int], capacity: int, min_groups: int, n_groups_divisor: int = 1
 ) -> list[list[int]]:
