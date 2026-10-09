@@ -60,12 +60,6 @@ pauses. Evaluation leaves this unset, using stream/server defaults. Explicit
 
 ## Required runtime support
 
-Stable QSA top-k preserves score ordering and resolves exact ties by lower relative
-index. Row bounds and finite scores within those bounds are always validated. On CUDA,
-device assertions avoid per-call host synchronization; invalid inputs invalidate the
-CUDA context and require terminating the worker, not retrying the request. Errors may
-surface at a subsequent CUDA operation. CPU inputs retain immediate `ValueError`s.
-
 Qwen4Exp vision uses Transformers 5.16.1, including `Qwen4ExpModel.get_rope_index` and
 `get_vision_position_ids`. Supply the compatible runtime through `PYTHONPATH`; the
 project dependency declarations retain main's Transformers constraints. Initialization
@@ -78,8 +72,8 @@ packed zigzag order and sequence-parallel handling are preserved.
 
 Prepare Transformers 5.16.1 with compatible Tokenizers 0.23.1 and Safetensors 0.8.0 in a
 shared runtime directory, and a clean checkout of
-`dingzhiqiang/mcore-bridge@557aaf93b16d083fdec4f82a8251d47d47c76ccb` (based on
-ModelScope `bc58ea9`, including the generated-vision-token embedding fix). Set these
+`dingzhiqiang/mcore-bridge@7ad1b2d0e1ebc1b11b87c469719f6225e645d2fe` (based on
+ModelScope `bc58ea9`, including the generated-vision-token and PLE fixes). Set these
 paths in the launch environment:
 
 ```bash
@@ -108,12 +102,9 @@ The small Python helpers in this directory are runtime support, not additional e
   preserve the GDN CP path, causal PLE history/gradients, and rejection of nonfinite
   optimizer updates. Chunked LM-head loss uses 1024-token chunks; PLE uses 8192.
 - The SGLang patch helpers validate their source revision before applying the QSA
-  compatibility changes. `proxy.py` and `template_defaults.py` provide model request
-  defaults. Shell helpers launch the controller and workers.
-- `batch_snapshot.py` supports opt-in diagnosis through `QWEN_BATCH_SNAPSHOT_DIR` and
-  replay through `QWEN_BATCH_REPLAY_PATH` or `QWEN_BATCH_REPLAY_PATHS`. Replay consumes
-  each supplied batch once and requires disabled recovery and matching step count; it
-  does not restore RNG or optimizer state and is not an on-policy RL run.
+  compress-gather bounds and image-preprocessing compatibility fixes. `proxy.py` and
+  `template_defaults.py` provide model request defaults. Shell helpers launch the
+  controller and workers.
 
 Vision requires `language_model_only: false`, multimodal SGLang, and processor-produced
 modality IDs. AWEX derives frozen-weight exclusions from the model configuration and
@@ -129,9 +120,77 @@ PLE tables.
 
 Training allocations retain expandable segments; AWEX disables them only for IPC staging
 allocation and restores allocator settings. Validate CUDA IPC compatibility, repeated
-weight equality and checkpoint recovery with the actual image pair. CPU tests and
-zero-gradient replay do not establish full-model numerical parity or RL learning.
+weight equality and checkpoint recovery with the actual image pair. CPU tests do not
+establish full-model numerical parity or RL learning.
 
 RL output defaults to `/storage/openpsi/experiments/qwen38-flash-next/<profile>`. Set
 `QWEN_OUTPUT_ROOT` for a specific experiment directory, or `QWEN_EXPERIMENTS_ROOT` to
 change the shared experiments root.
+
+The default recipe uses SGLang's native QSA top-k and prefix cache. Stable top-k, random
+cache salt, saved-batch replay and snapshots are opt-in on this debug branch. Full
+trajectory/result persistence and verbose rollout tracing remain disabled by default.
+Health metrics, checkpoint recovery and model compatibility patches remain enabled. NCCL
+selects its algorithm and protocol unless explicitly overridden in the launch
+environment.
+
+## Production fixes retained in this recipe
+
+| Path                                                                                                         | Problem addressed                                                                                             | Runtime behavior                                                                                                    |
+| ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `areal/models/mcore/mcore_bridge_adapter.py`, `registry.py`, `mcore_bridge_checkpoint.py`                    | The standard bridge does not register or export Qwen4Exp's full multimodal model.                             | Register the model, configure frozen PLE/visual parameters, and load/export the matching HF layout.                 |
+| `areal/engine/megatron_utils/qwen4_exp_cp.py`                                                                | A non-autograd PLE gather loses gradients from remote CP consumers.                                           | Gather with a backward collective while preserving packed zigzag ordering.                                          |
+| `areal/engine/megatron_utils/qwen4_exp_mrope.py`, `packed_context_parallel.py`, `areal/trainer/ppo/actor.py` | Generated special token IDs can be mistaken for image placeholders.                                           | Use the original input loss mask to identify visual prompt tokens and construct three-axis positions.               |
+| `areal/engine/sglang_remote.py`, `patch_sglang_qwen4_vl.py`                                                  | Expanded image tokens can trigger whole-prompt retokenization; processor merging must match the model.        | Compact image placeholders only for inference transport, preserve training IDs, and align image preprocessing.      |
+| `areal/models/mcore/qwen4_exp_awex_*.py`, `qwen4_exp_frozen_state.py`                                        | Frozen PLE/visual weights are excluded from live transfer and can be lost during inference offload.           | Verify checkpoint contents, preserve visual parameters across offload, and release PLE caches in the correct order. |
+| `areal/models/mcore/vision_checkpoint.py`                                                                    | Visual encoder activations increase training memory use.                                                      | Checkpoint visual blocks when gradient checkpointing is enabled.                                                    |
+| `gdn_cp_compat.py`, `ple_chunked.py`, `patch_sglang_qsa_compress_gather.py`, `actor_worker.py`               | The 256K recipe needs compatible GDN CP, bounded PLE/LM-head work, QSA bounds, and optimizer memory.          | Install those compatibility helpers and CPU optimizer offload.                                                      |
+| `areal/engine/megatron_utils/transport.py`, `areal/engine/megatron_engine.py`                                | Filtered RL groups can leave empty microbatches; the first gradient collective competes with allocator cache. | Choose a real microbatch schedule when possible and reclaim cached memory before the first gradient finalization.   |
+| `grad_norm_guard.py`                                                                                         | A nonfinite gradient norm would contaminate optimizer state.                                                  | Reject the update before clipping and stepping, without scanning or dumping full gradients.                         |
+
+The bridge's PLE host-allocation, packed-memory and TP-gradient fixes live in the pinned
+external `mcore-bridge` checkout, not in this repository. `examples/swe/config.py` keeps
+the OmegaConf-compatible SFT split-mode field, and `areal/utils/stats_logger.py` loads
+the optional Trackio backend only when selected; both are needed by the existing
+image-based launch path. OpenAI image transport preserves data URIs and shares CPU
+vision tensors across completions.
+
+These fixes support model execution and data correctness. This recipe does not enable
+MoE routing replay; they do not establish that the remaining training/inference logp
+difference is resolved. Validation of the full 64-GPU configuration requires a separate
+run with the selected training and inference images.
+
+Arena failure classification, terminal receipts, gateway retry/lease renewal and context
+budget recovery remain part of the production workflow. They distinguish model-origin
+failures from infrastructure failures and preserve usable training samples. NUMA
+placement, asynchronous checkpoint saving and existing runtime reliability fixes are
+also retained. The cleanup removes diagnostic helpers and diagnostic defaults only; it
+does not split production fixes by whether they are model-specific.
+
+## Debug branch: garbled output and logp differences
+
+`chucai.dzq/debug-qwen38-flash-logp` preserves the diagnostic tools on top of the
+production fixes in PR #1774. Normal training changes belong on
+`chucai.dzq/fix-qwen38-flash-rl`; snapshots, replay and diagnostic comparisons belong
+here. Both branches keep the same default RL configuration and runtime dependency pins.
+
+| Tool                                                                  | Purpose                                                                                                               | Activation                                                                                                                                                             |
+| --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `batch_snapshot.py` and `train_rl.py` capture hooks                   | Save CPU copies of original token IDs, masks, logp and image tensors without changing the live batch.                 | Set `QWEN_BATCH_SNAPSHOT_DIR` in the controller environment.                                                                                                           |
+| `batch_snapshot.py`, `train_rl.py` and `actor_worker.py` replay hooks | Replay saved batches once through actor workers without generating new Arena rollouts.                                | Set `QWEN_BATCH_REPLAY_PATH` or JSON-array `QWEN_BATCH_REPLAY_PATHS`; propagate replay variables to actor workers and set controller `QWEN_AB_ARM=fixed` or `unfixed`. |
+| `patch_sglang_qsa_topk.py`                                            | Compare stable QSA selection with native top-k; this is a diagnostic option, not a proven RL correctness requirement. | Apply the patch to a fresh compatible SGLang worker layer and set that worker's `QWEN_QSA_STABLE_TOPK=1`. The default startup does not apply this patch.               |
+| `proxy.py` cache-salt wrapper                                         | Compare requests with prefix-cache isolation.                                                                         | Set `QWEN_ISOLATE_REQUEST_CACHE=1` in the proxy worker environment; disabled by default.                                                                               |
+| `grad_norm_guard.py`                                                  | Include per-parameter gradient summaries when a nonfinite norm rejects an update.                                     | Runs on the nonfinite-gradient failure path on this branch.                                                                                                            |
+
+Replay requires recovery disabled, `eval_before_train=false`, and one training step per
+supplied snapshot. Metadata must match the model, allocation and sample count. The
+`fixed` replay profile preserves shared image storage; `unfixed` deliberately splits
+image aliases for the historical host-cache comparison. Replay does not restore RNG or
+optimizer state and is not an on-policy RL experiment.
+
+For garbled-output analysis, preserve the original token IDs and image data. Count
+tokens whose original bytes decode with U+FFFD separately from all tokens in a response
+containing such bytes. Excluding those tokens changes only the statistics mask; keep the
+original forward context. Compare the same weights and masks before attributing logp
+differences to text corruption or MoE routing. These helpers do not implement R3 routing
+replay; its integration remains a separate change.

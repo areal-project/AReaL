@@ -17,6 +17,9 @@ def format_reward(predict_str: str) -> float:
 
 def acc_reward(predict_str: str, ground_truth: str) -> float:
     answer = extract_boxed_content(predict_str)
+    # "None" is mathruler's sentinel for "no closed \boxed{} found".
+    if answer == "None":
+        return 0.0
     return 1.0 if grade_answer(answer, ground_truth) else 0.0
 
 
