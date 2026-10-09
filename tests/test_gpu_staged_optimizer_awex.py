@@ -123,7 +123,8 @@ def test_awex_releases_mixed_managed_and_ordinary_optimizer_chain(
     ordinary_param.grad = torch.tensor([0.5, -0.25], device="cuda")
     ordinary.step()
     ordinary_state = ordinary.state[ordinary_param]
-    # Ordinary optimizer tensors with non-AdamW names must migrate too.
+    # Native Muon uses this state name; v1 AWEX must migrate it alongside
+    # AdamW's moments when the optimizer is not CPU-staged.
     ordinary_state["momentum_buffer"] = torch.tensor([0.25, -0.5], device="cuda")
     expected_state = {
         key: value.detach().cpu().clone()

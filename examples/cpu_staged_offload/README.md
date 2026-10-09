@@ -19,10 +19,36 @@ No example-specific actor, trainer, or worker environment variables are required
 `buffer_count` controls the number of reusable GPU staging slots; `bucket_size_mb`
 bounds one slot's master/moment/gradient tensors.
 
-The AdamW backend requires Megatron-Core 0.17.0, BF16 training, distributed optimizer,
+The AdamW backend requires Megatron-Core 0.19.0, BF16 training, distributed optimizer,
 precision-aware optimizer semantics, and FP32 master/moment state. Enabling it selects
 precision-aware mode automatically. Staged optimizer checkpoint saves are synchronous;
 `megatron.async_save=true` is rejected.
+
+The staged Muon backend remains available through the same core configuration:
+
+```yaml
+actor:
+  optimizer:
+    type: dist_muon
+    muon:
+      momentum: 0.95
+      num_ns_steps: 5
+      tp_mode: duplicated
+  megatron:
+    ddp:
+      use_distributed_optimizer: false
+    cpu_staged_offload:
+      enabled: true
+      buffer_count: 1
+      bucket_size_mb: 128
+```
+
+The optimizer algorithm is independent from CPU staging: set `type: dist_muon` with
+`cpu_staged_offload.enabled: false` to use native layer-wise Muon, or enable CPU staging
+without changing any Muon hyperparameters. Muon retains MCore's official LayerWise
+ownership and the staged variant's synchronous DCP schema. It requires Megatron-Core
+0.19.0, emerging-optimizers 0.3.0, BF16, and synchronous parameter gather; TP or
+expert-TP greater than one requires `buffer_count: 1`.
 
 Checkpoint loading is fail-stop. DCP writes optimizer state into the authoritative CPU
 slabs in place. If loading fails, the process must terminate and AReaL recovery starts a
@@ -31,9 +57,9 @@ recovery retry is attempted.
 
 AWEX colocation itself does not require CPU staging. However, the current AWEX weight
 exchange explicitly releases optimizer memory before restoring actor weights. That
-release uses the managed CPU slabs for staged AdamW. Ordinary Megatron optimizers retain
-AWEX's original phase-boundary GPU-to-CPU migration and are copied back before training
-resumes. The optional HybridDeviceOptimizer compatibility path is not supported.
+release uses the managed CPU slabs for staged AdamW and staged Muon. Ordinary Megatron
+optimizers retain AWEX's phase-boundary GPU-to-CPU migration and are copied back before
+training resumes. HybridDeviceOptimizer's native CPU state remains CPU-resident.
 
 Set `QWEN3_30B_A3B_BASE_MODEL_PATH` and `DAPO_MATH_17K_PATH` to your model and dataset
 locations. The agent proxy requires a unique admin key when binding to a non-loopback
@@ -62,7 +88,7 @@ python examples/cpu_staged_offload/dapo-math_rl_cpu_staged.py \
 
 Use the activated training environment. Qwen3.5 additionally requires AWEX's Qwen3.5
 converter, available in AWEX 0.8.1; the repository's pinned AWEX 0.8.0 lacks it. The
-validated environment used Megatron Bridge 0.4.0, Megatron-Core 0.17.0, SGLang
+earlier comparison used Megatron Bridge 0.4.0, Megatron-Core 0.17.0, SGLang
 0.5.10.post1, and the AWEX 0.8.1 source checkout on `PYTHONPATH`. When using a source
 checkout, export `PYTHONPATH="${AWEX_SOURCE_DIR}:$PWD${PYTHONPATH:+:$PYTHONPATH}"`
 before launching so the workers inherit it.
