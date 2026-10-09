@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from numbers import Real
 from typing import Any, Literal
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
@@ -70,6 +70,7 @@ class ArenaTaskFailedError(ArenaAPIError):
         self.status = status
         self.payload = dict(payload or {})
         self.result = result
+        self.harness_result: dict[str, Any] | None = None
         super().__init__(f"Arena task {task_id!r} failed with {status}")
 
 
@@ -80,6 +81,11 @@ def _is_retryable_status(status_code: int) -> bool:
 def _is_retryable_response(response: httpx.Response) -> bool:
     if _is_retryable_status(response.status_code):
         return True
+    if response.status_code == 302:
+        # Spanner renders an upstream 502 as a redirect to an HTML waiting page.
+        # Retry the original request within its existing budget, never the redirect.
+        location = response.headers.get("location", "")
+        return parse_qs(urlsplit(location).query).get("fromspanner") == ["apigwmoe_502"]
     if response.status_code != 403:
         return False
     return "spanner-http-ant-group-watch-all" in response.text[:1000]
@@ -306,6 +312,31 @@ class ArenaOpenAPIClient:
         "SETUP_FAILED",
         "TIMEOUT",
     }
+
+    async def get_harness_result_async(
+        self,
+        task_id: str,
+        *,
+        client: httpx.AsyncClient,
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Fetch the terminal Harness receipt for one failed task."""
+
+        encoded_task_id = quote(task_id, safe="")
+        url = f"{self.base_url}/api/artifacts/{encoded_task_id}/harness_result.json"
+        response = await self._async_request(
+            client, "GET", url, headers=self._headers, timeout=timeout
+        )
+        response.raise_for_status()
+        if len(response.content) > 65536:
+            raise ArenaAPIError("Harness result artifact exceeds 64 KiB")
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise ArenaAPIError("Harness result artifact is not JSON") from exc
+        if not isinstance(result, dict):
+            raise ArenaAPIError("Harness result artifact must be a JSON object")
+        return result
 
     def __init__(
         self,

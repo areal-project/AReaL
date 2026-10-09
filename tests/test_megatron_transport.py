@@ -7,8 +7,52 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from areal.api.cli_args import MicroBatchSpec
-from areal.engine.megatron_utils.transport import validate_transport_padding
-from areal.utils.data import TRANSPORT_DUMMY_KEY, MicroBatchList
+from areal.engine.megatron_utils.transport import (
+    nonempty_microbatch_target,
+    validate_transport_padding,
+)
+from areal.utils.data import (
+    TRANSPORT_DUMMY_KEY,
+    MicroBatchList,
+    split_padded_tensor_dict_into_mb_list,
+)
+
+
+@pytest.mark.parametrize(
+    ("requested", "real_rows", "expected"),
+    [(128, 112, 112), (128, 74, 72), (128, 64, 64), (96, 112, 96)],
+)
+def test_nonempty_microbatch_target_uses_real_rows_without_dummy(
+    requested, real_rows, expected
+):
+    """A variable-size rollout batch uses the largest real pipeline schedule."""
+    target = nonempty_microbatch_target(requested, real_rows, 4, 8)
+    data = {
+        "input_ids": torch.arange(real_rows).view(real_rows, 1),
+        "attention_mask": torch.ones(real_rows, 1, dtype=torch.bool),
+    }
+
+    mb_list = split_padded_tensor_dict_into_mb_list(
+        data,
+        MicroBatchSpec(n_mbs=target, n_mbs_divisor=4, max_tokens_per_mb=2),
+        allow_transport_padding=True,
+    )
+
+    assert target == expected
+    assert len(mb_list.mbs) == expected
+    assert mb_list.transport_dummy_count == 0
+
+
+def test_nonempty_microbatch_target_preserves_minimum_when_rows_too_few():
+    """The existing MoE transport guard diagnoses an undersized batch."""
+    assert nonempty_microbatch_target(96, 7, 4, 8) == 96
+
+
+def test_nonempty_microbatch_target_respects_pair_granularity():
+    """A preference batch counts pairs rather than individual rows."""
+    real_rows = 148
+    granularity = 2
+    assert nonempty_microbatch_target(128, real_rows // granularity, 4, 8) == 72
 
 
 def _microbatches(has_dummy: bool) -> MicroBatchList:

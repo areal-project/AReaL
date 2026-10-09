@@ -51,7 +51,7 @@ esac
         MEGATRON_ROOT="/inference/megatron",
         MCORE_BRIDGE_ROOT="/training/bridge",
         QWEN_TRAIN_EXTRA_PYTHONPATH="/training/transformers",
-        TEST_BRIDGE_REVISION="557aaf93b16d083fdec4f82a8251d47d47c76ccb",
+        TEST_BRIDGE_REVISION="7ad1b2d0e1ebc1b11b87c469719f6225e645d2fe",
         QWEN_INFER_EXTRA_PYTHONPATH="/inference/overlay",
     )
     for key in ("QWEN_PRIVATE_ENV", "QWEN_ARENA_STREAMS_FILE"):
@@ -142,7 +142,7 @@ def test_rollout_startup_uses_image_python_for_patches_and_rpc(
     )
     assert result.returncode == 0, result.stderr
     assert Path(env["TEST_LOG"]).read_text().splitlines() == [
-        "-m examples.swe.qwen38_flash_next.patch_sglang_qsa_topk",
         "-m examples.swe.qwen38_flash_next.patch_sglang_qsa_compress_gather",
+        "-m examples.swe.qwen38_flash_next.patch_sglang_qwen4_vl",
         "-m areal.infra.rpc.rpc_server",
     ]

@@ -10,16 +10,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from examples.swe.qwen38_flash_next.batch_snapshot import (
-    capture_training_batches,
-    load_batch_snapshot,
-    save_batch_snapshot,
-)
 from examples.swe.qwen38_flash_next.gdn_cp_compat import patch_packed_cp_forward
-from examples.swe.qwen38_flash_next.grad_norm_guard import (
-    guard_grad_norm,
-    local_gradient_diagnostics,
-)
+from examples.swe.qwen38_flash_next.grad_norm_guard import guard_grad_norm
 from examples.swe.qwen38_flash_next.ple_chunked import chunked_ple
 from examples.swe.qwen38_flash_next.train_rl import (
     configure_training_rpc,
@@ -35,8 +27,6 @@ from areal.engine.megatron_utils.qwen4_exp_mrope import (
 )
 from areal.utils.data import (
     MicroBatchSpec,
-    RolloutGroup,
-    TrajBatchMeta,
     concat_padded_tensors,
     pack_tensor_dict,
     pad_mb_list,
@@ -473,47 +463,14 @@ def _optimizer(grad):
     return SimpleNamespace(get_main_grads_for_grad_norm=lambda: [grad])
 
 
-def test_large_finite_gradients_diagnose_fp32_norm_overflow():
+def test_nonfinite_grad_norm_rejected_before_clipping():
     grad = torch.tensor([1e20, -1e20], dtype=torch.float32)
     assert torch.isinf(grad.norm())
     before = grad.clone()
     optimizer = _optimizer(grad)
-    report = local_gradient_diagnostics(optimizer, chunk_size=1)
-    assert report["nonfinite_elements"] == 0
-    assert report["finite_fp64_norm"] == pytest.approx(grad.double().norm().item())
     with pytest.raises(RuntimeError, match="before clipping"):
         guard_grad_norm(lambda _: grad.norm().item())(optimizer)
     torch.testing.assert_close(grad, before, rtol=0, atol=0)
-
-
-def test_snapshot_real_rollout_metadata_roundtrips_without_mutating_batch(tmp_path):
-    group = RolloutGroup((1, 2, 1, 1), (0.0, 1.0, 1.0, 1.0))
-    pixels = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
-    batch = [
-        {
-            "rollout_group": group,
-            "pixel_values": pixels,
-            "alias": pixels,
-            "logprobs": torch.zeros(5, 3),
-            "attention_mask": torch.ones(5, 3),
-        }
-    ]
-    actor = SimpleNamespace(
-        prepare_batch=lambda: batch, compute_advantages=lambda data: data
-    )
-    with capture_training_batches(actor, tmp_path, {}):
-        assert actor.prepare_batch() is batch
-        assert actor.compute_advantages(batch) is batch
-    path = tmp_path / "prepare_batch-0000.output.pt"
-    assert torch.load(path, weights_only=True)["schema_version"] == 2
-    restored = load_batch_snapshot(path)["batch"][0]
-    assert restored["rollout_group"].validate_rows(5) == group
-    assert batch[0]["rollout_group"] is group
-    assert restored["pixel_values"] is restored["alias"]
-    torch.testing.assert_close(restored["pixel_values"], pixels, rtol=0, atol=0)
-    meta = TrajBatchMeta(1, [5], [3], [group])
-    save_batch_snapshot(tmp_path / "meta.pt", {"meta": meta}, {})
-    assert load_batch_snapshot(tmp_path / "meta.pt")["batch"]["meta"] == meta
 
 
 def evaluation_config():

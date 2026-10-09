@@ -45,6 +45,7 @@ HARNESS_OUTCOME_METRIC_CODES = frozenset(
         "AGENT_RUN_TIMEOUT",
         "AUTONOMOUS_INCOMPLETE_NO_SHIP",
         "GAMEAGENT_RUN_FAILED",
+        "LLM_CONTEXT_WINDOW_EXCEEDED",
         "LLM_RESPONSE_FAILED",
         "LLM_RESPONSE_TIMEOUT",
     }
@@ -271,7 +272,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 **metadata,
             }
 
-    async def _call_agent_hook(self, name: str, *args: Any, **kwargs: Any) -> None:
+    async def _call_agent_hook(self, name: str, *args: Any, **kwargs: Any) -> Any:
         """Call an optional agent lifecycle hook without blocking the event loop."""
 
         hook = getattr(self.agent, name, None)
@@ -279,7 +280,8 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             return
         result = hook(*args, **kwargs)
         if inspect.isawaitable(result):
-            await result
+            return await result
+        return result
 
     def _classify_agent_failure(
         self,
@@ -565,6 +567,14 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 else:
                     raise ValueError(f"Invalid reward type: {type(rewards)}")
 
+        if (
+            agent_error is None
+            and proxy_client.context_overflow
+            and proxy_client.system_error
+        ):
+            agent_error = RuntimeError(
+                "Proxy session had a system failure as well as context overflow"
+            )
         failure_disposition: AgentFailureDisposition | None = None
         if agent_error is not None:
             failure_disposition = self._classify_agent_failure(
@@ -579,6 +589,26 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 agent_error,
                 failure_disposition,
             )
+
+        reject_failed_sample = getattr(self.agent, "should_reject_failed_sample", None)
+        if (
+            agent_error is not None
+            and not proxy_client.system_error
+            and callable(reject_failed_sample)
+            and reject_failed_sample(agent_error, failure_disposition)
+        ):
+            logger.warning(
+                "Agent task failed with disposition %s (%s: %s). "
+                "Rejecting this sample from its rollout group.",
+                failure_disposition,
+                type(agent_error).__name__,
+                agent_error,
+            )
+            stats_tracker.get(workflow_context.stat_scope()).scalar(
+                context_overflow=float(proxy_client.context_overflow),
+                proxy_system_error=float(proxy_client.system_error),
+            )
+            return None
 
         if agent_error is not None and failure_disposition != "model_failure_zero":
             logger.warning(
@@ -621,12 +651,38 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 proxy_system_error=float(proxy_client.system_error),
             )
 
+        # Request episode-return assignment while the proxy still owns the full
+        # parent graph. This is an explicit agent opt-in, never a scalar default.
+        export_kwargs = {}
+        if proxy_client.context_overflow or failure_disposition == "model_failure_zero":
+            episode_reward = await self._call_agent_hook(
+                "get_failure_reward_for_export",
+                data,
+                export_style=self.export_style,
+            )
+            if episode_reward is not None:
+                export_kwargs["episode_reward"] = episode_reward
+        elif (
+            agent_error is None
+            and not proxy_client.context_overflow
+            and isinstance(rewards, float)
+        ):
+            episode_reward = await self._call_agent_hook(
+                "get_episode_reward_for_export",
+                data,
+                rewards,
+                export_style=self.export_style,
+            )
+            if episode_reward is not None:
+                export_kwargs["episode_reward"] = episode_reward
+
         # Apply turn-level discount and export interactions
         interactions = await proxy_client.export_interactions(
             discount=self.discount,
             style=self.export_style,
             drop_retry_orphans=self.drop_retry_orphans,
             is_eval=workflow_context.get().is_eval,
+            **export_kwargs,
         )
 
         if not interactions:
