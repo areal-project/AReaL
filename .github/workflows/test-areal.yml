@@ -307,6 +307,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Sync AWEX dependency
+        run: |
+          AWEX_REQUIREMENT=$("$VIRTUAL_ENV/bin/python" - <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as f:
+              dependencies = tomllib.load(f)["project"]["dependencies"]
+          print(next(dep for dep in dependencies if dep.startswith("awex==")))
+          PY
+          )
+          uv pip install --python "$VIRTUAL_ENV/bin/python" --no-deps "$AWEX_REQUIREMENT"
+
       - name: Validate Docker installation
         run: |
           export PATH="/opt/.venv/bin:$PATH"
