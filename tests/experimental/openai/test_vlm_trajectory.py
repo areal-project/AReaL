@@ -100,9 +100,10 @@ def _response(input_tokens: list[int], output_tokens: list[int]) -> ModelRespons
     )
 
 
-def test_extract_images_preserves_remote_url_for_backend_forwarding():
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_extract_images_preserves_remote_url_for_backend_forwarding(scheme):
     """Tokenizer-only clients should keep backend-managed image URLs unchanged."""
-    url = "https://example.com/image.png"
+    url = f"{scheme}://example.com/image.png"
     messages = [
         {
             "role": "user",
@@ -122,11 +123,20 @@ def test_extract_images_preserves_remote_url_for_backend_forwarding():
         "http://169.254.169.254/latest/meta-data/",
         "https://internal.example/image.png",
         "file:///etc/passwd",
+        "ftp://example.com/image.png",
+        "./image.png",
+        "data:image/png,not-base64",
+        "data:text/plain;base64,aGVsbG8=",
     ],
 )
-def test_local_multimodal_processing_rejects_non_inline_urls(url):
-    """Local VLM processing must not fetch external resources."""
-    with pytest.raises(ValueError, match="requires valid base64-encoded image data"):
+def test_local_multimodal_processing_rejects_non_inline_urls(url, monkeypatch):
+    """Unsupported sources must fail before base64 decoding or image loading."""
+
+    def unexpected_decode(*args, **kwargs):
+        pytest.fail("Unsupported image source reached base64 decoding")
+
+    monkeypatch.setattr(base64, "b64decode", unexpected_decode)
+    with pytest.raises(ValueError, match="URLs and filesystem paths are not supported"):
         _process_multimodal_prompt(
             _FakeProcessor(),
             _FakeTokenizer(),
@@ -137,12 +147,26 @@ def test_local_multimodal_processing_rejects_non_inline_urls(url):
         )
 
 
+@pytest.mark.parametrize("payload", ["abc", "aGVsbG8="])
+def test_local_multimodal_processing_rejects_invalid_inline_images(payload):
+    """Base64-shaped input still requires valid padding and decodable image bytes."""
+    with pytest.raises(ValueError, match="requires valid base64-encoded image data"):
+        _process_multimodal_prompt(
+            _FakeProcessor(),
+            _FakeTokenizer(),
+            [{"role": "user", "content": [{"type": "image"}]}],
+            [payload],
+            None,
+            {},
+        )
+
+
 def test_local_multimodal_processing_rejects_existing_local_image_path(tmp_path):
     """Local VLM processing must not open filesystem paths from requests."""
     image_path = tmp_path / "private-image.png"
     Image.new("RGB", (2, 2), color="red").save(image_path)
 
-    with pytest.raises(ValueError, match="requires valid base64-encoded image data"):
+    with pytest.raises(ValueError, match="URLs and filesystem paths are not supported"):
         _process_multimodal_prompt(
             _FakeProcessor(),
             _FakeTokenizer(),
@@ -434,11 +458,18 @@ async def test_generation_api_rejects_vllm_multimodal_trajectory(api_type):
 
 
 @pytest.mark.parametrize("image_format", ["JPEG", "PNG"])
-def test_inline_image_uri_preserved_for_backend_and_decoded_locally(image_format):
+@pytest.mark.parametrize("use_data_uri", [True, False])
+def test_inline_image_uri_preserved_for_backend_and_decoded_locally(
+    image_format, use_data_uri
+):
     with BytesIO() as buffer:
         Image.new("RGB", (2, 2), color="red").save(buffer, format=image_format)
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    uri = f"data:image/{image_format.lower()};base64,{encoded}"
+    uri = (
+        f"data:image/{image_format.lower()};base64,{encoded}"
+        if use_data_uri
+        else encoded
+    )
     messages = [
         {"role": "user", "content": [{"type": "image_url", "image_url": {"url": uri}}]}
     ]

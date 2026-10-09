@@ -163,7 +163,11 @@ def _process_multimodal_prompt(
     tools: Iterable[ChatCompletionToolParam] | None,
     chat_template_kwargs: dict[str, Any],
 ) -> _PreparedPrompt:
-    """Build model-ready prompt tokens and vision tensors with an HF processor."""
+    """Build prompt tokens and vision tensors from inline base64 images only.
+
+    Accept image data URIs or bare base64 payloads. URLs and filesystem paths
+    are not supported locally; URL forwarding requires a tokenizer-only client.
+    """
     import base64
     import binascii
     from io import BytesIO
@@ -173,9 +177,16 @@ def _process_multimodal_prompt(
 
     images = []
     for encoded_image in image_data:
+        match = _DATA_URI_RE.match(encoded_image)
+        payload = match.group(1) if match else encoded_image
+        if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", payload):
+            raise ValueError(
+                "Local multimodal processing only supports inline base64 image data "
+                "(data:image/<subtype>;base64,... or a bare base64 payload). "
+                "URLs and filesystem paths are not supported. "
+                "URL forwarding is only available for tokenizer-only clients."
+            )
         try:
-            match = _DATA_URI_RE.match(encoded_image)
-            payload = match.group(1) if match else encoded_image
             image_bytes = base64.b64decode(payload, validate=True)
             with Image.open(BytesIO(image_bytes)) as image:
                 images.append(load_image(image))
@@ -417,6 +428,10 @@ def _extract_images_from_messages(
     preserves image data URIs (or raw URLs), and converts messages to a
     HuggingFace-compatible format for ``apply_chat_template``.
 
+    Extraction preserves sources for backend forwarding by tokenizer-only clients.
+    Local preprocessing with an HF processor accepts only inline base64 images;
+    preserving a URL here does not make it supported by local preprocessing.
+
     Args:
         messages: Normalized list of message dicts (OpenAI format).
 
@@ -464,7 +479,9 @@ def _extract_images_from_messages(
                 if not isinstance(url, str) or not url:
                     raise ValueError(
                         "image_url content part has an empty or missing URL. "
-                        "Provide a valid data URI or HTTP(S) URL in image_url.url."
+                        "Provide inline base64 image data in image_url.url. "
+                        "HTTP(S) URLs are only supported for backend forwarding "
+                        "by tokenizer-only clients."
                     )
 
                 # Preserve the URI: bare JPEG base64 starts with "/" and can
