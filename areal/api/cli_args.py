@@ -1827,6 +1827,12 @@ class PPOActorConfig(TrainEngineConfig):
     m2_threshold: float | None = field(
         default=None, metadata={"help": "The second momentum threshold for M2PO."}
     )
+    m2po_optimizer_minibatch: bool = field(
+        default=False,
+        metadata={
+            "help": "Select the M2PO mask once per optimizer minibatch instead of per engine microbatch. Requires m2_threshold, data parallel size 1, and cached proximal log-probabilities (recompute or metrics)."
+        },
+    )
     # Reward
     reward_norm: NormConfig | None = field(
         default=None,
@@ -2053,6 +2059,8 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if self.m2po_optimizer_minibatch and self.m2_threshold is None:
+            raise ValueError("m2po_optimizer_minibatch requires m2_threshold")
         if isinstance(self.gae_lambda, bool) or not isinstance(
             self.gae_lambda, int | float | str
         ):
