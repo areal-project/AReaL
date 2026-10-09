@@ -250,6 +250,40 @@ def _pad_cat_dim0(tensors: list[torch.Tensor], pad_value: float = 0.0) -> torch.
         for i in range(1, ndim):
             max_shape[i - 1] = max(max_shape[i - 1], t.shape[i])
 
+    # Small rollout groups are faster with padding and cat than per-input copies.
+    if len(tensors) >= 16:
+        padded_shape = torch.Size(max_shape)
+        if all(t.shape[1:] == padded_shape for t in tensors):
+            return torch.cat(tensors, dim=0)
+
+        first = tensors[0]
+        if (
+            type(first) is torch.Tensor
+            and not first.is_quantized
+            and all(
+                type(t) is torch.Tensor
+                and t.dtype == first.dtype
+                and t.device == first.device
+                and t.layout == torch.strided
+                and t.is_contiguous()
+                and not t.requires_grad
+                and all(size > 0 for size in t.shape[1:])
+                for t in tensors
+            )
+        ):
+            result = first.new_full(
+                (sum(t.shape[0] for t in tensors), *max_shape), pad_value
+            )
+            offset = 0
+            for t in tensors:
+                slices = (
+                    slice(offset, offset + t.shape[0]),
+                    *(slice(0, size) for size in t.shape[1:]),
+                )
+                result[slices].copy_(t)
+                offset += t.shape[0]
+            return result
+
     padded_tensors = []
     for t in tensors:
         pad_sizes = [max_shape[i - 1] - t.shape[i] for i in range(1, ndim)]
