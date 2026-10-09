@@ -6,6 +6,20 @@ import torch.distributed as dist
 from areal.utils.data import TRANSPORT_DUMMY_KEY, MicroBatchList
 
 
+def nonempty_microbatch_target(
+    requested: int, real_groups: int, pipeline_size: int, minimum: int
+) -> int:
+    """Cap a pipeline schedule at the number of real, divisible microbatches.
+
+    A MoE/MTP training schedule cannot consume transport-only microbatches.
+    Preserve the minimum pipeline schedule when there are too few real groups;
+    its existing transport validation will report that unsupported case.
+    """
+    if real_groups < minimum:
+        return requested
+    return min(requested, (real_groups // pipeline_size) * pipeline_size)
+
+
 def validate_transport_padding(
     mb_list: MicroBatchList,
     *,

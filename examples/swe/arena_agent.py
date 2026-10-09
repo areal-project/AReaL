@@ -47,6 +47,14 @@ _GAMEAGENT_MODEL_FAILURE_CODES = {
     "AGENT_MAX_TURNS_EXCEEDED",
     "AUTONOMOUS_INCOMPLETE_NO_SHIP",
 }
+_CORE_MODEL_ZERO_FAILURE_MESSAGES = {
+    ("LLM_RESPONSE_FAILED", "empty_completion"): (
+        "model stopped without visible output or tool calls"
+    ),
+    ("LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED", "provider_length_stop"): (
+        "model stopped with reason: length"
+    ),
+}
 _CLAUDE_AGENT_ERROR_MARKER = "harness: agent phase error: claude reported error:"
 _CLAUDE_LIFECYCLE_RECORD_PATTERN = re.compile(
     r"\n(?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? )?"
@@ -490,9 +498,11 @@ class ArenaStreamAgentWorkflow:
         econfig: dict[str, Any] | None = None,
         gen_args: dict[str, Any] | None = None,
         timeout: float = 3600.0,
+        reject_terminal_task_failures: bool = False,
     ) -> None:
         self.econfig = econfig or {}
         self.gen_args = gen_args or {}
+        self.reject_terminal_task_failures = reject_terminal_task_failures
         self.timeout = float(self.econfig.get("timeout", timeout))
         self.registration_timeout = float(
             self.econfig.get("arena_registration_timeout", 180.0)
@@ -635,10 +645,142 @@ class ArenaStreamAgentWorkflow:
             return None
         return codes[0] if len(set(codes)) == 1 else None
 
+    @classmethod
+    def _core_model_zero_failure_message(cls, raw: Any) -> str | None:
+        """Identify a model-origin terminal failure in Arena's runner envelope."""
+        if not isinstance(raw, dict):
+            return None
+        outcome = raw.get("outcome")
+        harness = raw.get("harness")
+        if not isinstance(outcome, dict) or not isinstance(harness, dict):
+            return None
+        if (
+            outcome.get("class") != "agent"
+            or outcome.get("source") != "core_model"
+            or not isinstance(outcome.get("details"), dict)
+            or set(outcome["details"]) != {"reason"}
+            or not isinstance(outcome["details"]["reason"], str)
+            or cls._gameagent_outcome_code(raw) != outcome.get("code")
+            or harness.get("phase") != "agent"
+            or harness.get("result_status") != "ERROR"
+            or type(harness.get("exit_code")) is not int
+            or harness["exit_code"] != 1
+            or raw.get("failure") is not None
+        ):
+            return None
+        code = outcome["code"]
+        if harness.get("summary") != (
+            f"GAMEAGENT_OUTCOME_CODE={code} GAMEAGENT_OUTCOME_CLASS=agent"
+        ):
+            return None
+        return _CORE_MODEL_ZERO_FAILURE_MESSAGES.get(
+            (code, outcome["details"]["reason"])
+        )
+
+    @classmethod
+    def _core_context_zero_failure_message(cls, raw: Any) -> str | None:
+        """Validate an agent context guard before treating it as a zero reward."""
+        if not isinstance(raw, dict):
+            return None
+        outcome = raw.get("outcome")
+        harness = raw.get("harness")
+        if not isinstance(outcome, dict) or not isinstance(harness, dict):
+            return None
+        details = outcome.get("details")
+        if (
+            outcome.get("code") != "LLM_CONTEXT_WINDOW_EXCEEDED"
+            or outcome.get("class") != "agent"
+            or outcome.get("source") != "core_context_budget"
+            or not isinstance(details, dict)
+            or set(details)
+            != {
+                "byteLimit",
+                "byteLimitExceeded",
+                "bytes",
+                "compactionEnabled",
+                "estimatedTokens",
+                "tokenLimit",
+                "tokenLimitExceeded",
+            }
+            or cls._gameagent_outcome_code(raw) != outcome["code"]
+            or harness.get("phase") != "agent"
+            or harness.get("result_status") != "ERROR"
+            or type(harness.get("exit_code")) is not int
+            or harness["exit_code"] != 1
+            or raw.get("failure") is not None
+            or harness.get("summary")
+            != "GAMEAGENT_OUTCOME_CODE=LLM_CONTEXT_WINDOW_EXCEEDED "
+            "GAMEAGENT_OUTCOME_CLASS=agent"
+        ):
+            return None
+        for key in ("byteLimit", "bytes", "estimatedTokens", "tokenLimit"):
+            if type(details[key]) is not int or details[key] <= 0:
+                return None
+        for key in (
+            "byteLimitExceeded",
+            "compactionEnabled",
+            "tokenLimitExceeded",
+        ):
+            if type(details[key]) is not bool:
+                return None
+        byte_exceeded = details["bytes"] > details["byteLimit"]
+        token_exceeded = details["estimatedTokens"] >= details["tokenLimit"]
+        if (
+            details["compactionEnabled"]
+            or details["byteLimitExceeded"] != byte_exceeded
+            or details["tokenLimitExceeded"] != token_exceeded
+            or not (byte_exceeded or token_exceeded)
+        ):
+            return None
+        return (
+            "context window limit exceeded: compaction is disabled "
+            f"({details['bytes']} bytes / {details['estimatedTokens']} estimated tokens)"
+        )
+
+    @classmethod
+    def _is_core_agent_zero_failure(cls, raw: Any, receipt: Any) -> bool:
+        """Require a matching native receipt for model or context exhaustion."""
+        message = cls._core_model_zero_failure_message(raw)
+        if message is None:
+            message = cls._core_context_zero_failure_message(raw)
+        if message is None or not isinstance(receipt, dict):
+            return False
+        if (
+            receipt.get("implementation") != "rust-core-runtime"
+            or receipt.get("status") != "ERROR"
+            or type(receipt.get("exit_code")) is not int
+            or receipt["exit_code"] != 1
+            or receipt.get("turn_statuses") != ["failed"]
+            or receipt.get("delivery") is not None
+            or receipt.get("summary") != raw["harness"]["summary"]
+        ):
+            return False
+        errors = receipt.get("error")
+        if (
+            not isinstance(errors, list)
+            or len(errors) != 1
+            or not isinstance(errors[0], dict)
+            or errors[0].get("message") != message
+        ):
+            return False
+        expected = raw["outcome"]
+        for outcome in (
+            errors[0].get("outcome"),
+            receipt.get("raw", {}).get("outcome")
+            if isinstance(receipt.get("raw"), dict)
+            else None,
+        ):
+            if not isinstance(outcome, dict) or any(
+                outcome.get(field) != expected.get(field)
+                for field in ("code", "class", "source", "details")
+            ):
+                return False
+        return True
+
     @staticmethod
     def _harness_result_format(
         raw: Any,
-    ) -> Literal["native", "gameagent", "legacy-claude"] | None:
+    ) -> Literal["native", "native-runner", "gameagent", "legacy-claude"] | None:
         """Identify the envelope before validation, including broken receipts.
 
         Presence of reserved fields identifies a family even if their values are
@@ -666,11 +808,122 @@ class ArenaStreamAgentWorkflow:
             "harness: agent phase error: claude " in detail.lower()
             or "(claude=" in detail
         )
-        if sum((native, gameagent, claude)) != 1:
+        runner = "implementation" in raw or (
+            isinstance(raw.get("harness"), dict)
+            and not any((native, gameagent, claude))
+        )
+        if sum((native, runner, gameagent, claude)) != 1:
             return None
         if native:
             return "native"
+        if runner:
+            return "native-runner"
         return "gameagent" if gameagent else "legacy-claude"
+
+    @staticmethod
+    def _is_runner_context_failure(raw: dict[str, Any]) -> bool:
+        """Validate the runner terminal receipt or Arena's abbreviated envelope.
+
+        Requires a typed proxy overflow at the caller. Arena currently returns
+        only the beginning of the harness log, not the terminal receipt. Normal
+        setup/collect timeout settings in that prefix are not timeout failures.
+        Proxy system errors remain a separate, sticky veto in the workflow.
+        """
+        if "implementation" in raw:
+            if (
+                raw["implementation"] != "rust-core-runtime"
+                or raw.get("status") != "ERROR"
+                or type(raw.get("exit_code")) is not int
+                or raw["exit_code"] != 1
+                or raw.get("execution_state") != "exited"
+                or raw.get("unconfirmed_tools") != []
+                or raw.get("unconfirmed_tool_count") != 0
+                or raw.get("delivery") is not None
+            ):
+                return False
+            for field in (
+                "turn_statuses",
+                "recorded_turn_statuses",
+                "root_turn_statuses",
+            ):
+                statuses = raw.get(field)
+                if (
+                    not isinstance(statuses, list)
+                    or not statuses
+                    or any(status != "failed" for status in statuses)
+                ):
+                    return False
+            errors = raw.get("error")
+            return (
+                isinstance(errors, list)
+                and bool(errors)
+                and all(
+                    isinstance(error, dict)
+                    and re.fullmatch(
+                        r"model reported a streaming error \(event=error, "
+                        r'code=Some\("context_length_exceeded"\), '
+                        r'type=Some\("context_length_exceeded"\), reason=None\)',
+                        str(error.get("message", "")),
+                    )
+                    is not None
+                    for error in errors
+                )
+            )
+        detail = raw.get("error", "")
+        if not isinstance(detail, str):
+            return False
+        # Ignore only known lifecycle configuration records, not actual timeout
+        # failures or later collect/export/provider errors in the same log.
+        detail = re.sub(
+            r"running (?:setup|collect) hook \(timeout=[0-9.hms]+\)",
+            "running hook",
+            detail,
+        )
+        if _HARNESS_SYSTEM_ERROR_PATTERN.search(detail):
+            return False
+        harness = raw.get("harness")
+        return (
+            isinstance(harness, dict)
+            and harness.get("phase") == "agent"
+            and harness.get("result_status") == "ERROR"
+            and type(harness.get("exit_code")) is int
+            and harness["exit_code"] == 1
+        )
+
+    @classmethod
+    def _is_runner_model_failure(cls, raw: dict[str, Any], receipt: Any) -> bool:
+        """Accept explicit native model failures with a healthy runner envelope."""
+
+        if not cls._is_runner_context_failure(raw) or not isinstance(receipt, dict):
+            return False
+        if (
+            receipt.get("implementation") != "rust-core-runtime"
+            or receipt.get("status") != "ERROR"
+            or type(receipt.get("exit_code")) is not int
+            or receipt["exit_code"] != 1
+            or receipt.get("delivery") is not None
+            or receipt.get("turn_statuses") != ["failed"]
+        ):
+            return False
+        errors = receipt.get("error")
+        if (
+            not isinstance(errors, list)
+            or len(errors) != 1
+            or not isinstance(errors[0], dict)
+            or not isinstance(errors[0].get("message"), str)
+        ):
+            return False
+        message = errors[0]["message"]
+        return (
+            message == "model stopped with reason: length"
+            or message == "model stopped without visible output or tool calls"
+            or re.fullmatch(
+                r"context window limit exceeded: compaction is disabled "
+                r"\([1-9][0-9]* bytes / [1-9][0-9]* estimated tokens\)",
+                message,
+            )
+            is not None
+        )
 
     @staticmethod
     def _is_native_model_failure(raw: Any) -> bool:
@@ -762,6 +1015,17 @@ class ArenaStreamAgentWorkflow:
             return False
         if "status" in raw and raw["status"] != "ERROR":
             return False
+        if result_format == "native-runner":
+            return (
+                context_overflow and cls._is_runner_context_failure(raw)
+            ) or cls._is_runner_model_failure(raw, error.harness_result)
+        if (
+            result_format == "gameagent"
+            and result is not None
+            and result.score == 0.0
+            and cls._is_core_agent_zero_failure(raw, error.harness_result)
+        ):
+            return True
         detail = raw.get("error")
         if detail is not None and not isinstance(detail, str):
             return False
@@ -824,6 +1088,55 @@ class ArenaStreamAgentWorkflow:
         ):
             return "model_failure_zero"
         return "unknown_failure_reject"
+
+    def should_reject_failed_sample(self, error: Exception, disposition: str) -> bool:
+        """Drop a failed Arena sample while retaining healthy group siblings."""
+        if not self.reject_terminal_task_failures or not isinstance(
+            error, ArenaTaskFailedError
+        ):
+            return False
+        # A failed grader leaves this task unscored. It does not invalidate
+        # other tasks' rewards, even though it is not a model-attributed failure.
+        if error.status == "EVAL_FAILED":
+            return disposition == "system_failure_reject"
+        return (
+            error.status in {"HARNESS_FAILED", "NO_OUTPUT", "TIMEOUT"}
+            and disposition == "unknown_failure_reject"
+        )
+
+    def get_episode_reward_for_export(
+        self,
+        data: dict[str, Any],
+        reward: float,
+        *,
+        export_style: str,
+    ) -> float | None:
+        """Opt successful Arena concat episodes into segment reward assignment.
+
+        The proxy validates and scores the full conversation graph before tensor
+        serialization removes parent links. Arena's terminal score applies to
+        the whole episode, including context-compaction requests.
+        """
+        result = self._task_result.get()
+        if (
+            export_style == "concat"
+            and result is not None
+            and result.status in {"OK", "DONE"}
+            and math.isfinite(reward)
+        ):
+            return reward
+        return None
+
+    def get_failure_reward_for_export(
+        self, data: dict[str, Any], *, export_style: str
+    ) -> float | None:
+        """Score every valid concat segment after approved model-failure recovery.
+
+        Called only after the proxy workflow's failure classification and system
+        error veto. The cache still validates the conversation graph, preserving
+        explicit process rewards and rejecting ambiguous unscored branches.
+        """
+        return 0.0 if export_style == "concat" else None
 
     def record_episode_metrics(
         self,
@@ -1237,6 +1550,28 @@ class ArenaStreamAgentWorkflow:
                 _record_arena_metrics(**{"arena/call_success": 0.0})
                 if exc.result is not None:
                     self._task_result.set(exc.result)
+                    if exc.status == "HARNESS_FAILED" and (
+                        self._harness_result_format(exc.result.raw) == "native-runner"
+                        or self._core_model_zero_failure_message(exc.result.raw)
+                        is not None
+                        or self._core_context_zero_failure_message(exc.result.raw)
+                        is not None
+                    ):
+                        try:
+                            exc.harness_result = (
+                                await self.client.get_harness_result_async(
+                                    exc.task_id,
+                                    client=client,
+                                    timeout=min(self.request_timeout, 15.0),
+                                )
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to fetch Harness receipt for task %s; "
+                                "keeping the failure unscored.",
+                                exc.task_id,
+                                exc_info=True,
+                            )
                 raise
             except asyncio.CancelledError:
                 await audit_incomplete_task("LOCAL_WAIT_CANCELLED")

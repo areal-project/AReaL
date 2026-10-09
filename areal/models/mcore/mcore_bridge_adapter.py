@@ -42,10 +42,12 @@ def _configure_qwen4_exp_parameters(
             module.requires_grad_(True)
         elif name.endswith(".ple.ple_embedding"):
             if getattr(module, "cpu_offload", False):
-                raise NotImplementedError(
-                    "Qwen4-Exp training requires gradients for the PLE ngram table; "
-                    "mcore-bridge's PLE_CPU_OFFLOAD host table has no backward path."
-                )
+                if not freeze_ple_table:
+                    raise NotImplementedError(
+                        "Qwen4-Exp training requires gradients for the PLE ngram table; "
+                        "mcore-bridge's PLE_CPU_OFFLOAD host table has no backward path."
+                    )
+                continue
             table = getattr(module, "ngram_embedding", None)
             weight = getattr(table, "weight", None)
             if (

@@ -164,6 +164,7 @@ class OpenAIProxyClient:
         style: str = "individual",
         drop_retry_orphans: bool = False,
         is_eval: bool = False,
+        episode_reward: float | None = None,
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Export interactions for this session via HTTP.
 
@@ -191,6 +192,9 @@ class OpenAIProxyClient:
             for the same input messages.
         is_eval : bool
             Route process-reward metrics to the eval-rollout scope.
+        episode_reward : float, optional
+            Assign an episode return to disjoint concat segments before tensor
+            serialization. Applied only when the proxy has no PRM runner.
 
         Returns
         -------
@@ -216,6 +220,8 @@ class OpenAIProxyClient:
             ),
             "is_eval": is_eval,
         }
+        if episode_reward is not None:
+            payload["episode_reward"] = episode_reward
         headers = self._admin_auth_headers()
         async with self._session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()

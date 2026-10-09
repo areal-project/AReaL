@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -864,6 +865,274 @@ def test_gameagent_failure_uses_model_attribution(code, encoding, interaction_co
         else "unknown_failure_reject"
     )
     assert disposition == expected
+
+
+def _core_model_failure_error(
+    code: str, reason: str, message: str
+) -> ArenaTaskFailedError:
+    outcome = {
+        "code": code,
+        "class": "agent",
+        "source": "core_model",
+        "details": {"reason": reason},
+    }
+    summary = f"GAMEAGENT_OUTCOME_CODE={code} GAMEAGENT_OUTCOME_CLASS=agent"
+    error = ArenaTaskFailedError(
+        task_id="task-1",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task-1",
+            status="HARNESS_FAILED",
+            score=0.0,
+            raw={
+                "error": "harness: running setup hook (timeout=10m0s)\n" + summary,
+                "harness": {
+                    "phase": "agent",
+                    "result_status": "ERROR",
+                    "exit_code": 1,
+                    "summary": summary,
+                },
+                "outcome": outcome,
+            },
+        ),
+    )
+    error.harness_result = {
+        "implementation": "rust-core-runtime",
+        "status": "ERROR",
+        "exit_code": 1,
+        "turn_statuses": ["failed"],
+        "delivery": None,
+        "summary": summary,
+        "error": [{"message": message, "outcome": outcome.copy()}],
+        "raw": {"outcome": outcome.copy()},
+    }
+    return error
+
+
+@pytest.mark.parametrize(
+    "code,reason,message",
+    [
+        (
+            "LLM_RESPONSE_FAILED",
+            "empty_completion",
+            "model stopped without visible output or tool calls",
+        ),
+        (
+            "LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED",
+            "provider_length_stop",
+            "model stopped with reason: length",
+        ),
+    ],
+)
+def test_core_model_failure_with_matching_native_receipt_keeps_zero(
+    code, reason, message
+):
+    error = _core_model_failure_error(code, reason, message)
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=0
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_receipt",
+        "wrong_receipt_message",
+        "wrong_receipt_outcome",
+        "infrastructure_outcome",
+        "missing_arena_score",
+    ],
+)
+def test_core_model_failure_rejects_missing_or_conflicting_evidence(mutation):
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "model stopped without visible output or tool calls",
+    )
+    if mutation == "missing_receipt":
+        error.harness_result = None
+    elif mutation == "wrong_receipt_message":
+        error.harness_result["error"][0]["message"] = "model service unavailable"
+    elif mutation == "wrong_receipt_outcome":
+        error.harness_result["error"][0]["outcome"]["class"] = "infrastructure"
+    elif mutation == "infrastructure_outcome":
+        error.result.raw["outcome"]["class"] = "infrastructure"
+    else:
+        error.result = replace(error.result, score=None)
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
+
+
+def _core_context_failure_error() -> ArenaTaskFailedError:
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "model stopped without visible output or tool calls",
+    )
+    details = {
+        "byteLimit": 2097152,
+        "byteLimitExceeded": False,
+        "bytes": 404340,
+        "compactionEnabled": False,
+        "estimatedTokens": 188711,
+        "tokenLimit": 188416,
+        "tokenLimitExceeded": True,
+    }
+    outcome = {
+        "code": "LLM_CONTEXT_WINDOW_EXCEEDED",
+        "class": "agent",
+        "source": "core_context_budget",
+        "details": details,
+    }
+    summary = (
+        "GAMEAGENT_OUTCOME_CODE=LLM_CONTEXT_WINDOW_EXCEEDED "
+        "GAMEAGENT_OUTCOME_CLASS=agent"
+    )
+    raw = dict(error.result.raw)
+    raw["outcome"] = outcome
+    raw["harness"] = {**raw["harness"], "summary": summary}
+    raw["error"] = "harness: running setup hook (timeout=10m0s)\n" + summary
+    error.result = replace(error.result, raw=raw)
+    error.harness_result["summary"] = summary
+    error.harness_result["error"] = [
+        {
+            "message": "context window limit exceeded: compaction is disabled "
+            "(404340 bytes / 188711 estimated tokens)",
+            "outcome": outcome.copy(),
+        }
+    ]
+    error.harness_result["raw"] = {"outcome": outcome.copy()}
+    return error
+
+
+def test_core_context_budget_exhaustion_keeps_zero_with_matching_native_receipt():
+    error = _core_context_failure_error()
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=0
+        )
+        == "unknown_failure_reject"
+    )
+    assert (
+        ArenaStreamAgentWorkflow._gameagent_outcome_metric_code(error.result.raw)
+        == "LLM_CONTEXT_WINDOW_EXCEEDED"
+    )
+
+
+def test_context_budget_failure_fetches_native_receipt_before_classification(
+    monkeypatch,
+):
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
+    monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
+    workflow = ArenaStreamAgentWorkflow(
+        econfig={
+            "arena_base_url": "https://arena.example",
+            "arena_streams": [{"name": "a", "stream_id": "stream-a"}],
+        }
+    )
+    error = _core_context_failure_error()
+    receipt = error.harness_result
+    error.harness_result = None
+    fetched = []
+
+    async def register(**_kwargs):
+        return "https://arena.example/api", "model-a"
+
+    async def launch(**kwargs):
+        kwargs["on_launch_success"](error.task_id)
+        raise error
+
+    async def get_receipt(task_id, **_kwargs):
+        fetched.append(task_id)
+        return receipt
+
+    async def delete(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(workflow.client, "register_llm_proxy_async", register)
+    monkeypatch.setattr(workflow.client, "launch_one_task_result", launch)
+    monkeypatch.setattr(workflow.client, "get_harness_result_async", get_receipt)
+    monkeypatch.setattr(workflow.client, "delete_llm_proxy_async", delete)
+
+    with pytest.raises(ArenaTaskFailedError) as caught:
+        asyncio.run(
+            workflow.run(
+                {
+                    "arena_stream_name": "a",
+                    "stream_id": "stream-a",
+                    "data_id": "data-a",
+                },
+                base_url="http://rollout-proxy",
+                api_key="session-key",
+            )
+        )
+
+    assert fetched == [error.task_id]
+    assert (
+        workflow.classify_proxy_failure(
+            caught.value, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_receipt",
+        "wrong_receipt_message",
+        "wrong_receipt_outcome",
+        "wrong_source",
+        "inconsistent_limit",
+        "compaction_enabled",
+        "missing_arena_score",
+    ],
+)
+def test_core_context_budget_exhaustion_rejects_conflicting_evidence(mutation):
+    error = _core_context_failure_error()
+    if mutation == "missing_receipt":
+        error.harness_result = None
+    elif mutation == "wrong_receipt_message":
+        error.harness_result["error"][0]["message"] = "model service unavailable"
+    elif mutation == "wrong_receipt_outcome":
+        error.harness_result["error"][0]["outcome"]["class"] = "infrastructure"
+    elif mutation == "wrong_source":
+        error.result.raw["outcome"]["source"] = "core_transport"
+    elif mutation == "inconsistent_limit":
+        error.result.raw["outcome"]["details"]["tokenLimit"] = 262144
+    elif mutation == "compaction_enabled":
+        error.result.raw["outcome"]["details"]["compactionEnabled"] = True
+    else:
+        error.result = replace(error.result, score=None)
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
 
 
 @pytest.mark.parametrize(

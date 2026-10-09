@@ -5,7 +5,7 @@ enable_offload: false
 total_train_epochs: 10
 total_train_steps: 10
 tokenizer_path: ${oc.env:QWEN_MODEL}
-should_accept_fn: null
+should_accept_fn: examples.swe.filter_function.filter_function
 dynamic_bs: false
 cluster:
   n_nodes: 8
@@ -62,7 +62,7 @@ rollout:
   queue_size: 8
   consumer_batch_size: 2
   max_head_offpolicyness: 2
-  enable_rollout_tracing: true
+  enable_rollout_tracing: false
   check_trajectory_format: false
   scheduling_spec:
   - task_type: worker
@@ -79,8 +79,6 @@ rollout:
     env_vars:
       TMS_INIT_ENABLE: '0'
       TMS_INIT_ENABLE_CPU_BACKUP: '0'
-      QWEN_QSA_STABLE_TOPK: '1'
-      QWEN_ISOLATE_REQUEST_CACHE: '1'
       QWEN_PRIVATE_ENV: ${oc.env:QWEN_PRIVATE_ENV}
       ARENA_OPENAPI_BASE: ${oc.env:ARENA_OPENAPI_BASE}
       NO_PROXY: '*'
@@ -101,8 +99,8 @@ rollout:
     - test "$TMS_INIT_ENABLE" = 0
     - test "$TMS_INIT_ENABLE_CPU_BACKUP" = 0
     - cd ${oc.env:QWEN_REPO}
-    - python3 -m examples.swe.qwen38_flash_next.patch_sglang_qsa_topk
     - python3 -m examples.swe.qwen38_flash_next.patch_sglang_qsa_compress_gather
+    - python3 -m examples.swe.qwen38_flash_next.patch_sglang_qwen4_vl
     image: ${oc.env:QWEN_ROLLOUT_IMAGE}
   scheduling_strategy:
     type: colocation
@@ -110,7 +108,7 @@ rollout:
     fork: true
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
-  dump_to_file: true
+  dump_to_file: false
   setup_timeout: 7200
   request_timeout: 15600
   request_retries: 0
@@ -243,7 +241,6 @@ actor:
       TMS_INIT_ENABLE_CPU_BACKUP: '0'
       QWEN_PLE_CHUNK_TOKENS: '8192'
       QWEN_GDN_CP_COMPAT: '1'
-      QWEN_ISOLATE_REQUEST_CACHE: '1'
       QWEN_PRIVATE_ENV: ${oc.env:QWEN_PRIVATE_ENV}
       ARENA_OPENAPI_BASE: ${oc.env:ARENA_OPENAPI_BASE}
       NO_PROXY: '*'
@@ -252,11 +249,8 @@ actor:
       PLE_CPU_OFFLOAD: '0'
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,garbage_collection_threshold:0.7
       NCCL_DEBUG: WARN
-      NCCL_ALGO: Ring
-      NCCL_PROTO: Simple
       CUDA_DEVICE_MAX_CONNECTIONS: '1'
       NVIDIA_TF32_OVERRIDE: '0'
-      CUBLAS_WORKSPACE_CONFIG: :4096:8
       OMP_NUM_THREADS: '4'
       HF_HUB_OFFLINE: '1'
       TRANSFORMERS_OFFLINE: '1'
@@ -277,8 +271,7 @@ econfig:
   stream_id: ''
   arena_base_url: ${oc.env:ARENA_OPENAPI_BASE}
   arena_llm_route_mode: gateway
-  arena_result_dump_dir: ${cluster.fileroot}/arena-results
-  arena_result_dump_max_bytes: 10000000
+  arena_result_dump_dir: ''
   arena_request_timeout: 180.0
   arena_request_retries: 1
   arena_poll_interval: 5.0

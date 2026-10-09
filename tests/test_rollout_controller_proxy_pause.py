@@ -58,3 +58,17 @@ def test_pause_and_resume_skip_proxy_rpc_when_not_started():
         "workers.resume",
         "dispatcher.resume",
     ]
+
+
+def test_pause_generation_sync_waits_once_for_sglang_two_stage_pause():
+    calls = []
+
+    class _Controller:
+        def _collective_rpc(self, method, **kwargs):
+            calls.append((method, kwargs))
+
+        pause_generation_sync = RolloutController.pause_generation_sync
+
+    _Controller().pause_generation_sync()
+
+    assert calls == [("pause_generation", {"http_timeout": 600.0, "max_retries": 1})]
