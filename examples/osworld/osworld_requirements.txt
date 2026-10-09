@@ -1,0 +1,65 @@
+# Filtered OSWorld host-side deps for use alongside AReaL.
+#
+# Drops pins that clash with AReaL's install (torch>=2.9, transformers>=5.0,
+# numpy>=2, Pillow), plus `accelerate`/`openai`/`anthropic`/`matplotlib`/
+# `pandas`/`tqdm`/`psutil`/`requests`/`filelock`/`backoff`/`tiktoken`/`wandb`
+# which uv sync already installs.
+fabric
+gymnasium
+pytz
+pynput
+pyautogui
+flask
+requests-toolbelt
+ag2
+lxml
+cssselect
+xmltodict
+openpyxl
+python-docx
+python-pptx
+pypdf
+PyGetWindow
+rapidfuzz
+pyacoustid
+pygame
+opencv-python-headless
+ImageHash
+scikit-image
+librosa
+pymupdf
+chardet
+playwright
+formulas
+pydrive
+fastdtw
+odfpy
+func-timeout
+beautifulsoup4
+dashscope
+google-genai
+google-generativeai
+PyYaml
+mutagen
+easyocr
+borb
+pypdf2
+pdfplumber
+wrapt_timeout_decorator
+gdown
+groq
+boto3
+azure-identity
+azure-mgmt-compute
+azure-mgmt-network
+docker
+loguru
+dotenv
+tldextract
+alibabacloud_ecs20140526
+alibabacloud_tea_openapi
+alibabacloud_tea_util
+json_minify
+json_repair
+# volcengine-python-sdk[ark]  # only needed for volcengine provider
+# ui-tars>=0.4.2.2             # only used by mm_agents.uitars_agent; not on internal mirror
