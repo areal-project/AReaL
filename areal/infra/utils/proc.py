@@ -23,6 +23,19 @@ if TYPE_CHECKING:
     from typing import IO
 
 
+def build_supervised_cmd(command: list[str], python_executable: str = "python") -> str:
+    """Run the lightweight supervisor using the worker's installed AReaL path."""
+    # find_spec on the top-level package does not import it. Running the file
+    # directly avoids a second copy of torch/framework imports in every task.
+    bootstrap = (
+        "from importlib.util import find_spec; from pathlib import Path; "
+        "import runpy; "
+        "runpy.run_path(str(Path(find_spec('areal').origin).parent / "
+        "'infra/utils/process_supervisor.py'), run_name='__main__')"
+    )
+    return shlex.join([python_executable, "-c", bootstrap, "--", *command])
+
+
 def build_target_cmd(
     cmd: str | list[str],
     *,
