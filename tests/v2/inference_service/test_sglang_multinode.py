@@ -53,6 +53,16 @@ class TestSGLangMultiNode:
         assert args["node_rank"] == 0
         assert args.get("dist_init_addr") is None
 
+    def test_build_args_preserves_return_routed_experts_flag(self):
+        """R3 rollout must launch SGLang with routed expert return enabled."""
+        args = self._build_args(
+            sglang_config=SGLangConfig(
+                model_path="test-model",
+                enable_return_routed_experts=True,
+            )
+        )
+        assert args["enable_return_routed_experts"] is True
+
     def test_build_args_multi_node_head(self):
         """Head node (rank 0) with n_nodes > 1 should set nnodes and dist_init_addr."""
         args = self._build_args(

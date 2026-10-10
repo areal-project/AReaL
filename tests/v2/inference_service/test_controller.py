@@ -525,6 +525,7 @@ class TestRolloutControllerV2Construction:
             tokenizer_path="mock-tokenizer",
             _version="v2",
             request_timeout=15.0,
+            return_routed_experts=True,
             deterministic_sampling=deterministic_sampling,
             agent=AgentConfig(
                 agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
@@ -574,6 +575,8 @@ class TestRolloutControllerV2Construction:
                         host="127.0.0.1", port=30000, process=MagicMock()
                     )
                 ],
+                r3_num_moe_layers=27,
+                r3_topk=8,
             )
 
         data_proxy_calls = [
@@ -588,6 +591,11 @@ class TestRolloutControllerV2Construction:
         assert "7.5" in data_proxy_cmd
         assert "--callback-server-addr" in data_proxy_cmd
         assert "http://127.0.0.1:19000" in data_proxy_cmd
+        assert "--return-routed-experts" in data_proxy_cmd
+        assert "--r3-num-moe-layers" in data_proxy_cmd
+        assert "27" in data_proxy_cmd
+        assert "--r3-topk" in data_proxy_cmd
+        assert "8" in data_proxy_cmd
         assert ("--deterministic-sampling" in data_proxy_cmd) is deterministic_sampling
         assert data_proxy_cmd.count("--message-preprocessor") == 2
         first = data_proxy_cmd.index("--message-preprocessor")

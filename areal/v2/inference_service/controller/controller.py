@@ -205,6 +205,8 @@ class RolloutControllerV2:
         role: str,
         server_args: dict[str, Any] | None = None,
         server_infos: list[LocalInfServerInfo] | None = None,
+        r3_num_moe_layers: int | None = None,
+        r3_topk: int | None = None,
         *args: Any,
         wait: bool = False,
         **kwargs: Any,
@@ -222,7 +224,13 @@ class RolloutControllerV2:
         self._workers_ready.clear()
         self._shutdown_requested.clear()
         self._init_future = get_executor("ctrl_init").submit(
-            self._guarded_bg_initialize, server_args, server_infos, *args, **kwargs
+            self._guarded_bg_initialize,
+            server_args,
+            server_infos,
+            r3_num_moe_layers,
+            r3_topk,
+            *args,
+            **kwargs,
         )
 
         ready_timeout = self.config.workers_ready_timeout
@@ -248,13 +256,21 @@ class RolloutControllerV2:
         self,
         server_args: dict[str, Any] | None,
         server_infos: list[LocalInfServerInfo] | None = None,
+        r3_num_moe_layers: int | None = None,
+        r3_topk: int | None = None,
         *args: Any,
         **kwargs: Any,
     ) -> None:
         from areal.infra.utils.concurrent import run_async_task
 
         run_async_task(
-            self._async_initialize, server_args, server_infos, *args, **kwargs
+            self._async_initialize,
+            server_args,
+            server_infos,
+            r3_num_moe_layers,
+            r3_topk,
+            *args,
+            **kwargs,
         )
 
         if self._shutdown_requested.is_set():
@@ -321,6 +337,8 @@ class RolloutControllerV2:
         self,
         server_args: dict[str, Any] | None,
         server_infos: list[LocalInfServerInfo] | None = None,
+        r3_num_moe_layers: int | None = None,
+        r3_topk: int | None = None,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -489,6 +507,15 @@ class RolloutControllerV2:
                 "--engine-max-tokens",
                 str(agent_cfg.engine_max_tokens),
             ]
+        if cfg.return_routed_experts:
+            data_proxy_base_cmd.append("--return-routed-experts")
+            if r3_num_moe_layers is not None:
+                data_proxy_base_cmd += [
+                    "--r3-num-moe-layers",
+                    str(r3_num_moe_layers),
+                ]
+            if r3_topk is not None:
+                data_proxy_base_cmd += ["--r3-topk", str(r3_topk)]
         if cfg.deterministic_sampling:
             data_proxy_base_cmd.append("--deterministic-sampling")
         for preprocessor_path in agent_cfg.message_preprocessors:

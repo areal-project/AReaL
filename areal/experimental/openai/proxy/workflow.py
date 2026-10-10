@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     from ..types import InteractionWithTokenLogpReward
     from .proxy_gateway import CompletedSessionInfo
 
+from ..types import configure_r3_interactions
+
 logger = logging.getLogger("OpenAIProxyWorkflow")
 
 
@@ -117,6 +119,8 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         export_style: str = "individual",
         subproc_max_workers: int = 4,
         proxy_gateway_addr: str | None = None,
+        r3_num_moe_layers: int | None = None,
+        r3_topk: int | None = None,
         drop_retry_orphans: bool = False,
     ):
         if mode not in ("inline", "subproc", "online"):
@@ -157,6 +161,19 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         self.subproc_max_workers = subproc_max_workers
         self.drop_retry_orphans = drop_retry_orphans
         self._shared_tensor_resolver = SharedTensorResolver()
+        self.r3_num_moe_layers = r3_num_moe_layers
+        self.r3_topk = r3_topk
+
+    def _configure_r3_interactions(
+        self,
+        interactions: dict[str, InteractionWithTokenLogpReward],
+    ) -> dict[str, InteractionWithTokenLogpReward]:
+        configure_r3_interactions(
+            interactions,
+            num_moe_layers=self.r3_num_moe_layers,
+            topk=self.r3_topk,
+        )
+        return interactions
 
     @trace_session("run_agent")
     async def _run_agent(
@@ -510,6 +527,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 drop_retry_orphans=self.drop_retry_orphans,
                 is_eval=workflow_context.get().is_eval,
             )
+            self._configure_r3_interactions(interactions)
 
             # Return None if no interactions (empty session — user never sent chat/completions)
             if not interactions:
@@ -628,6 +646,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             drop_retry_orphans=self.drop_retry_orphans,
             is_eval=workflow_context.get().is_eval,
         )
+        self._configure_r3_interactions(interactions)
 
         if not interactions:
             logger.warning(
