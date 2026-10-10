@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from areal.api.cli_args import InferenceEngineConfig
 from areal.trainer import dpo_trainer, rl_trainer, rw_trainer, sft_trainer
 from areal.trainer.dpo_trainer import DPOTrainer
 from areal.trainer.rl_trainer import PPOTrainer
@@ -157,7 +158,7 @@ def _build_ppo_trainer(events: list[tuple], *, recovered: bool = False):
     trainer.config = SimpleNamespace(
         total_train_epochs=1,
         total_train_steps=None,
-        rollout=SimpleNamespace(agent=None, _version="v1"),
+        rollout=InferenceEngineConfig(agent=None, _version="v1"),
         teacher=None,
         gconfig=SimpleNamespace(
             n_samples=1,

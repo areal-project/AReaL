@@ -4,6 +4,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from areal.api import ModelResponse
 from areal.api.cli_args import PPOActorConfig
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.trainer.ppo.actor import PPOActor
@@ -92,11 +93,9 @@ def _make_interaction(
     *,
     parent: InteractionWithTokenLogpReward | None = None,
 ) -> InteractionWithTokenLogpReward:
-    response = SimpleNamespace(
+    response = ModelResponse(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        input_len=len(input_tokens),
-        output_len=len(output_tokens),
         output_logprobs=[-0.1] * len(output_tokens),
         output_versions=[1] * len(output_tokens),
         stop_reason="stop",
