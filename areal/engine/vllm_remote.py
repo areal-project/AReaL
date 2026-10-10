@@ -104,10 +104,12 @@ class VLLMBackend:
                                 raise ValueError(
                                     "Not enough images in req.image_data to match image_url entries."
                                 )
-                            mime = detect_image_mime(base64_img)
-                            content["image_url"] = {
-                                "url": f"data:{mime};base64,{base64_img}"
-                            }
+                            if base64_img.startswith(("data:", "http://", "https://")):
+                                image_url = base64_img
+                            else:
+                                mime = detect_image_mime(base64_img)
+                                image_url = f"data:{mime};base64,{base64_img}"
+                            content["image_url"] = {"url": image_url}
             payload["messages"] = parsed_input.copy()
             payload["logprobs"] = True
             return HttpRequest(endpoint="/v1/chat/completions", payload=payload)
@@ -440,6 +442,7 @@ class RemotevLLMEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> int:
         """Submit a request to the inference engine."""
         return self._engine.submit(
@@ -454,6 +457,7 @@ class RemotevLLMEngine(InferenceEngine):
             is_eval=is_eval,
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
 
@@ -483,6 +487,7 @@ class RemotevLLMEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ) -> dict[str, Any]:
         """Submit a batch of requests and wait for results.
 
@@ -496,6 +501,7 @@ class RemotevLLMEngine(InferenceEngine):
             group_size=group_size,
             min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
 
@@ -510,6 +516,7 @@ class RemotevLLMEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        reward_normalization_use_std: bool = True,
     ):
         """Asynchronously submit and wait until a full batch is ready."""
         return self._engine.prepare_batch(
@@ -521,6 +528,7 @@ class RemotevLLMEngine(InferenceEngine):
             min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
+            reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
 

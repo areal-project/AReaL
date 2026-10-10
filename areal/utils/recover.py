@@ -254,16 +254,20 @@ class RecoverHandler:
         if not callable(getattr(inference_engine, "pause_generation_sync", None)):
             missing.append("pause_generation_sync()")
 
-        offload = getattr(inference_engine, "offload", None)
-        if not callable(offload):
-            missing.append("offload(tags=...)")
-        else:
+        for method in ("abort_all_requests", "continue_generation"):
+            if not callable(getattr(inference_engine, method, None)):
+                missing.append(f"{method}()")
+        for method in ("offload", "onload"):
+            function = getattr(inference_engine, method, None)
+            if not callable(function):
+                missing.append(f"{method}(tags=...)")
+                continue
             try:
-                accepts_tags = "tags" in inspect.signature(offload).parameters
+                accepts_tags = "tags" in inspect.signature(function).parameters
             except (TypeError, ValueError):
                 accepts_tags = True
             if not accepts_tags:
-                missing.append("offload(tags=...)")
+                missing.append(f"{method}(tags=...)")
 
         if missing:
             raise NotImplementedError(
@@ -519,6 +523,7 @@ class RecoverHandler:
                         inference_engine.pause_generation_sync()
                         inference_engine.offload(tags=["kv_cache"])
                         inference_engine.offload(tags=["weights"])
+                        inference_engine.offload(tags=["cuda_graph"])
                         # Load the actor checkpoint only after the colocated
                         # rollout engine has released its GPU memory; loading
                         # first would stack DCP weights/optimizer on top of the
@@ -532,6 +537,7 @@ class RecoverHandler:
                     inference_engine.set_version(recovery_version)
                     if is_awex_colocate:
                         inference_engine.abort_all_requests()
+                        inference_engine.onload(tags=["cuda_graph"])
                         inference_engine.onload(tags=["kv_cache"])
                         call_maybe_async(inference_engine.continue_generation)
                         can_resume_inference = True

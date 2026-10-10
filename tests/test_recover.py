@@ -4,7 +4,7 @@ import dataclasses
 import os
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock, call, create_autospec
 
 import pytest
 
@@ -591,6 +591,7 @@ class TestAwexRecoverRestore:
         actor = events.actor
         inference = events.inference
         inference.offload = lambda tags=None: events.offload(tags=tags)
+        inference.attach_mock(create_autospec(lambda tags=None: None), "onload")
         inference.attach_mock(
             AsyncMock() if async_continue else Mock(), "continue_generation"
         )
@@ -627,11 +628,13 @@ class TestAwexRecoverRestore:
             call.inference.pause_generation_sync(),
             call.offload(tags=["kv_cache"]),
             call.offload(tags=["weights"]),
+            call.offload(tags=["cuda_graph"]),
             call.load(actor, path="payload", name="default"),
             call.actor.update_weights(actor.update_weights.call_args.args[0]),
             call.actor.set_version(18),
             call.inference.set_version(18),
             call.inference.abort_all_requests(),
+            call.inference.onload(tags=["cuda_graph"]),
             call.inference.onload(tags=["kv_cache"]),
             call.inference.continue_generation(),
             call.inference.resume(),
@@ -743,8 +746,17 @@ class TestColocateRolloutProtocol:
     """Engines lacking the colocate protocol must fail before any side effect."""
 
     def test_engine_with_full_protocol_is_accepted(self):
-        engine = Mock(spec=["pause_generation_sync", "offload"])
+        engine = Mock(
+            spec=[
+                "pause_generation_sync",
+                "offload",
+                "onload",
+                "abort_all_requests",
+                "continue_generation",
+            ]
+        )
         engine.offload = lambda tags=None: None
+        engine.onload = lambda tags=None: None
 
         RecoverHandler._require_colocate_rollout_protocol(engine)
 
@@ -765,3 +777,94 @@ class TestColocateRolloutProtocol:
             RecoverHandler._require_colocate_rollout_protocol(engine)
 
         assert "tags" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("colocated", [True, False])
+@pytest.mark.parametrize("failure", [None, "load", "update"])
+def test_recover_awex_restores_generation_only_after_success(
+    tmp_path, monkeypatch, colocated, failure
+):
+    handler = TestRecoverHandler._make_handler(str(tmp_path), "on")
+    handler.freq_ctl = Mock()
+    handler.freq_ctl.state_dict.return_value = {}
+    engine = Mock()
+    engine.config = SimpleNamespace(
+        backend="fsdp:d1", megatron=SimpleNamespace(async_save=False)
+    )
+    dependencies = TestRecoverHandler._dump_dependencies()
+    handler.dump(engine, TestRecoverHandler._step_info(handler), *dependencies)
+    events = Mock()
+    events.attach_mock(engine, "actor")
+    rollout = Mock()
+    rollout.offload = create_autospec(lambda tags=None: None)
+    rollout.onload = create_autospec(lambda tags=None: None)
+    # A real coroutine verifies that the engine is resumed, not merely created.
+    rollout.continue_generation = AsyncMock()
+    events.attach_mock(rollout, "rollout")
+    load = Mock()
+    events.attach_mock(load, "load")
+    monkeypatch.setattr(handler, "_load_checkpoint", load)
+    if failure == "load":
+        load.side_effect = RuntimeError("checkpoint load failed")
+    elif failure == "update":
+        engine.update_weights.side_effect = RuntimeError("weight update failed")
+    meta = Mock(type="awex")
+    kwargs = dict(
+        inference_engine=rollout, weight_update_meta=meta, colocated_rollout=colocated
+    )
+    if failure:
+        with pytest.raises(RuntimeError, match="failed"):
+            handler.load(engine, *dependencies, **kwargs)
+        rollout.onload.assert_not_called()
+        rollout.continue_generation.assert_not_awaited()
+        if not colocated and failure == "update":
+            rollout.resume.assert_called_once()
+        else:
+            rollout.resume.assert_not_called()
+        return
+    handler.load(engine, *dependencies, **kwargs)
+    if not colocated:
+        rollout.onload.assert_not_called()
+        rollout.continue_generation.assert_not_awaited()
+        return
+    calls = events.mock_calls
+    before = [
+        call.rollout.pause(),
+        call.rollout.pause_generation_sync(),
+        call.rollout.offload(tags=["kv_cache"]),
+        call.rollout.offload(tags=["weights"]),
+        call.rollout.offload(tags=["cuda_graph"]),
+    ]
+    after = [
+        call.actor.update_weights(meta.with_version.return_value),
+        call.actor.set_version(4),
+        call.rollout.set_version(4),
+        call.rollout.abort_all_requests(),
+        call.rollout.onload(tags=["cuda_graph"]),
+        call.rollout.onload(tags=["kv_cache"]),
+        call.rollout.continue_generation(),
+        call.rollout.resume(),
+    ]
+    load_index = next(i for i, c in enumerate(calls) if c[0] == "load")
+    assert calls[load_index - len(before) : load_index] == before
+    assert calls[load_index + 1 :] == after
+    rollout.continue_generation.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "missing", ["onload", "abort_all_requests", "continue_generation"]
+)
+def test_colocate_recovery_missing_restore_method_rejected(missing):
+    methods = [
+        "pause_generation_sync",
+        "offload",
+        "onload",
+        "abort_all_requests",
+        "continue_generation",
+    ]
+    engine = Mock(spec=[method for method in methods if method != missing])
+    engine.offload = lambda tags=None: None
+    if missing != "onload":
+        engine.onload = lambda tags=None: None
+    with pytest.raises(NotImplementedError, match=missing):
+        RecoverHandler._require_colocate_rollout_protocol(engine)

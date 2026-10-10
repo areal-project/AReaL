@@ -2157,3 +2157,126 @@ def test_launch_one_task_failed_launch_score_raises(monkeypatch):
 
     with pytest.raises(ArenaTaskFailedError, match="HARNESS_FAILED"):
         asyncio.run(launch_task())
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "override,expected",
+    [
+        (None, "https://control.example/arena/api"),
+        ("https://llm.example/api/", "https://llm.example/api"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_registration_uses_gateway_url_without_changing_control_plane(
+    monkeypatch, asynchronous, override, expected
+):
+    if override is None:
+        monkeypatch.delenv("ARENA_LLM_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("ARENA_LLM_BASE_URL", override)
+    client = ArenaOpenAPIClient(
+        base_url="https://control.example/arena/", api_token="test-token"
+    )
+    model = "stream-areal-test"
+
+    def handler(request):
+        assert str(request.url) == "https://control.example/arena/openapi/v1/llm/models"
+        assert request.headers["Authorization"] == "Bearer test-token"
+        return httpx.Response(200, json={"model_name": model})
+
+    kwargs = dict(
+        model_name=model,
+        upstream_base_url="http://proxy.example",
+        upstream_api_key="session-key",
+        deployment_id="deployment",
+    )
+    transport = httpx.MockTransport(handler)
+    if asynchronous:
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            result = await client.register_llm_proxy_async(**kwargs, client=http_client)
+    else:
+        with httpx.Client(transport=transport) as http_client:
+            result = client.register_llm_proxy(**kwargs, client=http_client)
+    assert result == (expected, model)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/api",
+        "ftp://llm.example/api",
+        "https://",
+        "https://user:secret@llm.example",
+        "https://llm.example/api?key=secret",
+        "https://llm.example/api#fragment",
+        "https://llm.example:bad/api",
+        "https://llm.example:70000/api",
+        "https://llm. example/api",
+    ],
+)
+def test_invalid_gateway_url_is_rejected_without_echoing_credentials(
+    monkeypatch, value
+):
+    monkeypatch.setenv("ARENA_LLM_BASE_URL", value)
+    with pytest.raises(ValueError, match="Arena LLM base URL") as error:
+        ArenaOpenAPIClient(base_url="https://control.example", api_token="test-token")
+    assert "secret" not in str(error.value)
+
+
+@pytest.mark.parametrize("via_poll", [False, True])
+@pytest.mark.parametrize(
+    "status",
+    [
+        "ERROR",
+        "CANCELLED",
+        "COLLECT_FAILED",
+        "EVAL_FAILED",
+        "FAILED",
+        "HARNESS_FAILED",
+        "NO_OUTPUT",
+        "SETUP_FAILED",
+        "TIMEOUT",
+    ],
+)
+def test_terminal_failure_with_score_stops_without_repolling(
+    monkeypatch, via_poll, status
+):
+    """Both result paths must preserve failure receipts, including grader ERROR."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
+    calls = []
+    payload = {
+        "task_id": "task-1",
+        "status": status,
+        "score": 0,
+        "raw": {"error": "subsection not found", "instance_id": "example-1"},
+    }
+
+    def handler(request):
+        calls.append(request.method)
+        # A regression fails immediately instead of spinning until a test timeout.
+        assert len(calls) <= (2 if via_poll else 1)
+        if via_poll and request.method == "POST":
+            return httpx.Response(202, json={"task_id": "task-1", "status": "PENDING"})
+        return httpx.Response(200, json={"data": payload})
+
+    async def launch():
+        client = ArenaOpenAPIClient(base_url="https://arena.example", poll_interval=0.0)
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            await client.launch_one_task(
+                stream_id="stream-1",
+                data_id="data-1",
+                model_name="deployment-1",
+                proxy_base_url="http://rollout-proxy/v1",
+                proxy_api_key="session-key",
+                client=http_client,
+            )
+
+    with pytest.raises(ArenaTaskFailedError) as exc:
+        asyncio.run(launch())
+    assert exc.value.status == status
+    assert exc.value.result.score == 0
+    assert exc.value.result.raw == payload["raw"]
+    assert calls == (["POST", "GET"] if via_poll else ["POST"])

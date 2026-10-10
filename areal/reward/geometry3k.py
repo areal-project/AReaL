@@ -29,13 +29,17 @@ def geometry3k_reward_fn(
 ) -> float:
     try:
         sol = extract_answer(str(completions))
-        ans = extract_answer(str(answer)) or str(answer)
+        # Gold answers can be LaTeX such as "5 \sqrt { 3 }"; taking their last
+        # number would turn it into "3".
+        ans = extract_answer(str(answer), use_last_number=False) or str(answer)
 
         if not sol or not ans:
             return 0.0
 
         worker = get_math_verify_worker()
-        return worker.verify(sol, ans)
+        # Wrap in $...$ so math-verify parses bare LaTeX as one expression
+        # instead of extracting its last number.
+        return worker.verify(f"${sol}$", f"${ans}$")
     except Exception:
         logger.warning("Exception in geometry3k_reward_fn", exc_info=True)
         return 0.0

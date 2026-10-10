@@ -260,6 +260,13 @@ class GenerationHyperparameters:
             )
         },
     )
+    reward_normalization_use_std: bool = field(
+        default=True,
+        metadata={
+            "help": "Divide grouped rollout rewards by their standard deviation. "
+            "Set False to subtract only the mean when reward_normalization is enabled."
+        },
+    )
     drop_incomplete_group: bool = field(
         default=False,
         metadata={
@@ -267,8 +274,7 @@ class GenerationHyperparameters:
                 "If True, discard the entire group when any of the n_samples "
                 "rollouts fails or returns None. prepare_batch will automatically "
                 "retry with a new prompt. This prevents partial groups from "
-                "causing reward normalization group misalignment. Not supported by "
-                "RolloutControllerV2 yet."
+                "causing reward normalization group misalignment."
             )
         },
     )
@@ -325,6 +331,7 @@ class GenerationHyperparameters:
     # OpenAI client kwargs even when users enable them.
     _WORKFLOW_ONLY_ARGS: ClassVar[set[str]] = {
         "reward_normalization",
+        "reward_normalization_use_std",
         "drop_incomplete_group",
     }
 
@@ -929,6 +936,15 @@ class MegatronEngineConfig:
             )
         },
     )
+    language_model_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "For multimodal ModelScope bridges, build only the language model. "
+                "Set True for text-only inputs and False for vision inputs."
+            )
+        },
+    )
     # Don't use MegatronOptimizerConfig here because OmegaConf
     # does not recognize the annotation "torch.dtype"
     overlap_param_gather_with_optimizer_step: bool = False
@@ -1074,8 +1090,8 @@ class MegatronEngineConfig:
     bridge_type: str = field(
         default="mbridge",
         metadata={
-            "help": "Bridge backend for MegatronEngine. Choices: 'mbridge' or 'megatron-bridge'.",
-            "choices": ["mbridge", "megatron-bridge"],
+            "help": "Bridge backend for MegatronEngine. Choices: 'mbridge', 'megatron-bridge', or 'mcore-bridge'.",
+            "choices": ["mbridge", "megatron-bridge", "mcore-bridge"],
         },
     )
 
@@ -1089,7 +1105,7 @@ class MegatronEngineConfig:
     use_bridge_for_update_weights: bool = field(
         default=False,
         metadata={
-            "help": "When True and bridge_type='megatron-bridge', delegate live "
+            "help": "When True and bridge_type is 'megatron-bridge' or 'mcore-bridge', delegate live "
             "weight sync to bridge.export_hf_weights instead of the hand-rolled "
             "convert_to_hf registry. Required for models without a registry entry "
             "(e.g. Qwen3.5). FP8 paths fall back to the registry automatically.",
@@ -1114,16 +1130,26 @@ class MegatronEngineConfig:
         },
     )
 
+    freeze_ple_table: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Freeze the Qwen4-Exp PLE/N-gram table while keeping the PLE "
+                "projection, norm, convolution, and token embedding trainable. "
+                "Set False to train and export the full PLE table."
+            )
+        },
+    )
+
     enable_mtp_training: bool = field(
         default=False,
         metadata={
             "help": "Train the Multi-Token-Prediction (MTP) head as an auxiliary "
-            "objective (SFT/RL). Requires enable_mtp=True. The MTP loss is fed an "
-            "independent label channel (mtp_kwargs) so the main forward keeps "
-            "labels=None and returns logits; MTP gradients are isolated from the "
-            "backbone (output weight detached, backbone hidden states cut from the "
-            "MTP graph). bridge_type=megatron-bridge only; packed context parallel "
-            "training is supported.",
+            "objective (SFT/RL). Requires enable_mtp=True. The main forward keeps "
+            "labels=None and returns logits; Megatron-Core derives MTP targets from "
+            "input_ids and isolates MTP gradients from the backbone and LM head. "
+            "bridge_type=megatron-bridge only; packed context parallel training is "
+            "supported.",
         },
     )
 
@@ -1171,8 +1197,8 @@ class MegatronEngineConfig:
             import torch
 
             for package, minimum in (
-                ("megatron-core", "0.18.2"),
-                ("megatron-bridge", "0.5.1"),
+                ("megatron-core", "0.19.0"),
+                ("megatron-bridge", "0.6.0"),
             ):
                 try:
                     installed = pkg_version.get_version(package)
@@ -1889,8 +1915,7 @@ class PPOActorConfig(TrainEngineConfig):
             "help": "Minimum usable rollout slots a prompt group must keep to stay "
             "trainable when some slots fail or are filtered. None derives the "
             "minimum from reward_norm/adv_norm: 2 when either uses group "
-            "statistics (1 for a singleton target group), else 1. Only the v1 "
-            "rollout path consumes this option."
+            "statistics (1 for a singleton target group), else 1."
         },
     )
 
@@ -2620,6 +2645,18 @@ class PRMConfig:
         default_factory=list,
         metadata={"help": "Process-reward scorers whose weighted outputs are summed."},
     )
+
+    error_policy: str = field(
+        default="reject",
+        metadata={
+            "help": "On v1 proxy PRM errors: reject the trajectory or keep pre-scoring rewards.",
+            "choices": ["reject", "keep_original"],
+        },
+    )
+
+    def __post_init__(self) -> None:
+        if self.error_policy not in {"reject", "keep_original"}:
+            raise ValueError("PRM error_policy must be reject or keep_original")
 
 
 @dataclass

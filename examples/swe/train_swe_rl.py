@@ -337,6 +337,8 @@ def main(args):
         econfig=econfig_dict,
         gen_args=dict(
             temperature=config.gconfig.temperature,
+            top_p=config.gconfig.top_p,
+            top_k=config.gconfig.top_k,
             max_completion_tokens=config.gconfig.max_new_tokens,
         ),
         timeout=econfig.timeout,

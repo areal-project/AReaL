@@ -75,13 +75,8 @@ router expert-bias updates are unsupported. Chunked LM-head loss remains unsuppo
 with MTP training. Full backbone forward computation is still required. Setting
 `mtp_only: false` retains the default joint-training behavior.
 
-Qwen hybrid GDN models using the `qwen3_5` architecture require Megatron-Core >=0.18.2
-and Megatron-Bridge >=0.5.1 for packed THD and context parallelism. With these versions,
-AReaL aligns MTP labels and response masks with each packed sequence's CP partition.
-Older runtimes retain the padded path and require `CP=1`. The default dependency pins
-are not upgraded automatically. Use a compatible runtime for THD/CP; a recipe alone does
-not enable these capabilities on older versions. For dense Qwen models, EP is 1.
-
-The compatibility shim for MTP full recomputation accepts a missing padding mask on
-affected Megatron-Core versions. It explicitly rejects a nonempty padding mask if that
-upstream checkpoint implementation cannot forward it.
+Native MTP training requires Megatron-Core >=0.19.0 and Megatron-Bridge >=0.6.0. With
+this stack, Megatron-Core derives MTP targets from the layout-aligned input IDs, while
+AReaL aligns the response mask with each packed sequence's CP partition. Model-owned
+Qwen THD forwards delegate the final CP slicing to Megatron-Bridge after multimodal
+embedding fusion. For dense Qwen models, EP is 1.

@@ -182,12 +182,57 @@ def _session(session_id="session", *, finished=True):
     return session
 
 
-async def _export(client, session_id="session"):
+async def _export(client, session_id="session", *, is_eval=False):
     return await client.post(
         "/export_trajectories",
         headers={"Authorization": f"Bearer {_ADMIN_KEY}"},
-        json={"session_id": session_id, "style": "concat"},
+        json={"session_id": session_id, "style": "concat", "is_eval": is_eval},
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_eval", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "keep_original", "reject"])
+async def test_export_preserves_prm_results_and_releases_admission(
+    engine, monkeypatch, outcome, is_eval
+):
+    """Scoring/fallback semantics and metrics survive lifecycle counter cleanup."""
+    engine.config.agent.prm.error_policy = (
+        "keep_original" if outcome == "keep_original" else "reject"
+    )
+    tracker = MagicMock()
+    get_tracker = MagicMock(return_value=tracker)
+    monkeypatch.setattr(srv.stats_tracker, "get", get_tracker)
+    async with srv.app.router.lifespan_context(srv.app), _client() as client:
+        await _rpc(client, "initialize")
+        scorer = ResourceScorer.instances[0]
+        scorer.fail_score = outcome != "success"
+        _session()
+        response = await _export(client, is_eval=is_eval)
+        assert response.status_code == 200
+        interactions = deserialize_interactions(response.json()["interactions"])
+        if outcome == "reject":
+            assert interactions == {}
+        else:
+            assert set(interactions) == {"turn"}
+            if outcome == "success":
+                torch.testing.assert_close(
+                    interactions["turn"].to_tensor_dict()["token_rewards"],
+                    torch.tensor([[0.0, 1.0]]),
+                    rtol=0,
+                    atol=0,
+                )
+            else:
+                assert interactions["turn"].reward == 0.0
+                assert "token_rewards" not in interactions["turn"].to_tensor_dict()
+        get_tracker.assert_called_with("eval-rollout" if is_eval else "rollout")
+        tracker.scalar.assert_any_call(
+            prm_fallback=1.0 if outcome == "keep_original" else 0.0
+        )
+        assert srv._active_prm_exports == 0
+        assert srv._prm_idle.is_set()
+        assert "session" not in srv._session_cache
+    assert scorer.flushed and scorer.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -447,10 +492,12 @@ async def test_unfinished_export_does_not_block_shutdown_or_bypass_prm(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel_score", [False, True])
+@pytest.mark.parametrize("error_policy", ["keep_original", "reject"])
 async def test_failed_or_cancelled_scoring_releases_shutdown_waiter(
-    engine, cancel_score
+    engine, cancel_score, error_policy
 ):
     """The scoring admission counter is released on failure and cancellation."""
+    engine.config.agent.prm.error_policy = error_policy
     async with srv.app.router.lifespan_context(srv.app), _client() as client:
         await _rpc(client, "initialize")
         scorer = ResourceScorer.instances[0]
@@ -467,9 +514,18 @@ async def test_failed_or_cancelled_scoring_releases_shutdown_waiter(
                 await pending
         else:
             scorer.score_release.set()
-            assert (await pending).json()["interactions"] == {}
+            response = await pending
+            assert response.status_code == 200
+            interactions = deserialize_interactions(response.json()["interactions"])
+            if error_policy == "reject":
+                assert interactions == {}
+            else:
+                assert set(interactions) == {"turn"}
+                assert interactions["turn"].reward == 0.0
+                assert "token_rewards" not in interactions["turn"].to_tensor_dict()
         await asyncio.wait_for(destroy, timeout=2)
         assert srv._active_prm_exports == 0
+        assert srv._prm_idle.is_set()
         assert scorer.flushed
 
 

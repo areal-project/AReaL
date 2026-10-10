@@ -113,7 +113,7 @@ def test_worker_gpu_assignment_preserves_slurm_allocation(
     )
     tokens = shlex.split(script[script.index("stdbuf -oL srun") :])
     command = tokens[tokens.index("bash") + 2]
-    command = command[: command.rindex("true --experiment-name")]
+    command = command[: command.rindex("exec ")]
     command += f'printf "%s" "${{{device_var}}}"'
     env = {
         key: value

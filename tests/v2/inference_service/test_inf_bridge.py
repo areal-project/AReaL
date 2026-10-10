@@ -488,6 +488,23 @@ class TestVLLMBridgeBackend:
         else:
             assert http_req.payload["seed"] == seed
 
+    def test_vllm_build_generation_request_forwards_frequency_penalty_and_stop(
+        self,
+    ):
+        """vLLM bridge forwards frequency_penalty and stop like the SGLang bridge."""
+        backend = VLLMBridgeBackend()
+        req = ModelRequest(
+            input_ids=[11, 12],
+            gconfig=GenerationHyperparameters(
+                max_new_tokens=7, frequency_penalty=0.5, stop=["STOP"]
+            ),
+        )
+
+        http_req = backend.build_generation_request(req, with_lora=False, version=0)
+
+        assert http_req.payload["frequency_penalty"] == 0.5
+        assert http_req.payload["stop"] == ["STOP"]
+
     def test_vllm_parse_generation_response_for_chat_format(self):
         """vLLM bridge parses chat logprobs content format."""
         backend = VLLMBridgeBackend()

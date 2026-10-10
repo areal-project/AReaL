@@ -48,11 +48,14 @@ class VLLMBridgeBackend:
             "stop_token_ids": gconfig.stop_token_ids,
             "ignore_eos": gconfig.ignore_eos,
             "skip_special_tokens": gconfig.skip_special_tokens,
+            "frequency_penalty": gconfig.frequency_penalty,
             "return_tokens_as_token_ids": True,
             "logprobs": 0,
             "use_beam_search": gconfig.use_beam_search,
             "stream": False,
         }
+        if gconfig.stop:
+            payload["stop"] = gconfig.stop
         if gconfig.seed is not None:
             payload["seed"] = gconfig.seed
 
@@ -77,10 +80,12 @@ class VLLMBridgeBackend:
                                 raise ValueError(
                                     "Not enough images in req.image_data to match image_url entries."
                                 ) from exc
-                            mime = detect_image_mime(base64_img)
-                            content["image_url"] = {
-                                "url": f"data:{mime};base64,{base64_img}"
-                            }
+                            if base64_img.startswith(("data:", "http://", "https://")):
+                                image_url = base64_img
+                            else:
+                                mime = detect_image_mime(base64_img)
+                                image_url = f"data:{mime};base64,{base64_img}"
+                            content["image_url"] = {"url": image_url}
             payload["messages"] = parsed_input.copy()
             payload["logprobs"] = True
             return HttpRequest(endpoint="/v1/chat/completions", payload=payload)

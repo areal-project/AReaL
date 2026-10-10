@@ -333,6 +333,7 @@ class PPOActor:
             raise RuntimeError("prepare_mopd_batch is only valid for pure distillation")
         if "mopd_teacher_logp_sum" not in data:
             raise RuntimeError("Pure MOPD distillation requires teacher targets")
+        data["input_token_loss_mask"] = data["loss_mask"].bool()
         loss_mask = torch.roll(data["loss_mask"].float(), shifts=-1, dims=-1)
         behavior_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
         data["mopd_behavior_logprobs"] = (behavior_logp * loss_mask).detach()
@@ -420,6 +421,10 @@ class PPOActor:
                 reward_score = self.reward_norm(reward_score, group_sizes=group_sizes)
 
         token_loss_mask = data["loss_mask"].bool()
+        # Preserve token provenance before converting to next-token loss alignment.
+        # Multimodal preprocessing must distinguish generated special IDs from
+        # prompt image/video placeholders even after advantages are computed.
+        data["input_token_loss_mask"] = token_loss_mask
         loss_mask = token_loss_mask.float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
 

@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
+from areal.engine.awex.metadata import serialize_metadata_gc
+from areal.engine.awex.parallel import resolve_scheduler_parallel_attr
 
 # Must run before importing SGLang. Its scheduler may import Megatron while
 # initializing the model, and Megatron otherwise switches torch-memory-saver
@@ -61,7 +63,12 @@ from areal.utils.environ import get_float_env_var  # noqa: E402
 from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexSGLangPlugin")
-SUPPORTED_SGLANG_VERSIONS = ("0.5.9", "0.5.10.post1", "0.5.18.dev10+g85b539146")
+SUPPORTED_SGLANG_VERSIONS = (
+    "0.5.9",
+    "0.5.10.post1",
+    "0.5.18.dev10+g85b539146",
+    "0.5.19.dev125+g119b5ffe4",
+)
 
 
 @contextmanager
@@ -225,6 +232,7 @@ class AwexSchedulerPlugin:
         self._scheduler = scheduler
         self._receiver = None
         self._bg_thread: threading.Thread | None = None
+        self._initialization_error: Exception | None = None
         self._weight_queue: queue.Queue = queue.Queue()
         self._version = 0
         self._paused_poll_interval_s = max(
@@ -233,16 +241,12 @@ class AwexSchedulerPlugin:
 
     @staticmethod
     def _int_attr(scheduler: Any, name: str, default: int) -> int:
-        for obj in (
-            scheduler,
-            getattr(scheduler, "ps", None),
-            getattr(scheduler, "server_args", None),
-        ):
-            if obj is None or not hasattr(obj, name):
-                continue
-            value = getattr(obj, name)
-            if value is not None:
-                return int(value)
+        value = resolve_scheduler_parallel_attr(scheduler, name)
+        if value is not None:
+            return value
+        value = getattr(getattr(scheduler, "server_args", None), name, None)
+        if value is not None:
+            return int(value)
         return default
 
     @staticmethod
@@ -307,6 +311,15 @@ class AwexSchedulerPlugin:
 
         meta_server_addr = os.environ.get("AWEX_META_SERVER_ADDR")
         if meta_server_addr:
+            model = getattr(
+                getattr(
+                    getattr(self._scheduler, "tp_worker", None), "model_runner", None
+                ),
+                "model",
+                None,
+            )
+            if type(model).__name__ == "Qwen4ExpForConditionalGeneration":
+                self._require_receiver().prepare_frozen_weights(meta_server_addr)
             self._start_background_worker(meta_server_addr)
             self._patch_event_loop()
 
@@ -415,6 +428,12 @@ class AwexSchedulerPlugin:
     def awex_get_parallelism(self) -> dict:
         return self._require_receiver().get_parallelism()
 
+    def _raise_initialization_error(self) -> None:
+        if self._initialization_error is not None:
+            raise RuntimeError(
+                "AWEX receiver initialization failed"
+            ) from self._initialization_error
+
     # ── Main loop hook: process queued weight updates ─────────────────
 
     def process_awex_queue(self, extra_ready: bool = True) -> None:
@@ -444,6 +463,8 @@ class AwexSchedulerPlugin:
         """
         import torch
         import torch.distributed
+
+        self._raise_initialization_error()
 
         tp_cpu_group = self._scheduler.tp_cpu_group
         tp_size = self._int_attr(self._scheduler, "tp_size", 1)
@@ -537,6 +558,7 @@ class AwexSchedulerPlugin:
             original_process_input_requests = scheduler.process_input_requests
 
             def _process_input_requests_with_awex(recv_reqs):
+                plugin._raise_initialization_error()
                 result = original_process_input_requests(recv_reqs)
                 if getattr(scheduler, "_engine_paused", False):
                     plugin.process_awex_queue()
@@ -655,6 +677,7 @@ class AwexSchedulerPlugin:
                 )
 
         def _recv_requests():
+            plugin._raise_initialization_error()
             if hasattr(scheduler, "recv_requests"):
                 return scheduler.recv_requests()
             return scheduler.request_receiver.recv_requests()
@@ -824,7 +847,8 @@ class AwexSchedulerPlugin:
 
         try:
             self._init_receiver_from_meta_server(meta_server_addr)
-        except Exception:
+        except Exception as exc:
+            self._initialization_error = exc
             logger.exception("AWEX background worker initialization failed")
             return
 
@@ -1015,6 +1039,31 @@ class ModelWorkerTask:
     kwargs: dict = field(default_factory=dict)
 
 
+def _install_qwen_frozen_hooks(scheduler_type: type) -> None:
+    # Legacy SGLang used by other architectures has no static-state API.
+    # Qwen's binder requires these hooks and fails explicitly on such versions.
+    try:
+        from sglang.srt.managers.scheduler_components import weight_updater
+    except ModuleNotFoundError as exc:
+        if exc.name != "sglang.srt.managers.scheduler_components":
+            raise
+        return
+    if not all(
+        hasattr(weight_updater, name)
+        for name in (
+            "_export_static_state",
+            "_import_static_state",
+            "SchedulerWeightUpdaterManager",
+        )
+    ):
+        return
+    from areal.models.mcore.qwen4_exp_awex_memory import install_kv_residency_hooks
+    from areal.models.mcore.qwen4_exp_frozen_state import install_static_state_hooks
+
+    install_static_state_hooks(weight_updater)
+    install_kv_residency_hooks(weight_updater, scheduler_type)
+
+
 def register_awex_plugin() -> None:
     """Patch Scheduler.__init__ to inject awex plugin after construction.
 
@@ -1024,6 +1073,16 @@ def register_awex_plugin() -> None:
     """
     assert_supported_sglang_version()
     from sglang.srt.managers.scheduler import Scheduler
+
+    _install_qwen_frozen_hooks(Scheduler)
+
+    # Install before construction: the scheduler dispatcher captures bound
+    # handlers during __init__. Metadata aggregation runs in our worker thread.
+    freeze_gc = getattr(Scheduler, "handle_freeze_gc", None)
+    if callable(freeze_gc) and not getattr(freeze_gc, "_areal_awex_gc_guard", False):
+        guarded_freeze_gc = serialize_metadata_gc(freeze_gc)
+        guarded_freeze_gc._areal_awex_gc_guard = True
+        Scheduler.handle_freeze_gc = guarded_freeze_gc
 
     _orig_init = Scheduler.__init__
 
@@ -1075,9 +1134,15 @@ def _patch_execute_task_in_model_worker(
     task_cls = _get_model_worker_task_cls()
 
     def execute_task_in_model_worker(task_spec):
+        tp_size = plugin._int_attr(scheduler, "tp_size", 1)
+        tp_rank = resolve_scheduler_parallel_attr(scheduler, "tp_rank")
+        if tp_rank is None and tp_size == 1:
+            tp_rank = 0
+        if tp_rank is None or not 0 <= tp_rank < tp_size:
+            raise RuntimeError("Cannot resolve a valid AWEX inference TP rank")
         model_context = dict(
-            tp_rank=plugin._int_attr(scheduler, "tp_rank", 0),
-            tp_size=plugin._int_attr(scheduler, "tp_size", 1),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             server_args=scheduler.server_args,
             scheduler=scheduler,
         )

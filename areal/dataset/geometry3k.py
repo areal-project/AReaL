@@ -102,9 +102,7 @@ def get_geometry3k_sft_dataset(
         multi_modal_input = {}
         multi_modal_input["pixel_values"] = processed_input["pixel_values"]
         if "image_grid_thw" in processed_input:
-            multi_modal_input["image_grid_thw"] = processed_input[
-                "image_grid_thw"
-            ].squeeze(0)
+            multi_modal_input["image_grid_thw"] = processed_input["image_grid_thw"]
         example["multi_modal_input"] = [multi_modal_input]
         example["loss_mask"] = get_multimodal_sft_loss_mask(
             input_ids=example["input_ids"],

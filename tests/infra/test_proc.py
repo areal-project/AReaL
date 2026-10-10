@@ -1,10 +1,51 @@
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import Mock, patch
 
-from areal.infra.utils.proc import build_streaming_log_cmd, run_with_streaming_logs
+from areal.infra.utils.proc import (
+    build_streaming_log_cmd,
+    build_supervised_cmd,
+    run_with_streaming_logs,
+)
 
 MODULE = "areal.infra.utils.proc"
+
+
+def test_supervised_command_quotes_arguments_without_importing_framework(tmp_path):
+    # A package that cannot be imported verifies the lightweight bootstrap path.
+    package = tmp_path / "areal"
+    supervisor = package / "infra/utils/process_supervisor.py"
+    supervisor.parent.mkdir(parents=True)
+    (package / "__init__.py").write_text("raise RuntimeError('framework imported')")
+    shutil.copyfile(
+        Path(__file__).resolve().parents[2] / "areal/infra/utils/process_supervisor.py",
+        supervisor,
+    )
+    command = build_supervised_cmd(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write(sys.argv[1]); sys.exit(9)",
+            "spaces ' and $(literal)",
+        ],
+        sys.executable,
+    )
+    result = subprocess.run(
+        ["bash", "-c", command],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path)),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 9, result.stderr
+    assert result.stdout == "spaces ' and $(literal)"
+    assert result.stderr == ""
 
 
 def _target_command(shell_command: str) -> str:

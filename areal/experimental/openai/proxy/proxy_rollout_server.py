@@ -38,7 +38,7 @@ from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
-from areal.utils import name_resolve, names, seeding
+from areal.utils import name_resolve, names, seeding, stats_tracker
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.logging import getLogger
@@ -959,15 +959,29 @@ async def _call_client_create(
     defaults = dict(
         getattr(_engine.config.agent, "chat_template_kwargs", {}) if _engine else {}
     )
-    extra_body = dict(kwargs.get("extra_body") or {})
-    session_template = session_data.metadata.get("chat_template_kwargs") or {}
+    extra_body = kwargs.get("extra_body")
+    extra_body = {} if extra_body is None else extra_body
+    session_template = session_data.metadata.get("chat_template_kwargs")
+    session_template = {} if session_template is None else session_template
+    flat_template = kwargs.pop("chat_template_kwargs", None)
+    flat_template = {} if flat_template is None else flat_template
+    if not isinstance(extra_body, Mapping):
+        raise HTTPException(status_code=400, detail="Template options must be objects")
+    extra_body = dict(extra_body)
+    nested_template = extra_body.get("chat_template_kwargs")
+    nested_template = {} if nested_template is None else nested_template
+    if any(
+        not isinstance(layer, Mapping)
+        for layer in (session_template, nested_template, flat_template)
+    ):
+        raise HTTPException(status_code=400, detail="Template options must be objects")
     thinking_keys = ("thinking_option", "enable_thinking", "thinking")
     template_kwargs = {}
     for layer in (
         defaults,
         session_template,
-        extra_body.get("chat_template_kwargs") or {},
-        kwargs.pop("chat_template_kwargs", None) or {},
+        nested_template,
+        flat_template,
     ):
         effective = {
             key: value
@@ -1236,9 +1250,11 @@ async def responses(
     )
 
 
-def _anthropic_tool_error_ids(anthropic_request: dict[str, Any]) -> set[str]:
-    """Return IDs of Anthropic tool results explicitly marked as errors."""
-    failed_ids: set[str] = set()
+def _anthropic_tool_result_statuses(
+    anthropic_request: dict[str, Any],
+) -> dict[str, bool]:
+    """Preserve explicit success and error states without inferring missing flags."""
+    statuses: dict[str, bool] = {}
     for message in anthropic_request.get("messages") or []:
         content = message.get("content") if isinstance(message, Mapping) else None
         if not isinstance(content, list):
@@ -1247,11 +1263,11 @@ def _anthropic_tool_error_ids(anthropic_request: dict[str, Any]) -> set[str]:
             if (
                 isinstance(block, Mapping)
                 and block.get("type") == "tool_result"
-                and block.get("is_error")
+                and isinstance(block.get("is_error"), bool)
                 and block.get("tool_use_id")
             ):
-                failed_ids.add(str(block["tool_use_id"]))
-    return failed_ids
+                statuses[str(block["tool_use_id"])] = block["is_error"]
+    return statuses
 
 
 def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) -> dict:
@@ -1262,15 +1278,15 @@ def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) ->
         raise ValueError("Failed to translate request")
     openai_request = dict(openai_request)
 
-    failed_ids = _anthropic_tool_error_ids(anthropic_request)
-    if failed_ids:
+    statuses = _anthropic_tool_result_statuses(anthropic_request)
+    if statuses:
         for message in openai_request.get("messages") or []:
             if (
                 isinstance(message, dict)
                 and message.get("role") == "tool"
-                and message.get("tool_call_id") in failed_ids
+                and message.get("tool_call_id") in statuses
             ):
-                message["is_error"] = True
+                message["is_error"] = statuses[message["tool_call_id"]]
 
     return openai_request
 
@@ -1494,10 +1510,26 @@ async def export_trajectories(
                 is_eval=request.is_eval,
             )
         except Exception:
-            logger.exception(
-                "PRM runner failed for session %s; rejecting trajectory", session_id
+            if _prm_runner.config.error_policy == "keep_original":
+                logger.exception(
+                    "PRM runner failed for session %s; keeping pre-scoring rewards",
+                    session_id,
+                )
+                stats_tracker.get(
+                    "eval-rollout" if request.is_eval else "rollout"
+                ).scalar(prm_fallback=1.0)
+            else:
+                logger.exception(
+                    "PRM runner failed for session %s; rejecting trajectory", session_id
+                )
+                interactions = {}
+                stats_tracker.get(
+                    "eval-rollout" if request.is_eval else "rollout"
+                ).scalar(prm_fallback=0.0)
+        else:
+            stats_tracker.get("eval-rollout" if request.is_eval else "rollout").scalar(
+                prm_fallback=0.0
             )
-            interactions = {}
         finally:
             _active_prm_exports -= 1
             if _active_prm_exports == 0:

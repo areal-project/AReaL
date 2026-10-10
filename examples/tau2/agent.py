@@ -92,12 +92,11 @@ class Tau2Runner:
         return ModelResponse(**completion.model_dump())
 
     @staticmethod
-    def _clean_messages(messages: list[dict], for_user: bool = False) -> list[dict]:
+    def _clean_messages(messages: list[dict]) -> list[dict]:
         """Clean messages for OpenAI API compatibility.
 
         Args:
             messages: List of message dicts
-            for_user: If True, also removes tool-related content for user simulator
         """
         cleaned = []
         for msg in messages:
@@ -106,13 +105,6 @@ class Tau2Runner:
                 # Remove tool_calls if it's None
                 if msg.get("tool_calls") is None:
                     msg = {k: v for k, v in msg.items() if k != "tool_calls"}
-                if for_user:
-                    # Skip tool messages for user simulator
-                    if msg.get("role") == "tool":
-                        continue
-                    # Remove tool_calls from assistant messages
-                    if msg.get("role") == "assistant" and "tool_calls" in msg:
-                        msg = {k: v for k, v in msg.items() if k != "tool_calls"}
             cleaned.append(msg)
         return cleaned
 
@@ -141,9 +133,7 @@ class Tau2Runner:
 
             # Clean messages
             if "messages" in kwargs:
-                kwargs["messages"] = self._clean_messages(
-                    kwargs["messages"], for_user=not is_agent
-                )
+                kwargs["messages"] = self._clean_messages(kwargs["messages"])
 
             try:
                 completion = await client.chat.completions.create(**kwargs)

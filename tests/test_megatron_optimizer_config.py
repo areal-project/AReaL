@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ def _make_test_engine(optimizer_config: OptimizerConfig):
     engine.optimizer_config = optimizer_config
     engine.config = SimpleNamespace(use_lora=False)
     engine.mcore_config = MegatronEngineConfig()
+    engine.bridge_cls = "mbridge"
     engine.model = [object()]
     engine.dtype = torch.bfloat16
     engine.enable_fp8 = False
@@ -60,8 +62,10 @@ def test_optimizer_loss_scale_is_not_wired_without_optimizer() -> None:
     assert config.grad_scale_func is None
 
 
+@pytest.mark.parametrize("per_token_loss", [False, True])
 def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
     monkeypatch,
+    per_token_loss,
 ) -> None:
     class _MicroBatchList:
         mbs = [{}, {}]
@@ -76,9 +80,17 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
     engine = megatron_engine_module.MegatronEngine.__new__(
         megatron_engine_module.MegatronEngine
     )
+    engine.model = [
+        SimpleNamespace(config=SimpleNamespace(calculate_per_token_loss=per_token_loss))
+    ]
     engine._awex_adapter = None
     engine._weight_residency = None
+    engine.hf_config = None
     engine.device = torch.device("cpu")
+    # This test isolates loss scaling; metrics have their own batch-aware tests.
+    monkeypatch.setattr(
+        megatron_engine_module, "record_training_batch", lambda *args: nullcontext()
+    )
     engine.optimizer = _Optimizer()
     engine._ensure_ready = lambda: None
     engine.optimizer_zero_grad = lambda: None
@@ -91,6 +103,7 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
 
     def capture_loss(*args, loss_multiplier, **kwargs):
         captured["loss_multiplier"] = loss_multiplier
+        captured["per_token_loss"] = kwargs["per_token_loss"]
         return torch.tensor(0.0)
 
     engine._compute_logprobs_and_loss = capture_loss
@@ -123,7 +136,52 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
         loss_weight_fn=lambda input_: torch.tensor(1),
     )
 
-    assert captured["loss_multiplier"] == 6
+    assert captured["loss_multiplier"] == (1.0 if per_token_loss else 6)
+    assert captured["per_token_loss"] is per_token_loss
+
+
+def test_collect_mtp_loss_uses_mcore_metrics_tracker(monkeypatch) -> None:
+    from megatron.core.transformer.multi_token_prediction import (
+        MTPLossLoggingHelper,
+    )
+
+    engine = megatron_engine_module.MegatronEngine.__new__(
+        megatron_engine_module.MegatronEngine
+    )
+    engine.mcore_config = SimpleNamespace(enable_mtp_training=True)
+
+    reduced = False
+    cleaned = False
+
+    def reduce_metrics() -> None:
+        nonlocal reduced
+        reduced = True
+
+    def clean_metrics() -> None:
+        nonlocal cleaned
+        cleaned = True
+
+    monkeypatch.setattr(
+        MTPLossLoggingHelper,
+        "tracker",
+        {"loss_values": torch.tensor([2.0, 4.0])},
+    )
+    monkeypatch.setattr(
+        MTPLossLoggingHelper,
+        "reduce_metrics_in_tracker",
+        reduce_metrics,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        MTPLossLoggingHelper,
+        "clean_metrics_in_tracker",
+        clean_metrics,
+        raising=False,
+    )
+
+    assert engine._collect_mtp_loss(num_microbatches=2) == 3.0
+    assert reduced
+    assert cleaned
 
 
 def test_precision_aware_optimizer_fields_are_applied_before_validation(
@@ -136,6 +194,7 @@ def test_precision_aware_optimizer_fields_are_applied_before_validation(
     )
     engine.optimizer_config = OptimizerConfig(type="adam")
     engine.config = SimpleNamespace(use_lora=False)
+    engine.bridge_cls = "mbridge"
     engine.mcore_config = MegatronEngineConfig(
         use_precision_aware_optimizer=True,
         main_grads_dtype="bfloat16",

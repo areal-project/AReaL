@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from unittest.mock import MagicMock, patch
 
 
@@ -9,31 +10,23 @@ def test_data_proxy_main_formats_ipv6_serving_addr():
         __main__ as data_proxy_main,
     )
 
-    args = argparse.Namespace(
-        host="::1",
-        port=8082,
-        backend_addr="http://backend",
-        backend_type="sglang",
-        tokenizer_path="mock-tokenizer",
-        log_level="info",
-        request_timeout=120.0,
-        set_reward_finish_timeout=0.0,
-        admin_api_key="admin-key",
-        callback_server_addr="http://[::1]:19000",
-        deterministic_sampling=False,
-        tool_call_parser="qwen",
-        reasoning_parser="qwen3",
-        engine_max_tokens=None,
-        chat_template_type="hf",
-        message_preprocessor=[],
-        prefix_matcher=None,
-    )
-
     with (
         patch.object(
-            data_proxy_main.argparse.ArgumentParser,
-            "parse_known_args",
-            return_value=(args, []),
+            sys,
+            "argv",
+            [
+                "data-proxy",
+                "--host",
+                "::1",
+                "--port",
+                "8082",
+                "--tokenizer-path",
+                "mock-tokenizer",
+                "--admin-api-key",
+                "admin-key",
+                "--callback-server-addr",
+                "http://[::1]:19000",
+            ],
         ),
         patch.object(data_proxy_main, "create_app") as mock_create_app,
         patch.object(data_proxy_main.uvicorn, "run") as mock_run,

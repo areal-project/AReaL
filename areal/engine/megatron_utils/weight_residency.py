@@ -30,6 +30,8 @@ class MegatronWeightResidency:
     def __init__(self, engine: MegatronEngine) -> None:
         self._engine = engine
         self._released_tags: set[str] = set()
+        self._offloaded_optimizer_params: list[tuple[torch.Tensor, torch.device]] = []
+        self._offloaded_optimizer_states: list[tuple[dict, str, torch.device]] = []
 
     @property
     def released_tags(self) -> frozenset[str]:
@@ -226,17 +228,23 @@ class MegatronWeightResidency:
 
         count = 0
         for opt in inner_optimizers:
+            # Offload FP32 main parameter copies (shard_fp32_from_float16_groups)
             if hasattr(opt, "shard_fp32_from_float16_groups"):
                 for group in opt.shard_fp32_from_float16_groups:
                     if isinstance(group, list):
                         for tensor in group:
                             if tensor is not None and tensor.data.is_cuda:
+                                self._offloaded_optimizer_params.append(
+                                    (tensor, tensor.device)
+                                )
                                 tensor.data = tensor.data.to("cpu", non_blocking=True)
                                 count += 1
                     elif group is not None and group.data.is_cuda:
+                        self._offloaded_optimizer_params.append((group, group.device))
                         group.data = group.data.to("cpu", non_blocking=True)
                         count += 1
 
+            # Offload Adam states (exp_avg, exp_avg_sq)
             base_opt = getattr(opt, "optimizer", opt)
             if not hasattr(base_opt, "state") or base_opt.state is None:
                 continue
@@ -247,6 +255,9 @@ class MegatronWeightResidency:
                         and isinstance(state[key], torch.Tensor)
                         and state[key].is_cuda
                     ):
+                        self._offloaded_optimizer_states.append(
+                            (state, key, state[key].device)
+                        )
                         state[key] = state[key].to("cpu", non_blocking=True)
                         count += 1
 
@@ -274,38 +285,19 @@ class MegatronWeightResidency:
             logger.info("Reloaded optimizer via restore_from_cpu()")
             return
 
-        inner_optimizers = self._get_inner_optimizers()
-        if not inner_optimizers:
-            return
-
-        device = self._engine.device
+        # Restore only tensors moved by this adapter. HybridDeviceOptimizer
+        # also owns native CPU parameters and moments, which must stay on CPU.
         count = 0
-        for opt in inner_optimizers:
-            if hasattr(opt, "shard_fp32_from_float16_groups"):
-                for group in opt.shard_fp32_from_float16_groups:
-                    if isinstance(group, list):
-                        for tensor in group:
-                            if tensor is not None and not tensor.data.is_cuda:
-                                tensor.data = tensor.data.to(device, non_blocking=True)
-                                count += 1
-                    elif group is not None and not group.data.is_cuda:
-                        group.data = group.data.to(device, non_blocking=True)
-                        count += 1
-
-            base_opt = getattr(opt, "optimizer", opt)
-            if not hasattr(base_opt, "state") or base_opt.state is None:
-                continue
-            for state in base_opt.state.values():
-                for key in ("exp_avg", "exp_avg_sq"):
-                    if (
-                        key in state
-                        and isinstance(state[key], torch.Tensor)
-                        and not state[key].is_cuda
-                    ):
-                        state[key] = state[key].to(device, non_blocking=True)
-                        count += 1
+        for param, device in self._offloaded_optimizer_params:
+            param.data = param.data.to(device, non_blocking=True)
+            count += 1
+        for state, key, device in self._offloaded_optimizer_states:
+            state[key] = state[key].to(device, non_blocking=True)
+            count += 1
         torch.cuda.synchronize()
-        logger.info("Reloaded %d optimizer state tensors to GPU", count)
+        self._offloaded_optimizer_params.clear()
+        self._offloaded_optimizer_states.clear()
+        logger.info("Reloaded %d optimizer state tensors to original devices", count)
 
 
 __all__ = ["MegatronWeightResidency"]

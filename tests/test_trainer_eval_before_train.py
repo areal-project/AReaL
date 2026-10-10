@@ -162,6 +162,7 @@ def _build_ppo_trainer(events: list[tuple], *, recovered: bool = False):
         gconfig=SimpleNamespace(
             n_samples=1,
             reward_normalization=False,
+            reward_normalization_use_std=True,
             drop_incomplete_group=False,
         ),
         dynamic_bs=False,
@@ -333,8 +334,9 @@ def test_ppo_train_colocated_auxiliary_scoring_releases_rollout_first(
     ("requires_rl", "explicit_minimum", "expected"),
     [(False, None, 1), (False, 3, 3), (True, None, 2)],
 )
+@pytest.mark.parametrize("version", ["v1", "v2"])
 def test_rollout_minimum_uses_only_active_rl_estimator(
-    monkeypatch, requires_rl, explicit_minimum, expected
+    monkeypatch, requires_rl, explicit_minimum, expected, version
 ):
     from areal.api.cli_args import NormConfig, PPOActorConfig
 
@@ -345,15 +347,30 @@ def test_rollout_minimum_uses_only_active_rl_estimator(
         min_usable_group_size=explicit_minimum,
     )
     trainer.config.gconfig.n_samples = 4
+    trainer.config.rollout._version = version
     trainer.mopd_execution_plan = SimpleNamespace(requires_rl=requires_rl)
 
     def prepare_batch(*args, **kwargs):
         assert kwargs["min_usable_group_size"] == expected
+        assert ("reward_normalization_use_std" in kwargs) == (version == "v1")
         raise _StopAfterFirstUpdate
 
     trainer.actor.prepare_batch = prepare_batch
     with pytest.raises(_StopAfterFirstUpdate):
         trainer.train(workflow=object())
+
+
+def test_v2_mean_only_rollout_normalization_fails_before_sampling():
+    trainer = _build_ppo_trainer([])
+    trainer.config.rollout._version = "v2"
+    trainer.config.gconfig.reward_normalization = True
+    trainer.config.gconfig.reward_normalization_use_std = False
+    trainer.actor.prepare_batch = Mock()
+
+    with pytest.raises(ValueError, match="requires a v1 rollout backend"):
+        trainer.train(workflow=object())
+
+    trainer.actor.prepare_batch.assert_not_called()
 
 
 def test_ppo_initial_eval_offloads_rollout_when_evaluation_fails(monkeypatch):

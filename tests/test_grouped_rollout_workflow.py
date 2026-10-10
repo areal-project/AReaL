@@ -93,6 +93,27 @@ async def test_grouped_rollout_workflow_normalizes_rewards_and_updates_cache():
 
 
 @pytest.mark.asyncio
+async def test_grouped_rollout_mean_only_normalization_preserves_scale_and_cache():
+    first = _interaction(0.0)
+    second = _interaction(0.4)
+    workflow = GroupedRolloutWorkflow(
+        _ListWorkflow([{"a": first}, {"b": second}]),
+        group_size=2,
+        logger=_Logger(),
+        reward_normalization=True,
+        reward_normalization_use_std=False,
+    )
+    await workflow.arun_episode(engine=None, data={})
+    assert first.reward == pytest.approx(-0.2)
+    assert second.reward == pytest.approx(0.2)
+    assert first.original_reward == 0.0
+    assert second.original_reward == 0.4
+    assert first._cache["rewards"].item() == pytest.approx(-0.2)
+    assert second._cache["rewards"].item() == pytest.approx(0.2)
+    assert second.rollout_reward == pytest.approx(0.2)
+
+
+@pytest.mark.asyncio
 async def test_grouped_rollout_workflow_drops_incomplete_group():
     logger = _Logger()
     workflow = GroupedRolloutWorkflow(
@@ -188,6 +209,7 @@ def test_dist_rollout_coordinator_forwards_reward_group_flags(monkeypatch):
         dataloader=object(),
         workflow=object(),
         reward_normalization=True,
+        reward_normalization_use_std=False,
         drop_incomplete_group=True,
     )
     coordinator.rollout_batch(
@@ -195,9 +217,12 @@ def test_dist_rollout_coordinator_forwards_reward_group_flags(monkeypatch):
         workflow=object(),
         min_usable_group_size=2,
         reward_normalization=True,
+        reward_normalization_use_std=False,
         drop_incomplete_group=True,
     )
 
+    assert rollout_engine.prepare_kwargs["reward_normalization_use_std"] is False
+    assert rollout_engine.rollout_kwargs["reward_normalization_use_std"] is False
     assert rollout_engine.prepare_kwargs["reward_normalization"] is True
     assert rollout_engine.prepare_kwargs["drop_incomplete_group"] is True
     assert rollout_engine.rollout_kwargs["reward_normalization"] is True
