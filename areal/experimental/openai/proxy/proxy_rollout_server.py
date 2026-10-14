@@ -37,6 +37,7 @@ from areal.experimental.openai.client import ArealOpenAI, ContextLengthExceededE
 from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry
+from areal.infra.remote_inf_engine import RemoteInfEngine, use_server_for_session
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding, stats_tracker
@@ -81,6 +82,7 @@ if TYPE_CHECKING:
 logger = getLogger("ProxyRolloutServer")
 
 _STREAM_HEARTBEAT_INTERVAL_SECONDS = 30.0
+_MAX_GROUP_SAMPLE_FANOUT = 4
 
 
 # =============================================================================
@@ -581,6 +583,23 @@ def _cleanup_stale_sessions():
         logger.info(f"Cleaned up {len(orphaned_sids)} orphaned API key mappings")
 
 
+def _session_backend_address(sample_idx: int | None, group_size: int) -> str | None:
+    """Choose one backend for all turns of a grouped proxy session."""
+    if (
+        _engine is None
+        or getattr(_engine.config, "routing_strategy", None) != "least_active_groups"
+    ):
+        return None
+    remote_engine = getattr(_engine, "_engine", _engine)
+    if not isinstance(remote_engine, RemoteInfEngine) or not remote_engine.addresses:
+        return None
+    # Bound fanout so siblings can still share expensive multimodal prefixes.
+    fanout = max(
+        1, min(group_size, len(remote_engine.addresses), _MAX_GROUP_SAMPLE_FANOUT)
+    )
+    return remote_engine.addresses[(sample_idx or 0) % fanout]
+
+
 @app.post(f"/{RL_START_SESSION_PATHNAME}", dependencies=[Depends(_require_admin_key)])
 def start_session(request: StartSessionRequest) -> StartSessionResponse:
     """Start a new RL session and allocate a unique session API key.
@@ -592,6 +611,9 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
     """
     global _capacity
     task_id = request.task_id
+    backend_address = _session_backend_address(
+        request.sample_idx, request.processor_cache_group_size
+    )
 
     if (
         request.processor_cache_group_id is not None
@@ -659,6 +681,7 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
             sampling_seed_identity=task_id,
             processor_cache=processor_cache,
             processor_cache_group_id=request.processor_cache_group_id,
+            backend_address=backend_address,
             metadata=request.metadata,
         )
         _session_invalid_tool_errors.pop(session_id, None)
@@ -1088,7 +1111,8 @@ async def _call_client_create(
         }
         if supports_processor_cache:
             client_kwargs["processor_cache"] = session_data.processor_cache
-        return await create_fn(**client_kwargs)
+        with use_server_for_session(session_data.backend_address):
+            return await create_fn(**client_kwargs)
     except InvalidToolCallError as exc:
         # A streaming response has already sent HTTP 200 by the time the model
         # output can be validated. Poison the session so an SDK retry receives

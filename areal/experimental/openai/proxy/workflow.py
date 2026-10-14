@@ -552,6 +552,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             admin_api_key=self._admin_api_key,
             processor_cache_group_id=processor_cache_group_id,
             processor_cache_group_size=context.group_size,
+            sample_idx=context.sample_idx,
             shared_tensor_resolver=self._shared_tensor_resolver,
             metadata=await self._get_agent_session_metadata(data),
         )

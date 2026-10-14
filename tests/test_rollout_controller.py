@@ -1738,3 +1738,44 @@ async def test_proxy_start_inherits_current_weight_version(version):
     )
     await controller._async_start_proxy()
     controller._proxy_collective_rpc_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_proxy_group_routing_rotates_all_backend_addresses():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    controller = object.__new__(RolloutController)
+    workers = [
+        SimpleNamespace(
+            id=f"proxy-rollout/{idx}", ip="127.0.0.1", worker_ports=[8000 + idx]
+        )
+        for idx in range(3)
+    ]
+    controller._worker_role = "rollout"
+    controller.inf_engine = MockInferenceEngine
+    controller.config = create_test_config()
+    controller.config.routing_strategy = "least_active_groups"
+    controller.server_infos = [
+        SimpleNamespace(host="127.0.0.1", port=9000 + idx) for idx in range(3)
+    ]
+    controller.proxy_addrs = []
+    controller.scheduler = Mock()
+    controller.scheduler.fork_workers.return_value = [worker.id for worker in workers]
+    controller.scheduler.get_workers.return_value = workers
+    controller.scheduler.create_engine = AsyncMock()
+    controller.scheduler.async_call_engine = AsyncMock()
+    controller._proxy_collective_rpc_async = AsyncMock()
+    controller.get_version = Mock(return_value=0)
+
+    await controller._async_start_proxy()
+
+    init_addrs = [
+        call.kwargs["addr"]
+        for call in controller.scheduler.async_call_engine.await_args_list
+    ]
+    assert init_addrs == [
+        ["127.0.0.1:9000", "127.0.0.1:9001", "127.0.0.1:9002"],
+        ["127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9000"],
+        ["127.0.0.1:9002", "127.0.0.1:9000", "127.0.0.1:9001"],
+    ]

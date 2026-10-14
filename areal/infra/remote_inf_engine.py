@@ -9,8 +9,10 @@ import shutil
 import subprocess
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from logging import Logger
 from threading import Lock
@@ -68,6 +70,21 @@ if TYPE_CHECKING:
     from areal.experimental.openai import InteractionWithTokenLogpReward
 
 RID_CACHE_SIZE = 128
+
+_session_server_address: ContextVar[str | None] = ContextVar(
+    "areal_session_server_address", default=None
+)
+
+
+@contextmanager
+def use_server_for_session(address: str | None) -> Iterator[None]:
+    """Pin model calls in one proxy session to the same inference server."""
+    token = _session_server_address.set(address)
+    try:
+        yield
+    finally:
+        _session_server_address.reset(token)
+
 
 logger = logging.getLogger("RemoteInfEngine")
 
@@ -1060,14 +1077,15 @@ class RemoteInfEngine(InferenceEngine):
         NotImplementedError
             If the routing strategy is unsupported for the bound servers
         """
-        if (
-            self.config.routing_strategy == "least_active_groups"
-            and len(self.addresses) == 1
-        ):
-            # RolloutController selects the worker for this strategy. Each
-            # worker's inference engine is bound to its own server.
-            return self.addresses[0]
-        if self.config.routing_strategy == "round_robin":
+        session_address = _session_server_address.get()
+        if session_address is not None:
+            if session_address not in self.addresses:
+                raise ValueError(
+                    f"Session inference server {session_address!r} is not bound "
+                    "to this engine."
+                )
+            return session_address
+        if self.config.routing_strategy in ("round_robin", "least_active_groups"):
             server = self.addresses[self.server_idx]
             self.server_idx = (self.server_idx + 1) % len(self.addresses)
             return server
@@ -1129,6 +1147,12 @@ class RemoteInfEngine(InferenceEngine):
         # A single "rid" shares the same server to allow KV cache reuse
         if req.rid in self.rid_to_address:
             server_addr = self.rid_to_address[req.rid]
+            session_address = _session_server_address.get()
+            if session_address is not None and session_address != server_addr:
+                raise ValueError(
+                    f"Request {req.rid!r} was already routed to {server_addr!r}, "
+                    f"not session server {session_address!r}."
+                )
         else:
             server_addr = self.choose_server()
             if len(self.rid_queue) >= RID_CACHE_SIZE:

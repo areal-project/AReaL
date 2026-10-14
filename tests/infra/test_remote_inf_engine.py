@@ -6,7 +6,7 @@ from unittest import mock
 import pytest
 
 from areal.api.cli_args import InferenceEngineConfig
-from areal.infra.remote_inf_engine import RemoteInfEngine
+from areal.infra.remote_inf_engine import RemoteInfEngine, use_server_for_session
 
 
 def test_choose_server_accepts_controller_routing_for_single_bound_server():
@@ -15,6 +15,21 @@ def test_choose_server_accepts_controller_routing_for_single_bound_server():
     engine.addresses = ["localhost:30000"]
 
     assert engine.choose_server() == "localhost:30000"
+
+
+def test_grouped_proxy_session_keeps_its_backend_across_model_calls():
+    config = InferenceEngineConfig(routing_strategy="least_active_groups")
+    engine = RemoteInfEngine(config, backend=mock.Mock())
+    engine.addresses = ["localhost:30000", "localhost:30001"]
+
+    with use_server_for_session("localhost:30001"):
+        assert engine.choose_server() == "localhost:30001"
+        assert engine.choose_server() == "localhost:30001"
+
+    assert engine.choose_server() == "localhost:30000"
+    with use_server_for_session("localhost:30002"):
+        with pytest.raises(ValueError, match="not bound"):
+            engine.choose_server()
 
 
 def test_wait_for_server_dead_process_raises_runtime_error_with_returncode():

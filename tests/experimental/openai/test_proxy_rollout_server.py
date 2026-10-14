@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from copy import deepcopy
@@ -13,6 +14,7 @@ import pytest
 import torch
 
 from areal.api import ModelResponse
+from areal.api.cli_args import InferenceEngineConfig
 from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.client import ContextLengthExceededError
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
@@ -25,6 +27,7 @@ from areal.experimental.openai.proxy.server import (
 from areal.experimental.openai.proxy.tensor_reference import GroupTensorStoreRegistry
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry
+from areal.infra.remote_inf_engine import RemoteInfEngine
 from areal.infra.rpc.serialization import deserialize_value
 from areal.reward.prm import BaseScorer, PRMConfig, PRMRunner
 from areal.utils import stats_tracker
@@ -195,6 +198,64 @@ def _client():
 
 def _admin_headers():
     return {"Authorization": f"Bearer {_ADMIN_KEY}"}
+
+
+@pytest.mark.asyncio
+async def test_group_samples_use_distinct_pinned_backends_and_one_processor_cache(
+    monkeypatch,
+):
+    config = InferenceEngineConfig(routing_strategy="least_active_groups")
+    remote = RemoteInfEngine(config, backend=MagicMock())
+    remote.addresses = ["server-a:30000", "server-b:30000", "server-c:30000"]
+    monkeypatch.setattr(srv, "_engine", SimpleNamespace(config=config, _engine=remote))
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_capacity", 3)
+
+    async with _client() as client:
+        session_ids = []
+        for sample_idx in range(3):
+            response = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={
+                    "task_id": f"task-1:{sample_idx}",
+                    "sample_idx": sample_idx,
+                    "processor_cache_group_id": "train:task-1",
+                    "processor_cache_group_size": 3,
+                },
+            )
+            assert response.status_code == 200
+            session_ids.append(response.json()["session_id"])
+
+    sessions = [srv._session_cache[sid] for sid in session_ids]
+    assert [session.backend_address for session in sessions] == remote.addresses
+    assert sessions[0].processor_cache is sessions[1].processor_cache
+    assert sessions[1].processor_cache is sessions[2].processor_cache
+
+    async def create_fn(**kwargs):
+        await asyncio.sleep(0)
+        return remote.choose_server()
+
+    routed = await asyncio.gather(
+        *(srv._call_client_create(create_fn, {}, sid) for sid in session_ids)
+    )
+    assert routed == remote.addresses
+    assert (
+        await srv._call_client_create(create_fn, {}, session_ids[1])
+        == remote.addresses[1]
+    )
+    assert remote.choose_server() == remote.addresses[0]
+
+
+def test_group_sample_fanout_preserves_prefix_locality(monkeypatch):
+    config = InferenceEngineConfig(routing_strategy="least_active_groups")
+    remote = RemoteInfEngine(config, backend=MagicMock())
+    remote.addresses = [f"server-{idx}:30000" for idx in range(16)]
+    monkeypatch.setattr(srv, "_engine", SimpleNamespace(config=config, _engine=remote))
+
+    routed = [srv._session_backend_address(idx, 12) for idx in range(12)]
+
+    assert routed == remote.addresses[:4] * 3
 
 
 @pytest.mark.asyncio

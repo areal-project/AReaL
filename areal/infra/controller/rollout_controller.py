@@ -668,15 +668,23 @@ class RolloutController:
         logger.info("Proxy engines created")
 
         init_tasks = []
+        server_addrs = [f"{info.host}:{info.port}" for info in self.server_infos]
         for rank, (worker, server_info) in enumerate(
             zip(self.proxy_workers, self.server_infos, strict=True)
         ):
+            if self.config.routing_strategy == "least_active_groups":
+                # Every proxy keeps its group's shared processor cache, while
+                # individual sample sessions can reach different backends.
+                # Rotate so sample 0 still uses the worker's local server.
+                addr = server_addrs[rank:] + server_addrs[:rank]
+            else:
+                addr = f"{server_info.host}:{server_info.port}"
             init_tasks.append(
                 self.scheduler.async_call_engine(
                     worker_id=worker.id,
                     method="initialize",
                     engine_name=self._proxy_engine_name(rank),
-                    addr=f"{server_info.host}:{server_info.port}",
+                    addr=addr,
                 )
             )
             self.proxy_addrs.append(
