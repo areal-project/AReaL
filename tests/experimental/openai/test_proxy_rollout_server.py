@@ -250,12 +250,12 @@ async def test_group_samples_use_distinct_pinned_backends_and_one_processor_cach
 def test_group_sample_fanout_preserves_prefix_locality(monkeypatch):
     config = InferenceEngineConfig(routing_strategy="least_active_groups")
     remote = RemoteInfEngine(config, backend=MagicMock())
-    remote.addresses = [f"server-{idx}:30000" for idx in range(16)]
+    remote.addresses = [f"server-{idx}:30000" for idx in range(2)]
     monkeypatch.setattr(srv, "_engine", SimpleNamespace(config=config, _engine=remote))
 
     routed = [srv._session_backend_address(idx, 12) for idx in range(12)]
 
-    assert routed == remote.addresses[:4] * 3
+    assert routed == remote.addresses * 6
 
 
 @pytest.mark.asyncio

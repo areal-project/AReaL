@@ -1741,7 +1741,7 @@ async def test_proxy_start_inherits_current_weight_version(version):
 
 
 @pytest.mark.asyncio
-async def test_proxy_group_routing_rotates_all_backend_addresses():
+async def test_proxy_group_routing_uses_same_node_backends():
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
@@ -1757,7 +1757,8 @@ async def test_proxy_group_routing_rotates_all_backend_addresses():
     controller.config = create_test_config()
     controller.config.routing_strategy = "least_active_groups"
     controller.server_infos = [
-        SimpleNamespace(host="127.0.0.1", port=9000 + idx) for idx in range(3)
+        SimpleNamespace(host=("node-0" if idx != 1 else "node-1"), port=9000 + idx)
+        for idx in range(3)
     ]
     controller.proxy_addrs = []
     controller.scheduler = Mock()
@@ -1775,7 +1776,7 @@ async def test_proxy_group_routing_rotates_all_backend_addresses():
         for call in controller.scheduler.async_call_engine.await_args_list
     ]
     assert init_addrs == [
-        ["127.0.0.1:9000", "127.0.0.1:9001", "127.0.0.1:9002"],
-        ["127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9000"],
-        ["127.0.0.1:9002", "127.0.0.1:9000", "127.0.0.1:9001"],
+        ["node-0:9000", "node-0:9002"],
+        ["node-1:9001"],
+        ["node-0:9002", "node-0:9000"],
     ]

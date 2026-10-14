@@ -82,7 +82,6 @@ if TYPE_CHECKING:
 logger = getLogger("ProxyRolloutServer")
 
 _STREAM_HEARTBEAT_INTERVAL_SECONDS = 30.0
-_MAX_GROUP_SAMPLE_FANOUT = 4
 
 
 # =============================================================================
@@ -593,10 +592,9 @@ def _session_backend_address(sample_idx: int | None, group_size: int) -> str | N
     remote_engine = getattr(_engine, "_engine", _engine)
     if not isinstance(remote_engine, RemoteInfEngine) or not remote_engine.addresses:
         return None
-    # Bound fanout so siblings can still share expensive multimodal prefixes.
-    fanout = max(
-        1, min(group_size, len(remote_engine.addresses), _MAX_GROUP_SAMPLE_FANOUT)
-    )
+    # The controller binds only same-node backends, so siblings can share
+    # expensive multimodal prefixes without crossing the network.
+    fanout = max(1, min(group_size, len(remote_engine.addresses)))
     return remote_engine.addresses[(sample_idx or 0) % fanout]
 
 

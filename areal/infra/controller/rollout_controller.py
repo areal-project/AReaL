@@ -673,10 +673,15 @@ class RolloutController:
             zip(self.proxy_workers, self.server_infos, strict=True)
         ):
             if self.config.routing_strategy == "least_active_groups":
-                # Every proxy keeps its group's shared processor cache, while
-                # individual sample sessions can reach different backends.
-                # Rotate so sample 0 still uses the worker's local server.
-                addr = server_addrs[rank:] + server_addrs[:rank]
+                # Share a group's processor cache in one proxy and spread its
+                # sample sessions across the co-located inference servers.
+                # Keep the worker's own server first to avoid cross-node image
+                # transfers and retain prefix locality.
+                addr = [server_addrs[rank]] + [
+                    address
+                    for idx, address in enumerate(server_addrs)
+                    if idx != rank and self.server_infos[idx].host == server_info.host
+                ]
             else:
                 addr = f"{server_info.host}:{server_info.port}"
             init_tasks.append(
