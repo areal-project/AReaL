@@ -1,15 +1,16 @@
-# Supports sglang and vllm variants via the VARIANT build argument.
-# VARIANT is declared early so each variant gets the correct torch version
-# and C++ extensions compiled against it.
+# Build the SGLang and vLLM images from the same Dockerfile.
+# VARIANT selects the matching base image and CUDA extension build.
 #
 # Usage:
 #   docker build -t areal-runtime:dev-sglang .                          # default (sglang)
 #   docker build --build-arg VARIANT=vllm -t areal-runtime:dev-vllm .    # vllm variant
+ARG VARIANT=sglang
+ARG SGLANG_BASE_IMAGE=lmsysorg/sglang:v0.5.20-cu130-runtime
 
 # ============================================================
 # BUILDER STAGE: compile C++ extensions and install all deps
 # ============================================================
-FROM lmsysorg/sglang:v0.5.10.post1-runtime AS builder
+FROM lmsysorg/sglang:v0.5.10.post1-runtime AS vllm-builder
 
 # Inference backend selector: sglang (default) or vllm
 ARG VARIANT=sglang
@@ -186,7 +187,7 @@ RUN uv pip install --no-cache-dir -U setuptools nvidia-ml-py
 # RUNTIME STAGE: lean final image (no build tools, no source
 # checkouts, no intermediate compilation artifacts)
 # ============================================================
-FROM lmsysorg/sglang:v0.5.10.post1-runtime
+FROM lmsysorg/sglang:v0.5.10.post1-runtime AS vllm-final
 
 ARG VARIANT=sglang
 
@@ -239,7 +240,7 @@ ENV VIRTUAL_ENV=/opt/.venv
 ENV CUDA_HOME=/usr/local/cuda
 
 # Copy the fully-built venv from builder (all C++ extensions included)
-COPY --from=builder /opt/.venv /opt/.venv
+COPY --from=vllm-builder /opt/.venv /opt/.venv
 
 ##############################################################
 # Install Node.js and npm-based tools
@@ -285,3 +286,198 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 # Reset entrypoint (some base images set custom entrypoints; this ensures /bin/bash)
 ENTRYPOINT []
 CMD ["/bin/bash"]
+
+# SGLang 0.5.20 / CUDA 13 variant.
+FROM ${SGLANG_BASE_IMAGE} AS sglang-deps
+WORKDIR /
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda-13.0 \
+    CUDA_VERSION=13.0.3 \
+    NVIDIA_REQUIRE_CUDA="cuda>=13.0" \
+    VIRTUAL_ENV=/opt/.venv \
+    UV_INDEX_URL=https://pypi.org/simple \
+    UV_HTTP_TIMEOUT=300 \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=0
+ENV PATH="${CUDA_HOME}/bin:${VIRTUAL_ENV}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+
+# The public SGLang runtime does not include the uv executable. Copy a pinned
+# standalone binary so both released and local development bases can build.
+COPY --from=ghcr.io/astral-sh/uv:0.11.8 /uv /uvx /usr/local/bin/
+
+# Local development bases may still have Torch 2.9 extensions. The lockfile
+# selects Torch 2.13 and CUDA 13 for SGLang 0.5.20.
+
+COPY pyproject.toml uv.lock /opt/areal-sglang/
+
+# Start with a clean environment: the base's Torch/CUDA extension wheels were
+# compiled against Torch 2.9 and cannot be reused with Torch 2.13.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv --clear "${VIRTUAL_ENV}" \
+    && uv sync --active --locked --no-install-project \
+       --extra cuda --extra sandbox --group dev \
+       --project /opt/areal-sglang
+
+RUN python -c 'import sglang, torch; assert sglang.__version__ == "0.5.20"; assert torch.__version__.startswith("2.13.0+cu130"); assert torch.version.cuda == "13.0"'
+
+# Add the CUDA 13 compiler for local extension builds. The inference target
+# also serves as a smoke-testable image while training extensions are built.
+FROM sglang-deps AS sglang-inference
+
+# CUDA libraries and additional headers come from the installed CUDA 13 wheels.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       cuda-minimal-build-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CPATH="/opt/.venv/lib/python3.12/site-packages/nvidia/cu13/include" \
+    LIBRARY_PATH="/opt/.venv/lib/python3.12/site-packages/nvidia/cu13/lib" \
+    LD_LIBRARY_PATH="/opt/.venv/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
+
+RUN set -eu; \
+    for library in /opt/.venv/lib/python3.12/site-packages/nvidia/cu13/lib/lib*.so.*; do \
+        name="${library%%.so.*}.so"; \
+        if [ ! -e "$name" ]; then ln -s "$(basename "$library")" "$name"; fi; \
+    done
+
+RUN nvcc --version | grep 'release 13.0' \
+    && python -c 'import sglang, torch; assert sglang.__version__ == "0.5.20"; assert torch.version.cuda == "13.0"'
+
+FROM sglang-inference AS sglang-runtime
+
+ENV NVTE_WITH_USERBUFFERS=1 \
+    NVTE_FRAMEWORK=pytorch \
+    MPI_HOME=/usr/local/mpi \
+    TORCH_CUDA_ARCH_LIST="8.0 8.9 9.0 9.0a" \
+    MAX_JOBS=1 \
+    UV_COMPILE_BYTECODE=0
+
+RUN uv pip install "setuptools>=77.0.3,<80" pybind11 wheel
+
+RUN NVCC_APPEND_FLAGS="--threads 1" uv pip install --no-build-isolation --no-cache-dir \
+    git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
+
+RUN NVCC_APPEND_FLAGS="--threads 1" APEX_PARALLEL_BUILD=1 APEX_CPP_EXT=1 APEX_CUDA_EXT=1 \
+    uv pip install --no-build-isolation --no-cache-dir \
+    git+https://github.com/NVIDIA/apex.git
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+# CMake's FindCUDAToolkit searches the toolkit tree for CUDA::cublas, while
+# the CUDA 13 Python wheels place their libraries in the venv.
+RUN set -eu; \
+    for library in /opt/.venv/lib/python3.12/site-packages/nvidia/cu13/lib/lib*.so; do \
+        target="/usr/local/cuda-13.0/targets/x86_64-linux/lib/$(basename "$library")"; \
+        if [ ! -e "$target" ]; then ln -s "$library" "$target"; fi; \
+    done; \
+    for header in /opt/.venv/lib/python3.12/site-packages/nvidia/cu13/include/*; do \
+        target="/usr/local/cuda-13.0/targets/x86_64-linux/include/$(basename "$header")"; \
+        if [ ! -e "$target" ]; then ln -s "$header" "$target"; fi; \
+    done
+
+# Keep nvcc's own headers first; the CUDA wheel's host_runtime.h has a
+# different __cudaLaunch signature. cuDNN headers come from its Python wheel.
+ENV CPATH="/usr/local/cuda-13.0/targets/x86_64-linux/include:/opt/.venv/lib/python3.12/site-packages/nvidia/cudnn/include"
+
+# NVIDIA publishes a CUDA 13 core wheel. Build only the PyTorch bindings here;
+# compiling the full core from source exhausts memory on emulated builders.
+RUN NVTE_WITH_NCCL_EP=0 NVTE_CUDA_ARCHS="80;89;90" \
+    uv pip install --no-build-isolation --no-cache-dir \
+    "transformer-engine[core_cu13,pytorch]==2.20.2"
+
+RUN git clone https://github.com/deepseek-ai/FlashMLA.git /flash-mla \
+    && cd /flash-mla \
+    && git checkout 71c7379 \
+    && git submodule update --init --recursive \
+    && uv pip install . --no-build-isolation --no-cache-dir \
+    && rm -rf /flash-mla
+
+RUN git clone https://github.com/deepseek-ai/DeepGEMM /DeepGEMM \
+    && cd /DeepGEMM \
+    && git checkout d30fc36 \
+    && git submodule update --init --recursive \
+    && uv pip install . --no-build-isolation --no-cache-dir \
+    && rm -rf /DeepGEMM
+
+RUN git clone https://github.com/deepseek-ai/DeepEP /DeepEP \
+    && cd /DeepEP \
+    && git checkout 567632d \
+    && TORCH_CUDA_ARCH_LIST="9.0 9.0a" uv pip install . --no-build-isolation --no-cache-dir \
+    && rm -rf /DeepEP
+
+RUN git clone https://github.com/Dao-AILab/causal-conv1d -b v1.6.0 /causal-conv1d \
+    && cd /causal-conv1d \
+    && uv pip install . --no-build-isolation --no-cache-dir \
+    && rm -rf /causal-conv1d
+
+# The clean venv no longer contains the editable AReaL install from the base.
+# Copy the current checkout and install it after compiling CUDA extensions so
+# source edits do not invalidate the expensive compilation layers.
+FROM sglang-inference AS sglang-inference-local
+WORKDIR /AReaL
+COPY . /AReaL
+RUN uv sync --active --locked --no-editable \
+    --extra cuda --extra sandbox --group dev \
+    --project /AReaL
+
+FROM sglang-runtime AS sglang-final
+WORKDIR /AReaL
+
+# Keep the runtime utilities provided by the original image recipe.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    net-tools \
+    unzip \
+    kmod \
+    libibverbs-dev \
+    librdmacm-dev \
+    ibverbs-utils \
+    rdmacm-utils \
+    python3-pyverbs \
+    opensm \
+    ibutils \
+    perftest \
+    python3-venv \
+    tmux \
+    lsof \
+    nvtop \
+    rsync \
+    dnsutils \
+    vim \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV FNM_DIR=/root/.fnm
+ENV NODE_VERSION=24.15.0
+ENV NPM_VERSION=12.0.2
+ENV PATH="$FNM_DIR/aliases/default/bin:/root/.local/bin:$PATH"
+RUN set -ex \
+    && curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir "$FNM_DIR" --skip-shell \
+    && eval "$($FNM_DIR/fnm env --shell bash)" \
+    && $FNM_DIR/fnm install $NODE_VERSION \
+    && $FNM_DIR/fnm default $NODE_VERSION \
+    && npm install -g "npm@$NPM_VERSION" \
+    && npm install -g @openai/codex @google/gemini-cli openclaw@latest \
+    && curl -fsSL https://claude.ai/install.sh | bash \
+    && curl -fsSL https://opencode.ai/install | bash \
+    && npm cache clean --force \
+    && rm -rf /root/.cache/uv /root/.cache/pip /tmp/*
+
+ENV PATH="/root/.cargo/bin:$PATH"
+RUN curl -fsSL \
+    https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/install.sh \
+    | bash -s -- --skip-quickstart \
+    && rm -rf /tmp/*
+
+COPY . /AReaL
+RUN uv pip install --no-cache-dir --no-deps -e /AReaL
+
+ENTRYPOINT []
+CMD ["/bin/bash"]
+
+# Keep the VARIANT build argument as the single-image selector.
+FROM ${VARIANT}-final AS runtime

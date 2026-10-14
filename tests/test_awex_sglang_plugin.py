@@ -10,6 +10,7 @@ import torch
 
 from areal.api.cli_args import MegatronEngineConfig, PPOActorConfig
 from areal.engine.awex.adapters.sglang_adapter import (
+    AwexSGLangAdapter,
     _get_legacy_awex_hf_config,
     _get_router_dtype,
     _PhysicalDeviceMetaServerClient,
@@ -111,6 +112,46 @@ def test_awex_config_preserves_nested_router_and_vision_metadata(monkeypatch):
     assert config.vision_config.hidden_size == 64
     assert _get_router_dtype(config) == "fp32"
     assert config.architectures == ["SimpleNamespace"]
+
+
+def test_v0520_adapter_uses_scheduler_parallel_gpu_id(monkeypatch):
+    adapter = object.__new__(AwexSGLangAdapter)
+    adapter._scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(tp_size=1, pp_size=1, dp_size=1),
+        ps=SimpleNamespace(gpu_id=2, tp_rank=0, pp_rank=0),
+    )
+    adapter._legacy_instance_world_size = None
+    adapter._legacy_instance_local_rank = None
+    monkeypatch.setenv("LOCAL_RANK", "7")
+
+    assert adapter._get_model_context()["local_rank"] == 2
+
+
+def test_v0520_adapter_releases_memory_through_weight_updater(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.io_struct",
+        SimpleNamespace(
+            ReleaseMemoryOccupationReqInput=lambda tags: SimpleNamespace(tags=tags),
+            ResumeMemoryOccupationReqInput=lambda tags: SimpleNamespace(tags=tags),
+        ),
+    )
+    calls = []
+    updater = SimpleNamespace(
+        release_memory_occupation=lambda req: calls.append(("release", req.tags)),
+        resume_memory_occupation=lambda req: calls.append(("resume", req.tags)),
+    )
+    adapter = object.__new__(AwexSGLangAdapter)
+    adapter._scheduler = SimpleNamespace(weight_updater=updater)
+    adapter._released_tags = set()
+
+    adapter.release_memory(["kv_cache"])
+    adapter.release_memory(["kv_cache"])
+    adapter.resume_memory(["kv_cache"])
+
+    assert calls == [("release", ["kv_cache"]), ("resume", ["kv_cache"])]
 
 
 def test_memory_transitions_are_idempotent(monkeypatch):

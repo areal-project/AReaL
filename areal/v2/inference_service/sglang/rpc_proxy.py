@@ -3,10 +3,16 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import zmq
-from sglang.srt.managers.io_struct import RpcReqInput, RpcReqOutput
+from sglang.srt.managers.io_struct import (
+    RpcReqInput,
+    RpcReqOutput,
+    sock_recv,
+    sock_send,
+)
 from sglang.srt.server_args import PortArgs
 
 
@@ -34,9 +40,11 @@ class RpcProxy:
         self._result_pull.bind(result_ipc)
 
     def collective_rpc(self, method: str, **kwargs: Any) -> None:
-        req = RpcReqInput(method=method, parameters=kwargs if kwargs else None)
-        self._rpc_socket.send_pyobj(req)
-        resp: RpcReqOutput = self._rpc_socket.recv_pyobj()
+        # RpcReqInput accepts scalar parameters in SGLang 0.5.20. AWEX
+        # arguments can contain lists, so carry them in one JSON string.
+        req = RpcReqInput(method=method, parameters={"payload": json.dumps(kwargs)})
+        sock_send(self._rpc_socket, req)
+        resp: RpcReqOutput = sock_recv(self._rpc_socket)
         assert isinstance(resp, RpcReqOutput)
         if not resp.success:
             raise RuntimeError(f"RPC {method} failed: {resp.message}")

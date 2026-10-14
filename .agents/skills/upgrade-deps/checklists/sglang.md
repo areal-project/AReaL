@@ -10,8 +10,16 @@ upstream_paths:
   - python/sglang/srt/function_call/core_types.py
   - python/sglang/srt/managers/scheduler.py
   - python/sglang/srt/managers/io_struct.py
+  - python/sglang/srt/managers/scheduler_components/weight_updater.py
   - python/sglang/srt/parser/reasoning_parser.py
+  - python/sglang/srt/plugins/__init__.py
+  - python/sglang/srt/runtime_context.py
   - python/sglang/srt/server_args.py
+  - python/sglang/srt/state_capturer/base.py
+  - python/sglang/srt/state_capturer/routed_experts.py
+  - python/sglang/srt/multimodal/processors/executor.py
+  - python/sglang/srt/multimodal/processors/qwen_vl.py
+  - python/sglang/srt/weight_sync/tensor_bucket.py
   - python/sglang/srt/utils/__init__.py
   - python/sglang/srt/utils/common.py
   - python/sglang/srt/utils/network.py
@@ -23,14 +31,20 @@ upstream_paths:
 
 ### Primary (engine layer — most likely to break)
 
-| File                                                 | Imports / Usage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `areal/engine/sglang_remote.py`                      | HTTP-only (no Python imports). Sends requests to `/generate`, `/load_lora_adapter`, `/update_weights_from_disk`, `/update_weights_from_distributed`, `/init_weights_update_group`, `/pause_generation`, `/continue_generation`, `/health`, `/release_memory_occupation`, `/resume_memory_occupation`. Parses `meta_info`, `finish_reason`, `output_token_logprobs`, `routed_experts` from JSON responses.                                                                                                                   |
-| `areal/experimental/openai/tool_call_parser.py`      | `sglang.srt.entrypoints.openai.protocol.Function`, `sglang.srt.entrypoints.openai.protocol.Tool`, `sglang.srt.function_call.function_call_parser.FunctionCallParser`, `sglang.srt.parser.reasoning_parser.ReasoningParser`                                                                                                                                                                                                                                                                                                  |
-| `areal/v2/inference_service/sglang/launch_server.py` | `sglang.srt.entrypoints.engine.Engine`, `sglang.srt.entrypoints.engine.init_tokenizer_manager`, `sglang.srt.entrypoints.http_server._execute_server_warmup`, `sglang.srt.entrypoints.http_server._setup_and_run_http_server`, `sglang.srt.entrypoints.http_server.app`, `sglang.srt.managers.detokenizer_manager.run_detokenizer_process`                                                                                                                                                                                   |
-| `areal/v2/inference_service/sglang/scheduler.py`     | `sglang.srt.managers.scheduler.Scheduler`, `sglang.srt.managers.scheduler.configure_scheduler`, `sglang.srt.observability.trace.process_tracing_init`, `sglang.srt.observability.trace.trace_set_thread_info`, `sglang.srt.utils.get_bool_env_var`, `sglang.srt.utils.kill_itself_when_parent_died`, `sglang.srt.utils.set_gpu_proc_affinity`, `sglang.srt.utils.numa_utils.get_numa_node_if_available`, `sglang.srt.utils.numa_utils.numa_bind_to_node`, `sglang.srt.environ.envs`, `sglang.utils.get_exception_traceback` |
-| `areal/v2/inference_service/sglang/rpc_proxy.py`     | `sglang.srt.managers.io_struct.RpcReqInput`, `sglang.srt.managers.io_struct.RpcReqOutput`, `sglang.srt.server_args.PortArgs`, `sglang.srt.utils.network.get_zmq_socket`                                                                                                                                                                                                                                                                                                                                                     |
-| `areal/v2/inference_service/sglang/bridge.py`        | HTTP-only (same protocol as `sglang_remote.py`). `/generate` request/response, `/pause_generation`, `/continue_generation`, `/release_memory_occupation`, `/resume_memory_occupation`.                                                                                                                                                                                                                                                                                                                                      |
+| File                                                            | Imports / Usage                                                                                                                                                                                                                                                                                                                                                                                           |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `areal/engine/sglang_remote.py`                                 | HTTP-only (no Python imports). Sends requests to `/generate`, `/load_lora_adapter`, `/update_weights_from_disk`, `/update_weights_from_distributed`, `/init_weights_update_group`, `/pause_generation`, `/continue_generation`, `/health`, `/release_memory_occupation`, `/resume_memory_occupation`. Parses `meta_info`, `finish_reason`, `output_token_logprobs`, `routed_experts` from JSON responses. |
+| `areal/experimental/openai/tool_call_parser.py`                 | `sglang.srt.entrypoints.openai.protocol.Function`, `sglang.srt.entrypoints.openai.protocol.Tool`, `sglang.srt.function_call.function_call_parser.FunctionCallParser`, `sglang.srt.parser.reasoning_parser.ReasoningParser`                                                                                                                                                                                |
+| `areal/v2/inference_service/sglang/launch_server.py`            | `sglang.srt.entrypoints.engine.Engine`, `sglang.srt.entrypoints.engine.init_tokenizer_manager`, `sglang.srt.entrypoints.http_server._execute_server_warmup`, `sglang.srt.entrypoints.http_server._setup_and_run_http_server`, `sglang.srt.entrypoints.http_server.app`, `sglang.srt.managers.detokenizer_manager.run_detokenizer_process`                                                                 |
+| `areal/v2/inference_service/sglang/scheduler.py`                | `Scheduler`, `configure_scheduler_process`, runtime-context `publish`, `load_plugins`, tracing, and `scheduler.ps` parallel state.                                                                                                                                                                                                                                                                        |
+| `areal/v2/inference_service/sglang/rpc_proxy.py`                | `RpcReqInput`, `RpcReqOutput`, `sock_send`, `sock_recv`, `PortArgs`, and `get_zmq_socket`. AWEX parameters travel as a JSON string in a msgpack-compatible RPC field.                                                                                                                                                                                                                                     |
+| `areal/v2/inference_service/sglang/bridge.py`                   | HTTP-only (same protocol as `sglang_remote.py`). `/generate` request/response, `/pause_generation`, `/continue_generation`, `/release_memory_occupation`, `/resume_memory_occupation`.                                                                                                                                                                                                                    |
+| `areal/engine/awex/plugins/sglang_plugin.py`                    | Patches SGLang `Scheduler` and model-worker task dispatch, imports scheduler RPC structs and optional weight-updater/plugin modules; strict supported-version guard.                                                                                                                                                                                                                                      |
+| `areal/engine/awex/colocate_reader.py`                          | Imports weight updater and release/resume memory request structs for colocated IPC updates.                                                                                                                                                                                                                                                                                                               |
+| `areal/v2/inference_service/sglang/mtp_weight_update_bridge.py` | Imports `FlattenedTensorBucket` and routes distributed weights to target and draft runners; strict supported-version guard.                                                                                                                                                                                                                                                                               |
+| `areal/engine/awex/adapters/sglang_adapter.py`                  | Imports SGLang release/resume memory request structs for v2 weight updates.                                                                                                                                                                                                                                                                                                                               |
+| `areal/v2/inference_service/sglang/routed_experts_compat.py`    | Sizes routed-experts device capture buffers through the 0.5.20 `RoutedExpertsCapturer` before graph capture.                                                                                                                                                                                                                                                                                              |
+| `areal/engine/sglang_model_patches.py`                          | Selects SHA-guarded Qwen and multimodal processor patches for the installed SGLang source revision.                                                                                                                                                                                                                                                                                                       |
 
 ### Secondary (model / infra layer)
 
@@ -44,6 +58,7 @@ upstream_paths:
 | `areal/infra/launcher/slurm.py`                       | `SGLangConfig` import + `to_structured_cfg`.                                                                                         |
 | `areal/v2/inference_service/controller/controller.py` | `SGLangConfig` in gateway controller.                                                                                                |
 | `areal/v2/inference_service/data_proxy/backend.py`    | HTTP protocol implementation for inference service proxy (SGLangBridgeBackend).                                                      |
+| `areal/experimental/openai/client.py`                 | Imports SGLang OpenAI `Tool` to align tool payload serialization.                                                                    |
 
 ### Tertiary (tests, config)
 
@@ -61,11 +76,9 @@ the target version. Focus on: **missing new required parameters**, **removed old
 parameters**, **renamed parameters**, **changed return types**, **changed method
 signatures on returned objects**, and **moved/renamed modules**.
 
-> **Note:** Most sglang integration in AReaL is HTTP-based — the server is launched as a
-> subprocess and communicated with over REST. Only `areal/experimental/openai/` imports
-> the Python SDK directly. For the HTTP-based call sites, the risk is in **JSON field
-> renames** in request payloads and response bodies, not in Python API signature
-> changes.
+> **Note:** The v1 remote engine uses HTTP, while the v2 inference service and AWEX
+> bridge import SGLang Python internals directly. Audit both HTTP payloads and Python
+> signatures; the latter are especially sensitive to minor releases.
 
 ______________________________________________________________________
 
@@ -206,25 +219,24 @@ string representations of torch dtypes. Check whether `abort_all_requests` is st
 honored.
 
 AReaL's NEXTN compatibility bridge in
-`areal/v2/inference_service/sglang/mtp_weight_update_bridge.py` additionally depends on
-the following SGLang 0.5.10.post1 internals:
+`areal/v2/inference_service/sglang/mtp_weight_update_bridge.py` is guarded to SGLang
+0.5.20 and depends on these internals:
 
 - `Scheduler.tp_worker.model_runner` is the target `ModelRunner`.
 - Spec v1 exposes the NEXTN draft `ModelRunner` as `Scheduler.draft_worker.model_runner`
   (`EAGLEWorker`).
 - Spec v2 exposes it as `Scheduler.draft_worker.draft_worker.draft_runner`
   (`EAGLEWorkerV2` wrapping `EagleDraftWorker`).
-- `ModelRunner._model_update_group`, `ModelRunner.device`, and
-  `ModelRunner.update_weights_from_tensor(named_tensors, load_format)` retain their
-  current semantics.
+- `ModelRunner.weight_updater._model_update_group`, `ModelRunner.device`, and
+  `ModelRunner.weight_updater.update_weights_from_tensor(named_tensors, load_format)`
+  retain their current semantics.
 - `sglang.srt.weight_sync.tensor_bucket.FlattenedTensorBucket` accepts `named_tensors`,
   exposes `get_flattened_tensor()`, and reconstructs regular `(name, tensor)` pairs with
   `reconstruct_tensors()`.
 
-**Check:** Revalidate these private APIs before changing the SGLang pin. The bridge must
-receive every distributed bucket exactly once, then apply the same named tensor objects
-to draft and target runners. Keep the explicit version guard until this path has been
-revalidated end to end.
+**Check:** The bridge now uses `model_runner.weight_updater` and guards the exact 0.5.20
+version. Unit tests cover receiving one bucket and applying the same tensors to draft
+and target. GPU end-to-end coverage is still required before release.
 
 ______________________________________________________________________
 
@@ -493,7 +505,7 @@ Confirm `app` is still the FastAPI instance exported from this module.
 
 ______________________________________________________________________
 
-### 17. `Scheduler` constructor and `configure_scheduler`
+### 17. `Scheduler` constructor and `configure_scheduler_process`
 
 **Source:** `python/sglang/srt/managers/scheduler.py`
 
@@ -501,10 +513,12 @@ Called in `areal/v2/inference_service/sglang/scheduler.py`
 (`areal_run_scheduler_process`):
 
 ```python
-from sglang.srt.managers.scheduler import Scheduler, configure_scheduler
+from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
 
-dp_rank = configure_scheduler(
-    server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
+load_plugins()
+publish(server_args, role="scheduler")
+dp_rank = configure_scheduler_process(
+    server_args, gpu_id, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
 )
 
 scheduler = Scheduler(
@@ -515,13 +529,15 @@ pipe_writer.send(scheduler.get_init_info())
 scheduler.run_event_loop()
 ```
 
-**Check:** Confirm `configure_scheduler` signature is
-`(server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank)`.
-Confirm `Scheduler.__init__` signature is
+**Check:** In 0.5.20, `configure_scheduler_process` takes
+`(server_args, gpu_id, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank)`.
+Load plugins and publish the scheduler runtime context before configuration, following
+the upstream process entrypoint. `Scheduler.__init__` still takes
 `(server_args, port_args, gpu_id, tp_rank, moe_ep_rank, pp_rank, attn_cp_rank, moe_dp_rank, dp_rank)`.
-Verify `get_init_info()` and `run_event_loop()` still exist. Confirm `tp_rank`,
-`dp_rank`, `tp_cpu_group`, `tp_size` attributes are present on the scheduler instance
-(used by `AwexSchedulerBridge`).
+`get_init_info()` and `run_event_loop()` remain. Rank and size values are now under
+`scheduler.ps`, while `tp_cpu_group` remains on `scheduler`; migrate
+`AwexSchedulerBridge` access accordingly. Follow upstream cleanup on exceptional and
+graceful exit.
 
 ______________________________________________________________________
 
@@ -532,18 +548,18 @@ ______________________________________________________________________
 Used in `areal/v2/inference_service/sglang/rpc_proxy.py`:
 
 ```python
-from sglang.srt.managers.io_struct import RpcReqInput, RpcReqOutput
+from sglang.srt.managers.io_struct import RpcReqInput, RpcReqOutput, sock_recv, sock_send
 
-req = RpcReqInput(method=method, parameters=kwargs if kwargs else None)
-self._rpc_socket.send_pyobj(req)
-resp: RpcReqOutput = self._rpc_socket.recv_pyobj()
+req = RpcReqInput(method=method, parameters={"payload": json.dumps(kwargs)})
+sock_send(self._rpc_socket, req)
+resp: RpcReqOutput = sock_recv(self._rpc_socket, flags=zmq.BLOCKY)
 # resp.success: bool, resp.message: str
 ```
 
-**Check:** Confirm `RpcReqInput` still has `method: str` and
-`parameters: Optional[Dict]` fields. Confirm `RpcReqOutput` still has `success: bool`
-and `message: str` fields. Verify `send_pyobj`/`recv_pyobj` serialization still works
-(both inherit from `BaseReq` which is a dataclass).
+**Check:** `RpcReqInput.parameters` now accepts only scalar values. Keep complex AWEX
+arguments inside one JSON string and decode it in the scheduler bridge. Use SGLang's
+`sock_send`/`sock_recv` so the proxy follows its msgpack IPC mode. The dedicated unit
+test round-trips a request through SGLang's msgpack encoder.
 
 ______________________________________________________________________
 
@@ -566,6 +582,77 @@ functions move between submodules, update AReaL import paths accordingly.
 
 ______________________________________________________________________
 
+### 20. AWEX scheduler hooks and colocated weight updates
+
+**Source:** `python/sglang/srt/managers/scheduler.py`,
+`python/sglang/srt/managers/scheduler_components/weight_updater.py`,
+`python/sglang/srt/managers/io_struct.py`
+
+Used in `areal/engine/awex/plugins/sglang_plugin.py` and
+`areal/engine/awex/colocate_reader.py`: the plugin wraps `Scheduler.__init__`, installs
+event-loop and model-worker task hooks, and sends `ReleaseMemoryOccupationReqInput` /
+`ResumeMemoryOccupationReqInput` while weights move through CUDA IPC. The plugin accepts
+only explicitly verified SGLang versions.
+
+**Check:** Revalidate the scheduler constructor, event loops, weight-updater ownership,
+task dispatch, RPC request classes, and memory-saver hooks before adding the target
+version to `SUPPORTED_SGLANG_VERSIONS`.
+
+### 21. Built-in MTP distributed weight update bridge
+
+**Source:** `python/sglang/srt/weight_sync/tensor_bucket.py`,
+`python/sglang/srt/managers/scheduler.py`
+
+Used in `areal/v2/inference_service/sglang/mtp_weight_update_bridge.py`:
+`FlattenedTensorBucket` receives a distributed bucket, then
+`draft_runner.update_weights_from_tensor()` and
+`target_runner.update_weights_from_tensor()` apply the same named tensors.
+
+**Check:** Verify the new target/draft runner ownership and distributed update semantics
+before changing `_SUPPORTED_SGLANG_VERSION`; otherwise built-in MTP must remain disabled
+for that version.
+
+### 22. v2 AWEX memory RPC and OpenAI tool alignment
+
+**Source:** `python/sglang/srt/managers/io_struct.py`,
+`python/sglang/srt/entrypoints/openai/protocol.py`
+
+Used in `areal/engine/awex/adapters/sglang_adapter.py` and
+`areal/experimental/openai/client.py`: the adapter constructs
+`ReleaseMemoryOccupationReqInput` and `ResumeMemoryOccupationReqInput`, while the client
+serializes tools through SGLang's `Tool` model.
+
+**Check:** Confirm request fields and `Tool.model_dump()` output still match the v2
+adapter and OpenAI client payloads.
+
+### 23. Routed-experts capture in SGLang 0.5.20
+
+**Source:** `python/sglang/srt/state_capturer/routed_experts.py`,
+`python/sglang/srt/state_capturer/base.py`, `python/sglang/srt/runtime_context.py`
+
+`areal/v2/inference_service/sglang/routed_experts_compat.py` wraps
+`RoutedExpertsCapturer.__init__` before model creation. The wrapper raises the per-DP
+capacity to cover prefill tokens; the native constructor allocates both the device cache
+and scattered-A2A gather buffer. The retired
+`sglang.srt.layers.moe.routed_experts_capturer` path applies only to older versions.
+
+**Check:** Revalidate constructor signature, `max_prefill_buffer_tokens()`, DP scaling,
+and graph-aware local slicing on each SGLang upgrade.
+
+### 24. SHA-guarded multimodal processor patches
+
+**Source:** `python/sglang/srt/multimodal/processors/executor.py`,
+`python/sglang/srt/multimodal/processors/qwen_vl.py`
+
+`areal/engine/sglang_model_patches.py` applies the executor StopIteration conversion and
+model-specific Qwen processing changes only to validated source hashes. The QSA gather
+clamp is already present in 0.5.20 and needs no rewrite.
+
+**Check:** Compare exact installed source hashes and output behavior for Qwen4Exp and
+external Qwen-VL CPU preprocessing before changing the guarded profiles.
+
+______________________________________________________________________
+
 ## Version-Guarded Code
 
 - `areal/api/cli_args.py:1877-1878` —
@@ -573,3 +660,7 @@ ______________________________________________________________________
   Minimum floor raised from `0.4.9.post2` to `0.5.10.post1` during this upgrade. The
   legacy `max_loaded_loras` version guard (`<0.4.10.post2`) was removed because the new
   floor is well past that version.
+- `areal/engine/awex/plugins/sglang_plugin.py` — `SUPPORTED_SGLANG_VERSIONS` allows only
+  audited scheduler implementations.
+- `areal/v2/inference_service/sglang/mtp_weight_update_bridge.py` —
+  `_SUPPORTED_SGLANG_VERSION` protects the built-in MTP update patch.

@@ -68,6 +68,7 @@ SUPPORTED_SGLANG_VERSIONS = (
     "0.5.10.post1",
     "0.5.18.dev10+g85b539146",
     "0.5.19.dev125+g119b5ffe4",
+    "0.5.20",
 )
 
 
@@ -133,10 +134,8 @@ def assert_supported_sglang_version() -> None:
 def _load_sglang_plugins_if_available() -> bool:
     """Load SGLang runtime plugins when supported by the installed version.
 
-    ``sglang.srt.plugins`` was added after the 0.5.10 runtime currently pinned
-    by AReaL.  AWEX does not depend on that registry because it injects its
-    scheduler entry point directly through ``launch_server``.  Treat the
-    registry as optional so the same entry module works with both APIs.
+    AWEX injects its scheduler entry point directly through ``launch_server``.
+    Treat the registry as optional so the same entry module works with both APIs.
     """
     try:
         plugins = importlib.import_module("sglang.srt.plugins")
