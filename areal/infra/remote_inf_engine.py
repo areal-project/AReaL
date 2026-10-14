@@ -1058,13 +1058,23 @@ class RemoteInfEngine(InferenceEngine):
         Raises
         ------
         NotImplementedError
-            If routing strategy other than round-robin is used
+            If the routing strategy is unsupported for the bound servers
         """
+        if (
+            self.config.routing_strategy == "least_active_groups"
+            and len(self.addresses) == 1
+        ):
+            # RolloutController selects the worker for this strategy. Each
+            # worker's inference engine is bound to its own server.
+            return self.addresses[0]
         if self.config.routing_strategy == "round_robin":
             server = self.addresses[self.server_idx]
             self.server_idx = (self.server_idx + 1) % len(self.addresses)
             return server
-        raise NotImplementedError("Only round-robin scheduling is implemented.")
+        raise NotImplementedError(
+            f"Routing strategy {self.config.routing_strategy!r} is unsupported "
+            f"for {len(self.addresses)} bound servers."
+        )
 
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
         """Asynchronously generate a response for the given request.

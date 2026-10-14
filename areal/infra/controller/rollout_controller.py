@@ -182,8 +182,9 @@ class RolloutController:
         self._worker_role: str
         self._gpus_per_server: int = 1
 
-        # Round-robin scheduling
+        # Round-robin tie breaking and in-flight group counts for worker selection.
         self._current_worker_idx = 0
+        self._active_rollout_groups: list[int] = []
 
         # State
         self._version_lock = Lock()
@@ -391,6 +392,7 @@ class RolloutController:
         # Wait for workers to be ready
         logger.info("Waiting for workers to be ready...")
         self.workers = self.scheduler.get_workers(role=job.role)
+        self._active_rollout_groups = [0] * len(self.workers)
         logger.info(f"Workers ready: {[w.id for w in self.workers]}")
 
         # Get engine class path for dynamic import on workers
@@ -999,7 +1001,7 @@ class RolloutController:
         return await asyncio.gather(*tasks)
 
     def _choose_worker(self) -> tuple[Worker, int]:
-        """Choose a worker for the next request using round-robin scheduling.
+        """Choose a worker for the next request.
 
         Returns
         -------
@@ -1008,10 +1010,23 @@ class RolloutController:
         """
         if not self.workers:
             raise RuntimeError("No workers available to choose from.")
-        worker = self.workers[self._current_worker_idx]
-        rank = self._current_worker_idx
-        self._current_worker_idx = (self._current_worker_idx + 1) % len(self.workers)
-        return worker, rank
+        strategy = self.config.routing_strategy
+        if strategy == "least_active_groups":
+            if len(self._active_rollout_groups) != len(self.workers):
+                raise RuntimeError("Rollout worker counts are not initialized.")
+            rank = min(
+                range(len(self.workers)),
+                key=lambda idx: (
+                    self._active_rollout_groups[idx],
+                    (idx - self._current_worker_idx) % len(self.workers),
+                ),
+            )
+        elif strategy == "round_robin":
+            rank = self._current_worker_idx
+        else:
+            raise ValueError(f"Unsupported rollout routing strategy: {strategy}")
+        self._current_worker_idx = (rank + 1) % len(self.workers)
+        return self.workers[rank], rank
 
     def _resolve_workflow_str(self, workflow: WorkflowLike | None) -> str | None:
         """Resolve workflow to a string import path.
@@ -1070,8 +1085,9 @@ class RolloutController:
 
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
         async def _submit_then_wait() -> WorkflowTaskResult | None:
-            # Choose worker via round-robin
+            # Keep a group on one worker/proxy for its entire lifetime.
             worker, rank = self._choose_worker()
+            self._active_rollout_groups[rank] += 1
             engine_name = self._engine_name(rank)
 
             # NOTE: No need to call `on_rollout_submitted` here.
@@ -1163,6 +1179,8 @@ class RolloutController:
                 manager.on_rollout_rejected()
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
                 return None
+            finally:
+                self._active_rollout_groups[rank] -= 1
 
         return _submit_then_wait
 

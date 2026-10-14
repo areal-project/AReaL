@@ -9,6 +9,14 @@ from areal.api.cli_args import InferenceEngineConfig
 from areal.infra.remote_inf_engine import RemoteInfEngine
 
 
+def test_choose_server_accepts_controller_routing_for_single_bound_server():
+    config = InferenceEngineConfig(routing_strategy="least_active_groups")
+    engine = RemoteInfEngine(config, backend=mock.Mock())
+    engine.addresses = ["localhost:30000"]
+
+    assert engine.choose_server() == "localhost:30000"
+
+
 def test_wait_for_server_dead_process_raises_runtime_error_with_returncode():
     # Arrange
     config = InferenceEngineConfig(setup_timeout=5.0)

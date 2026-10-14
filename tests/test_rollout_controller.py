@@ -555,8 +555,51 @@ class TestRolloutControllerWorkerSelection:
 
         controller.destroy()
 
+    def test_choose_worker_least_active_groups_avoids_busy_worker(self):
+        config = create_test_config(
+            backend="sglang:d3",
+            routing_strategy="least_active_groups",
+        )
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=MockScheduler(),
+        )
+        controller.initialize(role="rollout", server_args={})
+        controller._active_rollout_groups[:] = [2, 0, 1]
+
+        worker, rank = controller._choose_worker()
+        assert rank == 1
+        assert worker.id == "rollout/1"
+
+        controller._active_rollout_groups[:] = [0, 0, 0]
+        assert [controller._choose_worker()[1] for _ in range(3)] == [2, 0, 1]
+        controller.destroy()
+
 
 class TestRolloutControllerSubmitAndWait:
+    def test_least_active_group_count_released_after_rollout(self):
+        config = create_test_config(
+            backend="sglang:d2",
+            routing_strategy="least_active_groups",
+            consumer_batch_size=1,
+        )
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=MockScheduler(),
+        )
+        controller.initialize(role="rollout", server_args={})
+        controller.submit(
+            {"id": 0},
+            workflow="tests.utils.TestWorkflow",
+            workflow_kwargs={},
+        )
+
+        assert len(controller.wait(count=1, timeout=5.0)) == 1
+        assert controller._active_rollout_groups == [0, 0]
+        controller.destroy()
+
     def test_wait_returns_distributed_batch(self):
         config = create_test_config(consumer_batch_size=16, max_concurrent_rollouts=50)
         scheduler = MockScheduler()
