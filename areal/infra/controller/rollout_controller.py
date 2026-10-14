@@ -1027,9 +1027,21 @@ class RolloutController:
         if strategy == "least_active_groups":
             if len(self._active_rollout_groups) != len(self.workers):
                 raise RuntimeError("Rollout worker counts are not initialized.")
+            node_loads: dict[str, int] = {}
+            if self._proxy_started and len(self.server_infos) == len(self.workers):
+                # A proxy spreads one group across all of its same-node servers.
+                # Count both proxies' groups when deciding where the next group
+                # belongs, otherwise an idle proxy can hide a busy sibling.
+                for info, active in zip(
+                    self.server_infos, self._active_rollout_groups, strict=True
+                ):
+                    node_loads[info.host] = node_loads.get(info.host, 0) + active
             rank = min(
                 range(len(self.workers)),
                 key=lambda idx: (
+                    node_loads.get(self.server_infos[idx].host, 0)
+                    if node_loads
+                    else self._active_rollout_groups[idx],
                     self._active_rollout_groups[idx],
                     (idx - self._current_worker_idx) % len(self.workers),
                 ),

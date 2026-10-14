@@ -576,6 +576,31 @@ class TestRolloutControllerWorkerSelection:
         assert [controller._choose_worker()[1] for _ in range(3)] == [2, 0, 1]
         controller.destroy()
 
+    def test_choose_worker_least_active_groups_counts_same_node_proxies(self):
+        from types import SimpleNamespace
+
+        config = create_test_config(
+            backend="sglang:d4",
+            routing_strategy="least_active_groups",
+        )
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=MockScheduler(),
+        )
+        controller.initialize(role="rollout", server_args={})
+        controller.server_infos = [
+            SimpleNamespace(host=host)
+            for host in ("node-a", "node-b", "node-a", "node-b")
+        ]
+        controller._proxy_started = True
+        controller._active_rollout_groups[:] = [0, 1, 4, 1]
+
+        worker, rank = controller._choose_worker()
+        assert rank == 1
+        assert worker.id == "rollout/1"
+        controller.destroy()
+
 
 class TestRolloutControllerSubmitAndWait:
     def test_least_active_group_count_released_after_rollout(self):
