@@ -248,17 +248,21 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
         if os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE") != package:
             return
         root = installed_sglang_root()
+        patches = [
+            (
+                root / sglang_qwen_vl_cpu.TARGET_RELATIVE,
+                sglang_qwen_vl_cpu.patched_source,
+            ),
+        ]
+        base_target = root / sglang_qwen_vl_cpu.BASE_RELATIVE
+        if (
+            hashlib.sha256(base_target.read_bytes()).hexdigest()
+            != sglang_qwen_vl_cpu.V0520_BASE_SHA256
+        ):
+            # Earlier installations may need the legacy CPU override restored.
+            patches.append((base_target, sglang_qwen_vl_cpu.patched_base_source))
         install_source_patches(
-            [
-                (
-                    root / sglang_qwen_vl_cpu.TARGET_RELATIVE,
-                    sglang_qwen_vl_cpu.patched_source,
-                ),
-                (
-                    root / sglang_qwen_vl_cpu.BASE_RELATIVE,
-                    sglang_qwen_vl_cpu.patched_base_source,
-                ),
-            ],
+            patches,
             lock_path=root / ".areal-sglang-patches.lock",
         )
         return
@@ -272,7 +276,14 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
     )
 
     root = installed_sglang_root()
-    patches = (sglang_mm_executor, sglang_qsa_compress_gather, sglang_qwen4_vl)
+    patches = [sglang_mm_executor, sglang_qwen4_vl]
+    qsa_target = root / sglang_qsa_compress_gather.TARGET_RELATIVE
+    if (
+        hashlib.sha256(qsa_target.read_bytes()).hexdigest()
+        != sglang_qsa_compress_gather.V0520_SHA256
+    ):
+        # SGLang 0.5.20 already clamps the gather indices.
+        patches.insert(1, sglang_qsa_compress_gather)
     install_source_patches(
         [(root / patch.TARGET_RELATIVE, patch.patched_source) for patch in patches],
         lock_path=root / ".areal-sglang-patches.lock",

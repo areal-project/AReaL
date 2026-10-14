@@ -22,6 +22,7 @@ upstream_paths:
 | -------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `areal/api/cli_args.py`                      | `ArchonFP8Config` dataclass — string references to `torchao_config` field; no direct import |
 | `areal/tools/check_pyproject_consistency.py` | `torchao` listed in `ESCAPABLE_PACKAGES` — expected to differ between sglang/vllm variants  |
+| `pyproject.toml`                             | `cuda-train` installs torchao 0.18.0 for Archon FP8 on Linux x86_64                         |
 
 ### Tertiary (tests, config)
 
@@ -43,7 +44,10 @@ parameters**, **renamed parameters**, **changed return types**, **changed method
 signatures on returned objects**, and **moved/renamed modules**.
 
 > **Warning:** All torchao usage goes through the `prototype` module path. These APIs
-> are explicitly experimental and carry a HIGH risk of breakage between releases.
+> are explicitly experimental and carry a HIGH risk of breakage between releases. The
+> 0.18.0 source retains the imports, positional `fp8_blockwise_mm.apply` arguments, and
+> quantization kernel signatures below. GPU numerical behavior still needs a CUDA SM90+
+> run with the SGLang 0.5.20 / Torch 2.13 image.
 
 ### 1. `torchao.prototype.blockwise_fp8_training.linear.fp8_blockwise_mm` (HIGH RISK)
 

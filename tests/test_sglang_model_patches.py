@@ -23,6 +23,9 @@ from areal.engine import (
 from areal.engine import (
     sglang_qwen4_vl as qwen,
 )
+from areal.engine import (
+    sglang_qwen_vl_cpu as qwen_cpu,
+)
 
 
 @pytest.fixture
@@ -90,6 +93,94 @@ def test_flash_next_startup_patches_all_sources_and_repeated_start_is_write_free
 
     assert not lock.exists()
     assert all(target.stat().st_mtime_ns == mtime for target, mtime in mtimes.items())
+
+
+def test_v0520_source_profiles_apply_only_missing_fixes(monkeypatch):
+    executor_source = (
+        "def run(function, processor, args, kwargs):\n" + executor.OLD
+    ).encode()
+    qwen_source = (
+        "class Processor:\n"
+        '    models = ("qwen4_exp",)\n'
+        + qwen.DEVICE_OLD
+        + "        self, *args, **kwargs\n    ):\n        pass\n"
+    ).encode()
+    qwen_cpu_source = (
+        "class Processor:\n"
+        + qwen_cpu.DECODE_OLD
+        + "    def process(self):\n        pass\n"
+    ).encode()
+    profiles = (
+        (executor, executor_source, executor.OLD, executor.NEW),
+        (qwen, qwen_source, qwen.DEVICE_OLD, qwen.DEVICE_NEW),
+        (qwen_cpu, qwen_cpu_source, qwen_cpu.DECODE_OLD, qwen_cpu.DECODE_NEW),
+    )
+    for patch, source, old, new in profiles:
+        output = source.replace(old.encode(), new.encode())
+        monkeypatch.setattr(
+            patch, "V0520_EXPECTED_SHA256", hashlib.sha256(source).hexdigest()
+        )
+        monkeypatch.setattr(
+            patch, "V0520_PATCHED_SHA256", hashlib.sha256(output).hexdigest()
+        )
+        assert patch.patched_source(source) == output
+        assert patch.patched_source(output) == output
+
+    qsa_source = ("def gather():\n    # already clamped\n" + qsa.NEW).encode()
+    monkeypatch.setattr(qsa, "V0520_SHA256", hashlib.sha256(qsa_source).hexdigest())
+    assert qsa.patched_source(qsa_source) == qsa_source
+
+
+def test_v0520_startup_skips_qsa_patch_already_in_upstream(runtime, monkeypatch):
+    root, model, sources = runtime
+    qsa_target = root / qsa.TARGET_RELATIVE
+    upstream_source = ("def gather():\n    # already clamped\n" + qsa.NEW).encode()
+    qsa_target.write_bytes(upstream_source)
+    monkeypatch.setattr(
+        qsa, "V0520_SHA256", hashlib.sha256(upstream_source).hexdigest()
+    )
+    monkeypatch.setattr(
+        qsa, "patched_source", lambda source: pytest.fail("QSA patch ran")
+    )
+
+    startup.apply_model_patches(["--model-path", str(model)])
+
+    assert qsa_target.read_bytes() == upstream_source
+    for patch in (executor, qwen):
+        assert (root / patch.TARGET_RELATIVE).read_bytes() == patch.patched_source(
+            sources[patch]
+        )
+
+
+def test_v0520_cpu_processor_skips_native_base_processor(tmp_path, monkeypatch):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    root = tmp_path / "sglang"
+    target = root / qwen_cpu.TARGET_RELATIVE
+    target.parent.mkdir(parents=True)
+    target.write_text("class Processor:\n    pass\n")
+    base_target = root / qwen_cpu.BASE_RELATIVE
+    base_target.write_text("class BaseProcessor:\n    pass\n")
+    monkeypatch.setattr(startup, "installed_sglang_root", lambda: root)
+    monkeypatch.setattr(
+        qwen_cpu,
+        "V0520_BASE_SHA256",
+        hashlib.sha256(base_target.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(qwen_cpu, "patched_source", lambda source: source)
+    monkeypatch.setattr(
+        qwen_cpu,
+        "patched_base_source",
+        lambda source: pytest.fail("native base processor was patched"),
+    )
+    monkeypatch.setenv(
+        "SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", "areal.engine.sglang_processors"
+    )
+
+    startup.apply_model_patches(["--model-path", str(model)])
+
+    assert base_target.read_text() == "class BaseProcessor:\n    pass\n"
 
 
 @pytest.mark.parametrize("model_type", ["qwen2_vl", "llama", None])

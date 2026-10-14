@@ -58,9 +58,13 @@ def resolve_routed_experts_device_cache_rows(
 
 
 def normalize_routed_experts_server_args(server_args: Any) -> bool:
-    """Disable SGLang paths that are incompatible with routed expert capture."""
+    """Disable the older piecewise graph path when that setting exists."""
 
     if not getattr(server_args, "enable_return_routed_experts", False):
+        return False
+    if not hasattr(server_args, "disable_piecewise_cuda_graph"):
+        # SGLang 0.5.20 uses a different prefill graph configuration and its
+        # capturer handles graph-local slices. Do not add a dead setting.
         return False
     if getattr(server_args, "disable_piecewise_cuda_graph", False):
         return False
@@ -77,6 +81,13 @@ def apply_sglang_routed_experts_token_cache_patch() -> bool:
     Returns ``True`` when this call applied the patch and ``False`` when the
     current process was already patched.
     """
+
+    from packaging.version import Version
+
+    from areal.utils.pkg_version import get_version
+
+    if Version(get_version("sglang")).base_version == "0.5.20":
+        return _patch_v0520_routed_experts_cache()
 
     import torch
     from sglang.srt.layers.moe import routed_experts_capturer
@@ -135,4 +146,52 @@ def apply_sglang_routed_experts_token_cache_patch() -> bool:
     setattr(cache_cls, _PATCH_ATTR, True)
 
     logger.info("Applied SGLang routed expert token-cache compatibility patch.")
+    return True
+
+
+def _patch_v0520_routed_experts_cache() -> bool:
+    """Size 0.5.20's capturer before it creates device and gather buffers."""
+    from sglang.srt.runtime_context import (
+        get_schedule,
+        max_prefill_buffer_tokens,
+    )
+    from sglang.srt.state_capturer.routed_experts import RoutedExpertsCapturer
+
+    if getattr(RoutedExpertsCapturer, _PATCH_ATTR, False):
+        return False
+
+    original_init = RoutedExpertsCapturer.__init__
+
+    def patched_init(
+        self,
+        model_config,
+        num_tokens: int,
+        max_running_requests: int,
+        num_fused_shared_experts: int,
+        device: str,
+    ) -> None:
+        schedule = get_schedule()
+        prefill_rows = _positive_int(max_prefill_buffer_tokens()) or 0
+        if not _positive_int(getattr(schedule, "chunked_prefill_size", None)):
+            prefill_rows = max(
+                prefill_rows,
+                _positive_int(getattr(schedule, "max_prefill_tokens", None)) or 0,
+            )
+        # The native constructor multiplies by dp_size and also sizes the
+        # scattered-A2A gather buffer from the resulting device cache.
+        # Keep allocation outside capture so CUDA graphs retain valid pointers.
+        required_per_dp = max(max_running_requests, prefill_rows)
+        original_init(
+            self,
+            model_config,
+            num_tokens,
+            required_per_dp,
+            num_fused_shared_experts,
+            device,
+        )
+
+    RoutedExpertsCapturer.__init__ = patched_init
+    setattr(RoutedExpertsCapturer, _ORIGINAL_INIT_ATTR, original_init)
+    setattr(RoutedExpertsCapturer, _PATCH_ATTR, True)
+    logger.info("Applied SGLang 0.5.20 routed expert cache compatibility patch.")
     return True
