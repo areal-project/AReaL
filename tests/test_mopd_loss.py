@@ -551,7 +551,8 @@ def test_mopd_m2_filtering_preserves_loss_and_gradient_across_microbatches(
         with (
             patch("areal.trainer.ppo.actor.stats_tracker"),
             patch(
-                "areal.trainer.ppo.actor._apply_m2po_masking", side_effect=filter_tokens
+                "areal.trainer.ppo.policy_loss._apply_m2po_masking",
+                side_effect=filter_tokens,
             ),
         ):
             return grpo_loss_fn(
@@ -616,7 +617,8 @@ def test_single_teacher_m2_filtering_preserves_loss_and_gradient_across_microbat
         with (
             patch("areal.trainer.ppo.actor.stats_tracker"),
             patch(
-                "areal.trainer.ppo.actor._apply_m2po_masking", side_effect=filter_tokens
+                "areal.trainer.ppo.policy_loss._apply_m2po_masking",
+                side_effect=filter_tokens,
             ),
         ):
             return grpo_loss_fn(

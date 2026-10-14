@@ -233,7 +233,7 @@ def test_actor_objective_metric_matches_weighted_loss_across_microbatches(
             with (
                 patch("areal.trainer.ppo.actor.stats_tracker", tracker),
                 patch(
-                    "areal.trainer.ppo.actor._apply_m2po_masking",
+                    "areal.trainer.ppo.policy_loss._apply_m2po_masking",
                     return_value=retained[rows] if filtered else local_mask,
                 ),
             ):
@@ -313,7 +313,7 @@ def test_prompt_objective_metric_averages_optimizer_steps_equally(filtered):
         with (
             patch("areal.trainer.ppo.actor.stats_tracker", tracker),
             patch(
-                "areal.trainer.ppo.actor._apply_m2po_masking",
+                "areal.trainer.ppo.policy_loss._apply_m2po_masking",
                 return_value=retained[i : i + 1] if filtered else batch["loss_mask"],
             ),
         ):

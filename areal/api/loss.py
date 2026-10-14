@@ -8,9 +8,9 @@ transport-only ranks. Each mass is a batch-derived nonnegative scalar without
 gradients. Empty terms retain their name and a graph-connected zero numerator.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import partial
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 import torch
 
@@ -55,3 +55,21 @@ def get_named_loss_names(function: Callable[..., Any]) -> tuple[str, ...] | None
 
 def is_named_loss_normalizer(function: Callable[..., Any]) -> bool:
     return get_named_loss_names(function) is not None
+
+
+class TokenLossFn(Protocol):
+    """Actor plugin returning differentiable, unreduced token losses.
+
+    ``mask`` is batch-derived support fixed before optimizer splitting. Runtime
+    filtering may zero numerator contributions but cannot change normalization.
+    ``outputs`` and ``batch`` are read-only mappings; tensors must not be mutated.
+    Algorithm parameters are bound once through the configured kwargs.
+    """
+
+    def __call__(
+        self,
+        *,
+        outputs: Mapping[str, torch.Tensor],
+        batch: Mapping[str, Any],
+        mask: torch.Tensor,
+    ) -> torch.Tensor: ...

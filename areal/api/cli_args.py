@@ -10,7 +10,7 @@ from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 
 import uvloop
 import yaml
@@ -34,6 +34,14 @@ from areal.utils.seqpack import PACKING_ALGORITHMS
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerFast
+
+    _LossReduction = Literal[
+        "token_mean", "seq_mean", "prompt_mean", "constant", "turn_mean"
+    ]
+else:
+    # OmegaConf structured configs reject Literal annotations at runtime.
+    # TODO(agent): use the Literal directly when OmegaConf supports it.
+    _LossReduction = str
 
 uvloop.install()
 
@@ -1922,6 +1930,92 @@ class AdvantageConfig:
 
 
 @dataclass
+class LossTermConfig:
+    """One actor loss with its own support, reduction, and final coefficient.
+
+    Implementations return unreduced token-shaped tensors. ``mask_key`` refers
+    to a batch-only support mask; zero reward does not imply missing support.
+    ``reduction=None`` inherits actor.loss_aggregation. Named loss mappings replace
+    the implicit legacy objective, so include a policy term when desired.
+    """
+
+    implementation: str = field(
+        default="policy",
+        metadata={
+            "help": "Built-in key (policy, entropy, mopd) or trusted dotted callable path."
+        },
+    )
+    enabled: bool = field(
+        default=True,
+        metadata={
+            "help": "Disable a term without importing or evaluating its implementation."
+        },
+    )
+    coefficient: float = field(
+        default=1.0,
+        metadata={"help": "Finite nonnegative multiplier applied once to this loss."},
+    )
+    reduction: _LossReduction | None = field(
+        default=None,
+        metadata={
+            "help": "None inherits policy reduction. token_mean averages supported tokens; turn_mean averages supported turns; prompt_mean averages rollout groups equally and tokens equally within each group. prompt_mean preserves response-level optimizer scheduling and normalizes by full-update active groups. seq_mean averages active response means; constant uses actor.loss_aggregation_divisor.",
+            "choices": [
+                "token_mean",
+                "seq_mean",
+                "turn_mean",
+                "prompt_mean",
+                "constant",
+            ],
+        },
+    )
+    mask_key: str = field(
+        default="loss_mask",
+        metadata={
+            "help": "Prediction-aligned, batch-derived binary support mask key. Intersected with the post-advantage loss_mask; custom masks are not shifted automatically."
+        },
+    )
+    kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "JSON-serializable algorithm kwargs for loss_fn(*, outputs, batch, mask, ...). Runtime arguments cannot be overridden. Built-in kwargs override actor defaults except pipeline-owned prox_logp_method/use_decoupled_loss, which must match the actor."
+        },
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.implementation, str) or not self.implementation.strip():
+            raise ValueError("loss implementation must be a nonempty string")
+        self.implementation = self.implementation.strip()
+        if not isinstance(self.enabled, bool):
+            raise ValueError("loss enabled must be boolean")
+        if (
+            isinstance(self.coefficient, bool)
+            or not isinstance(self.coefficient, (int, float))
+            or not math.isfinite(self.coefficient)
+            or self.coefficient < 0
+        ):
+            raise ValueError("loss coefficient must be finite and nonnegative")
+        if self.reduction not in {
+            None,
+            "token_mean",
+            "seq_mean",
+            "turn_mean",
+            "prompt_mean",
+            "constant",
+        }:
+            raise ValueError("invalid loss reduction")
+        if not isinstance(self.mask_key, str) or not self.mask_key:
+            raise ValueError("loss mask_key must be a nonempty string")
+        if isinstance(self.kwargs, DictConfig):
+            self.kwargs = OmegaConf.to_container(self.kwargs, resolve=False)
+        if not isinstance(self.kwargs, dict):
+            raise ValueError("loss kwargs must be a mapping")
+        try:
+            json.dumps(self.kwargs, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("loss kwargs must be JSON-serializable") from exc
+
+
+@dataclass
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
@@ -1929,6 +2023,13 @@ class PPOActorConfig(TrainEngineConfig):
         default_factory=AdvantageConfig,
         metadata={
             "help": "Composable advantage computation; defaults preserve GAE/PRM settings."
+        },
+    )
+
+    losses: dict[str, LossTermConfig] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Named token losses with independent support and reduction. Empty preserves the existing objective; a nonempty mapping replaces it."
         },
     )
 
@@ -2092,16 +2193,23 @@ class PPOActorConfig(TrainEngineConfig):
             "'seq_mean': average per-response token means. "
             "'prompt_mean': average per-prompt-group token means while preserving "
             "the response-level optimizer schedule; groups may span steps. "
+            "'turn_mean': average token means over supported turns. "
             "'constant': sum of masked token losses divided by "
             "(n_active_responses * loss_aggregation_divisor). Tree-packed actor "
             "training currently supports only 'token_mean'.",
-            "choices": ["token_mean", "seq_mean", "prompt_mean", "constant"],
+            "choices": [
+                "token_mean",
+                "seq_mean",
+                "prompt_mean",
+                "constant",
+                "turn_mean",
+            ],
         },
     )
     loss_aggregation_divisor: float | None = field(
         default=None,
         metadata={
-            "help": "Positive fixed denominator L for loss_aggregation='constant'. "
+            "help": "Positive fixed denominator L for any active constant loss reduction. "
             "Unused by other loss aggregation modes.",
         },
     )
@@ -2206,6 +2314,22 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if not isinstance(self.losses, (dict, DictConfig)):
+            raise ValueError("actor.losses must be a mapping")
+        self.losses = {
+            name: spec
+            if isinstance(spec, LossTermConfig)
+            else LossTermConfig(**dict(spec))
+            for name, spec in self.losses.items()
+        }
+        for name in self.losses:
+            if not isinstance(name, str) or not name.isidentifier():
+                raise ValueError("loss term names must be Python identifiers")
+        if self.losses and not any(
+            s.enabled and s.coefficient > 0 for s in self.losses.values()
+        ):
+            raise ValueError("At least one active loss term is required")
+
         if isinstance(self.advantage, (dict, DictConfig)):
             self.advantage = AdvantageConfig(**dict(self.advantage))
         if not isinstance(self.advantage, AdvantageConfig):
@@ -2318,14 +2442,25 @@ class PPOActorConfig(TrainEngineConfig):
         if self.loss_aggregation not in (
             "token_mean",
             "seq_mean",
+            "turn_mean",
             "prompt_mean",
             "constant",
         ):
             raise ValueError(
                 "loss_aggregation must be 'token_mean', 'seq_mean', "
-                f"'prompt_mean', or 'constant', got {self.loss_aggregation!r}."
+                f"'turn_mean', 'prompt_mean', or 'constant', got {self.loss_aggregation!r}."
             )
-        if self.loss_aggregation == "constant":
+        effective_reductions = (
+            {
+                spec.reduction or self.loss_aggregation
+                for spec in self.losses.values()
+                if spec.enabled and spec.coefficient > 0
+            }
+            if self.losses
+            else {self.loss_aggregation}
+        )
+        uses_constant = "constant" in effective_reductions
+        if uses_constant:
             if (
                 self.loss_aggregation_divisor is None
                 or not math.isfinite(self.loss_aggregation_divisor)
@@ -2333,14 +2468,14 @@ class PPOActorConfig(TrainEngineConfig):
             ):
                 raise ValueError(
                     "loss_aggregation_divisor must be a positive finite value "
-                    "when loss_aggregation='constant'."
+                    "when any active loss uses constant reduction."
                 )
         elif self.loss_aggregation_divisor is not None:
             raise ValueError(
                 "loss_aggregation_divisor is only used when "
-                "loss_aggregation='constant'."
+                "an active loss uses constant reduction."
             )
-        if self.enable_tree_training and self.loss_aggregation != "token_mean":
+        if self.enable_tree_training and effective_reductions != {"token_mean"}:
             raise ValueError(
                 f"loss_aggregation={self.loss_aggregation!r} needs per-sequence "
                 "boundaries, which tree-packed batches do not carry; tree "
