@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import tempfile
@@ -41,8 +42,8 @@ class AwexSchedulerBridge:
         # duplicate/corrupted messages on the single PULL socket.
         if (
             result_ipc
-            and scheduler.tp_rank == 0
-            and (getattr(scheduler, "dp_rank", None) is None or scheduler.dp_rank == 0)
+            and scheduler.ps.tp_rank == 0
+            and (scheduler.ps.dp_rank is None or scheduler.ps.dp_rank == 0)
         ):
             ctx = zmq.Context(1)
             self._result_push = ctx.socket(zmq.PUSH)
@@ -68,7 +69,15 @@ class AwexSchedulerBridge:
             "awex_resume_memory",
         ]
         for name in methods:
-            setattr(self._scheduler, name, getattr(self, name))
+            bridge_method = getattr(self, name)
+
+            def call_awex(*, payload: str, _method=bridge_method) -> None:
+                parameters = json.loads(payload)
+                if not isinstance(parameters, dict):
+                    raise ValueError("AWEX RPC payload must be a JSON object")
+                _method(**parameters)
+
+            setattr(self._scheduler, name, call_awex)
 
     def _require_adapter(self) -> Any:
         if self._adapter is None:
@@ -89,8 +98,8 @@ class AwexSchedulerBridge:
         s = self._scheduler
 
         # All-gather across TP ranks so rank 0 returns aggregated metadata
-        if s.tp_size > 1:
-            gathered: list[list] = [[] for _ in range(s.tp_size)]
+        if s.ps.tp_size > 1:
+            gathered: list[list] = [[] for _ in range(s.ps.tp_size)]
             dist.all_gather_object(gathered, local_meta, group=s.tp_cpu_group)
             all_meta: list = []
             for rank_meta in gathered:
@@ -115,7 +124,7 @@ class AwexSchedulerBridge:
         self, save_path: str, names: list[str] | None = None
     ) -> None:
         adapter = self._require_adapter()
-        if self._scheduler.tp_rank == 0:
+        if self._scheduler.ps.tp_rank == 0:
             adapter.save_parameters(save_path, names)
 
     def awex_randomize_parameters(self) -> None:
@@ -157,6 +166,9 @@ def areal_run_scheduler_process(
     pp_rank: int,
     dp_rank: int | None,
     pipe_writer,
+    display_tp_rank: int | None = None,
+    display_dp_rank: int | None = None,
+    display_moe_ep_rank: int | None = None,
 ) -> None:
     """Drop-in for ``sglang.srt.managers.scheduler.run_scheduler_process``.
 
@@ -173,20 +185,18 @@ def areal_run_scheduler_process(
     import signal
 
     import psutil
+    from sglang.srt.distributed.parallel_state import abort_distributed_environment
     from sglang.srt.environ import envs
-    from sglang.srt.managers.scheduler import Scheduler, configure_scheduler
+    from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
     from sglang.srt.observability.trace import (
         process_tracing_init,
         trace_set_thread_info,
     )
-    from sglang.srt.utils import (
-        get_bool_env_var,
-        kill_itself_when_parent_died,
-        set_gpu_proc_affinity,
-    )
-    from sglang.srt.utils.numa_utils import (
-        get_numa_node_if_available,
-        numa_bind_to_node,
+    from sglang.srt.plugins import load_plugins
+    from sglang.srt.runtime_context import (
+        get_disagg,
+        get_observability,
+        publish,
     )
     from sglang.utils import get_exception_traceback
 
@@ -201,33 +211,40 @@ def areal_run_scheduler_process(
     )
 
     logger = logging.getLogger(__name__)
-    dp_rank = configure_scheduler(
-        server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
+    load_plugins()
+    publish(server_args, role="scheduler")
+    dp_rank = configure_scheduler_process(
+        server_args,
+        gpu_id,
+        tp_rank,
+        attn_cp_rank,
+        moe_dp_rank,
+        moe_ep_rank,
+        pp_rank,
+        dp_rank,
+        display_tp_rank=display_tp_rank,
+        display_dp_rank=display_dp_rank,
+        display_moe_ep_rank=display_moe_ep_rank,
     )
 
-    kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
-    # Set cpu affinity to this gpu process
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(
-            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
-        )
-    numa_node = get_numa_node_if_available(server_args, gpu_id)
-    if numa_node is not None and not envs.SGLANG_NUMA_BIND_V2.get():
-        numa_bind_to_node(numa_node)
-
     # Set up tracing
-    if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+    if get_observability().enable_trace:
+        process_tracing_init(
+            get_observability().otlp_traces_endpoint,
+            "sglang",
+            trace_modules=get_observability().trace_modules,
+        )
         thread_label = "Scheduler"
-        if server_args.disaggregation_mode == "prefill":
+        if get_disagg().disaggregation_mode == "prefill":
             thread_label = "Prefill Scheduler"
-        elif server_args.disaggregation_mode == "decode":
+        elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode Scheduler"
-        trace_set_thread_info(thread_label, tp_rank, dp_rank)
+        trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
     # Create a scheduler and run the event loop
+    scheduler = None
     try:
         # ---- BEGIN AREAL ----
         if server_args.enable_return_routed_experts:
@@ -259,6 +276,17 @@ def areal_run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+        if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
+            try:
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+            except Exception:
+                pass
+    finally:
+        if scheduler is not None:
+            scheduler.metrics_reporter._shutdown_fpm()
+            if scheduler.gracefully_exit:
+                scheduler.release_host_resources()
+                abort_distributed_environment()
 
 
 def create_result_ipc() -> str:

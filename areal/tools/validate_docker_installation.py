@@ -5,8 +5,8 @@
 Docker Installation Validation Script for AReaL
 
 This script validates dependencies in the Docker environment, which includes
-additional packages (grouped_gemm, apex, transformer_engine, flash_attn_3)
-and flash-attn version 2.8.3 (installed separately in Dockerfile).
+additional packages (grouped_gemm, apex, transformer_engine, flash_attn_3).
+The SGLang and vLLM images use different Flash Attention and CUDA wheels.
 
 Also validates DeepSeek-V3 related packages:
 - FlashMLA: Multi-head Latent Attention (requires SM90+ GPU)
@@ -23,6 +23,12 @@ from validation_base import BaseInstallationValidator
 
 class DockerInstallationValidator(BaseInstallationValidator):
     """Validates installation in Docker environment with additional packages."""
+
+    PACKAGE_IMPORT_MAP = {
+        **BaseInstallationValidator.PACKAGE_IMPORT_MAP,
+        "flash-attn-4": "flash_attn.cute",
+        "nvidia-cudnn-cu13": "nvidia.cudnn",
+    }
 
     # Extend CUDA sub-modules with Docker-specific packages
     CUDA_SUBMODULES = {
@@ -80,11 +86,6 @@ class DockerInstallationValidator(BaseInstallationValidator):
         # so they stay in sync automatically.
         opt_versions = self._get_optional_dep_versions()
 
-        # flash-attn (pre-built wheel installed in Dockerfile)
-        fa_spec = opt_versions.get("flash-attn", "==2.8.3")
-        self.add_additional_package("flash-attn", fa_spec, required=True)
-        print(f"  Note: Expecting flash-attn {fa_spec} for Docker environment")
-
         # C++ packages built from source in Dockerfile (not in pyproject.toml)
         self.add_additional_package("grouped_gemm", required=True)
         self.add_additional_package("apex", required=True)
@@ -95,6 +96,13 @@ class DockerInstallationValidator(BaseInstallationValidator):
         # Each Docker image has exactly one of sglang or vllm.
         has_sglang = self._is_package_importable("sglang")
         has_vllm = self._is_package_importable("vllm")
+
+        if has_sglang:
+            self.add_additional_package("flash-attn-4", ">=4.0.0b18", required=True)
+        elif has_vllm:
+            # The vLLM Dockerfile installs the Flash Attention 2 wheel.
+            fa_spec = opt_versions.get("flash-attn", "==2.8.3")
+            self.add_additional_package("flash-attn", fa_spec, required=True)
 
         if has_sglang and has_vllm:
             print(
@@ -109,13 +117,12 @@ class DockerInstallationValidator(BaseInstallationValidator):
             self.add_additional_package(
                 "sglang", opt_versions.get("sglang", ""), required=True
             )
-            self.CRITICAL_PACKAGES = {*self.CRITICAL_PACKAGES, "sglang"}
-            print("  Detected variant: sglang")
             self.add_additional_package(
-                "nvidia-cudnn-cu12",
-                opt_versions.get("nvidia-cudnn-cu12", ""),
-                required=False,
+                "torchao", opt_versions.get("torchao", ""), required=True
             )
+            self.CRITICAL_PACKAGES = {*self.CRITICAL_PACKAGES, "sglang", "torchao"}
+            print("  Detected variant: sglang")
+            self.add_additional_package("nvidia-cudnn-cu13", required=True)
         else:
             self.add_additional_package("sglang", required=False)
 

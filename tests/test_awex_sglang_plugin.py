@@ -10,6 +10,7 @@ import torch
 
 from areal.api.cli_args import MegatronEngineConfig, PPOActorConfig
 from areal.engine.awex.adapters.sglang_adapter import (
+    AwexSGLangAdapter,
     _get_legacy_awex_hf_config,
     _get_router_dtype,
     _PhysicalDeviceMetaServerClient,
@@ -22,6 +23,22 @@ from areal.engine.awex.plugins.sglang_plugin import (
     _resolve_transfer_rank,
     _writer_version_key,
 )
+
+
+def _mock_sglang_embedding_cache(monkeypatch, version, cache):
+    import sys
+
+    import areal.engine.awex.plugins.sglang_plugin as plugin_module
+
+    cache_module = (
+        "sglang.srt.managers.mm_schedule"
+        if version == "0.5.20"
+        else "sglang.srt.managers.mm_utils"
+    )
+    monkeypatch.setattr(plugin_module.pkg_version, "get_version", lambda name: version)
+    monkeypatch.setitem(
+        sys.modules, cache_module, SimpleNamespace(embedding_cache=cache)
+    )
 
 
 def test_load_sglang_plugins_accepts_runtime_without_registry(monkeypatch):
@@ -113,6 +130,46 @@ def test_awex_config_preserves_nested_router_and_vision_metadata(monkeypatch):
     assert config.architectures == ["SimpleNamespace"]
 
 
+def test_v0520_adapter_uses_scheduler_parallel_gpu_id(monkeypatch):
+    adapter = object.__new__(AwexSGLangAdapter)
+    adapter._scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(tp_size=1, pp_size=1, dp_size=1),
+        ps=SimpleNamespace(gpu_id=2, tp_rank=0, pp_rank=0),
+    )
+    adapter._legacy_instance_world_size = None
+    adapter._legacy_instance_local_rank = None
+    monkeypatch.setenv("LOCAL_RANK", "7")
+
+    assert adapter._get_model_context()["local_rank"] == 2
+
+
+def test_v0520_adapter_releases_memory_through_weight_updater(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.io_struct",
+        SimpleNamespace(
+            ReleaseMemoryOccupationReqInput=lambda tags: SimpleNamespace(tags=tags),
+            ResumeMemoryOccupationReqInput=lambda tags: SimpleNamespace(tags=tags),
+        ),
+    )
+    calls = []
+    updater = SimpleNamespace(
+        release_memory_occupation=lambda req: calls.append(("release", req.tags)),
+        resume_memory_occupation=lambda req: calls.append(("resume", req.tags)),
+    )
+    adapter = object.__new__(AwexSGLangAdapter)
+    adapter._scheduler = SimpleNamespace(weight_updater=updater)
+    adapter._released_tags = set()
+
+    adapter.release_memory(["kv_cache"])
+    adapter.release_memory(["kv_cache"])
+    adapter.resume_memory(["kv_cache"])
+
+    assert calls == [("release", ["kv_cache"]), ("resume", ["kv_cache"])]
+
+
 def test_memory_transitions_are_idempotent(monkeypatch):
     import sys
 
@@ -159,19 +216,14 @@ def test_memory_transitions_are_idempotent(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("sglang_version", ["0.5.10.post1", "0.5.20"])
 @pytest.mark.parametrize("separate_updater", [False, True])
 @pytest.mark.parametrize("frozen_visual", [False, True])
 def test_successful_flush_reencodes_images_after_weight_update(
-    monkeypatch, separate_updater, frozen_visual
+    monkeypatch, separate_updater, frozen_visual, sglang_version
 ):
-    import sys
-
     embeddings = {}
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.managers.mm_utils",
-        SimpleNamespace(embedding_cache=embeddings),
-    )
+    _mock_sglang_embedding_cache(monkeypatch, sglang_version, embeddings)
     flush_calls = []
     owner = SimpleNamespace(
         release_memory_occupation=lambda request: None,
@@ -188,6 +240,8 @@ def test_successful_flush_reencodes_images_after_weight_update(
         scheduler.weight_updater = owner
     else:
         scheduler = owner
+    if sglang_version == "0.5.20":
+        scheduler.flush_wrapper = SimpleNamespace(_flush_cache=flush_cache)
     scheduler._request_dispatcher = SimpleNamespace(_mapping={"flush": flush_cache})
     plugin = AwexSchedulerPlugin(scheduler)
     plugin._visual_embeddings_frozen = frozen_visual
@@ -213,7 +267,11 @@ def test_successful_flush_reencodes_images_after_weight_update(
     assert embeddings == {}
     assert image_embedding() == 59
     version = 100
-    assert scheduler.flush_cache(empty_cache=False)
+    if sglang_version == "0.5.20":
+        assert scheduler.flush_wrapper._flush_cache is patched_flush
+        assert scheduler.flush_wrapper._flush_cache(empty_cache=False)
+    else:
+        assert scheduler.flush_cache(empty_cache=False)
     if frozen_visual:
         assert embeddings == {"same-image": 59}
         assert image_embedding() == 59
@@ -226,17 +284,14 @@ def test_successful_flush_reencodes_images_after_weight_update(
     assert owner.flush_cache is scheduler.flush_cache
 
 
+@pytest.mark.parametrize("sglang_version", ["0.5.10.post1", "0.5.20"])
 @pytest.mark.parametrize("raises", [False, True])
-def test_unsuccessful_flush_preserves_image_embeddings(monkeypatch, raises):
-    import sys
-
+def test_unsuccessful_flush_preserves_image_embeddings(
+    monkeypatch, raises, sglang_version
+):
     embeddings = {"same-image": object()}
     before = embeddings.copy()
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.managers.mm_utils",
-        SimpleNamespace(embedding_cache=embeddings),
-    )
+    _mock_sglang_embedding_cache(monkeypatch, sglang_version, embeddings)
 
     def flush_cache():
         if raises:
@@ -258,14 +313,11 @@ def test_unsuccessful_flush_preserves_image_embeddings(monkeypatch, raises):
     assert embeddings == before
 
 
-def test_successful_flush_accepts_uninitialized_image_cache(monkeypatch):
-    import sys
-
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.managers.mm_utils",
-        SimpleNamespace(embedding_cache=None),
-    )
+@pytest.mark.parametrize("sglang_version", ["0.5.10.post1", "0.5.20"])
+def test_successful_flush_accepts_uninitialized_image_cache(
+    monkeypatch, sglang_version
+):
+    _mock_sglang_embedding_cache(monkeypatch, sglang_version, None)
     scheduler = SimpleNamespace(
         release_memory_occupation=lambda request: None,
         resume_memory_occupation=lambda request: None,

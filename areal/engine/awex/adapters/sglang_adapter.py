@@ -380,11 +380,20 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         if self._legacy_instance_world_size is not None:
             local_rank = tp_rank
         else:
+            # SGLang 0.5.20 selects the model device from scheduler.ps.gpu_id.
+            # LOCAL_RANK can still refer to the parent launcher.
+            parallel = getattr(self._scheduler, "ps", self._scheduler)
             local_rank = int(
                 getattr(
-                    self._scheduler,
-                    "local_rank",
-                    os.environ.get("LOCAL_RANK", getattr(self._scheduler, "gpu_id", 0)),
+                    parallel,
+                    "gpu_id",
+                    getattr(
+                        self._scheduler,
+                        "local_rank",
+                        os.environ.get(
+                            "LOCAL_RANK", getattr(self._scheduler, "gpu_id", 0)
+                        ),
+                    ),
                 )
             )
 
@@ -1404,7 +1413,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         tags_to_release = [tag for tag in tags if tag not in self._released_tags]
         if tags_to_release:
             req = ReleaseMemoryOccupationReqInput(tags=tags_to_release)
-            self._scheduler.release_memory_occupation(req)
+            owner = getattr(self._scheduler, "weight_updater", None) or self._scheduler
+            owner.release_memory_occupation(req)
             self._released_tags.update(tags_to_release)
         logger.info("release_memory: tags=%s", tags)
 
@@ -1415,7 +1425,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         tags_to_resume = [tag for tag in tags if tag in self._released_tags]
         if tags_to_resume:
             req = ResumeMemoryOccupationReqInput(tags=tags_to_resume)
-            self._scheduler.resume_memory_occupation(req)
+            owner = getattr(self._scheduler, "weight_updater", None) or self._scheduler
+            owner.resume_memory_occupation(req)
             self._released_tags.difference_update(tags_to_resume)
         logger.info("resume_memory: tags=%s", tags)
 
