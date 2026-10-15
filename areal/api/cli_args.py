@@ -3100,14 +3100,34 @@ class InferenceEngineConfig:
     )
     routing_strategy: str = field(
         default="round_robin",
-        metadata={"help": "Routing strategy for the inference-service router."},
+        metadata={
+            "help": "Routing strategy for the v2 inference-service router. "
+            "For v1 rollout balancing, prefer load_balance_policy."
+        },
+    )
+    load_balance_policy: str | None = field(
+        default=None,
+        metadata={
+            "help": "V1 rollout group allocation policy. 'least_groups' selects the worker "
+            "with the fewest active groups; 'round_robin' cycles through workers. "
+            "None preserves routing_strategy for compatibility.",
+            "choices": ["round_robin", "least_groups"],
+        },
+    )
+    load_balance_scope: str | None = field(
+        default=None,
+        metadata={
+            "help": "Backend pool for grouped v1 proxy sessions with least_groups balancing. "
+            "'node' uses instances on the proxy's machine; 'global' uses all rollout instances. "
+            "Each trajectory stays on its first instance across turns. "
+            "None preserves the deprecated proxy_backend_scope setting.",
+            "choices": ["node", "global"],
+        },
     )
     proxy_backend_scope: str = field(
         default="node",
         metadata={
-            "help": "Backend pool for grouped v1 proxy sessions with least_active_groups routing. "
-            "'node' uses the proxy's node; 'global' uses all rollout backends. "
-            "Each session stays on its selected backend across turns.",
+            "help": "Deprecated alias for load_balance_scope; use load_balance_scope in new configs.",
             "choices": ["node", "global"],
         },
     )
@@ -3145,6 +3165,35 @@ class InferenceEngineConfig:
             raise ValueError(
                 f"_version must be either 'v1' or 'v2', got '{self._version}'"
             )
+        if self.load_balance_policy is not None:
+            policies = {
+                "round_robin": "round_robin",
+                "least_groups": "least_active_groups",
+            }
+            if self.load_balance_policy not in policies:
+                raise ValueError(
+                    "load_balance_policy must be 'round_robin' or 'least_groups', "
+                    f"got '{self.load_balance_policy}'"
+                )
+            if self._version != "v1":
+                raise ValueError("load_balance_policy requires _version='v1'")
+            strategy = policies[self.load_balance_policy]
+            if self.routing_strategy not in ("round_robin", strategy):
+                raise ValueError("load_balance_policy conflicts with routing_strategy")
+            self.routing_strategy = strategy
+        if self.load_balance_scope is not None:
+            if self.load_balance_scope not in ("node", "global"):
+                raise ValueError(
+                    "load_balance_scope must be 'node' or 'global', "
+                    f"got '{self.load_balance_scope}'"
+                )
+            if self._version != "v1":
+                raise ValueError("load_balance_scope requires _version='v1'")
+            if self.proxy_backend_scope not in ("node", self.load_balance_scope):
+                raise ValueError(
+                    "load_balance_scope conflicts with proxy_backend_scope"
+                )
+            self.proxy_backend_scope = self.load_balance_scope
         if self.proxy_backend_scope not in ("node", "global"):
             raise ValueError(
                 "proxy_backend_scope must be either 'node' or 'global', "
@@ -3153,6 +3202,11 @@ class InferenceEngineConfig:
         if self.proxy_backend_scope == "global" and (
             self._version != "v1" or self.routing_strategy != "least_active_groups"
         ):
+            if self.load_balance_scope is not None:
+                raise ValueError(
+                    "load_balance_scope='global' requires _version='v1' and "
+                    "load_balance_policy='least_groups'"
+                )
             raise ValueError(
                 "proxy_backend_scope='global' requires _version='v1' and "
                 "routing_strategy='least_active_groups'"

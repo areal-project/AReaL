@@ -53,15 +53,18 @@ For the v1 internal proxy, enable session distribution with:
 
 ```yaml
 rollout:
-  routing_strategy: least_active_groups
-  proxy_backend_scope: node # or global
+  load_balance_policy: least_groups
+  load_balance_scope: node # or global
 ```
 
-`node` (default) spreads a group's samples across inference instances on the proxy's
-machine. With one instance per machine, the group stays on that instance. `global`
-spreads samples across all rollout instances, including other machines; proxy ranks use
-offset backend orders to avoid concentrating samples on the first few instances. Both
-modes support one or multiple independent instances per machine.
+`least_groups` assigns each new group to the worker with the fewest active groups; these
+counts cover the group lifecycle, including time waiting for tools, rather than live
+inference queue lengths. `node` (default scope) spreads a group's samples across
+inference instances on the proxy's machine. With one instance per machine, the group
+stays on that instance. `global` spreads samples across all rollout instances, including
+other machines; proxy ranks use offset backend orders to avoid concentrating samples on
+the first few instances. Both modes support one or multiple independent instances per
+machine.
 
 Each trajectory selects a backend when its session starts and keeps it for all tool
 turns, preserving its own KV/prefix cache reuse. The group's processor cache, tensor
@@ -70,9 +73,11 @@ spread correlated group tails, but transfers image payloads across machines and 
 duplicate common-prefix processing on more instances. It distributes sessions by index,
 without inspecting live backend queue lengths; throughput gains need measurement.
 
-This option requires `routing_strategy: least_active_groups`; `global` also requires
-`_version: v1`. Direct workflows and the v2 inference-service router are unaffected.
-Without these options, the existing `round_robin` behavior remains the default.
+These settings apply to `_version: v1`; `global` requires
+`load_balance_policy: least_groups`. Direct workflows and the v2 inference-service
+router are unaffected. Without these options, the existing `round_robin` behavior
+remains the default. Older configs using `routing_strategy: least_active_groups` and
+`proxy_backend_scope` remain compatible.
 
 ## Examples
 

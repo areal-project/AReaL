@@ -207,7 +207,7 @@ async def test_group_samples_use_distinct_pinned_backends_and_one_processor_cach
     scope,
 ):
     config = InferenceEngineConfig(
-        routing_strategy="least_active_groups", proxy_backend_scope=scope
+        load_balance_policy="least_groups", load_balance_scope=scope
     )
     remote = RemoteInfEngine(config, backend=MagicMock())
     remote.addresses = (

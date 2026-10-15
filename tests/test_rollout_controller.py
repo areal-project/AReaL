@@ -1824,7 +1824,10 @@ def _make_proxy_controller(hosts, strategy="least_active_groups", scope="global"
     controller._worker_role = "rollout"
     controller.inf_engine = MockInferenceEngine
     controller.config = create_test_config(
-        routing_strategy=strategy, proxy_backend_scope=scope
+        load_balance_policy=(
+            "least_groups" if strategy == "least_active_groups" else strategy
+        ),
+        load_balance_scope=scope,
     )
     controller.server_infos = [
         SimpleNamespace(host=host, port=9000 + idx) for idx, host in enumerate(hosts)
