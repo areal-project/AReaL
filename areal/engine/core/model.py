@@ -177,6 +177,11 @@ def requires_padded_seq(model_type: str, bridge_type: str | None = None) -> bool
     Only the active Megatron-Bridge backend has a validated GDN THD contract.
     Keep other or unspecified bridges padded regardless of installed packages.
     """
+    if model_type == "qwen4_exp" and bridge_type == "megatron-bridge":
+        # The pinned Qwen4Exp GDN implementation requires FLA for THD. The
+        # validated runtime intentionally has no FLA package, so use its native
+        # padded BSHD path at CP1.
+        return True
     return is_qwen3_5_model(model_type) and not (
         bridge_type == "megatron-bridge" and supports_gdn_packed_seq()
     )

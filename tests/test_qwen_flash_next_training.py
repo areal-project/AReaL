@@ -460,6 +460,34 @@ def test_wrapper_mtp_preserves_thd_supervision_without_padding_mask(packed_forwa
     torch.testing.assert_close(kwargs["loss_mask"].reshape(-1), mask)
 
 
+def test_mtp_training_prefers_unshifted_input_token_loss_mask():
+    """Label-free MTP must not apply its rolls to an already shifted mask."""
+    from areal.engine.megatron_engine import _mtp_token_loss_mask
+
+    input_mask = torch.tensor([False, False, True, True])
+    main_mask = torch.roll(input_mask, shifts=-1)
+
+    selected = _mtp_token_loss_mask(
+        {
+            "input_token_loss_mask": input_mask,
+            "loss_mask": main_mask,
+        }
+    )
+
+    torch.testing.assert_close(selected, input_mask, rtol=0, atol=0)
+
+
+def test_mtp_training_direct_caller_uses_loss_mask_fallback():
+    """Focused engine callers may supply a token-domain loss_mask directly."""
+    from areal.engine.megatron_engine import _mtp_token_loss_mask
+
+    loss_mask = torch.tensor([False, True, True])
+
+    selected = _mtp_token_loss_mask({"loss_mask": loss_mask})
+
+    torch.testing.assert_close(selected, loss_mask, rtol=0, atol=0)
+
+
 class _SourceConfig(PretrainedConfig):
     model_type = "qwen4_exp"
 
@@ -792,3 +820,83 @@ def test_mcore_bridge_rejects_unsupported_mtp_before_model_construction():
     engine.mcore_config = SimpleNamespace(enable_mtp_training=True)
     with pytest.raises(NotImplementedError, match="MCore 0.19 MTP supervision"):
         engine._build_hf_mcore_bridge()
+
+
+def test_megatron_bridge_registers_qwen_before_hf_config_exists(monkeypatch):
+    """Provider registration precedes AutoBridge's checkpoint-config load."""
+    from megatron.bridge import AutoBridge
+
+    from areal.engine.megatron_engine import MegatronEngine
+    from areal.models.mcore import qwen4_exp_megatron_bridge
+
+    register = Mock()
+    bridge = object()
+    load = Mock(return_value=bridge)
+    monkeypatch.setattr(
+        qwen4_exp_megatron_bridge,
+        "register_qwen4_exp_megatron_bridge",
+        register,
+    )
+    monkeypatch.setattr(AutoBridge, "from_hf_pretrained", load)
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.bridge_cls = "megatron-bridge"
+    engine.config = SimpleNamespace(
+        path="/checkpoint/qwen38-flash-next", dtype="bfloat16"
+    )
+    engine.enable_tree_training = False
+    engine.logger = Mock()
+
+    assert not hasattr(engine, "hf_config")
+    assert engine._build_hf_mcore_bridge() is bridge
+    register.assert_called_once_with()
+    load.assert_called_once_with(
+        engine.config.path,
+        trust_remote_code=True,
+        dtype=engine.config.dtype,
+    )
+
+
+def test_optimizer_step_reports_independent_mtp_grad_norm():
+    """MTP-only training reports MCore's globally reduced MTP norm."""
+    from areal.engine.megatron_engine import MegatronEngine
+
+    class Optimizer:
+        param_groups = [{"lr": 2e-5}]
+
+        def step(self):
+            self.grad_norms_by_group = {"mtp": 0.375}
+            return True, 0.0, 0
+
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.optimizer = Optimizer()
+    engine._dte_runtime_config = SimpleNamespace(enabled=False)
+
+    stats = engine.optimizer_step()
+
+    assert stats == {
+        "update_successful": 1.0,
+        "grad_norm": 0.0,
+        "lr": 2e-5,
+        "mtp_grad_norm": 0.375,
+    }
+
+
+def test_optimizer_step_omits_absent_mtp_grad_norm():
+    """Backbone-only runs preserve their existing statistics schema."""
+    from areal.engine.megatron_engine import MegatronEngine
+
+    optimizer = SimpleNamespace(
+        param_groups=[{"lr": 1e-4}],
+        step=lambda: (True, 1.25, 0),
+    )
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.optimizer = optimizer
+    engine._dte_runtime_config = SimpleNamespace(enabled=False)
+
+    stats = engine.optimizer_step()
+
+    assert stats == {
+        "update_successful": 1.0,
+        "grad_norm": 1.25,
+        "lr": 1e-4,
+    }

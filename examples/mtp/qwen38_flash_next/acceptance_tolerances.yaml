@@ -1,0 +1,30 @@
+# Declared before any recovery-comparison output is produced.
+conditions:
+  dtype: bfloat16
+  # Declared after FA3 rejected deterministic hdim=256 backward and before any
+  # continuous-vs-recovered result was produced.  Tolerances below are not
+  # changed from their original BF16 declaration.
+  deterministic_algorithms: false
+  seed: 20261001
+  nvte_allow_nondeterministic_algo: 1
+  cublas_workspace_config: ":4096:8"
+comparisons:
+  conversion_roundtrip:
+    parameter_atol: 0.0
+    parameter_rtol: 0.0
+  no_mtp_forward:
+    logits_atol: 0.02
+    logits_rtol: 0.02
+    loss_atol: 0.02
+    loss_rtol: 0.02
+  continuous_vs_recovered_next_step:
+    loss_atol: 0.02
+    loss_rtol: 0.02
+    mtp_loss_atol: 0.02
+    mtp_loss_rtol: 0.02
+    parameter_atol: 0.02
+    parameter_rtol: 0.02
+    # Optimizer arithmetic consumes BF16-derived gradients. Boundary restoration
+    # (including FP32 masters/moments and RNG) is independently required exact.
+    optimizer_state_atol: 0.02
+    optimizer_state_rtol: 0.02

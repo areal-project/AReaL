@@ -1,0 +1,121 @@
+# Qwen3.8 Flash-Next native-MTP-only SFT acceptance recipe.
+# The run-specific launchers select the immutable dataset and output root.
+experiment_name: ${oc.env:EXPERIMENT_NAME,"chucai-rsi-task2-native-mtp"}
+trial_name: ${oc.env:TRIAL_NAME}
+seed: 20261001
+tokenizer_path: ${actor.path}
+# Eight fixed samples form two four-sample optimizer steps per epoch.  Three
+# deterministic epochs permit the five-step 16K acceptance run; the explicit
+# total_train_steps bound still terminates shorter smoke/recovery runs exactly.
+total_train_epochs: 3
+total_train_steps: ${oc.env:TOTAL_TRAIN_STEPS}
+enable_offload: false
+
+cluster:
+  n_nodes: 2
+  n_gpus_per_node: 8
+  fileroot: ${oc.env:FILERoot}
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${cluster.fileroot}/name_resolve
+
+allocation_mode: "megatron:(attn:d1p2t8c1|ffn:d1p2e8)"
+scheduler:
+  type: null
+
+actor:
+  backend: ${allocation_mode}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${oc.env:MODEL_PATH}
+  init_from_scratch: false
+  dtype: bfloat16
+  gradient_checkpointing: true
+  mb_spec:
+    # AReaL's training schedule uses 2*PP real microbatches to avoid bubbles.
+    # Transport-only padding is not semantically neutral for MoE router state
+    # or MTP normalization, so all four schedule entries contain real samples.
+    n_mbs: 4
+    n_mbs_divisor: 2
+    max_tokens_per_mb: ${oc.env:SEQUENCE_LENGTH}
+  optimizer:
+    type: adam
+    lr: 2e-5
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+  megatron:
+    bridge_type: megatron-bridge
+    enable_mtp: true
+    enable_mtp_training: true
+    mtp_only: true
+    mtp_loss_scaling_factor: 0.1
+    freeze_ple_table: true
+    language_model_only: true
+    enable_chunked_logits: false
+    cross_entropy_loss_fusion: false
+    moe_permute_fusion: true
+    # FlashAttention-3 reports that deterministic backward is unsupported for
+    # this checkpoint's 256-wide attention heads.  Recovery comparisons use
+    # the predeclared BF16 nondeterministic tolerance instead.
+    use_deterministic_algorithms: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    ddp:
+      use_distributed_optimizer: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      grad_reduce_in_fp32: true
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 8
+      mem: 128
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+train_dataset:
+  # Four one-sample microbatches exactly fill AReaL's 2*PP schedule.
+  batch_size: 4
+  shuffle: false
+  pin_memory: true
+  num_workers: 0
+  drop_last: true
+  path: ${oc.env:SFT_DATASET}
+  type: sft
+  max_length: ${oc.env:SEQUENCE_LENGTH}
+valid_dataset: null
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_steps: ${oc.env:SAVER_FREQ_STEPS,null}
+  freq_epochs: null
+  freq_secs: null
+recover:
+  mode: ${oc.env:RECOVER_MODE,disabled}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_steps: ${oc.env:RECOVER_FREQ_STEPS,null}
+  freq_epochs: null
+  freq_secs: null
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_steps: null
+  freq_epochs: null
+  freq_secs: null
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled

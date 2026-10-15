@@ -29,6 +29,14 @@ def test_qwen4_exp_uses_wrapper_thd_with_mcore_bridge():
     )
 
 
+def test_qwen4_exp_megatron_bridge_uses_padded_bshd_without_fla():
+    assert not supports_model_packed_seq("qwen4_exp", "megatron-bridge")
+    assert (
+        resolve_sequence_packing_mode("qwen4_exp", "megatron-bridge")
+        == SequencePackingMode.PADDED
+    )
+
+
 def test_qwen4_exp_is_registered_as_vision_and_moe_model():
     from areal.engine.core.model import is_moe_model, is_valid_vision_model
 
