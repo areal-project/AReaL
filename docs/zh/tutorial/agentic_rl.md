@@ -31,6 +31,26 @@ AReaL 通过提供以下功能来解决这些限制：
 > **调度器兼容性**：使用代理方法的智能体工作流在 `local`、`slurm` 和 `ray` 调度器上均受支持。在 `ray` 下，每个代理服务器会作为 HTTP
 > worker 子进程在其 rollout worker 旁启动，行为与 `local` 和 `slurm` 一致。
 
+## 智能体组内轨迹分流
+
+v1 内部 proxy 可以通过以下配置启用分流：
+
+```yaml
+rollout:
+  routing_strategy: least_active_groups
+  proxy_backend_scope: node # 或 global
+```
+
+`node`（默认）将同组不同轨迹分到 proxy 所在机器的推理实例；每机器只有一个实例时，整组仍使用该实例。`global` 将轨迹分散到全部 rollout
+实例，包括其他机器。不同 proxy 使用错开的实例顺序，避免请求集中到地址列表前几个实例。两种模式都支持每机器一个或多个独立实例。
+
+每条轨迹在创建 session 时选定实例，后续工具调用后的多轮请求始终使用这个实例，复用自身的 KV/前缀缓存。组内共享的 processor
+cache、张量引用和结果汇总仍保留在原 proxy。全局分流可以分散同组相关长尾，但会增加跨机器图片传输，也可能在更多实例上重复处理公共前缀。 当前按 sample
+序号分配，不读取实例实时排队长度；实际吞吐收益需要实验测量。
+
+此选项需配合 `routing_strategy: least_active_groups`，`global` 还要求 `_version: v1`。直接调用引擎的
+workflow 和 v2 推理服务路由不受影响。不启用这些配置时，默认仍使用原有 `round_robin` 行为。
+
 ## 示例
 
 ### 使用 OpenAI 智能体训练

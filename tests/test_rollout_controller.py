@@ -576,12 +576,16 @@ class TestRolloutControllerWorkerSelection:
         assert [controller._choose_worker()[1] for _ in range(3)] == [2, 0, 1]
         controller.destroy()
 
-    def test_choose_worker_least_active_groups_counts_same_node_proxies(self):
+    @pytest.mark.parametrize(("scope", "expected_rank"), [("node", 1), ("global", 0)])
+    def test_choose_worker_counts_node_load_only_for_node_scope(
+        self, scope, expected_rank
+    ):
         from types import SimpleNamespace
 
         config = create_test_config(
             backend="sglang:d4",
             routing_strategy="least_active_groups",
+            proxy_backend_scope=scope,
         )
         controller = RolloutController(
             inf_engine=MockInferenceEngine,
@@ -597,8 +601,8 @@ class TestRolloutControllerWorkerSelection:
         controller._active_rollout_groups[:] = [0, 1, 4, 1]
 
         worker, rank = controller._choose_worker()
-        assert rank == 1
-        assert worker.id == "rollout/1"
+        assert rank == expected_rank
+        assert worker.id == f"rollout/{expected_rank}"
         controller.destroy()
 
 
@@ -1766,7 +1770,47 @@ async def test_proxy_start_inherits_current_weight_version(version):
 
 
 @pytest.mark.asyncio
-async def test_proxy_group_routing_uses_same_node_backends():
+@pytest.mark.parametrize(
+    ("strategy", "scope", "expected_addrs"),
+    [
+        (
+            "least_active_groups",
+            "node",
+            [
+                ["node-0:9000", "node-0:9002"],
+                ["node-1:9001"],
+                ["node-0:9002", "node-0:9000"],
+            ],
+        ),
+        (
+            "least_active_groups",
+            "global",
+            [
+                ["node-0:9000", "node-1:9001", "node-0:9002"],
+                ["node-1:9001", "node-0:9002", "node-0:9000"],
+                ["node-0:9002", "node-0:9000", "node-1:9001"],
+            ],
+        ),
+        ("round_robin", "node", ["node-0:9000", "node-1:9001", "node-0:9002"]),
+    ],
+)
+async def test_proxy_group_routing_respects_backend_scope(
+    strategy, scope, expected_addrs
+):
+    controller = _make_proxy_controller(
+        hosts=["node-0", "node-1", "node-0"], strategy=strategy, scope=scope
+    )
+
+    await controller._async_start_proxy()
+
+    init_addrs = [
+        call.kwargs["addr"]
+        for call in controller.scheduler.async_call_engine.await_args_list
+    ]
+    assert init_addrs == expected_addrs
+
+
+def _make_proxy_controller(hosts, strategy="least_active_groups", scope="global"):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
@@ -1775,15 +1819,15 @@ async def test_proxy_group_routing_uses_same_node_backends():
         SimpleNamespace(
             id=f"proxy-rollout/{idx}", ip="127.0.0.1", worker_ports=[8000 + idx]
         )
-        for idx in range(3)
+        for idx in range(len(hosts))
     ]
     controller._worker_role = "rollout"
     controller.inf_engine = MockInferenceEngine
-    controller.config = create_test_config()
-    controller.config.routing_strategy = "least_active_groups"
+    controller.config = create_test_config(
+        routing_strategy=strategy, proxy_backend_scope=scope
+    )
     controller.server_infos = [
-        SimpleNamespace(host=("node-0" if idx != 1 else "node-1"), port=9000 + idx)
-        for idx in range(3)
+        SimpleNamespace(host=host, port=9000 + idx) for idx, host in enumerate(hosts)
     ]
     controller.proxy_addrs = []
     controller.scheduler = Mock()
@@ -1793,15 +1837,91 @@ async def test_proxy_group_routing_uses_same_node_backends():
     controller.scheduler.async_call_engine = AsyncMock()
     controller._proxy_collective_rpc_async = AsyncMock()
     controller.get_version = Mock(return_value=0)
+    return controller
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("instances_per_node", [1, 2])
+@pytest.mark.parametrize("group_size", [3, 12, 24])
+async def test_global_proxy_pools_balance_sessions_across_all_backends(
+    instances_per_node, group_size
+):
+    from collections import Counter
+
+    from areal.experimental.openai.proxy import proxy_rollout_server as srv
+
+    hosts = [f"node-{idx}" for _ in range(instances_per_node) for idx in range(8)]
+    controller = _make_proxy_controller(hosts)
     await controller._async_start_proxy()
 
-    init_addrs = [
+    pools = [
         call.kwargs["addr"]
         for call in controller.scheduler.async_call_engine.await_args_list
     ]
-    assert init_addrs == [
-        ["node-0:9000", "node-0:9002"],
-        ["node-1:9001"],
-        ["node-0:9002", "node-0:9000"],
-    ]
+    all_backends = {f"{info.host}:{info.port}" for info in controller.server_infos}
+    assert all(set(pool) == all_backends for pool in pools)
+
+    # Model the initially uniform 32 groups from the Arena run, using the real
+    # proxy selector. A common, unrotated address order fails when GS < DP.
+    from areal.infra.remote_inf_engine import RemoteInfEngine
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        counts = Counter()
+        contributing_groups = {address: set() for address in all_backends}
+        for group_idx in range(32):
+            remote = RemoteInfEngine(controller.config, backend=Mock())
+            remote.addresses = pools[group_idx % len(pools)]
+            monkeypatch.setattr(srv, "_engine", remote)
+            for sample_idx in range(group_size):
+                address = srv._session_backend_address(sample_idx, group_size)
+                counts[address] += 1
+                contributing_groups[address].add(group_idx)
+
+    assert len(counts) == len(all_backends)
+    assert set(counts.values()) == {32 * group_size // len(all_backends)}
+    assert min(map(len, contributing_groups.values())) > 32 // len(pools)
+
+
+@pytest.mark.parametrize("scope", ["node", "global"])
+def test_proxy_scope_keeps_model_management_on_original_workers(scope):
+    import threading
+    from types import SimpleNamespace
+
+    controller = _make_proxy_controller(["node-0", "node-1"], scope=scope)
+    controller.workers = [SimpleNamespace(id=f"rollout/{idx}") for idx in range(2)]
+    controller.proxy_workers = controller.scheduler.get_workers.return_value
+    controller._proxy_started = True
+    controller._version_lock = threading.Lock()
+    controller._dispatcher = Mock()
+    controller.get_version = RolloutController.get_version.__get__(controller)
+    controller._proxy_collective_rpc_async = (
+        RolloutController._proxy_collective_rpc_async.__get__(controller)
+    )
+
+    controller.pause_generation_sync()
+    controller.offload(tags=["kv_cache"])
+    controller.onload(tags=["kv_cache"])
+    asyncio.run(controller.update_weights_from_distributed(meta=Mock(), param_specs=[]))
+    controller.set_version(7)
+    controller.pause()
+    controller.resume()
+
+    calls = controller.scheduler.async_call_engine.call_args_list
+    worker_ids = {worker.id for worker in controller.workers}
+    proxy_ids = {worker.id for worker in controller.proxy_workers}
+    for method in (
+        "pause_generation",
+        "offload",
+        "onload",
+        "update_weights_from_distributed",
+    ):
+        targets = [c.kwargs["worker_id"] for c in calls if c.kwargs["method"] == method]
+        assert len(targets) == len(worker_ids)
+        assert set(targets) == worker_ids
+    for method in ("set_version", "pause", "resume"):
+        targets = [c.kwargs["worker_id"] for c in calls if c.kwargs["method"] == method]
+        assert len(targets) == len(worker_ids | proxy_ids)
+        assert set(targets) == worker_ids | proxy_ids
+    assert controller.get_version() == 7
+    controller.dispatcher.pause.assert_called_once()
+    controller.dispatcher.resume.assert_called_once()

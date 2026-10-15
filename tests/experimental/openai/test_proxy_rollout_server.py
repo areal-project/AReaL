@@ -201,12 +201,20 @@ def _admin_headers():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["node", "global"])
 async def test_group_samples_use_distinct_pinned_backends_and_one_processor_cache(
     monkeypatch,
+    scope,
 ):
-    config = InferenceEngineConfig(routing_strategy="least_active_groups")
+    config = InferenceEngineConfig(
+        routing_strategy="least_active_groups", proxy_backend_scope=scope
+    )
     remote = RemoteInfEngine(config, backend=MagicMock())
-    remote.addresses = ["server-a:30000", "server-b:30000", "server-c:30000"]
+    remote.addresses = (
+        ["node-a:30000", "node-a:30001", "node-a:30002"]
+        if scope == "node"
+        else ["node-a:30000", "node-b:30000", "node-c:30000"]
+    )
     monkeypatch.setattr(srv, "_engine", SimpleNamespace(config=config, _engine=remote))
     monkeypatch.setattr(srv, "_openai_client", object())
     monkeypatch.setattr(srv, "_capacity", 3)
@@ -236,14 +244,16 @@ async def test_group_samples_use_distinct_pinned_backends_and_one_processor_cach
         await asyncio.sleep(0)
         return remote.choose_server()
 
-    routed = await asyncio.gather(
-        *(srv._call_client_create(create_fn, {}, sid) for sid in session_ids)
-    )
-    assert routed == remote.addresses
-    assert (
-        await srv._call_client_create(create_fn, {}, session_ids[1])
-        == remote.addresses[1]
-    )
+    for turn in range(3):
+        # Reverse arrival order on alternating turns; concurrent sessions must
+        # keep their first backend independently of scheduling order.
+        order = session_ids if turn % 2 == 0 else session_ids[::-1]
+        routed = await asyncio.gather(
+            *(srv._call_client_create(create_fn, {}, sid) for sid in order)
+        )
+        assert dict(zip(order, routed, strict=True)) == dict(
+            zip(session_ids, remote.addresses, strict=True)
+        )
     assert remote.choose_server() == remote.addresses[0]
 
 

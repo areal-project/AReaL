@@ -47,6 +47,33 @@ We demonstrate several concrete examples below. More examples can be found in th
 > HTTP worker subprocess launched next to its rollout worker, the same as under `local`
 > and `slurm`.
 
+## Routing grouped agent sessions
+
+For the v1 internal proxy, enable session distribution with:
+
+```yaml
+rollout:
+  routing_strategy: least_active_groups
+  proxy_backend_scope: node # or global
+```
+
+`node` (default) spreads a group's samples across inference instances on the proxy's
+machine. With one instance per machine, the group stays on that instance. `global`
+spreads samples across all rollout instances, including other machines; proxy ranks use
+offset backend orders to avoid concentrating samples on the first few instances. Both
+modes support one or multiple independent instances per machine.
+
+Each trajectory selects a backend when its session starts and keeps it for all tool
+turns, preserving its own KV/prefix cache reuse. The group's processor cache, tensor
+references, and result collection remain in its original proxy. Global routing can
+spread correlated group tails, but transfers image payloads across machines and may
+duplicate common-prefix processing on more instances. It distributes sessions by index,
+without inspecting live backend queue lengths; throughput gains need measurement.
+
+This option requires `routing_strategy: least_active_groups`; `global` also requires
+`_version: v1`. Direct workflows and the v2 inference-service router are unaffected.
+Without these options, the existing `round_robin` behavior remains the default.
+
 ## Examples
 
 ### Training with OpenAI Agent

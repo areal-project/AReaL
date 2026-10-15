@@ -3102,6 +3102,15 @@ class InferenceEngineConfig:
         default="round_robin",
         metadata={"help": "Routing strategy for the inference-service router."},
     )
+    proxy_backend_scope: str = field(
+        default="node",
+        metadata={
+            "help": "Backend pool for grouped v1 proxy sessions with least_active_groups routing. "
+            "'node' uses the proxy's node; 'global' uses all rollout backends. "
+            "Each session stays on its selected backend across turns.",
+            "choices": ["node", "global"],
+        },
+    )
     poll_interval: float = field(
         default=5.0,
         metadata={
@@ -3135,6 +3144,18 @@ class InferenceEngineConfig:
         if self._version not in ("v1", "v2"):
             raise ValueError(
                 f"_version must be either 'v1' or 'v2', got '{self._version}'"
+            )
+        if self.proxy_backend_scope not in ("node", "global"):
+            raise ValueError(
+                "proxy_backend_scope must be either 'node' or 'global', "
+                f"got '{self.proxy_backend_scope}'"
+            )
+        if self.proxy_backend_scope == "global" and (
+            self._version != "v1" or self.routing_strategy != "least_active_groups"
+        ):
+            raise ValueError(
+                "proxy_backend_scope='global' requires _version='v1' and "
+                "routing_strategy='least_active_groups'"
             )
         if not self.admin_api_key or not self.admin_api_key.strip():
             raise ValueError("admin_api_key must not be empty or whitespace-only")

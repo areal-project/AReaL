@@ -673,15 +673,20 @@ class RolloutController:
             zip(self.proxy_workers, self.server_infos, strict=True)
         ):
             if self.config.routing_strategy == "least_active_groups":
-                # Share a group's processor cache in one proxy and spread its
-                # sample sessions across the co-located inference servers.
-                # Keep the worker's own server first to avoid cross-node image
-                # transfers and retain prefix locality.
-                addr = [server_addrs[rank]] + [
-                    address
-                    for idx, address in enumerate(server_addrs)
-                    if idx != rank and self.server_infos[idx].host == server_info.host
-                ]
+                if self.config.proxy_backend_scope == "global":
+                    # Offset each proxy's session placement. With fewer samples
+                    # than backends, a common ordering overloads the first few
+                    # servers. Each trajectory remains pinned by the proxy.
+                    addr = server_addrs[rank:] + server_addrs[:rank]
+                else:
+                    # Share the processor cache in one proxy and keep model
+                    # requests on its node to retain prefix locality.
+                    addr = [server_addrs[rank]] + [
+                        address
+                        for idx, address in enumerate(server_addrs)
+                        if idx != rank
+                        and self.server_infos[idx].host == server_info.host
+                    ]
             else:
                 addr = f"{server_info.host}:{server_info.port}"
             init_tasks.append(
@@ -1028,7 +1033,11 @@ class RolloutController:
             if len(self._active_rollout_groups) != len(self.workers):
                 raise RuntimeError("Rollout worker counts are not initialized.")
             node_loads: dict[str, int] = {}
-            if self._proxy_started and len(self.server_infos) == len(self.workers):
+            if (
+                self._proxy_started
+                and self.config.proxy_backend_scope == "node"
+                and len(self.server_infos) == len(self.workers)
+            ):
                 # A proxy spreads one group across all of its same-node servers.
                 # Count both proxies' groups when deciding where the next group
                 # belongs, otherwise an idle proxy can hide a busy sibling.

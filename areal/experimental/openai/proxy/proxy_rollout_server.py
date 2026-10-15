@@ -592,8 +592,8 @@ def _session_backend_address(sample_idx: int | None, group_size: int) -> str | N
     remote_engine = getattr(_engine, "_engine", _engine)
     if not isinstance(remote_engine, RemoteInfEngine) or not remote_engine.addresses:
         return None
-    # The controller binds only same-node backends, so siblings can share
-    # expensive multimodal prefixes without crossing the network.
+    # The controller supplies an ordered node-local or global pool. Limit
+    # fanout to the group size so siblings can still reuse common prefixes.
     fanout = max(1, min(group_size, len(remote_engine.addresses)))
     return remote_engine.addresses[(sample_idx or 0) % fanout]
 
