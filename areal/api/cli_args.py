@@ -1904,6 +1904,18 @@ class PPOActorConfig(TrainEngineConfig):
             raise ValueError(
                 f"entropy_coeff must be non-negative, got {self.entropy_coeff}"
             )
+        if (
+            self.entropy_coeff > 0.0
+            and self.megatron.enable_chunked_logits
+            and not self.megatron.entropy_requires_grad
+        ):
+            # The AReaL LM Head reuses logits storage when entropy gradients are
+            # disabled, so the entropy bonus would change the loss value without
+            # contributing any gradient.
+            raise ValueError(
+                "entropy_coeff > 0 requires megatron.entropy_requires_grad=True "
+                "when megatron.enable_chunked_logits=True"
+            )
 
         reward_norm = self.reward_norm
         if isinstance(reward_norm, (dict, DictConfig)):

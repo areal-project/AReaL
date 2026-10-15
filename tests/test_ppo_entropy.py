@@ -3,8 +3,9 @@
 import pytest
 import torch
 
-from areal.api.cli_args import PPOActorConfig
+from areal.api.cli_args import MegatronEngineConfig, PPOActorConfig
 from areal.trainer.ppo.actor import grpo_loss_fn
+from areal.utils.functional.vocab_parallel import gather_logprobs_entropy
 
 
 def _make_dummy_input():
@@ -120,3 +121,60 @@ def test_grpo_loss_fn_entropy_bonus_modifies_loss():
     expected_diff = coeff * (-3.5)
     actual_diff = (loss_with_bonus - loss_zero).item()
     assert pytest.approx(actual_diff, abs=1e-5) == expected_diff
+
+
+def test_ppo_actor_config_entropy_coeff_rejects_nondifferentiable_megatron_entropy():
+    """Test that an entropy bonus is rejected when Megatron entropy has no grad."""
+    megatron = MegatronEngineConfig(enable_chunked_logits=True)
+
+    with pytest.raises(ValueError, match="entropy_requires_grad=True"):
+        PPOActorConfig(entropy_coeff=0.01, megatron=megatron)
+
+
+def test_ppo_actor_config_entropy_coeff_accepts_differentiable_megatron_entropy():
+    """Test that an entropy bonus is accepted on the differentiable fallback."""
+    megatron = MegatronEngineConfig(
+        enable_chunked_logits=True, entropy_requires_grad=True
+    )
+
+    cfg = PPOActorConfig(entropy_coeff=0.01, megatron=megatron)
+
+    assert cfg.entropy_coeff == 0.01
+
+
+def test_grpo_loss_fn_engine_entropy_contributes_logit_gradients():
+    """Test that engine-produced entropy carries the bonus gradient to the logits."""
+    torch.manual_seed(0)
+    input_data = _make_dummy_input()
+    labels = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]])
+    base_logits = torch.randn(2, 4, 8)
+    coeff = 0.05
+
+    def logit_grad(entropy_coeff):
+        logits = base_logits.clone().requires_grad_(True)
+        logprobs, entropy = gather_logprobs_entropy(logits, labels)
+        input_data["logprobs"] = logprobs.detach()
+        input_data["prox_logp"] = logprobs.detach()
+        loss = grpo_loss_fn(
+            logprobs=logprobs,
+            entropy=entropy,
+            input_data=input_data,
+            eps_clip=0.2,
+            eps_clip_higher=None,
+            c_clip=None,
+            entropy_coeff=entropy_coeff,
+        )
+        loss.backward()
+        return logits.grad
+
+    # Gradient of the entropy bonus alone, computed independently.
+    logits = base_logits.clone().requires_grad_(True)
+    _, entropy = gather_logprobs_entropy(logits, labels)
+    mask = input_data["loss_mask"].bool()
+    (-coeff * (entropy * mask).sum() / mask.sum()).backward()
+    expected_bonus_grad = logits.grad
+
+    bonus_grad = logit_grad(coeff) - logit_grad(0.0)
+
+    assert expected_bonus_grad.abs().sum() > 0
+    torch.testing.assert_close(bonus_grad, expected_bonus_grad, rtol=1e-5, atol=1e-6)
