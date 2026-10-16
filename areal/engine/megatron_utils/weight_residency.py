@@ -9,7 +9,6 @@ buffer residency used by both persistent scoring workers and AWEX publishers.
 
 from __future__ import annotations
 
-import gc
 from typing import TYPE_CHECKING
 
 import torch
@@ -20,6 +19,7 @@ from areal.engine.megatron_utils.optimizer_chain import (
     build_optimizer_residency_plan,
     checkpoint_awex_residency,
 )
+from areal.infra.platforms import current_platform
 from areal.utils.logging import getLogger
 
 if TYPE_CHECKING:
@@ -69,9 +69,7 @@ class MegatronWeightResidency:
         if "weights" in tags_to_release:
             self._offload_model_weights()
 
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+        current_platform.clear_memory()
 
         self._released_tags.update(tags_to_release)
         logger.info("release_memory done: tags=%s", tags_to_release)
@@ -86,7 +84,7 @@ class MegatronWeightResidency:
             self._reload_model_weights(load_grad=False)
         if "optimizer" in tags_to_resume:
             self._reload_optimizer_states()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self._released_tags.difference_update(tags_to_resume)
         if "optimizer" in tags_to_resume:
             self._optimizer_residency_plan = None
@@ -112,9 +110,7 @@ class MegatronWeightResidency:
                             buf.grad_data.storage().resize_(0)
                             count += 1
         if count > 0:
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+            current_platform.clear_memory()
         logger.info("Released %d grad buffers", count)
 
     def ensure_grad_buffers(self) -> None:
@@ -139,7 +135,7 @@ class MegatronWeightResidency:
                             buf.grad_data.zero_()
                             count += 1
         if count > 0:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             logger.info("Allocated %d grad buffers for training", count)
 
     def _offload_model_weights(self) -> None:
@@ -179,7 +175,7 @@ class MegatronWeightResidency:
                     "Megatron flat-buffer residency requires MCore DDP; "
                     "per-parameter weight offload is forbidden"
                 )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         logger.info("Offloaded %d weight buffers to CPU", count)
 
     def _reload_model_weights(self, load_grad: bool = False) -> None:
@@ -211,7 +207,7 @@ class MegatronWeightResidency:
                 raise RuntimeError(
                     "Cannot reload Megatron weights without MCore DDP flat buffers"
                 )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         logger.info("Reloaded model weights to GPU (load_grad=%s)", load_grad)
 
     def _offload_optimizer_states(self) -> None:
@@ -225,7 +221,7 @@ class MegatronWeightResidency:
                 entry.managed_optimizer.offload_to_cpu()
             else:
                 ordinary_restores[index] = self._release_ordinary_optimizer(entry)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self._purge_te_cache()
         self._ordinary_optimizer_restores = ordinary_restores
         self._optimizer_residency_plan = plan
@@ -245,7 +241,7 @@ class MegatronWeightResidency:
                 continue
             for tensor, device in self._ordinary_optimizer_restores.get(index, []):
                 tensor.data = tensor.data.to(device, non_blocking=True)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self._ordinary_optimizer_restores.clear()
         self._optimizer_residency_plan = None
         logger.info("Restored managed and ordinary optimizer state")

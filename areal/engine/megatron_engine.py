@@ -1344,7 +1344,7 @@ class MegatronEngine(TrainEngine):
             # coalesced all-gather transient.
             self._weight_residency.release_grad_memory()
             gc.collect()
-            torch.cuda.empty_cache()
+            current_platform.clear_memory()
         with self._checkpoint_aware_context(
             with_model=True, with_optimizer=meta.with_optim
         ):
