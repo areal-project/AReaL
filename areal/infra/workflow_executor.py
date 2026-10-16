@@ -37,6 +37,14 @@ from areal.experimental.openai.types import (
     concat_string_interactions,
     concat_tensor_interactions,
 )
+from areal.utils.episode_turns import track_episode_turns
+from areal.utils.environ import is_single_controller
+from areal.utils.rollout_metrics import ConsumedMetrics, Metrics, capture_metrics
+from areal.utils.rollout_stats import (
+    localize_rollout_turn_stats,
+    record_rollout_turn_stats,
+    with_rollout_turn_stats,
+)
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
 from areal.utils.data import RolloutGroup, cycle_dataloader
@@ -246,7 +254,8 @@ class _RolloutTaskInput:
 @dataclass(frozen=True)
 class _RolloutResult:
     task_id: int
-    trajectory: dict[str, Any]
+    trajectory: dict[str, Any] | None
+    metrics: Metrics | None = None
 
 
 class WorkflowContractError(ValueError):
@@ -266,6 +275,7 @@ def validate_rollout_group_sizes(group_size: int, min_usable_group_size: int) ->
 @dataclass(frozen=True)
 class WorkflowContractFailure:
     message: str
+    metrics: Metrics | None = None
 
 
 WorkflowTaskResult = _RolloutResult | WorkflowContractFailure
@@ -355,11 +365,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         enable_tracing: bool = False,
         terminal_error_fn: Callable[[TResult], Exception | None] | None = None,
         deterministic_order: bool = False,
+        consume_result: Callable[[TResult | None], TResult | None] | None = None,
     ):
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
             enable_tracing=enable_tracing,
         )
+        self.consume_result = consume_result or (lambda result: result)
         self.task_factory = task_factory
         self.staleness_manager = staleness_manager
         self.enable_tracing = enable_tracing
@@ -686,7 +698,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             for r in selected:
                 self._active_task_ids.discard(r.task_id)
 
-        return [r.data for r in selected]
+        return [self.consume_result(r.data) for r in selected]
 
     def wait_for_task(
         self,
@@ -694,6 +706,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         timeout: float | None = None,
         raise_timeout: bool = True,
         raise_terminal_error: bool = True,
+        *,
+        consume: bool = True,
     ) -> TResult | None:
         """Wait for a specific task result by task_id."""
         start_time = time.perf_counter()
@@ -725,7 +739,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             found_result = self._pending_results.pop(task_id)
             self._active_task_ids.remove(task_id)
             self._result_cv.notify_all()
-            return found_result.data
+            result = found_result.data
+        return self.consume_result(result) if consume else result
 
     def _pop_terminal_error_locked(
         self, task_id: int | None = None
@@ -743,6 +758,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             if error is None:
                 continue
             self._pending_results.pop(pending_task_id)
+            self.consume_result(result.data)
             self._active_task_ids.discard(pending_task_id)
             self._result_cv.notify_all()
             return error
@@ -1217,9 +1233,13 @@ class WorkflowExecutor:
 
         # Create and initialize the dispatcher
         qsize = self.config.queue_size or self.max_concurrent_rollouts * 16
+        self.consumed_metrics = ConsumedMetrics(
+            publish_to_tracker=not is_single_controller()
+        )
         self._dispatcher = BatchTaskDispatcher[_RolloutTaskInput, WorkflowTaskResult](
             max_queue_size=qsize,
             task_factory=self._create_workflow_task,
+            consume_result=self.consumed_metrics.consume,
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
             terminal_error_fn=get_workflow_result_error,
@@ -1338,9 +1358,10 @@ class WorkflowExecutor:
             try:
                 workflow_data = pending_task.data
                 if workflow_data is not None:
-                    traj = await pending_task.workflow.arun_episode(
-                        self.inference_engine, workflow_data
-                    )
+                    with track_episode_turns():
+                        traj = await pending_task.workflow.arun_episode(
+                            self.inference_engine, workflow_data
+                        )
 
                 # Trajectory format checking
                 if self.config.check_trajectory_format and traj is not None:
@@ -1391,6 +1412,10 @@ class WorkflowExecutor:
 
                 assert traj is None or isinstance(traj, dict), traj
                 if traj is not None and "input_ids" in traj:
+                    if "rollout_num_turns" not in traj and isinstance(
+                        traj.get("turn_ids"), torch.Tensor
+                    ):
+                        traj = with_rollout_turn_stats(traj, None)
                     try:
                         rows = traj["input_ids"].shape[0]
                         group = traj.get("rollout_group")
@@ -1430,8 +1455,16 @@ class WorkflowExecutor:
                         )
 
                 if should_accept_traj:
+                    if pending_task.is_eval:
+                        turn_rows = await asyncio.to_thread(
+                            localize_rollout_turn_stats, [traj]
+                        )
+                        if turn_rows:
+                            record_rollout_turn_stats(turn_rows, scope="eval-train")
                     manager.on_rollout_accepted()
-                    stats_tracker.get("rollout").scalar(accepted=1)
+                    stats_tracker.get(workflow_context.stat_scope()).scalar(
+                        accepted=1, rejected=0
+                    )
                     trace_session_event(
                         "mark_finalized",
                         task_id=task_id,
@@ -1445,7 +1478,9 @@ class WorkflowExecutor:
                     return _RolloutResult(task_id=task_id, trajectory=traj)
 
                 manager.on_rollout_rejected()
-                stats_tracker.get("rollout").scalar(rejected=1)
+                stats_tracker.get(workflow_context.stat_scope()).scalar(
+                    accepted=0, rejected=1
+                )
                 trace_session_event(
                     "mark_finalized",
                     task_id=task_id,
@@ -1461,7 +1496,9 @@ class WorkflowExecutor:
 
             except WorkflowContractError as exc:
                 manager.on_rollout_rejected()
-                stats_tracker.get("rollout").scalar(rejected=1)
+                stats_tracker.get(workflow_context.stat_scope()).scalar(
+                    accepted=0, rejected=1
+                )
                 trace_session_event(
                     "mark_finalized",
                     task_id=task_id,
@@ -1475,7 +1512,9 @@ class WorkflowExecutor:
                 return WorkflowContractFailure(message=str(exc))
             except Exception as exc:  # pragma: no cover - workflow execution errors
                 manager.on_rollout_rejected()
-                stats_tracker.get("rollout").scalar(rejected=1)
+                stats_tracker.get(workflow_context.stat_scope()).scalar(
+                    accepted=0, rejected=1
+                )
                 trace_session_event(
                     "mark_finalized",
                     task_id=task_id,
@@ -1489,7 +1528,16 @@ class WorkflowExecutor:
                 await self._clear_rejected_trajectory(traj)
                 return None
 
-        return _execute_workflow
+        async def _execute_with_metrics() -> WorkflowTaskResult:
+            with capture_metrics() as metrics:
+                result = await _execute_workflow()
+            if isinstance(result, WorkflowContractFailure):
+                return WorkflowContractFailure(result.message, metrics)
+            return _RolloutResult(
+                pending_task.task_id, result.trajectory if result else None, metrics
+            )
+
+        return _execute_workflow if pending_task.is_eval else _execute_with_metrics
 
     def submit(
         self,
@@ -1585,6 +1633,7 @@ class WorkflowExecutor:
             timeout,
             raise_timeout,
             raise_terminal_error=False,
+            consume=False,
         )
 
     @trace_perf("workflow_executor.rollout_batch", category="scheduler")

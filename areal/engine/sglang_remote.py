@@ -893,7 +893,11 @@ class RemoteSGLangEngine(InferenceEngine):
         return self._engine.onload(tags=tags)
 
     def export_stats(self) -> dict[str, float]:
-        return stats_tracker.export_all(reduce_group=None)
+        result = stats_tracker.export_all(reduce_group=None)
+        executor = self._engine._workflow_executor
+        if executor is not None:
+            result.update(executor.consumed_metrics.export())
+        return result
 
     @classmethod
     def as_controller(cls, config: InferenceEngineConfig, scheduler: Scheduler):

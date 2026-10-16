@@ -69,6 +69,7 @@ from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.perf_tracer import Category
 from areal.utils.recover import RecoverHandler
+from areal.utils.rollout_stats import record_rollout_turn_stats
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 from areal.v2.inference_service.controller.controller import (
@@ -985,6 +986,8 @@ class PPOTrainer:
                 self.rollout.offload(tags=["weights"])
                 logger.info("[AWEX] colocate: offload cuda_graph...")
                 self.rollout.offload(tags=["cuda_graph"])
+
+            record_rollout_turn_stats(rollout_batch)
 
             if self.critic is not None:
                 if self._should_offload_critic:

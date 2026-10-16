@@ -125,7 +125,10 @@ class MockScheduler:
                 worker_id in self._pending_results
                 and task_id in self._pending_results[worker_id]
             ):
-                return self._pending_results[worker_id].pop(task_id)
+                return {
+                    "trajectory": self._pending_results[worker_id].pop(task_id),
+                    "metrics": {},
+                }
             return None
         elif method == "wait":
             # Return a result from pending results if available

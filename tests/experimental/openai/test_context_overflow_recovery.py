@@ -918,3 +918,38 @@ async def test_arena_legacy_model_failure_requires_usable_proxy_trajectory(
     finally:
         workflow_context.set(WorkflowContext())
         stats_tracker.export_all(reset=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_proxy_episode_preserves_turn_count_without_export(monkeypatch):
+    from types import SimpleNamespace
+
+    from areal.utils.episode_turns import track_episode_turns
+    from areal.utils.rollout_metrics import ConsumedMetrics, capture_metrics
+
+    fake_client = _FakeProxyClient()
+    fake_client.context_overflow = False
+    fake_client.generated_turn_count = 7
+    fake_client.export_interactions = AsyncMock(
+        side_effect=AssertionError("must not export failed data")
+    )
+    monkeypatch.setattr(
+        workflow_module, "OpenAIProxyClient", lambda *args, **kwargs: fake_client
+    )
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=_FailingAgent())
+    monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    workflow_context.set(WorkflowContext(task_id=3))
+    with capture_metrics() as metrics:
+        with pytest.raises(RuntimeError, match="harness failed"):
+            with track_episode_turns():
+                await workflow.arun_episode(engine=None, data={})
+    consumer = ConsumedMetrics()
+    assert consumer.export() == {}
+    consumer.consume(SimpleNamespace(trajectory=None, metrics=metrics))
+    result = consumer.export()
+    assert result["rollout/num_turns/avg"] == 7
+    assert result["rollout/num_turns_count"] == 1
+    fake_client.export_interactions.assert_not_awaited()

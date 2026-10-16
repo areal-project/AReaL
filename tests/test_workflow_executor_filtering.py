@@ -143,7 +143,7 @@ async def test_filter_rejection_or_failure_clears_remote_payload(
 
     result = await task()
 
-    assert result is None
+    assert result.trajectory is None
     manager.on_rollout_rejected.assert_called_once_with()
     clear_node.assert_has_awaits(
         [
@@ -181,7 +181,7 @@ async def test_filter_rejection_times_out_blocked_remote_cleanup(monkeypatch):
 
     result = await asyncio.wait_for(task(), timeout=1.0)
 
-    assert result is None
+    assert result.trajectory is None
     manager.on_rollout_rejected.assert_called_once_with()
     assert cleared == [("node-b:1234", ["mask"])]
     executor.logger.warning.assert_called_once_with(

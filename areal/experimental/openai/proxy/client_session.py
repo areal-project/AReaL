@@ -113,6 +113,7 @@ class OpenAIProxyClient:
         self.session_id: str | None = None
         self._session_api_key: str | None = None
         self.interaction_count = 0
+        self.generated_turn_count: int | None = None
         self.context_overflow = False
         self.context_overflow_message = ""
         self.system_error = False
@@ -227,6 +228,7 @@ class OpenAIProxyClient:
             resp.raise_for_status()
             data = await resp.json()
 
+        self.generated_turn_count = data.get("generated_turn_count")
         serialized_interactions = data["interactions"]
         tensor_group_id = data.get("tensor_reference_group_id")
         if tensor_group_id is not None:
@@ -296,6 +298,7 @@ class OpenAIProxyClient:
                 headers=self._session_auth_headers(),
             )
             self.interaction_count = int(data.get("interaction_count", 0))
+            self.generated_turn_count = data.get("generated_turn_count")
             self.context_overflow = bool(data.get("context_overflow", False))
             self.context_overflow_message = str(
                 data.get("context_overflow_message", "")

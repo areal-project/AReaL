@@ -802,6 +802,7 @@ class TestEndSessionInteractionCount:
             assert resp_end.status_code == 200
             data = resp_end.json()
             assert data["interaction_count"] == 0
+            assert data["generated_turn_count"] == 0
 
     @pytest.mark.asyncio
     async def test_context_overflow_is_reported_when_session_ends(self, monkeypatch):
@@ -1149,6 +1150,7 @@ class TestExportTrajectories:
             )
             assert resp_export.status_code == 200
             assert "interactions" in resp_export.json()
+            assert resp_export.json()["generated_turn_count"] == 0
 
     @pytest.mark.asyncio
     async def test_group_exports_share_multimodal_tensor_reference(self):
@@ -1338,3 +1340,4 @@ class TestExportTrajectories:
             )
             assert resp_export.status_code == 200
             assert "interactions" in resp_export.json()
+            assert resp_export.json()["generated_turn_count"] == 0

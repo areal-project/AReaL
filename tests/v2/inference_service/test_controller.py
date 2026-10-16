@@ -1066,6 +1066,7 @@ class TestInferenceServiceWorkflow:
             context.get_aiohttp_session = AsyncMock(return_value=AsyncMock())
             context.get.return_value = MagicMock(task_id=42)
             context.get_httpx_client = AsyncMock(return_value=MagicMock())
+            context.stat_scope.return_value = "rollout"
             result = await workflow.arun_episode(engine=MagicMock(), data={})
 
         assert result is None
@@ -1111,6 +1112,7 @@ class TestInferenceServiceWorkflow:
             call(reward=1.0),
             call(reward=2.0),
             call(reward=3.0),
+            call(incomplete_trajectories=0, incomplete_group=0.0),
         ]
 
     @pytest.mark.asyncio
@@ -1127,6 +1129,7 @@ class TestInferenceServiceWorkflow:
             call(reward=1.0),
             call(reward=2.0),
             call(reward=3.0),
+            call(incomplete_trajectories=0, incomplete_group=0.0),
         ]
 
     @pytest.mark.asyncio
@@ -1173,11 +1176,12 @@ class TestInferenceServiceWorkflow:
             (args.args[1], args.args[2])
             for args in workflow._set_last_reward.await_args_list
         } == {(0.0, "session-key-0"), (2.0, "session-key-2"), (3.0, "session-key-3")}
-        assert tracker.scalar.call_args_list == (
-            [call(reward=0.0), call(reward=2.0), call(reward=3.0)]
-            if is_trainable
-            else []
-        )
+        assert tracker.scalar.call_args_list == [
+            call(reward=0.0),
+            call(reward=2.0),
+            call(reward=3.0),
+            call(incomplete_trajectories=1, incomplete_group=1.0),
+        ]
 
 
 # =============================================================================
