@@ -50,8 +50,12 @@ class InteractionWithTokenLogpReward:
     r3_topk: int | None = None
     _cache: dict[str, Any] | None = None
 
-    # Multimodal training data prepared from the complete prompt for this turn.
+    # Prompt token cache
     prompt_token_ids: list[int] | None = None
+    prompt_base_token_ids: list[int] | None = None
+    # Tool set the cached base prefix was rendered with; see
+    # IncrementalPromptRenderer.render_incremental.
+    prompt_tools_signature: str | None = None
     mm_token_type_ids: list[int] | None = None
     multi_modal_input: dict[str, torch.Tensor] | None = None
 

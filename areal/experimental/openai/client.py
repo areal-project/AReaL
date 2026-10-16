@@ -57,6 +57,10 @@ from pydantic import BaseModel
 from areal.api import ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai.cache import InteractionCache
+from areal.experimental.openai.prompt_renderer import (
+    IncrementalPromptRenderer,
+    tools_signature,
+)
 from areal.experimental.openai.tool_call_parser import (
     process_tool_calls,
     split_reasoning,
@@ -715,11 +719,14 @@ def _concat_prompt_token_ids_with_parent(
     tools: Iterable[ChatCompletionToolParam] | None = None,
     extra_body: Body = {},
     full_prompt_token_ids: list[int] | None = None,
+    incremental_prompt_rendering: bool = False,
 ) -> tuple[list[int], int, int]:
     """Return concat prompt IDs, full-prompt cutoff, and parent-prefix length.
 
     ``full_prompt_token_ids`` lets multimodal callers provide processor-expanded
     prompt IDs while preserving the existing parent-token concatenation rules.
+    ``incremental_prompt_rendering`` opts in to rendering only the new turn's
+    tokens; see :class:`IncrementalPromptRenderer`.
     """
     parent_tokens: list[int] = []
     all_message_list: list[dict] = []
@@ -756,6 +763,27 @@ def _concat_prompt_token_ids_with_parent(
     all_message_list = _parse_tool_call_arguments(all_message_list)
 
     if full_prompt_token_ids is None:
+        if (
+            incremental_prompt_rendering
+            and parent is not None
+            and parent.output_message_list is not None
+            and IncrementalPromptRenderer.is_supported(
+                tokenizer,
+                tools=tools,
+                chat_template_kwargs=extra_body.get("chat_template_kwargs", {}),
+            )
+        ):
+            child_tokens = IncrementalPromptRenderer.render_concat_child_tokens(
+                tokenizer,
+                parent_output_messages=parent.output_message_list,
+                message_list=message_list,
+                tools=tools,
+                chat_template_kwargs=extra_body.get("chat_template_kwargs", {}),
+            )
+            if child_tokens is not None:
+                prompt_token_ids = parent_tokens + child_tokens
+                return prompt_token_ids, len(parent_tokens) - 1, len(parent_tokens)
+
         all_tokens = apply_chat_template(
             tokenizer,
             all_message_list,
@@ -797,9 +825,16 @@ async def _prepare_prompt(
     tools: Iterable[ChatCompletionToolParam] | None,
     extra_body: Body,
     require_multimodal_processor: bool = False,
+    interaction: InteractionWithTokenLogpReward | None = None,
     processor_cache: ProcessorCallCache | None = None,
+    incremental_prompt_rendering: bool = False,
 ) -> _PreparedPrompt:
-    """Prepare text or multimodal prompt data for one agent interaction."""
+    """Prepare text or multimodal prompt data for one agent interaction.
+
+    Incremental rendering is opt-in via ``incremental_prompt_rendering``. Its
+    capability probes cover specific conversation shapes, not every template
+    behavior, so the default renders the full history on every turn.
+    """
     chat_template_kwargs = extra_body.get("chat_template_kwargs", {})
     processed_prompt: _PreparedPrompt | None = None
     if image_data and processor is None and require_multimodal_processor:
@@ -843,18 +878,99 @@ async def _prepare_prompt(
             processed_prompt = cached_prompt.copy_for_consumer()
 
     if chat_template_type == "hf":
-        input_ids = (
-            processed_prompt.input_ids
-            if processed_prompt is not None
-            else apply_chat_template(
-                tokenizer,
-                tokenizer_messages,
-                tools=tools,
-                add_generation_prompt=True,
-                tokenize=True,
-                **chat_template_kwargs,
+        if processed_prompt is not None:
+            input_ids = processed_prompt.input_ids
+        elif (
+            incremental_prompt_rendering
+            and processor is None
+            and parent is not None
+            and parent.messages
+            and len(tokenizer_messages) > len(parent.messages)
+            and IncrementalPromptRenderer.is_supported(
+                tokenizer, tools=tools, chat_template_kwargs=chat_template_kwargs
             )
-        )
+        ):
+            delta_messages = tokenizer_messages[len(parent.messages) :]
+            current_tools_signature = tools_signature(tools)
+            parent_base = parent.prompt_base_token_ids
+            parent_tools_signature = parent.prompt_tools_signature
+            if parent_base is None:
+                parent_base = apply_chat_template(
+                    tokenizer,
+                    parent.messages,
+                    tools=tools,
+                    add_generation_prompt=False,
+                    tokenize=True,
+                    **chat_template_kwargs,
+                )
+                parent.prompt_base_token_ids = parent_base
+                # Re-rendered here with the current tool set, so it is up to date.
+                parent_tools_signature = current_tools_signature
+                parent.prompt_tools_signature = parent_tools_signature
+            rendered = IncrementalPromptRenderer.render_incremental(
+                tokenizer,
+                parent_base,
+                delta_messages,
+                tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
+                parent_tools_signature=parent_tools_signature,
+                parent_messages=parent.messages,
+            )
+            if rendered is not None:
+                input_ids, new_base = rendered
+                if interaction is not None:
+                    interaction.prompt_base_token_ids = new_base
+                    interaction.prompt_tools_signature = current_tools_signature
+                    interaction.prompt_token_ids = list(input_ids)
+            else:
+                input_ids = apply_chat_template(
+                    tokenizer,
+                    tokenizer_messages,
+                    tools=tools,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    **chat_template_kwargs,
+                )
+                if interaction is not None:
+                    interaction.prompt_token_ids = list(input_ids)
+        else:
+            # Rendering the base prefix costs an extra chat-template pass, so only
+            # pay for it when a later turn could actually reuse it.
+            if (
+                incremental_prompt_rendering
+                and processor is None
+                and IncrementalPromptRenderer.is_supported(
+                    tokenizer, tools=tools, chat_template_kwargs=chat_template_kwargs
+                )
+                and IncrementalPromptRenderer.is_history_safe(
+                    tokenizer,
+                    tokenizer_messages,
+                    tools=tools,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+            ):
+                input_ids, base_ids = IncrementalPromptRenderer.render_initial(
+                    tokenizer,
+                    tokenizer_messages,
+                    tools=tools,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+                if interaction is not None:
+                    interaction.prompt_base_token_ids = base_ids
+                    interaction.prompt_tools_signature = tools_signature(tools)
+                    interaction.prompt_token_ids = list(input_ids)
+            else:
+                input_ids = apply_chat_template(
+                    tokenizer,
+                    tokenizer_messages,
+                    tools=tools,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    **chat_template_kwargs,
+                )
+                if interaction is not None:
+                    interaction.prompt_token_ids = list(input_ids)
+
         if processor is None:
             return _PreparedPrompt(input_ids=input_ids)
         return _PreparedPrompt(
@@ -883,6 +999,7 @@ async def _prepare_prompt(
         full_prompt_token_ids=(
             processed_prompt.input_ids if processed_prompt is not None else None
         ),
+        incremental_prompt_rendering=incremental_prompt_rendering,
     )
     if processor is None:
         return _PreparedPrompt(input_ids=input_ids)
@@ -944,6 +1061,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         chat_template_type: str = "hf",
         lora_name: str = "",
         require_multimodal_processor: bool = False,
+        incremental_prompt_rendering: bool = False,
     ):
         super().__init__(client)
         self.engine = engine
@@ -956,6 +1074,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self.chat_template_type = chat_template_type
         self.lora_name = lora_name
         self.require_multimodal_processor = require_multimodal_processor
+        self.incremental_prompt_rendering = incremental_prompt_rendering
 
     def _build_chat_completion(
         self,
@@ -1174,7 +1293,9 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             tools=tools_list,
             extra_body=extra_body,
             require_multimodal_processor=self.require_multimodal_processor,
+            interaction=interaction,
             processor_cache=processor_cache,
+            incremental_prompt_rendering=self.incremental_prompt_rendering,
         )
         prompt_token_ids = prepared_prompt.input_ids
         if interaction is not None and self.processor is not None:
@@ -1540,6 +1661,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         chat_template_type: str = "hf",
         lora_name: str = "",
         require_multimodal_processor: bool = False,
+        incremental_prompt_rendering: bool = False,
     ):
         super().__init__(client)
         self.engine = engine
@@ -1552,6 +1674,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         self.chat_template_type = chat_template_type
         self.lora_name = lora_name
         self.require_multimodal_processor = require_multimodal_processor
+        self.incremental_prompt_rendering = incremental_prompt_rendering
 
     async def create(
         self,
@@ -1668,7 +1791,9 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             tools=tools_list,
             extra_body=extra_body,
             require_multimodal_processor=self.require_multimodal_processor,
+            interaction=interaction,
             processor_cache=processor_cache,
+            incremental_prompt_rendering=self.incremental_prompt_rendering,
         )
         prompt_token_ids = prepared_prompt.input_ids
         if self.processor is not None:
@@ -1870,6 +1995,7 @@ class ArealOpenAI(AsyncOpenAI):
         lora_name: str = "",
         processor: "ProcessorMixin | None" = None,
         require_multimodal_processor: bool = False,
+        incremental_prompt_rendering: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1896,6 +2022,7 @@ class ArealOpenAI(AsyncOpenAI):
             chat_template_type=chat_template_type,
             lora_name=lora_name,
             require_multimodal_processor=require_multimodal_processor,
+            incremental_prompt_rendering=incremental_prompt_rendering,
         )
 
         # Override chat.completions with our extended implementation
@@ -1911,6 +2038,7 @@ class ArealOpenAI(AsyncOpenAI):
             chat_template_type=chat_template_type,
             lora_name=lora_name,
             require_multimodal_processor=require_multimodal_processor,
+            incremental_prompt_rendering=incremental_prompt_rendering,
         )
 
     def get_interaction(self, id: str) -> InteractionWithTokenLogpReward | None:
