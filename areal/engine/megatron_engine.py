@@ -260,6 +260,18 @@ def _reuse_chunked_logits_storage(
     return enable_chunked_logits and not entropy_requires_grad
 
 
+def _mtp_token_loss_mask(inputs: dict[str, Any]) -> torch.Tensor | None:
+    """Return supervision in the input-token domain for label-free MTP.
+
+    SFT/PPO shift ``loss_mask`` for their ordinary next-token objective but
+    preserve the original mask separately.  MCore derives and rolls MTP labels
+    itself, so it must start from that original mask.  Direct engine callers
+    may omit the preserved copy and provide an already token-domain mask.
+    """
+
+    return inputs.get("input_token_loss_mask", inputs.get("loss_mask"))
+
+
 def _warn_if_areal_lm_head_entropy_is_nondifferentiable(
     logger: Any,
     *,
@@ -624,6 +636,15 @@ class MegatronEngine(TrainEngine):
                 set_deterministic_algorithms(self.tf_config, prebuild=True)
 
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
+            if (
+                self.bridge_cls == "megatron-bridge"
+                and self.hf_config.model_type == "qwen4_exp"
+            ):
+                # AReaL's Qwen4Exp Megatron-Bridge provider intentionally
+                # materializes only the text GPT. Vision tensors are retained
+                # from the source checkpoint during HF export, but there is no
+                # vision wrapper in this training graph.
+                self.is_vision_model = False
             self.sequence_packing_mode = resolve_sequence_packing_mode(
                 self.hf_config.model_type, self.bridge_cls
             )
@@ -1024,6 +1045,17 @@ class MegatronEngine(TrainEngine):
 
         elif self.bridge_cls == "megatron-bridge":
             from megatron.bridge import AutoBridge as MegatronBridgeAutoBridge
+
+            # Megatron-Bridge 0.6.0 does not register the Qwen3.8 Flash-Next
+            # (Qwen4Exp) architecture. Register AReaL's provider before
+            # AutoBridge reads the checkpoint config. ``self.hf_config`` is
+            # intentionally unavailable until after this method returns, and
+            # the registration helper is idempotent for every other model.
+            from areal.models.mcore.qwen4_exp_megatron_bridge import (
+                register_qwen4_exp_megatron_bridge,
+            )
+
+            register_qwen4_exp_megatron_bridge()
 
             if self.enable_tree_training:
                 raise NotImplementedError(
@@ -1502,6 +1534,13 @@ class MegatronEngine(TrainEngine):
                 param_group["_areal_last_step_lr"] = float(param_group["lr"])
         with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
+        # MCore 0.19 tags detached MTP-head parameters with the independent
+        # ``mtp`` gradient-norm group.  The scalar returned by ``step`` is the
+        # *main* group only, so an MTP-only update correctly returns 0 even
+        # when its gradients are finite and nonzero.  Surface MCore's already
+        # reduced pre-clip group norm instead of recomputing it from local
+        # shards (which would double count TP replicas and miss PP peers).
+        grad_norms_by_group = getattr(self.optimizer, "grad_norms_by_group", {})
         # MTP-only pipeline stages without an MTP block have no parameter
         # groups. Their stub optimizer must still step for global grad stats.
         current_lr = (
@@ -1510,11 +1549,15 @@ class MegatronEngine(TrainEngine):
             else self.lr_scheduler.get_lr({})
         )
 
-        return dict(
+        stats = dict(
             update_successful=float(update_successful),
             grad_norm=float(grad_norm) if grad_norm is not None else float("nan"),
             lr=current_lr,
         )
+        mtp_grad_norm = grad_norms_by_group.get("mtp")
+        if mtp_grad_norm is not None:
+            stats["mtp_grad_norm"] = float(mtp_grad_norm)
+        return stats
 
     def lr_scheduler_step(self):
         assert self.lr_scheduler is not None, "LR Scheduler is not initialized."
@@ -2079,6 +2122,11 @@ class MegatronEngine(TrainEngine):
                 and is_qwen3_5_model(self.hf_config.model_type)
                 and not has_vision_inputs
             )
+            qwen4_megatron_text_padded = (
+                self.bridge_cls == "megatron-bridge"
+                and self.hf_config.architectures == ["Qwen4ExpForConditionalGeneration"]
+                and self.sequence_packing_mode == SequencePackingMode.PADDED
+            )
             # Qwen4Exp's wrapper retains the visual embedding forward while
             # bypassing only the inner language model's final projection. Its
             # mRoPE and token masks are prepared before the shared THD/CP split.
@@ -2113,7 +2161,13 @@ class MegatronEngine(TrainEngine):
             # forward wrapper applies the same zigzag split to these channels as
             # input_ids before MCore performs its CP-aware target rolling.
             if not forward_only and self.mcore_config.enable_mtp_training:
-                mtp_loss_mask = mb_input.padded_mb.get("loss_mask")
+                # SFT/PPO keep the original token-domain supervision mask in
+                # ``input_token_loss_mask`` before shifting ``loss_mask`` to
+                # align the main next-token objective.  MCore's label-free MTP
+                # path derives labels from input_ids and performs its own
+                # boundary-safe rolls, so feeding the already-shifted main
+                # mask would advance MTP supervision by one token too many.
+                mtp_loss_mask = _mtp_token_loss_mask(mb_input.padded_mb)
                 if mtp_loss_mask is None:
                     raise ValueError(
                         "MTP training requires a token-aligned loss_mask so prompt, "
@@ -2133,8 +2187,13 @@ class MegatronEngine(TrainEngine):
                 model,
                 mb_input.padded_mb,
                 gather_cp_output=not cp_local,
-                is_vision_model=self.is_vision_model,
-                use_padded_seq=self.use_padded_seq,
+                # Qwen4Exp's text-only component needs padded BSHD when FLA is
+                # unavailable, but its custom GPT expects no 2-D padding mask.
+                # Route it through the image-free VLM padded branch: this
+                # reconstructs [B,S] ids/positions and deliberately passes a
+                # null attention mask. Fixed-length batch-1 SFT has no padding.
+                is_vision_model=(self.is_vision_model or qwen4_megatron_text_padded),
+                use_padded_seq=(self.use_padded_seq and not qwen4_megatron_text_padded),
                 use_model_packed_seq=self.use_model_packed_seq,
                 fp32_output=_float16_wrapper_fp32_output(
                     self.mcore_config.enable_chunked_logits,
@@ -2142,7 +2201,8 @@ class MegatronEngine(TrainEngine):
                 ),
                 return_hidden_states=use_chunked_lm_head,
                 use_wrapper_packed_seq=(
-                    self.bridge_cls == "mcore-bridge"
+                    self.bridge_cls in ("mcore-bridge", "megatron-bridge")
+                    and self.hf_config.model_type == "qwen4_exp"
                     and self.sequence_packing_mode == SequencePackingMode.WRAPPER_THD
                 ),
                 language_model_only=(
@@ -3714,6 +3774,16 @@ class MegatronEngine(TrainEngine):
         base_model_path: str | None = None,
     ) -> None:
         assert self.model is not None, "Model is not initialized."
+        if (
+            self.bridge_cls == "megatron-bridge"
+            and self.hf_config.model_type == "qwen4_exp"
+            and not self.mcore_config.mtp_only
+        ):
+            raise ValueError(
+                "Qwen4Exp Megatron-Bridge HF export requires mtp_only=True; "
+                "the current exporter streams the source table and would discard "
+                "trained PLE updates."
+            )
         os.makedirs(path, exist_ok=True)
 
         if self.bridge_cls == "megatron-bridge":

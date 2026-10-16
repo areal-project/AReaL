@@ -606,6 +606,10 @@ def packed_context_parallel_forward(
             input_ids, attention_mask, seq_lens, max_seqlen = _reconstruct_padded_2d(
                 input_ids, cu_seqlens, input_.get("max_seqlen")
             )
+            if position_ids is not None:
+                position_ids, _, _, _ = _reconstruct_padded_2d(
+                    position_ids, cu_seqlens, max_seqlen
+                )
             padded_repack_info = (cu_seqlens, seq_lens, max_seqlen)
 
     # Every VLM forward is mask-free (attention_mask=None): the model
@@ -648,13 +652,6 @@ def packed_context_parallel_forward(
                     token_types, cu_seqlens, input_.get("max_seqlen")
                 )
         vlm_kwargs["mm_token_type_ids"] = token_types.to(dtype=torch.long)
-
-    # For BSHD text-only, drop the packed-form position_ids (a 1D tensor of
-    # length total_len) — they don't match the 2D [B, S] input. Let mcore
-    # compute the default torch.arange positions per row; padding positions
-    # are masked out by attention_mask.
-    if dense_mask_text_forward:
-        position_ids = None
 
     # MTP training: convert the supervision mask to the exact layout used by
     # this forward. MCore 0.19 derives targets from input_ids and performs the
