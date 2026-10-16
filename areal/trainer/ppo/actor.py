@@ -37,6 +37,10 @@ from areal.utils.functional import (
     sapo_loss_fn,
 )
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.score_centering import (
+    gather_train_head_logp,
+    score_centering_correction,
+)
 
 logger = logging.getLogger("PPOActor")
 
@@ -360,6 +364,11 @@ class PPOActor:
                         sapo_tau_pos=self.config.sapo_tau_pos,
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_decoupled_loss=self.config.use_decoupled_loss,
+                        use_score_centering=self.config.use_score_centering,
+                        sc_mode=self.config.sc_mode,
+                        sc_clip_low=self.config.sc_clip_low,
+                        sc_clip_high=self.config.sc_clip_high,
+                        sc_temperature=self.config.temperature,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
@@ -470,6 +479,11 @@ def grpo_loss_fn(
     use_decoupled_loss: bool = False,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
+    use_score_centering: bool = False,
+    sc_mode: str = "none",
+    sc_clip_low: float = 0.0,
+    sc_clip_high: float = float("inf"),
+    sc_temperature: float = 1.0,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -525,6 +539,53 @@ def grpo_loss_fn(
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
         )
+
+    # === Score Centering (SC) correction ===
+    sc_correction = None
+    sc_s_bar = None
+    sc_q_mass = None
+    if use_score_centering:
+        sampler_topk_logps = input_data.get("sampler_topk_logps")
+        sampler_topk_token_ids = input_data.get("sampler_topk_token_ids")
+        train_logits = input_data.get("logits")  # [batch, seq, vocab]
+
+        if (
+            sampler_topk_logps is not None
+            and sampler_topk_token_ids is not None
+            and train_logits is not None
+        ):
+            # Gather trainer log-probs for the sampler's top-k tokens, using the
+            # same temperature the trainer applied to its own logprobs.
+            with stats_tracker.record_timing("sc_gather_train_head_logp"):
+                train_head_logp = gather_train_head_logp(
+                    logits=train_logits,
+                    token_ids=sampler_topk_token_ids,
+                    temperature=sc_temperature,
+                )  # [batch, seq, k]
+
+            with stats_tracker.record_timing("sc_correction"):
+                sc_correction, sc_s_bar, sc_q_mass = score_centering_correction(
+                    train_head_logp=train_head_logp,
+                    sampler_topk_logps=sampler_topk_logps,
+                    sampler_topk_mask=input_data.get("sampler_topk_mask"),
+                    sc_mode=sc_mode,
+                    sc_clip_low=sc_clip_low,
+                    sc_clip_high=sc_clip_high,
+                )  # each [batch, seq]
+
+            # Add SC correction to the loss (per-token, masked)
+            sc_loss = torch.where(
+                loss_mask, sc_correction, torch.zeros_like(sc_correction)
+            ).sum() / (loss_mask.sum().clamp(min=1))
+            loss = loss + sc_loss
+        else:
+            logger.warning(
+                "use_score_centering=True but SC correction skipped: "
+                f"sampler_topk_logps={'present' if sampler_topk_logps is not None else 'MISSING'}, "
+                f"sampler_topk_token_ids={'present' if sampler_topk_token_ids is not None else 'MISSING'}, "
+                f"logits={'present' if train_logits is not None else 'MISSING'}; "
+                f"input_data keys={list(input_data.keys())[:18]}"
+            )
 
     # Joint Distillation KL Loss
     teacher_logp = input_data.get("teacher_logp")
@@ -683,6 +744,15 @@ def grpo_loss_fn(
             versions=input_data["versions"],
             current_version=current_version,
             version_metrics_mask=version_metrics_mask,
+        )
+
+    # Log SC statistics
+    if sc_correction is not None:
+        stats_tracker.stat(
+            sc_correction=sc_correction.detach(),
+            sc_s_bar=sc_s_bar.detach() if sc_s_bar is not None else None,
+            sc_q_mass=sc_q_mass.detach() if sc_q_mass is not None else None,
+            denominator="n_valid_tokens",
         )
 
     return loss

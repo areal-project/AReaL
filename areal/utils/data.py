@@ -346,7 +346,14 @@ def concat_padded_tensors(
             continue
         values = [td[key] for td in tensor_dicts]
         if isinstance(values[0], torch.Tensor):
-            pv = 0.0 if key == "attention_mask" else pad_value
+            if key == "attention_mask":
+                pv = 0.0
+            elif "_logps" in key or "_logprobs" in key:
+                # exp(-inf) == 0 so padded slots contribute no probability mass;
+                # exp(0.0) == 1 would silently inflate q_mass (see score_centering).
+                pv = float("-inf")
+            else:
+                pv = pad_value
             result[key] = _pad_cat_dim0(values, pad_value=pv)
         elif isinstance(values[0], list):
             result[key] = [item for v in values for item in v]
@@ -806,8 +813,18 @@ def split_padded_tensor_dict_into_mb_list(
     for key, value in data.items():
         if key in multimodal_keys:
             continue
-        if key == "position_ids" or (
-            torch.is_tensor(value) and value.numel() == bs * max_seqlen
+        if (
+            key == "position_ids"
+            or (torch.is_tensor(value) and value.numel() == bs * max_seqlen)
+            or (
+                # Score Centering: also split 3D tensors [bs, max_seqlen, k] (e.g.
+                # sampler_topk_logps/token_ids) so pack_tensor_dict can pack them
+                # to [total_tokens, k], matching logits/loss_mask seq dimension.
+                torch.is_tensor(value)
+                and value.ndim >= 2
+                and value.shape[0] == bs
+                and value.shape[1] == max_seqlen
+            )
         ):
             # NOTE: qwen2.5-vl position_ids.numel() == bs * max_seqlen * 3
             to_split[key] = value

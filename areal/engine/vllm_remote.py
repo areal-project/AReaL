@@ -78,6 +78,55 @@ def _check_placeholder_count(req: ModelRequest) -> None:
         )
 
 
+def _token_to_id(token: object) -> int | None:
+    """Best-effort conversion of a top-logprob token key to an int id."""
+    if isinstance(token, int):
+        return token
+    if token is None:
+        return None
+    s = str(token)
+    if ":" in s:
+        s = s.split(":")[-1]
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def _parse_top_logprobs(top: object) -> tuple[list[int], list[float]]:
+    """Parse one position's top-k logprobs into (token_ids, logprobs).
+
+    Accepts a mapping ``{token: logprob}`` or a list of
+    ``{"token_id"|"token": ..., "logprob": ...}`` entries. Entries whose token
+    cannot be resolved to an int are skipped.
+    """
+    if top is None:
+        return [], []
+    pairs: list[tuple[object, object]] = []
+    if isinstance(top, dict):
+        pairs = list(top.items())
+    else:
+        for item in top:
+            if not isinstance(item, dict):
+                continue
+            tok = item.get("token_id", item.get("token"))
+            lp = item.get("logprob")
+            if lp is not None:
+                pairs.append((tok, lp))
+    ids: list[int] = []
+    logps: list[float] = []
+    # vLLM already returns top_logprobs sorted by logprob descending; the
+    # downstream SC correction (sum over k) is order-invariant, so we skip
+    # the redundant O(k log k) sort that dominated per-position parsing cost.
+    for tok, lp in pairs:
+        tid = _token_to_id(tok)
+        if tid is None:
+            continue
+        ids.append(tid)
+        logps.append(float(lp))
+    return ids, logps
+
+
 class VLLMBackend:
     """vLLM-specific backend implementation for remote inference."""
 
@@ -123,8 +172,9 @@ class VLLMBackend:
             "ignore_eos": gconfig.ignore_eos,
             "skip_special_tokens": gconfig.skip_special_tokens,
             "frequency_penalty": gconfig.frequency_penalty,
-            # 0 = the sampled token's own logprob, no top-k alternatives.
-            "logprobs": 0,
+            # Score Centering: >0 requests that many top alternatives
+            # per position; 0 requests only the sampled token logprob.
+            "logprobs": getattr(gconfig, "sc_top_k", 0),
         }
         if gconfig.stop:
             # Stop strings require server-side detokenization, so `detokenize`
@@ -198,10 +248,30 @@ class VLLMBackend:
                 f"{len(output_logprobs)} logprobs; they must stay parallel."
             )
 
+        # Score Centering: parse per-position top-k alternatives, if requested.
+        output_topk_ids = None
+        output_topk_logps = None
+        if any(entry.get("top_logprobs") for entry in content):
+            output_topk_ids = []
+            output_topk_logps = []
+            for entry in content:
+                ids, logps = _parse_top_logprobs(entry.get("top_logprobs"))
+                output_topk_ids.append(ids)
+                output_topk_logps.append(logps)
+            if not any(output_topk_ids):
+                logger.warning(
+                    "Received top_logprobs but parsed no token ids; the vLLM "
+                    "/inference/v1/generate schema may not carry token ids for "
+                    "top alternatives. Score Centering will be skipped for this "
+                    "response."
+                )
+
         return HttpGenerationResult(
             output_tokens=output_tokens,
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
+            output_topk_ids=output_topk_ids,
+            output_topk_logps=output_topk_logps,
         )
 
     def build_score_request(

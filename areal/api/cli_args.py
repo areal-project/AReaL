@@ -195,6 +195,13 @@ class GenerationHyperparameters:
         default=1.0,
         metadata={"help": "Sampling temperature. Higher values increase diversity."},
     )
+    # Score Centering: number of top-k logprobs to request from sampler
+    sc_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "Number of top-k logprobs to request for Score Centering. 0 = disabled."
+        },
+    )
     stop_token_ids: list[int] = field(
         default_factory=list,
         metadata={"help": "Stop generation when encountering these token IDs."},
@@ -1715,6 +1722,36 @@ class PPOActorConfig(TrainEngineConfig):
         },
     )
 
+    # Score Centering (arXiv:2609.20807) — additive drift correction
+    use_score_centering: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable Score Centering (SC) additive drift correction. "
+            "When True, requires sampler top-k logprobs in input_data."
+        },
+    )
+    sc_top_k: int = field(
+        default=128,
+        metadata={
+            "help": "Top-k for Score Centering (number of sampler tokens to capture)."
+        },
+    )
+    sc_mode: str = field(
+        default="none",
+        metadata={
+            "help": "SC + IS combination mode: 'none' (pure SC), 'tis' (truncated IS), 'mis' (mixture IS; not yet implemented, raises at runtime).",
+            "choices": ["none", "tis", "mis"],
+        },
+    )
+    sc_clip_low: float = field(
+        default=0.0,
+        metadata={"help": "Lower bound for SC IS ratio clipping."},
+    )
+    sc_clip_high: float = field(
+        default=float("inf"),
+        metadata={"help": "Upper bound for SC IS ratio clipping."},
+    )
+
     # Logging Agent Trajectories
     log_agent_stats: bool = field(
         default=False,
@@ -1781,6 +1818,17 @@ class PPOActorConfig(TrainEngineConfig):
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
                 )
 
+        # Validate Score Centering configuration
+        if self.sc_mode not in ("none", "tis", "mis"):
+            raise ValueError(
+                f"sc_mode must be 'none', 'tis', or 'mis'; got {self.sc_mode!r}."
+            )
+        if self.sc_clip_low >= self.sc_clip_high:
+            raise ValueError(
+                "sc_clip_low must be strictly less than sc_clip_high; "
+                f"got {self.sc_clip_low} >= {self.sc_clip_high}."
+            )
+
         super().__post_init__()
 
 
@@ -1840,6 +1888,9 @@ class vLLMConfig:
     # original
     max_num_batched_tokens: int = 2048
     max_num_seqs: int = 256
+    # Score Centering: vLLM caps logprobs at max_logprobs (default 20).
+    # Auto-raised from gconfig.sc_top_k in PPOConfig.__post_init__.
+    max_logprobs: int = 20
     # kv_cache_type: str = "auto"
     block_size: int = 16
     cpu_offload_gb: float = 0
@@ -2470,6 +2521,14 @@ class InferenceEngineConfig:
             "requests select the adapter by this name (plus the weight version). "
             "Usually left empty and auto-filled from gconfig.lora_name by "
             "PPOConfig.__post_init__ so load and request sides stay in sync."
+        },
+    )
+    sc_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "Score Centering: number of top-k logprobs to request from "
+            "the vLLM sampler. Auto-filled from gconfig.sc_top_k by "
+            "PPOConfig.__post_init__. 0 = disabled (no top-k logprobs)."
         },
     )
     agent: AgentConfig = field(
@@ -3465,6 +3524,29 @@ class PPOConfig(BaseExperimentConfig):
         # the engine config. Single source of truth: gconfig.lora_name.
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
+        # Score Centering: actor.sc_top_k is a convenience fallback for the
+        # request side's single source of truth, gconfig.sc_top_k.
+        if self.actor.use_score_centering and self.gconfig.sc_top_k <= 0:
+            if self.actor.sc_top_k > 0:
+                self.gconfig.sc_top_k = self.actor.sc_top_k
+            else:
+                logger.warning(
+                    "actor.use_score_centering=True but both actor.sc_top_k and "
+                    "generation.sc_top_k are 0; no sampler top-k logprobs will be "
+                    "requested and Score Centering will be skipped."
+                )
+        # Propagate sc_top_k to the rollout engine so the OpenAI-proxy generation
+        # path requests the same top-k logprobs the trainer expects for SC.
+        # The request side (ArealOpenAI) cannot read gconfig.sc_top_k, so it must
+        # come from the engine config. Single source of truth: gconfig.sc_top_k.
+        if self.gconfig.sc_top_k > 0 and not self.rollout.sc_top_k:
+            self.rollout.sc_top_k = self.gconfig.sc_top_k
+        # Propagate sc_top_k to vLLM's max_logprobs so the engine accepts
+        # logprobs=sc_top_k (vLLM default cap is 20). Only raises, never lowers.
+        if self.gconfig.sc_top_k > 0:
+            vllm_cfg = getattr(self, "vllm", None)
+            if vllm_cfg is not None and vllm_cfg.max_logprobs < self.gconfig.sc_top_k:
+                vllm_cfg.max_logprobs = self.gconfig.sc_top_k
         super().__post_init__()
 
 

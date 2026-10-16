@@ -532,3 +532,109 @@ def test_matching_placeholder_count_passes_the_guard():
     )
 
     assert payload["token_ids"] == req.collapsed_input_ids
+
+
+def test_parse_top_logprobs_dict_format():
+    """F-03: _parse_top_logprobs handles {token: logprob} dict format.
+
+    Order follows dict insertion order (no re-sort); downstream SC correction
+    is order-invariant (sum over k), so the exact ordering does not matter
+    as long as ids and logps stay parallel.
+    """
+    from areal.engine.vllm_remote import _parse_top_logprobs
+
+    top = {"token:5": -0.1, "token:3": -0.5, "token:7": -0.01}
+    ids, logps = _parse_top_logprobs(top)
+    assert ids == [5, 3, 7]
+    assert logps == [-0.1, -0.5, -0.01]
+
+
+# === US-SC-VERIFY: Score Centering sampler top-k data flow (spec F-03) ===
+
+
+def test_parse_top_logprobs_list_of_dicts():
+    """F-03: _parse_top_logprobs handles [{"token_id":..,"logprob":..}] list."""
+    from areal.engine.vllm_remote import _parse_top_logprobs
+
+    top = [
+        {"token_id": 5, "logprob": -0.1},
+        {"token_id": 3, "logprob": -0.5},
+    ]
+    ids, logps = _parse_top_logprobs(top)
+    assert ids == [5, 3]
+    assert logps == [-0.1, -0.5]
+
+
+def test_parse_top_logprobs_none():
+    """F-03: None top_logprobs returns empty (padding case)."""
+    from areal.engine.vllm_remote import _parse_top_logprobs
+
+    ids, logps = _parse_top_logprobs(None)
+    assert ids == [] and logps == []
+
+
+def test_parse_generation_response_with_top_logprobs():
+    """F-03: parse_generation_response extracts output_topk_ids/logps."""
+    response = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "token_ids": [5, 6],
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": "a",
+                            "logprob": -0.1,
+                            "top_logprobs": [
+                                {"token_id": 5, "logprob": -0.1},
+                                {"token_id": 3, "logprob": -0.5},
+                            ],
+                        },
+                        {
+                            "token": "b",
+                            "logprob": -0.2,
+                            "top_logprobs": [
+                                {"token_id": 6, "logprob": -0.2},
+                                {"token_id": 4, "logprob": -0.4},
+                            ],
+                        },
+                    ]
+                },
+            }
+        ]
+    }
+    result = VLLMBackend().parse_generation_response(response)
+    assert result.output_topk_ids == [[5, 3], [6, 4]]
+    assert result.output_topk_logps == [[-0.1, -0.5], [-0.2, -0.4]]
+
+
+def test_parse_generation_response_without_top_logprobs():
+    """F-03: no top_logprobs -> output_topk_ids/logps are None."""
+    response = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "token_ids": [5, 6],
+                "logprobs": {
+                    "content": [
+                        {"token": "a", "logprob": -0.1},
+                        {"token": "b", "logprob": -0.2},
+                    ]
+                },
+            }
+        ]
+    }
+    result = VLLMBackend().parse_generation_response(response)
+    assert result.output_topk_ids is None
+    assert result.output_topk_logps is None
+
+
+def test_build_generation_request_requests_sc_top_k():
+    """F-03: build_generation_request includes logprobs=sc_top_k in sampling_params."""
+    gconfig = GenerationHyperparameters(sc_top_k=128, max_new_tokens=4)
+    req = ModelRequest(input_ids=[1, 2, 3], gconfig=gconfig)
+    http_req = VLLMBackend().build_generation_request(req, with_lora=False, version=0)
+    assert http_req.payload["sampling_params"]["logprobs"] == 128
+
+
+# === END US-SC-VERIFY ===

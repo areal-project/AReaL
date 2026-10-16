@@ -23,6 +23,7 @@ from areal.utils.perf_tracer import (
     session_context,
     trace_session,
 )
+from areal.utils.score_centering import pad_topk_ids, pad_topk_logps
 from areal.workflow.reward_metrics import log_reward_metrics
 
 logger = logging.getLogger("RLVRWorkflow")
@@ -175,4 +176,38 @@ class RLVRWorkflow(RolloutWorkflow):
             "attention_mask": torch.ones(len(seq), dtype=torch.bool),
             "rewards": torch.tensor(reward, dtype=torch.float32),
         }
+
+        # Score Centering: propagate sampler top-k data if available
+        if resp.output_topk_ids is not None and resp.output_topk_logps is not None:
+            raw_max_k = (
+                max(len(k) for k in resp.output_topk_ids) if resp.output_topk_ids else 0
+            )
+            if raw_max_k > 0:
+                # vLLM v1 returns 1 + num_logprobs entries (sampled token +
+                # top-N); when the sampled token is outside top-N the dict keeps
+                # all 1+N entries, so raw_max_k may be sc_top_k + 1. Cap k_dim at
+                # sc_top_k so pad_topk_ids/pad_topk_logps slice [:k] truncates the
+                # extra sampled-token entry, keeping all episodes at a uniform k.
+                sc_top_k = getattr(self.gconfig, "sc_top_k", 0)
+                k_dim = sc_top_k if sc_top_k > 0 else raw_max_k
+                # Pad absent slots with id 0 and log-prob -inf (zero mass).
+                input_topk_ids = [
+                    pad_topk_ids([], k_dim) for _ in range(resp.input_len)
+                ]
+                input_topk_logps = [
+                    pad_topk_logps([], k_dim) for _ in range(resp.input_len)
+                ]
+                output_topk_ids = [
+                    pad_topk_ids(ids, k_dim) for ids in resp.output_topk_ids
+                ]
+                output_topk_logps = [
+                    pad_topk_logps(logps, k_dim) for logps in resp.output_topk_logps
+                ]
+                res["sampler_topk_token_ids"] = torch.tensor(
+                    input_topk_ids + output_topk_ids, dtype=torch.int32
+                )  # [seq_len, k]
+                res["sampler_topk_logps"] = torch.tensor(
+                    input_topk_logps + output_topk_logps, dtype=torch.float32
+                )  # [seq_len, k]
+
         return {k: v.unsqueeze(0) for k, v in res.items()}

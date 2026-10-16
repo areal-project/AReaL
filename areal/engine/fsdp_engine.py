@@ -132,6 +132,7 @@ from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.save_load import get_state_dict_from_repo_id_or_path
+from areal.utils.score_centering import check_score_centering_sp_supported
 
 if TYPE_CHECKING:
     from areal.api import Scheduler
@@ -2180,6 +2181,16 @@ class FSDPEngine(TrainEngine):
                     entropy = entropy[: -ctx.pad_length]
                     vocab_min_logits = vocab_min_logits[: -ctx.pad_length]
                     vocab_max_logits = vocab_max_logits[: -ctx.pad_length]
+                    logits = logits[: -ctx.pad_length]
+            # Score Centering: inject raw trainer logits into input_data so
+            # grpo_loss_fn can call gather_train_head_logp. Conditional on SC
+            # being enabled (read from the loss_fn partial) to avoid carrying
+            # full-vocab logits when SC is off.
+            if getattr(loss_fn, "keywords", {}).get("use_score_centering", False):
+                # Fail fast: the injected logits below are the local SP slice,
+                # while loss_mask/sampler data are all-gathered across SP.
+                check_score_centering_sp_supported(True, self.parallel_helper.sp_size)
+                ctx.mb_input["logits"] = logits
             loss = loss_fn(
                 logprobs,
                 entropy,
