@@ -12,7 +12,7 @@ import re
 import struct
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -76,6 +76,10 @@ from areal.engine.core.model import (
     requires_padded_seq,
     resolve_sequence_packing_mode,
     validate_model_packed_seq_dependencies,
+)
+from areal.engine.megatron_utils.activation_storage import (
+    install_activation_storage_tracking,
+    track_activation_storage,
 )
 from areal.engine.megatron_utils.bailing_v3 import (
     BailingV3MlaWeightPairs,
@@ -2395,11 +2399,39 @@ class MegatronEngine(TrainEngine):
                     total_token_count=total_token_count,
                 )
 
-            self.forward_backward_batch(
-                mb_list,
-                process_output,
-                forward_only=False,
-            )
+            activation_context = nullcontext()
+            if self._weight_residency is not None:
+                install_activation_storage_tracking()
+                model_chunks = (
+                    self.model
+                    if isinstance(self.model, (list, tuple))
+                    else [self.model]
+                )
+                protected_tensors = [
+                    tensor
+                    for model_chunk in model_chunks
+                    # Megatron DDP shadows nn.Module.buffers with its grad buffers.
+                    for tensor in (
+                        *model_chunk.parameters(),
+                        *torch.nn.Module.buffers(model_chunk),
+                    )
+                ]
+                activation_context = track_activation_storage(protected_tensors)
+            with activation_context as activation_tracker:
+                self.forward_backward_batch(
+                    mb_list,
+                    process_output,
+                    forward_only=False,
+                )
+
+            if activation_tracker is not None:
+                released_storages, released_bytes = activation_tracker.release()
+                if released_storages:
+                    self.logger.debug(
+                        "Released %d retained Megatron/TE activation storages (%.3f GiB)",
+                        released_storages,
+                        released_bytes / 1024**3,
+                    )
 
             # Step 4: Optimizer step
             stats = self.optimizer_step()
