@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import getpass
+import json
 import os
+import tempfile
+from pathlib import Path
+from typing import Any
 
 import psutil
 
@@ -110,3 +114,39 @@ def validate_shared_path(path: str, name: str = "path", warn_nfs: bool = True) -
             "need access to the same files. Consider using NFS, Lustre, or "
             "other shared storage."
         )
+
+
+def atomic_write_json(
+    path: Path, data: Any, *, indent: int | None = 2, **json_kwargs: Any
+) -> None:
+    """Atomically write ``data`` as JSON to ``path``.
+
+    Writes to a unique tempfile in ``path``'s directory, fsync()s it to
+    disk, then renames into place. ``NamedTemporaryFile(delete=False)``
+    gives us a fresh name per call so concurrent writers do not stomp on
+    each other's tempfiles, and the tempfile is unlinked on serialization
+    or rename failure so half-written state never lingers on disk.
+    JSON keyword arguments override the existing default=str fallback; callers
+    can pass default=None and allow_nan=False for strict data serialization.
+    """
+
+    options = {"default": str}
+    options.update(json_kwargs)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False, suffix=".tmp"
+    ) as f:
+        tmp_path = Path(f.name)
+        try:
+            json.dump(data, f, indent=indent, **options)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise

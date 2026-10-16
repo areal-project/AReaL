@@ -75,6 +75,7 @@ LOGGER_COLORS_EXACT = {
     "vLLMEngine": "white",
     # Dataset - green
     "Dataset": "light_green",
+    "DataEngineeringRunner": "light_green",
     "CLEVR70KDataset": "light_green",
     "ViRL39KDataset": "light_green",
     # Trainers - green

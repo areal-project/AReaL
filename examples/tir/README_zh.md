@@ -196,6 +196,10 @@ examples/tir/
     └── __init__.py
 ```
 
+## 数据工程 recipe
+
+任务生成、清洗、校准和数据集导出见 [TIR 数据工程示例](../data_engineering/tir/README_zh.md)。
+
 ## TODOs
 
 - [ ] 评估脚本
