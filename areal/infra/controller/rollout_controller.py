@@ -37,6 +37,7 @@ from areal.api.cli_args import (
     SchedulingStrategyType,
 )
 from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY, DatasetRoute
+from areal.infra.rpc.rtensor import flatten_shard_ids
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
 from areal.infra.utils.inference_targets import write_inference_targets
@@ -1382,6 +1383,40 @@ class RolloutController:
             return merged
 
         return run_async_task(_compute)
+
+    def clear_batches(self, *targets: Any) -> None:
+        """Drain worker input caches after teacher scoring.
+
+        The actor controller owns source-storage cleanup. Send only shard IDs
+        here so workers can evict cached inputs even after those sources have
+        been deleted, without localizing or refetching the batch. Wait for all
+        worker drains before propagating a failure.
+        """
+        shard_ids = list(dict.fromkeys(flatten_shard_ids(targets)))
+        if not shard_ids:
+            return
+
+        async def _clear() -> list[Any]:
+            return await asyncio.gather(
+                *[
+                    self.scheduler.async_call_engine(
+                        worker_id=worker.id,
+                        method="clear_batches",
+                        engine_name=self._engine_name(rank),
+                        shard_ids=shard_ids,
+                        rpc_meta={"broadcast": False},
+                        http_timeout=self.config.request_timeout,
+                    )
+                    for rank, worker in enumerate(self.workers)
+                ],
+                return_exceptions=True,
+            )
+
+        results = run_async_task(_clear)
+        for worker, result in zip(self.workers, results, strict=True):
+            if isinstance(result, BaseException):
+                result.add_note(f"clear_batches failed on worker {worker.id}")
+                raise result
 
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
         """Asynchronously generate a response for the given request.

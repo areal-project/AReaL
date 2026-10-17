@@ -1277,6 +1277,13 @@ class PPOTrainer:
                         cleanups.append(
                             ("ref", lambda: self.ref.clear_batches(rollout_batch))
                         )
+                    if self.teacher is not None:
+                        cleanups.append(
+                            (
+                                "teacher",
+                                lambda: self.teacher.clear_batches(rollout_batch),
+                            )
+                        )
                     if self.data_controller is not None:
                         cleanups.append(
                             ("data", lambda: self.data_controller.clear_batches())
