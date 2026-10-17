@@ -1009,6 +1009,8 @@ class RemoteInfEngine(InferenceEngine):
         accumulated_output_logprobs = []
         accumulated_versions = []
         accumulated_routed_experts: list[np.ndarray] = []
+        accumulated_topk_ids = []
+        accumulated_topk_logps = []
 
         # A single "rid" shares the same server to allow KV cache reuse
         if req.rid in self.rid_to_address:
@@ -1091,6 +1093,24 @@ class RemoteInfEngine(InferenceEngine):
             # Accumulate routed_experts for MoE models
             if gen_result.routed_experts is not None:
                 accumulated_routed_experts.append(gen_result.routed_experts)
+            # Accumulate SC top-k fields
+            if gen_result.output_topk_ids is not None:
+                # P1: assert per-chunk length to catch truncation early.
+                assert len(gen_result.output_topk_ids) == len(
+                    gen_result.output_tokens
+                ), (
+                    f"output_topk_ids len {len(gen_result.output_topk_ids)} "
+                    f"!= output_tokens len {len(gen_result.output_tokens)}"
+                )
+                accumulated_topk_ids.extend(gen_result.output_topk_ids)
+            if gen_result.output_topk_logps is not None:
+                assert len(gen_result.output_topk_logps) == len(
+                    gen_result.output_tokens
+                ), (
+                    f"output_topk_logps len {len(gen_result.output_topk_logps)} "
+                    f"!= output_tokens len {len(gen_result.output_tokens)}"
+                )
+                accumulated_topk_logps.extend(gen_result.output_topk_logps)
 
             # Update request for next iteration
             req.extend_prompt(gen_result.output_tokens)
@@ -1130,6 +1150,10 @@ class RemoteInfEngine(InferenceEngine):
             tokenizer=req.tokenizer,
             processor=req.processor,
             routed_experts=accumulated_routed_experts,
+            output_topk_ids=accumulated_topk_ids if accumulated_topk_ids else None,
+            output_topk_logps=accumulated_topk_logps
+            if accumulated_topk_logps
+            else None,
         )
         return response
 

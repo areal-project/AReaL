@@ -259,6 +259,13 @@ def drop_vision_pad_tokens(response: Any, pad_ids: frozenset[int]) -> None:
         seq = getattr(response, attr, None)
         if seq is not None and len(seq) == n_dropped + len(keep):
             setattr(response, attr, [seq[i] for i in keep])
+    # P1: also filter SC top-k fields to stay index-aligned with tokens.
+    # If top-k is not filtered but tokens are, the seq length mismatch
+    # will desync the sampler_topk <-> logits alignment in the trainer.
+    for attr in ("output_topk_ids", "output_topk_logps"):
+        seq = getattr(response, attr, None)
+        if seq is not None and len(seq) == n_dropped + len(keep):
+            setattr(response, attr, [seq[i] for i in keep])
     logger.warning(
         f"Dropped {n_dropped} generated vision-pad token(s) from the response. "
         "The model is sampling reserved image/video placeholders, which would "
@@ -865,6 +872,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
         processor: Any | None = None,
+        sc_top_k: int = 0,
     ):
         super().__init__(client)
         self.engine = engine
@@ -876,6 +884,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self.chat_template_type = chat_template_type
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.lora_name = lora_name
+        self.sc_top_k = sc_top_k
         self.processor = processor
         self.vision_pad_ids = vision_pad_token_ids(tokenizer, processor=processor)
 
@@ -1228,6 +1237,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
+            sc_top_k=self.sc_top_k,
             stop_token_ids=list(
                 set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
             ),
@@ -1438,6 +1448,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
         processor: Any | None = None,
+        sc_top_k: int = 0,
     ):
         super().__init__(client)
         self.engine = engine
@@ -1449,6 +1460,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         self.chat_template_type = chat_template_type
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.lora_name = lora_name
+        self.sc_top_k = sc_top_k
         self.processor = processor
         self.vision_pad_ids = vision_pad_token_ids(tokenizer, processor=processor)
 
@@ -1658,6 +1670,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             temperature=temp,
             max_new_tokens=max_new_tokens,
             max_tokens=resolved_max_tokens,
+            sc_top_k=self.sc_top_k,
             top_p=top_p_val,
             stop=stop,
             greedy=temp == 0,
@@ -1815,6 +1828,7 @@ class ArealOpenAI(AsyncOpenAI):
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
         processor: Any | None = None,
+        sc_top_k: int = 0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1823,6 +1837,7 @@ class ArealOpenAI(AsyncOpenAI):
         self.tool_call_parser = tool_call_parser
         self.reasoning_parser = reasoning_parser
         self.lora_name = lora_name
+        self.sc_top_k = sc_top_k
         self.processor = processor
 
         # Use an ordered dict to maintain insertion order of completions/responses
@@ -1841,6 +1856,7 @@ class ArealOpenAI(AsyncOpenAI):
             chat_template_kwargs=chat_template_kwargs,
             lora_name=lora_name,
             processor=processor,
+            sc_top_k=self.sc_top_k,
         )
 
         # Override chat.completions with our extended implementation
@@ -1856,6 +1872,7 @@ class ArealOpenAI(AsyncOpenAI):
             chat_template_kwargs=chat_template_kwargs,
             lora_name=lora_name,
             processor=processor,
+            sc_top_k=self.sc_top_k,
         )
 
     def get_interaction(self, id: str) -> InteractionWithTokenLogpReward | None:

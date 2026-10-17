@@ -13,6 +13,7 @@ from openai.types.responses.response_input_param import ResponseInputParam
 
 from areal.api import ModelResponse
 from areal.utils import logging
+from areal.utils.score_centering import pad_topk_ids, pad_topk_logps
 
 logger = logging.getLogger("TokenLogpReward")
 
@@ -256,6 +257,43 @@ class InteractionWithTokenLogpReward:
                 _align_mm_token_type_ids(self.mm_token_type_ids, resp, len(seq)),
                 dtype=torch.long,
             ).unsqueeze(0)
+        # Score Centering: propagate sampler top-k logprobs if available.
+        # Mirrors rlvr.py SC logic: input positions get zero top-k (no sampler
+        # data), output positions get the actual top-k token ids and logprobs.
+        if resp.output_topk_ids is not None and resp.output_topk_logps is not None:
+            if self.chat_template_type == "concat" and self.parent is not None:
+                raise NotImplementedError(
+                    "Score Centering is not supported with chat_template_type="
+                    "'concat' multi-turn interactions: the parent's top-k sampler "
+                    "data is not propagated into the child trajectory. Use "
+                    "chat_template_type='hf' or disable Score Centering."
+                )
+            pad_k = (
+                max(len(k) for k in resp.output_topk_ids) if resp.output_topk_ids else 0
+            )
+            if pad_k > 0:
+                k_dim = pad_k
+                # Input tokens have no sampler data. Pad ids with 0 and
+                # log-probs with -inf so they contribute zero mass.
+                input_topk_ids = [
+                    pad_topk_ids([], k_dim) for _ in range(resp.input_len)
+                ]
+                input_topk_logps = [
+                    pad_topk_logps([], k_dim) for _ in range(resp.input_len)
+                ]
+                # Output tokens: pad each row to k_dim.
+                output_topk_ids = [
+                    pad_topk_ids(ids, k_dim) for ids in resp.output_topk_ids
+                ]
+                output_topk_logps = [
+                    pad_topk_logps(logps, k_dim) for logps in resp.output_topk_logps
+                ]
+                result["sampler_topk_token_ids"] = torch.tensor(
+                    input_topk_ids + output_topk_ids, dtype=torch.int32
+                ).unsqueeze(0)  # [1, seq_len, k]
+                result["sampler_topk_logps"] = torch.tensor(
+                    input_topk_logps + output_topk_logps, dtype=torch.float32
+                ).unsqueeze(0)  # [1, seq_len, k]
         self._cache = result
         return result
 
