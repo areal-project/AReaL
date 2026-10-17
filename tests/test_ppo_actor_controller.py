@@ -9,6 +9,7 @@ from areal.trainer.ppo.actor import PPOActorController
 def _make_controller(backend: str) -> PPOActorController:
     controller = object.__new__(PPOActorController)
     controller.train_alloc = SimpleNamespace(backend=backend)
+    controller.config = SimpleNamespace(packing_algorithm="ffd")
     return controller
 
 

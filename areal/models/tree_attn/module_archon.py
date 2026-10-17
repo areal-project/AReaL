@@ -93,6 +93,7 @@ class TreeAttentionWrapper(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         tree_attn_meta: TreeAttentionMeta | None = None,
+        cu_seqlens_k: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute tree attention.
 
@@ -107,6 +108,8 @@ class TreeAttentionWrapper(nn.Module):
                 kept for API compatibility with VarlenAttentionWrapper).
             tree_attn_meta: Tree attention metadata containing either a
                 BlockMask (flex attention) or TreeAttentionData (Triton).
+            cu_seqlens_k: Unused. Accepted for interface compatibility with
+                VarlenAttentionWrapper.
 
         Returns:
             Attention output, shape [batch, heads, seq_len, head_dim]

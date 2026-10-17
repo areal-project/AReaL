@@ -14,6 +14,7 @@ import importlib.machinery
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -40,6 +41,61 @@ if _TORCH_VERSION < _MIN_TORCH_VERSION:
     collect_ignore_glob.append("test_*.py")
 if _TF_VERSION < _MIN_TF_QWEN3_5:
     collect_ignore_glob.extend(["test_qwen3_5*.py", "test_hf_parity_qwen3_5*.py"])
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--dta-data",
+        type=str,
+        default=None,
+        help="Path to .pt file with DTA token sequences (list[Tensor]).",
+    )
+    parser.addoption(
+        "--no-dta",
+        action="store_true",
+        default=False,
+        help="Disable DTA.",
+    )
+    parser.addoption(
+        "--max-tokens-per-mb",
+        type=int,
+        default=5596,
+        help="Cap sequence length and set mb_spec.max_tokens_per_mb for archon tests.",
+    )
+    parser.addoption(
+        "--dta-limit",
+        type=int,
+        default=-1,
+        help="Use at most N sequences from --dta-data; -1 keeps all sequences.",
+    )
+    parser.addoption(
+        "--use-hf",
+        action="store_true",
+        default=False,
+        help="Use HuggingFace model for Archon DTA tests.",
+    )
+    parser.addoption(
+        "--model-path",
+        type=str,
+        default="/storage/openpsi/models/Qwen__Qwen2.5-0.5B-Instruct/",
+        help="Path to model.",
+    )
+
+
+@pytest.fixture(scope="module")
+def archon_test_config(request) -> SimpleNamespace:
+    """Expose archon runtime config to tests/fixtures."""
+    Ans = SimpleNamespace(
+        max_tokens_per_mb=int(request.config.getoption("--max-tokens-per-mb")),
+        tree_training_mode=(
+            "disabled" if request.config.getoption("--no-dta") else "dta"
+        ),
+        dta_data=request.config.getoption("--dta-data"),
+        dta_limit=int(request.config.getoption("--dta-limit")),
+        use_hf=request.config.getoption("--use-hf"),
+        model_path=request.config.getoption("--model-path"),
+    )
+    return Ans
 
 
 def pytest_collection_modifyitems(config, items):

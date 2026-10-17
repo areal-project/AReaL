@@ -1,0 +1,72 @@
+# Example config for tests/experimental/archon/torchrun/run_archon_training_test.py.
+#
+# Launch (2 GPUs, dp=2, DTA enabled):
+#   torchrun --nproc_per_node=2 \
+#     tests/experimental/archon/torchrun/run_archon_training_test.py \
+#     --config tests/experimental/archon/torchrun/archon_training_test.yaml \
+#     test_config.step=4 \
+#     test_config.data_dir=/path/to/data_dir
+#
+# CLI overrides use OmegaConf dotlist syntax; eg ``actor.mb_spec.max_tokens_per_mb=8192``.
+
+experiment_name: archon_train_test
+trial_name: trial0
+
+cluster:
+  fileroot: /storage/openpsi/experiments
+
+actor:
+  backend: archon:d2
+  path: /storage/openpsi/models/Qwen__Qwen3-0.6B
+  dtype: bfloat16
+  init_from_scratch: false
+  gradient_checkpointing: false
+
+  mb_spec:
+    max_tokens_per_mb: 16384
+
+  archon:
+    attn_type: varlen
+
+  optimizer:
+    type: adam
+    lr: 1.0e-5
+    weight_decay: 0.01
+    warmup_steps_proportion: 0.0
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+
+  # Dynamic Tree Attention toggles.
+  tree_training_mode: dta        # {disabled, sparse, dta}
+  dta_block_size: 2048
+  packing_algorithm: dta         # rollout: {ffd, kk, dta} (not mb_spec)
+
+test_config:
+  # step is required; set via CLI or here.
+  step: 4
+  # Optional: max sequences to use from each .pt after load (0 = use all).
+  max_sequences_per_pt: 16
+  # data_dir is required; must be set via CLI override, eg
+  #   test_config.data_dir=/path/to/data_dir
+  data_dir: ""
+  disable_optimizer: false
+  save_diff: true
+  save_params: false
+  save_initial_params: false
+  seed: 42
+  is_critic: false
+  # Optional entropy regularization for debugging token-length sensitivity.
+  # entropy_mode=sum makes longer (less truncated) batches contribute more.
+  entropy_coef: 1e-4
+  entropy_mode: sum             # {mean, sum}
+  # Optional: store full fp32 parameter deltas in diff.pt for elementwise compare.
+  save_full_diff_tensors_fp32: true
+  # Optional: after the last step, write last_grads.pt (before teardown). Safe with
+  # disable_optimizer=true (captures .grad inside the patched step before zeroing).
+  dump_last_grads: true
+  # Full fp32 grad tensors in last_grads.pt (set false for stats-only / smaller files).
+  save_full_last_grad_tensors_fp32: true
+  # Optional: ``null``/omit = no HF export after init; else directory for ``save_model_to_hf``.
+  save_hf_checkpoint_dir: null
+  # Optional: dump forward_batch parity payload (current mode vs disabled baseline).
+  dump_forward_compare: true

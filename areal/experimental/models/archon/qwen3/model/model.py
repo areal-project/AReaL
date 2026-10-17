@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DTensor
+from transformers.cache_utils import DynamicCache
 
 from areal.experimental.models.archon.attention import (
     SDPAWrapper,
@@ -195,6 +198,8 @@ class Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         tree_attn_meta: TreeAttentionMeta | None = None,
+        past_key_values: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
     ) -> torch.Tensor:
         bs, seqlen, _ = x.shape
 
@@ -251,6 +256,21 @@ class Attention(nn.Module):
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
+        cu_seqlens_k = None
+        # Preserve per-step KV for cache update. Attention may still consume
+        # concatenated (past + current) KV when past_key_values is provided.
+        kv_step = (xk, xv)
+        # KV cache for attention compute path: concat past K/V with newly computed K/V
+        if past_key_values is not None:
+            past_k, past_v = past_key_values
+            xk = torch.cat([past_k, xk], dim=2)
+            xv = torch.cat([past_v, xv], dim=2)
+            cu_seqlens_k = cu_seqlens.clone()
+            cu_seqlens_k += past_k.shape[2]
+            cu_seqlens_k[0] = 0
+
+        new_kv = kv_step if use_cache else None
+
         output = self.packed_attn(
             xq,
             xk,
@@ -259,6 +279,7 @@ class Attention(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             tree_attn_meta=tree_attn_meta,
+            cu_seqlens_k=cu_seqlens_k,
         )
 
         output = output.transpose(1, 2).contiguous()
@@ -271,7 +292,11 @@ class Attention(nn.Module):
             seqlen = output.shape[1]
 
         output = output.view(bs, seqlen, -1)
-        return self.wo(output)
+        output = self.wo(output)
+
+        if use_cache:
+            return output, new_kv
+        return output
 
 
 class FeedForward(nn.Module):
@@ -334,19 +359,31 @@ class TransformerBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         tree_attn_meta: TreeAttentionMeta | None = None,
+        past_key_values: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
     ) -> torch.Tensor:
-        x = x + self.attention(
+        attn_out = self.attention(
             self.attention_norm(x),
             rope_cache,
             positions,
             cu_seqlens,
             max_seqlen,
             tree_attn_meta=tree_attn_meta,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
         )
+        new_kv: tuple[torch.Tensor, torch.Tensor] | None = None
+        if use_cache:
+            assert isinstance(attn_out, tuple)
+            attn_out, new_kv = attn_out
+        x = x + attn_out
         if self.moe_enabled:
             x = x + self.moe(self.ffn_norm(x))
         else:
             x = x + self.feed_forward(self.ffn_norm(x))
+        if use_cache:
+            assert new_kv is not None
+            return x, new_kv
         return x
 
     def init_weights(self):
@@ -456,11 +493,42 @@ class Qwen3Model(BaseArchonModel):
     def forward(
         self,
         tokens: torch.Tensor,
-        positions: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int | torch.Tensor,
+        positions: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | torch.Tensor | None = None,
         tree_attn_meta: TreeAttentionMeta | None = None,
-    ) -> torch.Tensor:
+        past_key_values: DynamicCache | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | SimpleNamespace:
+        if past_key_values is not None:
+            if (
+                positions is not None
+                or cu_seqlens is not None
+                or max_seqlen is not None
+            ):
+                raise ValueError(
+                    "When past_key_values is provided, positions/cu_seqlens/max_seqlen "
+                    "must be None and are inferred internally."
+                )
+            past_len = 0
+            if len(past_key_values.layers) > 0:
+                past_len = int(past_key_values.layers[0].keys.shape[2])
+            seq_len = tokens.shape[1]
+            positions = torch.arange(
+                past_len,
+                past_len + seq_len,
+                dtype=torch.long,
+                device=tokens.device,
+            ).unsqueeze(0)
+            cu_seqlens = torch.tensor(
+                [0, tokens.shape[1]], dtype=torch.int32, device=tokens.device
+            )
+            max_seqlen = int(tokens.shape[1]) + past_len
+
+        assert positions is not None
+        assert cu_seqlens is not None
+        assert max_seqlen is not None
+
         # When pipeline parallelism enabled, cu_seqlens is [1, B+1]
         if cu_seqlens.ndim == 2:
             cu_seqlens = cu_seqlens.squeeze(0)
@@ -471,15 +539,34 @@ class Qwen3Model(BaseArchonModel):
 
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
-        for layer in self.layers.values():
-            h = layer(
+        if use_cache:
+            if past_key_values is not None:
+                next_cache = past_key_values
+            else:
+                next_cache = DynamicCache()
+        for layer_idx, layer in enumerate(self.layers.values()):
+            layer_past = None
+            if past_key_values is not None and layer_idx < len(past_key_values.layers):
+                layer_entry = past_key_values.layers[layer_idx]
+                layer_past = (layer_entry.keys, layer_entry.values)
+
+            layer_out = layer(
                 h,
                 self.rope_cache,
                 positions,
                 cu_seqlens,
                 max_seqlen,
                 tree_attn_meta=tree_attn_meta,
+                past_key_values=layer_past,
+                use_cache=use_cache,
             )
+            if use_cache:
+                assert isinstance(layer_out, tuple)
+                h, layer_kv = layer_out
+                assert next_cache is not None
+                next_cache.update(layer_kv[0], layer_kv[1], layer_idx=layer_idx)
+            else:
+                h = layer_out
 
         h = self.norm(h) if self.norm else h
 
@@ -487,6 +574,8 @@ class Qwen3Model(BaseArchonModel):
             output = self.score(h) if self.score else h
         else:
             output = self.output(h) if self.output else h
+        if use_cache:
+            return SimpleNamespace(logits=output, past_key_values=next_cache)
         return output
 
 

@@ -133,7 +133,10 @@ def test_assign_domain_teacher_logps_routes_each_trajectory_to_matching_teacher(
             distill_loss_weight=0.25,
             distill_loss_type="mopd_pg",
             mopd_adv_clip=3.0,
-        )
+        ),
+        actor=SimpleNamespace(
+            packing_algorithm="ffd",
+        ),
     )
     trainer.teachers = [_FakeTeacher(1.0), _FakeTeacher(2.0)]
     trainer.teacher_configs = [_teacher_config("math"), _teacher_config("coding")]

@@ -86,7 +86,7 @@ actor:
     std_level: batch
   max_new_tokens: ${gconfig.max_new_tokens}
   pad_to_maximum: true
-  enable_tree_training: true
+  tree_training_mode: sparse
   scheduling_spec:
     - task_type: worker
       port_count: 2
