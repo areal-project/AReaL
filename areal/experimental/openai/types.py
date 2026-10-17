@@ -417,7 +417,11 @@ def concat_tensor_interactions(
 def normalize_group_rewards(
     results: list[dict[str, InteractionWithTokenLogpReward] | None],
 ) -> bool:
-    """Normalize one scalar reward per rollout while preserving raw rewards."""
+    """Normalize one scalar reward per rollout while preserving raw rewards.
+
+    ``original_reward`` is populated from ``reward`` only when it is still
+    unset, so a raw baseline recorded earlier in the pipeline survives.
+    """
     if not results:
         return False
 
@@ -442,7 +446,8 @@ def normalize_group_rewards(
         for interaction in result.values():
             if interaction.reward is None:
                 continue
-            interaction.original_reward = interaction.reward
+            if interaction.original_reward is None:
+                interaction.original_reward = interaction.reward
             interaction.reward = normalized_reward
             if interaction._cache is not None:
                 interaction._cache["rewards"] = torch.tensor([float(normalized_reward)])
