@@ -348,7 +348,10 @@ def concat_padded_tensors(
         if isinstance(values[0], torch.Tensor):
             if key == "attention_mask":
                 pv = 0.0
-            elif "_logps" in key or "_logprobs" in key:
+            elif key in ("sampler_topk_logps", "ref_logprobs", "logprobs"):
+                # P1: explicit whitelist for logprob keys that need -inf padding.
+                # Previously used substring match ("_logps" in key) which also
+                # matched ref_logprobs correctly but could false-match future keys.
                 # exp(-inf) == 0 so padded slots contribute no probability mass;
                 # exp(0.0) == 1 would silently inflate q_mass (see score_centering).
                 pv = float("-inf")

@@ -259,6 +259,13 @@ def drop_vision_pad_tokens(response: Any, pad_ids: frozenset[int]) -> None:
         seq = getattr(response, attr, None)
         if seq is not None and len(seq) == n_dropped + len(keep):
             setattr(response, attr, [seq[i] for i in keep])
+    # P1: also filter SC top-k fields to stay index-aligned with tokens.
+    # If top-k is not filtered but tokens are, the seq length mismatch
+    # will desync the sampler_topk <-> logits alignment in the trainer.
+    for attr in ("output_topk_ids", "output_topk_logps"):
+        seq = getattr(response, attr, None)
+        if seq is not None and len(seq) == n_dropped + len(keep):
+            setattr(response, attr, [seq[i] for i in keep])
     logger.warning(
         f"Dropped {n_dropped} generated vision-pad token(s) from the response. "
         "The model is sampling reserved image/video placeholders, which would "

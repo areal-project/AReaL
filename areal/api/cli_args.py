@@ -1828,6 +1828,58 @@ class PPOActorConfig(TrainEngineConfig):
                 "sc_clip_low must be strictly less than sc_clip_high; "
                 f"got {self.sc_clip_low} >= {self.sc_clip_high}."
             )
+        # P0-D: tis requires finite sc_clip_high (otherwise weight_fn=identity,
+        # correction degenerates to 0 and pad slots produce 0*inf=NaN).
+        if self.use_score_centering and self.sc_mode == "tis":
+            import math
+
+            if not math.isfinite(self.sc_clip_high):
+                raise ValueError(
+                    "sc_mode='tis' requires finite sc_clip_high "
+                    f"(got {self.sc_clip_high}); use 'none' for pure SC."
+                )
+        # P0-D: mis requires finite sc_clip_low and sc_clip_high, and low >= 0.
+        if self.use_score_centering and self.sc_mode == "mis":
+            import math
+
+            if not (
+                math.isfinite(self.sc_clip_low) and math.isfinite(self.sc_clip_high)
+            ):
+                raise ValueError(
+                    "sc_mode='mis' requires finite sc_clip_low and sc_clip_high "
+                    f"(got low={self.sc_clip_low}, high={self.sc_clip_high})."
+                )
+            if self.sc_clip_low < 0:
+                raise ValueError(
+                    f"sc_mode='mis' requires sc_clip_low >= 0 (got {self.sc_clip_low})."
+                )
+            if self.sc_clip_high <= 0:
+                raise ValueError(
+                    f"sc_mode='mis' requires sc_clip_high > 0 (got {self.sc_clip_high})."
+                )
+
+        # P1: SC + unsupported combinations fail fast.
+        if self.use_score_centering:
+            if self.enable_tree_training:
+                raise NotImplementedError(
+                    "Score Centering is not supported with tree training "
+                    "(enable_tree_training=True). Tree training uses flex attention "
+                    "with a different sequence layout that breaks top-k alignment."
+                )
+            # recompute_logprob=True means the engine computes old_logp from
+            # the trainer's own forward pass, so TIM (train-inference mismatch)
+            # is effectively 0 — the drift SC is designed to correct does not
+            # exist.  With the P0-A fix (advantage * correction) the spurious
+            # gradient is advantage-gated (≈0 for GRPO), so we warn rather
+            # than hard-reject to avoid blocking on-policy SC experiments.
+            if self.recompute_logprob:
+                logger.warning(
+                    "use_score_centering=True with recompute_logprob=True: "
+                    "TIM is 0 (old_logp from trainer forward), so SC correction "
+                    "targets a non-existent drift. With P0-A fix the gradient is "
+                    "advantage-gated, but consider recompute_logprob=False for "
+                    "meaningful drift correction."
+                )
 
         super().__post_init__()
 
@@ -3547,6 +3599,38 @@ class PPOConfig(BaseExperimentConfig):
             vllm_cfg = getattr(self, "vllm", None)
             if vllm_cfg is not None and vllm_cfg.max_logprobs < self.gconfig.sc_top_k:
                 vllm_cfg.max_logprobs = self.gconfig.sc_top_k
+
+        # P1: Score Centering sampling prerequisites — SC requires stochastic
+        # sampling so the sampler top-k head is a meaningful distribution.
+        if self.actor.use_score_centering:
+            if self.gconfig.greedy:
+                raise ValueError(
+                    "use_score_centering=True requires stochastic sampling; "
+                    "set generation.greedy=False."
+                )
+            if self.gconfig.temperature <= 0:
+                raise ValueError(
+                    "use_score_centering=True requires temperature > 0; "
+                    f"got {self.gconfig.temperature}."
+                )
+            if not (0 < self.gconfig.top_p <= 1.0):
+                raise ValueError(
+                    "use_score_centering=True requires 0 < top_p <= 1.0; "
+                    f"got {self.gconfig.top_p}."
+                )
+            # top_k: vLLM semantics — <=0 or >= vocab means unbounded.
+            # If bounded, it must be >= sc_top_k so the top-k head is complete.
+            if 0 < self.gconfig.top_k < self.gconfig.sc_top_k:
+                raise ValueError(
+                    f"use_score_centering=True requires top_k >= sc_top_k "
+                    f"({self.gconfig.sc_top_k}) when top_k is bounded; "
+                    f"got top_k={self.gconfig.top_k}. Set top_k<=0 for unbounded."
+                )
+            if self.gconfig.frequency_penalty != 0.0:
+                raise ValueError(
+                    "use_score_centering=True requires no frequency_penalty; "
+                    "set frequency_penalty=0.0."
+                )
         super().__post_init__()
 
 

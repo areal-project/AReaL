@@ -187,7 +187,7 @@ def score_centering_correction(
     sc_mode: str = "none",
     sc_clip_low: float = 0.0,
     sc_clip_high: float = float("inf"),
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute the additive Score Centering correction.
 
     The sampler's tail (outside the top-k head H) is modeled as the trainer's
@@ -212,12 +212,16 @@ def score_centering_correction(
         sc_clip_low / sc_clip_high: bounds for IS ratio clipping (tis/mis).
 
     Returns:
-        ``(correction, s_bar, q_mass)`` each ``[batch, seq]``.
+        ``(correction, s_bar, q_mass, p_mass, rho)`` each ``[batch, seq]``.
 
         - correction: centering term to subtract from the loss (has gradient).
         - s_bar: ``sum_v q_v * s_p(v)`` (expected trainer score under sampler,
           detached). Kept for backward-compatible stats reporting.
         - q_mass: ``sum_v q_v`` (sampler head mass, detached).
+        - p_mass: ``sum_v p_v`` (trainer head mass over the sampler top-k,
+          detached). Used to detect pad-slot pollution of the trainer head.
+        - rho: ``(1 - q_mass) / (1 - p_mass)`` tail-mass ratio (detached).
+          A value of ~0 signals tail-model degeneration.
     """
 
     # Promote low-precision floats (bf16/fp16) to fp32 for numerical safety;
@@ -230,15 +234,21 @@ def score_centering_correction(
 
     q = torch.exp(q_logp)  # [batch, seq, k]
 
-    # Apply mask: a masked slot must contribute zero mass, not exp(0)=1.
+    # Self-evident mask: -inf logprob slots are invalid (pad). Fall back to
+    # finiteness of the sampler logprob when no explicit mask is provided.
     if sampler_topk_mask is not None:
-        mask = sampler_topk_mask.detach().bool().float()
-        q = q * mask
+        valid = sampler_topk_mask.detach().bool()
+    else:
+        valid = torch.isfinite(q_logp)
+    mask = valid.float()  # [batch, seq, k]
+
+    # Apply mask: a masked slot must contribute zero mass, not exp(0)=1.
+    q = q * mask
 
     weight_fn = _build_weight_fn(sc_mode, sc_clip_low, sc_clip_high)
 
     with torch.no_grad():
-        p = train_head_logp.exp()  # [batch, seq, k] — detached inside no_grad
+        p = train_head_logp.exp() * mask  # [batch, seq, k] — also masked
         p_mass = p.sum(-1)  # [batch, seq]
         q_mass = q.sum(-1)  # [batch, seq]
 
@@ -249,9 +259,14 @@ def score_centering_correction(
         alpha = rho * weight_fn(1.0 / rho)  # [batch, seq]
 
         # Head IS weight: w = weight_fn(p/q). In pure SC (weight_fn=ones), w=1.
-        head_weights = weight_fn((train_head_logp - q_logp).exp())  # [batch, seq, k]
+        # Use a safe ratio (replace inf/NaN in pad slots with 0 before weight_fn).
+        ratio = torch.where(
+            valid, (train_head_logp - q_logp).exp(), torch.zeros_like(q_logp)
+        )
+        head_weights = weight_fn(ratio) * mask  # [batch, seq, k]
 
         # Residual: weighted sampler head minus weighted trainer tail estimate.
+        # Pad slots are exactly zero: q=0, head_weights=0, p=0, so residual=0.
         residual = q * head_weights - alpha.unsqueeze(-1) * p  # [batch, seq, k]
 
     # Gradient flows only through train_head_logp (residual is detached).
@@ -260,4 +275,4 @@ def score_centering_correction(
     # s_bar kept for backward-compatible stats reporting (detached).
     s_bar = (q * train_head_logp.detach()).sum(-1)  # [batch, seq]
 
-    return correction, s_bar, q_mass
+    return correction, s_bar, q_mass, p_mass, rho

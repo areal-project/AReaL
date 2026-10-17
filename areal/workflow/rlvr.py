@@ -190,6 +190,16 @@ class RLVRWorkflow(RolloutWorkflow):
                 # extra sampled-token entry, keeping all episodes at a uniform k.
                 sc_top_k = getattr(self.gconfig, "sc_top_k", 0)
                 k_dim = sc_top_k if sc_top_k > 0 else raw_max_k
+                # P1: raise if the sampler returned fewer top-k entries
+                # than sc_top_k requires — the SC correction needs a
+                # complete top-k head to estimate the tail mass ratio.
+                if sc_top_k > 0 and raw_max_k < sc_top_k:
+                    raise RuntimeError(
+                        f"Score Centering requires sc_top_k={sc_top_k} "
+                        f"but the sampler returned only {raw_max_k} "
+                        "top-k entries. Increase vLLM max_logprobs or "
+                        "reduce sc_top_k."
+                    )
                 # Pad absent slots with id 0 and log-prob -inf (zero mass).
                 input_topk_ids = [
                     pad_topk_ids([], k_dim) for _ in range(resp.input_len)
