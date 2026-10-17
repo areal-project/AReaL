@@ -671,12 +671,16 @@ class FSDPEngine(TrainEngine):
 
     def save(self, meta: SaveLoadMeta):
         with self._offload_aware_context():
+            if meta.weight_format not in ("hf", "dcp"):
+                raise ValueError(f"Unknown weight format {meta.weight_format}. ")
+
+            if meta.with_optim:
+                self._save_lr_scheduler_state(meta.path)
+
             if meta.weight_format == "hf":
                 self._save_model_to_hf(meta.path, meta.tokenizer, meta.processor)
-            elif meta.weight_format == "dcp":
-                self._save_to_dcp(meta.path, meta.with_optim)
             else:
-                raise ValueError(f"Unknown weight format {meta.weight_format}. ")
+                self._save_to_dcp(meta.path, meta.with_optim)
 
             if meta.with_optim and meta.weight_format == "hf":
                 self._save_optimizer_state(meta.path)
@@ -692,6 +696,9 @@ class FSDPEngine(TrainEngine):
 
             if meta.with_optim and meta.weight_format == "hf":
                 self._load_optimizer_state(meta.path)
+
+            if meta.with_optim:
+                self._load_lr_scheduler_state(meta.path)
 
             # Checkpoint load replaces optimizer state tensor objects, losing
             # pinning and normalization established by PerLayerOptimWrapper.__init__.
@@ -1945,6 +1952,28 @@ class FSDPEngine(TrainEngine):
             state_dict=state_dict,
             checkpoint_id=path,
         )
+
+    def _save_lr_scheduler_state(self, path: str) -> None:
+        # Write replicated state before the synchronous DCP/HF save. Its existing
+        # collectives ensure this file is ready before any rank finishes saving.
+        if dist.get_rank(self.cpu_group) == 0:
+            os.makedirs(path, exist_ok=True)
+            scheduler_path = os.path.join(path, "lr_scheduler.pt")
+            torch.save(self.lr_scheduler.state_dict(), scheduler_path + ".tmp")
+            os.replace(scheduler_path + ".tmp", scheduler_path)
+
+    def _load_lr_scheduler_state(self, path: str) -> None:
+        scheduler_path = os.path.join(path, "lr_scheduler.pt")
+        if not os.path.exists(scheduler_path):
+            self.logger.warning(
+                "Checkpoint %s has no LR scheduler state. Keeping the current "
+                "scheduler; resumed learning rates may differ from uninterrupted "
+                "training.",
+                path,
+            )
+            return
+        state_dict = torch.load(scheduler_path, map_location="cpu", weights_only=True)
+        self.lr_scheduler.load_state_dict(state_dict)
 
     def _save_optimizer_state(self, path: str):
         assert self.optimizer is not None

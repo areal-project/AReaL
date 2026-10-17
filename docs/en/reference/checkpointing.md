@@ -40,6 +40,14 @@ Used by `RecoverHandler` for fault tolerance:
   through a `LATEST` pointer
 - Retains the legacy overwrite layout in SPMD mode
 
+FSDP checkpoints saved with `with_optim=True` also contain `lr_scheduler.pt`, which
+restores learning-rate scheduler progress alongside the optimizer. This applies to both
+DCP and HF training checkpoints. Keep the scheduler configuration and total training
+steps unchanged when resuming. Older checkpoints without this file remain loadable, but
+emit a warning and leave the current scheduler unchanged; their original learning-rate
+trajectory cannot be restored exactly. Model-only loading (`with_optim=False`) does not
+restore scheduler state.
+
 ## Architecture
 
 ```
