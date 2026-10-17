@@ -253,26 +253,42 @@ class PPOActor:
             rewards[batch_indices, indices] += reward_score
 
         # Compute GAE.
-        if "values" not in data:
-            values = torch.zeros_like(rewards)
-        else:
+        # For GRPO/GSPO without a critic, gamma=lambda=1 reduces to a masked
+        # reward-to-go and can be computed with a cumulative sum.
+        has_critic = "values" in data
+        if has_critic:
             values = data["values"]
-        advantages_reversed = [
-            torch.zeros(bs, dtype=torch.float32, device=values.device)
-        ]
-        lastgaelam = 0
-        nextvalues = values[:, max_seqlen - 1] * seq_no_eos_mask
-        for t in reversed(range(max_seqlen - 1)):
-            delta = rewards[:, t] + self.discount * nextvalues - values[:, t]
-            newgaelam = delta + self.discount * self.gae_lambda * lastgaelam
+        else:
+            values = torch.zeros_like(rewards)
 
-            # Skip tokens that do not contribute to the loss
-            mask = loss_mask[:, t]
-            nextvalues = nextvalues * (1 - mask) + values[:, t] * mask
-            lastgaelam = lastgaelam * (1 - mask) + newgaelam * mask
-            advantages_reversed.append(lastgaelam)
+        if not has_critic and self.discount == 1.0 and self.gae_lambda == 1.0:
+            active_rewards = rewards[:, :-1].float() * loss_mask[:, :-1].float()
+            advantages_body = torch.flip(
+                torch.cumsum(torch.flip(active_rewards, dims=[1]), dim=1),
+                dims=[1],
+            )
+            advantages = torch.nn.functional.pad(
+                advantages_body,
+                (0, 1),
+                value=0.0,
+            )
+        else:
+            advantages_reversed = [
+                torch.zeros(bs, dtype=torch.float32, device=values.device)
+            ]
+            lastgaelam = 0
+            nextvalues = values[:, max_seqlen - 1] * seq_no_eos_mask
+            for t in reversed(range(max_seqlen - 1)):
+                delta = rewards[:, t] + self.discount * nextvalues - values[:, t]
+                newgaelam = delta + self.discount * self.gae_lambda * lastgaelam
 
-        advantages = torch.stack(advantages_reversed[::-1], dim=1)
+                # Skip tokens that do not contribute to the loss
+                mask = loss_mask[:, t]
+                nextvalues = nextvalues * (1 - mask) + values[:, t] * mask
+                lastgaelam = lastgaelam * (1 - mask) + newgaelam * mask
+                advantages_reversed.append(lastgaelam)
+
+            advantages = torch.stack(advantages_reversed[::-1], dim=1)
         data["returns"] = advantages + values
 
         # Optionally perform advantage normalization.

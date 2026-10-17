@@ -371,6 +371,7 @@ jobs:
             tests/test_megatron_engine_distributed.py
           collect_base_tests megatron-loss-aggregation \
             tests/test_megatron_loss_aggregation.py
+          collect_base_tests ppo-advantages tests/test_ppo_advantages.py
           collect_base_tests lock tests/test_lock.py
           collect_base_tests perf-tracer tests/test_perf_tracer.py
           collect_base_tests ulysses tests/test_ulysses.py
@@ -565,14 +566,14 @@ jobs:
           start_normal_test() {
             local name="$1"
             local devices="$2"
-            local selector="$3"
+            shift 2
 
             echo "START: ${name} devices=${devices}"
             (
               export ASCEND_RT_VISIBLE_DEVICES="${devices}"
               export TMPDIR="${wave_tmpdir}"
               timeout --kill-after=60s 900s \
-                pytest -q -p scripts.ci_test_report "${selector}"
+                pytest -q -p scripts.ci_test_report "$@"
             ) >"npu-test-logs/${name}.log" 2>&1 &
             pids+=("$!")
             names+=("${name}")
@@ -753,7 +754,7 @@ jobs:
               wait_for_normal_wave
             done
 
-            # The remaining four single-device cases share the final wave.
+            # The remaining four single-device loss cases share the final wave.
             start_normal_test \
               megatron-loss-aggregation-legacy-main-d1c1 \
               0 \
@@ -770,6 +771,16 @@ jobs:
               megatron-loss-aggregation-update-protocol-auxiliary-d1c1 \
               3 \
               "${loss_selector}[update-protocol-auxiliary-1-1]"
+            start_normal_test \
+              ppo-advantages \
+              4 \
+              'tests/test_ppo_advantages.py::test_terminal_reward_fastpath_respects_masks_and_truncation[accelerator-False]' \
+              'tests/test_ppo_advantages.py::test_terminal_reward_fastpath_respects_masks_and_truncation[accelerator-True]' \
+              'tests/test_ppo_advantages.py::test_dense_kl_fastpath_matches_original_gae[accelerator]' \
+              'tests/test_ppo_advantages.py::test_critic_or_discounted_gae_keeps_original_recurrence[accelerator-True-1.0-1.0]' \
+              'tests/test_ppo_advantages.py::test_critic_or_discounted_gae_keeps_original_recurrence[accelerator-False-0.9-1.0]' \
+              'tests/test_ppo_advantages.py::test_critic_or_discounted_gae_keeps_original_recurrence[accelerator-False-1.0-0.8]' \
+              'tests/test_ppo_advantages.py::test_fastpath_single_token_sequence_has_zero_advantage[accelerator]'
             wait_for_normal_wave
 
             return "${failed}"
