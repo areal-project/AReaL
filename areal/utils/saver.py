@@ -31,6 +31,11 @@ class Saver:
         )
         self._async_mode = AsyncMode(config.mode)
         self._managers: dict[str, AsyncCheckpointManager] = {}
+        # Trainers call ``save`` once per model (e.g. actor and critic) in the
+        # same training step. The first call of a step makes the frequency
+        # decision and later calls of that step reuse it, so every model is
+        # saved on the same steps and the frequency counter advances once.
+        self._last_freq_check: tuple[int, bool] | None = None
 
     @staticmethod
     def get_save_root(
@@ -136,9 +141,7 @@ class Saver:
             and self.config.freq_secs is None
         ):
             return
-        if not self.freq_ctl.check(
-            epochs=int(step == self.ft_spec.steps_per_epoch - 1), steps=1
-        ):
+        if not self._should_save(step, global_step):
             return
         path = Saver.get_model_save_path(
             self.config.experiment_name,
@@ -176,6 +179,17 @@ class Saver:
                 base_model_path=base_model_path,
             )
             engine.save(meta)
+
+    def _should_save(self, step: int, global_step: int) -> bool:
+        if self._last_freq_check is not None:
+            last_global_step, should_save = self._last_freq_check
+            if last_global_step == global_step:
+                return should_save
+        should_save = self.freq_ctl.check(
+            epochs=int(step == self.ft_spec.steps_per_epoch - 1), steps=1
+        )
+        self._last_freq_check = (global_step, should_save)
+        return should_save
 
     def _async_save(
         self,
