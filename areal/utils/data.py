@@ -2228,10 +2228,17 @@ class Normalization:
                 slices.append(slice(offset, offset + sz))
                 offset += sz
             return slices
-        return [
+        if self.group_size <= 0:
+            raise ValueError(f"group_size must be positive, got {self.group_size}")
+
+        slices = [
             slice(i * self.group_size, (i + 1) * self.group_size)
             for i in range(bs // self.group_size)
         ]
+        rem = bs % self.group_size
+        if rem > 0:
+            slices.append(slice(bs - rem, bs))
+        return slices
 
     @torch.no_grad()
     def __call__(
