@@ -191,21 +191,6 @@ class RecoverHandler:
             return engine
         return {"default": engine}
 
-    def _ensure_recover_supported(self, engine) -> None:
-        from areal.v2.training_service.controller.controller import (
-            GatewayTrainController,
-        )
-
-        for controller in self._normalize_recover_engines(engine).values():
-            if isinstance(
-                controller, GatewayTrainController
-            ) and self._uses_async_checkpoint(controller):
-                # TODO(agent): Drain asynchronous saves before v2 worker teardown.
-                raise NotImplementedError(
-                    "Asynchronous recovery checkpoints are not supported with "
-                    "GatewayTrainController yet. Set megatron.async_save=False."
-                )
-
     @staticmethod
     def _supports_checkpoint_pointer() -> bool:
         multi_rank = dist.is_initialized() and dist.get_world_size() > 1
@@ -289,7 +274,6 @@ class RecoverHandler:
     ):
         if self.config.mode in ("disabled", "off"):
             return
-        self._ensure_recover_supported(engine)
         # currently only support recover on one engine
         if not self.freq_ctl.check(
             epochs=int(step_info.epoch_step == self.ft_spec.steps_per_epoch - 1),
@@ -422,7 +406,6 @@ class RecoverHandler:
     ) -> RecoverInfo | None:
         if self.config.mode in ("disabled", "off"):
             return
-        self._ensure_recover_supported(engine)
         if inference_engine is not None and weight_update_meta is None:
             raise ValueError("Weight update meta is required for recovery.")
 

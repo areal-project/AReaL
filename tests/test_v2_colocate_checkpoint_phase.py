@@ -75,7 +75,7 @@ def test_colocate_version_commit_is_marked_after_all_version_updates():
     assert updates[0].lineno < commits[0].lineno
 
 
-def test_v2_controller_rejects_async_dcp_before_dispatch():
+def test_colocated_async_checkpoint_dispatch_tracks_pending_on_rpc_failure():
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -89,14 +89,15 @@ def test_v2_controller_rejects_async_dcp_before_dispatch():
     controller.config = SimpleNamespace(
         backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
     )
-    controller._gateway_post = Mock()
+    controller._gateway_post = Mock(side_effect=RuntimeError("lost response"))
 
-    with pytest.raises(NotImplementedError, match="async_save=False"):
+    with pytest.raises(RuntimeError, match="lost response"):
         controller.save(
             SaveLoadMeta(path="unused", weight_format="dcp", with_optim=True)
         )
 
-    controller._gateway_post.assert_not_called()
+    assert controller._async_checkpoint_pending is True
+    assert controller._gateway_post.call_args.args[0] == "/save"
 
 
 def test_separated_manual_async_checkpoint_keeps_existing_dispatch():

@@ -6,14 +6,14 @@ transfer lifecycle.
 
 ## Supported configurations
 
-| Component           | Supported configuration                                                                                  |
-| ------------------- | -------------------------------------------------------------------------------------------------------- |
-| Training            | Megatron, full weights                                                                                   |
-| Inference           | SGLang with `enable_memory_saver: true`                                                                  |
-| Placement           | Local scheduler, or full-node Slurm allocations                                                          |
-| Slurm GPU namespace | Contiguous numeric device IDs matching the guard placement                                               |
-| Checkpoints         | HF export and synchronous DCP recovery                                                                   |
-| Unsupported         | LoRA colocation, FSDP colocation, vLLM colocation, Ray v2 guard colocation, asynchronous v2 DCP recovery |
+| Component           | Supported configuration                                                    |
+| ------------------- | -------------------------------------------------------------------------- |
+| Training            | Megatron, full weights                                                     |
+| Inference           | SGLang with `enable_memory_saver: true`                                    |
+| Placement           | Local scheduler, or full-node Slurm allocations                            |
+| Slurm GPU namespace | Contiguous numeric device IDs matching the guard placement                 |
+| Checkpoints         | HF export and synchronous/asynchronous DCP recovery                        |
+| Unsupported         | LoRA colocation, FSDP colocation, vLLM colocation, Ray v2 guard colocation |
 
 UUID, reordered, or partial-node Slurm GPU allocations are rejected before training
 guards are forked. Existing v1 colocation and v2 separated weight updates keep their own
@@ -23,7 +23,7 @@ Use `actor._version: v2` and `rollout._version: v2`, select Megatron and SGLang
 backends, and configure actor colocation with the rollout guards. The actor and rollout
 must cover the same physical GPUs. Their parallel layouts may differ, but every SGLang
 TP/PP group must fit the supported node-local placement. Set
-`actor.megatron.async_save: false` when enabling recovery.
+`actor.megatron.async_save: true` to overlap DCP disk writes with training.
 
 ## Memory ownership
 
@@ -46,12 +46,17 @@ training batch.
 
 ## Recovery
 
-Synchronous DCP recovery uses the same immutable checkpoint generations and `LATEST`
-publication protocol as other supported training paths. Restore loads the selected
-generation inside the colocated training phase, reuses the existing gateway, publishes
-the recovered weights, and commits the recovered version before resuming generation.
-Checkpoint corruption or a failed restore does not silently resume training.
+DCP recovery uses the same immutable checkpoint generations and `LATEST` publication
+protocol as other supported training paths. Restore loads the selected generation inside
+the colocated training phase, reuses the existing gateway, publishes the recovered
+weights, and commits the recovered version before resuming generation. Checkpoint
+corruption or a failed restore does not silently resume training.
 
-Asynchronous v2 DCP recovery is rejected because worker shutdown does not yet provide a
-reliable drain for arbitrarily long background saves. Supporting it requires validating
-both asynchronous publication and final worker teardown.
+Asynchronous saves stage their payload before returning, so subsequent weight updates
+and offload do not modify the saved snapshot. `LATEST` is published only after the
+background save finalizes. Normal shutdown drains every training rank before destroying
+workers or their parent rollout guards. The drain uses `actor.request_timeout` (or the
+corresponding critic setting), which must cover the longest expected checkpoint write. A
+failed or timed-out drain raises and preserves worker resources for diagnosis; it does
+not report a successful shutdown. Abrupt process termination may leave an unpublished
+generation; recovery continues to select the last successfully published checkpoint.

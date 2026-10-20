@@ -59,6 +59,7 @@ class GatewayTrainController:
         self._role: str = ""
         self._parallel_strategy = self.train_alloc.parallel
         self._own_process_group = False
+        self._async_checkpoint_pending = False
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
         self._colocate = False
@@ -846,15 +847,12 @@ class GatewayTrainController:
         from areal.infra.rpc.serialization import serialize_value
 
         if (
-            self._colocate
-            and meta.weight_format == "dcp"
+            meta.weight_format == "dcp"
             and self.config.backend.split(":", 1)[0] == "megatron"
             and self.config.megatron.async_save
         ):
-            raise NotImplementedError(
-                "V2 colocated DCP saving requires megatron.async_save=False until "
-                "worker teardown can drain asynchronous checkpoints"
-            )
+            # A failed response may still have scheduled saves on some ranks.
+            self._async_checkpoint_pending = True
         self._gateway_post(
             "/save",
             {
@@ -1534,6 +1532,42 @@ class GatewayTrainController:
 
     # -- Destroy -----------------------------------------------------------
 
+    def wait_async_saves(self) -> None:
+        """Drain every rank before any worker or its parent guard can exit."""
+        if not getattr(self, "_async_checkpoint_pending", False):
+            return
+
+        if not self._worker_addrs:
+            raise RuntimeError(
+                "Cannot drain pending checkpoints without training workers"
+            )
+
+        async def drain() -> None:
+            # Use the configurable training RPC budget, not the short teardown
+            # timeout. Bound the wait if a peer cannot enter the collective.
+            timeout = aiohttp.ClientTimeout(
+                total=self.config.request_timeout, sock_connect=30
+            )
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+
+                async def wait_one(addr: str) -> None:
+                    async with session.post(
+                        f"{addr}/wait_async_saves", json={}
+                    ) as response:
+                        response.raise_for_status()
+
+                results = await asyncio.gather(
+                    *(wait_one(addr) for addr in self._worker_addrs),
+                    return_exceptions=True,
+                )
+                errors = [result for result in results if isinstance(result, Exception)]
+                if errors:
+                    raise ExceptionGroup("Asynchronous checkpoint drain failed", errors)
+
+        run_async_task(drain)
+        self._async_checkpoint_pending = False
+        logger.info("All training workers finalized asynchronous checkpoints")
+
     def _graceful_shutdown_workers(self) -> None:
         """Destroy engines on all training workers before killing processes.
 
@@ -1578,6 +1612,7 @@ class GatewayTrainController:
         logger.info("All training worker engines destroyed gracefully")
 
     def _cleanup_runtime_state(self) -> None:
+        self.wait_async_saves()
         if self._router_addr and self._model_addr:
             try:
                 import requests

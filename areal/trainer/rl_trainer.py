@@ -278,19 +278,6 @@ class PPOTrainer:
         # In colocate (awex) mode the GPU switch between rollout and training
         # is managed by the AWEX adapter (manual offload/onload + tagged SGLang
         # release), not by the TMS-based offload machinery below.
-        if config.recover.mode not in ("off", "disabled"):
-            for role in ("actor", "critic"):
-                engine_config = getattr(config, role, None)
-                if (
-                    engine_config is not None
-                    and getattr(engine_config, "_version", None) == "v2"
-                    and engine_config.backend.split(":", 1)[0] == "megatron"
-                    and engine_config.megatron.async_save
-                ):
-                    raise ValueError(
-                        f"{role}: v2 recovery requires megatron.async_save=False "
-                        "until asynchronous checkpoint teardown is supported"
-                    )
         self._is_v2_awex_colocate = (
             config.actor._version == "v2"
             and not config.actor.use_lora
@@ -1473,6 +1460,17 @@ class PPOTrainer:
         )
 
     def close(self):
+        # Drain before destroying any guard: colocated training workers are
+        # children of rollout guards. A failed drain must preserve both.
+        from areal.v2.training_service.controller.controller import (
+            GatewayTrainController,
+        )
+
+        for role in ("actor", "critic"):
+            engine = getattr(self, role, None)
+            if isinstance(engine, GatewayTrainController):
+                engine.wait_async_saves()
+
         # P87: must tolerate a partially-constructed trainer (called from
         # __init__'s failure path), and one engine's destroy() failure must
         # not keep the remaining workers alive.

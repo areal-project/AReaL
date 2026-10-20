@@ -473,45 +473,31 @@ class TestRecoverHandler:
         assert checkpoint_pointer.read_latest(save_root) is None
 
     @pytest.mark.parametrize("mode", ["on", "auto"])
-    def test_load_rejects_async_gateway_train_controller(self, mode):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            handler = self._make_handler(tmpdir, mode)
-
-            with pytest.raises(NotImplementedError) as exc_info:
-                handler.load(
-                    self._make_gateway_controller(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                )
-
-            assert "GatewayTrainController" in str(exc_info.value)
-            assert "async_save=False" in str(exc_info.value)
-
-    @pytest.mark.parametrize("mode", ["on", "auto"])
-    def test_dump_rejects_async_gateway_train_controller(self, mode):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            handler = self._make_handler(tmpdir, mode)
-            step_info = StepInfo(
-                epoch=0,
-                epoch_step=0,
-                global_step=0,
-                steps_per_epoch=handler.ft_spec.steps_per_epoch,
+    def test_load_async_gateway_without_checkpoint_returns_none(self, tmp_path, mode):
+        handler = self._make_handler(str(tmp_path), mode)
+        assert (
+            handler.load(
+                self._make_gateway_controller(), Mock(), Mock(), Mock(), Mock()
             )
+            is None
+        )
 
-            with pytest.raises(NotImplementedError) as exc_info:
-                handler.dump(
-                    self._make_gateway_controller(),
-                    step_info,
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                )
+    def test_dump_async_gateway_defers_publication(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        engine = self._make_gateway_controller()
+        engine.save = Mock()
 
-            assert "GatewayTrainController" in str(exc_info.value)
-            assert "async_save=False" in str(exc_info.value)
+        handler.dump(engine, self._step_info(handler), *self._dump_dependencies())
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert checkpoint_pointer.read_latest(save_root) is None
+        meta = engine.save.call_args.args[0]
+        assert meta.checkpoint_pointer_path == checkpoint_pointer.latest_path(save_root)
+        assert meta.checkpoint_pointer_value is not None
+        assert meta.wait_for_async_save is False
 
     @pytest.mark.parametrize("no_save_optim", [False, True])
     def test_save_checkpoint_passes_with_optim_from_config(self, no_save_optim):
