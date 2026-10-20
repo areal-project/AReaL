@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -465,3 +467,117 @@ def test_connect_engine_awex_allocates_rendezvous_only_for_separation(colocate):
         response.raise_for_status.assert_called_once()
         assert kwargs["nccl_master_addr"] == "infer"
         assert kwargs["nccl_master_port"] == 12345
+
+
+def test_destroy_waits_for_late_guards_and_cleans_them_once(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    live = set()
+    controller = _make_controller(
+        scheduling_strategy=SchedulingStrategy(type="colocation", target="rollout")
+    )
+
+    def create(*, job):
+        entered.set()
+        assert release.wait(5)
+        live.add(job.role)
+
+    controller.scheduler.create_workers.side_effect = create
+    controller.scheduler.delete_workers.side_effect = lambda role: live.remove(role)
+    controller._graceful_shutdown_workers = MagicMock()
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        monkeypatch.setattr(f"{MODULE}.get_executor", lambda *args: pool)
+        initialization = controller.initialize(role="actor")
+        try:
+            assert entered.wait(5)
+            destruction = pool.submit(controller.destroy)
+            assert controller._shutdown_requested.wait(5)
+            assert not destruction.done()
+            assert controller._init_future is initialization
+            another_destroy = pool.submit(controller.destroy)
+        finally:
+            release.set()
+        destruction.result(timeout=5)
+        another_destroy.result(timeout=5)
+        initialization.result(timeout=5)
+
+    assert not live
+    assert controller._init_future is None
+    assert controller._workers_ready.is_set()
+    controller.scheduler.get_workers.assert_not_called()
+    controller.scheduler.delete_workers.assert_called_once_with(role="actor-guard")
+
+
+def test_destroy_cancels_queued_initialization_without_creating_guards(monkeypatch):
+    release = threading.Event()
+    controller = _make_controller(
+        scheduling_strategy=SchedulingStrategy(type="colocation", target="rollout")
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        blocker = pool.submit(release.wait)
+        monkeypatch.setattr(f"{MODULE}.get_executor", lambda *args: pool)
+        try:
+            initialization = controller.initialize(role="actor")
+            controller.destroy()
+            assert initialization.cancelled()
+        finally:
+            release.set()
+            blocker.result(timeout=5)
+    assert controller._workers_ready.is_set()
+    controller.scheduler.create_workers.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_initialization_failure_waits_for_sibling_fork_before_cleanup(
+    monkeypatch,
+):
+    late_started, failure_seen, release = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    controller = _make_controller()
+    controller.scheduler.get_workers.return_value = [
+        MagicMock(ip="127.0.0.1", worker_ports=[18000 + i]) for i in range(2)
+    ]
+    controller._async_set_guards_env = AsyncMock()
+    controller._async_wait_for_service = AsyncMock()
+    controller._graceful_shutdown_workers = MagicMock()
+    controller._kill_forked_service = MagicMock()
+
+    async def post(url, json, **kwargs):
+        if url.endswith("/alloc_ports"):
+            return _make_response(
+                "POST",
+                url,
+                json={
+                    "host": "127.0.0.1",
+                    "ports": [19000 + json.get("worker_index", 0)],
+                },
+            )
+        if url.endswith("/fork"):
+            if json["worker_index"] == 0:
+                await late_started.wait()
+                failure_seen.set()
+                raise RuntimeError("first fork failed")
+            late_started.set()
+            await release.wait()
+        return _make_response("POST", url, json={"status": "ok"})
+
+    client = SimpleNamespace(post=post)
+    controller._get_async_client = AsyncMock(return_value=client)
+    task = asyncio.create_task(controller._async_initialize("actor"))
+    try:
+        await asyncio.wait_for(failure_seen.wait(), 5)
+        await asyncio.sleep(0)
+        assert not task.done()
+        controller.scheduler.delete_workers.assert_not_called()
+    finally:
+        release.set()
+    with pytest.raises(ExceptionGroup, match="initialization failed"):
+        await asyncio.wait_for(task, 5)
+    controller._kill_forked_service.assert_called_once_with(
+        "http://127.0.0.1:18001", "train-worker", 1
+    )
+    controller.scheduler.delete_workers.assert_called_once_with(role="actor-guard")
+    assert controller._forked_services == []
+    assert controller._service_roles == []

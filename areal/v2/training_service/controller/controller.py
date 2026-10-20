@@ -33,6 +33,15 @@ logger = logging.getLogger("GatewayTrainController")
 _MAX_CLEAR_STEP_FAILURES = 2
 
 
+async def _gather_initialization(*tasks):
+    # Sibling forks must finish registering their resources before rollback.
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    errors = [result for result in results if isinstance(result, BaseException)]
+    if errors:
+        raise BaseExceptionGroup("Training worker initialization failed", errors)
+    return results
+
+
 class GatewayTrainController:
     _GUARD_SUFFIX = "-guard"
 
@@ -94,44 +103,44 @@ class GatewayTrainController:
         wait: bool = False,
         **kwargs: Any,
     ) -> concurrent.futures.Future | None:
-        if self._init_future is not None:
-            raise RuntimeError(
-                "initialize() called while a previous initialization is in progress"
+        with self._init_lock:
+            if self._init_future is not None:
+                raise RuntimeError(
+                    "initialize() called while a previous initialization is in progress"
+                )
+
+            self._role = role
+            self._workers_ready.clear()
+            self._shutdown_requested.clear()
+            future = get_executor("ctrl_init").submit(
+                self._guarded_bg_initialize, role, ft_spec, **kwargs
             )
-
-        self._role = role
-
-        self._workers_ready.clear()
-        self._shutdown_requested.clear()
-        self._init_future = get_executor("ctrl_init").submit(
-            self._guarded_bg_initialize, role, ft_spec, **kwargs
-        )
+            self._init_future = future
 
         if is_colocation_strategy(self.config.scheduling_strategy):
             # Colocated train guards fork from the target role's allocation,
             # which the trainer only initializes after this call returns.
             # Blocking here would deadlock; callers must _ensure_initialized()
             # once the target stack is up.
-            return self._init_future
+            return future
 
         ready_timeout = self.config.workers_ready_timeout
         if not self._workers_ready.wait(timeout=ready_timeout):
             raise TimeoutError(f"Worker creation timed out after {ready_timeout}s")
-        if self._init_future.done():
-            self._init_future.result()
+        if future.done():
+            future.result()
 
         if wait:
             self._ensure_initialized()
             return None
-        return self._init_future
+        return future
 
     def _guarded_bg_initialize(self, *args: Any, **kwargs: Any) -> None:
         """Ensure _workers_ready is signaled even if _bg_initialize fails."""
         try:
             self._bg_initialize(*args, **kwargs)
-        except BaseException:
+        finally:
             self._workers_ready.set()
-            raise
 
     def _bg_initialize(
         self, role: str, ft_spec: FinetuneSpec | None = None, **kwargs: Any
@@ -209,6 +218,8 @@ class GatewayTrainController:
             )
             await asyncio.to_thread(self.scheduler.create_workers, job=guard_job)
             self._service_roles.append(guard_role)
+            if self._shutdown_requested.is_set():
+                return
             guard_workers = await asyncio.to_thread(
                 self.scheduler.get_workers,
                 role=guard_role,
@@ -281,7 +292,7 @@ class GatewayTrainController:
                 return f"http://{format_hostport(host, port)}"
 
             self._worker_addrs = list(
-                await asyncio.gather(
+                await _gather_initialization(
                     *[_fork_worker(rank) for rank in range(world_size)]
                 )
             )
@@ -296,7 +307,7 @@ class GatewayTrainController:
                 engine_class = (
                     f"{self.train_engine.__module__}.{self.train_engine.__name__}"
                 )
-            await asyncio.gather(
+            await _gather_initialization(
                 *[
                     self._create_engine_on_worker(
                         worker_addr=addr,
@@ -310,7 +321,7 @@ class GatewayTrainController:
             logger.info("Engines created on all workers")
 
             pg_kwargs = {"parallel_strategy": self._parallel_strategy}
-            await asyncio.gather(
+            await _gather_initialization(
                 *[
                     self._call_worker_engine_endpoint(
                         addr,
@@ -323,7 +334,7 @@ class GatewayTrainController:
                 ]
             )
 
-            await asyncio.gather(
+            await _gather_initialization(
                 *[
                     self._call_worker_engine_endpoint(
                         addr,
@@ -428,13 +439,17 @@ class GatewayTrainController:
                 self._router_addr, self._model_addr, self.api_key
             )
             logger.info("Model registered with api_key=%s", self.api_key)
-        except Exception:
+        except BaseException:
             logger.error(
                 "GatewayTrainController initialization failed, rolling back",
                 exc_info=True,
             )
-            self._cleanup_runtime_state()
+            if not self._shutdown_requested.is_set():
+                self._cleanup_runtime_state()
             raise
+        finally:
+            if self._shutdown_requested.is_set():
+                self._cleanup_runtime_state()
 
     # -- Engine creation ---------------------------------------------------
 
@@ -461,7 +476,9 @@ class GatewayTrainController:
             resp = await client.post(f"{addr}/set_env", json={"env": env}, timeout=30.0)
             resp.raise_for_status()
 
-        await asyncio.gather(*[_set_env(rank) for rank in range(len(guard_workers))])
+        await _gather_initialization(
+            *[_set_env(rank) for rank in range(len(guard_workers))]
+        )
         logger.info("NCCL env set on %d guards", len(guard_workers))
 
     async def _create_engine_on_worker(
@@ -1678,9 +1695,20 @@ class GatewayTrainController:
 
     def destroy(self) -> None:
         self._shutdown_requested.set()
-        future = self._init_future
-        self._init_future = None
-        if future is not None:
-            future.cancel()
-
-        self._cleanup_runtime_state()
+        # Initializer rollback does not acquire this lock. Wait for it before
+        # cleanup, while excluding another initialization or destruction.
+        with self._init_lock:
+            self._shutdown_requested.set()
+            future = self._init_future
+            if future is not None:
+                if future.cancel():
+                    self._workers_ready.set()
+                else:
+                    try:
+                        future.result()
+                    except Exception:
+                        logger.warning(
+                            "Initialization failed while shutting down", exc_info=True
+                        )
+                self._init_future = None
+            self._cleanup_runtime_state()
