@@ -8,7 +8,7 @@ import os
 from areal.utils.environ import get_float_env_var
 
 
-def resolve_physical_gpu_id(relative_gpu_id: int) -> int:
+def resolve_physical_gpu_id(relative_gpu_id: int | None = None) -> int:
     """Map a CUDA-masked relative device index to its physical GPU id.
 
     CUDA IPC keys must be unique per node, so both sides of a colocated
@@ -18,6 +18,12 @@ def resolve_physical_gpu_id(relative_gpu_id: int) -> int:
     mask itself is the only ground truth. UUID masks and invalid indices are
     rejected because they cannot produce the node-local ordinal AWEX keys use.
     """
+    if relative_gpu_id is None:
+        import torch
+
+        relative_gpu_id = torch.cuda.current_device()
+    if relative_gpu_id < 0:
+        raise ValueError(f"CUDA device index must be nonnegative: {relative_gpu_id}")
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if not cuda_visible:
         return relative_gpu_id

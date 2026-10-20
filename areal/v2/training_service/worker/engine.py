@@ -280,6 +280,9 @@ def create_engine_module(
     _register_engine_route("/get_version", "get_version", methods=["GET"])
     _register_engine_route("/save", "save")
     _register_engine_route("/load", "load")
+    _register_engine_route(
+        "/init_weight_residency_adapter", "init_weight_residency_adapter"
+    )
     _register_engine_route("/offload", "offload")
     _register_engine_route("/onload", "onload")
     _register_engine_route("/optimizer_zero_grad", "optimizer_zero_grad")

@@ -28,7 +28,7 @@ def create_awex_blueprint(
     """
     bp = flask_module.Blueprint("awex", __name__, url_prefix="/awex")
 
-    _state: dict[str, Any] = {"adapter": None}
+    _state: dict[str, Any] = {"adapter": None, "colocate_enabled": False}
 
     def _require_adapter():
         if _state["adapter"] is None:
@@ -38,12 +38,34 @@ def create_awex_blueprint(
             _state["adapter"] = _create_training_adapter(engine)
         return _state["adapter"]
 
+    def _require_colocate_adapter():
+        from areal.engine.awex.adapters.training_adapter import (
+            AwexColocateTrainingAdapter,
+        )
+
+        adapter = _require_adapter()
+        if not isinstance(adapter, AwexColocateTrainingAdapter):
+            raise NotImplementedError(
+                f"{type(adapter).__name__} does not support AWEX colocation"
+            )
+        if not _state["colocate_enabled"]:
+            adapter.enable_colocate_memory_management()
+            _state["colocate_enabled"] = True
+        return adapter
+
     @bp.route("/report_parallelism", methods=["GET"])
     def report_parallelism():
         try:
             adapter = _require_adapter()
-            return flask_module.jsonify(adapter.parallelism_strategy)
-        except RuntimeError as e:
+            info = dict(adapter.parallelism_strategy)
+            if flask_module.request.args.get("include_device") == "1":
+                from areal.engine.awex.utils import resolve_physical_gpu_id
+                from areal.utils.network import gethostip
+
+                info["ip"] = gethostip()
+                info["device_id"] = resolve_physical_gpu_id()
+            return flask_module.jsonify(info)
+        except (RuntimeError, ValueError) as e:
             return flask_module.jsonify({"error": str(e)}), 400
 
     @bp.route("/report_weight_meta", methods=["POST"])
@@ -115,8 +137,11 @@ def create_awex_blueprint(
             return flask_module.jsonify({"status": "success"})
 
         def action():
+            if _state["colocate_enabled"]:
+                adapter.teardown_colocate_weight_update()
             adapter.teardown_weight_update_group()
             _state["adapter"] = None
+            _state["colocate_enabled"] = False
 
         return run_endpoint(
             "awex_teardown",
@@ -129,8 +154,9 @@ def create_awex_blueprint(
         data = flask_module.request.get_json(force=True)
 
         def action():
-            adapter = _require_adapter()
+            adapter = _require_colocate_adapter()
             adapter.init_colocate_weight_update(**data)
+            _state["colocate_enabled"] = True
 
         return run_endpoint(
             "init_colocate_weight_update",
@@ -144,8 +170,11 @@ def create_awex_blueprint(
         version = data.get("version", 0)
 
         def action():
-            adapter = _require_adapter()
+            adapter = _require_colocate_adapter()
             adapter.execute_colocate_weight_update(version)
+            adapter.finish_colocate_weight_update(
+                training_world_size=adapter.parallelism_strategy["world_size"]
+            )
 
         return run_endpoint(
             "execute_colocate_weight_update",
@@ -159,7 +188,7 @@ def create_awex_blueprint(
         tags = data.get("tags")
 
         def action():
-            adapter = _require_adapter()
+            adapter = _require_colocate_adapter()
             adapter.release_memory(tags)
 
         return run_endpoint(
@@ -174,7 +203,7 @@ def create_awex_blueprint(
         tags = data.get("tags")
 
         def action():
-            adapter = _require_adapter()
+            adapter = _require_colocate_adapter()
             adapter.resume_memory(tags)
 
         return run_endpoint(

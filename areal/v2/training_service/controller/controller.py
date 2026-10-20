@@ -8,12 +8,15 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Callable
+from contextlib import contextmanager
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import aiohttp
 
+from areal.api.cli_args import is_colocation_strategy
 from areal.infra.utils.concurrent import get_executor, run_async_task
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
@@ -58,6 +61,10 @@ class GatewayTrainController:
         self._own_process_group = False
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
+        self._colocate = False
+        self._colocate_update_started = False
+        self._colocate_transfer_succeeded = False
+        self._colocate_update_succeeded = False
 
         # Version management
         self._version_lock = Lock()
@@ -98,6 +105,13 @@ class GatewayTrainController:
         self._init_future = get_executor("ctrl_init").submit(
             self._guarded_bg_initialize, role, ft_spec, **kwargs
         )
+
+        if is_colocation_strategy(self.config.scheduling_strategy):
+            # Colocated train guards fork from the target role's allocation,
+            # which the trainer only initializes after this call returns.
+            # Blocking here would deadlock; callers must _ensure_initialized()
+            # once the target stack is up.
+            return self._init_future
 
         ready_timeout = self.config.workers_ready_timeout
         if not self._workers_ready.wait(timeout=ready_timeout):
@@ -254,7 +268,9 @@ class GatewayTrainController:
                     "--log-level",
                     cfg.log_level,
                 ]
-
+                # Colocated guards are created pinned to a single GPU
+                # (CUDA_VISIBLE_DEVICES set at guard-fork time by the
+                # scheduler); the worker simply inherits it.
                 host, port = await self._async_fork_on_guard(
                     guard_addr=guard,
                     role="train-worker",
@@ -829,6 +845,15 @@ class GatewayTrainController:
     def save(self, meta: Any) -> None:
         from areal.infra.rpc.serialization import serialize_value
 
+        if (
+            meta.weight_format == "dcp"
+            and self.config.backend.split(":", 1)[0] == "megatron"
+            and self.config.megatron.async_save
+        ):
+            raise NotImplementedError(
+                "V2 DCP saving requires megatron.async_save=False until "
+                "worker teardown can drain asynchronous checkpoints"
+            )
         self._gateway_post(
             "/save",
             {
@@ -847,6 +872,24 @@ class GatewayTrainController:
                 "kwargs": serialize_value({}),
             },
         )
+
+    def init_weight_residency_adapter(self) -> None:
+        """Enable explicit Megatron memory residency without weight publication."""
+        self._ensure_initialized()
+
+        async def initialize():
+            await asyncio.gather(
+                *[
+                    self._call_worker_engine_endpoint(
+                        addr,
+                        "/init_weight_residency_adapter",
+                        timeout=self.config.request_timeout,
+                    )
+                    for addr in self._worker_addrs
+                ]
+            )
+
+        run_async_task(initialize)
 
     def offload(self) -> None:
         self._gateway_post("/offload")
@@ -1061,11 +1104,14 @@ class GatewayTrainController:
     def train_worker_urls(self) -> list[str]:
         return list(self._worker_addrs)
 
+    def enable_colocation(self) -> None:
+        """Enable the actor/rollout shared-memory lifecycle before connect."""
+        self._colocate = True
+
     # -- RL parity methods (connect_engine / update_weights / batch) --------
 
     def connect_engine(self, rollout: Any, meta: Any) -> None:
         self._ensure_initialized()
-        import requests
 
         from areal.v2.inference_service.controller.controller import (
             RolloutControllerV2,
@@ -1111,24 +1157,37 @@ class GatewayTrainController:
         pair_name = f"{self._role}-rollout"
 
         if meta.type == "awex":
-            # NCCL rendezvous master must live on the rank-0 process's node.
-            # awex assigns rank 0 to inference[0], so allocate on the inference
-            # rank-0 guard rather than a train guard.
-            inf_guard_addrs = rollout.inference_guard_addrs
-            resp = requests.post(
-                f"{inf_guard_addrs[0]}/alloc_ports",
-                json={"count": 1},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            port_data = resp.json()
+            colocate = getattr(meta, "colocate", False)
+            self._colocate = colocate
+            if colocate and len(self._worker_addrs) % max(1, len(inference_urls)):
+                raise ValueError(
+                    "awex colocate requires inference servers to evenly cover "
+                    f"the train GPUs, got train={len(self._worker_addrs)} "
+                    f"workers vs inference={len(inference_urls)} servers"
+                )
+            nccl_master_addr = ""
+            nccl_master_port = 0
+            if not colocate:
+                import requests
+
+                # AWEX rank 0 belongs to the first inference instance.
+                resp = requests.post(
+                    f"{rollout.inference_guard_addrs[0]}/alloc_ports",
+                    json={"count": 1},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                port_data = resp.json()
+                nccl_master_addr = port_data["host"]
+                nccl_master_port = port_data["ports"][0]
             ctrl.connect(
                 pair_name=pair_name,
                 train_worker_urls=self._worker_addrs,
                 inference_worker_urls=inference_urls,
                 mode="awex",
-                nccl_master_addr=port_data["host"],
-                nccl_master_port=port_data["ports"][0],
+                colocate=colocate,
+                nccl_master_addr=nccl_master_addr,
+                nccl_master_port=nccl_master_port,
             )
         else:  # disk
             ctrl.connect(
@@ -1149,6 +1208,215 @@ class GatewayTrainController:
             len(inference_urls),
         )
 
+    def _broadcast_awex_memory_op(self, op: str, tags: list[str]) -> None:
+        import requests
+
+        def _post(addr: str) -> None:
+            url = f"{addr}/awex/{op}"
+            resp = requests.post(
+                url,
+                json={"tags": tags},
+                timeout=self.config.request_timeout,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"AWEX memory operation failed on {url}: "
+                    f"HTTP {resp.status_code}: {resp.text}"
+                )
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, len(self._worker_addrs))
+        ) as executor:
+            futures = [executor.submit(_post, addr) for addr in self._worker_addrs]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+    def enter_train_phase(
+        self, *, before_actor_onload: Callable[[], None] | None = None
+    ) -> None:
+        if not self._colocate:
+            return
+        assert self.rollout is not None
+        self._colocate_update_started = False
+        self._colocate_transfer_succeeded = False
+        self._colocate_update_succeeded = False
+        workflow_paused = False
+        generation_paused = False
+        released_tags: list[str] = []
+        train_memory_resumed = False
+        auxiliary_in_progress = False
+        try:
+            logger.info("[train-phase] enter: pausing rollout")
+            self.rollout.pause()
+            workflow_paused = True
+            generation_paused = True
+            self.rollout.pause_generation_sync()
+            logger.info("[train-phase] enter: rollout drained; offloading kv_cache")
+            released_tags.append("kv_cache")
+            self.rollout.offload(tags=["kv_cache"])
+            logger.info("[train-phase] enter: offloading inference cuda_graph")
+            released_tags.append("cuda_graph")
+            self.rollout.offload(tags=["cuda_graph"])
+            logger.info("[train-phase] enter: offloading inference weights")
+            released_tags.append("weights")
+            self.rollout.offload(tags=["weights"])
+            if before_actor_onload is not None:
+                auxiliary_in_progress = True
+                before_actor_onload()
+                auxiliary_in_progress = False
+            logger.info(
+                "[train-phase] enter: resuming train memory (weights+optimizer)"
+            )
+            train_memory_resumed = True
+            self._broadcast_awex_memory_op("resume_memory", ["weights", "optimizer"])
+            logger.info("[train-phase] enter complete: GPUs handed to training")
+        except Exception as phase_error:
+            if auxiliary_in_progress:
+                logger.error(
+                    "[train-phase] auxiliary scoring failed; keeping rollout paused "
+                    "because auxiliary model memory may still be resident"
+                )
+                raise
+            release_train_steps: list[tuple[str, Any]] = []
+            if train_memory_resumed:
+                release_train_steps.append(
+                    (
+                        "release train memory",
+                        lambda: self._broadcast_awex_memory_op(
+                            "release_memory", ["weights", "optimizer"]
+                        ),
+                    )
+                )
+            restore_inference_steps: list[tuple[str, Any]] = []
+            for tag in reversed(released_tags):
+                restore_inference_steps.append(
+                    (
+                        f"restore inference {tag}",
+                        lambda tag=tag: self.rollout.onload(tags=[tag]),
+                    )
+                )
+            try:
+                self._run_phase_cleanup(release_train_steps)
+                self._run_phase_cleanup(restore_inference_steps)
+                if generation_paused:
+                    self.rollout.continue_generation()
+                if workflow_paused:
+                    self.rollout.resume()
+            except Exception as cleanup_error:
+                raise ExceptionGroup(
+                    "Failed to enter and roll back the colocated train phase",
+                    [phase_error, cleanup_error],
+                ) from phase_error
+            raise
+
+    def exit_train_phase(
+        self, *, resume_rollout: bool = True, resume_generation: bool = True
+    ) -> None:
+        if not self._colocate:
+            return
+        assert self.rollout is not None
+        release_train_steps: list[tuple[str, Any]] = [
+            (
+                "release train memory",
+                lambda: self._broadcast_awex_memory_op(
+                    "release_memory", ["weights", "optimizer"]
+                ),
+            )
+        ]
+        if self._colocate_update_started and not self._colocate_update_succeeded:
+            logger.error(
+                "[train-phase] weight update failed after starting; keeping "
+                "generation paused because inference weight residency is uncertain"
+            )
+            self._run_phase_cleanup(release_train_steps)
+            return
+
+        # Before update starts (for example, checkpoint load failure), weights
+        # are still released and need explicit restoration. A successful
+        # transfer restores weights inside the inference adapter.
+        self._run_phase_cleanup(release_train_steps)
+        restore_inference_steps: list[tuple[str, Any]] = []
+        if not self._colocate_update_started:
+            restore_inference_steps.append(
+                (
+                    "restore inference weights",
+                    lambda: self.rollout.onload(tags=["weights"]),
+                )
+            )
+        restore_inference_steps.extend(
+            [
+                (
+                    "restore inference cuda_graph",
+                    lambda: self.rollout.onload(tags=["cuda_graph"]),
+                ),
+                (
+                    "restore inference kv_cache",
+                    lambda: self.rollout.onload(tags=["kv_cache"]),
+                ),
+            ]
+        )
+        self._run_phase_cleanup(restore_inference_steps)
+        if resume_generation:
+            self.rollout.continue_generation()
+        if resume_rollout:
+            self.rollout.resume()
+        logger.info("[train-phase] exit complete: resume_rollout=%s", resume_rollout)
+
+    @staticmethod
+    def _run_phase_cleanup(steps: list[tuple[str, Any]]) -> None:
+        errors: list[Exception] = []
+        for description, action in steps:
+            try:
+                action()
+            except Exception as exc:
+                logger.exception("[train-phase] cleanup failed: %s", description)
+                errors.append(exc)
+        if errors:
+            raise ExceptionGroup("Colocated train-phase cleanup failed", errors)
+
+    @contextmanager
+    def train_phase(
+        self,
+        *,
+        before_actor_onload: Callable[[], None] | None = None,
+        resume_rollout: bool = True,
+    ):
+        """Run a train phase; update_weights() must be called inside the phase.
+
+        Under colocation, before_actor_onload runs with rollout and actor memory
+        released. If it fails, rollout stays paused until caller teardown because
+        auxiliary residency is unknown. Separation does not invoke the callback.
+        """
+        self.enter_train_phase(before_actor_onload=before_actor_onload)
+        try:
+            yield
+        except Exception as phase_error:
+            try:
+                self.exit_train_phase(resume_rollout=False, resume_generation=False)
+            except Exception as cleanup_error:
+                raise ExceptionGroup(
+                    "Colocated train phase and cleanup both failed",
+                    [phase_error, cleanup_error],
+                ) from phase_error
+            raise
+        else:
+            self.exit_train_phase(resume_rollout=resume_rollout)
+
+    def release_train_memory_for_colocate(self) -> None:
+        if not self._colocate:
+            return
+        self._ensure_initialized()
+        # Rollout guards already exist (the actor forks from them), but request
+        # serving has not started yet. Free actor memory so SGLang can finish
+        # model initialization on the shared GPUs.
+        logger.info(
+            "[train-phase] initial release: freeing train memory on %d workers "
+            "before SGLang model initialization",
+            len(self._worker_addrs),
+        )
+        self._broadcast_awex_memory_op("release_memory", ["weights", "optimizer"])
+        logger.info("[train-phase] initial release complete")
+
     def update_weights(self, meta: Any) -> None:
         if self._weight_update_ctrl is None or self.rollout is None:
             raise RuntimeError(
@@ -1158,22 +1426,41 @@ class GatewayTrainController:
         assert meta.version is not None and meta.version > 0, (
             f"meta.version must be a positive integer, got {meta.version}"
         )
+        if self._colocate:
+            self._colocate_update_started = True
         result = self._weight_update_ctrl.update_weights(version=meta.version)
-        # Publish the version before resuming generation. Requests unblocked by
-        # continue_generation() are served by the new weights, so they must be
-        # stamped with the new version; otherwise every segment resumed during
-        # the version broadcast is recorded as pre-update policy and downstream
-        # importance ratios pick the wrong behavior policy for it.
-        try:
-            self.rollout.set_version(meta.version)
-        finally:
-            self.rollout.continue_generation()
+        if result.status != "ok":
+            raise RuntimeError(
+                f"Weight update v{meta.version} failed: {result.error or result.status}"
+            )
+        if self._colocate:
+            self._colocate_transfer_succeeded = True
+        if not self._colocate:
+            # Publish policy metadata before unblocking requests on new weights.
+            # Colocation publishes through the surrounding train phase, which
+            # must also restore inference memory before generation can resume.
+            try:
+                self.rollout.set_version(meta.version)
+            finally:
+                self.rollout.continue_generation()
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",
             meta.version,
             result.status,
             result.duration_ms,
         )
+
+    def mark_colocate_update_committed(self) -> None:
+        """Allow generation only after transfer and version metadata both commit."""
+        if not self._colocate:
+            return
+        if not self._colocate_update_started:
+            raise RuntimeError("Cannot commit a colocate update before it starts")
+        if not self._colocate_transfer_succeeded:
+            raise RuntimeError(
+                "Cannot commit a colocate update before transfer succeeds"
+            )
+        self._colocate_update_succeeded = True
 
     def prepare_batch(
         self,
