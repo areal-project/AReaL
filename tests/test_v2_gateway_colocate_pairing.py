@@ -2,6 +2,7 @@
 
 from unittest import mock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from areal.v2.weight_update.gateway import app as gateway_app
@@ -74,27 +75,18 @@ def test_colocate_connect_uses_physical_pairing_without_legacy_weight_meta():
     assert all("master_port" not in payload for _, payload in init_calls)
 
 
-def test_gateway_rejects_a_second_colocate_pair():
-    app = gateway_app.create_app()
-    app.state.colocate_pair_name = "actor-rollout"
-    with TestClient(app) as client:
-        response = client.post(
-            "/connect",
-            headers=_auth_headers(),
-            json={
-                "pair_name": "critic-rollout",
-                "train_worker_urls": ["http://train"],
-                "inference_worker_urls": ["http://infer"],
-                "mode": "awex",
-                "colocate": True,
-            },
-        )
-
-    assert response.status_code == 409
-    assert "actor-rollout" in response.json()["error"]
-
-
-def test_gateway_retries_an_active_colocate_connect_idempotently():
+@pytest.mark.parametrize(
+    "pair_name,workers,disconnect,status,error",
+    [
+        ("other-pair", ["http://train"], False, 409, "actor-rollout"),
+        ("actor-rollout", ["http://train"], False, 200, None),
+        ("actor-rollout", ["http://changed"], False, 409, "different worker endpoints"),
+        ("actor-rollout", ["http://train"], True, 409, "gateway lifetime"),
+    ],
+)
+def test_gateway_reconnect_preserves_pair_identity(
+    pair_name, workers, disconnect, status, error
+):
     app = gateway_app.create_app()
     app.state.colocate_pair_name = "actor-rollout"
     app.state.registry.register(
@@ -105,8 +97,39 @@ def test_gateway_retries_an_active_colocate_connect_idempotently():
             colocate=True,
         )
     )
-
     with TestClient(app) as client:
+        if disconnect:
+            response = client.post(
+                "/disconnect",
+                headers=_auth_headers(),
+                json={"pair_name": "actor-rollout"},
+            )
+            assert response.status_code == 200
+        response = client.post(
+            "/connect",
+            headers=_auth_headers(),
+            json={
+                "pair_name": pair_name,
+                "train_worker_urls": workers,
+                "inference_worker_urls": ["http://infer"],
+                "mode": "awex",
+                "colocate": True,
+            },
+        )
+    assert response.status_code == status
+    if error:
+        assert error in response.json()["error"]
+
+
+@pytest.mark.parametrize(
+    "override,error",
+    [
+        ({"mode": "disk"}, "mode='awex'"),
+        ({"use_lora": True}, "does not support LoRA"),
+    ],
+)
+def test_gateway_rejects_unsupported_colocate_mode(override, error):
+    with TestClient(gateway_app.create_app()) as client:
         response = client.post(
             "/connect",
             headers=_auth_headers(),
@@ -116,110 +139,8 @@ def test_gateway_retries_an_active_colocate_connect_idempotently():
                 "inference_worker_urls": ["http://infer"],
                 "mode": "awex",
                 "colocate": True,
+                **override,
             },
         )
-
-    assert response.status_code == 200
-
-
-def test_gateway_rejects_colocate_connect_with_non_awex_mode():
-    app = gateway_app.create_app()
-    with TestClient(app) as client:
-        response = client.post(
-            "/connect",
-            headers=_auth_headers(),
-            json={
-                "pair_name": "actor-rollout",
-                "train_worker_urls": ["http://train"],
-                "inference_worker_urls": ["http://infer"],
-                "mode": "disk",
-                "colocate": True,
-            },
-        )
-
     assert response.status_code == 400
-    assert "mode='awex'" in response.json()["error"]
-
-
-def test_gateway_rejects_colocate_connect_with_lora():
-    app = gateway_app.create_app()
-    with TestClient(app) as client:
-        response = client.post(
-            "/connect",
-            headers=_auth_headers(),
-            json={
-                "pair_name": "actor-rollout",
-                "train_worker_urls": ["http://train"],
-                "inference_worker_urls": ["http://infer"],
-                "mode": "awex",
-                "use_lora": True,
-                "colocate": True,
-            },
-        )
-
-    assert response.status_code == 400
-    assert "does not support LoRA" in response.json()["error"]
-
-
-def test_gateway_rejects_same_pair_name_with_changed_workers():
-    app = gateway_app.create_app()
-    app.state.colocate_pair_name = "actor-rollout"
-    app.state.registry.register(
-        PairInfo(
-            pair_name="actor-rollout",
-            train_worker_urls=["http://train-old"],
-            inference_worker_urls=["http://infer"],
-            colocate=True,
-        )
-    )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/connect",
-            headers=_auth_headers(),
-            json={
-                "pair_name": "actor-rollout",
-                "train_worker_urls": ["http://train-new"],
-                "inference_worker_urls": ["http://infer"],
-                "mode": "awex",
-                "colocate": True,
-            },
-        )
-
-    assert response.status_code == 409
-    assert "different worker endpoints" in response.json()["error"]
-
-
-def test_gateway_rejects_colocate_reconnect_after_disconnect():
-    app = gateway_app.create_app()
-    app.state.colocate_pair_name = "actor-rollout"
-    app.state.registry.register(
-        PairInfo(
-            pair_name="actor-rollout",
-            train_worker_urls=["http://train"],
-            inference_worker_urls=["http://infer"],
-            colocate=True,
-        )
-    )
-
-    with TestClient(app) as client:
-        disconnect = client.post(
-            "/disconnect",
-            headers=_auth_headers(),
-            json={"pair_name": "actor-rollout"},
-        )
-        reconnect = client.post(
-            "/connect",
-            headers=_auth_headers(),
-            json={
-                "pair_name": "actor-rollout",
-                "train_worker_urls": ["http://train"],
-                "inference_worker_urls": ["http://infer"],
-                "mode": "awex",
-                "colocate": True,
-            },
-        )
-
-    assert disconnect.status_code == 200
-    assert reconnect.status_code == 409
-    assert "gateway lifetime" in reconnect.json()["error"]
+    assert error in response.json()["error"]

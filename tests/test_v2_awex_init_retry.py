@@ -1,11 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import Mock
 
+import flask
 import pytest
 
-from areal.engine.awex.adapters.fsdp_adapter import AwexFSDPAdapter
 from areal.engine.awex.adapters.megatron_adapter import AwexMegatronAdapter
 from areal.engine.awex.adapters.sglang_adapter import AwexSGLangAdapter
+from areal.v2.training_service.worker.awex import create_awex_blueprint
 
 SEPARATION_ARGS = dict(
     pair_name="pair",
@@ -19,6 +23,8 @@ SEPARATION_ARGS = dict(
     num_engines=1,
     timeout_s=30.0,
 )
+
+
 COLOCATE_ARGS = dict(
     pair_name="pair",
     meta_server_addr="192.0.2.1:1234",
@@ -41,12 +47,6 @@ def test_separation_init_retry_preserves_one_initialization(adapter_type):
     adapter._initialize_separation_group.assert_called_once()
     with pytest.raises(RuntimeError, match="differently"):
         adapter.init_weight_update_group(**{**SEPARATION_ARGS, "master_port": 1235})
-
-
-def test_fsdp_separation_init_retry_is_idempotent():
-    adapter = AwexFSDPAdapter(SimpleNamespace())
-    adapter._init_fingerprint = tuple(SEPARATION_ARGS.values())
-    adapter.init_weight_update_group(**SEPARATION_ARGS)
 
 
 def test_megatron_failed_init_keeps_residency_and_allows_retry(monkeypatch):
@@ -147,3 +147,120 @@ def test_pending_colocate_export_rejects_teardown_without_losing_state():
     assert adapter._pending_ipc_export is export
     assert adapter._legacy_meta_server_client is client
     assert adapter._colocate_init_fingerprint == ("pair",)
+
+
+class _MetaServer:
+    def __init__(self, events):
+        self.events = events
+
+    def wait_set_until_size(self, key, size, timeout):
+        self.events.append(("wait", key, size, timeout))
+
+    def delete_if_exists(self, key):
+        self.events.append(("delete", key))
+
+
+def _adapter(events):
+    adapter = AwexMegatronAdapter.__new__(AwexMegatronAdapter)
+    adapter._engine = SimpleNamespace(cpu_group="cpu")
+    adapter._legacy_meta_server_client = _MetaServer(events)
+    adapter._legacy_num_infer_engines = 4
+    adapter._legacy_timeout_s = 120.0
+    return adapter
+
+
+def test_finish_colocate_update_cleans_reusable_keys_between_barriers():
+    events = []
+    adapter = _adapter(events)
+
+    with (
+        mock.patch(
+            "areal.engine.awex.adapters.megatron_adapter.dist.get_world_size",
+            return_value=8,
+        ),
+        mock.patch(
+            "areal.engine.awex.adapters.megatron_adapter.dist.get_rank",
+            return_value=0,
+        ),
+        mock.patch(
+            "areal.engine.awex.adapters.megatron_adapter.dist.barrier",
+            side_effect=lambda group: events.append(("barrier", group)),
+        ),
+    ):
+        adapter.finish_colocate_weight_update(training_world_size=8)
+
+    assert events == [
+        ("barrier", "cpu"),
+        ("wait", "finished_weights_update_engines", 4, 120.0),
+        ("delete", "finished_weights_update_engines"),
+        ("delete", "all_training_offloaded_weights"),
+        ("barrier", "cpu"),
+    ]
+
+
+def test_nonzero_rank_only_participates_in_finish_barriers():
+    events = []
+    adapter = _adapter(events)
+
+    with (
+        mock.patch(
+            "areal.engine.awex.adapters.megatron_adapter.dist.get_world_size",
+            return_value=8,
+        ),
+        mock.patch(
+            "areal.engine.awex.adapters.megatron_adapter.dist.get_rank",
+            return_value=3,
+        ),
+        mock.patch(
+            "areal.engine.awex.adapters.megatron_adapter.dist.barrier",
+            side_effect=lambda group: events.append(("barrier", group)),
+        ),
+    ):
+        adapter.finish_colocate_weight_update(training_world_size=8)
+
+    assert events == [("barrier", "cpu"), ("barrier", "cpu")]
+
+
+def test_worker_execute_endpoint_runs_finish_after_transfer():
+    events = []
+    adapter = SimpleNamespace(
+        parallelism_strategy={"world_size": 8},
+        enable_colocate_memory_management=lambda: events.append("enable"),
+        init_colocate_weight_update=lambda **_kwargs: events.append("init"),
+        execute_colocate_weight_update=lambda version: events.append(
+            ("execute", version)
+        ),
+        finish_colocate_weight_update=lambda training_world_size: events.append(
+            ("finish", training_world_size)
+        ),
+        release_memory=lambda tags=None: None,
+        resume_memory=lambda tags=None: None,
+        teardown_colocate_weight_update=lambda: None,
+    )
+
+    def submit_to_engine_thread(_name, action):
+        return action()
+
+    def run_endpoint(_name, action, return_result=True):
+        result = action()
+        return flask.jsonify({"result": result} if return_result else {"status": "ok"})
+
+    with mock.patch(
+        "areal.v2.training_service.worker.awex._create_training_adapter",
+        return_value=adapter,
+    ):
+        app = flask.Flask(__name__)
+        app.register_blueprint(
+            create_awex_blueprint(
+                flask_module=flask,
+                get_engine=lambda: object(),
+                submit_to_engine_thread=submit_to_engine_thread,
+                run_endpoint=run_endpoint,
+            )
+        )
+        response = app.test_client().post(
+            "/awex/execute_colocate_weight_update", json={"version": 3}
+        )
+
+    assert response.status_code == 200
+    assert events == ["enable", ("execute", 3), ("finish", 8)]

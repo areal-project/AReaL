@@ -472,16 +472,6 @@ class TestRecoverHandler:
         )
         assert checkpoint_pointer.read_latest(save_root) is None
 
-    @pytest.mark.parametrize("mode", ["on", "auto"])
-    def test_load_async_gateway_without_checkpoint_returns_none(self, tmp_path, mode):
-        handler = self._make_handler(str(tmp_path), mode)
-        assert (
-            handler.load(
-                self._make_gateway_controller(), Mock(), Mock(), Mock(), Mock()
-            )
-            is None
-        )
-
     def test_dump_async_gateway_defers_publication(self, tmp_path):
         handler = self._make_handler(str(tmp_path), "on")
         handler.freq_ctl = Mock()

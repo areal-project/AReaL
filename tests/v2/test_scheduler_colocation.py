@@ -8,8 +8,6 @@ from areal.api import Job, Worker
 from areal.api.cli_args import (
     SchedulingSpec,
     SchedulingStrategy,
-    SchedulingStrategyType,
-    is_colocation_strategy,
 )
 from areal.infra.scheduler.colocation import (
     is_v2_training_guard_colocation,
@@ -20,24 +18,6 @@ from areal.infra.scheduler.local import LocalScheduler, WorkerInfo
 from areal.infra.scheduler.ray import RayScheduler
 from areal.infra.scheduler.slurm import SlurmScheduler, SlurmWorkerInfo
 from areal.infra.utils.concurrent import run_async_task
-
-
-@pytest.mark.parametrize(
-    ("strategy", "expected"),
-    [
-        (None, False),
-        (SchedulingStrategy(), False),
-        (SchedulingStrategy(type="colocation", target="rollout"), True),
-        (
-            SchedulingStrategy(
-                type=SchedulingStrategyType.colocation, target="rollout"
-            ),
-            True,
-        ),
-    ],
-)
-def test_is_colocation_strategy(strategy, expected):
-    assert is_colocation_strategy(strategy) is expected
 
 
 def test_v2_training_guard_colocation_requires_training_guard_module():

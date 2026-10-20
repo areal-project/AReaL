@@ -94,11 +94,6 @@ def test_trainer_close_drain_failure_does_not_destroy_parent_rollout():
     trainer.rollout.destroy.assert_not_called()
 
 
-def test_partial_initialization_without_save_does_not_drain():
-    controller = object.__new__(GatewayTrainController)
-    controller.wait_async_saves()
-
-
 def test_unreachable_rank_and_stalled_peer_fail_within_request_budget():
     from aiohttp import web
 

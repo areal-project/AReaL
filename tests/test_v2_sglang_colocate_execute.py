@@ -1,8 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from areal.engine.awex.adapters.sglang_adapter import AwexSGLangAdapter
+from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
+from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
 
 
 def test_execute_colocate_update_resumes_weights_before_reader():
@@ -93,3 +99,11 @@ class TestResumeMemoryIgnoresLocallyTrackedTags:
         with mock.patch.dict(sys.modules, {"sglang.srt.managers.io_struct": io_struct}):
             adapter.release_memory(["optimizer"])
         adapter._scheduler.release_memory_occupation.assert_not_called()
+
+
+def test_partial_offload_preserves_tags_or_rejects_unsupported_backend():
+    tags = ["kv_cache", "cuda_graph"]
+    request = SGLangBridgeBackend().get_offload_request(tags=tags)
+    assert request.payload == {"tags": tags}
+    with pytest.raises(NotImplementedError, match="tags"):
+        VLLMBridgeBackend().get_offload_request(tags=tags)
