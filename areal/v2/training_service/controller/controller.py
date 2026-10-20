@@ -846,12 +846,13 @@ class GatewayTrainController:
         from areal.infra.rpc.serialization import serialize_value
 
         if (
-            meta.weight_format == "dcp"
+            self._colocate
+            and meta.weight_format == "dcp"
             and self.config.backend.split(":", 1)[0] == "megatron"
             and self.config.megatron.async_save
         ):
             raise NotImplementedError(
-                "V2 DCP saving requires megatron.async_save=False until "
+                "V2 colocated DCP saving requires megatron.async_save=False until "
                 "worker teardown can drain asynchronous checkpoints"
             )
         self._gateway_post(

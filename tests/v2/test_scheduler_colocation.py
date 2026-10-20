@@ -61,7 +61,7 @@ def test_v2_training_guard_colocation_requires_training_guard_module():
 def _slurm_worker(worker_id, ip, gpu):
     return SlurmWorkerInfo(
         worker=Worker(id=worker_id, ip=ip, worker_ports=["10000"]),
-        role="rollout-inf",
+        role=worker_id.rsplit("/", 1)[0],
         slurm_job_id=11,
         task_index=int(worker_id.rsplit("/", 1)[1]),
         spec=SchedulingSpec(cpu=1, gpu=gpu, mem=1),
@@ -147,21 +147,30 @@ def test_local_v2_guard_cleanup_uses_saved_parent_after_target_deleted():
 
 
 @pytest.mark.parametrize("node_order", [(0, 1), (1, 0), (0, 1, 2, 3), (3, 1, 0, 2)])
-def test_slurm_v2_guard_colocation_forks_inside_target_allocation(tmp_path, node_order):
+@pytest.mark.parametrize("target", ["rollout", "actor"])
+def test_slurm_v2_guard_colocation_forks_inside_target_allocation(
+    tmp_path, node_order, target
+):
+    parent_role = "rollout-inf" if target == "rollout" else "actor-guard"
+    child_role = "actor-guard" if target == "rollout" else "ref-guard"
+    parent_gpus = 4 if target == "rollout" else 1
+    groups_per_node = 8 // parent_gpus
     num_nodes = len(node_order)
     world_size = num_nodes * 8
     scheduler = object.__new__(SlurmScheduler)
     scheduler._n_gpus_per_node = 8
     scheduler._workers = {
-        "rollout-inf": [
+        parent_role: [
             _slurm_worker(
-                f"rollout-inf/{group * num_nodes + node}", f"192.0.2.{node + 1}", gpu=4
+                f"{parent_role}/{group * num_nodes + node}",
+                f"192.0.2.{node + 1}",
+                gpu=parent_gpus,
             )
-            for group in range(2)
+            for group in range(groups_per_node)
             for node in node_order
         ]
     }
-    scheduler._jobs = {"rollout-inf": 11}
+    scheduler._jobs = {parent_role: 11}
     scheduler._colocated_roles = {}
     scheduler._v2_guard_parents = {}
     scheduler.enable_tms_offload = False
@@ -169,11 +178,11 @@ def test_slurm_v2_guard_colocation_forks_inside_target_allocation(tmp_path, node
     scheduler.trial_name = "trial"
     scheduler.fileroot = str(tmp_path)
     scheduler.get_workers = MagicMock(
-        return_value=[worker.worker for worker in scheduler._workers["rollout-inf"]]
+        return_value=[worker.worker for worker in scheduler._workers[parent_role]]
     )
 
     job = Job(
-        role="actor-guard",
+        role=child_role,
         replicas=world_size,
         tasks=[
             SchedulingSpec(
@@ -183,23 +192,25 @@ def test_slurm_v2_guard_colocation_forks_inside_target_allocation(tmp_path, node
                 cmd="python -m areal.v2.training_service.guard",
             )
         ],
-        scheduling_strategy=SchedulingStrategy(type="colocation", target="rollout"),
+        scheduling_strategy=SchedulingStrategy(type="colocation", target=target),
     )
 
     health_responses = [
         MagicMock(
             json=lambda base=base: {
-                "cuda_visible_devices": ",".join(str(i) for i in range(base, base + 4))
+                "cuda_visible_devices": ",".join(
+                    str(i) for i in range(base, base + parent_gpus)
+                )
             }
         )
         for _ in range(num_nodes)
-        for base in (0, 4)
+        for base in range(0, 8, parent_gpus)
     ]
     with (
         patch("areal.infra.scheduler.slurm.requests.get", side_effect=health_responses),
         patch(
             "areal.infra.scheduler.slurm.run_async_task",
-            return_value=[f"actor-guard/{rank}" for rank in range(world_size)],
+            return_value=[f"{child_role}/{rank}" for rank in range(world_size)],
         ) as run_async,
     ):
         worker_ids = scheduler.create_workers(job)
@@ -207,10 +218,10 @@ def test_slurm_v2_guard_colocation_forks_inside_target_allocation(tmp_path, node
     assert len(worker_ids) == world_size
     parent_workers = run_async.call_args.args[3]
     assert [worker.worker.id for worker in parent_workers] == [
-        f"rollout-inf/{group * num_nodes + node}"
+        f"{parent_role}/{group * num_nodes + node}"
         for node in range(num_nodes)
-        for group in range(2)
-        for _ in range(4)
+        for group in range(groups_per_node)
+        for _ in range(parent_gpus)
     ]
     assert run_async.call_args.args[4] == "areal.v2.training_service.guard"
     fork_envs = run_async.call_args.args[5]
@@ -231,7 +242,7 @@ def test_slurm_v2_guard_colocation_forks_inside_target_allocation(tmp_path, node
             assert len({slots[8 * node + 2 * cp + tp][0] for tp in range(2)}) == 1
         for tp in range(2):
             assert len({slots[8 * node + 2 * cp + tp][0] for cp in range(4)}) == 1
-    assert scheduler._v2_guard_parents["actor-guard"] == parent_workers
+    assert scheduler._v2_guard_parents[child_role] == parent_workers
     assert all(env["TMS_INIT_ENABLE"] == "0" for env in fork_envs)
     assert all(env["LD_PRELOAD"] == "" for env in fork_envs)
 
@@ -301,8 +312,11 @@ def test_colocated_namespace_rejects_unsupported_allocation(visible):
         validate_colocated_device_namespace(visible, base=0, count=4)
 
 
-def test_inference_guard_reports_only_visible_device_namespace(monkeypatch):
-    from areal.v2.inference_service.guard.app import app
+@pytest.mark.parametrize("service", ["inference_service", "training_service"])
+def test_guard_reports_only_visible_device_namespace(monkeypatch, service):
+    import importlib
+
+    app = importlib.import_module(f"areal.v2.{service}.guard.app").app
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
     response = app.test_client().get("/health")

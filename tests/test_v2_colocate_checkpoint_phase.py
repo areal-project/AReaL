@@ -85,6 +85,7 @@ def test_v2_controller_rejects_async_dcp_before_dispatch():
     from areal.v2.training_service.controller.controller import GatewayTrainController
 
     controller = object.__new__(GatewayTrainController)
+    controller._colocate = True
     controller.config = SimpleNamespace(
         backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
     )
@@ -96,3 +97,23 @@ def test_v2_controller_rejects_async_dcp_before_dispatch():
         )
 
     controller._gateway_post.assert_not_called()
+
+
+def test_separated_manual_async_checkpoint_keeps_existing_dispatch():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from areal.api.io_struct import SaveLoadMeta
+    from areal.v2.training_service.controller.controller import GatewayTrainController
+
+    controller = object.__new__(GatewayTrainController)
+    controller._colocate = False
+    controller.config = SimpleNamespace(
+        backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+    )
+    controller._gateway_post = Mock()
+
+    controller.save(SaveLoadMeta(path="unused", weight_format="dcp", with_optim=True))
+
+    controller._gateway_post.assert_called_once()
+    assert controller._gateway_post.call_args.args[0] == "/save"
