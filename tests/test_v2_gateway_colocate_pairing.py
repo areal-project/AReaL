@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 from unittest import mock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -89,6 +91,7 @@ def test_gateway_reconnect_preserves_pair_identity(
 ):
     app = gateway_app.create_app()
     app.state.colocate_pair_name = "actor-rollout"
+    app.state.colocate_state = "active"
     app.state.registry.register(
         PairInfo(
             pair_name="actor-rollout",
@@ -144,3 +147,79 @@ def test_gateway_rejects_unsupported_colocate_mode(override, error):
         )
     assert response.status_code == 400
     assert error in response.json()["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+async def test_colocate_connect_reserves_session_and_quarantines_failed_init(
+    monkeypatch, outcome
+):
+    app = gateway_app.create_app()
+    app.state.http_session = object()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    init_calls = []
+
+    async def report(*args):
+        return {"ip": "192.0.2.1", "device_id": 0, "tp_size": 1, "pp_size": 1}
+
+    async def initialize(session, url, timeout, json_data):
+        init_calls.append(json_data["pair_name"])
+        if "train" in url:
+            entered.set()
+            await release.wait()
+            if outcome == "failure":
+                raise RuntimeError("training worker initialization failed")
+
+    monkeypatch.setattr(gateway_app, "_get_json", report)
+    monkeypatch.setattr(gateway_app, "_post", initialize)
+    monkeypatch.setattr(gateway_app, "_ensure_meta_server", lambda app: "meta:1")
+    body = {
+        "pair_name": "a",
+        "train_worker_urls": ["http://train"],
+        "inference_worker_urls": ["http://infer"],
+        "mode": "awex",
+        "colocate": True,
+    }
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://gateway", headers=_auth_headers()
+    ) as client:
+        first = asyncio.create_task(client.post("/connect", json=body))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            assert app.state.colocate_state == "connecting"
+            for name in ("a", "b"):
+                response = await client.post(
+                    "/connect", json={**body, "pair_name": name}
+                )
+                assert response.status_code == 409
+            assert init_calls == ["a", "a"]
+            if outcome == "cancelled":
+                first.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await first
+            else:
+                release.set()
+                response = await first
+                assert response.status_code == (200 if outcome == "success" else 500)
+            expected = "active" if outcome == "success" else "failed"
+            assert app.state.colocate_state == expected
+            assert app.state.colocate_pair_name == "a"
+            for name in ("a", "b"):
+                response = await client.post(
+                    "/connect", json={**body, "pair_name": name}
+                )
+                assert response.status_code == (
+                    200 if outcome == "success" and name == "a" else 409
+                )
+            assert init_calls == ["a", "a"]
+            assert (app.state.registry.get_by_name("a") is not None) == (
+                outcome == "success"
+            )
+            assert app.state.registry.get_by_name("b") is None
+        finally:
+            release.set()
+            if not first.done():
+                first.cancel()
+            await asyncio.gather(first, return_exceptions=True)

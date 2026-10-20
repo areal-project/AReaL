@@ -268,6 +268,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     # Set by _ensure_meta_server on first colocate connect; empty until then.
     app.state.meta_server_addr = ""
     app.state.colocate_pair_name = ""
+    app.state.colocate_state = "idle"
 
     def _auth(request: Request) -> None:
         require_admin_key(request, config.admin_api_key)
@@ -294,8 +295,19 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     status_code=400,
                     content={"error": "AWEX colocation does not support LoRA weights"},
                 )
-            active_pair = request.app.state.colocate_pair_name
-            if active_pair:
+            state = request.app.state
+            active_pair = state.colocate_pair_name
+            if state.colocate_state in ("connecting", "failed"):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": (
+                            f"Colocate session {active_pair!r} is {state.colocate_state}; "
+                            "wait for initialization or restart the gateway after failure"
+                        )
+                    },
+                )
+            if state.colocate_state == "active":
                 existing = registry.get_by_name(pair_name)
                 if active_pair == pair_name and existing is not None:
                     if (
@@ -323,9 +335,22 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                         )
                     },
                 )
-            return await _connect_colocate(
-                request, pair_name, train_urls, inference_urls
+            # Reserve before the first await so concurrent requests cannot
+            # initialize another session against the shared MetaServer keys.
+            state.colocate_pair_name = pair_name
+            state.colocate_state = "connecting"
+            try:
+                response = await _connect_colocate(
+                    request, pair_name, train_urls, inference_urls
+                )
+            except BaseException:
+                # RPC failure/cancellation may leave initialized workers behind.
+                state.colocate_state = "failed"
+                raise
+            state.colocate_state = (
+                "active" if isinstance(response, ConnectResponse) else "failed"
             )
+            return response
 
         if body.mode == "disk":
             if not body.save_path:
@@ -771,7 +796,6 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             colocate=True,
         )
         registry.register(pair_info)
-        request.app.state.colocate_pair_name = pair_name
 
         for pair in pairing_table:
             logger.info(
