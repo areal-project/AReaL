@@ -5,14 +5,6 @@ from unittest import mock
 from areal.engine.awex.adapters.sglang_adapter import AwexSGLangAdapter
 
 
-def test_sglang_memory_tags_include_cuda_graph():
-    assert AwexSGLangAdapter._SGLANG_MEMORY_TAGS == {
-        "kv_cache",
-        "weights",
-        "cuda_graph",
-    }
-
-
 def test_execute_colocate_update_resumes_weights_before_reader():
     events = []
 

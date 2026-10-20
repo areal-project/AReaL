@@ -138,3 +138,30 @@ def test_unreachable_rank_and_stalled_peer_fail_within_request_budget():
             await runner.cleanup()
 
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("colocate", [False, True])
+@pytest.mark.parametrize("rpc_failed", [False, True])
+def test_async_save_tracks_pending_even_when_rpc_fails(colocate, rpc_failed):
+    from areal.api.io_struct import SaveLoadMeta
+    from areal.infra.rpc.serialization import deserialize_value
+
+    controller = object.__new__(GatewayTrainController)
+    controller._colocate = colocate
+    controller.config = SimpleNamespace(
+        backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+    )
+    controller._gateway_post = Mock(
+        side_effect=RuntimeError("lost response") if rpc_failed else None
+    )
+    meta = SaveLoadMeta(path="checkpoint", weight_format="dcp", with_optim=True)
+    if rpc_failed:
+        with pytest.raises(RuntimeError, match="lost response"):
+            controller.save(meta)
+    else:
+        controller.save(meta)
+
+    assert controller._async_checkpoint_pending is True
+    route, payload = controller._gateway_post.call_args.args
+    assert route == "/save"
+    assert deserialize_value(payload["args"])[0] == meta

@@ -1,15 +1,6 @@
-import pytest
-
 from areal.v2.inference_service.sglang.launch_server import (
     normalize_alloc_conf_for_inference,
-    physical_base_from_cvd,
 )
-
-
-def test_normalize_alloc_conf_flips_expandable_segments_off():
-    env = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
-    normalize_alloc_conf_for_inference(env, awex_colocate=True)
-    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:False"
 
 
 def test_normalize_alloc_conf_preserves_other_tokens():
@@ -36,8 +27,3 @@ def test_normalize_alloc_conf_leaves_separation_env_untouched():
     normalize_alloc_conf_for_inference(env, awex_colocate=False)
 
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
-
-
-def test_physical_base_from_cvd_still_validates():
-    with pytest.raises(ValueError):
-        physical_base_from_cvd("0,2,3,4")

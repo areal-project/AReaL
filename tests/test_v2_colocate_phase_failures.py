@@ -186,8 +186,20 @@ def test_mark_committed_allows_generation_to_resume():
 
     assert controller._colocate_update_succeeded
     assert controller._colocate_transfer_succeeded
-    assert "continue" in events
-    assert "resume" in events
+    assert events == [
+        "pause",
+        "drain",
+        ("offload", "kv_cache"),
+        ("offload", "cuda_graph"),
+        ("offload", "weights"),
+        ("actor", "resume_memory", ("weights", "optimizer")),
+        "pause_generation",
+        ("actor", "release_memory", ("weights", "optimizer")),
+        ("onload", "cuda_graph"),
+        ("onload", "kv_cache"),
+        "continue",
+        "resume",
+    ]
 
 
 def test_phase_auxiliary_failure_keeps_rollout_and_actor_offloaded():
@@ -265,3 +277,17 @@ def test_close_destroys_training_children_before_rollout_guards(monkeypatch):
     assert events.index("ref") < events.index("actor") < events.index("rollout")
     assert events.index("teacher") < events.index("actor")
     assert events.index("critic") < events.index("actor")
+
+
+@pytest.mark.parametrize("colocate", [False, True])
+def test_update_weights_leaves_resume_to_colocated_phase_only(colocate):
+    events = []
+    controller = _controller(events)
+    controller._colocate = colocate
+    controller._weight_update_ctrl = SimpleNamespace(
+        update_weights=lambda version: SimpleNamespace(status="ok", duration_ms=1.0)
+    )
+    controller.update_weights(SimpleNamespace(version=1))
+    assert events == (
+        ["pause_generation"] if colocate else ["pause_generation", "continue"]
+    )
