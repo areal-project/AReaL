@@ -321,3 +321,23 @@ def test_awex_colocation_requires_sglang_memory_saver(version):
         PPOTrainer._validate_awex_colocate_backends(
             "megatron", "sglang", enable_memory_saver=False, version=version
         )
+
+
+@pytest.mark.parametrize("backend", ["fsdp", "megatron"])
+@pytest.mark.parametrize("colocated_role", ["actor", "rollout"])
+def test_v2_lora_colocation_is_rejected_before_engine_initialization(
+    backend, colocated_role
+):
+    trainer = object.__new__(PPOTrainer)
+    trainer.actor_alloc = SimpleNamespace(backend=backend)
+    trainer.rollout_alloc = SimpleNamespace(backend="sglang")
+    trainer.config = SimpleNamespace(
+        actor=SimpleNamespace(_version="v2", use_lora=True, scheduling_strategy=None),
+        rollout=SimpleNamespace(scheduling_strategy=None),
+    )
+    getattr(trainer.config, colocated_role).scheduling_strategy = SimpleNamespace(
+        type="colocation", target="rollout" if colocated_role == "actor" else "actor"
+    )
+
+    with pytest.raises(ValueError, match="V2 LoRA colocation is not supported"):
+        trainer._validate_cfg()

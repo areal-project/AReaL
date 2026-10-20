@@ -179,7 +179,7 @@ class SGLangBridgeBackend:
                 return 1
             running = entry.get("num_running_reqs", entry.get("total_running_reqs"))
             waiting = entry.get("num_waiting_reqs", entry.get("total_waiting_reqs"))
-            if running is None and waiting is None:
+            if running is None or waiting is None:
                 return 1
             total += int(running or 0) + int(waiting or 0)
         return total

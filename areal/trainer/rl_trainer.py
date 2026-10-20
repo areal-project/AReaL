@@ -2191,6 +2191,14 @@ class PPOTrainer:
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
         rollout_backend = self.rollout_alloc.backend
         actor_backend = self.actor_alloc.backend
+        if (
+            self.config.actor._version == "v2"
+            and self.config.actor.use_lora
+            and self._is_actor_rollout_colocated(self.config)
+        ):
+            raise ValueError(
+                "V2 LoRA colocation is not supported; use separate actor and rollout GPUs."
+            )
         requires_train_engine_offload = any(
             (
                 self._should_offload_rollout,

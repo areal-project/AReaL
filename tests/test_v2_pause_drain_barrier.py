@@ -83,9 +83,19 @@ class TestParseInFlight:
     def test_counts_running_and_waiting_across_dp_ranks(self, body, expected):
         assert SGLangBridgeBackend.parse_in_flight(body) == expected
 
-    def test_missing_fields_are_treated_as_busy_not_idle(self):
-        """An unparseable payload must not be mistaken for a drained engine."""
-        assert SGLangBridgeBackend.parse_in_flight({}) > 0
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            {"num_running_reqs": 0},
+            {"num_waiting_reqs": 0},
+            {"loads": [{"num_running_reqs": 0}]},
+            {"loads": [{"num_waiting_reqs": 0}]},
+        ],
+    )
+    def test_missing_fields_are_treated_as_busy_not_idle(self, body):
+        """Unknown counts must not be mistaken for a drained engine."""
+        assert SGLangBridgeBackend.parse_in_flight(body) > 0
 
 
 @pytest.mark.parametrize(
