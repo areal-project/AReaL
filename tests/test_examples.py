@@ -8,6 +8,7 @@ import time
 import uuid
 
 import pytest
+from omegaconf import OmegaConf
 
 from tests.utils import get_dataset_path, get_model_path
 
@@ -506,12 +507,33 @@ def test_gsm8k_grpo_awex_v2_colocate_20_steps(tmp_path_factory, monkeypatch):
         os.environ.get("AREAL_TEST_GSM8K_PATH", ""), "openai/gsm8k"
     )
 
+    config = OmegaConf.load("examples/math/gsm8k_grpo.yaml")
+    config.actor.scheduling_spec[0].env_vars.update(
+        {
+            "TORCHINDUCTOR_CACHE_DIR": str(cache_path / "torchinductor"),
+            "TRITON_CACHE_DIR": str(cache_path / "triton"),
+            "PYTORCH_KERNEL_CACHE_PATH": str(cache_path / "torch-kernels"),
+            "VLLM_CACHE_ROOT": str(cache_path / "vllm"),
+        }
+    )
+    config.rollout.scheduling_spec = OmegaConf.to_container(
+        config.actor.scheduling_spec, resolve=True
+    )
+    config.rollout.scheduling_spec[0].env_vars.update(
+        {
+            "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+        }
+    )
+    config_path = experiments_path / "config.yaml"
+    OmegaConf.save(config, config_path)
+
     monkeypatch.setenv("AREAL_ALLOW_DEFAULT_ADMIN_KEY", "1")
 
     success = run_async_task(
         run_example,
         "examples/math/gsm8k_rl.py",
-        "examples/math/gsm8k_grpo.yaml",
+        str(config_path),
         "+total_train_steps=20",
         "rollout.backend=sglang:d1t2p1",
         "actor.backend=megatron:d2",
@@ -520,10 +542,6 @@ def test_gsm8k_grpo_awex_v2_colocate_20_steps(tmp_path_factory, monkeypatch):
         "+rollout._version=v2",
         "+actor.scheduling_strategy.type=colocation",
         "+actor.scheduling_strategy.target=rollout",
-        f"+actor.scheduling_spec.0.env_vars.TORCHINDUCTOR_CACHE_DIR={cache_path / 'torchinductor'}",
-        f"+actor.scheduling_spec.0.env_vars.TRITON_CACHE_DIR={cache_path / 'triton'}",
-        f"+actor.scheduling_spec.0.env_vars.PYTORCH_KERNEL_CACHE_PATH={cache_path / 'torch-kernels'}",
-        f"+actor.scheduling_spec.0.env_vars.VLLM_CACHE_ROOT={cache_path / 'vllm'}",
         "ref=null",
         "gconfig.n_samples=2",
         "gconfig.max_new_tokens=128",

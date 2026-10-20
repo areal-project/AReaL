@@ -13,39 +13,19 @@ from __future__ import annotations
 import os
 import sys
 
+from areal.engine.awex.utils import validate_memory_saver_allocator
+
 
 def physical_base_from_cvd(cvd: str) -> int:
     entries = [e.strip() for e in cvd.split(",") if e.strip()]
     if not entries:
         raise ValueError(f"CUDA_VISIBLE_DEVICES is empty: {cvd!r}")
-    ids = sorted(int(e) for e in entries)
-    if ids != list(range(ids[0], ids[0] + len(ids))):
-        raise ValueError(f"CUDA_VISIBLE_DEVICES is not contiguous: {cvd!r}")
+    ids = [int(e) for e in entries]
+    if ids[0] < 0 or ids != list(range(ids[0], ids[0] + len(ids))):
+        raise ValueError(
+            f"CUDA_VISIBLE_DEVICES must be nonnegative and contiguous in the given order: {cvd!r}"
+        )
     return ids[0]
-
-
-def normalize_alloc_conf_for_inference(env: dict, *, awex_colocate: bool) -> None:
-    """Force expandable_segments off for SGLang processes.
-
-    The colocated guard env ships ``expandable_segments:True`` for the actor
-    (fragmentation fix), and the forked SGLang server inherits it. SGLang's
-    memory saver cannot physically unmap/remap expandable segments, so weight
-    pages resumed after a release are invalid CUDA IPC/copy targets. Mirror of
-    the donor's ``_normalize_cuda_alloc_conf_for_memory_saver``; must run
-    before any CUDA initialization.
-    """
-    if not awex_colocate:
-        return
-    conf = env.get("PYTORCH_CUDA_ALLOC_CONF", "")
-    if "expandable_segments" not in conf.lower():
-        return
-    tokens = [
-        t.strip()
-        for t in conf.split(",")
-        if t.strip() and not t.strip().lower().startswith("expandable_segments")
-    ]
-    tokens.append("expandable_segments:False")
-    env["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(tokens)
 
 
 def unmask_gpus_for_awex_colocate(server_args) -> None:
@@ -141,7 +121,8 @@ def areal_launch_server(server_args) -> None:
 
 if __name__ == "__main__":
     awex_colocate = os.environ.get("AREAL_AWEX_COLOCATE") == "1"
-    normalize_alloc_conf_for_inference(os.environ, awex_colocate=awex_colocate)
+    if awex_colocate:
+        validate_memory_saver_allocator(os.environ)
 
     from sglang.srt.server_args import prepare_server_args
     from sglang.srt.utils import kill_process_tree

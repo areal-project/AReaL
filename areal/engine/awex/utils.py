@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 
 from areal.utils.environ import get_float_env_var
 
@@ -43,3 +44,22 @@ def resolve_physical_gpu_id(relative_gpu_id: int | None = None) -> int:
 
 def awex_colocate_timeout_s(default: float = 1800.0) -> float:
     return get_float_env_var("AWEX_COLOCATE_TIMEOUT_S", default)
+
+
+def validate_memory_saver_allocator(env: Mapping[str, str]) -> None:
+    """Reject allocator settings unsupported by the current torch-memory-saver."""
+    # PyTorch prefers the new name, but TMS also checks the legacy name itself.
+    for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        conf = env.get(name, "")
+        for option in conf.split(","):
+            key, _, value = option.partition(":")
+            if (
+                key.strip().lower() == "expandable_segments"
+                and value.strip().lower() == "true"
+            ):
+                raise RuntimeError(
+                    "Torch-memory-saver does not support expandable segments "
+                    f"({name}={conf!r}). Set expandable_segments:False or remove "
+                    "that option in the rollout role's scheduling_spec.env_vars; "
+                    "keep actor allocator settings separate."
+                )

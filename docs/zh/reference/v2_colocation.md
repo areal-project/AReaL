@@ -20,6 +20,21 @@ Slurm 分配使用 UUID、重排编号或部分节点 GPU 时，会在 fork 训�
 rollout guard 共卡。两侧必须覆盖相同的物理 GPU。训练和推理 并行布局可以不同，但每个 SGLang TP/PP 组必须满足支持的节点内布局。 设置
 `actor.megatron.async_save: true` 可使 DCP 磁盘写入与训练重叠。
 
+## Allocator 配置
+
+TMS 0.0.9 和 0.0.10 明确拒绝 `expandable_segments:True`。v1/v2 AWEX rollout
+启动时使用统一校验，不会自动改写环境变量。 rollout 应独立于 actor 配置，例如在各个 `rollout.scheduling_spec` 条目的
+`env_vars` 中设置：
+
+```yaml
+PYTORCH_ALLOC_CONF: expandable_segments:False
+PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+```
+
+PyTorch 2.9 优先读取 `PYTORCH_ALLOC_CONF`，但 TMS 仍会直接检查旧变量 `PYTORCH_CUDA_ALLOC_CONF`，因此
+rollout 中两个变量均不能开启 expandable segments。 也可以移除该选项；actor 的 allocator 配置可以独立保留。GPU mask
+必须按升序连续排列，重排编号会明确报错，不再自动排序。
+
 ## 显存交接
 
 初始化时先创建 rollout guard、初始化训练 worker，然后释放训练显存，再加载辅助模型和 SGLang。 需要 offload 的 v2 辅助模型须使用

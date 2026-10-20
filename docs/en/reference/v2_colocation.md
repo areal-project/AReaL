@@ -25,6 +25,24 @@ must cover the same physical GPUs. Their parallel layouts may differ, but every 
 TP/PP group must fit the supported node-local placement. Set
 `actor.megatron.async_save: true` to overlap DCP disk writes with training.
 
+## Allocator configuration
+
+TMS 0.0.9 and 0.0.10 reject `expandable_segments:True`. Both v1 and v2 AWEX rollout
+startup validate allocator settings without rewriting the environment. Configure the
+rollout role independently from the actor, for example in each `rollout.scheduling_spec`
+entry's `env_vars`:
+
+```yaml
+PYTORCH_ALLOC_CONF: expandable_segments:False
+PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+```
+
+PyTorch 2.9 prefers `PYTORCH_ALLOC_CONF`, but TMS also checks the legacy
+`PYTORCH_CUDA_ALLOC_CONF` directly. Neither variable may enable expandable segments in
+the rollout process. Omitting that option is also valid. Actor allocator settings can
+remain independent. GPU masks must retain ascending, contiguous device order; reordered
+masks are rejected rather than sorted.
+
 ## Memory ownership
 
 Initialization creates rollout guards, initializes training workers, and releases

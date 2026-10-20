@@ -89,10 +89,9 @@ def test_physical_base_from_cvd_maps_guard_mask_to_physical_base():
     assert physical_base_from_cvd("0,1,2,3,4,5,6,7") == 0
 
 
-def test_physical_base_from_cvd_rejects_empty_and_noncontiguous():
+@pytest.mark.parametrize("cvd", ["", "0,2,3,4", "5,4", "0,1,1", "-1,0", "GPU-uuid"])
+def test_physical_base_from_cvd_rejects_invalid_device_order(cvd):
     from areal.v2.inference_service.sglang.launch_server import physical_base_from_cvd
 
     with pytest.raises(ValueError):
-        physical_base_from_cvd("")
-    with pytest.raises(ValueError):
-        physical_base_from_cvd("0,2,3,4")
+        physical_base_from_cvd(cvd)
