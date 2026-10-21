@@ -10,17 +10,17 @@ workers.
 The new files provide the dense controller/actor entry points, the exact training
 parameters and Slurm submission preflights. They do not modify the running trial.
 
-| Setting       | Value                                                             |
-| ------------- | ----------------------------------------------------------------- |
-| Sampling      | temperature 1, top-p 1, top-k 100000                              |
-| Batch / group | bs32 / gs12; at most 16 concurrent rollout groups                 |
-| Training      | TP4 / PP4 / CP4 / EP1; CPU Adam offload                           |
-| Inference     | 16 TP4 replicas; CUDA graph, memory saver and radix cache enabled |
-| Attention     | dense provider `auto`; native GDN defaults; no PLE override       |
-| LM head       | native projection; chunked logits disabled                        |
-| Reward        | group normalization uses standard deviation                       |
-| R3            | disabled                                                          |
-| Recovery      | auto; model/optimizer/LR/RNG state retained; save every two hours |
+| Setting       | Value                                                               |
+| ------------- | ------------------------------------------------------------------- |
+| Sampling      | temperature 1, top-p 1, top-k 100000                                |
+| Batch / group | bs16 / gs12; consumer batch 16; rollout concurrency 1500; queue 256 |
+| Training      | TP4 / PP4 / CP4 / EP1; CPU Adam offload                             |
+| Inference     | 16 TP4 replicas; CUDA graph, memory saver and radix cache enabled   |
+| Attention     | dense provider `auto`; native GDN defaults; no PLE override         |
+| LM head       | native projection; chunked logits disabled                          |
+| Reward        | group normalization uses standard deviation                         |
+| R3            | disabled                                                            |
+| Recovery      | auto; model/optimizer/LR/RNG state retained; save every two hours   |
 
 Actor/controller use **areal-dev-sglang-0821.sif**, with the historical dependency
 overlay providing **Megatron-Core 0.18.2**, **megatron-bridge 0.5.1** and **AWEX
@@ -55,7 +55,7 @@ files.
    bash examples/swe/rl/qwen38_27b/submit.sh
    ```
 
-The launcher uses `sudo` when necessary to rsync code and the selected profile into
+The launcher uses `sudo` when necessary to copy code and the selected profile into
 `$QWEN_RUN_DIR/source/code`. `QWEN_SYNC_DIR` can override the snapshot directory; it
 must be on shared storage visible to all containers. Source and destination must not
 overlap. Tracked files include local edits and deletions; non-ignored new files under
@@ -79,10 +79,11 @@ in every role. An existing trial snapshot is reused only if identical; changed c
 profile requires a new trial/run directory, so active workers' code is never
 overwritten.
 
-The YAML selects `whitebox-b-overfit64-20261013` with `whitebox-unified-b-areal@0.1.0`.
-Dataset setup generates `$QWEN_RUN_DIR/reward-mapping.json` from each published Env
-version's original reward reference and checks reward publication before creating
-rollout workers. Keep this mapping when recovering; all roles must be able to read it.
+The YAML selects `whitebox-b-overfit64-20261013` with
+`whitebox-unified-b-areal@0.1.1-no-budget`. Dataset setup generates
+`$QWEN_RUN_DIR/reward-mapping.json` from each published Env version's original reward
+reference and checks reward publication before creating rollout workers. Keep this
+mapping when recovering; all roles must be able to read it.
 
 The controller verifies the source snapshot, durable storage, Arena authentication,
 rollout imports, structured config, W&B name length and dense model provider before

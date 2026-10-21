@@ -48,7 +48,7 @@ finally:
 print("Shared storage preflight: 16 MiB fsync succeeded", flush=True)
 VERIFY_STORAGE
 
-# Validate the exact rsynced files, including uncommitted source and site profile.
+# Validate the exact copied files, including uncommitted source and site profile.
 # Compute hosts may have an old system Python; use the training image for scripts.
 preflight_python() {
   singularity exec --no-eval --no-home --writable-tmpfs \

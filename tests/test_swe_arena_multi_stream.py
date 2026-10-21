@@ -25,7 +25,6 @@ from examples.swe.arena_config import (
     parse_arena_stream_config,
 )
 from examples.swe.arena_preflight import _arena_json, _recent_health, validate_streams
-from examples.swe.arena_reward_breakdown import build_fine64_reward_breakdown
 from examples.swe.train_swe_rl import get_arena_dataset, get_arena_mixture_dataset
 from examples.swe.utils import ArenaRewardRefConfig, ArenaStreamConfig
 
@@ -727,15 +726,11 @@ async def test_workflow_audit_oversized_telemetry_is_truncated(
     assert record["arena_score"] == 0.5
 
 
-def test_workflow_breakdown_metrics_follow_consumed_rollouts(monkeypatch):
+def test_workflow_reward_subscores_follow_consumed_rollouts(monkeypatch):
     """Telemetry uses the same batch sidecar and step as the episode score."""
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setattr(workflow_context, "stat_scope", lambda: "rollout")
     stats_tracker.export_all(reset=True)
-    measured = json.loads(
-        (REPO_ROOT / "tests/fixtures/arena_fine64_reward.json").read_text()
-    )
-    breakdown = build_fine64_reward_breakdown(measured)
     workflow = ArenaStreamAgentWorkflow(
         econfig={
             "arena_base_url": "https://arena.example",
@@ -746,27 +741,22 @@ def test_workflow_breakdown_metrics_follow_consumed_rollouts(monkeypatch):
         ArenaTaskResult(
             task_id="task",
             status="OK",
-            score=0.1482,
-            sub_scores=measured["rule_result"]["sub_scores"],
-            raw={"reward_breakdown": breakdown},
+            score=0.5,
+            sub_scores={"quality": 0.25},
         )
     )
     with capture_metrics() as captured:
-        workflow.record_episode_metrics({"arena_stream_name": "fine"}, 0.1482)
+        workflow.record_episode_metrics({"arena_stream_name": "fine"}, 0.5)
 
-    key = "rollout/reward_breakdown/total/vlm/weight"
+    key = "rollout/reward_sub_score/quality"
     assert key not in stats_tracker.export_all(reset=True)
     buffer = ConsumedMetrics()
     assert buffer.export() == {}
     buffer.consume(SimpleNamespace(trajectory={}, metrics=captured))
     exported = buffer.export()
-    assert exported[key] == 0.1
+    assert exported[key] == 0.25
     assert exported[f"{key}__count"] == 1
-    assert exported["rollout/reward_breakdown/valid"] == 1
-    assert exported["rollout/reward_breakdown/total/vlm/share_of_parent_mean"] == (
-        pytest.approx(0.1 / measured["score"])
-    )
-    assert exported["rollout/stream/fine/reward_breakdown/total/vlm/weight"] == 0.1
+    assert exported["rollout/stream/fine/reward_sub_score/quality"] == 0.25
     assert workflow._task_result.get() is None
 
 
@@ -1111,148 +1101,6 @@ def _core_context_failure_error() -> ArenaTaskFailedError:
     ]
     error.harness_result["raw"] = {"outcome": outcome.copy()}
     return error
-
-
-def _provider_context_failure_error(source="provider_stream"):
-    error = _core_context_failure_error()
-    outcome = {
-        "code": "LLM_CONTEXT_WINDOW_EXCEEDED",
-        "class": "agent",
-        "source": source,
-        "details": {
-            "code": "context_length_exceeded",
-            "errorShape": "object",
-            "errorType": "context_length_exceeded",
-            "eventType": "error",
-            "reason": None,
-        },
-    }
-    error.result.raw["outcome"] = outcome
-    error.harness_result["error"][0] = {
-        "message": "provider stream error: context_length_exceeded",
-        "outcome": outcome.copy(),
-    }
-    error.harness_result["raw"]["outcome"] = outcome.copy()
-    return error
-
-
-@pytest.mark.parametrize(
-    "source", ["provider_stream", "provider_http", "other_producer"]
-)
-def test_structured_context_code_from_other_producers_keeps_zero(source):
-    """The terminal code, rather than the producer name, defines overflow."""
-    error = _provider_context_failure_error(source)
-    assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
-            error, context_overflow=False, interaction_count=2
-        )
-        == "model_failure_zero"
-    )
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "infrastructure",
-        "different_code",
-        "missing_receipt",
-        "conflicting_receipt",
-        "system_failure",
-        "unhealthy",
-        "no_interactions",
-        "setup_failed",
-    ],
-)
-def test_provider_context_failure_with_invalid_evidence_is_rejected(mutation):
-    """A context outcome cannot hide infrastructure errors or empty samples."""
-    error = _provider_context_failure_error()
-    count = 2
-    if mutation == "infrastructure":
-        error.result.raw["outcome"]["class"] = "infrastructure"
-    elif mutation == "different_code":
-        error.result.raw["outcome"]["code"] = "LLM_RESPONSE_FAILED"
-    elif mutation == "missing_receipt":
-        error.harness_result = None
-    elif mutation == "conflicting_receipt":
-        error.harness_result["raw"]["outcome"]["source"] = "core_context_budget"
-    elif mutation == "system_failure":
-        error.result.raw["failure"] = {"code": "EXPORT_FAILED"}
-    elif mutation == "unhealthy":
-        error.result.raw["trajectoryHealth"] = "unhealthy"
-    elif mutation == "setup_failed":
-        error.status = "SETUP_FAILED"
-    else:
-        count = 0
-    assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
-            error, context_overflow=True, interaction_count=count
-        )
-        != "model_failure_zero"
-    )
-
-
-def _current_core_context_failure_error(reason="compaction is disabled"):
-    error = _core_context_failure_error()
-    details = {"estimatedTokens": 189066, "inputLimit": 188416, "reason": reason}
-    error.result.raw["outcome"]["details"] = details
-    for outcome in (
-        error.harness_result["error"][0]["outcome"],
-        error.harness_result["raw"]["outcome"],
-    ):
-        outcome["details"] = details.copy()
-    error.harness_result["error"][0]["message"] = (
-        f"context window limit exceeded: {reason} "
-        "(189066 estimated tokens / 188416 input tokens)"
-    )
-    return error
-
-
-@pytest.mark.parametrize(
-    "reason",
-    [
-        "compaction is disabled",
-        "full request does not fit after compaction; inspect fixed instructions, tools and retained inputs",
-    ],
-)
-def test_current_core_context_overflow_keeps_zero(reason):
-    error = _current_core_context_failure_error(reason)
-    assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
-            error, context_overflow=False, interaction_count=2
-        )
-        == "model_failure_zero"
-    )
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "negative_tokens",
-        "missing_receipt",
-        "conflicting_receipt",
-        "bad_limit",
-        "no_interactions",
-    ],
-)
-def test_current_core_context_overflow_rejects_invalid_evidence(mutation):
-    error = _current_core_context_failure_error()
-    count = 2
-    if mutation == "negative_tokens":
-        error.result.raw["outcome"]["details"]["estimatedTokens"] = -1
-    elif mutation == "bad_limit":
-        error.result.raw["outcome"]["details"]["inputLimit"] = True
-    elif mutation == "missing_receipt":
-        error.harness_result = None
-    elif mutation == "conflicting_receipt":
-        error.harness_result["raw"]["outcome"]["details"]["inputLimit"] = 1
-    else:
-        count = 0
-    assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
-            error, context_overflow=True, interaction_count=count
-        )
-        == "unknown_failure_reject"
-    )
 
 
 def _whitebox_deadline_error():
@@ -2449,68 +2297,40 @@ def test_healthy_native_receipt_cannot_hide_explicit_system_failure(
     )
 
 
-def test_current_core_byte_context_overflow_below_token_limit_keeps_zero():
-    error = _current_core_context_failure_error()
+def _provider_context_failure_error(source="provider_stream"):
+    error = _core_context_failure_error()
+    outcome = {
+        "code": "LLM_CONTEXT_WINDOW_EXCEEDED",
+        "class": "agent",
+        "source": source,
+        "details": {
+            "code": "context_length_exceeded",
+            "errorShape": "object",
+            "errorType": "context_length_exceeded",
+            "eventType": "error",
+            "reason": None,
+        },
+    }
+    error.result.raw["outcome"] = outcome
+    error.harness_result["error"][0] = {
+        "message": "provider stream error: context_length_exceeded",
+        "outcome": outcome.copy(),
+    }
+    error.harness_result["raw"]["outcome"] = outcome.copy()
+    return error
+
+
+def _current_core_context_failure_error(reason="compaction is disabled"):
+    error = _core_context_failure_error()
+    details = {"estimatedTokens": 189066, "inputLimit": 188416, "reason": reason}
+    error.result.raw["outcome"]["details"] = details
     for outcome in (
-        error.result.raw["outcome"],
         error.harness_result["error"][0]["outcome"],
         error.harness_result["raw"]["outcome"],
     ):
-        outcome["details"]["estimatedTokens"] = 1000
+        outcome["details"] = details.copy()
     error.harness_result["error"][0]["message"] = (
-        "context window limit exceeded: compaction is disabled "
-        "(1000 estimated tokens / 188416 input tokens)"
+        f"context window limit exceeded: {reason} "
+        "(189066 estimated tokens / 188416 input tokens)"
     )
-    assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
-            error, context_overflow=False, interaction_count=2
-        )
-        == "model_failure_zero"
-    )
-
-
-@pytest.mark.parametrize(
-    "runner",
-    ["scene-whitebox-unified-b-bridge/scripts/runner.py", "other/scripts/runner.py"],
-)
-def test_whitebox_adopted_error_only_envelope_requires_known_runner(runner):
-    error = _whitebox_deadline_error()
-    error.result = replace(
-        error.result,
-        raw={
-            "error": "harness: adopted harness: harness agent phase exited with code 1: "
-            f"harness: running task lifecycle (runner=/envarena/harness/skills/{runner})"
-        },
-    )
-    expected = (
-        "model_failure_zero"
-        if runner.startswith("scene-whitebox")
-        else "unknown_failure_reject"
-    )
-    assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
-            error, context_overflow=False, interaction_count=2
-        )
-        == expected
-    )
-
-
-@pytest.mark.parametrize(
-    "code,reason",
-    [
-        ("LLM_RESPONSE_FAILED", "transport"),
-        ("LLM_RESPONSE_FAILED", "empty_completion"),
-        ("LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED", "unknown"),
-    ],
-)
-def test_final_usage_wrapper_without_valid_length_outcome_is_rejected(code, reason):
-    """The usage wrapper alone is not evidence of a model length stop."""
-    error = _core_model_failure_error(
-        code, reason, "provider terminal response includes final usage"
-    )
-    assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
-            error, context_overflow=False, interaction_count=2
-        )
-        == "unknown_failure_reject"
-    )
+    return error

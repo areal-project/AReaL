@@ -17,6 +17,12 @@ if [[ ${1:-} != --from-snapshot ]]; then
   local_repo=${QWEN_REPO:-$(cd "$recipe_dir/../../../.." && pwd)}
   : "${QWEN_RUN_DIR:?Set the run directory in site.env}"
   : "${QWEN_OUTPUT_ROOT:?Set the output root in site.env}"
+  checkout_root=$(realpath "$local_repo")
+  for output_dir in "$QWEN_RUN_DIR" "$QWEN_OUTPUT_ROOT"; do
+    case "$(realpath -m "$output_dir")/" in
+      "$checkout_root/"*) echo 'Keep run files and output outside the Git checkout' >&2; exit 1 ;;
+    esac
+  done
   snapshot=$(realpath -m "${QWEN_SYNC_DIR:-$QWEN_RUN_DIR/source}")
   privilege=()
   if (( EUID != 0 )); then

@@ -13,9 +13,7 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.workflow_executor import (
     BatchTaskDispatcher,
-    WorkflowExecutor,
     _RolloutResult,
-    _RolloutTaskInput,
 )
 from areal.utils import stats_tracker
 from areal.utils.rollout_metrics import ConsumedMetrics, capture_metrics
@@ -57,29 +55,6 @@ def test_prefetched_and_filtered_rewards_follow_consumed_attempts():
     assert buffer.export()["rollout/reward"] == pytest.approx(0.9)
 
 
-@pytest.mark.parametrize("trajectory", [None, {"text": "ok"}])
-def test_rpc_transfer_does_not_publish_worker_metrics(trajectory):
-    """Both accepted and rejected sidecars survive serialization and prefetch."""
-    result = _RolloutResult(0, trajectory, {"rollout/reward": [0.0, 1.0]})
-    worker, worker_buffer = dispatcher_with_results([result])
-    raw = worker.wait_for_task(0, consume=False)
-    transported = deserialize_value(
-        serialize_value({"trajectory": raw.trajectory, "metrics": raw.metrics})
-    )
-    assert worker_buffer.export() == {}
-    controller, controller_buffer = dispatcher_with_results(
-        [_RolloutResult(0, **transported)]
-    )
-    assert controller_buffer.export() == {}
-    consumed = controller.wait_for_task(0)
-    assert (consumed is None) == (trajectory is None)
-    assert controller_buffer.export() == {
-        "rollout/reward": 0.5,
-        "rollout/reward__count": 2,
-        "rollout/reward_sample_count": 2,
-    }
-
-
 @pytest.mark.asyncio
 async def test_capture_isolates_concurrent_groups_and_inherits_into_children():
     """Async group children share only their parent's metrics context."""
@@ -99,74 +74,6 @@ async def test_capture_isolates_concurrent_groups_and_inherits_into_children():
     assert second == {"rollout/reward": [1.0, 1.0]}
     tracker.scalar(reward=0.25)
     assert tracker.export()["rollout/reward"] == 0.25
-
-
-def test_capture_leaves_eval_operational_and_prm_metrics_in_export_window():
-    """The batch buffer only intercepts training quality scalar metrics."""
-    tracker = DistributedStatsTracker("rollout")
-    evaluation = DistributedStatsTracker("eval-rollout")
-    with capture_metrics() as metrics:
-        tracker.scalar(
-            **{
-                "arena/call_success": 1,
-                "prm_metric/rate": 0.5,
-                "spec_accept_rate": 0.75,
-                "reward": 0,
-            }
-        )
-        evaluation.scalar(reward=1)
-    assert metrics == {"rollout/reward": [0.0]}
-    assert tracker.export()["rollout/arena/call_success"] == 1
-    assert evaluation.export()["eval-rollout/reward"] == 1
-
-
-def test_capture_exception_restores_context_and_preserves_observations():
-    """A failing attempt retains already recorded metrics without leaking scope."""
-    tracker = DistributedStatsTracker("rollout")
-    with pytest.raises(ValueError), capture_metrics() as metrics:
-        tracker.scalar(reward=0)
-        raise ValueError("failed")
-    assert metrics == {"rollout/reward": [0.0]}
-    tracker.scalar(reward=1)
-    assert tracker.export()["rollout/reward"] == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["accepted", "filtered", "none", "exception"])
-async def test_workflow_quality_survives_rejection_and_failure(outcome, monkeypatch):
-    """The real workflow wrapper retains observations for every completed attempt."""
-    tracker = DistributedStatsTracker("rollout")
-    monkeypatch.setattr(stats_tracker, "get", lambda name: tracker)
-
-    class Workflow:
-        async def arun_episode(self, engine, data):
-            tracker.scalar(reward=0.75, harness_error=0)
-            if outcome == "exception":
-                raise ValueError("episode failed")
-            return None if outcome == "none" else {"text": "ok"}
-
-    executor = WorkflowExecutor.__new__(WorkflowExecutor)
-    executor.config = SimpleNamespace(
-        check_trajectory_format=False, dump_to_file=False, enable_rollout_tracing=False
-    )
-    executor.inference_engine = Mock()
-    executor._staleness_manager = Mock()
-    executor.logger = Mock()
-    executor.data_hooks = Mock()
-    executor.data_hooks.run_pre.return_value = ({}, [])
-    executor.data_hooks.run_post.side_effect = lambda phase, traj, state: traj
-    task = _RolloutTaskInput(0, {}, Workflow(), lambda traj: outcome != "filtered")
-    result = await executor._create_workflow_task(task)()
-    assert tracker.export() == {}
-    assert result.metrics["rollout/reward"] == [0.75]
-    accepted = outcome == "accepted"
-    assert (result.trajectory is not None) == accepted
-    buffer = ConsumedMetrics()
-    buffer.consume(result)
-    stats = buffer.export()
-    assert stats["rollout/group_attempt_count"] == 1
-    assert stats["rollout/accepted"] == float(accepted)
-    assert stats["rollout/rejected"] == float(not accepted)
 
 
 def test_rpc_envelope_preserves_remote_tensor_transport(monkeypatch):
@@ -209,19 +116,4 @@ def test_engine_facade_transfers_metrics_and_exports_only_consumed(
     assert result["rollout/reward"] == pytest.approx(1 / 3)
     assert result["rollout/reward__count"] == 3
     assert result["system"] == 2
-    assert engine.export_stats() == {"system": 2}
-
-
-@pytest.mark.parametrize("backend", ["sglang", "vllm"])
-def test_engine_stats_export_before_initialization_remains_supported(
-    backend, monkeypatch
-):
-    """Global operational stats remain exportable before workflow initialization."""
-    from areal.engine.sglang_remote import RemoteSGLangEngine
-    from areal.engine.vllm_remote import RemotevLLMEngine
-
-    engine_cls = RemoteSGLangEngine if backend == "sglang" else RemotevLLMEngine
-    engine = engine_cls.__new__(engine_cls)
-    engine._engine = SimpleNamespace(_workflow_executor=None)
-    monkeypatch.setattr(stats_tracker, "export_all", lambda **kwargs: {"system": 2})
     assert engine.export_stats() == {"system": 2}

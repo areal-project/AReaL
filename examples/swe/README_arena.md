@@ -207,11 +207,6 @@ Malformed optional telemetry is omitted and counted with validity metrics; it do
 reject an otherwise valid reward. Missing older breakdowns are reported as `present=0`
 and their existing sub-scores still log.
 
-The numeric verifier fixture in `tests/fixtures/arena_fine64_reward.json` has
-total=0.1482429, rule=0.0536032, and VLM=1. The rule's weight is 0.9 but its actual
-contribution is 0.0482429 (32.54% of this total); VLM contributes 0.1 (67.46%). This
-illustrates why formula weights and observed contribution shares are separate fields.
-
 Keep the breakdown private to grading and training. A published verifier needs a new
 immutable version to emit it; existing frozen experiments do not gain the field merely
 by updating this checkout.
