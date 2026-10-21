@@ -1065,15 +1065,29 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         if dist.get_world_size(group=group) != training_world_size:
             raise RuntimeError("Training world size changed during colocate update")
         dist.barrier(group=group)
+        completion_status: list[str | None] = [None]
+        completion_error: Exception | None = None
         if dist.get_rank(group=group) == 0:
-            client.wait_set_until_size(
-                "finished_weights_update_engines",
-                self._legacy_num_infer_engines,
-                timeout=self._legacy_timeout_s,
-            )
-            client.delete_if_exists("finished_weights_update_engines")
-            client.delete_if_exists("all_training_offloaded_weights")
-        dist.barrier(group=group)
+            try:
+                client.wait_set_until_size(
+                    "finished_weights_update_engines",
+                    self._legacy_num_infer_engines,
+                    timeout=self._legacy_timeout_s,
+                )
+                client.delete_if_exists("finished_weights_update_engines")
+                client.delete_if_exists("all_training_offloaded_weights")
+            except Exception as exc:
+                completion_error = exc
+                completion_status[0] = f"{type(exc).__name__}: {exc}"
+        # All ranks must observe a failed wait or cleanup instead of leaving
+        # peers stranded in a barrier that rank zero never reaches.
+        dist.broadcast_object_list(
+            completion_status, src=dist.get_global_rank(group, 0), group=group
+        )
+        if completion_status[0] is not None:
+            raise RuntimeError(
+                f"AWEX colocate completion failed: {completion_status[0]}"
+            ) from completion_error
 
     def teardown_colocate_weight_update(self) -> None:
         """Clear transport state without forgetting offloaded memory ownership."""

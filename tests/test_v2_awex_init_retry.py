@@ -169,7 +169,7 @@ def _adapter(events):
     return adapter
 
 
-def test_finish_colocate_update_cleans_reusable_keys_between_barriers():
+def test_finish_colocate_update_cleans_reusable_keys_before_broadcast():
     events = []
     adapter = _adapter(events)
 
@@ -186,6 +186,16 @@ def test_finish_colocate_update_cleans_reusable_keys_between_barriers():
             "areal.engine.awex.adapters.megatron_adapter.dist.barrier",
             side_effect=lambda group: events.append(("barrier", group)),
         ),
+        mock.patch(
+            "areal.engine.awex.adapters.megatron_adapter.dist.get_global_rank",
+            return_value=2,
+        ),
+        mock.patch(
+            "areal.engine.awex.adapters.megatron_adapter.dist.broadcast_object_list",
+            side_effect=lambda status, src, group: events.append(
+                ("broadcast", status[:], src, group)
+            ),
+        ),
     ):
         adapter.finish_colocate_weight_update(training_world_size=8)
 
@@ -194,11 +204,11 @@ def test_finish_colocate_update_cleans_reusable_keys_between_barriers():
         ("wait", "finished_weights_update_engines", 4, 120.0),
         ("delete", "finished_weights_update_engines"),
         ("delete", "all_training_offloaded_weights"),
-        ("barrier", "cpu"),
+        ("broadcast", [None], 2, "cpu"),
     ]
 
 
-def test_nonzero_rank_only_participates_in_finish_barriers():
+def test_nonzero_rank_only_participates_in_finish_collectives():
     events = []
     adapter = _adapter(events)
 
@@ -215,10 +225,20 @@ def test_nonzero_rank_only_participates_in_finish_barriers():
             "areal.engine.awex.adapters.megatron_adapter.dist.barrier",
             side_effect=lambda group: events.append(("barrier", group)),
         ),
+        mock.patch(
+            "areal.engine.awex.adapters.megatron_adapter.dist.get_global_rank",
+            return_value=2,
+        ),
+        mock.patch(
+            "areal.engine.awex.adapters.megatron_adapter.dist.broadcast_object_list",
+            side_effect=lambda status, src, group: events.append(
+                ("broadcast", status[:], src, group)
+            ),
+        ),
     ):
         adapter.finish_colocate_weight_update(training_world_size=8)
 
-    assert events == [("barrier", "cpu"), ("barrier", "cpu")]
+    assert events == [("barrier", "cpu"), ("broadcast", [None], 2, "cpu")]
 
 
 def test_worker_execute_endpoint_runs_finish_after_transfer():

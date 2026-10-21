@@ -84,6 +84,12 @@ def test_colocate_export_lifetime_follows_reader_ack(
     monkeypatch.setattr(megatron_adapter.dist, "get_rank", lambda group=None: 0)
     monkeypatch.setattr(megatron_adapter.dist, "barrier", lambda group: None)
     monkeypatch.setattr(megatron_adapter.dist, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(
+        megatron_adapter.dist, "get_global_rank", lambda group, rank: rank
+    )
+    monkeypatch.setattr(
+        megatron_adapter.dist, "broadcast_object_list", lambda status, src, group: None
+    )
 
     if completion is True:
         for version in range(3):

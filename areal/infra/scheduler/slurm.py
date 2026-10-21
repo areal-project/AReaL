@@ -1181,28 +1181,40 @@ set -o pipefail
             parent_workers: list[SlurmWorkerInfo] = []
             fork_envs: list[dict[str, str]] = []
             base_env = dict(schedulings[0].env_vars or {})
-            # A target guard fronts spec.gpu GPUs. Expand one forked worker
-            # per GPU and pin each to its node-local physical slot: guards on
-            # a host are laid out contiguously in worker order (the same
-            # base-gpu ordering the inference servers were forked with), so
-            # slot = host-running-base + within-guard offset. rank%N guessing
-            # breaks whenever guard count != GPU count (e.g. tp>1 servers).
+            # Forked guards inherit their parent's spec, which may describe
+            # more GPUs than they actually bind. Use the live device mask for
+            # both topology validation and expansion, including nested forks.
             host_base: dict[str, int] = {}
-            target_layout: list[tuple[int, str, SlurmWorkerInfo]] = []
+            target_layout: list[tuple[int, str, SlurmWorkerInfo, int]] = []
             for target_worker in target_workers:
-                target_gpu_count = target_worker.spec.gpu if target_worker.spec else 0
                 host_ip = target_worker.worker.ip
+                address = format_hostport(host_ip, target_worker.worker.worker_ports[0])
+                response = requests.get(f"http://{address}/health", timeout=30)
+                response.raise_for_status()
+                visible_devices = response.json().get("cuda_visible_devices")
+                target_gpu_count = (
+                    len(visible_devices.split(",")) if visible_devices else 0
+                )
+                base = host_base.get(host_ip, 0)
+                try:
+                    if not target_gpu_count:
+                        raise ValueError("Target guard has no visible GPUs")
+                    validate_colocated_device_namespace(
+                        visible_devices, base, target_gpu_count
+                    )
+                except ValueError as exc:
+                    raise WorkerCreationError(
+                        role, "Unsupported colocated GPU namespace", str(exc)
+                    ) from exc
                 target_gpus_by_host[host_ip] = (
                     target_gpus_by_host.get(host_ip, 0) + target_gpu_count
                 )
-                base = host_base.get(host_ip, 0)
-                target_layout.append((base, host_ip, target_worker))
+                target_layout.append((base, host_ip, target_worker, target_gpu_count))
                 host_base[host_ip] = base + target_gpu_count
 
             # Keep training ranks contiguous per host without changing GPU ownership.
             target_layout.sort(key=lambda item: (item[1], item[0]))
-            for base, _host_ip, target_worker in target_layout:
-                target_gpu_count = target_worker.spec.gpu if target_worker.spec else 0
+            for base, _host_ip, target_worker, target_gpu_count in target_layout:
                 for offset in range(target_gpu_count):
                     parent_workers.append(target_worker)
                     fork_envs.append(
@@ -1222,21 +1234,6 @@ set -o pipefail
                     "V2 guard colocation requires a full-node target allocation "
                     "with one training guard per GPU",
                 )
-
-            for base, host_ip, target_worker in target_layout:
-                address = format_hostport(host_ip, target_worker.worker.worker_ports[0])
-                response = requests.get(f"http://{address}/health", timeout=30)
-                response.raise_for_status()
-                try:
-                    validate_colocated_device_namespace(
-                        response.json().get("cuda_visible_devices"),
-                        base,
-                        target_worker.spec.gpu,
-                    )
-                except ValueError as exc:
-                    raise WorkerCreationError(
-                        role, "Unsupported colocated GPU namespace", str(exc)
-                    ) from exc
 
             command = schedulings[0].cmd
             command_parts = shlex.split(command) if command else []

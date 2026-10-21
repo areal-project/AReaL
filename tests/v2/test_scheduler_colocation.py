@@ -183,8 +183,8 @@ def test_slurm_v2_guard_colocation_forks_inside_target_allocation(
                 )
             }
         )
-        for _ in range(num_nodes)
         for base in range(0, 8, parent_gpus)
+        for _ in node_order
     ]
     with (
         patch("areal.infra.scheduler.slurm.requests.get", side_effect=health_responses),
@@ -254,7 +254,13 @@ def test_slurm_v2_guard_colocation_requires_full_node_topology(tmp_path):
         scheduling_strategy=SchedulingStrategy(type="colocation", target="rollout"),
     )
 
-    with pytest.raises(WorkerCreationError, match="full-node target allocation"):
+    with (
+        patch(
+            "areal.infra.scheduler.slurm.requests.get",
+            return_value=MagicMock(json=lambda: {"cuda_visible_devices": "0,1,2,3"}),
+        ),
+        pytest.raises(WorkerCreationError, match="full-node target allocation"),
+    ):
         scheduler.create_workers(job)
 
 
