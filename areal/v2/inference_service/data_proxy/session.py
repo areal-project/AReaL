@@ -16,6 +16,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from areal.experimental.openai.cache import InteractionCache, PrefixMatcher
+from areal.experimental.openai.finalization import finalize_interactions
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry, ProcessorCallCache
 from areal.reward.prm.export import PRMExportStats
@@ -409,7 +410,8 @@ class SessionData:
                     f"Trajectory {target_trajectory_id} not found for session {self.session_id}"
                 )
 
-        interactions = ready.completions.export_interactions(
+        interactions = finalize_interactions(
+            ready.completions,
             style=style,
             reward_discount=discount,
             drop_retry_orphans=drop_retry_orphans,

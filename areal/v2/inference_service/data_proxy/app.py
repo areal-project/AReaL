@@ -267,6 +267,7 @@ def _create_areal_client(
         tokenizer=tok._tok,
         processor=tok.processor,
         tool_call_parser=config.tool_call_parser,
+        tool_call_parser_allow_recovery=config.tool_call_parser_allow_recovery,
         reasoning_parser=config.reasoning_parser,
         engine_max_tokens=config.engine_max_tokens,
         chat_template_type=config.chat_template_type,

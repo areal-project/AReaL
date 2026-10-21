@@ -209,3 +209,6 @@ wandb/
 outputs/
 sympy/
 !/docs/figures/*
+
+debug/
+analysis/

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -13,6 +15,7 @@ from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
 
 from areal.api import ModelResponse
 from areal.experimental.openai.cache import InteractionCache
+from areal.experimental.openai.proxy import client_session as client_session_module
 from areal.experimental.openai.proxy import workflow as workflow_module
 from areal.experimental.openai.proxy.proxy_gateway import CompletedSessionInfo
 from areal.experimental.openai.proxy.server import (
@@ -312,11 +315,14 @@ async def test_caught_system_error_cannot_be_recovered_as_context_zero(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_recovered_overflow_keeps_all_eleven_siblings(monkeypatch):
+@pytest.mark.parametrize("failure", ["context_overflow", "invalid_tool_json"])
+async def test_recovered_overflow_keeps_all_eleven_siblings(monkeypatch, failure):
     from areal.api import RolloutWorkflow
     from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
 
     client = _FakeProxyClient()
+    client.context_overflow = failure == "context_overflow"
+    client.invalid_tool_json = failure == "invalid_tool_json"
     monkeypatch.setattr(workflow_module, "OpenAIProxyClient", lambda **_: client)
     monkeypatch.setattr(
         workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
@@ -743,7 +749,7 @@ async def test_concat_per_completion_rewards_do_not_fill_unscored_branch(monkeyp
         ("TIMEOUT", True),
         ("NO_OUTPUT", True),
         ("EVAL_FAILED", True),
-        ("SETUP_FAILED", False),
+        ("SETUP_FAILED", True),
     ],
 )
 @pytest.mark.parametrize("reject_terminal_task_failures", [False, True])
@@ -918,3 +924,276 @@ async def test_arena_legacy_model_failure_requires_usable_proxy_trajectory(
     finally:
         workflow_context.set(WorkflowContext())
         stats_tracker.export_all(reset=True)
+
+
+def _invalid_tool_json_error(source="provider_stream"):
+    """Sanitized native receipts from both lowpoly Harnesses."""
+    details = {
+        "code": None,
+        "errorShape": "object",
+        "errorType": "invalid_request_error",
+        "eventType": "error" if source == "provider_stream" else "http_error",
+        "reason": None,
+    }
+    if source == "provider_http":
+        details["httpStatus"] = 422
+    outcome = {
+        "code": "LLM_RESPONSE_FAILED",
+        "class": "infrastructure",
+        "source": source,
+        "details": details,
+    }
+    summary = (
+        "GAMEAGENT_OUTCOME_CODE=LLM_RESPONSE_FAILED "
+        "GAMEAGENT_OUTCOME_CLASS=infrastructure"
+    )
+    error = ArenaTaskFailedError(
+        task_id="invalid-tool-task",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="invalid-tool-task",
+            status="HARNESS_FAILED",
+            score=0.0,
+            raw={
+                "error": "harness: running setup hook (timeout=3m0s)\n" + summary,
+                "harness": {
+                    "phase": "agent",
+                    "result_status": "ERROR",
+                    "exit_code": 1,
+                    "summary": summary,
+                },
+                "outcome": deepcopy(outcome),
+            },
+        ),
+    )
+    error.harness_result = {
+        "implementation": "rust-core-runtime",
+        "status": "ERROR",
+        "exit_code": 1,
+        "turn_statuses": ["failed"],
+        "delivery": None,
+        "summary": summary,
+        "error": [
+            {
+                "message": (
+                    "model reported a streaming error (event=error, code=None, "
+                    'type=Some("invalid_request_error"), reason=None)'
+                    if source == "provider_stream"
+                    else "model HTTP status 422 Unprocessable Entity"
+                ),
+                "outcome": deepcopy(outcome),
+            }
+        ],
+        "raw": {"outcome": deepcopy(outcome)},
+    }
+    return error
+
+
+@pytest.mark.parametrize("source", ["provider_stream", "provider_http"])
+@pytest.mark.parametrize("local_error", [False, True])
+def test_native_invalid_request_requires_local_tool_json_evidence(source, local_error):
+    """A generic provider invalid_request_error is insufficient for zero reward."""
+    error = _invalid_tool_json_error(source)
+    assert ArenaStreamAgentWorkflow.classify_proxy_failure(
+        error,
+        context_overflow=False,
+        interaction_count=1,
+        invalid_tool_json=local_error,
+    ) == ("model_failure_zero" if local_error else "unknown_failure_reject")
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_receipt",
+        "unavailable",
+        "wrong_receipt",
+        "nonzero_score",
+        "no_interactions",
+        "wrong_source",
+        "non_string_source",
+        "authentication",
+        "collect_failure",
+        "eval_failure",
+        "export_failure",
+        "bad_exit",
+        "http404",
+    ],
+)
+def test_invalid_tool_json_does_not_rescue_other_failures(fault):
+    """Typed local evidence must not override conflicting terminal evidence."""
+    error = _invalid_tool_json_error()
+    interactions = 1
+    if fault == "missing_receipt":
+        error.harness_result = None
+    elif fault == "unavailable":
+        error.harness_result["error"][0]["message"] = "model service unavailable"
+    elif fault == "wrong_receipt":
+        error.harness_result["raw"]["outcome"]["source"] = "core"
+    elif fault == "nonzero_score":
+        error.result = replace(error.result, score=1.0)
+    elif fault == "no_interactions":
+        interactions = 0
+    elif fault == "wrong_source":
+        error.result.raw["outcome"]["source"] = "core"
+    elif fault == "non_string_source":
+        error.result.raw["outcome"]["source"] = {}
+    elif fault == "authentication":
+        error.result.raw["outcome"]["details"]["errorType"] = "authentication_error"
+    elif fault == "collect_failure":
+        error.status = "COLLECT_FAILED"
+    elif fault == "eval_failure":
+        error.status = "EVAL_FAILED"
+    elif fault == "export_failure":
+        error.result.raw["failure"] = {"code": "EXPORT_FAILED"}
+    elif fault == "bad_exit":
+        error.harness_result["exit_code"] = 137
+    else:
+        error = _invalid_tool_json_error("provider_http")
+        error.result.raw["outcome"]["details"]["httpStatus"] = 404
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error,
+            context_overflow=False,
+            interaction_count=interactions,
+            invalid_tool_json=True,
+        )
+        != "model_failure_zero"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported", [False, True])
+async def test_client_session_reads_local_invalid_tool_json_flag(monkeypatch, reported):
+    payload = {"interaction_count": 1}
+    if reported:
+        payload.update(
+            invalid_tool_json=True, invalid_tool_json_message="malformed tool"
+        )
+    monkeypatch.setattr(
+        client_session_module, "post_json_with_retry", AsyncMock(return_value=payload)
+    )
+    client = client_session_module.OpenAIProxyClient(
+        session=object(), base_url="http://proxy", task_id="test", admin_api_key="admin"
+    )
+    client.session_id = "sample-1"
+    client._session_api_key = "session-key"
+    await client.__aexit__(None, None, None)
+    assert client.invalid_tool_json is reported
+    assert client.invalid_tool_json_message == ("malformed tool" if reported else "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("system_error", [False, True])
+async def test_native_tool_json_zero_keeps_generated_tokens(monkeypatch, system_error):
+    """Retain the invalid model action and its loss mask; system errors veto recovery."""
+    error = _invalid_tool_json_error()
+
+    class NativeAgent(_RecordingFailingAgent):
+        classify_proxy_failure = staticmethod(
+            ArenaStreamAgentWorkflow.classify_proxy_failure
+        )
+
+        async def run(self, data, **kwargs):
+            raise error
+
+    client = _FakeProxyClient()
+    client.context_overflow = False
+    client.invalid_tool_json = True
+    client.system_error = system_error
+    client.interaction.model_response = ModelResponse(
+        input_tokens=[1],
+        output_tokens=[2, 3],
+        output_logprobs=[-0.2, -0.3],
+        output_versions=[0, 0],
+    )
+    monkeypatch.setattr(workflow_module, "OpenAIProxyClient", lambda **_: client)
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    agent = NativeAgent()
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
+    monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
+    workflow_context.set(WorkflowContext(task_id=1))
+    try:
+        if system_error:
+            with pytest.raises(ArenaTaskFailedError):
+                await workflow.arun_episode(None, {})
+            assert client.last_reward is None
+            return
+        result = await workflow.arun_episode(None, {})
+        assert client.last_reward == 0.0
+        assert agent.failure_dispositions[0][2] == "model_failure_zero"
+        assert agent.persisted_rewards == [({}, 0.0)]
+        tensors = concat_tensor_interactions(result)
+        assert tensors["input_ids"].tolist() == [[1, 2, 3]]
+        assert tensors["loss_mask"].tolist() == [[0, 1, 1]]
+        assert tensors["rollout_group"].rewards == (0.0,)
+    finally:
+        workflow_context.set(WorkflowContext())
+        stats_tracker.export_all(reset=True)
+
+
+@pytest.mark.parametrize(
+    "agent,expected",
+    [
+        (_SystemFailingAgent(), "system_failure_reject"),
+        (_ModelFailingAgent(), "model_failure_zero"),
+    ],
+)
+def test_invalid_tool_json_preserves_existing_classifier_hooks(agent, expected):
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
+    assert (
+        workflow._classify_agent_failure(
+            RuntimeError("agent failed"),
+            context_overflow=False,
+            interaction_count=1,
+            invalid_tool_json=True,
+        )
+        == expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_tool_json_fetches_native_receipt_before_recovery(monkeypatch):
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
+    monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
+    agent = ArenaStreamAgentWorkflow(
+        econfig={
+            "arena_base_url": "https://arena.example",
+            "arena_streams": [{"name": "a", "stream_id": "stream-a"}],
+        }
+    )
+    error = _invalid_tool_json_error()
+    receipt = error.harness_result
+    error.harness_result = None
+
+    async def launch(**kwargs):
+        kwargs["on_launch_success"](error.task_id)
+        raise error
+
+    fetched = AsyncMock(return_value=receipt)
+    monkeypatch.setattr(
+        agent.client,
+        "register_llm_proxy_async",
+        AsyncMock(return_value=("https://arena.example/api", "model-a")),
+    )
+    monkeypatch.setattr(agent.client, "launch_one_task_result", launch)
+    monkeypatch.setattr(agent.client, "get_harness_result_async", fetched)
+    monkeypatch.setattr(agent.client, "delete_llm_proxy_async", AsyncMock())
+    with pytest.raises(ArenaTaskFailedError) as caught:
+        await agent.run(
+            {"arena_stream_name": "a", "stream_id": "stream-a", "data_id": "data-a"},
+            base_url="http://proxy",
+            api_key="session-key",
+        )
+    fetched.assert_awaited_once()
+    assert (
+        agent.classify_proxy_failure(
+            caught.value,
+            context_overflow=False,
+            interaction_count=1,
+            invalid_tool_json=True,
+        )
+        == "model_failure_zero"
+    )

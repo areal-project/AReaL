@@ -2904,6 +2904,17 @@ class AgentConfig:
         default="qwen",
         metadata={"help": "Parser for tool calls in model output."},
     )
+    tool_call_parser_allow_recovery: bool = field(
+        default=True,
+        metadata={
+            "help": "Allow permissive tool-call parsing (legacy behavior). "
+            "False currently requires tool_call_parser='qwen3_coder': validate "
+            "the complete XML call structure without tag repairs, partial-call "
+            "extraction, or SGLang/vLLM fallback. Invalid tool protocol is "
+            "cached as a model interaction and returned as non-retryable "
+            "invalid_tool_json. Argument schema validation remains with the tool."
+        },
+    )
     reasoning_parser: str = field(
         default="qwen3",
         metadata={"help": "Parser for reasoning content (<think> tags)."},
@@ -3006,6 +3017,14 @@ class AgentConfig:
     def __post_init__(self) -> None:
         if not self.agent_cls_path:
             raise ValueError("agent_cls_path must be a non-empty import path")
+        if (
+            not self.tool_call_parser_allow_recovery
+            and self.tool_call_parser != "qwen3_coder"
+        ):
+            raise ValueError(
+                "tool_call_parser_allow_recovery=False requires "
+                "tool_call_parser='qwen3_coder'"
+            )
         if len(self.scheduling_spec) != 1:
             raise ValueError(
                 f"scheduling_spec must contain exactly 1 SchedulingSpec, got {len(self.scheduling_spec)}"

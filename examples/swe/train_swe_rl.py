@@ -20,9 +20,12 @@ from examples.swe.arena_config import (
     build_weighted_arena_rows,
     load_arena_stream_configs,
 )
+from examples.swe.arena_reward_mapping import (
+    load_harness_mapping,
+    prepare_reward_mapping,
+)
 from examples.swe.utils import ArenaRewardRefConfig, ArenaStreamConfig, SWEPPOConfig
 
-from areal import PPOTrainer
 from areal.api.cli_args import load_expr_config
 from areal.utils import logging
 
@@ -148,15 +151,39 @@ def _resolve_arena_stream(
         configured,
         stream_id=resolved_stream_id,
         llm_protocol=llm_protocol,
-        expected_reward_ref=actual_reward_ref,
+        expected_reward_ref=(
+            ArenaRewardRefConfig()
+            if configured.reward_mapping_file
+            else actual_reward_ref
+        ),
     )
     rows = client.get_all_dataset_rows(resolved_stream_id, llm_protocol)
+    mapping = (
+        prepare_reward_mapping(
+            client,
+            resolved_stream_id,
+            rows,
+            configured.reward_mapping_file,
+            stream=stream,
+        )
+        if configured.reward_mapping_file
+        else {}
+    )
+    harnesses = (
+        load_harness_mapping(configured.reward_mapping_file, resolved_stream_id)
+        if configured.reward_mapping_file
+        else {}
+    )
     for row in rows:
+        if harnesses:
+            row["harness"] = harnesses[row["data_id"]]
+            row["llm_protocol"] = infer_llm_protocol_from_harness(row["harness"])
+        reward_ref = mapping[row["data_id"]] if mapping else actual_reward_ref
         row.update(
             {
                 "arena_stream_name": resolved.name,
-                "reward_ref_key": actual_reward_ref.key,
-                "reward_ref_version": actual_reward_ref.version,
+                "reward_ref_key": reward_ref.key,
+                "reward_ref_version": reward_ref.version,
             }
         )
     return resolved, rows
@@ -282,6 +309,8 @@ def _resolve_aweagent_root(econfig) -> str:
 
 
 def main(args):
+    from areal import PPOTrainer
+
     warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
     config, _ = load_expr_config(args, SWEPPOConfig)
@@ -344,7 +373,9 @@ def main(args):
         timeout=econfig.timeout,
     )
     if econfig.dataset_source == "arena":
-        workflow_kwargs["experiment_name"] = config.experiment_name
+        workflow_kwargs["experiment_name"] = (
+            f"{config.experiment_name}-{config.trial_name}"
+        )
 
     # Eval workflow with lower temperature for deterministic evaluation
     eval_workflow_kwargs = workflow_kwargs.copy()

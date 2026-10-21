@@ -116,6 +116,155 @@ are retained for audit, not parsed for training rewards. Model-attributed failur
 retain interactions with zero reward; system and ambiguous failures are rejected. Result
 shards are written under `arena_result_dump_dir` when configured.
 
+### Reward components in W&B
+
+The client preserves the result envelope's `sub_scores`. Finite named entries are logged
+as `rollout/reward_sub_score/<name>` and
+`rollout/stream/<stream>/reward_sub_score/<name>`. These metrics describe the verifier
+score before any training reward transform. They do not change the reward used by GRPO.
+Sub-scores are also included in private result audit shards. Both `raw` and `sub_scores`
+are independently omitted from audit shards when their encoded size exceeds
+`arena_result_dump_max_bytes`; presence, size, and truncation flags remain available for
+each field.
+
+For a complete decomposition, the verifier can return a private `raw.reward_breakdown`
+object with schema `arena-reward-breakdown/v1`. Arena's existing opaque `raw` field
+carries it without a control-plane schema change. Build it after the final aggregation,
+before writing `reward_result.json`:
+
+```python
+from arena_reward_breakdown import build_fine64_reward_breakdown
+
+# Bundle examples/swe/arena_reward_breakdown.py with the verifier runtime.
+# result is the full measured verifier result, not the reduced task API reply.
+result.setdefault("raw", {})["reward_breakdown"] = build_fine64_reward_breakdown(result)
+```
+
+The helper validates the current fine64 `mean80-min20-v1` measurements. Its tree
+contains these operations:
+
+```text
+total = 0.9 * rule + 0.1 * vlm
+  rule = quality * factor
+    quality = 0.8 * mean + 0.2 * minimum
+      mean = sum(normalized_part_weight * part_quality)
+        part_quality = 0.25 * layout + 0.35 * surface + 0.40 * view
+      minimum = min(part_quality); selected_part_ids records all exact ties
+    factor = retention * scene_excess
+      retention = 1 - 0.15 * anomaly_A - 0.20 * x / (0.20 + x)
+      x = max(0, local_E - 0.25)
+      scene_excess = 1 / (1 + full_scene_excess_ratio)
+  vlm = 0.25 * sum(four majority-voted visual items)
+```
+
+Each node has `name`, `operator`, and `value`; aggregation nodes have `children`. Names
+are bounded identifiers, unique among siblings. Operations are `weighted_sum`,
+`product`, `leaf`, and `terminal`. The top-level object also declares `score_mode`. An
+additive child additionally carries:
+
+| Field                    | Meaning                                                      |
+| ------------------------ | ------------------------------------------------------------ |
+| `value`                  | Measured score of this component                             |
+| `weight`                 | Effective coefficient relative to its immediate parent       |
+| `declared_weight`        | Original coefficient, or original unnormalized part weight   |
+| `contribution_to_parent` | `weight * value`                                             |
+| `share_of_parent`        | Contribution divided by the parent score; null if it is zero |
+
+Product children are factors, so they have no additive weight, contribution, or share.
+The old `semantic_h` is retained as a sub-score diagnostic; it does not participate in
+the current mean80/min20 score. Do not add parent contributions and their descendants
+together.
+
+For `RULE_ONLY_FALLBACK`, the effective top-level weights are rule=1 and VLM=0; the
+declared weights remain 0.9 and 0.1. VLM `value` is null and `excluded` is true.
+`HARD_INVALID` carries a valid terminal zero without invented component zeros;
+`RULE_UNSCORABLE` carries a terminal null. The training adapter's model-failure zero
+policy remains separate from these verifier outcomes.
+
+The existing stats/W&B pipeline records the tree under these paths, also with a
+`rollout/stream/<stream>/` prefix:
+
+```text
+rollout/reward_breakdown/present
+rollout/reward_breakdown/valid
+rollout/reward_breakdown/mode/MIXED_90_10
+rollout/reward_breakdown/total/score
+rollout/reward_breakdown/total/rule/weight
+rollout/reward_breakdown/total/rule/contribution_to_parent
+rollout/reward_breakdown/total/vlm/share_of_parent_mean
+rollout/reward_breakdown/total/rule/quality/mean/<part>/surface/score
+rollout/reward_breakdown/total/rule/quality/mean/<part>/surface/weight
+rollout/reward_breakdown/total/rule/factor/score
+```
+
+Weights and shares use fractions, not percentages. Scalars are averaged over observed
+episodes in the consumed-rollout metric window; each component's `computed` and
+`share_computed` metrics expose missing measurements and undefined shares.
+`share_of_parent_mean` is the mean of episode shares, not the ratio of batch
+contribution sums. For aggregate contribution comparisons, compare the contribution and
+parent score metrics over the same observations. Do not mix different score modes.
+Malformed optional telemetry is omitted and counted with validity metrics; it does not
+reject an otherwise valid reward. Missing older breakdowns are reported as `present=0`
+and their existing sub-scores still log.
+
+The numeric verifier fixture in `tests/fixtures/arena_fine64_reward.json` has
+total=0.1482429, rule=0.0536032, and VLM=1. The rule's weight is 0.9 but its actual
+contribution is 0.0482429 (32.54% of this total); VLM contributes 0.1 (67.46%). This
+illustrates why formula weights and observed contribution shares are separate fields.
+
+Keep the breakdown private to grading and training. A published verifier needs a new
+immutable version to emit it; existing frozen experiments do not gain the field merely
+by updating this checkout.
+
+Structured `LLM_CONTEXT_WINDOW_EXCEEDED` agent failures are recognized by code across
+producers, including `provider_stream` and `provider_http`, with a matching native
+Harness receipt. Local context-budget outcomes additionally validate the legacy details
+or current `estimatedTokens / inputLimit / reason` format. For
+`whitebox-unified-b-areal`, the training adapter additionally reads
+`whitebox-lifecycle.json`: an explicit `BRIDGE_EXECUTION_DEADLINE` with completed
+cleanup and no existing terminal receipt or conflicting failure outcome retains valid
+interactions with reward zero. External termination, incomplete cleanup, generic process
+kills, and missing or invalid receipts remain rejected. Both recovery paths still
+require usable interactions and are vetoed by proxy system errors; they do not turn
+setup or evaluation failures into zero rewards.
+
+## Per-task reward mappings
+
+For a Stream whose tasks use different original graders, set `reward_mapping_file` in
+its Stream entry instead of `expected_reward_ref`:
+
+```yaml
+arena_streams:
+  - name: whitebox-b
+    stream_id: whitebox-b-overfit64-20261013
+    harness: whitebox-unified-b-areal@0.1.0
+    llm_protocol: chat_completions
+    reward_mapping_file: ${oc.env:EXPERIMENT_ROOT}/reward-mapping.json
+```
+
+The file must be on persistent storage visible at the same path to the controller and
+rollout workers. During preflight or training dataset setup, AReaL creates it if absent:
+it resolves each `env:<key>@<version>` using Stream `metadata.per_task_bindings` and
+published Env metadata (`source_reward_ref` or `reward_ref`, plus optional
+`harness_ref`). Conflicting sources fail before rollout. Each distinct reward and
+Harness version must be published, and references must include an exact version.
+
+When Harness bindings are present, they must cover every dataset row. Each task uses its
+pinned Harness in preference to the Stream-level `harness`; its LLM protocol is inferred
+from that Harness using the existing protocol inference rules. Snapshots without Harness
+bindings retain the Stream-level Harness and protocol behavior.
+
+Subsequent starts reuse the snapshot, check exact dataset coverage, verify the pinned
+versions remain published, and check declared Stream bindings for drift. An invalid or
+incomplete existing file is rejected, never regenerated automatically. Keep the same
+file when recovering; use a new run file for a changed dataset or to add Harness pins to
+an older reward-only snapshot. Each rollout validates its row against the snapshot and
+sends the task-specific `reward` and `harness` to Arena. Result audit records contain
+`expected_reward_ref` and `expected_harness`; terminal `score` processing is unchanged.
+Without `reward_mapping_file`, the existing Stream-default behavior is unchanged.
+Harness routing does not certify that a Harness forwards Session Gateway headers
+correctly; that still requires Harness-specific validation.
+
 ## Port provenance and scope
 
 This port applies selected changes from `swe-dev` commits `da1da65c7`, `1d0fc7ba0`,

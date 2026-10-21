@@ -69,6 +69,11 @@ def main():
         default="qwen",
     )
     parser.add_argument(
+        "--tool-call-parser-allow-recovery",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
         "--reasoning-parser",
         default="qwen3",
     )
@@ -135,6 +140,7 @@ def main():
         deterministic_sampling=args.deterministic_sampling,
         serving_addr=format_hostport(serving_host, args.port),
         tool_call_parser=args.tool_call_parser,
+        tool_call_parser_allow_recovery=args.tool_call_parser_allow_recovery,
         reasoning_parser=args.reasoning_parser,
         engine_max_tokens=args.engine_max_tokens,
         chat_template_type=args.chat_template_type,

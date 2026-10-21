@@ -28,3 +28,8 @@ class ArenaStreamConfig:
     )
     reward_threshold: float | None = None
     reward_transform_fn: str = ""
+    # Shared snapshot of per-data-id rewards and optional Harness bindings.
+    # Per-task Harness pins take precedence over the Stream-level harness.
+    # Created before training if absent; reused and checked on subsequent starts.
+    # Mutually exclusive with expected_reward_ref (the Stream-default mode).
+    reward_mapping_file: str = ""

@@ -20,7 +20,7 @@ import uvicorn
 from anthropic.types.message import Message
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses import Response
@@ -34,6 +34,7 @@ from areal.experimental.openai.anthropic import (
     translate_anthropic_stream,
 )
 from areal.experimental.openai.client import ArealOpenAI, ContextLengthExceededError
+from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
@@ -121,6 +122,7 @@ _prm_runner = None
 
 # Session management
 _session_cache: dict[str, SessionData] = {}
+_session_invalid_tool_errors: dict[str, str] = {}
 _lock = threading.Lock()
 _capacity = 0
 _last_cleanup_time: float = 0
@@ -324,6 +326,25 @@ def _remove_api_keys_for_session(session_id: str) -> None:
 app = FastAPI()
 
 
+@app.exception_handler(InvalidToolCallError)
+async def invalid_tool_call_error_response(
+    _request: Request, exc: InvalidToolCallError
+) -> JSONResponse:
+    """Return a protocol-native, explicitly non-retryable model error."""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": exc.code,
+                "message": str(exc),
+            },
+        },
+        headers={"x-should-retry": "false"},
+    )
+
+
 @app.get("/health")
 def health():
     return {
@@ -390,6 +411,9 @@ def _setup_openai_client():
         tokenizer=tokenizer,
         processor=processor,
         tool_call_parser=agent_cfg.tool_call_parser,
+        tool_call_parser_allow_recovery=getattr(
+            agent_cfg, "tool_call_parser_allow_recovery", True
+        ),
         reasoning_parser=agent_cfg.reasoning_parser,
         engine_max_tokens=agent_cfg.engine_max_tokens,
         chat_template_type=agent_cfg.chat_template_type,
@@ -552,6 +576,7 @@ def _cleanup_stale_sessions():
     for session_id in stale_sessions:
         logger.warning(f"Removing stale session: {session_id}")
         session_data = _session_cache.pop(session_id, None)
+        _session_invalid_tool_errors.pop(session_id, None)
         if session_data is not None:
             cache_group_id = session_data.take_processor_cache_group_id()
             if cache_group_id is not None:
@@ -656,6 +681,7 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
             processor_cache_group_id=request.processor_cache_group_id,
             metadata=request.metadata,
         )
+        _session_invalid_tool_errors.pop(session_id, None)
         _api_key_to_session[session_api_key] = session_id
         _session_to_api_key[session_id] = session_api_key
 
@@ -677,6 +703,7 @@ def end_session(session_id: str = Depends(_require_session_key)):
             )
         session = _session_cache[session_id]
         interaction_count = len(session.completions)
+        invalid_tool_json_message = _session_invalid_tool_errors.get(session_id, "")
 
     # finish() outside lock to avoid holding lock during potential I/O
     session.finish()
@@ -688,6 +715,8 @@ def end_session(session_id: str = Depends(_require_session_key)):
         "interaction_count": interaction_count,
         "context_overflow": session.context_overflow,
         "context_overflow_message": session.context_overflow_message,
+        "invalid_tool_json": bool(invalid_tool_json_message),
+        "invalid_tool_json_message": invalid_tool_json_message,
         "system_error": session.system_error,
         "system_error_message": session.system_error_message,
     }
@@ -743,6 +772,8 @@ def set_reward(
             logger.error(f"No interactions in session {session_id}")
             raise HTTPException(status_code=400, detail="No interactions in session")
         interaction_id = completions.last_interaction_id
+        completions.set_last_reward(reward)
+        return {"message": "success"}
     elif interaction_id not in completions:
         requested_interaction_id = interaction_id
         interaction_id = session_data.stream_completion_aliases.get(
@@ -1078,6 +1109,14 @@ async def _call_client_create(
         if supports_processor_cache:
             client_kwargs["processor_cache"] = session_data.processor_cache
         return await create_fn(**client_kwargs)
+    except InvalidToolCallError as exc:
+        # A streaming response has already sent HTTP 200 by the time the model
+        # output can be validated. Poison the session so an SDK retry receives
+        # a real HTTP 422 before it starts another model generation.
+        with _lock:
+            _session_invalid_tool_errors[session_id] = str(exc)
+        logger.warning("Session %s emitted invalid tool JSON", session_id)
+        raise
     except ContextLengthExceededError as e:
         session_data.mark_context_overflow(str(e))
         logger.warning("Session %s exceeded its context window: %s", session_id, e)
@@ -1141,6 +1180,14 @@ async def chat_completions(
             status_code=500,
             detail='Proxy server not initialized. Send requests to /create_engine then /call "initialize" first.',
         )
+
+    with _lock:
+        invalid_tool_error = _session_invalid_tool_errors.get(session_id)
+    if invalid_tool_error is not None:
+        logger.warning(
+            "Rejecting retry for session %s after invalid tool JSON", session_id
+        )
+        raise InvalidToolCallError(invalid_tool_error)
 
     # CompletionCreateParams is a TypedDict (dict subclass), so use dict access.
     is_streaming = request.get("stream") is True
@@ -1235,6 +1282,21 @@ async def _deferred_openai_sse_stream(
         yield "data: [DONE]\n\n"
     except asyncio.CancelledError:
         raise
+    except InvalidToolCallError as exc:
+        # The HTTP response has already started so the FastAPI exception
+        # handler cannot return its 422 response here. Preserve the same
+        # non-retryable error semantics in the OpenAI SSE payload; otherwise
+        # downstream gateways classify this as a retryable server_error and
+        # Claude Code silently retries the malformed model action.
+        logger.warning("Ending stream after invalid tool JSON: %s", exc)
+        error = {
+            "error": {
+                "message": str(exc),
+                "type": "invalid_request_error",
+                "code": exc.code,
+            }
+        }
+        yield f"data: {json.dumps(error, separators=(',', ':'))}\n\n"
     except Exception as exc:
         error = {
             "error": {
@@ -1531,26 +1593,22 @@ async def export_trajectories(
             status_code=400, detail="Episode reward assignment requires concat export"
         )
 
-    # Export interactions
+    # Apply the task return before final-response validation.
+    export_kwargs = {}
+    if request.episode_reward is not None and _prm_runner is None:
+        export_kwargs["episode_reward"] = request.episode_reward
+    elif request.episode_reward is not None:
+        logger.warning(
+            "Session %s requested episode reward assignment with PRM enabled; "
+            "preserving process-reward semantics.",
+            session_id,
+        )
     interactions = session_data.export_interactions(
         discount=request.discount,
         style=request.style,
         drop_retry_orphans=request.drop_retry_orphans,
+        **export_kwargs,
     )
-
-    if request.episode_reward is not None and interactions:
-        if _prm_runner is None:
-            from areal.experimental.openai.cache import InteractionCache
-
-            InteractionCache.from_dict(
-                interactions, session_id=session_id
-            ).assign_episode_reward(request.episode_reward)
-        else:
-            logger.warning(
-                "Session %s requested episode reward assignment with PRM enabled; "
-                "preserving process-reward semantics.",
-                session_id,
-            )
 
     if _prm_runner is not None and interactions:
         try:
@@ -1585,6 +1643,7 @@ async def export_trajectories(
     # Remove session from cache and clean up API key mapping
     with _lock:
         _session_cache.pop(session_id, None)
+        _session_invalid_tool_errors.pop(session_id, None)
         _remove_api_keys_for_session(session_id)
 
     # Grouped inline/subproc sessions export only multimodal tensor references.

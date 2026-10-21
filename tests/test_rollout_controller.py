@@ -5,8 +5,6 @@ import pytest
 import requests
 import torch
 
-from tests.utils import get_model_path
-
 from areal.api import (
     LocalInfServerInfo,
     ModelRequest,
@@ -22,7 +20,10 @@ from areal.api.cli_args import (
     SGLangConfig,
 )
 from areal.infra import RolloutController
-from areal.infra.controller.rollout_controller import _merge_worker_stats
+from areal.infra.controller.rollout_controller import (
+    _merge_worker_stats,
+    _RolloutResult,
+)
 from areal.infra.scheduler.local import LocalScheduler
 from areal.infra.workflow_executor import (
     WorkflowContractError,
@@ -116,8 +117,8 @@ class MockScheduler:
             resp = requests.post(callback_addr, json=dict(task_id=task_id))
             resp.raise_for_status()
             return task_id
-        # Handle controller-safe task result retrieval
-        elif method == "_wait_for_task_result":
+        # Handle wait_for_task method
+        elif method == "get_rollout_result":
             task_id = kwargs.get("task_id")
             if self.workflow_contract_error is not None:
                 return WorkflowContractFailure(message=self.workflow_contract_error)
@@ -125,7 +126,8 @@ class MockScheduler:
                 worker_id in self._pending_results
                 and task_id in self._pending_results[worker_id]
             ):
-                return self._pending_results[worker_id].pop(task_id)
+                result = self._pending_results[worker_id].pop(task_id)
+                return {"trajectory": result, "metrics": None}
             return None
         elif method == "wait":
             # Return a result from pending results if available
@@ -1223,18 +1225,17 @@ def test_parametrized_capacity_settings(
     controller.destroy()
 
 
-QWEN3_PATH = get_model_path(
-    "/storage/openpsi/models/Qwen__Qwen3-0.6B/", "Qwen/Qwen3-0.6B"
-)
-
-
 @pytest.mark.sglang
-@pytest.mark.parametrize("model_path", [QWEN3_PATH])
 @pytest.mark.slow
 @pytest.mark.ci
-def test_rollout_controller_integration(tmp_path, model_path):
+def test_rollout_controller_integration(tmp_path):
+    from tests.utils import get_model_path
+
     from areal.engine.sglang_remote import RemoteSGLangEngine
 
+    model_path = get_model_path(
+        "/storage/openpsi/models/Qwen__Qwen3-0.6B/", "Qwen/Qwen3-0.6B"
+    )
     tokenizer = load_hf_tokenizer(model_path)
     fileroot = tmp_path / "fileroot"
     fileroot.mkdir()
@@ -1539,6 +1540,56 @@ class TestRolloutControllerExportStats:
         assert "reward" in stats or "loss" in stats
 
         controller.destroy()
+
+    def test_export_stats_includes_consumed_rejected_samples_once(self):
+        """Controller exports the pre-filter denominator as a visible count."""
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=create_test_config(),
+            scheduler=MockScheduler(),
+        )
+        controller._collective_rpc = Mock(return_value=[{}])
+        controller.consumed_metrics.consume(
+            _RolloutResult(0, {}, {"rollout/reward": [1.0, 1.0]})
+        )
+        controller.consumed_metrics.consume(
+            _RolloutResult(1, None, {"rollout/reward": [0.0]})
+        )
+        stats = controller.export_stats()
+        assert stats["rollout/reward"] == pytest.approx(2 / 3)
+        assert stats["rollout/reward_sample_count"] == 3
+        assert controller.export_stats() == {}
+
+    def test_export_stats_weights_structured_prm_scalar_samples(self):
+        """The PRM adapter's scalar counts produce a global weighted rate."""
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=create_test_config(consumer_batch_size=16),
+            scheduler=MockScheduler(),
+        )
+        prefix = "rollout/prm_metric/turn/scorer/accepted"
+        controller._collective_rpc = Mock(
+            return_value=[
+                {
+                    f"{prefix}/observed_count": 2.0,
+                    f"{prefix}/count": 1.0,
+                    f"{prefix}/rate": 0.5,
+                    f"{prefix}/rate__count": 2,
+                },
+                {
+                    f"{prefix}/observed_count": 8.0,
+                    f"{prefix}/count": 1.0,
+                    f"{prefix}/rate": 0.125,
+                    f"{prefix}/rate__count": 8,
+                },
+            ]
+        )
+
+        stats = controller.export_stats()
+
+        assert stats[f"{prefix}/observed_count"] == 10.0
+        assert stats[f"{prefix}/count"] == 2.0
+        assert stats[f"{prefix}/rate"] == pytest.approx(0.2)
 
 
 class TestRolloutControllerRolloutStats:

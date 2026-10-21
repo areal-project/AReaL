@@ -115,6 +115,8 @@ class OpenAIProxyClient:
         self.interaction_count = 0
         self.context_overflow = False
         self.context_overflow_message = ""
+        self.invalid_tool_json = False
+        self.invalid_tool_json_message = ""
         self.system_error = False
         self.system_error_message = ""
 
@@ -299,6 +301,10 @@ class OpenAIProxyClient:
             self.context_overflow = bool(data.get("context_overflow", False))
             self.context_overflow_message = str(
                 data.get("context_overflow_message", "")
+            )
+            self.invalid_tool_json = bool(data.get("invalid_tool_json", False))
+            self.invalid_tool_json_message = str(
+                data.get("invalid_tool_json_message", "")
             )
             self.system_error = bool(data.get("system_error", False))
             self.system_error_message = str(data.get("system_error_message", ""))

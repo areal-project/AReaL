@@ -57,7 +57,13 @@ from pydantic import BaseModel
 from areal.api import ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai.cache import InteractionCache
+from areal.experimental.openai.finalization import (
+    ResponseValidator,
+    final_response_error,
+    finalize_interactions,
+)
 from areal.experimental.openai.tool_call_parser import (
+    InvalidToolCallError,
     process_tool_calls,
     split_reasoning,
 )
@@ -88,6 +94,23 @@ def _force_reasoning_from_chat_template_kwargs(
     if chat_template_kwargs.get("enable_thinking") is not None:
         return bool(chat_template_kwargs["enable_thinking"])
     return str(chat_template_kwargs.get("thinking_option", "")).lower() == "on"
+
+
+def _prompt_prefills_reasoning(
+    tokenizer: "PreTrainedTokenizerFast", prompt_token_ids: list[int]
+) -> bool:
+    """Read the actual generation prefix, including default-enabled thinking."""
+    if not prompt_token_ids:
+        return False
+    marker = "<think>"
+    suffix_len = len(marker)
+    while True:
+        suffix = tokenizer.decode(prompt_token_ids[-suffix_len:]).rstrip()
+        if len(suffix) >= len(marker) or suffix_len >= len(prompt_token_ids):
+            return suffix.endswith(marker)
+        # Usually only a few tokens are decoded. Expand only when trailing
+        # whitespace or a split marker prevents identifying the prefix yet.
+        suffix_len *= 2
 
 
 # reset OpenAI keys when using the wrapped client.
@@ -253,6 +276,24 @@ def _process_multimodal_prompt(
         mm_token_type_ids=mm_token_type_ids,
         multi_modal_input=multi_modal_input,
     )
+
+
+def _record_response_parse(
+    interaction: InteractionWithTokenLogpReward,
+    *,
+    output_text: str,
+    tool_calls: list | None,
+    tool_call_parse_failed: bool,
+) -> None:
+    """Record parser facts independently of the rollout's reward policy."""
+    interaction.metadata = {
+        **(interaction.metadata or {}),
+        "response_parse": {
+            "tool_call_parse_failed": tool_call_parse_failed,
+            "has_content": bool(output_text.strip()),
+            "has_tool_calls": bool(tool_calls),
+        },
+    }
 
 
 def _align_tools_with_sglang(tools_list: list) -> list[dict]:
@@ -944,12 +985,14 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         chat_template_type: str = "hf",
         lora_name: str = "",
         require_multimodal_processor: bool = False,
+        tool_call_parser_allow_recovery: bool = True,
     ):
         super().__init__(client)
         self.engine = engine
         self.tokenizer = tokenizer
         self.processor = processor
         self.tool_call_parser = tool_call_parser
+        self.tool_call_parser_allow_recovery = tool_call_parser_allow_recovery
         self.reasoning_parser = reasoning_parser
         self._cache = cache
         self.engine_max_tokens = engine_max_tokens
@@ -1291,9 +1334,17 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         # Call inference engine
         response = await self.engine.agenerate(model_request)
         output_text = self.tokenizer.decode(response.output_tokens_without_stop)
+        reasoning_prefilled = (
+            not self.tool_call_parser_allow_recovery
+            and self.tool_call_parser == "qwen3_coder"
+            and bool(self.reasoning_parser)
+            and _prompt_prefills_reasoning(self.tokenizer, prompt_token_ids)
+        )
         # Parse raw output first: prefilled Qwen thinking may enter a tool call
         # without emitting </think>. Splitting first would swallow that call.
         tool_calls = None
+        invalid_tool_call_error: InvalidToolCallError | None = None
+        tool_call_parse_failed = False
         try:
             if (is_omitted(tool_choice) or tool_choice != "none") and tools_list:
                 tool_calls, output_text, response.stop_reason = process_tool_calls(
@@ -1303,8 +1354,14 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                     self.reasoning_parser,
                     response.stop_reason,
                     tokenizer=self.tokenizer,
+                    tool_call_parser_allow_recovery=self.tool_call_parser_allow_recovery,
+                    reasoning_prefilled=reasoning_prefilled,
                 )
+        except InvalidToolCallError as e:
+            invalid_tool_call_error = e
+            tool_call_parse_failed = True
         except json.JSONDecodeError as e:
+            tool_call_parse_failed = True
             logger.warning(
                 f"Failed to parse tool calls from output text: {e}, output_text:\n"
                 f"{output_text}"
@@ -1313,10 +1370,18 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         reasoning_text, output_text = split_reasoning(
             output_text,
             self.reasoning_parser,
-            force_reasoning=_force_reasoning_from_chat_template_kwargs(
+            force_reasoning=reasoning_prefilled
+            or _force_reasoning_from_chat_template_kwargs(
                 extra_body.get("chat_template_kwargs")
             ),
         )
+        if interaction is not None:
+            _record_response_parse(
+                interaction,
+                output_text=output_text,
+                tool_calls=tool_calls,
+                tool_call_parse_failed=tool_call_parse_failed,
+            )
 
         # If streaming is requested, return an async generator
         if is_streaming:
@@ -1326,7 +1391,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             # message_start, content_block_start) before iterating the original
             # generator, so if the client disconnects early, the cache update
             # code inside the generator would never execute.
-            if cache is not None:
+            if interaction is not None:
                 chat_completion, output_message = self._build_chat_completion(
                     completion_id=completion_id,
                     current_time=current_time,
@@ -1336,11 +1401,16 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                     response=response,
                     reasoning_text=reasoning_text,
                 )
-                cache[completion_id].completion = chat_completion
-                cache[completion_id].model_response = response
-                cache[completion_id].output_message_list = [
+                # Retry cleanup may have removed this interaction while the
+                # generation was in flight. Finish its response without
+                # looking it up again or restoring an orphan to the cache.
+                interaction.completion = chat_completion
+                interaction.model_response = response
+                interaction.output_message_list = [
                     output_message.model_dump(exclude_none=True)
                 ]
+            if invalid_tool_call_error is not None:
+                raise invalid_tool_call_error
             return self._create_stream(
                 completion_id=completion_id,
                 current_time=current_time,
@@ -1362,12 +1432,14 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             reasoning_text=reasoning_text,
         )
 
-        if cache is not None:
-            cache[completion_id].completion = chat_completion
-            cache[completion_id].model_response = response
-            cache[completion_id].output_message_list = [
+        if interaction is not None:
+            interaction.completion = chat_completion
+            interaction.model_response = response
+            interaction.output_message_list = [
                 output_message.model_dump(exclude_none=True)
             ]
+        if invalid_tool_call_error is not None:
+            raise invalid_tool_call_error
         return chat_completion
 
     async def _create_stream(
@@ -1540,12 +1612,14 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         chat_template_type: str = "hf",
         lora_name: str = "",
         require_multimodal_processor: bool = False,
+        tool_call_parser_allow_recovery: bool = True,
     ):
         super().__init__(client)
         self.engine = engine
         self.tokenizer = tokenizer
         self.processor = processor
         self.tool_call_parser = tool_call_parser
+        self.tool_call_parser_allow_recovery = tool_call_parser_allow_recovery
         self.reasoning_parser = reasoning_parser
         self._cache = cache
         self.engine_max_tokens = engine_max_tokens
@@ -1742,9 +1816,17 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         # Call inference engine
         engine_resp = await self.engine.agenerate(model_request)
         output_text = self.tokenizer.decode(engine_resp.output_tokens_without_stop)
+        reasoning_prefilled = (
+            not self.tool_call_parser_allow_recovery
+            and self.tool_call_parser == "qwen3_coder"
+            and bool(self.reasoning_parser)
+            and _prompt_prefills_reasoning(self.tokenizer, prompt_token_ids)
+        )
 
         # Parse tool calls.
         tool_calls = None
+        invalid_tool_call_error: InvalidToolCallError | None = None
+        tool_call_parse_failed = False
         try:
             if (is_omitted(tool_choice) or tool_choice != "none") and tools_list:
                 tool_calls, output_text, engine_resp.stop_reason = process_tool_calls(
@@ -1755,12 +1837,34 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
                     engine_resp.stop_reason,
                     use_responses=True,
                     tokenizer=self.tokenizer,
+                    tool_call_parser_allow_recovery=self.tool_call_parser_allow_recovery,
+                    reasoning_prefilled=reasoning_prefilled,
                 )
+        except InvalidToolCallError as e:
+            invalid_tool_call_error = e
+            tool_call_parse_failed = True
         except json.JSONDecodeError as e:
+            tool_call_parse_failed = True
             logger.warning(
                 f"Failed to parse tool calls from output text: {e}, output_text:\n"
                 f"{output_text}"
             )
+
+        # Validate visible content while preserving Responses API serialization.
+        _, visible_output_text = split_reasoning(
+            output_text,
+            self.reasoning_parser,
+            force_reasoning=reasoning_prefilled
+            or _force_reasoning_from_chat_template_kwargs(
+                extra_body.get("chat_template_kwargs")
+            ),
+        )
+        _record_response_parse(
+            interaction,
+            output_text=visible_output_text,
+            tool_calls=tool_calls,
+            tool_call_parse_failed=tool_call_parse_failed,
+        )
 
         # Extract reasoning tokens from output
         reasoning_token_count = self._count_reasoning_tokens(output_text)
@@ -1828,11 +1932,13 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             user=None,
         )
 
-        cache[resp_id].response = deepcopy(response)
-        cache[resp_id].model_response = engine_resp
-        cache[resp_id].output_message_list = [
+        interaction.response = deepcopy(response)
+        interaction.model_response = engine_resp
+        interaction.output_message_list = [
             o.model_dump(exclude_none=True) for o in resp_output
         ]
+        if invalid_tool_call_error is not None:
+            raise invalid_tool_call_error
         return response
 
     def _count_reasoning_tokens(
@@ -1857,6 +1963,10 @@ class ArealOpenAI(AsyncOpenAI):
     """
     Extended AsyncOpenAI client that uses AReaL's inference engine
     and supports reward setting.
+
+    ``response_validator`` controls the task-reward policy applied at rollout
+    finalization. It returns an error reason or None to accept a response;
+    passing None disables validation without changing response parsing.
     """
 
     def __init__(
@@ -1870,18 +1980,27 @@ class ArealOpenAI(AsyncOpenAI):
         lora_name: str = "",
         processor: "ProcessorMixin | None" = None,
         require_multimodal_processor: bool = False,
+        tool_call_parser_allow_recovery: bool = True,
+        response_validator: ResponseValidator | None = final_response_error,
         **kwargs,
     ):
+        if not tool_call_parser_allow_recovery and tool_call_parser != "qwen3_coder":
+            raise ValueError(
+                "tool_call_parser_allow_recovery=False requires "
+                "tool_call_parser='qwen3_coder'"
+            )
         super().__init__(**kwargs)
         self.engine = engine
         self.tokenizer = tokenizer
         self.processor = processor
         self.tool_call_parser = tool_call_parser
+        self.tool_call_parser_allow_recovery = tool_call_parser_allow_recovery
         self.reasoning_parser = reasoning_parser
         self.lora_name = lora_name
 
         # Use an ordered dict to maintain insertion order of completions/responses
         self._cache: InteractionCache = InteractionCache()
+        self.response_validator = response_validator
 
         # Override responses with our extended implementation
         self.responses = AsyncResponsesWithReward(
@@ -1891,6 +2010,7 @@ class ArealOpenAI(AsyncOpenAI):
             processor,
             self._cache,
             tool_call_parser=self.tool_call_parser,
+            tool_call_parser_allow_recovery=self.tool_call_parser_allow_recovery,
             reasoning_parser=self.reasoning_parser,
             engine_max_tokens=engine_max_tokens,
             chat_template_type=chat_template_type,
@@ -1906,6 +2026,7 @@ class ArealOpenAI(AsyncOpenAI):
             processor,
             self._cache,
             tool_call_parser=self.tool_call_parser,
+            tool_call_parser_allow_recovery=self.tool_call_parser_allow_recovery,
             reasoning_parser=self.reasoning_parser,
             engine_max_tokens=engine_max_tokens,
             chat_template_type=chat_template_type,
@@ -1929,7 +2050,9 @@ class ArealOpenAI(AsyncOpenAI):
             raise RuntimeError("No interaction in cache to set reward for")
         return self._cache.set_last_reward(reward)
 
-    def apply_reward_discount(self, turn_discount: float = 1.0) -> None:
+    def apply_reward_discount(
+        self, turn_discount: float = 1.0, *, drop_retry_orphans: bool = False
+    ) -> None:
         """Apply backward discounted rewards across cached completions/responses.
 
         This method iterates over the cached completions/responses in reverse creation
@@ -1950,6 +2073,8 @@ class ArealOpenAI(AsyncOpenAI):
         turn_discount : float, optional
             The per-turn discount factor applied when propagating reward
             backward from a later completion/response to an earlier one, by default 1.0.
+        drop_retry_orphans : bool, optional
+            Remove unused retries before applying response policy and discounting.
 
         Returns
         -------
@@ -1957,10 +2082,22 @@ class ArealOpenAI(AsyncOpenAI):
             A shallow copy of the completion/response cache after rewards have been
             updated in-place.
         """
-        return self._cache.apply_reward_discount(turn_discount)
+        if self._cache.reward_discount_applied:
+            raise RuntimeError("apply_reward_discount should only be called once.")
+        return finalize_interactions(
+            self._cache,
+            style="individual",
+            reward_discount=turn_discount,
+            drop_retry_orphans=drop_retry_orphans,
+            response_validator=self.response_validator,
+        )
 
     def export_interactions(
-        self, style: str
+        self,
+        style: str,
+        *,
+        reward_discount: float | None = None,
+        drop_retry_orphans: bool = False,
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Export cached completions/responses in different formats.
 
@@ -1970,14 +2107,20 @@ class ArealOpenAI(AsyncOpenAI):
         parent. It then returns only leaf-node completions/responses (those without
         children). No reward propagation is performed here.
 
-        When ``style='individual'``, all cached completions/responses are returned as-is
-        without constructing the tree.
+        Response policy is applied to retained concat leaves, or to each retained
+        individual response before optional backward reward discounting. Already
+        discounted returns are preserved on subsequent exports.
 
         Parameters
         ----------
         style : str, optional
             The export style, either ``'concat'`` (build tree and return leaves)
             or ``'individual'`` (return all), by default 'concat'.
+        reward_discount : float, optional
+            Apply backward discounting for individual export after validation.
+        drop_retry_orphans : bool, optional
+            Remove unused retries before validation. Cleanup must precede the
+            first discount call and should not be requested again afterward.
 
         Returns
         -------
@@ -1991,7 +2134,13 @@ class ArealOpenAI(AsyncOpenAI):
         ValueError
             If an unsupported ``style`` is provided.
         """
-        return self._cache.export_interactions(style)
+        return finalize_interactions(
+            self._cache,
+            style=style,
+            reward_discount=reward_discount,
+            drop_retry_orphans=drop_retry_orphans,
+            response_validator=self.response_validator,
+        )
 
 
 def is_omitted(value) -> bool:

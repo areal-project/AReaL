@@ -796,6 +796,12 @@ class RemoteSGLangEngine(InferenceEngine):
         """Wait for a specified number of requests to complete."""
         return self._engine.wait(count, timeout, raise_timeout)
 
+    def get_rollout_result(
+        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+    ) -> dict[str, Any] | None:
+        """Transfer the trajectory and quality metrics to the rollout consumer."""
+        return self._engine.get_rollout_result(task_id, timeout, raise_timeout)
+
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | None:
@@ -895,7 +901,11 @@ class RemoteSGLangEngine(InferenceEngine):
         return self._engine.onload(tags=tags)
 
     def export_stats(self) -> dict[str, float]:
-        return stats_tracker.export_all(reduce_group=None)
+        result = stats_tracker.export_all(reduce_group=None)
+        executor = self._engine._workflow_executor
+        if executor is not None:
+            result.update(executor.consumed_metrics.export())
+        return result
 
     @classmethod
     def as_controller(cls, config: InferenceEngineConfig, scheduler: Scheduler):

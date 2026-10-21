@@ -1,0 +1,361 @@
+# Dense 27B; user-requested p1/k100000; persistent native logs.
+experiment_name: ${oc.env:QWEN_EXPERIMENT_NAME}
+trial_name: ${oc.env:QWEN_ARENA_TRIAL}
+seed: 42
+enable_offload: false
+total_train_epochs: 100
+total_train_steps: 100
+tokenizer_path: ${oc.env:QWEN_MODEL}
+should_accept_fn: examples.swe.filter_function.filter_function
+dynamic_bs: false
+cluster:
+  n_nodes: 8
+  n_gpus_per_node: 8
+  fileroot: ${oc.env:QWEN_ARENA_OUTPUT}
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${cluster.fileroot}/name_resolve/${experiment_name}/${trial_name}
+allocation_mode: megatron[actor]:d1p4t4c4e1|sglang[rollout]:d16t4
+scheduler:
+  type: slurm
+gconfig:
+  n_samples: 12
+  min_new_tokens: 0
+  max_new_tokens: 65536
+  max_tokens: 262144
+  greedy: false
+  top_p: 1.0
+  top_k: 100000
+  temperature: 1.0
+  stop_token_ids: []
+  ignore_eos: false
+  skip_special_tokens: true
+  stop: null
+  frequency_penalty: 0.0
+  lora_name: ''
+  use_beam_search: false
+  reward_normalization: true
+  reward_normalization_use_std: true
+  drop_incomplete_group: false
+eval_gconfig:
+  n_samples: 12
+  min_new_tokens: 0
+  max_new_tokens: 65536
+  max_tokens: 262144
+  greedy: false
+  top_p: 1.0
+  top_k: 100000
+  temperature: 1.0
+  stop_token_ids: []
+  ignore_eos: false
+  skip_special_tokens: true
+  stop: null
+  frequency_penalty: 0.0
+  lora_name: ''
+  use_beam_search: false
+  reward_normalization: false
+  drop_incomplete_group: false
+rollout:
+  backend: sglang:d16t4
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 1500
+  queue_size: 256
+  consumer_batch_size: 16
+  max_head_offpolicyness: 1
+  enable_rollout_tracing: false
+  check_trajectory_format: false
+  scheduling_spec:
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    cpu: 4
+    mem: 64
+    mount: ${oc.env:QWEN_MOUNTS}
+    cmd: python3 -m areal.infra.rpc.rpc_server
+    reservation: ${oc.env:QWEN_RESERVATION}
+    nodelist: ${oc.env:QWEN_NODELIST}
+    exclusive: false
+    srun_additional_args: --unbuffered --mpi=pmi2 -K --chdir ${oc.env:QWEN_REPO}
+    env_vars:
+      SGLANG_NUMA_BIND_V2: '0'
+      TMS_INIT_ENABLE: '0'
+      TMS_INIT_ENABLE_CPU_BACKUP: '0'
+      ARENA_OPENAPI_BASE: ${oc.env:ARENA_OPENAPI_BASE}
+      NO_PROXY: '*'
+      no_proxy: '*'
+      TOKENIZERS_PARALLELISM: 'false'
+      AWEX_ACTOR_ALLOC_CONF: expandable_segments:False
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NCCL_DEBUG: WARN
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+      OMP_NUM_THREADS: '4'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      PYTHONUNBUFFERED: '1'
+      PYTHONPATH: ${oc.env:QWEN_ROLLOUT_PYTHONPATH}
+      QWEN_RUNTIME_SCRIPT: ${oc.env:QWEN_RUNTIME_SCRIPT}
+      QWEN_ENV_FILE: ${oc.env:QWEN_ENV_FILE}
+    additional_bash_cmds:
+    - set -euo pipefail
+    - source "$QWEN_RUNTIME_SCRIPT"
+    - python3 "$QWEN_RECIPE_DIR/configure_sglang_logging.py"
+    - python3 -m areal.engine.sglang_mm_tensor_storage
+    - test "$TMS_INIT_ENABLE" = 0
+    - test "$TMS_INIT_ENABLE_CPU_BACKUP" = 0
+    - cd ${oc.env:QWEN_REPO}
+    image: ${oc.env:QWEN_ROLLOUT_IMAGE}
+  scheduling_strategy:
+    type: colocation
+    target: actor
+    fork: true
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  setup_timeout: 7200
+  request_timeout: 20000
+  request_retries: 0
+  pause_grace_period: 60
+  agent:
+    mode: inline
+    admin_api_key: ${oc.env:SWE_RL_ADMIN_API_KEY}
+    tool_call_parser: qwen3_coder
+    tool_call_parser_allow_recovery: false
+    reasoning_parser: qwen3
+    chat_template_type: concat
+    chat_template_kwargs:
+      reasoning_effort: medium
+    engine_max_tokens: 262144
+    export_style: concat
+    turn_discount: 1.0
+    subproc_max_workers: 4
+    drop_retry_orphans: true
+    session_timeout_seconds: 15600
+    message_preprocessors:
+    - examples.swe.preprocessors.MergeSystemMessages
+    - examples.swe.preprocessors.StripAnthropicBillingHeader
+    - examples.swe.preprocessors.StripAllSystemReminders
+    - examples.swe.preprocessors.StripAnthropicCacheFields
+    - examples.swe.preprocessors.NormalizeToolCallArguments
+    prefix_matcher: examples.swe.prefix_matchers.swe_prefix_matcher
+    prm:
+      enabled: false
+  return_routed_experts: false
+  _version: v1
+actor:
+  min_usable_group_size: 8
+  backend: megatron:d1p4t4c4e1
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${tokenizer_path}
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  weight_update_mode: awex
+  mb_spec:
+    n_mbs: 128
+    granularity: 1
+    max_tokens_per_mb: 262144
+    n_mbs_divisor: 8
+  optimizer:
+    type: adam
+    lr: 3.0e-06
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1.0e-08
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps: 2
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: false
+    enable_chunked_logits: false
+    lm_head_loss_chunk_size: 0
+    enable_fp32_lm_head: false
+    cross_entropy_loss_fusion: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    bridge_type: megatron-bridge
+    language_model_only: false
+    use_bridge_for_update_weights: false
+    enable_mtp: false
+    use_precision_aware_optimizer: false
+    main_grads_dtype: float32
+    main_params_dtype: float32
+    exp_avg_dtype: float32
+    exp_avg_sq_dtype: float32
+  eps_clip: 0.2
+  eps_clip_higher: 0.28
+  temperature: ${gconfig.temperature}
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  loss_aggregation: token_mean
+  recompute_logprob: false
+  prox_logp_method: reuse_train_logp
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+    lower: 0.5
+  discount: 1.0
+  gae_timestep_unit: turn
+  gae_lambda: areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae
+  gae_lambda_kwargs:
+    alpha: 1.5
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_clip: 5.0
+  reward_norm: null
+  adv_norm:
+    mean_level: null
+    std_level: null
+  token_rewards_as_adv: true
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    cpu: 4
+    mem: 64
+    mount: ${oc.env:QWEN_MOUNTS}
+    cmd: python3 -m qwen27_actor_worker
+    reservation: ${oc.env:QWEN_RESERVATION}
+    nodelist: ${oc.env:QWEN_NODELIST}
+    exclusive: false
+    srun_additional_args: --distribution=block:block --unbuffered --mpi=pmi2 -K --chdir ${oc.env:QWEN_REPO}
+    env_vars:
+      TMS_INIT_ENABLE: '0'
+      TMS_INIT_ENABLE_CPU_BACKUP: '0'
+      QWEN_PLE_CHUNK_TOKENS: '0'
+      QWEN_GDN_CP_COMPAT: '0'
+      ARENA_OPENAPI_BASE: ${oc.env:ARENA_OPENAPI_BASE}
+      NO_PROXY: '*'
+      no_proxy: '*'
+      TOKENIZERS_PARALLELISM: 'false'
+      AWEX_ACTOR_ALLOC_CONF: expandable_segments:True
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,garbage_collection_threshold:0.7
+      NCCL_DEBUG: WARN
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+      NVIDIA_TF32_OVERRIDE: '0'
+      OMP_NUM_THREADS: '4'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      PYTHONUNBUFFERED: '1'
+      PYTHONPATH: ${oc.env:QWEN_ACTOR_PYTHONPATH}
+      QWEN_RUNTIME_SCRIPT: ${oc.env:QWEN_RUNTIME_SCRIPT}
+      QWEN_ENV_FILE: ${oc.env:QWEN_ENV_FILE}
+      LD_LIBRARY_PATH: ${oc.env:QWEN_ACTOR_LIBRARY_PATH}
+      CUDNN_PATH: ${oc.env:QWEN_DENSE_RUNTIME}/dependencies/nvidia/cudnn
+    additional_bash_cmds:
+    - set -euo pipefail
+    - source "$QWEN_RUNTIME_SCRIPT"
+    - test "$TMS_INIT_ENABLE" = 0
+    - test "$TMS_INIT_ENABLE_CPU_BACKUP" = 0
+    - cd ${oc.env:QWEN_REPO}
+    image: ${oc.env:QWEN_ACTOR_IMAGE}
+  _version: v1
+ref: null
+econfig:
+  dataset_source: arena
+  stream_id: ''
+  arena_base_url: ${oc.env:ARENA_OPENAPI_BASE}
+  arena_llm_route_mode: gateway
+  arena_result_dump_dir: ''
+  arena_request_timeout: 180.0
+  arena_request_retries: 1
+  arena_poll_interval: 5.0
+  arena_task_envs:
+    DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
+  timeout: 15000.0
+  arena_streams_file: ''
+  arena_mixture_epoch_size: 0
+  arena_streams:
+  - name: whitebox-b
+    stream_id: whitebox-b-overfit64-20261013
+    sampling_weight: 1
+    harness: whitebox-unified-b-areal@0.1.1-no-budget
+    llm_protocol: chat_completions
+    task_envs:
+      DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
+    reward_mapping_file: ${oc.env:EXPERIMENT_ROOT}/reward-mapping.json
+sglang:
+  model_path: ${tokenizer_path}
+  random_seed: 42
+  skip_tokenizer_init: true
+  dtype: bfloat16
+  context_length: 262144
+  max_prefill_tokens: 8192
+  chunked_prefill_size: 8192
+  max_running_requests: 24
+  mem_fraction_static: 0.7
+  attention_backend: null
+  sampling_backend: null
+  disable_cuda_graph: false
+  cuda_graph_max_bs: 24
+  disable_radix_cache: false
+  enable_memory_saver: true
+  mamba_ssm_dtype: bfloat16
+  ep_size: 1
+  log_level: info
+  enable_multimodal: true
+train_dataset:
+  batch_size: 16
+  shuffle: true
+  pin_memory: true
+  num_workers: 0
+  path: ''
+  type: rl
+  max_length: 262144
+  drop_last: false
+valid_dataset: null
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: 5
+  freq_secs: null
+recover:
+  mode: auto
+  retries: 3
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: 7200
+  no_save_optim: false
+  no_load_optim: false
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: online
+    project: ${experiment_name}
+    name: ${trial_name}
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

@@ -1,0 +1,136 @@
+{
+  "schema": "building-reward-v1-overall-90-10",
+  "status": "OK",
+  "score": 0.14824290384003877,
+  "score_mode": "MIXED_90_10",
+  "rule_score": 0.053603226488931954,
+  "vlm_score": 1.0,
+  "vlm_status": "COMPLETE",
+  "rule_result": {
+    "status": "OK",
+    "score": 0.053603226488931954,
+    "aggregation": {
+      "policy": "mean80-min20-v1",
+      "mean_weight": 0.8,
+      "minimum_weight": 0.2,
+      "previous_rule_score": 0.03665352724115236,
+      "mean": 0.16899357081248767,
+      "minimum": 0.07046586147601755,
+      "factor_F": 0.35905910787133954
+    },
+    "sub_scores": {
+      "semantic_h": 0.13369844706053846,
+      "minimum_q": 0.07046586147601755,
+      "semantic_Q": 0.14928802894519366,
+      "anomaly_A": 0.7799017689721466,
+      "local_E": 0.9960868440503352,
+      "scene_excess_factor": 0.49505308591823705,
+      "factor_F": 0.35905910787133954
+    },
+    "full_scene_geometry": {
+      "excess_ratio": 1.0199853883249197,
+      "factor": 0.49505308591823705,
+      "ratio_range": "nonnegative unbounded; not a normalized sub-score"
+    },
+    "required_role_diagnostics": [
+      {
+        "id": "cliff_context",
+        "weight": 1.0,
+        "layout": 0.11716251603941497,
+        "surface": 0.0011182105563338966,
+        "view": 0.5295255316319343,
+        "quality": 0.24149221535734433
+      },
+      {
+        "id": "retaining_terrace",
+        "weight": 1.0,
+        "layout": 0.3900506222513812,
+        "surface": 0.13269661787712542,
+        "view": 0.5537642348708786,
+        "quality": 0.3654621657681906
+      },
+      {
+        "id": "hall_enclosures",
+        "weight": 1.0,
+        "layout": 0.19625324878829797,
+        "surface": 0.031085704738498275,
+        "view": 0.23404255147944103,
+        "quality": 0.1535603294473253
+      },
+      {
+        "id": "roof_groups",
+        "weight": 1.0,
+        "layout": 0.3178632741854309,
+        "surface": 0.06274702889183033,
+        "view": 0.2554386444211576,
+        "quality": 0.2036027364269614
+      },
+      {
+        "id": "decks_and_walkways",
+        "weight": 1.0,
+        "layout": 0.35323547696396723,
+        "surface": 0.027245777984379785,
+        "view": 0.182978722326299,
+        "quality": 0.17103638046604433
+      },
+      {
+        "id": "colonnades",
+        "weight": 1.0,
+        "layout": 0.1297481454405816,
+        "surface": 0.01654149779069923,
+        "view": 0.08059825222281852,
+        "quality": 0.07046586147601755
+      },
+      {
+        "id": "balcony_guards",
+        "weight": 1.0,
+        "layout": 0.2860756742069598,
+        "surface": 0.019778138763340083,
+        "view": 0.0400207895870764,
+        "quality": 0.09444958295373954
+      },
+      {
+        "id": "slender_cliff_supports",
+        "weight": 1.0,
+        "layout": 0.4033957240287395,
+        "surface": 0.03018980696775379,
+        "view": 0.03157569531726875,
+        "quality": 0.1240456415728062
+      },
+      {
+        "id": "visible_facade_openings",
+        "weight": 1.0,
+        "layout": 0.21544798690371447,
+        "surface": 0.06771181948327012,
+        "view": 0.048165225747216295,
+        "quality": 0.09682722384395967
+      }
+    ]
+  },
+  "visual": {
+    "status": "COMPLETE",
+    "vlm_score": 1.0,
+    "items": [
+      {
+        "id": "overall_shape",
+        "value": 1,
+        "weight": 0.25
+      },
+      {
+        "id": "major_proportions",
+        "value": 1,
+        "weight": 0.25
+      },
+      {
+        "id": "mass_layout",
+        "value": 1,
+        "weight": 0.25
+      },
+      {
+        "id": "large_completeness",
+        "value": 1,
+        "weight": 0.25
+      }
+    ]
+  }
+}

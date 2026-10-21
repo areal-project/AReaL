@@ -51,6 +51,7 @@ def test_arena_training_preserves_rows_and_cycles_tail(batch_size, monkeypatch):
     source = Dataset.from_list([{"data_id": str(index)} for index in range(19)])
     config = SWEPPOConfig()
     config.experiment_name = "arena-test-experiment"
+    config.trial_name = "arena-test-trial"
     config.train_dataset.batch_size = batch_size
     config.should_accept_fn = "examples.swe.filter_function.filter_function"
     monkeypatch.setattr(cli_args, "load_expr_config", lambda *_: (config, None))
@@ -78,7 +79,8 @@ def test_arena_training_preserves_rows_and_cycles_tail(batch_size, monkeypatch):
         def train(self, **kwargs):
             assert kwargs["dynamic_filter_fn"] == config.should_accept_fn
             assert (
-                kwargs["workflow_kwargs"]["experiment_name"] == config.experiment_name
+                kwargs["workflow_kwargs"]["experiment_name"]
+                == "arena-test-experiment-arena-test-trial"
             )
             raise TrainerBoundaryReached
 

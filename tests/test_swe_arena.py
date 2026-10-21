@@ -42,7 +42,16 @@ def _reset_stats() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_harness_result_fetches_authenticated_terminal_artifact(monkeypatch):
+@pytest.mark.parametrize(
+    "artifact, method",
+    [
+        ("harness_result.json", "get_harness_result_async"),
+        ("whitebox-lifecycle.json", "get_whitebox_lifecycle_async"),
+    ],
+)
+async def test_get_harness_result_fetches_authenticated_terminal_artifact(
+    monkeypatch, artifact, method
+):
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
     task_id = "job:env:0"
     receipt = {
@@ -56,15 +65,13 @@ async def test_get_harness_result_fetches_authenticated_terminal_artifact(monkey
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/artifacts/job:env:0/harness_result.json"
+        assert request.url.path == f"/api/artifacts/job:env:0/{artifact}"
         assert request.headers["Authorization"] == "Bearer test-token"
         return httpx.Response(200, json=receipt)
 
     client = ArenaOpenAPIClient(base_url="https://arena.example")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-        actual = await client.get_harness_result_async(
-            task_id, client=http_client, timeout=5.0
-        )
+        actual = await getattr(client, method)(task_id, client=http_client, timeout=5.0)
     assert actual == receipt
 
 

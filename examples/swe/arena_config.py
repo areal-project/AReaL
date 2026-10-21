@@ -112,6 +112,15 @@ def parse_arena_stream_config(value: Any) -> ArenaStreamConfig:
         if not math.isfinite(threshold):
             raise ValueError(f"Arena Stream {name!r} reward_threshold must be finite")
 
+    expected_reward_ref = _parse_reward_ref(
+        raw.get("expected_reward_ref"), stream_name=name
+    )
+    reward_mapping_file = str(raw.get("reward_mapping_file") or "").strip()
+    if reward_mapping_file and expected_reward_ref.key:
+        raise ValueError(
+            "reward_mapping_file and expected_reward_ref are mutually exclusive"
+        )
+
     return ArenaStreamConfig(
         name=name,
         stream_id=stream_id,
@@ -119,9 +128,8 @@ def parse_arena_stream_config(value: Any) -> ArenaStreamConfig:
         harness=str(raw.get("harness") or "").strip(),
         llm_protocol=llm_protocol,
         task_envs=dict(task_envs),
-        expected_reward_ref=_parse_reward_ref(
-            raw.get("expected_reward_ref"), stream_name=name
-        ),
+        expected_reward_ref=expected_reward_ref,
+        reward_mapping_file=reward_mapping_file,
         reward_threshold=threshold,
         reward_transform_fn=str(raw.get("reward_transform_fn") or "").strip(),
     )

@@ -58,6 +58,7 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         super().__init__(*args, **kwargs)
         self._apply_reward_discount_called = False
         self._total_reward = 0.0
+        self._last_task_reward_id: str | None = None
         self._lock = threading.Lock()
 
     def __deepcopy__(self, memo):
@@ -86,6 +87,11 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
     @property
     def total_reward(self) -> float:
         return self._total_reward
+
+    @property
+    def reward_discount_applied(self) -> bool:
+        """Whether scalar rewards have already been propagated backward."""
+        return self._apply_reward_discount_called
 
     def set_reward(self, interaction_id: str, reward: float) -> None:
         """Set reward for a specific completion/response by its ID."""
@@ -176,7 +182,9 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
 
     def set_last_reward(self, reward: float) -> None:
         """Set reward for the most recent completion/response."""
-        self.set_reward(self.last_interaction_id, reward)
+        interaction_id = self.last_interaction_id
+        self.set_reward(interaction_id, reward)
+        self._last_task_reward_id = interaction_id
 
     def assign_episode_reward(self, reward: float) -> None:
         """Score disjoint exported concat segments with one episode return.
@@ -482,6 +490,17 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
 
                 current_reward = current_reward * turn_discount + interaction.reward
                 interaction.reward = current_reward
+                if interaction._cache is not None:
+                    # Discount changes returns, not the recorded task score.
+                    cached_reward = interaction._cache.get("rewards")
+                    interaction._cache = {
+                        **interaction._cache,
+                        "rewards": (
+                            cached_reward.new_tensor([current_reward])
+                            if cached_reward is not None
+                            else torch.tensor([current_reward])
+                        ),
+                    }
         return dict(**self)
 
     def __setitem__(
@@ -642,7 +661,8 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         children). No reward propagation is performed here.
 
         When ``style='individual'``, all cached completions/responses are returned as-is
-        without constructing the tree.
+        without constructing the tree. Training callers should use the rollout
+        finalizer to apply response-validation policy before reward discounting.
 
         Parameters
         ----------
@@ -731,5 +751,6 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
                 for id, interaction in complete_cache.items()
                 if id not in has_children
             }
+
         elif style == "individual":
             return dict(**complete_cache)
