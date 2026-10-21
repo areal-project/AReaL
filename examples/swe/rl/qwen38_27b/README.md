@@ -85,11 +85,11 @@ The YAML selects `whitebox-b-overfit64-20261013` with
 reference and checks reward publication before creating rollout workers. Keep this
 mapping when recovering; all roles must be able to read it.
 
-The controller verifies the source snapshot, durable storage, Arena authentication,
-rollout imports, structured config, W&B name length and dense model provider before
-allocating training workers. Arena and Slurm cleanup remain scoped to this trial. Native
-SGLang logs rotate under the trial's `native/` log directory. Existing NUMA settings in
-`train.yaml` are preserved, including `SGLANG_NUMA_BIND_V2=0`.
+The controller verifies the source snapshot and durable storage before starting the
+training entrypoint. Configuration and dependencies follow normal AReaL initialization.
+Arena and Slurm cleanup remain scoped to this trial. Native SGLang logs rotate under the
+trial's `native/` log directory. Existing NUMA settings in `train.yaml` are preserved,
+including `SGLANG_NUMA_BIND_V2=0`.
 
 ## Recovery
 

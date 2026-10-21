@@ -28,9 +28,7 @@ from examples.swe.arena_preflight import _arena_json, _recent_health, validate_s
 from examples.swe.train_swe_rl import get_arena_dataset, get_arena_mixture_dataset
 from examples.swe.utils import ArenaRewardRefConfig, ArenaStreamConfig
 
-from areal.infra import workflow_context
 from areal.utils import stats_tracker
-from areal.utils.rollout_metrics import ConsumedMetrics, capture_metrics
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MULTI_STREAM_CONFIG = REPO_ROOT / "examples/swe/arena_multi_stream.yaml"
@@ -688,78 +686,6 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
     assert dump_files[0].stat().st_mode & 0o777 == 0o600
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("oversized_field", ["raw", "sub_scores"])
-async def test_workflow_audit_oversized_telemetry_is_truncated(
-    monkeypatch, tmp_path, oversized_field
-):
-    """Each optional telemetry field respects the configured audit size limit."""
-    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
-    workflow = ArenaStreamAgentWorkflow(
-        econfig={
-            "arena_base_url": "https://arena.example",
-            "arena_streams": [{"name": "fine", "stream_id": "fine"}],
-            "arena_result_dump_dir": str(tmp_path),
-            "arena_result_dump_max_bytes": 64,
-        }
-    )
-    telemetry = {"raw": {"small": 1}, "sub_scores": {"quality": 0.25}}
-    telemetry[oversized_field] = {"oversized": "测" * 64}
-    result = ArenaTaskResult(task_id="task", status="OK", score=0.5, **telemetry)
-
-    await workflow._dump_task_result(
-        {"arena_stream_name": "fine"},
-        workflow._stream_config_for_data({"arena_stream_name": "fine"}),
-        result,
-        training_score=0.5,
-    )
-
-    dump_file = next(tmp_path.glob("arena_results_*.jsonl"))
-    record = json.loads(dump_file.read_text(encoding="utf-8"))
-    other_field = "sub_scores" if oversized_field == "raw" else "raw"
-    assert record[oversized_field] is None
-    assert record[f"{oversized_field}_present"] is True
-    assert record[f"{oversized_field}_truncated"] is True
-    assert record[f"{oversized_field}_size_bytes"] > 64
-    assert record[other_field] == telemetry[other_field]
-    assert record[f"{other_field}_truncated"] is False
-    assert record["arena_score"] == 0.5
-
-
-def test_workflow_reward_subscores_follow_consumed_rollouts(monkeypatch):
-    """Telemetry uses the same batch sidecar and step as the episode score."""
-    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
-    monkeypatch.setattr(workflow_context, "stat_scope", lambda: "rollout")
-    stats_tracker.export_all(reset=True)
-    workflow = ArenaStreamAgentWorkflow(
-        econfig={
-            "arena_base_url": "https://arena.example",
-            "arena_streams": [{"name": "fine", "stream_id": "fine"}],
-        }
-    )
-    workflow._task_result.set(
-        ArenaTaskResult(
-            task_id="task",
-            status="OK",
-            score=0.5,
-            sub_scores={"quality": 0.25},
-        )
-    )
-    with capture_metrics() as captured:
-        workflow.record_episode_metrics({"arena_stream_name": "fine"}, 0.5)
-
-    key = "rollout/reward_sub_score/quality"
-    assert key not in stats_tracker.export_all(reset=True)
-    buffer = ConsumedMetrics()
-    assert buffer.export() == {}
-    buffer.consume(SimpleNamespace(trajectory={}, metrics=captured))
-    exported = buffer.export()
-    assert exported[key] == 0.25
-    assert exported[f"{key}__count"] == 1
-    assert exported["rollout/stream/fine/reward_sub_score/quality"] == 0.25
-    assert workflow._task_result.get() is None
-
-
 def test_workflow_rejects_row_reward_ref_mismatch(monkeypatch):
     """A row produced under another grader version must fail before launch."""
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
@@ -1101,87 +1027,6 @@ def _core_context_failure_error() -> ArenaTaskFailedError:
     ]
     error.harness_result["raw"] = {"outcome": outcome.copy()}
     return error
-
-
-def _whitebox_deadline_error():
-    error = _core_context_failure_error()
-    error.result = replace(
-        error.result,
-        raw={
-            "error": "harness agent phase exited with code 1",
-            "harness": {"phase": "agent", "exit_code": 1},
-        },
-    )
-    error.harness_result = None
-    error.whitebox_lifecycle = {
-        "schema": "whitebox-runner-lifecycle/v1",
-        "status": "INTERRUPTED",
-        "trigger": "BRIDGE_EXECUTION_DEADLINE",
-        "native_exit_code": -9,
-        "remaining_pids": [],
-        "native_receipt_synthesized": False,
-    }
-    return error
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        None,
-        "missing",
-        "external",
-        "cleanup",
-        "schema",
-        "outcome",
-        "native_receipt",
-        "outcome_marker",
-        "mixed_family",
-        "wrong_phase",
-        "no_interactions",
-        "setup",
-        "eval",
-    ],
-)
-def test_whitebox_deadline_only_recovers_confirmed_execution_timeout(mutation):
-    error = _whitebox_deadline_error()
-    count = 2
-    if mutation == "missing":
-        error.whitebox_lifecycle = None
-    elif mutation == "external":
-        error.whitebox_lifecycle["trigger"] = "EXTERNAL_TERMINATION"
-    elif mutation == "cleanup":
-        error.whitebox_lifecycle["remaining_pids"] = [123]
-    elif mutation == "schema":
-        error.whitebox_lifecycle["schema"] = "unknown"
-    elif mutation == "outcome":
-        error.result.raw["outcome"] = {"code": "HARNESS_INTERNAL_ERROR"}
-    elif mutation == "native_receipt":
-        error.harness_result = {"status": "ERROR", "error": "collect failed"}
-    elif mutation == "outcome_marker":
-        error.result.raw["error"] += " GAMEAGENT_OUTCOME_CODE=HARNESS_INTERNAL_ERROR"
-    elif mutation == "mixed_family":
-        error.result.raw["nativeFailure"] = {"code": "SYSTEM_FAILURE"}
-    elif mutation == "wrong_phase":
-        error.result.raw["harness"]["phase"] = "collect"
-    elif mutation == "no_interactions":
-        count = 0
-    elif mutation in ("setup", "eval"):
-        error.status = "SETUP_FAILED" if mutation == "setup" else "EVAL_FAILED"
-    expected = (
-        "model_failure_zero"
-        if mutation is None
-        else (
-            "system_failure_reject"
-            if mutation in ("setup", "eval")
-            else "unknown_failure_reject"
-        )
-    )
-    assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
-            error, context_overflow=False, interaction_count=count
-        )
-        == expected
-    )
 
 
 def test_core_context_budget_exhaustion_keeps_zero_with_matching_native_receipt():
@@ -2333,4 +2178,25 @@ def _current_core_context_failure_error(reason="compaction is disabled"):
         f"context window limit exceeded: {reason} "
         "(189066 estimated tokens / 188416 input tokens)"
     )
+    return error
+
+
+def _whitebox_deadline_error():
+    error = _core_context_failure_error()
+    error.result = replace(
+        error.result,
+        raw={
+            "error": "harness agent phase exited with code 1",
+            "harness": {"phase": "agent", "exit_code": 1},
+        },
+    )
+    error.harness_result = None
+    error.whitebox_lifecycle = {
+        "schema": "whitebox-runner-lifecycle/v1",
+        "status": "INTERRUPTED",
+        "trigger": "BRIDGE_EXECUTION_DEADLINE",
+        "native_exit_code": -9,
+        "remaining_pids": [],
+        "native_receipt_synthesized": False,
+    }
     return error

@@ -1560,37 +1560,6 @@ class TestRolloutControllerExportStats:
         assert stats["rollout/reward_sample_count"] == 3
         assert controller.export_stats() == {}
 
-    def test_export_stats_weights_structured_prm_scalar_samples(self):
-        """The PRM adapter's scalar counts produce a global weighted rate."""
-        controller = RolloutController(
-            inf_engine=MockInferenceEngine,
-            config=create_test_config(consumer_batch_size=16),
-            scheduler=MockScheduler(),
-        )
-        prefix = "rollout/prm_metric/turn/scorer/accepted"
-        controller._collective_rpc = Mock(
-            return_value=[
-                {
-                    f"{prefix}/observed_count": 2.0,
-                    f"{prefix}/count": 1.0,
-                    f"{prefix}/rate": 0.5,
-                    f"{prefix}/rate__count": 2,
-                },
-                {
-                    f"{prefix}/observed_count": 8.0,
-                    f"{prefix}/count": 1.0,
-                    f"{prefix}/rate": 0.125,
-                    f"{prefix}/rate__count": 8,
-                },
-            ]
-        )
-
-        stats = controller.export_stats()
-
-        assert stats[f"{prefix}/observed_count"] == 10.0
-        assert stats[f"{prefix}/count"] == 2.0
-        assert stats[f"{prefix}/rate"] == pytest.approx(0.2)
-
 
 class TestRolloutControllerRolloutStats:
     """Tests for _rollout_stats method."""

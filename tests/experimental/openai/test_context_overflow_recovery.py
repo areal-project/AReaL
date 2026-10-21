@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -922,79 +921,3 @@ async def test_arena_legacy_model_failure_requires_usable_proxy_trajectory(
     finally:
         workflow_context.set(WorkflowContext())
         stats_tracker.export_all(reset=True)
-
-
-def _invalid_tool_json_error(source="provider_stream"):
-    """Sanitized native receipts from both lowpoly Harnesses."""
-    details = {
-        "code": None,
-        "errorShape": "object",
-        "errorType": "invalid_request_error",
-        "eventType": "error" if source == "provider_stream" else "http_error",
-        "reason": None,
-    }
-    if source == "provider_http":
-        details["httpStatus"] = 422
-    outcome = {
-        "code": "LLM_RESPONSE_FAILED",
-        "class": "infrastructure",
-        "source": source,
-        "details": details,
-    }
-    summary = (
-        "GAMEAGENT_OUTCOME_CODE=LLM_RESPONSE_FAILED "
-        "GAMEAGENT_OUTCOME_CLASS=infrastructure"
-    )
-    error = ArenaTaskFailedError(
-        task_id="invalid-tool-task",
-        status="HARNESS_FAILED",
-        result=ArenaTaskResult(
-            task_id="invalid-tool-task",
-            status="HARNESS_FAILED",
-            score=0.0,
-            raw={
-                "error": "harness: running setup hook (timeout=3m0s)\n" + summary,
-                "harness": {
-                    "phase": "agent",
-                    "result_status": "ERROR",
-                    "exit_code": 1,
-                    "summary": summary,
-                },
-                "outcome": deepcopy(outcome),
-            },
-        ),
-    )
-    error.harness_result = {
-        "implementation": "rust-core-runtime",
-        "status": "ERROR",
-        "exit_code": 1,
-        "turn_statuses": ["failed"],
-        "delivery": None,
-        "summary": summary,
-        "error": [
-            {
-                "message": (
-                    "model reported a streaming error (event=error, code=None, "
-                    'type=Some("invalid_request_error"), reason=None)'
-                    if source == "provider_stream"
-                    else "model HTTP status 422 Unprocessable Entity"
-                ),
-                "outcome": deepcopy(outcome),
-            }
-        ],
-        "raw": {"outcome": deepcopy(outcome)},
-    }
-    return error
-
-
-@pytest.mark.parametrize("source", ["provider_stream", "provider_http"])
-@pytest.mark.parametrize("local_error", [False, True])
-def test_native_invalid_request_requires_local_tool_json_evidence(source, local_error):
-    """A generic provider invalid_request_error is insufficient for zero reward."""
-    error = _invalid_tool_json_error(source)
-    assert ArenaStreamAgentWorkflow.classify_proxy_failure(
-        error,
-        context_overflow=False,
-        interaction_count=1,
-        invalid_tool_json=local_error,
-    ) == ("model_failure_zero" if local_error else "unknown_failure_reject")

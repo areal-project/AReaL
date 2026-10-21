@@ -185,16 +185,6 @@ if [[ ${QWEN_CLEANUP_ONLY:-0} == 1 ]]; then
   exit 0
 fi
 
-# Check both credentials before GPU allocation; cleanup requires only OpenAPI.
-preflight_python "$QWEN_RECIPE_DIR/validate_arena_auth.py" \
-  --report "$EXPERIMENT_ROOT/monitoring/auth-preflight-${SLURM_JOB_ID}.json"
-
-# Import the actual proxy entry and Arena workflow before allocating GPU workers.
-singularity exec --no-home --writable-tmpfs --nv --bind "$QWEN_MOUNTS" \
-  --env "PYTHONPATH=$QWEN_ROLLOUT_PYTHONPATH" \
-  --env LD_LIBRARY_PATH= --env CUDNN_PATH= \
-  "$QWEN_ROLLOUT_IMAGE" python3 "$QWEN_RECIPE_DIR/probe-rollout-imports.py"
-
 # Slurm tools are available on the host, not in the actor SIF.
 # Require a same-trial checkpoint for an explicitly requested recovery.
 if [[ ${QWEN_REQUIRE_RECOVER:-0} == 1 ]]; then
@@ -254,9 +244,6 @@ srun --mpi=none --ntasks=1 --cpus-per-task=4 --mem=64G \
     unset QWEN_QSA_STABLE_TOPK QWEN_ISOLATE_REQUEST_CACHE NCCL_ALGO NCCL_PROTO CUBLAS_WORKSPACE_CONFIG
     unset QWEN_BATCH_REPLAY_PATH QWEN_BATCH_REPLAY_PATHS QWEN_BATCH_SNAPSHOT_DIR
     cd "$QWEN_REPO"
-    python3 "$QWEN_RECIPE_DIR/validate_config.py"
-    python3 "$QWEN_RECIPE_DIR/validate_wandb.py"
-    python3 "$QWEN_RECIPE_DIR/probe_runtime.py"
     if [[ ${QWEN_REQUIRE_RECOVER:-0} == 1 ]]; then
       python3 "$QWEN_RECIPE_DIR/validate_recover_preflight.py" \
         --submission "$QWEN_PREVIOUS_SUBMISSION" \

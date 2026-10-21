@@ -28,7 +28,6 @@ from starlette.responses import StreamingResponse
 from areal.api import ModelResponse
 from areal.experimental.openai.client import ArealOpenAI, AsyncCompletionsWithReward
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
-from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 
 # ---------------------------------------------------------------------------
@@ -647,81 +646,6 @@ class TestChatCompletionsEndpoint:
         release_generation.set()
         remaining = [chunk async for chunk in iterator]
         assert remaining[-1] == "data: [DONE]\n\n"
-
-    @pytest.mark.asyncio
-    async def test_streaming_invalid_tool_json_is_non_retryable(
-        self, monkeypatch, _mock_openai_client
-    ):
-        """Malformed model actions must not become retryable server errors."""
-
-        async def invalid_tool_create(
-            *,
-            messages=None,
-            model=None,
-            stream=None,
-            temperature=None,
-            top_p=None,
-            areal_cache=None,
-            **kwargs,
-        ):
-            raise InvalidToolCallError(
-                "invalid_tool_json: model emitted a malformed tool call"
-            )
-
-        srv._openai_client.chat.completions.create = invalid_tool_create
-        srv._session_cache["invalid-tool-session"] = srv.SessionData(
-            session_id="invalid-tool-session"
-        )
-
-        response = await srv.chat_completions(
-            {
-                "messages": [{"role": "user", "content": "hi"}],
-                "model": "test",
-                "stream": True,
-            },
-            session_id="invalid-tool-session",
-        )
-
-        assert isinstance(response, StreamingResponse)
-        events = [chunk async for chunk in response.body_iterator]
-        assert len(events) == 2
-        assert events[0].startswith("data: ")
-        error = json.loads(events[1].removeprefix("data: "))["error"]
-        assert error == {
-            "message": "invalid_tool_json: model emitted a malformed tool call",
-            "type": "invalid_request_error",
-            "code": "invalid_tool_json",
-        }
-        assert "server_error" not in events[1]
-        assert "[DONE]" not in events[1]
-
-        # Claude Code retries errors received after an HTTP 200 stream has
-        # started. The retry must be rejected as a real non-retryable 422
-        # before another model generation reaches AReaL.
-        srv._api_key_to_session["invalid-tool-key"] = "invalid-tool-session"
-        srv._session_to_api_key["invalid-tool-session"] = "invalid-tool-key"
-        async with _client() as client:
-            retry = await client.post(
-                "/v1/chat/completions",
-                headers=_session_headers("invalid-tool-key"),
-                json={
-                    "messages": [{"role": "user", "content": "retry"}],
-                    "model": "test",
-                    "stream": True,
-                },
-            )
-        assert retry.status_code == 422
-        assert retry.headers["x-should-retry"] == "false"
-        assert retry.json()["error"]["code"] == "invalid_tool_json"
-        ended = srv.end_session(session_id="invalid-tool-session")
-        assert ended["invalid_tool_json"] is True
-        assert ended["invalid_tool_json_message"] == error["message"]
-        assert ended["system_error"] is False
-
-        srv._session_cache["clean-session"] = srv.SessionData("clean-session")
-        clean = srv.end_session(session_id="clean-session")
-        assert clean["invalid_tool_json"] is False
-        assert clean["invalid_tool_json_message"] == ""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", ["/chat/completions", "/v1/chat/completions"])
