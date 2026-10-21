@@ -811,11 +811,12 @@ class LocalScheduler(Scheduler):
             command = schedulings[0].cmd
             command_parts = shlex.split(command) if command else []
             module = command_parts[command_parts.index("-m") + 1]
-            base_env = dict(schedulings[0].env_vars or {})
             parent_workers = [target_workers[slot.group_index] for slot in target_slots]
             fork_envs = [
-                colocated_train_guard_fork_env(base_env, slot.device_id)
-                for slot in target_slots
+                colocated_train_guard_fork_env(
+                    scheduling.env_vars or {}, slot.device_id
+                )
+                for scheduling, slot in zip(schedulings, target_slots, strict=True)
             ]
             child_gpus = [[slot.device_id] for slot in target_slots]
 

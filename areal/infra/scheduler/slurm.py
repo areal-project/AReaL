@@ -1179,8 +1179,7 @@ set -o pipefail
             target_workers = self._workers[target_role]
             target_gpus_by_host: dict[str, int] = {}
             parent_workers: list[SlurmWorkerInfo] = []
-            fork_envs: list[dict[str, str]] = []
-            base_env = dict(schedulings[0].env_vars or {})
+            gpu_slots: list[int] = []
             # Forked guards inherit their parent's spec, which may describe
             # more GPUs than they actually bind. Use the live device mask for
             # both topology validation and expansion, including nested forks.
@@ -1217,9 +1216,7 @@ set -o pipefail
             for base, _host_ip, target_worker, target_gpu_count in target_layout:
                 for offset in range(target_gpu_count):
                     parent_workers.append(target_worker)
-                    fork_envs.append(
-                        colocated_train_guard_fork_env(base_env, base + offset)
-                    )
+                    gpu_slots.append(base + offset)
 
             if (
                 any(
@@ -1235,6 +1232,10 @@ set -o pipefail
                     "with one training guard per GPU",
                 )
 
+            fork_envs = [
+                colocated_train_guard_fork_env(scheduling.env_vars or {}, gpu_slot)
+                for scheduling, gpu_slot in zip(schedulings, gpu_slots, strict=True)
+            ]
             command = schedulings[0].cmd
             command_parts = shlex.split(command) if command else []
             if (
