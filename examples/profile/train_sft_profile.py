@@ -5,13 +5,14 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 from torch.utils.data import Dataset
 
-from areal.api.cli_args import SFTConfig, load_expr_config
+from examples.profile.config import ProfileSFTConfig
+
+from areal.api.cli_args import load_expr_config
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.logging import getLogger
 
@@ -70,33 +71,6 @@ repeated structured conversation with code, JSON, and validation text. The
 second half of the sequence is included in the SFT loss mask so every layout
 optimizes the same target span.
 """
-
-
-@dataclass
-class ProfileDataConfig:
-    """Configuration for deterministic fake SFT profile data."""
-
-    fake_seq_len: int = field(
-        default=131072,
-        metadata={"help": "Token length of each fake profile sample."},
-    )
-    fake_dataset_size: int = field(
-        default=8,
-        metadata={"help": "Logical dataset size for repeated fake samples."},
-    )
-    fake_loss_start_ratio: float = field(
-        default=0.5,
-        metadata={
-            "help": "Fraction of each sequence treated as prompt/context tokens."
-        },
-    )
-
-
-@dataclass
-class ProfileSFTConfig(SFTConfig):
-    """SFT config extended with profile fake-data options."""
-
-    profile: ProfileDataConfig = field(default_factory=ProfileDataConfig)
 
 
 class RepeatedProfileSFTDataset(Dataset):
@@ -170,6 +144,12 @@ def main(args: list[str]) -> None:
     train_dataset = build_profile_dataset(config)
 
     with SFTTrainer(config, train_dataset=train_dataset, valid_dataset=None) as trainer:
+        if (
+            config.actor.backend.startswith("megatron")
+            and config.actor.megatron.cpu_staged_offload.enabled
+        ):
+            # Exercise the AWEX activation-storage lifecycle without rollout.
+            trainer.actor.init_weight_residency_adapter()
         trainer.train()
 
 

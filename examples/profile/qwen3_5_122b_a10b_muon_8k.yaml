@@ -45,7 +45,7 @@ actor:
     recompute_granularity: selective
     recompute_method: null
     recompute_num_layers: null
-    recompute_modules: [core_attn, moe_act, layernorm, shared_experts, mlp]
+    recompute_modules: [core_attn, moe_act, layernorm, shared_experts, mlp, gdn_norm_out]
 
 profile:
   fake_seq_len: 8192
