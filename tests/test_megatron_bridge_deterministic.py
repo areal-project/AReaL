@@ -72,6 +72,7 @@ def _run_until_provider_finalize(
     provider: _FakeProvider,
     *,
     deterministic: bool,
+    model_type: str = "qwen3",
 ) -> None:
     pytest.importorskip("mbridge")
     pytest.importorskip("megatron.core")
@@ -94,7 +95,7 @@ def _run_until_provider_finalize(
         for getter in mpu_mocks.values():
             getter.return_value = 1
         make_mcore_model(
-            hf_config=SimpleNamespace(),
+            hf_config=SimpleNamespace(model_type=model_type),
             tf_config=tf_config,
             mcore_config=mcore_config,
             bridge=_FakeBridge(provider),
@@ -130,6 +131,17 @@ def test_megatron_bridge_provider_applies_fusion_config_when_nondeterministic():
         True,
         True,
     )
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+def test_qwen35_thd_uses_flash_without_enabling_determinism(model_type):
+    """Avoid the faulty cuDNN THD backward without changing GDN execution."""
+    enums = pytest.importorskip("megatron.core.transformer.enums")
+    provider = _make_provider(enums.AttnBackend.auto)
+
+    _run_until_provider_finalize(provider, deterministic=False, model_type=model_type)
+
+    assert provider.config_at_finalize == (False, enums.AttnBackend.flash, True, True)
 
 
 @pytest.mark.parametrize("fusion_enabled", [False, True])
@@ -179,7 +191,7 @@ def test_megatron_bridge_rejects_multilayer_mtp_training():
         for getter in mpu_mocks.values():
             getter.return_value = 1
         make_mcore_model(
-            hf_config=SimpleNamespace(),
+            hf_config=SimpleNamespace(model_type="qwen3"),
             tf_config=SimpleNamespace(params_dtype=None),
             mcore_config=mcore_config,
             bridge=_FakeBridge(provider),
@@ -215,7 +227,7 @@ def test_megatron_bridge_enables_native_mtp_gradient_isolation():
         for getter in mpu_mocks.values():
             getter.return_value = 1
         make_mcore_model(
-            hf_config=SimpleNamespace(),
+            hf_config=SimpleNamespace(model_type="qwen3"),
             tf_config=SimpleNamespace(params_dtype=None),
             mcore_config=mcore_config,
             bridge=_FakeBridge(provider),

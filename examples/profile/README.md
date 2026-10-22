@@ -205,6 +205,13 @@ numerical correctness or training stability. Host memory use was approximately 1
 Selective recompute exhausted GPU memory during forward; it is not the validated
 configuration for this smoke.
 
+The large norms were subsequently traced to a TE/cuDNN THD attention backward
+regression, also reproduced with real DAPO data, AdamW, and the 35B model. Qwen3.5
+training now explicitly selects FlashAttention. See the
+[diagnosis and RL validation](../cpu_staged_offload/README.md#qwen35-thd-attention-backward-regression).
+The original SFT timings above are historical capacity measurements of the faulty path,
+not a numerically valid performance baseline.
+
 Initialization now reclaims HF-loading temporaries before warming native EP all-to-all:
 reserved memory fell from 131.36 GiB to 99.99–100.50 GiB per GPU, with live tensor
 memory unchanged. This avoids NCCL's first-use allocation competing with roughly 31 GiB

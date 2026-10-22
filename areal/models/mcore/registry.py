@@ -555,6 +555,16 @@ def make_mcore_model(
         if mcore_config.use_deterministic_algorithms:
             set_deterministic_algorithms(provider, prebuild=True)
 
+        if hf_config.model_type in ("qwen3_5", "qwen3_5_moe"):
+            from megatron.core.transformer.enums import AttnBackend
+
+            # Qwen3.5 uses model-owned THD packing. TE/cuDNN's fused BF16
+            # GQA backward corrupts the second half of THD gradients on the
+            # validated stack, although forward and BSHD backward are correct.
+            # Select the verified FlashAttention path before model creation.
+            provider.attention_backend = AttnBackend.flash
+            tf_config.attention_backend = provider.attention_backend
+            logger.info("Qwen3.5 THD training: attention_backend set to flash.")
         provider.finalize()
 
         if mcore_config.mtp_only:

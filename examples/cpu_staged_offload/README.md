@@ -140,3 +140,59 @@ This is a real reward-producing RL test, unlike the synthetic SFT capacity test 
 finite loss, and the **pre-clipping** gradient norm. Three updates do not establish
 convergence. The local 122B checkpoint used for validation is the post-trained model,
 not a Base checkpoint.
+
+### Qwen3.5 THD attention backward regression
+
+The initial 122B Muon smoke's large or NaN gradient norms were a correctness failure,
+not a property of Muon or the SFT data. Real 8K DAPO runs also reproduced the failure
+with 35B AdamW (pre-clipping norm about `5.34e10`) and with 35B Muon after disabling
+activation-storage release (about `2.25e10`). The gradients were already wrong before
+the optimizer update. `update_successful=1` alone did not detect this failure.
+
+The newer Megatron stack enables model-owned THD packing for Qwen3.5. A standalone
+Transformer Engine attention test reproduced incorrect gradients in the second half of
+the sequence with the default cuDNN fused backend. It required no optimizer, distributed
+communication, activation checkpointing, AWEX, or activation tracker. Filling freed
+allocator blocks with NaNs made the invalid gradients reproducibly NaN. Both BSHD with
+cuDNN and THD with FlashAttention remained correct. The behavior was observed at 4096,
+8190, and 8192 tokens; it was not just an unaligned sequence tail.
+
+Replaying captured training Q/K/V and output gradients confirmed the diagnosis: forward
+relative L2 error was only `0.00093`, but the faulty dV maximum was `31.75` versus the
+reference `5.94e-8`. FlashAttention dQ/dK/dV relative L2 errors were
+`0.00080 / 0.00298 / 0.00301`. The precise vendor-kernel defect has not been
+established.
+
+The isolated reproducer used PyTorch `2.9.1+cu129`, Transformer Engine
+`2.14.1+27de67e1`, cuDNN `9.16.0`, BF16 Q/K/V, 8 local query heads, 1 KV head, and head
+dimension 256 on L20X. This identifies the validated failing stack; it does not imply
+that every cuDNN version or THD configuration is affected.
+
+Qwen3.5 providers now select `AttnBackend.flash` before model construction, including
+non-deterministic training. This avoids the faulty fused-attention path without changing
+GDN, Muon, optimizer offload, activation release, or rollout. Do not force
+`NVTE_FUSED_ATTN=0` externally: MCore validates these variables against its provider's
+backend setting. Temporary per-layer diagnostics are not part of the training path.
+
+Post-fix validation uses real DAPO rollouts at the same 8K context limit, BF16, TP2/EP8
+on 8 GPUs, full recomputation, activation release, CPU-staged optimizer offload, and
+AWEX 0.9.0. Native Megatron MoE is used (`AREAL_USE_WEFTMOE=0`) to isolate the
+training-stack regression. Checkpoint and recover saving are disabled. Each update
+consumes 8 prompts with 4 samples each. Gradient norms below are **before clipping**;
+different rollouts are not a paired performance comparison.
+
+| Model / optimizer | Trial                             | Validated updates | Pre-clipping gradient norms  |
+| ----------------- | --------------------------------- | ----------------: | ---------------------------- |
+| 35B Base / AdamW  | `grad-debug-35b-adam / fixed-r3`  |                 3 | 0.336787, 0.389280, 0.341655 |
+| 35B Base / Muon   | `grad-debug-35b-muon / flash-r4`  |                 1 | 0.385123                     |
+| 122B / Muon       | `grad-debug-122b-muon / fixed-r1` |                 3 | 0.310677, 0.284341, 0.282264 |
+
+The 35B AdamW and 122B Muon runs use the clean production path and completed all three
+AWEX weight versions. The 35B Muon control still had temporary gradient diagnostics and
+is not a timing baseline. All listed updates have finite loss and `update_successful=1`;
+these short tests do not establish reward convergence. Metrics are online in the
+`sct-test/qwen3-5-grad-debug` W&B project.
+
+The separate 122B AdamW attempt exceeded the node's host-memory capacity while
+initializing CPU optimizer state, before backward. It therefore provides no numerical
+validation for that model/optimizer combination.
