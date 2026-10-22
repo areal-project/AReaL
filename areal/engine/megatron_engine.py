@@ -853,6 +853,28 @@ class MegatronEngine(TrainEngine):
         self._create_optimizer(ft_spec)
         self._set_optimizer_grad_scale_func()
 
+        # HF loading leaves large cached temporaries. NCCL allocates outside
+        # that cache and cannot reclaim it when lazily connecting EP peers.
+        self.get_device_stats().log(
+            "after model and optimizer initialization", rank=None
+        )
+        current_platform.clear_memory()
+        self.get_device_stats().log("after reclaiming initialization cache", rank=None)
+        if (
+            self.parallel_strategy.expert_parallel_size > 1
+            and self.tf_config.moe_token_dispatcher_type == "alltoall"
+            and self._weftmoe_adapter is None
+        ):
+            # All-reduce warmup does not establish the all-to-all P2P paths.
+            group = mpu.get_expert_model_parallel_group()
+            warmup_input = torch.zeros(
+                dist.get_world_size(group), dtype=self.dtype, device=self.device
+            )
+            warmup_output = torch.empty_like(warmup_input)
+            dist.all_to_all_single(warmup_output, warmup_input, group=group)
+            current_platform.synchronize()
+            self.get_device_stats().log("after expert all-to-all warmup", rank=None)
+
         from megatron.core.transformer.moe.router import TopKRouter
 
         self._moe_metrics = MoEMetrics()
