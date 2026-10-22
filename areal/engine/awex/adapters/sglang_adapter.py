@@ -1060,7 +1060,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         awex_hf_config = _get_legacy_awex_hf_config(self._get_model(), model_runner)
         infer_conf = {
             "engine_name": "sglang",
-            "infer_atten_tp_size": self._build_model_context()["attn_tp_size"],
+            "infer_atten_tp_size": self._get_model_context()["attn_tp_size"],
             "infer_world_size": infer_world_size,
             "hf_config": awex_hf_config,
             "router_dtype": _get_router_dtype(awex_hf_config),
