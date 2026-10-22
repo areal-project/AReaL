@@ -117,3 +117,26 @@ peaks were essentially unchanged, with the staged run peaking during AWEX exchan
 These short runs validate execution and memory use, not convergence or multi-node
 behavior. Optimizer staging also requires substantial pinned host memory; the validation
 node had 1.5 TiB of RAM.
+
+## Qwen3.5-122B-A10B: real DAPO RL smoke
+
+`dapo-math_grpo_qwen3_5_122b_muon.yaml` runs three GRPO updates on DAPO-Math with 8
+prompts and 4 samples per prompt. Set `QWEN3_5_122B_A10B_MODEL_PATH`,
+`DAPO_MATH_17K_PATH`, `AREAL_EXPERIMENT_ROOT`, and the proxy admin key as above:
+
+```bash
+python examples/cpu_staged_offload/dapo-math_rl_cpu_staged.py \
+  --config examples/cpu_staged_offload/dapo-math_grpo_qwen3_5_122b_muon.yaml
+```
+
+Training uses TP2/DP4/EP8, FP32 gradients, CPU-staged Muon, and full one-layer
+recomputation. Rollout uses one TP8/EP8 SGLang server on the same eight GPUs; four TP2
+replicas of the 122B model would not fit the validated memory budget. The 8K limit
+includes the prompt and completion. Checkpoints, recovery, and memory snapshots are
+disabled; W&B is online and takes credentials from the environment.
+
+This is a real reward-producing RL test, unlike the synthetic SFT capacity test in
+`examples/profile`. Monitor reward, nonzero advantages, policy logprob differences,
+finite loss, and the **pre-clipping** gradient norm. Three updates do not establish
+convergence. The local 122B checkpoint used for validation is the post-trained model,
+not a Base checkpoint.
