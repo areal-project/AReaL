@@ -16,6 +16,10 @@ import sys
 
 def areal_launch_server(server_args) -> None:
     # ---- BEGIN AREAL ----
+    if os.environ.get("AREAL_USE_WEFTMOE") == "1":
+        from weftmoe.sglang import install
+
+        install()
     from areal.v2.inference_service.sglang.routed_experts_compat import (
         normalize_routed_experts_server_args,
     )

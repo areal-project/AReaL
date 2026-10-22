@@ -64,6 +64,10 @@ class MegatronWeightResidency:
         if not tags_to_release:
             return
 
+        adapter = getattr(self._engine, "_weftmoe_adapter", None)
+        if adapter is not None:
+            adapter.suspend()
+
         if "optimizer" in tags_to_release:
             self._offload_optimizer_states()
         if "weights" in tags_to_release:

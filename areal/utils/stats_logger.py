@@ -166,7 +166,7 @@ class StatsLogger:
                     columns=["layer", "expert", "tokens", "load_percent"],
                     data=expert_rows,
                 )
-            wandb.log(wandb_item, step=log_step + i)
+            wandb.log(wandb_item, step=log_step + i, commit=True)
             swanlab.log(item, step=log_step + i)
             if getattr(self, "_trackio_enabled", False):
                 trackio.log(item, step=log_step + i)

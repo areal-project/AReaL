@@ -732,6 +732,18 @@ class MegatronEngine(TrainEngine):
                         )
 
         self.model = _MegatronModelList(models)
+        self._weftmoe_adapter = None
+        if os.environ.get("AREAL_USE_WEFTMOE") == "1":
+            from weftmoe.megatron import MegatronAdapter
+
+            self._weftmoe_adapter = MegatronAdapter(
+                self.model,
+                max_tokens=(
+                    self.config.mb_spec.max_tokens_per_mb
+                    // mpu.get_tensor_model_parallel_world_size()
+                ),
+            )
+            self._weftmoe_adapter.prepare()
         _warn_if_areal_lm_head_entropy_is_nondifferentiable(
             self.logger,
             global_rank=self.rank,
@@ -1161,6 +1173,9 @@ class MegatronEngine(TrainEngine):
         return self._cpu_group
 
     def destroy(self):
+        if getattr(self, "_weftmoe_adapter", None) is not None:
+            self._weftmoe_adapter.close()
+            self._weftmoe_adapter = None
         if hasattr(self, "_moe_metrics"):
             self._moe_metrics.close()
         self._initialized = False
@@ -2705,6 +2720,8 @@ class MegatronEngine(TrainEngine):
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/actor.py
         """
+        if getattr(self, "_weftmoe_adapter", None) is not None:
+            self._weftmoe_adapter.suspend()
         if self._weight_residency is not None:
             self._log_weight_residency_stats("before_offload")
             self.get_device_stats().log("before offload model")

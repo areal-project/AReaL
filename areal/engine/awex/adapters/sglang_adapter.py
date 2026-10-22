@@ -1057,11 +1057,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._get_legacy_weight_metadata()
 
         model_runner = self._scheduler.tp_worker.model_runner
-        parallelism = self.get_parallelism()
         awex_hf_config = _get_legacy_awex_hf_config(self._get_model(), model_runner)
         infer_conf = {
             "engine_name": "sglang",
-            "infer_atten_tp_size": parallelism["tp_size"],
+            "infer_atten_tp_size": self._build_model_context()["attn_tp_size"],
             "infer_world_size": infer_world_size,
             "hf_config": awex_hf_config,
             "router_dtype": _get_router_dtype(awex_hf_config),
@@ -1360,6 +1359,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     def release_memory(self, tags: list[str] | None = None) -> None:
         from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
 
+        if os.environ.get("AREAL_USE_WEFTMOE") == "1":
+            from weftmoe.sglang import suspend
+
+            suspend(self._scheduler.tp_worker.model_runner)
         tags = tags or ["kv_cache"]
         tags_to_release = [tag for tag in tags if tag not in self._released_tags]
         if tags_to_release:
@@ -1378,6 +1381,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             self._scheduler.resume_memory_occupation(req)
             self._released_tags.difference_update(tags_to_resume)
         logger.info("resume_memory: tags=%s", tags)
+        if os.environ.get("AREAL_USE_WEFTMOE") == "1":
+            from weftmoe.sglang import resume
+
+            resume(self._scheduler.tp_worker.model_runner)
 
 
 __all__ = ["AwexSGLangAdapter"]

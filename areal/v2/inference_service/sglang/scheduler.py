@@ -172,6 +172,10 @@ def areal_run_scheduler_process(
     """
     import signal
 
+    if os.environ.get("AREAL_USE_WEFTMOE") == "1":
+        from weftmoe.sglang import install
+
+        install()
     import psutil
     from sglang.srt.environ import envs
     from sglang.srt.managers.scheduler import Scheduler, configure_scheduler
