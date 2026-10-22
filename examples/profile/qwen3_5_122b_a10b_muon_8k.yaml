@@ -42,10 +42,11 @@ actor:
     enable_mtp: false
     enable_mtp_training: false
     lm_head_loss_chunk_size: 1024
-    recompute_granularity: selective
-    recompute_method: null
-    recompute_num_layers: null
-    recompute_modules: [core_attn, moe_act, layernorm, shared_experts, mlp, gdn_norm_out]
+    # Selective recompute exceeds 140 GiB/GPU at 8K with FP32 gradients.
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    recompute_modules: null
 
 profile:
   fake_seq_len: 8192

@@ -179,6 +179,39 @@ python examples/profile/postprocess_profile.py \
 
 ## Notes
 
+### Qwen3.5-122B-A10B Muon feasibility smoke
+
+`qwen3_5_122b_a10b_muon_8k.yaml` runs three real full-model updates on one eight-GPU
+node: TP2/DP4, EP8, BF16 weights, FP32 gradients, and CPU-staged Muon with one 128 MiB
+GPU staging slot. Set `QWEN3_5_122B_A10B_MODEL_PATH` and `AREAL_EXPERIMENT_ROOT`, then
+run:
+
+```bash
+AREAL_SPMD_MODE=0 python examples/profile/train_sft_profile.py \
+  --config examples/profile/qwen3_5_122b_a10b_muon_8k.yaml
+```
+
+The smoke uses 12 deterministic 8192-token samples, batch size 4, and loss on the second
+half of each sequence. Checkpoint/recovery saving is disabled; W&B is online and
+credentials must be supplied outside the configuration. The staged optimizer also
+activates the weight-residency activation tracker.
+
+On eight L20X GPUs at 1620 MHz, full uniform recompute (one layer per checkpoint)
+completed three Muon updates. The first step included compilation (110.74 s); the next
+two took 9.99 s and 10.60 s. This is a native Megatron feasibility result, not a
+convergence, rollout, or WeftMoE throughput result. The reported pre-clipping gradient
+norm was large (approximately 2.3e7–2.3e9); finite updates alone do not establish
+numerical correctness or training stability. Host memory use was approximately 1.1 TiB.
+Selective recompute exhausted GPU memory during forward; it is not the validated
+configuration for this smoke.
+
+Initialization now reclaims HF-loading temporaries before warming native EP all-to-all:
+reserved memory fell from 131.36 GiB to 99.99–100.50 GiB per GPU, with live tensor
+memory unchanged. This avoids NCCL's first-use allocation competing with roughly 31 GiB
+of unused allocator cache.
+
+### Profiling notes
+
 - Run kernel and memory profiles separately. PyTorch profiler memory recording disturbs
   the kernel timeline, so kernel trials set `AREAL_TORCH_PROFILER_PROFILE_MEMORY=false`
   by default.
