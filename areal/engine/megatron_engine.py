@@ -2712,6 +2712,10 @@ class MegatronEngine(TrainEngine):
             raise RuntimeError(
                 "torch_memory_saver requires `enable_offload=True` in yaml config."
             )
+        # Colocated trainers offload the actor before rollout init and again in
+        # the initial offload policy; a second TMS pause calls exit(1).
+        if self.is_offload:
+            return
 
         self.get_device_stats().log("before offload model")
 
@@ -2751,6 +2755,8 @@ class MegatronEngine(TrainEngine):
             self._log_weight_residency_stats("after_onload")
             self.get_device_stats().log("after onload model")
             self.is_offload = False
+            return
+        if not self.is_offload:
             return
 
         torch_memory_saver.resume()
