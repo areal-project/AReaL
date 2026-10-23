@@ -1,0 +1,222 @@
+--- a/awex/transfer/nccl_stream_batch.py
++++ b/awex/transfer/nccl_stream_batch.py
+@@ -36,9 +36,14 @@
+ hang_detector = ThreadPoolExecutor(max_workers=1)
+ 
+ 
+-def _clone_p2p_send_tensor(tensor: torch.Tensor) -> torch.Tensor:
+-    """Return a dense tensor suitable for torch.distributed P2P send."""
+-    return tensor.clone(memory_format=torch.contiguous_format)
++def _prepare_p2p_send_tensor(tensor: torch.Tensor) -> torch.Tensor:
++    """Borrow dense sources; materialize only strided send views.
++
++    The reader holds the imported training weights until this transport has
++    drained all sends. The writer cannot release them before the reader's IPC
++    close/ack handshake, so a separate copy per destination is unnecessary.
++    """
++    return tensor.contiguous()
+ 
+ 
+ def _prepare_p2p_recv_tensor(
+@@ -139,7 +144,7 @@
+             )
+             return
+ 
+-        # === LEGACY PATH (one-shot clone-then-transfer) ===
++        # === ONE-SHOT PATH (prepare-then-transfer) ===
+         # Build P2P operations with sliced tensors
+         all_send_p2p_ops = {}  # peer_rank -> List[(plan_op, p2p_op)]
+         all_recv_p2p_ops = {}  # peer_rank -> List[(plan_op, p2p_op)]
+@@ -171,18 +176,16 @@
+                     recv_rank = train_to_infer_device_mapping.get(
+                         op.recv_rank, op.recv_rank
+                     )
+-                    cloned = _clone_p2p_send_tensor(tensor_sliced)
++                    send_buffer = _prepare_p2p_send_tensor(tensor_sliced)
+                     # Wire-size parity with the receiver's dtype (see the
+                     # chunked path: a bf16 send into an fp32-sized recv
+                     # slot wedges the receiver forever).
+                     recv_dtype = getattr(op.recv_shard_meta, "dtype", None)
+-                    if recv_dtype is not None and cloned.dtype != recv_dtype:
+-                        cloned = cloned.to(recv_dtype)
+-                    if not cloned.is_contiguous():
+-                        cloned = cloned.contiguous()
++                    if recv_dtype is not None and send_buffer.dtype != recv_dtype:
++                        send_buffer = send_buffer.to(recv_dtype)
+                     p2p_op = dist.P2POp(
+                         dist.isend if async_op else dist.send,
+-                        cloned,
++                        send_buffer,
+                         recv_rank,
+                         group=weights_update_group,
+                     )
+@@ -465,12 +468,11 @@
+         NCCL P2P pairs FIFO within (group, src, dst) so this preserves
+         protocol semantics.
+ 
+-        step_size is derived from chunk_bytes by sampling the per-op nbytes
+-        from a representative op so that one chunk's clones approach but do
+-        not exceed chunk_bytes.
++        step_size conservatively budgets materialized send/recv buffers from
++        aggregate per-index wire bytes. Dense sends borrow source storage and
++        need no staging allocation.
+ 
+-        Local self-copy (tensors_to_copy) and self-recv-from-other-trains do
+-        not consume clone memory and are emitted once up front.
++        Local self-copy and self-recv-from-other-trains are emitted once up front.
+         """
+         train_slice_context = {}
+ 
+@@ -549,7 +551,7 @@
+         train_slice_context.clear()
+ 
+         def _op_wire_bytes(op) -> int:
+-            # Wire dtype is the receiver's dtype: send clones are cast to
++            # Wire dtype is the receiver's dtype: send buffers are cast to
+             # op.recv_shard_meta.dtype before posting (see the chunk loop
+             # below), so fp32 receivers cost 2x a bf16 train-side estimate.
+             dtype = getattr(op.recv_shard_meta, "dtype", None) or getattr(
+@@ -584,8 +586,8 @@
+                     numel *= d
+             return max(numel * elem_size, 1)
+ 
+-        # AWEX_CHUNK_MB bounds the transient allocation of ONE chunk across
+-        # ALL peers: chunk N clones send ops[N*step:(N+1)*step] for every
++        # AWEX_CHUNK_MB budgets worst-case staging for ONE chunk across
++        # ALL peers: chunk N prepares send ops[N*step:(N+1)*step] for every
+         # send peer and stages non-contiguous recvs for every recv peer.
+         # The budget must therefore be divided by the AGGREGATE per-index
+         # wire bytes summed over peers, not a single peer's sample op —
+@@ -680,7 +682,7 @@
+             f"max_send_per_peer={max_send_len} max_recv_per_peer={max_recv_len}"
+         )
+ 
+-        total_clone_bytes = 0
++        total_send_bytes = 0
+ 
+         for chunk_idx in range(n_chunks):
+             start = chunk_idx * step_size
+@@ -693,7 +695,7 @@
+             chunk_send_p2p_ops = {}
+             chunk_recv_p2p_ops = {}
+             chunk_recv_tensor_pairs = []
+-            chunk_clone_bytes = 0
++            chunk_send_bytes = 0
+             # Per-chunk slice cache: dedupes densified non-contiguous send
+             # slices WITHIN a chunk but is dropped at the chunk boundary, so
+             # dense staging copies do not accumulate across the whole
+@@ -713,26 +715,24 @@
+                     recv_rank = train_to_infer_device_mapping.get(
+                         op.recv_rank, op.recv_rank
+                     )
+-                    cloned = _clone_p2p_send_tensor(tensor_sliced)
++                    send_buffer = _prepare_p2p_send_tensor(tensor_sliced)
+                     # Wire-size parity: the receiver posts irecv with ITS shard
+                     # dtype. Some parameters (e.g. mlp.gate.weight) are bf16
+                     # on the train side but fp32 on the sglang side; sending
+                     # bf16 bytes into an fp32-sized recv leaves the receiver
+                     # waiting forever (a deterministic mid-transfer deadlock).
+-                    # Cast the clone to the receiver's dtype.
++                    # Cast the send buffer to the receiver's dtype.
+                     recv_dtype = getattr(op.recv_shard_meta, "dtype", None)
+-                    if recv_dtype is not None and cloned.dtype != recv_dtype:
+-                        cloned = cloned.to(recv_dtype)
+-                    if not cloned.is_contiguous():
+-                        cloned = cloned.contiguous()
++                    if recv_dtype is not None and send_buffer.dtype != recv_dtype:
++                        send_buffer = send_buffer.to(recv_dtype)
+                     p2p_op = dist.P2POp(
+                         dist.isend if async_op else dist.send,
+-                        cloned,
++                        send_buffer,
+                         recv_rank,
+                         group=weights_update_group,
+                     )
+                     p2p_ops.append((op, p2p_op))
+-                    chunk_clone_bytes += cloned.numel() * cloned.element_size()
++                    chunk_send_bytes += send_buffer.numel() * send_buffer.element_size()
+                 chunk_send_p2p_ops[mapped_peer_rank] = p2p_ops
+ 
+             for recv_from_rank, ops in recv_per_peer.items():
+@@ -785,7 +785,7 @@
+             logger.warning(
+                 f"[CHUNKED-DIAG {task_id}] chunk_idx={chunk_idx}/{n_chunks} EXIT "
+                 f"send_peers={len(chunk_send_p2p_ops)} recv_peers={len(chunk_recv_p2p_ops)} "
+-                f"clone_mb={chunk_clone_bytes/1024/1024:.1f}"
++                f"send_mb={chunk_send_bytes/1024/1024:.1f}"
+             )
+ 
+             chunk_send_p2p_ops = None
+@@ -797,9 +797,9 @@
+             if hasattr(torch, "cuda") and torch.cuda.is_available():
+                 torch.cuda.empty_cache()
+ 
+-            total_clone_bytes += chunk_clone_bytes
++            total_send_bytes += chunk_send_bytes
+ 
+         logger.info(
+             f"CHUNKED transfer done {task_id}: chunks={n_chunks} step_size={step_size} "
+-            f"total_clone_mb={total_clone_bytes / 1024 / 1024:.2f}"
++            f"total_send_mb={total_send_bytes / 1024 / 1024:.2f}"
+         )
+--- a/awex/reader/nccl_reader.py
++++ b/awex/reader/nccl_reader.py
+@@ -300,10 +300,11 @@
+         logger.info(
+             f"Finished getting serialized ipc weights {key} for rank {self.rank_coordinate}"
+         )
+-        logger.info(
+-            f"GPU status before deserialization:\n{get_gpu_status()} for rank {self.rank_coordinate}"
+-        )
+-        logger.info(f"Open fds before deserialization: {count_open_fds()}")
++        if self.enable_debug_mode:
++            logger.info(
++                f"GPU status before deserialization:\n{get_gpu_status()} for rank {self.rank_coordinate}"
++            )
++            logger.info(f"Open fds before deserialization: {count_open_fds()}")
+         # Deserialize weights into tensors
+         self.deserialized_weights, num_groups = reconstruct_ipc_weights(
+             serialized_weights, ipc_backend=self.ipc_backend, device_id=device_id
+@@ -311,10 +312,11 @@
+         logger.info(
+             f"Deserialized {len(self.deserialized_weights)} parameters and {num_groups} groups"
+         )
+-        logger.info(
+-            f"GPU status after deserialization for rank {self.rank_coordinate}:\n{get_gpu_status()}"
+-        )
+-        logger.info(f"Open fds after deserialization: {count_open_fds()}")
++        if self.enable_debug_mode:
++            logger.info(
++                f"GPU status after deserialization for rank {self.rank_coordinate}:\n{get_gpu_status()}"
++            )
++            logger.info(f"Open fds after deserialization: {count_open_fds()}")
+ 
+     @staticmethod
+     def _sync_non_contiguous_tensor_pairs(non_contiguous_tensor_pairs):
+--- a/awex/tests/test_nccl_stream_batch.py
++++ b/awex/tests/test_nccl_stream_batch.py
+@@ -18,7 +18,7 @@
+ import torch
+ 
+ from awex.transfer.nccl_stream_batch import (
+-    _clone_p2p_send_tensor,
++    _prepare_p2p_send_tensor,
+     _prepare_p2p_recv_tensor,
+     _sync_p2p_recv_tensor_pairs,
+ )
+@@ -50,12 +50,13 @@
+     assert copyback_pair is None
+ 
+ 
+-def test_clone_p2p_send_tensor_returns_contiguous_clone():
++def test_prepare_p2p_send_tensor_only_materializes_noncontiguous_views():
+     base = torch.arange(16, dtype=torch.float32).reshape(4, 4)
++    assert _prepare_p2p_send_tensor(base) is base
+     view = base[:, 1]
+     assert not view.is_contiguous()
+ 
+-    cloned = _clone_p2p_send_tensor(view)
++    cloned = _prepare_p2p_send_tensor(view)
+ 
+     assert cloned.is_contiguous()
+     assert cloned.data_ptr() != view.data_ptr()

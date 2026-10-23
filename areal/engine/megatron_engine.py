@@ -740,7 +740,10 @@ class MegatronEngine(TrainEngine):
                 self.model,
                 max_tokens=(
                     self.config.mb_spec.max_tokens_per_mb
-                    // mpu.get_tensor_model_parallel_world_size()
+                    // (
+                        mpu.get_tensor_model_parallel_world_size()
+                        * mpu.get_context_parallel_world_size()
+                    )
                 ),
             )
             self._weftmoe_adapter.prepare()
@@ -2742,8 +2745,6 @@ class MegatronEngine(TrainEngine):
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/actor.py
         """
-        if getattr(self, "_weftmoe_adapter", None) is not None:
-            self._weftmoe_adapter.suspend()
         if self._weight_residency is not None:
             self._log_weight_residency_stats("before_offload")
             self.get_device_stats().log("before offload model")
@@ -2755,6 +2756,11 @@ class MegatronEngine(TrainEngine):
             self.get_device_stats().log("after offload model")
             self.is_offload = True
             return
+
+        # Explicit residency drains the adapter in release_memory(), including
+        # direct AWEX calls. Only the TMS fallback needs the hook here.
+        if self._weftmoe_adapter is not None:
+            self._weftmoe_adapter.suspend()
 
         if not is_tms_enabled():
             raise RuntimeError(

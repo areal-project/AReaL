@@ -565,6 +565,15 @@ def make_mcore_model(
             provider.attention_backend = AttnBackend.flash
             tf_config.attention_backend = provider.attention_backend
             logger.info("Qwen3.5 THD training: attention_backend set to flash.")
+            if provider.context_parallel_size > 1:
+                from areal.models.mcore.flash_attention_compat import (
+                    patch_te_flash_attention_3,
+                )
+
+                if patch_te_flash_attention_3():
+                    logger.info(
+                        "Adapted TE CP calls to the FA3 tuple-window interface."
+                    )
         provider.finalize()
 
         if mcore_config.mtp_only:

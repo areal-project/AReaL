@@ -1359,13 +1359,17 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     def release_memory(self, tags: list[str] | None = None) -> None:
         from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
 
-        if os.environ.get("AREAL_USE_WEFTMOE") == "1":
-            from weftmoe.sglang import suspend
-
-            suspend(self._scheduler.tp_worker.model_runner)
         tags = tags or ["kv_cache"]
         tags_to_release = [tag for tag in tags if tag not in self._released_tags]
         if tags_to_release:
+            # The v1 plugin wraps these scheduler calls. The v2 service uses
+            # this adapter directly and needs the same hook exactly once.
+            if os.environ.get("AREAL_USE_WEFTMOE") == "1" and not getattr(
+                self._scheduler, "_areal_awex_memory_transitions_patched", False
+            ):
+                from weftmoe.sglang import suspend
+
+                suspend(self._scheduler.tp_worker.model_runner)
             req = ReleaseMemoryOccupationReqInput(tags=tags_to_release)
             self._scheduler.release_memory_occupation(req)
             self._released_tags.update(tags_to_release)
@@ -1381,7 +1385,16 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             self._scheduler.resume_memory_occupation(req)
             self._released_tags.difference_update(tags_to_resume)
         logger.info("resume_memory: tags=%s", tags)
-        if os.environ.get("AREAL_USE_WEFTMOE") == "1":
+        owner = getattr(self._scheduler, "weight_updater", None) or self._scheduler
+        if (
+            tags_to_resume
+            and not self._released_tags
+            and not getattr(owner, "offload_tags", set())
+            and os.environ.get("AREAL_USE_WEFTMOE") == "1"
+            and not getattr(
+                self._scheduler, "_areal_awex_memory_transitions_patched", False
+            )
+        ):
             from weftmoe.sglang import resume
 
             resume(self._scheduler.tp_worker.model_runner)
