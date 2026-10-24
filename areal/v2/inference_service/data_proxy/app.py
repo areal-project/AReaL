@@ -48,6 +48,7 @@ from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.seeding import derive_deterministic_seed
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+from areal.v2.inference_service.data_proxy.generation_gate import GenerationGate
 from areal.v2.inference_service.data_proxy.pause import PauseState
 from areal.v2.inference_service.data_proxy.session import (
     AbortEpisodeRequest,
@@ -469,6 +470,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         logger.info("Data proxy shutting down")
 
     app = FastAPI(title="AReaL Data Proxy", lifespan=lifespan)
+    app.state.generation_gate = GenerationGate()
     _registered_models: dict[str, dict[str, str | None]] = {}
     source_id = uuid.uuid4().hex
 
@@ -505,8 +507,15 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     class GenerationStream:
         """Retain the episode cache until a streaming request closes."""
 
-        def __init__(self, stream: Any, session: SessionData) -> None:
+        def __init__(
+            self,
+            stream: Any,
+            session: SessionData | None,
+            *,
+            release_gate: bool = False,
+        ) -> None:
             self.stream, self.session, self.closed = stream, session, False
+            self.release_gate = release_gate
 
         def __aiter__(self):
             return self
@@ -527,9 +536,12 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 finally:
                     # ArealOpenAI.create() has already awaited the complete
                     # backend response; this iterator only formats that result.
-                    self.session.finish_generation()
+                    if self.session is not None:
+                        self.session.finish_generation()
+                    if self.release_gate:
+                        await app.state.generation_gate.release()
 
-    async def _create_internal_chat_result(
+    async def _create_internal_chat_result_ungated(
         body_json: dict[str, Any],
         session: SessionData | None,
         episode: Any = None,
@@ -606,6 +618,51 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 session.finish_generation()
         return result, is_streaming
 
+    async def _create_internal_chat_result(body_json, session, episode=None):
+        gate = app.state.generation_gate
+        await gate.acquire()
+        streaming = False
+        try:
+            # Resolve the bridge only after admission: queued calls must use the
+            # replacement backend and retain their original session/cache.
+            result, streaming = await _create_internal_chat_result_ungated(
+                body_json, session, episode
+            )
+            if streaming:
+                result = GenerationStream(result, None, release_gate=True)
+            return result, streaming
+        finally:
+            if not streaming:
+                await gate.release()
+
+    @app.post("/reconfiguration/drain")
+    async def drain_generation(request: Request):
+        _require_admin_key(request, app.state.session_store)
+        body = await request.json()
+        try:
+            await app.state.generation_gate.drain(float(body["timeout"]))
+        except TimeoutError as exc:
+            raise HTTPException(
+                409, "Model calls have not drained; admission remains closed"
+            ) from exc
+        return {"status": "drained", "active": 0}
+
+    @app.post("/reconfiguration/pause_state")
+    async def set_local_pause(request: Request):
+        _require_admin_key(request, app.state.session_store)
+        body = await request.json()
+        paused = body.get("paused")
+        if type(paused) is not bool:
+            raise HTTPException(400, "paused must be boolean")
+        await app.state.pause_state.set_paused(paused)
+        return {"status": "ok", "paused": paused}
+
+    @app.post("/reconfiguration/open")
+    async def open_generation(request: Request):
+        _require_admin_key(request, app.state.session_store)
+        await app.state.generation_gate.open()
+        return {"status": "open"}
+
     # =========================================================================
     # Health
     # =========================================================================
@@ -616,7 +673,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         pause_state: PauseState = app.state.pause_state
         return DataProxyHealthResponse(
             status="ok",
-            backend=config.backend_addr,
+            backend=app.state.config.backend_addr,
             sessions=store.session_count,
             paused=await pause_state.is_paused(),
             version=app.state.version,
@@ -1231,37 +1288,38 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         new_addr = body.get("backend_addr")
         if not new_addr:
             raise HTTPException(status_code=400, detail="backend_addr is required")
-        pause_state: PauseState = app.state.pause_state
-        tok: TokenizerProxy = app.state.tokenizer
+        async with app.state.generation_gate.rebind():
+            pause_state: PauseState = app.state.pause_state
+            tok: TokenizerProxy = app.state.tokenizer
 
-        old_inf_bridge: InfBridge | None = app.state.inf_bridge
+            old_inf_bridge: InfBridge | None = app.state.inf_bridge
 
-        # Recreate InfBridge + ArealOpenAI with new backend address
-        new_inf_bridge = _create_inf_bridge(new_addr, pause_state, app.state.config)
-        try:
-            new_areal_client = _create_areal_client(
-                new_inf_bridge, tok, app.state.config
-            )
-        except Exception:
-            await new_inf_bridge.aclose()
-            raise
+            # Recreate InfBridge + ArealOpenAI with new backend address
+            new_inf_bridge = _create_inf_bridge(new_addr, pause_state, app.state.config)
+            new_inf_bridge.set_version(app.state.version)
+            try:
+                new_areal_client = _create_areal_client(
+                    new_inf_bridge, tok, app.state.config
+                )
+            except Exception:
+                await new_inf_bridge.aclose()
+                raise
 
-        # Build updated config copy, then swap all three state fields.
-        # Swap references first so new requests immediately use the new bridge.
-        from dataclasses import replace as _dc_replace
+            # Build updated config copy, then swap all three state fields.
+            # Swap references first so new requests immediately use the new bridge.
+            from dataclasses import replace as _dc_replace
 
-        new_config = _dc_replace(app.state.config, backend_addr=new_addr)
-        app.state.config = new_config
-        app.state.inf_bridge = new_inf_bridge
-        app.state.areal_client = new_areal_client
+            new_config = _dc_replace(app.state.config, backend_addr=new_addr)
+            app.state.config = new_config
+            app.state.inf_bridge = new_inf_bridge
+            app.state.areal_client = new_areal_client
 
-        # Close old InfBridge after the swap so in-flight requests that already
-        # hold a reference to the old bridge can still finish their HTTP calls.
-        if old_inf_bridge is not None:
-            await old_inf_bridge.aclose()
+            # No admitted call can hold the old bridge while this lock is held.
+            if old_inf_bridge is not None:
+                await old_inf_bridge.aclose()
 
-        logger.info("Backend reconfigured to %s", new_addr)
-        return ConfigureBackendResponse(status="ok", backend_addr=new_addr)
+            logger.info("Backend reconfigured to %s", new_addr)
+            return ConfigureBackendResponse(status="ok", backend_addr=new_addr)
 
     # =========================================================================
     # RTensor data storage endpoints

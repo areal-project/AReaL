@@ -60,7 +60,9 @@ def measurement_identity(owner) -> str:
                 "backend": getattr(owner, "actor_backend", config.actor.backend),
                 "world_size": getattr(owner, "actor_world_size", len(owner.gpu_uuids)),
             },
-            "rollout_gpus": list(owner.options.rollout_devices),
+            "rollout_gpus": list(
+                getattr(owner, "rollout_devices", owner.options.rollout_devices)
+            ),
             "cpu_hooks": {
                 name: dataclasses.asdict(getattr(config, name))
                 if dataclasses.is_dataclass(getattr(config, name))

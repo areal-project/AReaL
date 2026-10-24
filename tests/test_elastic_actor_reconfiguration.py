@@ -155,3 +155,136 @@ def test_manual_mailbox_changes_dp_at_completed_update(request):
     assert manager.actor_world_size == 4 and manager.control_snapshot().boundary_ready
     update(manager, 4)
     assert manager.applied_version == 2
+
+
+@pytest.mark.parametrize("native_lifecycle", [(2, 4)], indirect=True)
+def test_resource_layout_roundtrip_preserves_cpu_service_and_progress(request):
+    from unittest.mock import MagicMock
+
+    from areal.elastic.control.resource_reconfiguration import (
+        ResourceLayout,
+        poll_request,
+        submit_request,
+    )
+
+    fixture = request.getfixturevalue("native_lifecycle")
+    manager = fixture.manager
+    events, rollout = fixture.events, fixture.rollout
+    rollout.resource_reconfiguration_enabled = True
+    manager._actor_pool_setter = setter = MagicMock(
+        side_effect=lambda devices: events.append(f"pool-{devices}")
+    )
+    rollout.drain_model_calls = MagicMock(side_effect=lambda: events.append("drain"))
+    rollout.open_model_calls = MagicMock(side_effect=lambda: events.append("open"))
+    rollout.stop_inference_replicas = MagicMock(
+        side_effect=lambda: events.append("stop-rollout")
+    )
+    rollout.rebuild_inference_replicas = MagicMock(
+        side_effect=lambda devices: events.append(f"rollout-{devices}")
+    )
+    update(manager, 0)
+    original_identity = manager.identity
+    source = manager.resource_layout
+    cursor = manager.consumer.cursor.copy()
+    # Legacy Actor receipt becomes read-only when complete layouts take authority.
+    manager.reconfigure_actor(
+        world_size=2,
+        request_id="legacy",
+        expected_generation=0,
+        expected_weights_version=1,
+    )
+    legacy_bytes = (manager.root / "actor-reconfiguration/state.json").read_bytes()
+    events.clear()
+    target = ResourceLayout(1, (0,), (1, 2, 3, 4))
+    submit_request(
+        manager.root,
+        target=target,
+        request_id="more-rollout",
+        expected_generation=0,
+        expected_weights_version=1,
+    )
+    poll_request(manager)
+    first = json.loads(
+        (manager.root / "resource-reconfiguration/response.json").read_text()
+    )["receipt"]
+    assert first["status"] == "applied" and first["generation"] == 1
+    assert manager.resource_layout == target
+    assert manager.actor_world_size == 1 and manager.actor.updates == 1
+    assert manager.consumer.cursor == cursor and manager.rollout is rollout
+    assert (
+        events.index("release")
+        < events.index("stop-rollout")
+        < events.index("pool-[0]")
+    )
+    assert (
+        events.index("rollout-(1, 2, 3, 4)")
+        < events.index("publish-1")
+        < events.index("open")
+    )
+    assert (
+        manager.reconfigure_resources(
+            target=target,
+            request_id="more-rollout",
+            expected_generation=0,
+            expected_weights_version=1,
+        )
+        == first
+    )
+    update(manager, 4)
+    placement = json.loads((manager.latest_path / "actor-layout.json").read_text())
+    assert placement["format_version"] == 2
+    assert placement["reservation"] == [0, 1, 2, 3, 4]
+    assert placement["gpu_pool"] == [0] and placement["rollout_devices"] == [1, 2, 3, 4]
+    assert manager.policy_adapter.profile["inference_gpus"] == 4
+    assert (
+        manager.root / "actor-reconfiguration/state.json"
+    ).read_bytes() == legacy_bytes
+    # Restart selects the authoritative target lease BEFORE the first Actor.
+    manager.close()
+    restored = fixture.create(actor_pool_setter=setter)
+    try:
+        restored.ensure_actor()
+        assert restored.resource_layout == target and restored.actor.updates == 2
+        restored.reconfigure_resources(
+            target=source,
+            request_id="more-actor",
+            expected_generation=1,
+            expected_weights_version=2,
+        )
+        assert restored.resource_layout == source
+        assert restored.actor.restore_plan["target_world_size"] == 2
+        assert restored.identity == original_identity
+        assert restored.consumer.cursor["applied_batches"] == 2
+        update(restored, 8)
+        assert restored.actor.updates == 3
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize("native_lifecycle", [(2, 4)], indirect=True)
+def test_resource_device_movement_same_dp_uses_rank_state(request):
+    from unittest.mock import MagicMock
+
+    from areal.elastic.control.resource_reconfiguration import ResourceLayout
+
+    fixture = request.getfixturevalue("native_lifecycle")
+    manager = fixture.manager
+    fixture.rollout.resource_reconfiguration_enabled = True
+    manager._actor_pool_setter = MagicMock()
+    for method in (
+        "drain_model_calls",
+        "open_model_calls",
+        "stop_inference_replicas",
+        "rebuild_inference_replicas",
+    ):
+        setattr(fixture.rollout, method, MagicMock())
+    update(manager, 0)
+    manager.reconfigure_resources(
+        target=ResourceLayout(2, (3, 4), (0, 1, 2)),
+        request_id="move",
+        expected_generation=0,
+        expected_weights_version=1,
+    )
+    assert manager.actor.restore_plan is None
+    assert manager.actor.updates == manager.applied_version == 1
+    assert manager.gpu_uuids == ["GPU-3", "GPU-4"]

@@ -90,7 +90,9 @@ class PolicyAdapter:
                 "native_execution_id": identity,
                 "native_actor_world_size": world_size,
                 "compatibility": owner.compatibility,
-                "inference_gpus": len(owner.options.rollout_devices),
+                "inference_gpus": len(
+                    getattr(owner, "rollout_devices", owner.options.rollout_devices)
+                ),
                 "measurements": [],
             }
             self.policy = build_policy(
@@ -103,7 +105,7 @@ class PolicyAdapter:
                 or self.profile.get("native_actor_world_size") != world_size
                 or self.profile.get("compatibility") != owner.compatibility
                 or self.profile.get("inference_gpus")
-                != len(owner.options.rollout_devices)
+                != len(getattr(owner, "rollout_devices", owner.options.rollout_devices))
             ):
                 raise ValueError(
                     "Measured profile differs from the native execution identity"

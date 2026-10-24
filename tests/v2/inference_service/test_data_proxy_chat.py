@@ -2406,3 +2406,120 @@ async def test_retained_export_roundtrip_keeps_session_for_next_trajectory(clien
                 headers=admin_headers(),
             )
             assert ack.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_resource_drain_rebind_preserves_session_and_sampling(
+    config, mock_tokenizer, mock_areal_client, monkeypatch
+):
+    import asyncio
+
+    from areal.v2.inference_service.data_proxy import app as proxy_app
+    from areal.v2.inference_service.data_proxy.pause import PauseState
+
+    config.deterministic_sampling = True
+    app = create_app(config)
+    store = SessionStore()
+    store.set_admin_key(config.admin_api_key)
+    session_id, key = store.start_session("retained")
+    session = store.get_session(session_id)
+    app.state.session_store, app.state.config = store, config
+    app.state.tokenizer, app.state.pause_state = mock_tokenizer, PauseState()
+    app.state.version = 7
+    old_bridge = MagicMock(aclose=AsyncMock())
+    app.state.inf_bridge = old_bridge
+    app.state.areal_client = mock_areal_client
+    entered, finish = asyncio.Event(), asyncio.Event()
+    old_create = mock_areal_client.chat.completions.create.side_effect
+
+    async def slow_create(**kwargs):
+        entered.set()
+        await finish.wait()
+        return await old_create(**kwargs)
+
+    mock_areal_client.chat.completions.create.side_effect = slow_create
+    new_client = MagicMock()
+    new_client.chat.completions.create = AsyncMock(side_effect=old_create)
+    new_bridge = MagicMock(aclose=AsyncMock())
+    monkeypatch.setattr(proxy_app, "_create_inf_bridge", lambda *args: new_bridge)
+    monkeypatch.setattr(proxy_app, "_create_areal_client", lambda *args: new_client)
+    body = {"model": "math", "messages": [{"role": "user", "content": "1+1?"}]}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = asyncio.create_task(
+            client.post("/chat/completions", headers=session_headers(key), json=body)
+        )
+        await entered.wait()
+        drain = asyncio.create_task(
+            client.post(
+                "/reconfiguration/drain", headers=admin_headers(), json={"timeout": 5}
+            )
+        )
+        await asyncio.sleep(0)
+        assert app.state.generation_gate.closed and not drain.done()
+        second = asyncio.create_task(
+            client.post("/chat/completions", headers=session_headers(key), json=body)
+        )
+        await asyncio.sleep(0)
+        finish.set()
+        assert (await first).status_code == 200
+        assert (await drain).json() == {"status": "drained", "active": 0}
+        assert not second.done()
+        assert session._next_sampling_request_index == 1
+        response = await client.post(
+            "/configure_backend",
+            headers=admin_headers(),
+            json={"backend_addr": "http://new-backend"},
+        )
+        assert response.status_code == 200
+        new_bridge.set_version.assert_called_once_with(7)
+        old_bridge.aclose.assert_awaited_once()
+        await client.post("/reconfiguration/open", headers=admin_headers())
+        assert (await second).status_code == 200
+    assert store.get_session_by_api_key(key) is session
+    assert session._next_sampling_request_index == 2
+    assert len(session.active_completions) == 2
+    assert mock_areal_client.chat.completions.create.await_count == 1
+    assert new_client.chat.completions.create.await_count == 1
+    assert app.state.generation_gate.active == 0
+
+
+@pytest.mark.asyncio
+async def test_resource_drain_waits_for_admin_stream_completion(config):
+    import asyncio
+
+    app = create_app(config)
+    store = SessionStore()
+    store.set_admin_key(config.admin_api_key)
+    app.state.session_store = store
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def chunks():
+        entered.set()
+        await finish.wait()
+        yield MagicMock(model_dump_json=lambda: '{"choices":[]}')
+
+    app.state.areal_client = MagicMock()
+    app.state.areal_client.chat.completions.create = AsyncMock(return_value=chunks())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        stream = asyncio.create_task(
+            client.post(
+                "/chat/completions",
+                headers=admin_headers(),
+                json={"model": "math", "messages": [], "stream": True},
+            )
+        )
+        await entered.wait()
+        drain = asyncio.create_task(
+            client.post(
+                "/reconfiguration/drain", headers=admin_headers(), json={"timeout": 5}
+            )
+        )
+        await asyncio.sleep(0)
+        assert app.state.generation_gate.active == 1 and not drain.done()
+        finish.set()
+        assert (await stream).status_code == 200
+        assert (await drain).json() == {"status": "drained", "active": 0}

@@ -34,6 +34,13 @@ from areal.elastic.control.processes import (
     resolve_gpu_uuids,
     stop_owned_processes,
 )
+from areal.elastic.control.resource_reconfiguration import (
+    ResourceExecutor,
+    ResourceLayout,
+)
+from areal.elastic.control.resource_reconfiguration import (
+    poll_request as poll_resource_request,
+)
 from areal.elastic.monitor.collector import ElasticMonitor
 from areal.elastic.policy import build_policy
 from areal.elastic.policy.adapter import PolicyAdapter
@@ -174,6 +181,7 @@ class OnDemandActor:
         actor_factory: Callable[[Any], Any],
         *,
         policy_adapter: PolicyAdapter | None = None,
+        actor_pool_setter: Callable[[list[int]], None] | None = None,
     ) -> None:
         validate_unbound_adapter(policy_adapter)
         self.config, self.ft_spec, self.actor_factory = config, ft_spec, actor_factory
@@ -185,6 +193,12 @@ class OnDemandActor:
         self._policy_hooks_bound = False
         self._train_started: float | None = None
         self.options = config.actor_lifecycle
+        self.actor_devices = tuple(self.options.actor_devices)
+        self.rollout_devices = tuple(self.options.rollout_devices)
+        self.resource_reservation = self.actor_devices + self.rollout_devices
+        self._actor_pool_setter = actor_pool_setter
+        self.resource_config_application = None
+        self._resource_transition_incomplete = False
         build_policy(self.options.policy, idle_timeout=self.options.idle_timeout)
         self.checkpoint_frequency = EpochStepTimeFreqCtl(
             freq_epoch=config.recover.freq_epochs,
@@ -279,7 +293,7 @@ class OnDemandActor:
                     raise RuntimeError(
                         "Previous coordinator left an unconfirmed Actor generation; preserve its journal for cleanup"
                     )
-            self.gpu_uuids = resolve_gpu_uuids(list(self.options.actor_devices))
+            self.gpu_uuids = resolve_gpu_uuids(list(self.actor_devices))
             rollout_gpus = resolve_gpu_uuids(list(self.options.rollout_devices))
             present = gpu_processes()
             if any(present.get(gpu) for gpu in self.gpu_uuids + rollout_gpus):
@@ -288,7 +302,19 @@ class OnDemandActor:
                 ActorDPExecutor(self), self.root / "actor-reconfiguration"
             )
             journal = self.root / "actor-reconfiguration" / "state.json"
-            if journal.exists():
+            resource_journal = self.root / "resource-reconfiguration" / "state.json"
+            if resource_journal.exists():
+                self.resource_config_application = ConfigApplication(
+                    ResourceExecutor(self), resource_journal.parent
+                )
+                state = self.resource_config_application.state()
+                layout = (
+                    state["config"]
+                    if state["pending"] is None
+                    else state["pending"]["source"]["config"]
+                )
+                self._set_resource_layout(ResourceLayout.decode(layout))
+            elif journal.exists():
                 state = self.actor_config_application.state()
                 layout = (
                     state["config"]
@@ -367,6 +393,7 @@ class OnDemandActor:
                 and ready
                 and self.active is None
                 and not self._publication_uncertain
+                and not self._resource_transition_incomplete
                 and published == self.applied_version,
                 self.generation,
                 self.applied_version,
@@ -412,10 +439,7 @@ class OnDemandActor:
             raise ValueError(
                 "Actor reconfiguration currently supports pure FSDP DP only"
             )
-        if (
-            world_size > len(self.options.actor_devices)
-            or self.inbox.batch_size % world_size
-        ):
+        if world_size > len(self.actor_devices) or self.inbox.batch_size % world_size:
             raise ValueError(
                 "Actor DP size must fit the reserved pool and divide the effective batch"
             )
@@ -452,6 +476,15 @@ class OnDemandActor:
             expected_weights_version,
             "manual",
         )
+        if self.resource_config_application is not None:
+            old = self.actor_config_application.state()["receipts"].get(request_id)
+            if old is not None and old["request"] == json.loads(
+                json.dumps(dataclasses.asdict(request))
+            ):
+                return old
+            raise ValueError(
+                "The resource journal is authoritative; submit a complete resource layout"
+            )
         application = self.actor_config_application
         application.preflight(request)
         if request_id in application.state()["receipts"]:
@@ -501,6 +534,158 @@ class OnDemandActor:
         self._checkpoint_dirty = True
         self._event("RECONFIGURED", serving_versions=self.rollout.serving_versions())
 
+    @property
+    def supports_resource_reconfiguration(self) -> bool:
+        from areal.api.alloc_mode import ModelAllocation
+
+        actor = ModelAllocation.from_str(self.config.actor.backend)
+        rollout = ModelAllocation.from_str(self.config.rollout.backend)
+        return (
+            actor.backend == "fsdp"
+            and all(
+                getattr(actor.parallel, key) == 1
+                for key in ("tp_size", "pp_size", "cp_size", "ep_size", "etp_size")
+            )
+            and rollout.backend == "sglang"
+            and rollout.parallel.tp_size == rollout.parallel.pp_size == 1
+        )
+
+    @property
+    def resource_layout(self) -> ResourceLayout:
+        # Actor devices denote an exclusive lease, which may reserve headroom.
+        return ResourceLayout(
+            self.actor_world_size, self.actor_devices, self.rollout_devices
+        )
+
+    def validate_resource_layout(self, target: ResourceLayout) -> None:
+        if (
+            not self.supports_resource_reconfiguration
+            or not self.policy_adapter.supports_actor_dp_resize
+        ):
+            raise ValueError(
+                "Resource changes require pure FSDP DP, SGLang TP1/PP1 and the default timeout adapter"
+            )
+        if (
+            self.rollout is not None
+            and not self.rollout.resource_reconfiguration_enabled
+        ):
+            raise ValueError(
+                "Enable resource reconfiguration before initializing Rollout"
+            )
+        if self._actor_pool_setter is None:
+            raise ValueError("Resource changes require a local Actor pool setter")
+        if not set(target.actor_devices + target.rollout_devices) <= set(
+            self.resource_reservation
+        ):
+            raise ValueError("Resource target exceeds the original job reservation")
+        if self.inbox.batch_size % target.world_size:
+            raise ValueError("Actor DP count must divide the effective training batch")
+
+    def _set_resource_layout(self, target: ResourceLayout) -> None:
+        self.validate_resource_layout(target)
+        self._actor_pool_setter(list(target.actor_devices))
+        self.actor_devices, self.rollout_devices = (
+            target.actor_devices,
+            target.rollout_devices,
+        )
+        self.gpu_uuids = resolve_gpu_uuids(list(self.actor_devices))
+        self._set_actor_dp(target.world_size)
+
+    def _resource_application(self):
+        if self.resource_config_application is None:
+            # One-way handoff of authority. The old Actor journal and receipts
+            # remain immutable; generation is inherited, not reset to zero.
+            legacy = self.actor_config_application.state()
+            if legacy["pending"] is not None:
+                raise RuntimeError(
+                    "Recover the pending Actor request before transferring authority"
+                )
+            application = ConfigApplication(
+                ResourceExecutor(self), self.root / "resource-reconfiguration"
+            )
+            atomic_json(
+                application.root / "state.json",
+                {
+                    "format_version": 1,
+                    "context_id": application.executor.context_id,
+                    "generation": legacy["generation"],
+                    "config": dataclasses.asdict(self.resource_layout),
+                    "pending": None,
+                    "receipts": {},
+                    "legacy_receipts": legacy["receipts"],
+                },
+            )
+            self.resource_config_application = application
+        return self.resource_config_application
+
+    @_serialized
+    def reconfigure_resources(
+        self,
+        *,
+        target: ResourceLayout,
+        request_id: str,
+        expected_generation: int,
+        expected_weights_version: int,
+    ):
+        request = ConfigRequest(
+            request_id, target, expected_generation, expected_weights_version, "manual"
+        )
+        self.validate_resource_layout(target)
+        if not self.control_snapshot().boundary_ready:
+            raise ControlBusy("Resource changes require a completed, published update")
+        if self.applied_version < 1:
+            raise ValueError("Resource changes require a completed training update")
+        if self.resource_config_application is None:
+            legacy = self.actor_config_application.state()
+            if (
+                expected_generation != legacy["generation"]
+                or expected_weights_version != self.applied_version
+            ):
+                raise ValueError("Stale config generation or training weight version")
+        application = self._resource_application()
+        if request_id in application.state().get("legacy_receipts", {}):
+            raise ValueError("Request ID belongs to the immutable legacy Actor journal")
+        application.preflight(request)
+        if request_id in application.state()["receipts"]:
+            return application.apply(request)
+        if target != self.resource_layout:
+            self.save_checkpoint(reason="resource-reconfigure")
+            if self.checkpoint_version != self.applied_version:
+                raise RuntimeError("Resource source checkpoint is not current")
+        # The durable intent precedes closing ANY model-call gate. A partial
+        # drain therefore rolls back/reopens through the same transaction.
+        receipt = application.apply(request)
+        if not self.control_snapshot().boundary_ready:
+            raise RuntimeError("Resource transaction left an incomplete boundary")
+        self.rollout.continue_generation()
+        self.inbox.set_admission_open(True)
+        self.rollout.open_model_calls()
+        return receipt
+
+    def _switch_resources(self, target: ResourceLayout) -> None:
+        self.validate_resource_layout(target)
+        if target == self.resource_layout and self.control_snapshot().boundary_ready:
+            return
+        if self.active is not None or self.checkpoint_version != self.applied_version:
+            raise RuntimeError("Resource changes require the saved completed update")
+        self.rollout.drain_model_calls()
+        # An admitted call can still acquire its episode lease while draining.
+        self.inbox.set_admission_open(False)
+        self._resource_transition_incomplete = True
+        self._event("RECONFIGURING", resource_target=dataclasses.asdict(target))
+        # AWEX must disconnect while its old inference peers still exist.
+        self._release()
+        self.rollout.stop_inference_replicas()
+        self._set_resource_layout(target)
+        self.rollout.rebuild_inference_replicas(target.rollout_devices)
+        self.monitor = ElasticMonitor(self)
+        self.policy_adapter.rebind_actor_layout(self)
+        self.ensure_actor()
+        self._publish()
+        self._resource_transition_incomplete = False
+        self._checkpoint_dirty = True
+        self._event("RECONFIGURED", serving_versions=self.rollout.serving_versions())
+
     def _read_latest(self) -> dict[str, Any] | None:
         if not (self.store.root / "latest.json").exists():
             self.latest_path, self.latest_manifest = None, None
@@ -513,9 +698,20 @@ class OnDemandActor:
 
             if layout_path.exists():
                 layout = json.loads(layout_path.read_text())
-                if layout["world_size"] != self.latest_manifest["world_size"] or layout[
-                    "gpu_pool"
-                ] != list(self.options.actor_devices):
+                placement_valid = (
+                    layout.get("reservation") == list(self.resource_reservation)
+                    and set(layout["gpu_pool"]) <= set(self.resource_reservation)
+                    and set(layout.get("rollout_devices", ()))
+                    <= set(self.resource_reservation)
+                    and not set(layout["gpu_pool"])
+                    & set(layout.get("rollout_devices", ()))
+                    if layout.get("format_version") == 2
+                    else layout["gpu_pool"] == list(self.options.actor_devices)
+                )
+                if (
+                    layout["world_size"] != self.latest_manifest["world_size"]
+                    or not placement_valid
+                ):
                     raise ValueError(
                         "Checkpoint Actor layout disagrees with its manifest/reservation"
                     )
@@ -541,7 +737,8 @@ class OnDemandActor:
             "owner": self.owner,
             "actor_world_size": self.actor_world_size,
             "actor_backend": self.actor_backend,
-            "actor_gpu_pool": list(self.options.actor_devices),
+            "actor_gpu_pool": list(self.actor_devices),
+            "rollout_gpu_pool": list(self.rollout_devices),
             **details,
         }
         with (self.root / "events.jsonl").open("a") as stream:
@@ -584,9 +781,14 @@ class OnDemandActor:
             rollout.continue_generation()
         self.policy_adapter.bind(self)
         self._policy_hooks_bound = self.policy_hooks is not None
-        if (self.root / "actor-reconfiguration" / "state.json").exists():
+        if self.resource_config_application is not None:
+            self.resource_config_application.recover()
+            rollout.continue_generation()
+        elif (self.root / "actor-reconfiguration" / "state.json").exists():
             self.actor_config_application.recover()
         self.inbox.set_admission_open(True)
+        if self.resource_config_application is not None:
+            rollout.open_model_calls()
 
     def _restore_checkpoint_frequency(self) -> None:
         path = (
@@ -692,6 +894,7 @@ class OnDemandActor:
         if self.active is not None:
             raise RuntimeError("The previous native PPO update is still active")
         poll_request(self)
+        poll_resource_request(self)
         if self._policy_hooks_bound:
             self.policy_hooks.poll()
         if self.inbox.status()["published_version"] != self.applied_version:
@@ -808,7 +1011,10 @@ class OnDemandActor:
                 {
                     "backend": self.actor_backend,
                     "world_size": self.actor_world_size,
-                    "gpu_pool": list(self.options.actor_devices),
+                    "format_version": 2,
+                    "gpu_pool": list(self.actor_devices),
+                    "rollout_devices": list(self.rollout_devices),
+                    "reservation": list(self.resource_reservation),
                 },
             )
             atomic_json(path / "coordinator.json", self._capture_cpu())
@@ -1009,15 +1215,28 @@ class OnDemandActor:
             )
         else:
             self._restore_cpu(deepcopy(self._initial_cpu_state))
-        journal = self.root / "actor-reconfiguration" / "state.json"
+        application = self.resource_config_application or self.actor_config_application
+        journal = application.root / "state.json"
         if journal.exists():
-            state = self.actor_config_application.state()
+            state = application.state()
             layout = (
                 state["config"]
                 if state["pending"] is None
                 else state["pending"]["source"]["config"]
             )
-            if layout["world_size"] != self.actor_world_size:
+            if self.resource_config_application is not None:
+                target = ResourceLayout.decode(layout)
+                if (
+                    target != self.resource_layout
+                    or self._resource_transition_incomplete
+                ):
+                    self.rollout.drain_model_calls()
+                    self.rollout.stop_inference_replicas()
+                    self._set_resource_layout(target)
+                    self.rollout.rebuild_inference_replicas(target.rollout_devices)
+                self.monitor = ElasticMonitor(self)
+                self.policy_adapter.rebind_actor_layout(self)
+            elif layout["world_size"] != self.actor_world_size:
                 self._set_actor_dp(layout["world_size"])
                 self.monitor = ElasticMonitor(self)
                 self.policy_adapter.rebind_actor_layout(self)
@@ -1033,12 +1252,15 @@ class OnDemandActor:
         # require publication acknowledgment before reopening generation.
         self.ensure_actor()
         self._publish()
+        self._resource_transition_incomplete = False
         self.rollout.continue_generation()
         self.rollout.resume()
         self.monitor.complete_update()
         if journal.exists():
-            self.actor_config_application.recover()
+            application.recover()
         self.inbox.set_admission_open(True)
+        if self.resource_config_application is not None:
+            self.rollout.open_model_calls()
 
     @_serialized
     def close(self) -> None:

@@ -193,6 +193,21 @@ class LocalScheduler(Scheduler):
     def n_gpus_per_node(self) -> int:
         return len(self.gpu_devices)
 
+    def set_gpu_pool(self, devices: list[int]) -> None:
+        """Reassign a local lease only after every previous worker was removed."""
+        if self._workers or self._colocated_roles:
+            raise RuntimeError("Remove all workers before changing the GPU pool")
+        if (
+            not devices
+            or len(set(devices)) != len(devices)
+            or any(type(device) is not int or device < 0 for device in devices)
+        ):
+            raise ValueError(
+                "GPU pool must contain distinct nonnegative device indices"
+            )
+        self.gpu_devices = list(devices)
+        self._gpu_counter = 0
+
     def _detect_gpus(self) -> list[int]:
         cuda_visible = os.environ.get(current_platform.device_control_env_var)
         if current_platform.device_control_env_var and cuda_visible:

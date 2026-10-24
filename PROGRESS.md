@@ -10,15 +10,17 @@
 
 **本轮 reconfig**
 
-- 已实现显式纯FSDP Actor
-  DP切换：保存完整源状态→重建Actor→DCP恢复→重新连接并发布；Rollout布局与GPU预留池保持固定。原始训练身份、PPO步数和任务消费游标不变。
-- 跨DP使用显式恢复计划及确定性RNG派生；同布局仍严格恢复。持久事务在首次创建Actor前选择活动布局；每个布局重新建立测量身份，暂不接实测profile／revision自动决策。
-- 19项正常路径检查通过、2项CUDA检查因无GPU跳过；其中CPU协调器覆盖切换／重启／命令入口，PyTorch2.9.1真实Gloo／DTensor／DCP完成2→4→2，参数、Adam状态、学习率及后续更新核对通过。[本地证据](../artifacts/elastic-reconfig-20261024/)。
-- 尚未使用GPU；真实FSDP2／NCCL、Actor→SGLang发布及继续训练待验收，未执行故障注入。[范围与操作](areal/elastic/RECONFIGURATION.md)。
+- Actor DP实现见`7e0c7bea`。第三阶段实现：显式启用后，可受控重建Rollout副本并在原Actor／Rollout
+  GPU并集内重新分配卡；CPU服务、session、轨迹与采样序号保留，切换清空KV cache。
+- 统一资源事务继承旧generation，旧Actor
+  journal只读；先保存／排空，再断开AWEX、确认GPU进程释放、重建两侧、发布原版本，提交后恢复准入。训练身份、PPO步数和消费游标不变。[范围与操作](areal/elastic/RECONFIGURATION.md)。
+- 第三阶段18项CPU正常路径及接口兼容性检查通过；GPU／guard使用替身，不能证明真实资源释放。此前PyTorch2.9.1真实Gloo／DTensor／DCP的2→4→2已核对参数、Adam、LR及后续更新。[证据](../artifacts/elastic-reconfig-20261024/stage3-validation.json)。
+- 尚无GPU；真实FSDP2／NCCL、SGLang重建、AWEX发布及继续训练待验收。本轮未执行故障注入；实测profile／revision自动决策及热保留部分引擎尚未接入。
 
 **共享基线与下一步**
 
-1. GPU空闲后，先验收reconfig的2→4→2完整闭环；再推进Rollout副本增删及两侧GPU重新分配。Megatron／TP／CP／PP／EP切换、完整在线Reference策略仍待实现。
+1. GPU空闲后，验收Actor DP
+   2→4→2、Rollout副本4→2→4及两侧GPU转移的完整训练闭环。Megatron／TP／CP／PP／EP切换、完整在线Reference策略仍待实现。
 1. `elastic`线继续验证prefill／decode batch采集的GPU兼容性与开销、trace消费／batch关联和Expert的1.7B dense适配。
 1. 1.7B正式5轮／batch40／125更新原运行第4次更新反传OOM，仅3次更新、998题正常和2题服务错误，无checkpoint，进程已清理；正式重跑未启动。须覆盖原失败规模与64K完整前后向；`n_mbs=10`及分配器配置尚非已验证修复。
 1. 公司端接通Envarena后验收工具执行、stdout／stderr分流、清理及评分，再做16题评测与4更新训练；SWE先验证参考补丁。[2×2步骤](examples/task_workflows/RUN_2X2_8GPU.md)／[原Singularity方式](examples/task_workflows/RUN_SLURM_SINGULARITY.md)。

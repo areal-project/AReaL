@@ -207,7 +207,7 @@ checkpoint、队列、在线 inbox 与进程所有权移入 `areal/elastic/state
 - AReaL 的 `PolicyAdapter` 统一接默认超时／实测 Basic；AutoPilot 的 `RevisionAdapter` 接修订和独立验收后的
   bundle；默认 Monitor 统一提供观测、历史和测量恢复，旧串行 bundle 拒绝部署到原生 scope。
 - `ConfigApplication` 保留 CAS、持久意图／回执和恢复；原生 executor 只接受相同固定布局，独立拓扑调整待实现。
-- 2026-10-24：Runtime新增[显式纯FSDP Actor DP切换](../../areal/elastic/RECONFIGURATION.md)，CPU协调器与真实DCP的2→4→2已验证；GPU闭环待验收。上述AutoPilot
+- 2026-10-24：Runtime新增[显式纯FSDP Actor DP及资源切换](../../areal/elastic/RECONFIGURATION.md)，支持受控重建Rollout副本与并集内GPU转移；CPU正常路径已验证，GPU闭环待验收。上述AutoPilot
   executor仍保持固定布局。
 - `RuntimeRevisionLoop` 使用显式 host 协议；按完整 update 划分校准／验收并保留预算。原生首轮限定
   horizon=1、固定布局，阶段误差验收不代表异步完成时间或收益。

@@ -171,6 +171,7 @@ class RolloutControllerV2:
         # Track services forked directly via RPCGuard /fork (raw_cmd mode).
         # Each entry: (guard_addr, role, worker_index) for /kill_forked_worker.
         self._forked_services: list[tuple[str, str, int]] = []
+        self._managed_replicas = None
 
         # Shared HTTP clients
         self._sync_client = httpx.Client(timeout=30.0)
@@ -362,6 +363,15 @@ class RolloutControllerV2:
 
             inf_spec.cmd = "python -m areal.v2.inference_service.guard"
 
+        if self._managed_replicas is not None:
+            total_workers = len(self._managed_replicas.reservation)
+            inf_spec.gpu = 0
+            inf_spec.env_vars = {
+                **inf_spec.env_vars,
+                "CUDA_VISIBLE_DEVICES": "",
+                "AREAL_ELASTIC_PROCESS_OWNER": "",
+            }
+
         inf_role = f"{self._worker_role}{self._INF_SUFFIX}"
         inf_job = Job(
             replicas=total_workers,
@@ -414,7 +424,10 @@ class RolloutControllerV2:
             )
         )
 
-        if self.external_mode:
+        if self._managed_replicas is not None:
+            self._managed_replicas.server_args = dict(server_args or {})
+            await self._managed_replicas.launch(self._managed_replicas.devices)
+        elif self.external_mode:
             logger.info("External mode — skipping inference server launch")
         elif server_infos is not None:
             self._server_infos = server_infos
@@ -510,7 +523,7 @@ class RolloutControllerV2:
             else:
                 dp_cmd = data_proxy_base_cmd + [
                     "--backend-addr",
-                    self._inf_addrs[group_idx],
+                    self._inf_addrs[group_idx % len(self._inf_addrs)],
                     "--backend-type",
                     inf_backend or "sglang",
                 ]
@@ -545,7 +558,12 @@ class RolloutControllerV2:
             )
         )
         dp_results = await asyncio.gather(
-            *[_fork_data_proxy(i) for i in range(dp_size)]
+            *[
+                _fork_data_proxy(i)
+                for i in range(
+                    total_workers if self._managed_replicas is not None else dp_size
+                )
+            ]
         )
 
         # Track data-proxies in group order, then gateway — deterministic cleanup.
@@ -1035,6 +1053,99 @@ class RolloutControllerV2:
             "trajectory_id": int(trajectory_id),
         }
 
+    @property
+    def resource_reconfiguration_enabled(self) -> bool:
+        return self._managed_replicas is not None
+
+    def configure_resource_pool(self, reservation, devices, state_root) -> None:
+        """Keep guards/proxies CPU-owned while rebuilding local TP1 replicas."""
+        from areal.infra.scheduler.local import LocalScheduler
+
+        from .replicas import ManagedReplicas
+
+        if self._worker_role or not isinstance(self.scheduler, LocalScheduler):
+            raise ValueError(
+                "Resource reconfiguration requires an uninitialized local controller"
+            )
+        alloc = self.rollout_alloc
+        if (
+            self.external_mode
+            or alloc.backend != "sglang"
+            or alloc.parallel.tp_size != 1
+            or alloc.parallel.pp_size != 1
+        ):
+            raise ValueError("Managed replicas require local SGLang TP1/PP1")
+        self._managed_replicas = ManagedReplicas(self, reservation, devices, state_root)
+
+    def drain_model_calls(self) -> None:
+        self._ensure_initialized()
+        self.pause()
+        from areal.infra.utils.concurrent import run_async_task
+
+        async def drain_all():
+            client = await self._get_async_client()
+
+            async def drain(address):
+                response = await client.post(
+                    f"{address}/reconfiguration/drain",
+                    json={"timeout": self.config.request_timeout},
+                    headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+                    timeout=self.config.request_timeout + 10,
+                )
+                response.raise_for_status()
+                if response.json() != {"status": "drained", "active": 0}:
+                    raise RuntimeError("Data proxy did not confirm model-call drain")
+
+            results = await asyncio.gather(
+                *[drain(address) for address in self._data_proxy_addrs],
+                return_exceptions=True,
+            )
+            errors = [result for result in results if isinstance(result, Exception)]
+            if errors:
+                raise ExceptionGroup("Model-call drain incomplete", errors)
+
+        run_async_task(drain_all)
+
+    def open_model_calls(self) -> None:
+        for address in self._data_proxy_addrs:
+            response = self._sync_client.post(
+                f"{address}/reconfiguration/open",
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
+            response.raise_for_status()
+            if response.json() != {"status": "open"}:
+                raise RuntimeError(
+                    "Data proxy did not acknowledge model-call admission"
+                )
+        self.resume()
+
+    def stop_inference_replicas(self) -> None:
+        if self._managed_replicas is None:
+            raise RuntimeError("Rollout was not initialized with a resource pool")
+        self._managed_replicas.stop()
+
+    def rebuild_inference_replicas(self, devices) -> None:
+        from areal.infra.utils.concurrent import run_async_task
+
+        if self._managed_replicas is None:
+            raise RuntimeError("Rollout was not initialized with a resource pool")
+        run_async_task(self._managed_replicas.launch, tuple(devices))
+        # Preserve every session store and router assignment; only replace bridges.
+        for index, address in enumerate(self._data_proxy_addrs):
+            response = self._sync_client.post(
+                f"{address}/configure_backend",
+                json={"backend_addr": self._inf_addrs[index % len(self._inf_addrs)]},
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
+            response.raise_for_status()
+            if (
+                response.json().get("backend_addr")
+                != self._inf_addrs[index % len(self._inf_addrs)]
+            ):
+                raise RuntimeError(
+                    "Data proxy did not acknowledge its replacement backend"
+                )
+
     def configure_online_training(
         self,
         inbox: OnlineInbox,
@@ -1123,6 +1234,8 @@ class RolloutControllerV2:
         """Tear down all services and release resources."""
         if self._destroyed:
             return
+        if self._managed_replicas is not None:
+            self._managed_replicas.stop()
         self._destroyed = True
 
         self._shutdown_requested.set()
@@ -1652,6 +1765,9 @@ class RolloutControllerV2:
         run_async_task(self._async_pause_generation)
 
     async def _async_pause_generation(self) -> None:
+        if self._managed_replicas is not None:
+            await self._async_managed_pause(True)
+            return
         if not self._data_proxy_addrs:
             return
         results = await asyncio.gather(
@@ -1675,6 +1791,9 @@ class RolloutControllerV2:
         run_async_task(self._async_continue_generation)
 
     async def _async_continue_generation(self) -> None:
+        if self._managed_replicas is not None:
+            await self._async_managed_pause(False)
+            return
         if not self._data_proxy_addrs:
             return
         results = await asyncio.gather(
@@ -1691,6 +1810,42 @@ class RolloutControllerV2:
             raise RuntimeError(
                 f"continue_generation failed on ALL {len(failed)} workers"
             )
+
+    async def _async_managed_pause(self, paused: bool) -> None:
+        client = await self._get_async_client()
+
+        async def post(address, endpoint):
+            response = await client.post(
+                f"{address}{endpoint}",
+                json={"paused": paused},
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
+            response.raise_for_status()
+            if response.json() != {"status": "ok", "paused": paused}:
+                raise RuntimeError(
+                    "Every proxy/engine must acknowledge generation control"
+                )
+
+        async def local_state():
+            await asyncio.gather(
+                *[
+                    post(address, "/reconfiguration/pause_state")
+                    for address in self._data_proxy_addrs
+                ]
+            )
+
+        # Pause all bridges before aborting a backend; resume each unique engine
+        # before releasing its proxy waiters. Require EVERY acknowledgment.
+        if paused:
+            await local_state()
+        await asyncio.gather(
+            *[
+                post(address, "/pause_generation" if paused else "/continue_generation")
+                for address in self._data_proxy_addrs[: len(self._inf_addrs)]
+            ]
+        )
+        if not paused:
+            await local_state()
 
     # -- Stats -------------------------------------------------------------
 
@@ -1721,6 +1876,11 @@ class RolloutControllerV2:
     @property
     def inference_guard_addrs(self) -> list[str]:
         self._ensure_initialized()
+        if self._managed_replicas is not None:
+            return [
+                self._managed_replicas.guard(device)
+                for device in self._managed_replicas.devices
+            ]
         return [
             f"http://{format_hostport(w.ip, int(w.worker_ports[0]))}"
             for w in self.workers

@@ -357,6 +357,7 @@ class PPOTrainer:
                     scheduler=self.scheduler,
                 ),
                 policy_adapter=self._elastic_policy,
+                actor_pool_setter=self.scheduler.set_gpu_pool,
             )
         else:
             self.actor.initialize(**engine_init_kwargs, role="actor")
@@ -1416,6 +1417,15 @@ class PPOTrainer:
                 config=config, scheduler=cast(Scheduler, self.rollout_scheduler)
             )
             if self._on_demand is not None:
+                if self._on_demand.supports_resource_reconfiguration and (
+                    os.environ.get("AREAL_ELASTIC_RESOURCE_RECONFIGURATION") == "1"
+                    or self._on_demand.resource_config_application is not None
+                ):
+                    controller.configure_resource_pool(
+                        self._on_demand.resource_reservation,
+                        self._on_demand.rollout_devices,
+                        self._on_demand.root,
+                    )
                 controller.configure_online_training(
                     self._on_demand.inbox,
                     discount=self.config.rollout.agent.turn_discount,

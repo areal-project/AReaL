@@ -359,6 +359,7 @@ def native_lifecycle(tmp_path, monkeypatch, request):
     config.actor.path = str(base)
     initial_dp, pool_size = getattr(request, "param", (1, 1))
     config.actor.backend = f"fsdp:d{initial_dp}"
+    config.rollout.backend = "sglang:d1"
     config.train_dataset.batch_size = config.rollout.consumer_batch_size = 4
     config.rollout.max_head_offpolicyness = 2
     config.recover.mode = "on"
@@ -468,9 +469,13 @@ def native_lifecycle(tmp_path, monkeypatch, request):
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=48, train_batch_size=4)
     coordinator = {"step": 0}
 
-    def create(policy_adapter=None):
+    def create(policy_adapter=None, actor_pool_setter=None):
         manager = on_demand.OnDemandActor(
-            config, ft_spec, Actor, policy_adapter=policy_adapter
+            config,
+            ft_spec,
+            Actor,
+            policy_adapter=policy_adapter,
+            actor_pool_setter=actor_pool_setter,
         )
         try:
             manager.bind(

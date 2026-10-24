@@ -1211,3 +1211,147 @@ def test_failed_version_publication_does_not_advance_local_capacity():
     with pytest.raises(RuntimeError, match="partial publication"):
         controller.set_version(4)
     assert controller.get_version() == 3
+
+
+@pytest.mark.asyncio
+async def test_managed_replicas_rebuild_keeps_cpu_plane(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from areal.api.cli_args import SchedulingSpec
+    from areal.elastic.control.processes import OWNER_ENV
+    from areal.infra.scheduler.local import LocalScheduler
+    from areal.v2.inference_service.controller import replicas
+
+    scheduler = object.__new__(LocalScheduler)
+    scheduler.gpu_devices, scheduler._gpu_counter = [4, 5, 6, 7], 3
+    scheduler._workers, scheduler._colocated_roles = {}, {}
+    scheduler.create_workers = MagicMock()
+    scheduler.get_workers = MagicMock(
+        return_value=[
+            SimpleNamespace(id=f"cpu-{i}", ip="127.0.0.1", worker_ports=[18000 + i])
+            for i in range(8)
+        ]
+    )
+    scheduler.set_gpu_pool([1, 0])
+    assert scheduler._allocate_gpus(1) == [1]
+    assert scheduler._allocate_gpus(1) == [0]
+    cfg = InferenceEngineConfig(
+        backend="sglang:d4", scheduling_spec=(SchedulingSpec(gpu=1, cpu=1, mem=1),)
+    )
+    controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
+    controller.configure_resource_pool(tuple(range(8)), (4, 5, 6, 7), tmp_path)
+    controller._worker_role = "rollout"
+    controller._callback_host, controller._callback_port = "127.0.0.1", 19000
+    controller._ensure_initialized = MagicMock()
+    controller._workflow_executor = MagicMock()
+    controller._async_wait_for_service = AsyncMock()
+    forks, bindings, messages = [], [], []
+    port = 30000
+
+    def handler(request):
+        nonlocal port
+        body = json.loads(request.content or b"{}")
+        messages.append((request.url.path, body))
+        data = {"status": "ok"}
+        if request.url.path == "/alloc_ports":
+            port += 1
+            data = {"host": "127.0.0.1", "ports": [port]}
+        elif request.url.path == "/fork":
+            forks.append(body)
+        elif request.url.path == "/configure_backend":
+            bindings.append(body["backend_addr"])
+            data = {"status": "ok", "backend_addr": body["backend_addr"]}
+        elif request.url.path == "/reconfiguration/open":
+            data = {"status": "open"}
+        elif request.url.path == "/reconfiguration/drain":
+            data = {"status": "drained", "active": 0}
+        elif request.url.path in (
+            "/reconfiguration/pause_state",
+            "/pause_generation",
+            "/continue_generation",
+        ):
+            data = {"status": "ok", "paused": body["paused"]}
+        return httpx.Response(200, json=data)
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    sync_client = httpx.Client(transport=httpx.MockTransport(handler))
+    controller._get_async_client = AsyncMock(return_value=async_client)
+    controller._sync_client.close()
+    controller._sync_client = sync_client
+    cpu_calls = []
+
+    async def fork_cpu(**kwargs):
+        cpu_calls.append(kwargs)
+        return "127.0.0.1", 20000 + len(cpu_calls)
+
+    controller._async_fork_on_guard = AsyncMock(side_effect=fork_cpu)
+    monkeypatch.setattr(replicas, "gpu_processes", lambda: {})
+    monkeypatch.setattr(
+        replicas,
+        "resolve_gpu_uuids",
+        lambda devices: [str(device) for device in devices],
+    )
+    monkeypatch.setattr(replicas, "stop_owned_processes", lambda owner: None)
+    monkeypatch.setattr(replicas, "owned_processes", lambda owner: [])
+    try:
+        await controller._async_initialize(
+            server_args={
+                "model_path": "/protocol-model",
+                "tp_size": 1,
+                "base_gpu_id": 0,
+            }
+        )
+        job = scheduler.create_workers.call_args.kwargs["job"]
+        assert job.replicas == 8
+        assert all(
+            spec.gpu == 0
+            and spec.env_vars["CUDA_VISIBLE_DEVICES"] == ""
+            and spec.env_vars[OWNER_ENV] == ""
+            for spec in job.tasks
+        )
+        assert [f["env"]["CUDA_VISIBLE_DEVICES"] for f in forks] == ["4", "5", "6", "7"]
+        proxies = list(controller._data_proxy_addrs)
+        gateway, router, guards = (
+            controller._gateway_addr,
+            controller._router_addr,
+            list(controller.workers),
+        )
+        assert len(proxies) == 8
+        for devices in ((6, 7), (4, 5, 6, 7)):
+            controller.drain_model_calls()
+            controller.stop_inference_replicas()
+            controller.rebuild_inference_replicas(devices)
+            controls_start = len(messages)
+            controller.pause_generation()
+            controller.continue_generation()
+            controls = messages[controls_start:]
+            assert sum(path == "/pause_generation" for path, _ in controls) == len(
+                devices
+            )
+            assert sum(path == "/continue_generation" for path, _ in controls) == len(
+                devices
+            )
+            assert (
+                sum(path == "/reconfiguration/pause_state" for path, _ in controls)
+                == 16
+            )
+            assert bindings[-8:] == [
+                controller._inf_addrs[index % len(devices)] for index in range(8)
+            ]
+            controller.open_model_calls()
+            assert len(controller.inference_worker_urls) == len(devices)
+            assert controller.inference_guard_addrs == [
+                controller._managed_replicas.guard(device) for device in devices
+            ]
+        assert controller._data_proxy_addrs == proxies and controller.workers == guards
+        assert (controller._gateway_addr, controller._router_addr) == (gateway, router)
+        assert len(cpu_calls) == 10 and scheduler.create_workers.call_count == 1
+        assert len({f["env"][OWNER_ENV] for f in forks}) == 10
+        controller.stop_inference_replicas()
+        assert (
+            json.loads((tmp_path / "rollout-owners.json").read_text())["records"] == []
+        )
+    finally:
+        await async_client.aclose()
+        sync_client.close()
