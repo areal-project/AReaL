@@ -36,6 +36,7 @@ class PolicyAdapter:
     hooks: PolicyHooks | None = None
 
     def __init__(self, *, profile=None, settings=None):
+        self._provided_profile = profile is not None
         self.profile = None if profile is None else json.loads(json.dumps(profile))
         self.settings = dataclasses.asdict(
             BasicOptimizer(**dict(settings or {"horizon": 1}))
@@ -47,12 +48,27 @@ class PolicyAdapter:
         self.execution_id: str | None = None
         self.closed = False
 
+    @property
+    def supports_actor_dp_resize(self) -> bool:
+        return type(self) is PolicyAdapter and not self._provided_profile
+
+    def rebind_actor_layout(self, owner: Any) -> None:
+        """Start fresh measurements after an explicit default-policy DP change."""
+        if not self.supports_actor_dp_resize or self.closed:
+            raise ValueError(
+                "Measured/revision adapters require separately accepted target profiles"
+            )
+        self.owner = self.profile = self.execution_id = self.policy = None
+        self.settings["candidate_configs"] = None
+        self.bind(owner)
+
     def bind(self, owner: Any) -> None:
         if self.owner is not None or self.closed:
             raise RuntimeError("A policy adapter must be unbound and open")
         self.owner = owner
         identity = self.execution_id = measurement_identity(owner)
-        current = (TrainingConfig(len(owner.gpu_uuids)),)
+        world_size = getattr(owner, "actor_world_size", len(owner.gpu_uuids))
+        current = (TrainingConfig(world_size),)
         optimizer = BasicOptimizer(**self.settings)
         if (
             optimizer.candidate_configs is not None
@@ -72,7 +88,7 @@ class PolicyAdapter:
             self.profile = {
                 "execution_scope": SCOPE,
                 "native_execution_id": identity,
-                "native_actor_world_size": len(owner.gpu_uuids),
+                "native_actor_world_size": world_size,
                 "compatibility": owner.compatibility,
                 "inference_gpus": len(owner.options.rollout_devices),
                 "measurements": [],
@@ -84,7 +100,7 @@ class PolicyAdapter:
             if (
                 self.profile.get("execution_scope") != SCOPE
                 or self.profile.get("native_execution_id") != identity
-                or self.profile.get("native_actor_world_size") != len(owner.gpu_uuids)
+                or self.profile.get("native_actor_world_size") != world_size
                 or self.profile.get("compatibility") != owner.compatibility
                 or self.profile.get("inference_gpus")
                 != len(owner.options.rollout_devices)

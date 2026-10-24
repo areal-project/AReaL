@@ -56,6 +56,10 @@ def measurement_identity(owner) -> str:
                 if "token" in name or name in {"vocab.json", "merges.txt"}
             },
             "actor_gpus": owner.gpu_uuids,
+            "actor_layout": {
+                "backend": getattr(owner, "actor_backend", config.actor.backend),
+                "world_size": getattr(owner, "actor_world_size", len(owner.gpu_uuids)),
+            },
             "rollout_gpus": list(owner.options.rollout_devices),
             "cpu_hooks": {
                 name: dataclasses.asdict(getattr(config, name))

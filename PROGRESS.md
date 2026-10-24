@@ -1,31 +1,26 @@
 # AutoPilot 进度
 
-更新：2026-10-24。开发分支：`areal-project/AReaL:lws/feat/elastic`。
-[双机开发交接](examples/autopilot/DEVELOPMENT.md)／[架构](areal/elastic/README.md)／[研究计划](examples/autopilot/PLAN.md)。
+更新：2026-10-24。当前分支：`lws/feat/elastic-reconfig`。
+[开发交接](examples/autopilot/DEVELOPMENT.md)／[架构](areal/elastic/README.md)／[研究计划](examples/autopilot/PLAN.md)。
 
-**开发入口已迁移**
+**开发分工**
 
-- 新分支原样承接已验证 `86323615`，保留 v2.1.0 基线与原历史；迁移后的运行代码、测试与配置保持一致。
-- 本地 `origin` 指向官方仓库，个人仓库保留为 `fork`。两条旧 `lws/feat/autopilot*` 保留在 `0947bfc8`。
-- 公司 checkout 尚待按交接文档保存本机未推送改动并切换跟踪；模型、SIF、数据和外部 `artifacts` 由各机器配置。
+- `lws/feat/elastic`：共同基线，继续trace与运行验证；`origin`为官方仓库，个人仓库保留为`fork`，两条旧`lws/feat/autopilot*`保留。
+- `lws/feat/elastic-reconfig`：本地拓扑切换；公司端由用户另建`lws/feat/elastic-envarena`接入沙箱，完整环境待验收。
 
-**当前实现与验证**
+**本轮 reconfig**
 
-- 唯一训练入口为 `PPOTrainer → elastic/runtime.py`；固定布局下支持 Actor
-  按需启停、完整状态恢复和权重发布，Rollout持续服务。FSDP／Megatron闭环及恢复已有GPU验证。
-- `state/control/monitor/policy`
-  分工；Basic与冻结Expert分离，AutoPilot提供revision／activation。原生PPO与FP32 master／moments语义保留。
-- Hermes／CC × DAPO／SWE共享任务、环境与评分，训练沿用online PPO；Docker默认，Slurm／Singularity为显式执行方式。
-- 数学工具分开保存
-  `stdout`／`stderr`，`output`仅含标准输出；宿主支持Python3.6.8，`TASK_PROC_MODE=none`可关闭工具／评分容器的`/proc`挂载。
-- 工作流41项离线正常路径、真实3.6.8宿主14项跨版本检查通过；其中容器命令与模型响应为替身，完整公司环境待验收。
-- 逐调用计时／usage长度／工具依赖已记录；Rollout prefill／decode batch采集默认关闭，GPU兼容性与开销待验收。
+- 已实现显式纯FSDP Actor
+  DP切换：保存完整源状态→重建Actor→DCP恢复→重新连接并发布；Rollout布局与GPU预留池保持固定。原始训练身份、PPO步数和任务消费游标不变。
+- 跨DP使用显式恢复计划及确定性RNG派生；同布局仍严格恢复。持久事务在首次创建Actor前选择活动布局；每个布局重新建立测量身份，暂不接实测profile／revision自动决策。
+- 19项正常路径检查通过、2项CUDA检查因无GPU跳过；其中CPU协调器覆盖切换／重启／命令入口，PyTorch2.9.1真实Gloo／DTensor／DCP完成2→4→2，参数、Adam状态、学习率及后续更新核对通过。[本地证据](../artifacts/elastic-reconfig-20261024/)。
+- 尚未使用GPU；真实FSDP2／NCCL、Actor→SGLang发布及继续训练待验收，未执行故障注入。[范围与操作](areal/elastic/RECONFIGURATION.md)。
 
-**阻塞与下一步**
+**共享基线与下一步**
 
-1. 公司端先跑[CPU工具探针](examples/task_workflows/RUN_SLURM_SINGULARITY.md)，确认两路输出，再做16题纯推理评测；SWE先验证参考补丁评分。
-1. 1.7B正式5轮／batch40／125更新的原运行第4次更新反传OOM，仅3次更新、998题正常结果和2题服务错误，无checkpoint，相关进程已清理。正式重跑未启动；`n_mbs=10`和分配器配置均未构成已验证修复，须覆盖原失败规模及64K完整前后向。
-1. 显存验收后先做16题／4更新常驻训练，核对Trainer更新数、HF导出、逐调用计时与双方退出码，再推进正式训练和其余组合；[操作文档](examples/task_workflows/RUN_2X2_8GPU.md)。
-1. 完整在线Reference策略、独立拓扑调整、Expert的1.7B dense适配、trace消费／batch关联及资源收益／学习质量实验仍待完成。
+1. GPU空闲后，先验收reconfig的2→4→2完整闭环；再推进Rollout副本增删及两侧GPU重新分配。Megatron／TP／CP／PP／EP切换、完整在线Reference策略仍待实现。
+1. `elastic`线继续验证prefill／decode batch采集的GPU兼容性与开销、trace消费／batch关联和Expert的1.7B dense适配。
+1. 1.7B正式5轮／batch40／125更新原运行第4次更新反传OOM，仅3次更新、998题正常和2题服务错误，无checkpoint，进程已清理；正式重跑未启动。须覆盖原失败规模与64K完整前后向；`n_mbs=10`及分配器配置尚非已验证修复。
+1. 公司端接通Envarena后验收工具执行、stdout／stderr分流、清理及评分，再做16题评测与4更新训练；SWE先验证参考补丁。[2×2步骤](examples/task_workflows/RUN_2X2_8GPU.md)／[原Singularity方式](examples/task_workflows/RUN_SLURM_SINGULARITY.md)。
 
-验证摘要与边界见[交接文档](examples/autopilot/DEVELOPMENT.md)；详细历史保留在[迁移前进度快照](https://github.com/areal-project/AReaL/blob/86323615a3a62fc22c7371b1ceaba526ec1ada93/PROGRESS.md)。
+既有固定布局FSDP／Megatron恢复有GPU证据；共享工作流41项离线及真实3.6.8宿主14项检查通过，其中容器和模型为替身，详见[交接摘要](examples/autopilot/DEVELOPMENT.md)。历史见[迁移前快照](https://github.com/areal-project/AReaL/blob/86323615a3a62fc22c7371b1ceaba526ec1ada93/PROGRESS.md)。

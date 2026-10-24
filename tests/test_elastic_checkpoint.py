@@ -12,8 +12,9 @@ from areal.elastic.state.checkpoint_store import (
 
 
 @pytest.mark.parametrize("backend", ["fsdp", "megatron"])
+@pytest.mark.parametrize("legacy_rng", [False, True])
 def test_native_full_checkpoint_restores_optimizer_scheduler_and_rng(
-    tmp_path, monkeypatch, backend
+    tmp_path, monkeypatch, backend, legacy_rng
 ):
     import random
     from types import SimpleNamespace
@@ -90,6 +91,13 @@ def test_native_full_checkpoint_restores_optimizer_scheduler_and_rng(
         path=str(tmp_path), backend=backend, identity_sha256=identity, version=1
     )
     saved = native.save_full_checkpoint(source, **metadata)
+    if legacy_rng:
+        path = tmp_path / "runtime-0.json"
+        state = json.loads(path.read_text())
+        state.pop("seed_state")
+        state.pop("dtensor_rng")
+        atomic_json(path, state)
+        saved = native._report(state)
     expected = (random.random(), np.random.rand(), torch.rand(4))
     restored = Engine()
     restored.version = 0
@@ -334,7 +342,7 @@ def test_checkpoint_cannot_publish_older_step(tmp_path):
 
 
 @pytest.fixture
-def native_lifecycle(tmp_path, monkeypatch):
+def native_lifecycle(tmp_path, monkeypatch, request):
     """Protocol fixture: real inbox/checkpoint transactions, no GPU evidence."""
     from types import SimpleNamespace
     from unittest.mock import MagicMock
@@ -349,7 +357,8 @@ def native_lifecycle(tmp_path, monkeypatch):
     (base / "config.json").write_text("{}")
     (base / "model.safetensors").write_bytes(b"protocol fixture")
     config.actor.path = str(base)
-    config.actor.backend = "fsdp:d1"
+    initial_dp, pool_size = getattr(request, "param", (1, 1))
+    config.actor.backend = f"fsdp:d{initial_dp}"
     config.train_dataset.batch_size = config.rollout.consumer_batch_size = 4
     config.rollout.max_head_offpolicyness = 2
     config.recover.mode = "on"
@@ -357,8 +366,8 @@ def native_lifecycle(tmp_path, monkeypatch):
     config.actor_lifecycle = ActorLifecycleConfig(
         mode="on_demand",
         state_root=str(tmp_path / "state"),
-        actor_devices=(0,),
-        rollout_devices=(1,),
+        actor_devices=tuple(range(pool_size)),
+        rollout_devices=(pool_size,),
         checkpoint_estimated_bytes=1,
         checkpoint_free_space_floor=0,
     )
@@ -389,7 +398,10 @@ def native_lifecycle(tmp_path, monkeypatch):
 
     class Actor:
         def __init__(self, cfg):
+            from areal.api.alloc_mode import ModelAllocation
+
             self.config = cfg
+            self.world_size = ModelAllocation.from_str(cfg.backend).parallel.world_size
             self.version = self.updates = 0
             self.create_process_group = MagicMock()
             self.initialize = MagicMock()
@@ -407,7 +419,14 @@ def native_lifecycle(tmp_path, monkeypatch):
             self.version = version
 
         def full_checkpoint(
-            self, operation, *, path, backend, identity_sha256, version
+            self,
+            operation,
+            *,
+            path,
+            backend,
+            identity_sha256,
+            version,
+            restore_plan=None,
         ):
             root = Path(path)
             events.append(f"{operation}-{version}")
@@ -415,15 +434,25 @@ def native_lifecycle(tmp_path, monkeypatch):
                 (root / "dcp").mkdir()
                 (root / "dcp/.metadata").write_text("protocol")
                 atomic_json(root / "dcp/state.json", {"updates": self.updates})
-                atomic_json(
-                    root / "runtime-0.json",
-                    {
-                        "rank": 0,
-                        "world_size": 1,
-                        "policy_version": version,
-                    },
-                )
+                for rank in range(self.world_size):
+                    atomic_json(
+                        root / f"runtime-{rank}.json",
+                        {
+                            "rank": rank,
+                            "world_size": self.world_size,
+                            "policy_version": version,
+                        },
+                    )
             else:
+                source_size = json.loads((root / "manifest.json").read_text())[
+                    "world_size"
+                ]
+                if source_size != self.world_size:
+                    assert restore_plan["source_world_size"] == source_size
+                    assert restore_plan["target_world_size"] == self.world_size
+                else:
+                    assert restore_plan is None
+                self.restore_plan = restore_plan
                 self.updates = json.loads((root / "dcp/state.json").read_text())[
                     "updates"
                 ]
@@ -943,6 +972,7 @@ def test_native_checkpoint_seconds_schedule_works_in_cpu_coordinator(native_life
     assert manager.latest_manifest["global_step"] == 1
 
 
+@pytest.mark.parametrize("native_lifecycle", [(1, 1), (2, 4)], indirect=True)
 def test_native_trainer_defers_actor_initialization_and_legacy_recover(
     native_lifecycle, monkeypatch
 ):

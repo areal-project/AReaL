@@ -377,6 +377,45 @@ def test_full_checkpoint_preflight_failure_never_starts_collective_load():
     assert controller.get_version() == 0
 
 
+def test_full_checkpoint_mapped_load_preflights_all_target_ranks():
+    """The approved plan reaches every target and target digests agree after load."""
+    controller = _make_controller()
+    controller._ensure_initialized = MagicMock()
+    controller._worker_addrs = ["http://rank0", "http://rank1"]
+    events = []
+    plan = {"source_world_size": 4, "target_world_size": 2}
+
+    async def endpoint(worker, path, **kwargs):
+        assert kwargs["kwargs"]["restore_plan"] == plan
+        events.append(path)
+        rank = int(worker[-1])
+        return {
+            "rank": rank,
+            "world_size": 2,
+            "policy_version": 3,
+            "backend": "fsdp",
+            "identity_sha256": "a" * 64,
+            "state_sha256": str(rank) * 64,
+        }
+
+    controller._call_worker_engine_endpoint = AsyncMock(side_effect=endpoint)
+    reports = controller.full_checkpoint(
+        "load",
+        path="/checkpoint",
+        backend="fsdp",
+        identity_sha256="a" * 64,
+        version=3,
+        restore_plan=plan,
+    )
+    assert events == [
+        "/checkpoint/inspect",
+        "/checkpoint/inspect",
+        "/checkpoint/load",
+        "/checkpoint/load",
+    ]
+    assert len(reports) == 2 and controller.get_version() == 3
+
+
 def test_version_rpc_failure_does_not_advance_controller_version():
     controller = _make_controller()
     controller._gateway_post = MagicMock(

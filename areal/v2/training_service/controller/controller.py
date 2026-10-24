@@ -844,6 +844,7 @@ class GatewayTrainController:
         backend: str,
         identity_sha256: str,
         version: int,
+        restore_plan: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Preflight all ranks before a native collective save/load, with no retries."""
         self._ensure_initialized()
@@ -855,6 +856,10 @@ class GatewayTrainController:
             "identity_sha256": identity_sha256,
             "version": version,
         }
+        if restore_plan is not None:
+            if operation != "load" or backend != "fsdp":
+                raise ValueError("DP restore plans require a FSDP checkpoint load")
+            kwargs["restore_plan"] = restore_plan
 
         async def all_ranks(
             endpoint: str, parameters: dict[str, Any]

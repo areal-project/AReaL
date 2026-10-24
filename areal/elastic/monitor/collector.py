@@ -68,6 +68,10 @@ class ElasticMonitor:
         self._workload_cache = None
         self._history_sequence = 0
 
+    @property
+    def actor_world_size(self) -> int:
+        return getattr(self.owner, "actor_world_size", len(self.owner.gpu_uuids))
+
     def bind(self, execution_id: str) -> None:
         if self.measurement_id is not None:
             raise RuntimeError("Monitor is already bound")
@@ -162,7 +166,7 @@ class ElasticMonitor:
             committed=self.owner.active is None
             and state.published_version == state.applied_version,
             observed_at=now,
-            training_config=TrainingConfig(len(self.owner.gpu_uuids)),
+            training_config=TrainingConfig(self.actor_world_size),
             committed_samples=self.owner.data_progress["samples"],
             committed_tokens=self.completed_tokens,
             max_train_gpus=len(self.owner.gpu_uuids),
@@ -220,7 +224,7 @@ class ElasticMonitor:
         """Record native conditional service time at existing execution boundaries."""
         measurement = Measurement(
             phase,
-            len(self.owner.gpu_uuids),
+            self.actor_world_size,
             seconds,
             0 if self.pending is None else self.pending["workload"]["sequence_tokens"],
         )
@@ -242,7 +246,7 @@ class ElasticMonitor:
                         {
                             "phase": phase,
                             "seconds": seconds,
-                            "config": {"world_size": len(self.owner.gpu_uuids)},
+                            "config": {"world_size": self.actor_world_size},
                             "workload": rows[-1]["workload"] if rows else None,
                         }
                     ],
@@ -595,7 +599,7 @@ class ElasticMonitor:
                     {
                         "phase": "release",
                         "seconds": seconds,
-                        "config": {"world_size": len(self.owner.gpu_uuids)},
+                        "config": {"world_size": self.actor_world_size},
                         "workload": workload,
                     }
                 ],
@@ -604,7 +608,7 @@ class ElasticMonitor:
         self.history.add_measurement(
             Measurement(
                 "release",
-                len(self.owner.gpu_uuids),
+                self.actor_world_size,
                 seconds,
                 0 if workload is None else workload["sequence_tokens"],
             )

@@ -353,10 +353,8 @@ class PPOTrainer:
                 config,
                 ft_spec,
                 functools.partial(
-                    self._create_train_engine,
-                    alloc=self.actor_alloc,
+                    self._create_lifecycle_actor,
                     scheduler=self.scheduler,
-                    create_process_group=False,
                 ),
                 policy_adapter=self._elastic_policy,
             )
@@ -1269,6 +1267,16 @@ class PPOTrainer:
             # launch is the only ordering safe for all of them.
             for spec in engine_cfg.scheduling_spec:
                 spec.env_vars["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+
+    def _create_lifecycle_actor(
+        self, actor_config: PPOActorConfig, *, scheduler: Scheduler
+    ) -> FSDPPPOActor | MegatronPPOActor | ArchonPPOActor | PPOActorController:
+        return self._create_train_engine(
+            actor_config,
+            ModelAllocation.from_str(actor_config.backend),
+            scheduler=scheduler,
+            create_process_group=False,
+        )
 
     def _create_train_engine(
         self,

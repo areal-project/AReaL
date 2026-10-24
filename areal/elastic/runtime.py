@@ -17,7 +17,13 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from areal.elastic.control.actor_reconfiguration import (
+    ActorDPConfig,
+    ActorDPExecutor,
+    poll_request,
+)
 from areal.elastic.control.boundary import ControlBusy, ControlSnapshot
+from areal.elastic.control.config_application import ConfigApplication, ConfigRequest
 from areal.elastic.control.policy_hooks import (
     validate_unbound_adapter,
 )
@@ -114,12 +120,20 @@ def validate_on_demand(config: Any) -> None:
         raise ValueError(
             "on_demand requires one GPU per Actor guard and a positive Rollout GPU request"
         )
-    if (actor.parallel.world_size, rollout.parallel.world_size) != (
-        len(lifecycle.actor_devices),
-        len(lifecycle.rollout_devices),
+    actor_size = actor.parallel.world_size
+    actor_pool = len(lifecycle.actor_devices)
+    pure_fsdp_dp = actor.backend == "fsdp" and all(
+        getattr(actor.parallel, name) == 1
+        for name in ("tp_size", "pp_size", "cp_size", "ep_size", "etp_size")
+    )
+    if (
+        rollout.parallel.world_size != len(lifecycle.rollout_devices)
+        or actor_size > actor_pool
+        or actor_size != actor_pool
+        and not pure_fsdp_dp
     ):
         raise ValueError(
-            "Each fixed GPU pool must exactly match its native parallel layout"
+            "GPU pools must match their layouts; pure FSDP DP may use a subset of its reserved pool"
         )
     if (
         config.gconfig.n_samples != 1
@@ -190,6 +204,7 @@ class OnDemandActor:
         from areal.api.alloc_mode import ModelAllocation
 
         self.allocation = ModelAllocation.from_str(config.actor.backend)
+        self._actor_backend = config.actor.backend
         # Hash immutable model files, omitting download-cache bookkeeping.
         base = Path(config.actor.path)
         self.base_manifest = artifact_manifest(base)
@@ -269,6 +284,19 @@ class OnDemandActor:
             present = gpu_processes()
             if any(present.get(gpu) for gpu in self.gpu_uuids + rollout_gpus):
                 raise RuntimeError("The explicitly assigned GPU pools are not empty")
+            self.actor_config_application = ConfigApplication(
+                ActorDPExecutor(self), self.root / "actor-reconfiguration"
+            )
+            journal = self.root / "actor-reconfiguration" / "state.json"
+            if journal.exists():
+                state = self.actor_config_application.state()
+                layout = (
+                    state["config"]
+                    if state["pending"] is None
+                    else state["pending"]["source"]["config"]
+                )
+                self.validate_actor_dp(layout["world_size"])
+                self._set_actor_dp(layout["world_size"])
             self._event("STOPPED")
         except BaseException:
             self.consumer.close()
@@ -306,6 +334,14 @@ class OnDemandActor:
             )
         self.data_progress = dict(progress)
         self._active_data_progress = None
+
+    @property
+    def actor_world_size(self) -> int:
+        return self.allocation.parallel.world_size
+
+    @property
+    def actor_backend(self) -> str:
+        return self._actor_backend
 
     @property
     def published_version(self) -> int:
@@ -361,6 +397,110 @@ class OnDemandActor:
     def fence_admission(self) -> None:
         self.inbox.set_admission_open(False)
 
+    def validate_actor_dp(self, world_size: int) -> None:
+        """First capability: pure FSDP DP counts within the original reservation."""
+        from areal.api.alloc_mode import ModelAllocation
+
+        ActorDPConfig(world_size)
+        initial = ModelAllocation.from_str(self.config.actor.backend)
+        if world_size == self.actor_world_size:
+            return
+        if initial.backend != "fsdp" or any(
+            getattr(initial.parallel, name) != 1
+            for name in ("tp_size", "pp_size", "cp_size", "ep_size", "etp_size")
+        ):
+            raise ValueError(
+                "Actor reconfiguration currently supports pure FSDP DP only"
+            )
+        if (
+            world_size > len(self.options.actor_devices)
+            or self.inbox.batch_size % world_size
+        ):
+            raise ValueError(
+                "Actor DP size must fit the reserved pool and divide the effective batch"
+            )
+        if not self.policy_adapter.supports_actor_dp_resize:
+            raise ValueError(
+                "Explicit Actor DP changes require the default timeout adapter without a measured profile/revision"
+            )
+
+    def _set_actor_dp(self, world_size: int) -> None:
+        from areal.api.alloc_mode import ModelAllocation
+
+        initial = ModelAllocation.from_str(self.config.actor.backend)
+        self._actor_backend = (
+            self.config.actor.backend
+            if world_size == initial.parallel.world_size
+            else f"fsdp:d{world_size}"
+        )
+        self.allocation = ModelAllocation.from_str(self._actor_backend)
+
+    @_serialized
+    def reconfigure_actor(
+        self,
+        *,
+        world_size: int,
+        request_id: str,
+        expected_generation: int,
+        expected_weights_version: int,
+    ) -> dict[str, Any]:
+        """Apply an explicit DP-only request without advancing training/data state."""
+        request = ConfigRequest(
+            request_id,
+            ActorDPConfig(world_size),
+            expected_generation,
+            expected_weights_version,
+            "manual",
+        )
+        application = self.actor_config_application
+        application.preflight(request)
+        if request_id in application.state()["receipts"]:
+            return application.apply(request)
+        if not self.control_snapshot().boundary_ready:
+            raise ControlBusy("Actor DP changes require a completed, published update")
+        if world_size != self.actor_world_size:
+            if self.applied_version < 1:
+                raise ValueError(
+                    "Actor DP changes require at least one completed update/checkpoint"
+                )
+            # ConfigApplication's source boundary includes the checkpoint ID.
+            # Complete this save before its durable intent captures that boundary.
+            self.save_checkpoint(reason="reconfigure")
+            if self.checkpoint_version != self.applied_version:
+                raise RuntimeError("Actor DP source checkpoint is not current")
+        self.inbox.set_admission_open(False)
+        receipt = application.apply(request)
+        if not self.control_snapshot().boundary_ready:
+            raise RuntimeError(
+                "Actor DP application left an incomplete training boundary"
+            )
+        self.inbox.set_admission_open(True)
+        return receipt
+
+    def _switch_actor_dp(self, world_size: int) -> None:
+        """Called only by the serialized config transaction, including rollback."""
+        self.validate_actor_dp(world_size)
+        if (
+            world_size == self.actor_world_size
+            and self.control_snapshot().boundary_ready
+        ):
+            return
+        if self.active is not None or self.checkpoint_version != self.applied_version:
+            raise RuntimeError("Actor DP switch requires the saved completed update")
+        self._event("RECONFIGURING", target_world_size=world_size)
+        self._release()
+        self._set_actor_dp(world_size)
+        # Fixed-layout measurements must not be reused for a different DP size.
+        self.monitor = ElasticMonitor(self)
+        self.policy_adapter.rebind_actor_layout(self)
+        self.ensure_actor()
+        self.rollout.pause()
+        self._publish()
+        self.rollout.continue_generation()
+        self.rollout.resume()
+        self._checkpoint_dirty = True
+        self._event("RECONFIGURED", serving_versions=self.rollout.serving_versions())
+
     def _read_latest(self) -> dict[str, Any] | None:
         if not (self.store.root / "latest.json").exists():
             self.latest_path, self.latest_manifest = None, None
@@ -368,6 +508,26 @@ class OnDemandActor:
             self.latest_path, self.latest_manifest = self.store.latest(
                 self.compatibility
             )
+            layout_path = self.latest_path / "actor-layout.json"
+            from areal.api.alloc_mode import ModelAllocation
+
+            if layout_path.exists():
+                layout = json.loads(layout_path.read_text())
+                if layout["world_size"] != self.latest_manifest["world_size"] or layout[
+                    "gpu_pool"
+                ] != list(self.options.actor_devices):
+                    raise ValueError(
+                        "Checkpoint Actor layout disagrees with its manifest/reservation"
+                    )
+                backend = layout["backend"]
+            else:
+                backend = self.config.actor.backend
+            source = ModelAllocation.from_str(backend)
+            if (
+                source.backend != self.allocation.backend
+                or source.parallel.world_size != self.latest_manifest["world_size"]
+            ):
+                raise ValueError("Checkpoint Actor layout is missing or inconsistent")
         return self.latest_manifest
 
     def _event(self, state: str, **details: Any) -> None:
@@ -379,6 +539,9 @@ class OnDemandActor:
             "applied_version": getattr(self, "applied_version", 0),
             "checkpoint_version": self.checkpoint_version,
             "owner": self.owner,
+            "actor_world_size": self.actor_world_size,
+            "actor_backend": self.actor_backend,
+            "actor_gpu_pool": list(self.options.actor_devices),
             **details,
         }
         with (self.root / "events.jsonl").open("a") as stream:
@@ -421,6 +584,8 @@ class OnDemandActor:
             rollout.continue_generation()
         self.policy_adapter.bind(self)
         self._policy_hooks_bound = self.policy_hooks is not None
+        if (self.root / "actor-reconfiguration" / "state.json").exists():
+            self.actor_config_application.recover()
         self.inbox.set_admission_open(True)
 
     def _restore_checkpoint_frequency(self) -> None:
@@ -452,6 +617,7 @@ class OnDemandActor:
         self.started_at = time.monotonic()
         self._event("STARTING")
         actor_config = deepcopy(self.config.actor)
+        actor_config.backend = self.actor_backend
         for spec in actor_config.scheduling_spec:
             spec.env_vars[OWNER_ENV] = self.owner
         self.actor = self.actor_factory(actor_config)
@@ -464,13 +630,40 @@ class OnDemandActor:
             worker_seed=self.config.seed,
         )
         if self.latest_path is not None:
-            self.actor.full_checkpoint(
+            restore_options = {}
+            if self.latest_manifest["world_size"] != self.actor_world_size:
+                from areal.v2.training_service.dp_restore import DPStateRestorePlan
+
+                self.validate_actor_dp(self.actor_world_size)
+                restore_options["restore_plan"] = dataclasses.asdict(
+                    DPStateRestorePlan(
+                        identity_sha256=self.identity,
+                        checkpoint_generation=self.latest_path.name,
+                        policy_version=self.applied_version,
+                        source_world_size=self.latest_manifest["world_size"],
+                        target_world_size=self.actor_world_size,
+                        transition_id=json_digest(
+                            {
+                                "checkpoint": self.latest_path.name,
+                                "target_dp": self.actor_world_size,
+                                "run": self.identity,
+                            }
+                        ),
+                    )
+                )
+            reports = self.actor.full_checkpoint(
                 "load",
                 path=str(self.latest_path),
                 backend=self.allocation.backend,
                 identity_sha256=self.identity,
                 version=self.applied_version,
+                **restore_options,
             )
+            if isinstance(reports, list):
+                self._event(
+                    "RESTORED",
+                    worker_devices=[row.get("visible_devices") for row in reports],
+                )
         if self.config.perf_tracer is not None:
             self.actor.config_perf_tracer(self.config.perf_tracer, role="actor")
         self.actor.connect_engine(self.rollout, self.weight_meta)
@@ -498,6 +691,7 @@ class OnDemandActor:
 
         if self.active is not None:
             raise RuntimeError("The previous native PPO update is still active")
+        poll_request(self)
         if self._policy_hooks_bound:
             self.policy_hooks.poll()
         if self.inbox.status()["published_version"] != self.applied_version:
@@ -608,6 +802,14 @@ class OnDemandActor:
                 backend=self.allocation.backend,
                 identity_sha256=self.identity,
                 version=self.applied_version,
+            )
+            atomic_json(
+                path / "actor-layout.json",
+                {
+                    "backend": self.actor_backend,
+                    "world_size": self.actor_world_size,
+                    "gpu_pool": list(self.options.actor_devices),
+                },
             )
             atomic_json(path / "coordinator.json", self._capture_cpu())
             atomic_json(
@@ -761,7 +963,7 @@ class OnDemandActor:
         if self.owner is not None:
             stop_owned_processes(self.owner)
         self._confirm_stopped()
-        gpu_seconds = (time.monotonic() - self.started_at) * len(self.gpu_uuids)
+        gpu_seconds = (time.monotonic() - self.started_at) * self.actor_world_size
         self.actor, self.owner = None, None
         self.ready_since, self.idle_since, self.started_at = None, None, None
         self._cleanup_event("STOPPED", actor_gpu_seconds=gpu_seconds)
@@ -807,7 +1009,22 @@ class OnDemandActor:
             )
         else:
             self._restore_cpu(deepcopy(self._initial_cpu_state))
-        self.monitor.recover()
+        journal = self.root / "actor-reconfiguration" / "state.json"
+        if journal.exists():
+            state = self.actor_config_application.state()
+            layout = (
+                state["config"]
+                if state["pending"] is None
+                else state["pending"]["source"]["config"]
+            )
+            if layout["world_size"] != self.actor_world_size:
+                self._set_actor_dp(layout["world_size"])
+                self.monitor = ElasticMonitor(self)
+                self.policy_adapter.rebind_actor_layout(self)
+            else:
+                self.monitor.recover()
+        else:
+            self.monitor.recover()
         if self._policy_hooks_bound:
             self.policy_hooks.recover()
         # Failed transfers may have overwritten only some inference tensors
@@ -819,6 +1036,8 @@ class OnDemandActor:
         self.rollout.continue_generation()
         self.rollout.resume()
         self.monitor.complete_update()
+        if journal.exists():
+            self.actor_config_application.recover()
         self.inbox.set_admission_open(True)
 
     @_serialized

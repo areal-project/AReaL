@@ -21,6 +21,7 @@ elastic/
     boundary.py               控制接口与边界快照
     policy_hooks.py           可选修订轮询与激活恢复回调
     config_application.py     配置应用事务与固定布局 NativeConfigExecutor
+    actor_reconfiguration.py  显式 Actor DP 请求、事务适配与本地命令入口
     policy_activation.py      策略激活事务
     processes.py              进程所有权与 GPU 释放确认
   monitor/
@@ -35,8 +36,9 @@ elastic/
     reference/                独立 Expert 参考模型／simulator；不参与 Basic 实现
 ```
 
-原生执行器通过公开 `NativeControlPort` 提供串行控制边界和 admission fence。 配置应用目前只接受同布局、同 GPU
-池的身份确认；不支持实际拓扑调整。训练后先发布权重，再按 `recover.freq_*` 周期保存完整 checkpoint／游标； 评估、清理和恢复 Rollout
+原生执行器通过公开 `NativeControlPort` 提供串行控制边界和 admission fence。 AutoPilot 配置应用仍只接受同布局、同 GPU
+池的身份确认。Runtime 另提供[显式 Actor DP 重配置](RECONFIGURATION.md)，保持原预留 GPU 池和 Rollout 布局不变；实际 GPU
+验收状态见 `PROGRESS.md`。 训练后先发布权重，再按 `recover.freq_*` 周期保存完整 checkpoint／游标； 评估、清理和恢复 Rollout
 后判断是否释放，释放前补齐最新恢复状态。意外故障回到最近 checkpoint 并重放未保存 batch。
 
 发布失败时保持准入关闭；即使 serving 版本号未变，也必须重建权重连接并完整覆盖恢复权重，再确认后开放生成。 SGLang 分离部署的专用 AWEX NCCL
@@ -59,7 +61,7 @@ schema 的 `committed` 仍指“更新已完成并发布”， `committed_sample
 `trainer/rl_trainer.py` 保留 PPO 与每轮工作顺序，通过 `elastic/runtime.py` 接入按需生命周期。
 `v2/training_service/checkpoint.py` 执行完整状态读写，`runtime_state.py` 管理各 rank 的 LR／RNG；
 `elastic/state/checkpoint_store.py` 只管理提交存储。模型文件摘要和原子 JSON 工具统一位于 `utils/atomic.py`。
-当前主路径未使用的导出校验与 DP 重布局辅助代码已移入本地归档，不代表支持运行中调整拓扑。
+旧导出校验与 DP 重布局辅助代码已移入本地归档，不作为新路径的验收证据。
 
 `on_demand` 默认创建 `ElasticMonitor`。`collector.py` 汇总 Runtime／inbox 状态与 batch 负载， 记录决策前的
 observation／历史／动作，以及实际阶段耗时、版本、配置和 Actor generation。 `finish_update()` 完成、Rollout
