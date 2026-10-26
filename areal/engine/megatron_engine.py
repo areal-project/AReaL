@@ -2763,13 +2763,6 @@ class MegatronEngine(TrainEngine):
             self.is_offload = True
             return
 
-        # Initialization and the initial colocation policy can both request
-        # offload. TMS aborts on a second pause of already released allocations.
-        # Explicit AWEX residency above tracks individual tags independently
-        # of is_offload and must still process every release request.
-        if self.is_offload:
-            return
-
         if not is_tms_enabled():
             raise RuntimeError(
                 "torch_memory_saver requires `enable_offload=True` in yaml config."

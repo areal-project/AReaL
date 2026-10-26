@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable
@@ -122,9 +121,6 @@ class TensorShardInfo:
 
     shard_id: Any
     node_addr: str
-    shape: list[int] | None = None
-    dtype: str | None = None
-    contiguous: bool = False
 
 
 class HttpRTensorBackend:
@@ -132,45 +128,6 @@ class HttpRTensorBackend:
         if max_shards_per_request <= 0:
             raise ValueError("max_shards_per_request must be positive")
         self.max_shards_per_request = max_shards_per_request
-
-    async def _fetch_chunked_tensor(
-        self, session: aiohttp.ClientSession, shard: TensorShardInfo
-    ) -> torch.Tensor:
-        """Bound wire temporaries for large contiguous CPU tensors.
-
-        Older descriptors retain the JSON path. New descriptors include the
-        tensor layout, so no base64 or full response buffer is needed here.
-        """
-        dtype = getattr(torch, shard.dtype.removeprefix("torch."))
-        result = torch.empty(shard.shape, dtype=dtype, device="cpu")
-        output = result.view(torch.uint8).reshape(-1)
-        chunk_bytes = 4 * 1024 * 1024
-        for offset in range(0, output.numel(), chunk_bytes):
-            count = min(chunk_bytes, output.numel() - offset)
-            url = f"http://{shard.node_addr}/data/{shard.shard_id}/chunk"
-            for attempt in range(3):
-                try:
-                    async with session.get(
-                        url, params={"offset": offset, "length": count}
-                    ) as response:
-                        if response.status != 200:
-                            raise RuntimeError(
-                                f"Chunked tensor fetch returned HTTP {response.status}"
-                            )
-                        payload = await response.read()
-                        if len(payload) != count:
-                            raise RuntimeError(
-                                "Chunked tensor response has an invalid length"
-                            )
-                        # bytearray is writable and owns only one bounded chunk.
-                        output[offset : offset + count].copy_(
-                            torch.frombuffer(bytearray(payload), dtype=torch.uint8)
-                        )
-                    break
-                except (TimeoutError, aiohttp.ClientError):
-                    if attempt == 2:
-                        raise
-        return result
 
     def _create_session(self) -> aiohttp.ClientSession:
         """Create a properly configured aiohttp session for large tensor transfers."""
@@ -303,38 +260,15 @@ class HttpRTensorBackend:
             results: list[torch.Tensor | None] = [None] * len(shards)
 
             async with self._create_session() as session:
-                # Limit concurrent serialization/decoding pressure across
-                # storage nodes as well as bounding each large tensor chunk.
-                transfer_slots = asyncio.Semaphore(2)
 
                 async def _fetch_node(
                     node_addr: str, grouped: list[tuple[int, TensorShardInfo]]
                 ) -> None:
-                    small = []
-                    for index, shard in grouped:
-                        if (
-                            shard.contiguous
-                            and shard.shape is not None
-                            and shard.dtype is not None
-                        ):
-                            dtype = getattr(torch, shard.dtype.removeprefix("torch."))
-                            size = (
-                                math.prod(shard.shape)
-                                * torch.empty((), dtype=dtype).element_size()
-                            )
-                            if size >= 4 * 1024 * 1024:
-                                async with transfer_slots:
-                                    results[index] = await self._fetch_chunked_tensor(
-                                        session, shard
-                                    )
-                                continue
-                        small.append((index, shard))
-                    for start in range(0, len(small), self.max_shards_per_request):
-                        chunk = small[start : start + self.max_shards_per_request]
-                        async with transfer_slots:
-                            tensors = await self._fetch_shard_group(
-                                session, node_addr, chunk
-                            )
+                    for start in range(0, len(grouped), self.max_shards_per_request):
+                        chunk = grouped[start : start + self.max_shards_per_request]
+                        tensors = await self._fetch_shard_group(
+                            session, node_addr, chunk
+                        )
                         for (original_index, _), tensor in zip(
                             chunk, tensors, strict=True
                         ):
@@ -534,9 +468,6 @@ class RTensor:
             shard = TensorShardInfo(
                 shard_id=shard_id,
                 node_addr=node_addr,
-                shape=list(tensor.shape),
-                dtype=str(tensor.dtype),
-                contiguous=tensor.is_contiguous(),
             )
             remote_tensor = RTensor(shard=shard, data=tensor.to("meta"))
             if tensor_memo is not None:
@@ -670,25 +601,6 @@ class RTensor:
                 _fetch_buffer[shard_id] = tensor
                 for rtensor in references:
                     rtensor.data = tensor
-
-    @staticmethod
-    def evict_routing_fetches(obj: Any) -> None:
-        """Drop local cache ownership of routing after RPC localization.
-
-        This does not delete source shards or affect other consumers. Live
-        localized arguments retain their data until PP distribution completes.
-        """
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if key == "routed_experts" and isinstance(value, RTensor):
-                    with _fetch_buffer_lock:
-                        _fetch_buffer.pop(value.shard.shard_id, None)
-                    value.data = value.data.to(device="meta")
-                else:
-                    RTensor.evict_routing_fetches(value)
-        elif isinstance(obj, (tuple, list)):
-            for value in obj:
-                RTensor.evict_routing_fetches(value)
 
     @staticmethod
     def _collect_all(obj: Any, result: list[RTensor]) -> None:

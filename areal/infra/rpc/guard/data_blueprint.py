@@ -19,7 +19,6 @@ from __future__ import annotations
 import traceback
 
 import orjson
-import torch
 from flask import Blueprint, Response, jsonify, request
 from pydantic import BaseModel, ValidationError
 
@@ -30,36 +29,6 @@ from areal.utils import logging
 logger = logging.getLogger("DataBP")
 
 data_bp = Blueprint("data", __name__)
-
-
-@data_bp.route("/data/<shard_id>/chunk", methods=["GET"])
-def retrieve_tensor_chunk(shard_id: str):
-    """Read a bounded byte range without serializing the full tensor."""
-    try:
-        tensor = rtensor.fetch(shard_id)
-    except KeyError:
-        return jsonify({"error": "Shard not found"}), 404
-    try:
-        offset = int(request.args["offset"])
-        length = int(request.args["length"])
-    except (KeyError, ValueError):
-        return jsonify({"error": "offset and length must be integers"}), 400
-    if tensor.device.type != "cpu" or not tensor.is_contiguous():
-        return jsonify(
-            {"error": "Chunked transfer requires a contiguous CPU tensor"}
-        ), 400
-    byte_view = tensor.view(torch.uint8).reshape(-1)
-    if (
-        offset < 0
-        or length <= 0
-        or length > 4 * 1024 * 1024
-        or offset + length > byte_view.numel()
-    ):
-        return jsonify({"error": "Invalid tensor byte range"}), 400
-    return Response(
-        byte_view[offset : offset + length].numpy().tobytes(),
-        mimetype="application/octet-stream",
-    )
 
 
 # ================================================================================

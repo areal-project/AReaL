@@ -71,10 +71,6 @@ the conversion to native int64 replay indices happen on CPU for the current micr
 before upload. Routing is excluded from advantage computation, reference, critic, and
 teacher payloads.
 
-Large contiguous RTensors use binary HTTP chunks of at most 4 MiB instead of a
-full-tensor base64 response. Fetch concurrency is bounded across storage nodes.
-Descriptors without layout metadata retain the existing JSON transfer path.
-
 The engine logs host RSS/PSS before replay and exports `r3/cpu_routing_storage_bytes`,
 counting unique replay backing storages rather than counting each microbatch view again.
 This metric excludes model weights and other process allocations; use host PSS and

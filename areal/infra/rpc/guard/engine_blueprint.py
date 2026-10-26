@@ -516,7 +516,9 @@ def call_engine_method():
         if preserve_input_tensor_aliases and getattr(
             engine, "r3_pipeline_stages", None
         ):
-            RTensor.evict_routing_fetches((raw_args, raw_kwargs))
+            from areal.engine.r3.transport import evict_routing_fetches
+
+            evict_routing_fetches((raw_args, raw_kwargs))
             # Localized args own the tensors now; the serialized RTensor
             # objects must not retain the global routing during training.
             raw_args = raw_kwargs = None

@@ -16,6 +16,26 @@ R3_ROUTED_EXPERTS_KEY = "routed_experts"
 R3_ROUTING_VALID_KEY = "r3_routing_valid"
 
 
+def evict_routing_fetches(obj: Any) -> None:
+    """Release local routing cache ownership after RPC localization.
+
+    Source shards and other consumers remain unchanged. Localized arguments
+    retain the routing until pipeline distribution completes.
+    """
+    from areal.infra.rpc.rtensor import RTensor, clear_fetch_buffer
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key == R3_ROUTED_EXPERTS_KEY and isinstance(value, RTensor):
+                clear_fetch_buffer([value.shard.shard_id])
+                value.data = value.data.to(device="meta")
+            else:
+                evict_routing_fetches(value)
+    elif isinstance(obj, (tuple, list)):
+        for value in obj:
+            evict_routing_fetches(value)
+
+
 def without_r3_tensors(data: dict[str, Any]) -> dict[str, Any]:
     """Share trajectory tensors without actor-specific rollout routing.
 
