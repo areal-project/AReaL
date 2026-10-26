@@ -46,7 +46,7 @@ from areal.infra.utils.http import arequest_with_retry, get_default_connector
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names
-from areal.utils.data import concat_padded_tensors
+from areal.utils.data import concat_padded_tensors, get_batch_size
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import (
     find_free_ports,
@@ -83,6 +83,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None:
         from areal.experimental.openai import InteractionWithTokenLogpReward
+        from areal.experimental.openai.types import interactions_to_trajectory
         from areal.infra import workflow_context
         from areal.infra.processor_cache import ProcessorCallCache
         from areal.infra.workflow_context import WorkflowContext
@@ -169,15 +170,69 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                 isinstance(v, InteractionWithTokenLogpReward) for v in first.values()
             )
         ):
-            # Merge dicts - each result is {completion_id: InteractionWithTokenLogpReward}
-            merged: dict[str, InteractionWithTokenLogpReward] = {}
-            for result in valid_results:
-                merged.update(result)
-            return merged if merged else None
+            # An agent session can export more than one row: sub-agents and
+            # context compaction break the prefix chain, so every unmatched
+            # branch is exported on a row of its own. Merging the dicts first
+            # would erase the session boundaries, leaving downstream grouping
+            # (the GRPO baseline) unable to tell which rows came from the same
+            # trajectory. Convert each trajectory on its own instead and mark
+            # its first row, so the boundaries survive the concatenation.
+            if not all(
+                interaction.has_tensor_data
+                for result in valid_results
+                for interaction in result.values()
+            ):
+                # External-API interactions carry no tensors and cannot be
+                # concatenated; keep the flat merge for them.
+                merged: dict[str, InteractionWithTokenLogpReward] = {}
+                for result in valid_results:
+                    merged.update(result)
+                return merged if merged else None
 
-        # Otherwise, tensor dicts - concatenate
-        concatenated = concat_padded_tensors(valid_results)
-        return concatenated if concatenated else None
+            trajs = []
+            for result in valid_results:
+                traj = interactions_to_trajectory(result)
+                n_rows = get_batch_size(traj)
+                if n_rows == 0:
+                    continue
+                begin_of_trajectory = torch.zeros(n_rows, dtype=torch.int32)
+                begin_of_trajectory[0] = 1
+                traj["begin_of_trajectory"] = begin_of_trajectory
+                trajs.append(traj)
+        else:
+            # Tensor dicts can also contain multiple rows from one episode. Mark
+            # its boundary before concatenation, just as for proxy interactions.
+            trajs = []
+            for result in valid_results:
+                n_rows = get_batch_size(result)
+                if n_rows == 0:
+                    continue
+                traj = dict(result)
+                if "begin_of_trajectory" not in traj:
+                    begin_of_trajectory = torch.zeros(
+                        n_rows, dtype=torch.int32, device=traj["input_ids"].device
+                    )
+                    begin_of_trajectory[0] = 1
+                    traj["begin_of_trajectory"] = begin_of_trajectory
+                trajs.append(traj)
+
+        if not trajs:
+            return None
+        rollout_rewards = [result.get("rollout_rewards") for result in trajs]
+        tensors = [
+            {k: v for k, v in result.items() if k != "rollout_rewards"}
+            for result in trajs
+        ]
+        concatenated = concat_padded_tensors(tensors)
+        if any(rewards is not None for rewards in rollout_rewards):
+            concatenated["rollout_rewards"] = [
+                r
+                for rewards, result in zip(rollout_rewards, trajs)
+                for r in (
+                    rewards if rewards is not None else [None] * get_batch_size(result)
+                )
+            ]
+        return concatenated
 
 
 class RemoteInfBackendProtocol(Protocol):

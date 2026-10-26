@@ -12,6 +12,10 @@ import os
 import signal
 import threading
 from types import ModuleType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch.distributed import P2POp
 
 GROUPED_P2P_ENV = "AREAL_NPU_GROUPED_P2P"
 
@@ -69,6 +73,20 @@ def grouped_p2p_broken(torch_npu_version: str) -> bool:
     return GROUPED_P2P_FIXED_IN is None or version < Version(GROUPED_P2P_FIXED_IN)
 
 
+def _split_p2p_ops(p2p_op_list: list["P2POp"]) -> list[list["P2POp"]]:
+    """Keep one operation per direction and peer in each fused HCCL call."""
+    rounds: list[list[P2POp]] = []
+    counts: dict[tuple[str, int], int] = {}
+    for op in p2p_op_list:
+        key = (op.op.__name__, op.peer)
+        index = counts.get(key, 0)
+        if index == len(rounds):
+            rounds.append([])
+        rounds[index].append(op)
+        counts[key] = index + 1
+    return rounds
+
+
 def _apply_grouped_p2p_gate() -> None:
     """Route NPU batched P2P away from torch-npu's broken coalescing path.
 
@@ -120,19 +138,24 @@ def _apply_grouped_p2p_gate() -> None:
             group = _get_default_group()
         backend = group._get_backend(p2p_op_list[0].tensor.device)
 
-        op_type, tensors, remote_rank_list = [], [], []
         for p2p_op in p2p_op_list:
             if p2p_op.tensor.device.type != "npu":
                 raise RuntimeError(
                     "No backend type associated with device type "
                     f"{p2p_op.tensor.device.type}"
                 )
-            op_type.append(p2p_op.op.__name__)
-            tensors.append(p2p_op.tensor)
-            remote_rank_list.append(
-                get_group_rank(group, p2p_op.peer) if is_multi_pg else p2p_op.peer
-            )
-        return [backend.batch_isend_irecv(op_type, tensors, remote_rank_list)]
+        # HcclBatchSendRecv permits only one memory block per directed peer.
+        # Match the nth send with the nth receive, even with uneven peer counts.
+        works = []
+        for batch in _split_p2p_ops(p2p_op_list):
+            op_type = [op.op.__name__ for op in batch]
+            tensors = [op.tensor for op in batch]
+            remote_rank_list = [
+                get_group_rank(group, op.peer) if is_multi_pg else op.peer
+                for op in batch
+            ]
+            works.append(backend.batch_isend_irecv(op_type, tensors, remote_rank_list))
+        return works
 
     def batch_isend_irecv(p2p_op_list):
         if p2p_op_list and p2p_op_list[0].tensor.device.type == "npu":

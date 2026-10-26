@@ -1,11 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import signal
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from areal.utils import torch_npu_compat
+
+
+def test_split_p2p_ops_uneven_peers_preserves_matching_rounds():
+    """Each directed edge keeps its tensor order and agrees on round indices."""
+    sends = SimpleNamespace(__name__="isend")
+    recvs = SimpleNamespace(__name__="irecv")
+    edges = {(0, 2): 5, (0, 3): 2, (1, 2): 1, (1, 3): 4, (2, 0): 3}
+    schedules = {}
+    for rank in range(4):
+        ops = []
+        for (src, dst), count in edges.items():
+            for index in range(count):
+                if rank == src:
+                    ops.append(
+                        SimpleNamespace(op=sends, peer=dst, tensor=(src, dst, index))
+                    )
+                if rank == dst:
+                    ops.append(
+                        SimpleNamespace(op=recvs, peer=src, tensor=(src, dst, index))
+                    )
+        rounds = torch_npu_compat._split_p2p_ops(ops)
+        assert sum(map(len, rounds)) == len(ops)
+        for index, batch in enumerate(rounds):
+            keys = [(op.op.__name__, op.peer) for op in batch]
+            assert len(keys) == len(set(keys))
+            for op in batch:
+                assert op.tensor[2] == index
+                schedules[rank, op.tensor] = index
+    for (src, dst), count in edges.items():
+        for index in range(count):
+            assert (
+                schedules[src, (src, dst, index)] == schedules[dst, (src, dst, index)]
+            )
+
+
+def test_split_p2p_ops_unique_peers_keeps_one_batch():
+    """Warmup and mixed send/receive pairs need no extra HCCL calls."""
+    ops = [
+        SimpleNamespace(op=SimpleNamespace(__name__=direction), peer=peer)
+        for direction, peer in [("isend", 1), ("irecv", 1), ("isend", 2)]
+    ]
+    assert torch_npu_compat._split_p2p_ops(ops) == [ops]
+    assert torch_npu_compat._split_p2p_ops([]) == []
 
 
 def _mock_signal_state(monkeypatch):

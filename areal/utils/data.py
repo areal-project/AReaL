@@ -4,8 +4,9 @@
 # Copyright (c) 2023, Tri Dao.
 
 import copy
+import math
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -422,6 +423,7 @@ class TrajBatchMeta:
     n_trajs: int
     traj_group_sizes: list[int]
     traj_seqlens: list[int]
+    rollout_rewards: list[list[float | None] | None] = field(default_factory=list)
 
 
 def concat_batch(
@@ -431,21 +433,26 @@ def concat_batch(
     assert isinstance(data, list) and all(isinstance(d, dict) for d in data), (
         f"Expected list[dict], got {type(data)}"
     )
-    traj_group_sizes = []
-    for d in data:
-        first_tensor = next(
-            (v for v in d.values() if isinstance(v, torch.Tensor)), None
-        )
-        traj_group_sizes.append(
-            first_tensor.shape[0] if first_tensor is not None else 1
-        )
+    traj_group_sizes = [get_batch_size(d) for d in data]
+    rollout_rewards = [d.get("rollout_rewards") for d in data]
+    for rewards, rows in zip(rollout_rewards, traj_group_sizes):
+        if rewards is not None:
+            if not isinstance(rewards, list) or len(rewards) != rows:
+                raise ValueError("rollout_rewards must contain one reference per row")
+            if any(
+                r is not None and (type(r) not in (int, float) or not math.isfinite(r))
+                for r in rewards
+            ):
+                raise ValueError("rollout_reward must be finite")
     traj_seqlens = [d["attention_mask"].shape[-1] for d in data]
     meta = TrajBatchMeta(
         n_trajs=len(data),
         traj_group_sizes=traj_group_sizes,
         traj_seqlens=traj_seqlens,
+        rollout_rewards=rollout_rewards,
     )
-    return concat_padded_tensors(data), meta
+    tensors = [{k: v for k, v in d.items() if k != "rollout_rewards"} for d in data]
+    return concat_padded_tensors(tensors), meta
 
 
 def split_batch(
@@ -453,9 +460,14 @@ def split_batch(
     meta: TrajBatchMeta,
 ) -> list[Any] | None:
     """Inverse of concat_batch: split batched result back into per-trajectory list."""
-    return split_and_unpad_tensor(
+    split = split_and_unpad_tensor(
         result, meta.n_trajs, meta.traj_group_sizes, meta.traj_seqlens
     )
+    if isinstance(result, dict):
+        for item, rewards in zip(split, meta.rollout_rewards):
+            if rewards is not None:
+                item["rollout_rewards"] = rewards
+    return split
 
 
 def batched_call(
@@ -544,6 +556,44 @@ def allocate_balanced_mbs_synced(
     return allocate_balanced_mbs_synced(
         MicroBatchSpec.new(mb_spec, n_mbs=max(all_n_mbs)), lens, group=group
     )
+
+
+def split_training_batch_into_microbatches(
+    data: dict[str, Any],
+    n_mbs: int,
+    group: dist.ProcessGroup | None = None,
+) -> list[dict[str, Any]]:
+    """Split rows into common optimizer steps backed by real data on every rank.
+
+    Unlike transport padding, capping the step count by the smallest DP shard
+    needs no extra model forwards. Loss preparation uses the realized schedule
+    length. Prepared trajectory/prompt modes retain full-update coefficients
+    when the step count is capped.
+    """
+    if n_mbs < 1:
+        raise ValueError(f"n_mbs must be positive, got {n_mbs}")
+    batch_size = get_batch_size(data)
+    if dist.is_initialized():
+        device = (
+            "cpu"
+            if dist.get_backend(group) == "gloo"
+            else current_platform.current_device()
+        )
+        minimum_rows = torch.tensor(batch_size, dtype=torch.int64, device=device)
+        dist.all_reduce(minimum_rows, op=dist.ReduceOp.MIN, group=group)
+        batch_size = int(minimum_rows.cpu())
+    if batch_size < 1:
+        raise ValueError("Cannot split an empty training batch")
+    effective_n_mbs = min(n_mbs, batch_size)
+    if effective_n_mbs < n_mbs:
+        logger.warning(
+            "Reducing PPO minibatches from %d to %d to keep real rows on every DP rank",
+            n_mbs,
+            effective_n_mbs,
+        )
+    return split_padded_tensor_dict_into_mb_list(
+        data, MicroBatchSpec(n_mbs=effective_n_mbs), group=group
+    ).mbs
 
 
 def all_gather_int(value: int, group):
@@ -1484,13 +1534,131 @@ def cycle_dataloader(dataloader: StatefulDataLoader, num_cycles: int = -1):
             break
 
 
+def normalize_rollout_rewards(
+    row_rewards: torch.Tensor,
+    norm: "Normalization",
+    meta: TrajBatchMeta,
+    *,
+    reward_bias: float = 0.0,
+    reward_scaling: float = 1.0,
+    reward_clip: float = float("inf"),
+    unpenalized_rewards: torch.Tensor | None = None,
+    normalization_rewards: torch.Tensor | None = None,
+    require_shaped_references: bool = False,
+    traj_starts: torch.Tensor | None = None,
+    reduce_group=None,
+) -> torch.Tensor:
+    """Normalize row scores against one reference per logical rollout.
+
+    Shaped ``normalization_rewards``, when supplied, override raw references.
+    ``traj_starts`` defines membership; references remain row-aligned in metadata.
+    Explicit references bypass row-length penalties; all scores share the
+    actor's bias, scaling and clipping. Missing references require equal rows
+    or shared unpenalized rewards for split trajectories.
+    """
+    scores = ((row_rewards + reward_bias) * reward_scaling).clamp(
+        min=-reward_clip, max=reward_clip
+    )
+    if norm.mean_level is None and norm.std_level is None:
+        return scores.float()
+    if row_rewards.ndim != 1:
+        raise ValueError("row_rewards must contain one value per row")
+    if traj_starts is None:
+        traj_starts = torch.ones_like(row_rewards, dtype=torch.int64)
+    traj_starts = traj_starts.reshape(-1)
+    if traj_starts.shape != row_rewards.shape:
+        raise ValueError("traj_starts must match row_rewards")
+    if traj_starts[0] == 0:
+        raise ValueError("the first row must begin a trajectory")
+    starts = traj_starts.nonzero(as_tuple=True)[0]
+    member = traj_starts.long().cumsum(0) - 1
+    repeats = torch.cat((starts[1:], starts.new_tensor([row_rewards.numel()]))) - starts
+    group_sizes = meta.traj_group_sizes
+    group_slices = norm._build_group_slices(row_rewards.numel(), group_sizes)
+    boundaries = torch.tensor(
+        [s.start for s in group_slices] + [row_rewards.numel()],
+        dtype=torch.long,
+        device=starts.device,
+    )
+    if not torch.all(traj_starts[boundaries[:-1]] != 0):
+        raise ValueError("the first row of each group must begin a trajectory")
+    group_sizes = torch.searchsorted(starts, boundaries).diff().cpu().tolist()
+    explicit: list[float | None] = []
+    groups = meta.rollout_rewards
+    for group, rows in zip(groups, meta.traj_group_sizes):
+        explicit.extend(group if group is not None else [None] * rows)
+    supplied = torch.tensor(
+        [r is not None for r in explicit], device=row_rewards.device, dtype=torch.bool
+    )[starts]
+    row_reference = scores.new_tensor([r if r is not None else 0.0 for r in explicit])
+    reference = torch.where(supplied, row_reference[starts], row_rewards[starts])
+    # Retain the existing reference policy for rows without an explicit outcome.
+    original = row_rewards if unpenalized_rewards is None else unpenalized_rewards
+    if unpenalized_rewards is not None:
+        reference = torch.where(
+            ~supplied & (repeats > 1), unpenalized_rewards[starts], reference
+        )
+    if normalization_rewards is not None:
+        if not isinstance(normalization_rewards, torch.Tensor):
+            raise TypeError("normalization_rewards must be a tensor")
+        if (
+            normalization_rewards.shape != reference.shape
+            or normalization_rewards.device != row_rewards.device
+        ):
+            raise ValueError(
+                "normalization_rewards must match the logical rollout count and reward device"
+            )
+        if not torch.is_floating_point(normalization_rewards):
+            raise TypeError("normalization_rewards must be floating-point")
+        torch._assert_async(
+            torch.all(torch.isfinite(normalization_rewards)),
+            "normalization_rewards must be finite",
+        )
+        reference = normalization_rewards
+        invalid_reference = torch.zeros((), dtype=torch.bool, device=row_rewards.device)
+    else:
+        original_scores = ((original + reward_bias) * reward_scaling).clamp(
+            min=-reward_clip, max=reward_clip
+        )
+        equal_rows = original_scores == original_scores[starts][member]
+        invalid_reference = torch.any(~supplied[member] & ~equal_rows)
+        row_reference = ((row_reference + reward_bias) * reward_scaling).clamp(
+            min=-reward_clip, max=reward_clip
+        )
+        invalid_reference |= torch.any(~torch.isfinite(row_reference))
+        if require_shaped_references:
+            invalid_reference |= supplied.any()
+    if dist.is_initialized() and (
+        norm.mean_level == "batch" or norm.std_level == "batch"
+    ):
+        dist.all_reduce(invalid_reference, op=dist.ReduceOp.MAX, group=reduce_group)
+    torch._assert_async(
+        ~invalid_reference,
+        "Split rollout row rewards differ; supply an explicit rollout_reward "
+        "for reward normalization. Custom outcome shaping of explicit references "
+        "requires normalization_rewards.",
+    )
+    reference = ((reference + reward_bias) * reward_scaling).clamp(
+        min=-reward_clip, max=reward_clip
+    )
+    mean, scale = norm.affine_parameters(
+        reference,
+        group_sizes=group_sizes,
+        reduce_group=reduce_group,
+    )
+    if norm.std_level is not None:
+        # affine_parameters includes epsilon in the divisor.
+        scale = torch.where(scale <= 2 * norm.eps, 1.0, scale)
+    return ((scores - mean[member]) / scale[member]).float()
+
+
 class Normalization:
     """
     Adaptive normalization with different levels.
 
     Supports independent specification of normalization level for mean and std:
     - "batch": normalize across entire batch (with optional all_reduce in distributed setting)
-    - "group": normalize within fixed-size groups
+    - "group": normalize within groups (explicit sizes or fixed-size fallback)
     - None: no centering or no std scaling
     """
 
@@ -1502,6 +1670,37 @@ class Normalization:
         self.group_size = config.group_size
         self.eps = config.eps
 
+    def _build_group_slices(
+        self, bs: int, group_sizes: list[int] | None
+    ) -> list[slice]:
+        """Build slices for group-level normalization.
+
+        When ``group_sizes`` (e.g. ``[8, 7, 8, ...]``) is provided it gives
+        the actual sample count of each trajectory group, handling variable-size
+        groups that arise when some rollout samples fail / are filtered. A fixed
+        ``group_size`` slice would otherwise straddle two groups, or leave a tail
+        of sequences whose std stays 0 → advantage blows up to (reward-mean)/eps.
+        When *None*, fall back to fixed-``group_size`` slicing.
+        """
+        if group_sizes is not None:
+            if any(sz <= 0 for sz in group_sizes):
+                raise ValueError(f"group_sizes must be all positive, got {group_sizes}")
+            if sum(group_sizes) != bs:
+                raise ValueError(
+                    f"group_sizes sum ({sum(group_sizes)}) must equal "
+                    f"batch size ({bs}), got {group_sizes}"
+                )
+            slices: list[slice] = []
+            offset = 0
+            for sz in group_sizes:
+                slices.append(slice(offset, offset + sz))
+                offset += sz
+            return slices
+        return [
+            slice(start, min(start + self.group_size, bs))
+            for start in range(0, bs, self.group_size)
+        ]
+
     @torch.no_grad()
     def __call__(
         self,
@@ -1509,13 +1708,57 @@ class Normalization:
         loss_mask: torch.Tensor | None = None,
         high_precision: bool = True,
         reduce_group=None,
+        traj_starts: torch.Tensor | None = None,
+        group_sizes: list[int] | None = None,
+        unpenalized_rewards: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Normalize row values while preserving their trajectory references.
+
+        ``group_sizes`` counts rows in each prompt. ``unpenalized_rewards``
+        supplies shared pre-penalty row rewards for split trajectories; singleton
+        trajectories retain their ordinary penalized-reward statistics.
+        """
+        if traj_starts is not None:
+            return self._normalize_per_trajectory(
+                x,
+                traj_starts,
+                high_precision=high_precision,
+                reduce_group=reduce_group,
+                group_sizes=group_sizes,
+                unpenalized_rewards=unpenalized_rewards,
+            )
+        if loss_mask is not None and loss_mask.sum().item() == 0:
+            return x.float()
+        mean, scale = self.affine_parameters(
+            x,
+            loss_mask,
+            high_precision,
+            reduce_group,
+            group_sizes,
+        )
+        centered = x - mean
+        if loss_mask is not None:
+            centered = centered * loss_mask
+        return (centered / scale).float()
+
+    @torch.no_grad()
+    def affine_parameters(
+        self,
+        x: torch.Tensor,
+        loss_mask: torch.Tensor | None = None,
+        high_precision: bool = True,
+        reduce_group=None,
+        group_sizes: list[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the baseline and divisor, retaining masked token statistics."""
         bs = x.size(0)
         eps = self.eps
 
-        # Early return if no elements are active (all masked out)
-        if loss_mask is not None and loss_mask.sum().item() == 0:
-            return x.float()
+        group_slices = (
+            self._build_group_slices(bs, group_sizes)
+            if self.mean_level == "group" or self.std_level == "group"
+            else []
+        )
 
         # Step 1: Compute mean
         if self.mean_level == "batch":
@@ -1530,13 +1773,15 @@ class Normalization:
             mean = mean.expand_as(x)
         elif self.mean_level == "group":
             mean = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for s in group_slices:
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
+                group_size = (
+                    self.group_size if group_sizes is None else s.stop - s.start
+                )
 
                 # Special case: with group_size=1 and leave_one_out=True, mean should be 0
-                if self.group_size == 1 and self.mean_leave1out:
+                if group_size == 1 and self.mean_leave1out:
                     dtype = torch.float64 if high_precision else torch.float32
                     group_mean = torch.zeros(
                         (1, *xx.shape[1:]), dtype=dtype, device=xx.device
@@ -1554,12 +1799,6 @@ class Normalization:
         else:  # mean_level == "none"
             mean = torch.zeros_like(x)
 
-        # Subtract mean
-        x_centered = x - mean
-        # mask unrelevant elements as 0
-        if loss_mask is not None:
-            x_centered = x_centered * loss_mask
-
         # Step 2: Compute std
         if self.std_level == "batch":
             std = self._compute_std(
@@ -1574,14 +1813,16 @@ class Normalization:
             std = std.expand_as(x)
         elif self.std_level == "group":
             std = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for s in group_slices:
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
                 group_mean_slice = mean[s]  # already computed and expanded
+                group_size = (
+                    self.group_size if group_sizes is None else s.stop - s.start
+                )
 
                 # Special case: with group_size=1 and std_unbiased=True, std should be 1 for numerical stability
-                if self.group_size == 1 and self.std_unbiased:
+                if group_size == 1 and self.std_unbiased:
                     dtype = torch.float64 if high_precision else torch.float32
                     group_std = torch.ones(
                         (1, *xx.shape[1:]), dtype=dtype, device=xx.device
@@ -1601,8 +1842,94 @@ class Normalization:
             std = torch.ones_like(x)
             eps = 0.0
 
-        # Normalize
-        return (x_centered / (std + eps)).float()
+        return mean, std + eps
+
+    @torch.no_grad()
+    def _normalize_per_trajectory(
+        self,
+        x: torch.Tensor,
+        traj_starts: torch.Tensor,
+        high_precision: bool = True,
+        reduce_group=None,
+        group_sizes: list[int] | None = None,
+        unpenalized_rewards: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute logical reward statistics, then transform each row separately.
+
+        Split trajectories share an outcome reward before row-length penalties.
+        Use that reward as their reference, so a penalty on any branch neither
+        disappears nor changes the reference according to which row comes first.
+        Single-row trajectories keep their existing penalized-reward reference.
+        """
+        if x.ndim != 1:
+            raise ValueError(
+                "traj_starts expects one value per row, i.e. a 1D tensor, "
+                f"got shape {tuple(x.shape)}"
+            )
+        traj_starts = traj_starts.reshape(-1)
+        if traj_starts.shape[0] != x.shape[0]:
+            raise ValueError(
+                f"traj_starts has {traj_starts.shape[0]} entries but x has "
+                f"{x.shape[0]} rows; they must match one-to-one"
+            )
+        if traj_starts[0] == 0:
+            raise ValueError(
+                "the first row must begin a trajectory, but traj_starts[0] is 0"
+            )
+        # cumsum turns the start markers into a trajectory index per row:
+        # starts [1,1,1,0,0,1] -> [0,1,2,2,2,3]
+        row_to_traj = traj_starts.long().cumsum(0) - 1
+        first_rows = traj_starts.nonzero(as_tuple=True)[0]
+        if group_sizes is not None:
+            group_slices = self._build_group_slices(x.size(0), group_sizes)
+            boundaries = torch.tensor(
+                [s.start for s in group_slices] + [x.size(0)],
+                dtype=torch.long,
+                device=first_rows.device,
+            )
+            if not torch.all(traj_starts[boundaries[:-1]] != 0):
+                raise ValueError("the first row of each group must begin a trajectory")
+            # Count trajectories within each original prompt, not fixed-size
+            # windows over the concatenated trajectory rewards.
+            group_sizes = (
+                torch.searchsorted(first_rows, boundaries).diff().cpu().tolist()
+            )
+        if self.mean_level is None and self.std_level is None:
+            return x.float()
+        reference = x[first_rows]
+        original = x if unpenalized_rewards is None else unpenalized_rewards
+        invalid_reference = torch.any(original != original[first_rows][row_to_traj])
+        if dist.is_initialized() and (
+            self.mean_level == "batch" or self.std_level == "batch"
+        ):
+            dist.all_reduce(invalid_reference, op=dist.ReduceOp.MAX, group=reduce_group)
+        torch._assert_async(
+            ~invalid_reference,
+            "Split trajectory row rewards differ; supply shared unpenalized_rewards "
+            "for reward normalization.",
+        )
+        if unpenalized_rewards is not None:
+            row_counts = (
+                torch.cat((first_rows[1:], first_rows.new_tensor([x.numel()])))
+                - first_rows
+            )
+            reference = torch.where(row_counts > 1, original[first_rows], reference)
+        mean, scale = self.affine_parameters(
+            reference,
+            high_precision=high_precision,
+            reduce_group=reduce_group,
+            group_sizes=group_sizes,
+        )
+        if self.std_level is not None and unpenalized_rewards is not None:
+            adjusted = torch.zeros_like(reference, dtype=torch.int64)
+            adjusted.scatter_add_(
+                0, row_to_traj, (x != reference[row_to_traj]).to(torch.int64)
+            )
+            # affine_parameters includes epsilon in the divisor. Only split
+            # references can differ from row scores; retain ordinary singleton
+            # and unmodified-row behavior when the reference variance is tiny.
+            scale = torch.where((scale <= 2 * self.eps) & (adjusted > 0), 1.0, scale)
+        return ((x - mean[row_to_traj]) / scale[row_to_traj]).float()
 
     @staticmethod
     def _compute_mean(

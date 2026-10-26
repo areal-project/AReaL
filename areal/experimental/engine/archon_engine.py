@@ -967,6 +967,7 @@ class ArchonEngine(TrainEngine):
         self, mb_item: MicroBatchItem
     ) -> tuple[dict[str, Any], ArchonTrainContext]:
         inputs = dict(mb_item.padded_mb)
+        inputs.pop("unit_weights", None)
 
         # Extract trie_node for tree training (if present)
         trie_node = inputs.pop("trie_node", None)

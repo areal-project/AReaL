@@ -213,6 +213,16 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         finally:
             self._shared_tensor_resolver.discard(group_id)
 
+    def _set_individual_rollout_reward(
+        self, interactions: dict[str, InteractionWithTokenLogpReward]
+    ) -> None:
+        """Use the terminal reward as the individual export's default reference."""
+        if self.export_style == "individual" and all(
+            interaction.rollout_reward is None for interaction in interactions.values()
+        ):
+            last = interactions[next(reversed(interactions))]
+            last.rollout_reward = last.reward
+
     @session_context()
     async def arun_episode(
         self, engine: TRolloutEngine, data: dict[str, Any]
@@ -261,6 +271,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 )
                 return None
 
+            self._set_individual_rollout_reward(interactions)
             _log_interaction_reward_metrics(interactions, data)
             return interactions
 
@@ -303,6 +314,14 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             style=self.export_style,
         )
 
+        if not interactions:
+            logger.warning(
+                "Task %s exported no usable interactions; trajectory will be rejected.",
+                task_id,
+            )
+            return None
+
+        self._set_individual_rollout_reward(interactions)
         _log_interaction_reward_metrics(interactions, data)
 
         return interactions

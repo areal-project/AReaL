@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import warnings
 from dataclasses import MISSING as dataclass_missing
@@ -1753,6 +1754,37 @@ class PPOActorConfig(TrainEngineConfig):
         },
     )
 
+    loss_aggregation: str = field(
+        default="token-mean",
+        metadata={
+            "help": "Policy-gradient loss reduction. "
+            "'token-mean': average over valid tokens. "
+            "'seq-mean': average per-response token means. "
+            "'traj-mean': average per-trajectory token means, so an agent "
+            "rollout exported as several rows still counts once. "
+            "'prompt-mean': give every rollout group weight one and pool its "
+            "tokens, so a longer rollout weighs more inside its group. "
+            "Prompt boundaries come from rollout batch metadata. "
+            "'constant': average each response's masked token sum divided by "
+            "loss_aggregation_divisor. Non-token modes require sequence "
+            "boundaries; tree-packed actor training currently supports only "
+            "'token-mean'.",
+            "choices": [
+                "token-mean",
+                "seq-mean",
+                "traj-mean",
+                "prompt-mean",
+                "constant",
+            ],
+        },
+    )
+    loss_aggregation_divisor: float | None = field(
+        default=None,
+        metadata={
+            "help": "Positive fixed denominator L for loss_aggregation='constant'. "
+            "Unused by other loss aggregation modes.",
+        },
+    )
     # Logging Agent Trajectories
     log_agent_stats: bool = field(
         default=False,
@@ -1783,6 +1815,39 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if self.loss_aggregation not in (
+            "token-mean",
+            "seq-mean",
+            "traj-mean",
+            "prompt-mean",
+            "constant",
+        ):
+            raise ValueError(
+                "loss_aggregation must be 'token-mean', 'seq-mean', "
+                f"'traj-mean', 'prompt-mean', or 'constant', got "
+                f"{self.loss_aggregation!r}."
+            )
+        if self.loss_aggregation == "constant":
+            if (
+                self.loss_aggregation_divisor is None
+                or not math.isfinite(self.loss_aggregation_divisor)
+                or self.loss_aggregation_divisor <= 0
+            ):
+                raise ValueError(
+                    "loss_aggregation_divisor must be a positive finite value "
+                    "when loss_aggregation='constant'."
+                )
+        elif self.loss_aggregation_divisor is not None:
+            raise ValueError(
+                "loss_aggregation_divisor is only used when "
+                "loss_aggregation='constant'."
+            )
+        if self.enable_tree_training and self.loss_aggregation != "token-mean":
+            raise ValueError(
+                f"loss_aggregation={self.loss_aggregation!r} needs per-sequence "
+                "boundaries, which tree-packed batches do not carry; tree "
+                "training supports only 'token-mean'."
+            )
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
         if not self.use_decoupled_loss and self.rejection_sampling is not None:
             logger.warning(

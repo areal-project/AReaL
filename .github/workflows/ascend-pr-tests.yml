@@ -369,6 +369,8 @@ jobs:
             -m skipif tests/test_reassemble_cp_logprobs.py
           collect_base_tests megatron-distributed \
             tests/test_megatron_engine_distributed.py
+          collect_base_tests megatron-loss-aggregation \
+            tests/test_megatron_loss_aggregation.py
           collect_base_tests lock tests/test_lock.py
           collect_base_tests perf-tracer tests/test_perf_tracer.py
           collect_base_tests ulysses tests/test_ulysses.py
@@ -712,6 +714,62 @@ jobs:
               megatron-bridge-vision-cp \
               6,7 \
               tests/test_megatron_bridge_vision_cp.py::test_vision_cp_allgather_backward_hccl
+            wait_for_normal_wave
+
+            local loss_selector=tests/test_megatron_loss_aggregation.py::test_real_mcore_loss_aggregation_gradients
+            local loss_check
+
+            # Four-device cases: two concurrent tasks per wave.
+            for loss_check in main auxiliary; do
+              start_normal_test \
+                "megatron-loss-aggregation-legacy-${loss_check}-d2c2" \
+                0,1,2,3 \
+                "${loss_selector}[legacy-${loss_check}-2-2]"
+              start_normal_test \
+                "megatron-loss-aggregation-update-protocol-${loss_check}-d2c2" \
+                4,5,6,7 \
+                "${loss_selector}[update-protocol-${loss_check}-2-2]"
+              wait_for_normal_wave
+            done
+
+            # Two-device cases: four concurrent tasks per wave.
+            for loss_check in main auxiliary; do
+              start_normal_test \
+                "megatron-loss-aggregation-legacy-${loss_check}-d2c1" \
+                0,1 \
+                "${loss_selector}[legacy-${loss_check}-2-1]"
+              start_normal_test \
+                "megatron-loss-aggregation-legacy-${loss_check}-d1c2" \
+                2,3 \
+                "${loss_selector}[legacy-${loss_check}-1-2]"
+              start_normal_test \
+                "megatron-loss-aggregation-update-protocol-${loss_check}-d2c1" \
+                4,5 \
+                "${loss_selector}[update-protocol-${loss_check}-2-1]"
+              start_normal_test \
+                "megatron-loss-aggregation-update-protocol-${loss_check}-d1c2" \
+                6,7 \
+                "${loss_selector}[update-protocol-${loss_check}-1-2]"
+              wait_for_normal_wave
+            done
+
+            # The remaining four single-device cases share the final wave.
+            start_normal_test \
+              megatron-loss-aggregation-legacy-main-d1c1 \
+              0 \
+              "${loss_selector}[legacy-main-1-1]"
+            start_normal_test \
+              megatron-loss-aggregation-legacy-auxiliary-d1c1 \
+              1 \
+              "${loss_selector}[legacy-auxiliary-1-1]"
+            start_normal_test \
+              megatron-loss-aggregation-update-protocol-main-d1c1 \
+              2 \
+              "${loss_selector}[update-protocol-main-1-1]"
+            start_normal_test \
+              megatron-loss-aggregation-update-protocol-auxiliary-d1c1 \
+              3 \
+              "${loss_selector}[update-protocol-auxiliary-1-1]"
             wait_for_normal_wave
 
             return "${failed}"
