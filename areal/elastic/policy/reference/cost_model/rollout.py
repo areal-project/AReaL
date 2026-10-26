@@ -94,14 +94,25 @@ class ExpertRolloutModel:
     runtime_revision: str
     calibration: tuple[PhaseCalibration, ...] = ()
     version: str = "expert-rollout-v1"
+    calibration_scope: Literal["deployment", "replica"] = "deployment"
+    separate_phases: bool = False
+    timing_boundary: str = ""
+    execution_identity: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "calibration", tuple(self.calibration))
         if not self.version or not self.runtime_revision:
             raise ValueError("Model version is required")
+        if (
+            self.calibration_scope not in {"deployment", "replica"}
+            or type(self.separate_phases) is not bool
+        ):
+            raise ValueError("Unknown service calibration identity")
 
     def profile_key(self, config: RolloutConfig) -> str:
-        return fingerprint(
+        if self.calibration_scope == "replica":
+            config = replace(config, replicas=1)
+        identity = (
             code_revision(),
             self.version,
             self.runtime_revision,
@@ -110,6 +121,13 @@ class ExpertRolloutModel:
             self.rates,
             config,
         )
+        if self.calibration_scope != "deployment" or self.separate_phases:
+            identity += (
+                (self.calibration_scope, self.separate_phases, self.timing_boundary),
+            )
+        if self.execution_identity:
+            identity += (self.execution_identity,)
+        return fingerprint(*identity)
 
     def estimate(
         self,
@@ -136,6 +154,23 @@ class ExpertRolloutModel:
             ("attention_pairs", pairs),
             ("kv_tokens", float(state.kv_tokens)),
         )
+        if self.separate_phases:
+            features += (
+                ("batch_sequences", float(len(slices))),
+                ("query_tokens", float(tokens)),
+                ("max_context_tokens", float(max(s.context_tokens for s in slices))),
+                ("max_query_tokens", float(max(s.query_tokens for s in slices))),
+                (
+                    "kv_bytes_per_token_per_rank",
+                    float(
+                        2
+                        * self.model.layers
+                        * max(1, self.model.kv_heads // config.tp)
+                        * self.model.head_dim
+                        * config.kv_bytes
+                    ),
+                ),
+            )
         if (
             len(slices) > config.max_batch_sequences
             or tokens > config.max_batch_tokens
@@ -153,14 +188,16 @@ class ExpertRolloutModel:
                 kv_after,
             )
         m, tp = self.model, config.tp
-        if m.attention_heads % tp:
+        if m.attention_heads % tp or (m.mlp_type == "dense" and m.kv_heads % tp):
             return ServiceEstimate(
                 profile,
                 Estimate(
                     None,
                     "unsupported",
                     "infeasible",
-                    ("TP must divide query attention heads",),
+                    (
+                        "TP must divide query heads; dense adapter also requires KV heads divisible by TP",
+                    ),
                 ),
                 features,
                 kv_after,
@@ -168,8 +205,14 @@ class ExpertRolloutModel:
         seconds, lower_bound = iteration_cost(
             self.model, self.hardware, self.rates, config, slices, kv_after
         )
+        phase = "mixed" if prefill and decode else "prefill" if prefill else "decode"
         estimate = apply_calibration(
-            seconds, profile, "service", features, self.calibration
+            seconds,
+            profile,
+            phase if self.separate_phases else "service",
+            features,
+            self.calibration,
+            timing_boundary=self.timing_boundary,
         )
         estimate = replace(
             estimate,
@@ -178,7 +221,9 @@ class ExpertRolloutModel:
             else "unknown",
             notes=estimate.notes
             + (
-                "Uniform MoE routing and mixed-batch roofline prior; target service traces required",
+                "Dense mixed-batch roofline prior; target service traces required"
+                if m.mlp_type == "dense"
+                else "Uniform MoE routing and mixed-batch roofline prior; target service traces required",
                 "Queue, external tools and admission latency are excluded",
                 "Weight plus KV memory is a lower bound; temporary buffers are not certified",
             ),

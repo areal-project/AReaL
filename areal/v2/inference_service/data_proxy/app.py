@@ -47,9 +47,14 @@ from areal.utils import logging
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.seeding import derive_deterministic_seed
+from areal.utils.workload_trace import append_trace
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.generation_gate import GenerationGate
 from areal.v2.inference_service.data_proxy.pause import PauseState
+from areal.v2.inference_service.data_proxy.resume_observation import (
+    ResumeObservation,
+    current_observation,
+)
 from areal.v2.inference_service.data_proxy.session import (
     AbortEpisodeRequest,
     EpisodeIdentity,
@@ -471,6 +476,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     app = FastAPI(title="AReaL Data Proxy", lifespan=lifespan)
     app.state.generation_gate = GenerationGate()
+    app.state.resume_observation = ResumeObservation()
     _registered_models: dict[str, dict[str, str | None]] = {}
     source_id = uuid.uuid4().hex
 
@@ -620,7 +626,27 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     async def _create_internal_chat_result(body_json, session, episode=None):
         gate = app.state.generation_gate
+        received = time.monotonic()
         await gate.acquire()
+        observation = app.state.resume_observation.claim(received)
+        collect = bool(os.environ.get("AREAL_ROLLOUT_TRACE_DIR"))
+        if collect and observation is None:
+            admitted = time.monotonic()
+            observation = {
+                "received_monotonic": received,
+                "admitted_monotonic": admitted,
+                "admission_wait_seconds": admitted - received,
+                "backend_attempts": [],
+                "status": "running",
+            }
+        if collect:
+            observation.update(
+                session_id=None if session is None else session.session_id,
+                incarnation_id=None if session is None else session.incarnation_id,
+                episode=episode,
+                received_wall=time.time() - (time.monotonic() - received),
+            )
+        token = current_observation.set(observation)
         streaming = False
         try:
             # Resolve the bridge only after admission: queued calls must use the
@@ -628,12 +654,52 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             result, streaming = await _create_internal_chat_result_ungated(
                 body_json, session, episode
             )
+            if observation is not None:
+                ready = time.monotonic()
+                observation.update(
+                    status="completed",
+                    response_ready_monotonic=ready,
+                    admitted_to_response_seconds=ready
+                    - observation["admitted_monotonic"],
+                )
+                if "armed_monotonic" in observation:
+                    observation["armed_to_response_seconds"] = (
+                        ready - observation["armed_monotonic"]
+                    )
             if streaming:
                 result = GenerationStream(result, None, release_gate=True)
             return result, streaming
+        except BaseException:
+            if observation is not None:
+                observation.update(
+                    status="failed", response_ready_monotonic=time.monotonic()
+                )
+            raise
         finally:
+            current_observation.reset(token)
             if not streaming:
                 await gate.release()
+            if collect:
+                await asyncio.to_thread(append_trace, "model-calls", observation)
+
+    @app.post("/reconfiguration/observe")
+    async def arm_resume_observation(request: Request):
+        _require_admin_key(request, app.state.session_store)
+        body = await request.json()
+        transition_id = body.get("transition_id")
+        if (
+            not isinstance(transition_id, str)
+            or not transition_id
+            or len(transition_id) > 96
+        ):
+            raise HTTPException(400, "Invalid transition identity")
+        app.state.resume_observation.arm(transition_id)
+        return {"status": "armed", "transition_id": transition_id}
+
+    @app.get("/reconfiguration/metrics")
+    async def resume_metrics(request: Request):
+        _require_admin_key(request, app.state.session_store)
+        return app.state.resume_observation.snapshot()
 
     @app.post("/reconfiguration/drain")
     async def drain_generation(request: Request):

@@ -157,3 +157,34 @@ def test_native_dcp_two_four_two_restores_parameters_and_adam(tmp_path, device):
                 )
             }
         )
+
+
+def test_checkpoint_audit_reads_model_adam_and_param_groups_with_bounded_dcp(tmp_path):
+    import torch.distributed.checkpoint as dcp
+
+    from tests.test_elastic_runtime_state import make_engine
+
+    from areal.elastic.control.checkpoint_audit import compare_dcp, compare_runtime
+    from areal.engine.fsdp_utils.checkpoint import DCPState
+    from areal.v2.training_service.checkpoint import _capture, _report
+
+    model = torch.nn.Linear(4, 4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    model(torch.ones(2, 4)).sum().backward()
+    optimizer.step()
+    source, restored = tmp_path / "source", tmp_path / "restored"
+    for path in (source, restored):
+        path.mkdir()
+        dcp.save({"dcp": DCPState(model, optimizer)}, checkpoint_id=path / "dcp")
+    result = compare_dcp(source, restored)
+    assert result["status"] == "exact"
+    assert result["tensor_leaves"] >= 8 and result["value_leaves"] > 0
+    assert any("exp_avg" in key for key in result["fingerprints"])
+    assert any("param_groups" in key for key in result["fingerprints"])
+    engine = make_engine("cpu")
+    engine.world_size = 1
+    state = _capture(engine, "fsdp", "a" * 64)
+    for path in (source, restored):
+        atomic_json(path / "runtime-0.json", state)
+    runtime = compare_runtime(source, restored, [_report(state)])
+    assert runtime["status"] == "exact" and runtime["policy_version"] == 1

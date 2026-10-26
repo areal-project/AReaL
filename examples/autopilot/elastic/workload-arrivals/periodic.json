@@ -1,0 +1,14 @@
+[
+  {"until_s": 100, "rate_per_s": 1.0},
+  {"until_s": 300, "rate_per_s": 0.1},
+  {"until_s": 400, "rate_per_s": 1.0},
+  {"until_s": 600, "rate_per_s": 0.1},
+  {"until_s": 700, "rate_per_s": 1.0},
+  {"until_s": 900, "rate_per_s": 0.1},
+  {"until_s": 1000, "rate_per_s": 1.0},
+  {"until_s": 1200, "rate_per_s": 0.1},
+  {"until_s": 1300, "rate_per_s": 1.0},
+  {"until_s": 1500, "rate_per_s": 0.1},
+  {"until_s": 1600, "rate_per_s": 1.0},
+  {"until_s": 1800, "rate_per_s": 0.1}
+]

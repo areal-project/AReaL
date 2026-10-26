@@ -174,13 +174,17 @@ def test_resource_layout_roundtrip_preserves_cpu_service_and_progress(request):
     manager._actor_pool_setter = setter = MagicMock(
         side_effect=lambda devices: events.append(f"pool-{devices}")
     )
+    rollout.arm_reconfiguration_observation = MagicMock()
+    rollout.reconfiguration_metrics = MagicMock(
+        return_value=[{"proxy": "fixture", "marker": None, "first_call": None}]
+    )
     rollout.drain_model_calls = MagicMock(side_effect=lambda: events.append("drain"))
     rollout.open_model_calls = MagicMock(side_effect=lambda: events.append("open"))
     rollout.stop_inference_replicas = MagicMock(
         side_effect=lambda: events.append("stop-rollout")
     )
     rollout.rebuild_inference_replicas = MagicMock(
-        side_effect=lambda devices: events.append(f"rollout-{devices}")
+        side_effect=lambda devices, **kwargs: events.append(f"rollout-{devices}")
     )
     update(manager, 0)
     original_identity = manager.identity
@@ -231,6 +235,29 @@ def test_resource_layout_roundtrip_preserves_cpu_service_and_progress(request):
         == first
     )
     update(manager, 4)
+    timing = [
+        json.loads(line)
+        for line in (manager.root / "reconfiguration-timing.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    phases = {row["phase"] for row in timing if row["event"] == "phase_end"}
+    assert {
+        "checkpoint",
+        "drain",
+        "actor_release",
+        "rollout_stop",
+        "placement",
+        "actor_start",
+        "actor_restore",
+        "awex_connect",
+        "publish",
+        "application_and_commit",
+        "admission_open",
+    } <= phases
+    assert all(row["seconds"] >= 0 for row in timing if row["event"] == "phase_end")
+    assert any(row["event"] == "first_inference_snapshot" for row in timing)
+    assert rollout.arm_reconfiguration_observation.call_count == 1
     placement = json.loads((manager.latest_path / "actor-layout.json").read_text())
     assert placement["format_version"] == 2
     assert placement["reservation"] == [0, 1, 2, 3, 4]
@@ -288,3 +315,241 @@ def test_resource_device_movement_same_dp_uses_rank_state(request):
     assert manager.actor.restore_plan is None
     assert manager.actor.updates == manager.applied_version == 1
     assert manager.gpu_uuids == ["GPU-3", "GPU-4"]
+
+
+@pytest.mark.parametrize("native_lifecycle", [(4, 4)], indirect=True)
+def test_native_joint_planner_synthetic_trace_roundtrip(request, tmp_path):
+    """Real optimizer/SQLite/native transactions; synthetic costs and GPU workers."""
+    from dataclasses import asdict, replace
+    from unittest.mock import MagicMock
+
+    from tests.test_elastic_lifecycle_optimizer import joint_simulator
+
+    from areal.elastic.contracts import BatchWorkload, TrainingConfig, WorkloadStats
+    from areal.elastic.control.resource_reconfiguration import ResourceLayout
+    from areal.elastic.policy.basic import (
+        JointBatch,
+        JointConfig,
+        JointOptimizer,
+        JointPolicy,
+        JointScenario,
+        RolloutConfig,
+        RolloutStage,
+        RolloutWorkload,
+    )
+    from areal.elastic.policy.basic.actor_cost import ActorPrediction
+    from areal.elastic.policy.native_joint import JointPlacement, NativeJointPlanner
+    from areal.utils.atomic import atomic_json
+
+    fixture = request.getfixturevalue("native_lifecycle")
+    manager = fixture.manager
+    manager._actor_pool_setter = MagicMock()
+    fixture.rollout.resource_reconfiguration_enabled = True
+    for method in (
+        "drain_model_calls",
+        "open_model_calls",
+        "stop_inference_replicas",
+        "rebuild_inference_replicas",
+    ):
+        setattr(fixture.rollout, method, MagicMock())
+
+    placements = tuple(
+        JointPlacement(
+            JointConfig(
+                TrainingConfig(actor),
+                RolloutConfig(
+                    "synthetic-model",
+                    "synthetic-gpu",
+                    "synthetic-runtime",
+                    "fixed-sampling",
+                    5 - actor,
+                    1,
+                    8,
+                    32768,
+                    32768,
+                    3,
+                ),
+            ),
+            ResourceLayout(actor, tuple(range(actor)), tuple(range(actor, 5))),
+        )
+        for actor in (4, 2, 3)
+    )
+    configs = tuple(p.config for p in placements)
+    simulator = joint_simulator(configs, switch=2, publish=0.1, checkpoint=0.2)
+    simulator.rollout = replace(
+        simulator.rollout,
+        profiles=tuple(
+            replace(
+                p,
+                prefill_tokens_per_second=100000,
+                max_tokens=100000,
+                max_request_tokens=32768,
+            )
+            for p in simulator.rollout.profiles
+        ),
+    )
+
+    class SyntheticActor:
+        def actor_config(self, config):
+            return config
+
+        def predict(self, config, stats):
+            return ActorPrediction(
+                (("train_step", stats.sequence_tokens / (100 * config.world_size)),),
+                False,
+                ("Synthetic linear Actor throughput; not measured",),
+            )
+
+    simulator.actors = SyntheticActor()
+    trace = []
+
+    def forecast(owner):
+        # Each of four episodes has two sequential requests separated by a tool.
+        # These future lengths/outcomes are synthetic inputs, not online facts.
+        heavy = owner.applied_version < 3
+        prefill, decode, tool = (16, 600, 5) if heavy else (4000, 1, 20)
+        prompts = (prefill, prefill + decode + 16)
+        lengths = tuple(p + decode for _ in range(4) for p in prompts)
+        stats = WorkloadStats(
+            8,
+            sum(lengths),
+            loss_tokens=8 * decode,
+            sequence_lengths=lengths,
+            trajectory_group_sizes=(2,) * 4,
+        )
+        batch = JointBatch(
+            BatchWorkload(4, 8 * decode, sum(lengths), actor_stats=stats),
+            RolloutWorkload(
+                tuple(
+                    RolloutStage(4 * p, 4 * decode, tool if i == 0 else 0, 4)
+                    for i, p in enumerate(prompts)
+                ),
+                8,
+                max(lengths),
+            ),
+            4,
+        )
+        current = next(
+            p.config for p in placements if p.layout == owner.resource_layout
+        )
+        scenario = JointScenario(
+            (batch,),
+            current,
+            1,
+            owner.inbox.max_staleness,
+            4,
+            4,
+            5,
+            provider_version=owner.applied_version,
+            accepted_batches=owner.applied_version,
+            checkpoint_every=1,
+        )
+        trace.append(
+            {
+                "observed_version": owner.applied_version,
+                "episodes": [
+                    {
+                        "episode_id": f"synthetic-{owner.applied_version}-{i}",
+                        "requests": [
+                            {
+                                "prefill_tokens": p,
+                                "decode_tokens": decode,
+                                "tool_after_seconds": tool if j == 0 else 0,
+                            }
+                            for j, p in enumerate(prompts)
+                        ],
+                    }
+                    for i in range(4)
+                ],
+                "scenario": asdict(scenario),
+            }
+        )
+        return scenario
+
+    planner = NativeJointPlanner(
+        JointPolicy(simulator, JointOptimizer(configs)),
+        placements,
+        model_id="synthetic-linear-v1",
+        forecast_source="handcrafted-two-turn-trace-v1",
+        forecast=forecast,
+    )
+    manager.resource_planner = planner
+    # A real native protocol update is needed before any topology change.
+    update(manager, 0)
+    decisions = []
+    identity = manager.identity
+    for index, (status, actor, rollout) in enumerate(
+        (("applied", 2, 3), ("unchanged", 2, 3), ("applied", 4, 1))
+    ):
+        cursor = manager.consumer.cursor.copy()
+        progress = manager.data_progress.copy()
+        assert manager._poll_batch() is None
+        decision = planner.last_result
+        decisions.append(decision)
+        assert decision["status"] == status
+        assert manager.resource_layout.world_size == actor
+        assert len(manager.resource_layout.rollout_devices) == rollout
+        assert manager.consumer.cursor == cursor and manager.data_progress == progress
+        assert manager.inbox.status()["admission_open"]
+        assert len(decision["excluded"]) == 1  # DP3 cannot divide batch4.
+        assert decision["search"]["unevaluated"] == 0
+        if status == "applied":
+            receipt = decision["receipt"]
+            assert receipt["request"]["policy_bundle_id"].startswith("native-joint-")
+            assert receipt["actual"]["weights_version"] == index + 1
+        # Repeated polling at the same version must not rerun the provider/search.
+        assert manager._poll_batch() is None and len(trace) == index + 1
+        update(manager, (index + 1) * 4)
+        assert manager.applied_version == index + 2
+    assert manager.identity == identity
+    assert manager.consumer.cursor["applied_batches"] == 4
+    assert manager.data_progress == {"samples": 16, "effective_tokens": 32}
+    assert manager.resource_config_application.state()["generation"] == 2
+    fixture.rollout.stop_inference_replicas.assert_called()
+    assert fixture.rollout.stop_inference_replicas.call_count == 2
+    atomic_json(
+        tmp_path / "synthetic-trace.json",
+        {
+            "evidence": "synthetic forecasts and GPU workers; real CPU control protocol",
+            "trace": trace,
+            "decisions": decisions,
+            "final": {
+                "updates": manager.applied_version,
+                "cursor": manager.consumer.cursor,
+                "data_progress": manager.data_progress,
+                "config_generation": 2,
+            },
+        },
+    )
+
+
+@pytest.mark.parametrize("native_lifecycle", [(4, 4)], indirect=True)
+def test_native_joint_boundary_allows_arriving_training_work(request):
+    """Healthy incoming episodes finish admission before the planning fence."""
+    from unittest.mock import MagicMock
+
+    from areal.elastic.policy.native_joint import NativeJointPlanner
+
+    fixture = request.getfixturevalue("native_lifecycle")
+    manager = fixture.manager
+    manager._actor_pool_setter = MagicMock()
+    fixture.rollout.resource_reconfiguration_enabled = True
+    update(manager, 0)
+
+    def arriving_calls():
+        assert manager.inbox.status()["admission_open"]
+        _ready_native_episodes(manager, 4, manager.applied_version)
+
+    fixture.rollout.drain_model_calls = MagicMock(side_effect=arriving_calls)
+    fixture.rollout.open_model_calls = MagicMock()
+    with manager.control_operation():
+        with NativeJointPlanner._quiet_boundary(manager) as quiet:
+            assert not quiet
+            assert manager.inbox.status()["admission_open"]
+            assert manager.inbox.status()["active_credits"] == 4
+    fixture.rollout.open_model_calls.assert_called_once()
+    manager.next_batch()
+    manager.actor.updates += 1
+    _complete_native_update(manager, 2)
+    assert manager.consumer.cursor["applied_batches"] == 2
+    assert manager.data_progress["samples"] == 8

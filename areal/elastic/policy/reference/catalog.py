@@ -8,7 +8,7 @@ import gzip
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -48,10 +48,34 @@ def _hardware(gpu: dict, system: dict, hardware_name: str) -> Hardware:
     return Hardware(**gpu, **system["hardware"])
 
 
+def _validate_placement(
+    config: ExecutionConfig, host: dict, hardware_name: str
+) -> None:
+    if host["hardware_profile"] != hardware_name:
+        raise ValueError("System belongs to another GPU profile")
+    maximum = host["hardware"]["gpus_per_node"] * host["max_nodes"]
+    if len(config.actor_devices + config.rollout_devices) > maximum:
+        raise ValueError("Execution exceeds the system topology/measurement scope")
+    topology = host.get("topology", {})
+    if topology.get("role_node_local"):
+        for role in ("actor", "rollout"):
+            devices = getattr(config, f"{role}_devices")
+            if not set(devices) <= set(topology[f"{role}_devices"]):
+                raise ValueError("Execution devices exceed the system role pool")
+            nodes = {topology["device_nodes"][device] for device in devices}
+            if len(nodes) != 1 or len(devices) > host["hardware"]["gpus_per_node"]:
+                raise ValueError("Each role must remain within one node")
+
+
 def _model(value: dict) -> ModelShape:
     config = value["hf_config"]
-    if value["architecture"] != "qwen3_moe" or config["model_type"] != "qwen3_moe":
-        raise ValueError("This model adapter currently covers qwen3_moe")
+    architecture = value["architecture"]
+    if (
+        architecture not in {"qwen3_moe", "qwen3"}
+        or config["model_type"] != architecture
+    ):
+        raise ValueError("This model adapter covers Qwen3 dense and MoE")
+    dense = architecture == "qwen3"
     if (
         config.get("decoder_sparse_step", 1) != 1
         or config.get("mlp_only_layers")
@@ -64,17 +88,18 @@ def _model(value: dict) -> ModelShape:
         )
     shape = ModelShape(
         config["hidden_size"],
-        config["moe_intermediate_size"],
+        config["intermediate_size"] if dense else config["moe_intermediate_size"],
         config["num_hidden_layers"],
         config["num_attention_heads"],
         config["num_key_value_heads"],
         config["head_dim"],
-        config["num_experts"],
-        config["num_experts_per_tok"],
+        1 if dense else config["num_experts"],
+        1 if dense else config["num_experts_per_tok"],
         config["vocab_size"],
         config["tie_word_embeddings"],
+        "dense" if dense else "moe",
     )
-    if asdict(shape) != value["shape"]:
+    if shape != ModelShape(**value["shape"]):
         raise ValueError("Model dimensions disagree with the archived HF configuration")
     return shape
 
@@ -142,6 +167,42 @@ class AssembledTrial:
     binding: str
 
 
+def _components(
+    profiles: dict, hardware_name: str
+) -> tuple[ExpertActorModel, ExpertRolloutModel]:
+    hardware = _hardware(profiles["hardware"], profiles["system"], hardware_name)
+    model = _model(profiles["model"])
+    actor, rollout = profiles["actor"], profiles["rollout"]
+    raw = ExpertActorModel(
+        model,
+        hardware,
+        actor["runtime_revision"],
+        efficiency=Efficiency(**actor["efficiency"]),
+        group_gbps=tuple(profiles["system"]["group_gbps"]),
+        advantage_model=AggregateAdvantageModel(**actor["advantage"])
+        if actor.get("advantage")
+        else None,
+        dispatch=DispatchConfig(**actor["dispatch"]),
+        fsdp_host_rates=FSDPHostRates(**profiles["system"]["host_rates"])
+        if profiles["system"].get("host_rates")
+        else None,
+        execution_identity=fingerprint(profiles["model"], actor["execution"])
+        if actor.get("execution")
+        else "",
+    )
+    service = ExpertRolloutModel(
+        model,
+        hardware,
+        InferenceRates(**rollout["rates"]),
+        rollout["runtime_revision"],
+        execution_identity=fingerprint(profiles["model"], rollout["execution"])
+        if rollout.get("execution")
+        else "",
+        **rollout.get("model_options", {}),
+    )
+    return raw, service
+
+
 @dataclass(frozen=True)
 class Catalog:
     root: Path = Path(__file__).resolve().parent
@@ -191,6 +252,68 @@ class Catalog:
 
     def rollout(self, name: str) -> RolloutConfig:
         return _rollout(self.profile("rollout", name)["values"])
+
+    def assemble(
+        self,
+        *,
+        hardware: str,
+        system: str,
+        model: str,
+        actor: str,
+        rollout: str,
+        actor_parallel: ParallelLayout,
+        rollout_tp: int,
+        rollout_replicas: int,
+        kv_capacity_tokens: int,
+    ) -> AssembledTrial:
+        """Assemble uncalibrated components; require explicit target KV capacity.
+
+        Device pools and node-local limits come from the system profile. This
+        does not fit, inherit trial coefficients, or invent transition costs.
+        """
+        names = dict(
+            hardware=hardware, system=system, model=model, actor=actor, rollout=rollout
+        )
+        profiles = {
+            role: self.profile(_ROLES[role], name) for role, name in names.items()
+        }
+        values = {role: profile["values"] for role, profile in profiles.items()}
+        if any(
+            values[role].get("model_profile", model) != model
+            for role in ("actor", "rollout")
+        ):
+            raise ValueError("Execution recipe belongs to another model profile")
+        raw, service = _components(values, hardware)
+        actor_config = replace(_actor(values["actor"]), parallel=actor_parallel)
+        allowed = values["actor"].get("parallel_dimensions")
+        if allowed and any(
+            getattr(actor_parallel, name) != 1
+            for name in ("dp", "tp", "pp", "cp", "ep", "etp")
+            if name not in allowed
+        ):
+            raise ValueError("Parallel dimensions exceed this Actor profile scope")
+        rollout_config = replace(
+            _rollout(values["rollout"]),
+            tp=rollout_tp,
+            replicas=rollout_replicas,
+            kv_capacity_tokens=kv_capacity_tokens,
+        )
+        host = values["system"]
+        topology = host["topology"]
+        devices = []
+        for role, size in (
+            ("actor", actor_parallel.world_size),
+            ("rollout", rollout_config.world_size),
+        ):
+            pool = tuple(topology[f"{role}_devices"])
+            if size > len(pool):
+                raise ValueError("Execution exceeds the system role device pool")
+            chosen = pool[:size]
+            devices.append(chosen)
+        config = ExecutionConfig(actor_config, rollout_config, *devices)
+        _validate_placement(config, host, hardware)
+        binding = fingerprint(profiles, config)
+        return AssembledTrial(config, raw, raw, service, None, binding)
 
     def trial(self, name: str) -> TrialArchive:
         trial = TrialArchive(self, _name(name))
@@ -264,11 +387,7 @@ class TrialArchive:
             **manifest["execution"],
         )
         host = profiles["system"]
-        if host["hardware_profile"] != manifest["profiles"]["hardware"]["name"]:
-            raise ValueError("System belongs to another GPU profile")
-        maximum = host["hardware"]["gpus_per_node"] * host["max_nodes"]
-        if len(execution.actor_devices + execution.rollout_devices) > maximum:
-            raise ValueError("Execution exceeds the system topology/measurement scope")
+        _validate_placement(execution, host, manifest["profiles"]["hardware"]["name"])
         return execution
 
     def models(self, *, calibrated: bool = True) -> AssembledTrial:
@@ -283,27 +402,7 @@ class TrialArchive:
         p = self._profiles(manifest)
         config = self._configuration(manifest, p)
         binding = fingerprint(manifest["profiles"], manifest["execution"])
-        hardware = _hardware(
-            p["hardware"], p["system"], manifest["profiles"]["hardware"]["name"]
-        )
-        model = _model(p["model"])
-        advantage = AggregateAdvantageModel(**p["actor"]["advantage"])
-        raw = ExpertActorModel(
-            model,
-            hardware,
-            p["actor"]["runtime_revision"],
-            efficiency=Efficiency(**p["actor"]["efficiency"]),
-            group_gbps=tuple(p["system"]["group_gbps"]),
-            advantage_model=advantage,
-            dispatch=DispatchConfig(**p["actor"]["dispatch"]),
-            fsdp_host_rates=FSDPHostRates(**p["system"]["host_rates"]),
-        )
-        rollout = ExpertRolloutModel(
-            model,
-            hardware,
-            InferenceRates(**p["rollout"]["rates"]),
-            p["rollout"]["runtime_revision"],
-        )
+        raw, rollout = _components(p, manifest["profiles"]["hardware"]["name"])
         if not calibrated:
             return AssembledTrial(config, raw, raw, rollout, None, binding)
         calibration = self._read_data(manifest, "calibration")

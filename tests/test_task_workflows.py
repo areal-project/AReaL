@@ -336,6 +336,8 @@ async def test_shared_client_submits_and_rewards_both_benchmarks(
     assert summary["model_calls"] == 2 and summary["tool_executions"] == 1
     row = json.loads((tmp_path / "episodes.jsonl").read_text())
     assert row["task_index"] == 0 and row["available_at"] <= row["started"]
+    assert row["arrival_mode"] == "all_ready"
+    assert row["client_admission_started"] <= row["client_admitted"] <= row["submitted"]
     assert (
         row["timing"]["inference_seconds"] == 3 and row["timing"]["tool_seconds"] == 1
     )
@@ -557,6 +559,83 @@ def test_task_trace_parallel_tools_join_before_next_request(tmp_path, docker_tra
         runtime.close()
 
 
+@pytest.mark.asyncio
+async def test_task_scheduled_arrivals_continue_during_client_concurrency_wait(
+    tmp_path,
+):
+    """External arrivals keep their schedule while the single client slot is busy."""
+    import asyncio
+    import time
+
+    class ScheduledClient(EpisodeClient):
+        async def run_task(self, task, **kwargs):
+            started = time.time()
+            await asyncio.sleep(0.1)
+            return {
+                "task_id": task.task_id,
+                "started": started,
+                "status": "completed",
+                "score": {"reward": 0},
+                "metadata": {"api_calls": 0, "environment": {"calls": []}},
+            }
+
+    settings = ClientSettings(
+        "http://agent",
+        "http://inference",
+        "admin",
+        "admin",
+        "Qwen",
+        "eval",
+        tmp_path,
+        concurrency=1,
+        arrival_offsets=(0.0, 0.01, 0.02),
+    )
+    tasks = [MathTask(str(i), "Question", "42") for i in range(3)]
+    async with httpx.AsyncClient() as http:
+        summary = await ScheduledClient(settings, http).run(tasks)
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "episodes.jsonl").read_text().splitlines()
+    ]
+    assert summary["completed"] == 3
+    assert all(row["arrival_mode"] == "scheduled" for row in rows)
+    assert rows[2]["available_at"] - rows[0]["available_at"] == pytest.approx(0.02)
+    assert rows[2]["arrival_observed_at"] < rows[1]["started"]
+
+
+def test_task_trace_records_tool_payload_and_model_visible_tool_message():
+    """Tool payload token counts remain distinct from bytes and message wrappers."""
+    from types import SimpleNamespace
+
+    from examples.task_workflows.trace import CallTrace
+
+    class Tokenizer:
+        def encode(self, text, **kwargs):
+            return text.split()
+
+    runtime = SimpleNamespace(
+        kind="python", task_id="tokens", invoke=lambda *args: "答案 is 42"
+    )
+    trace = CallTrace(tokenizer=Tokenizer())
+    trace.bind_tools(runtime)
+    trace.request({"started": 0, "finished": 1})
+    runtime.invoke("python", {})
+    trace.request(
+        {"started": 2, "finished": 3},
+        messages=[
+            {"role": "tool", "tool_call_id": "call-1", "content": "Result: 答案 is 42"}
+        ],
+    )
+    first, tool, second = trace.nodes
+    assert tool["returned_text"] == "答案 is 42"
+    assert tool["output_tokens"] == 3
+    assert tool["output_utf8_bytes"] > len(tool["returned_text"])
+    assert second["tool_messages"][0]["tokens"] == 4
+    assert second["predecessors"] == [tool["name"]]
+    assert tool["predecessors"] == [first["name"]]
+    assert trace.snapshot()["tool_lengths_complete"]
+
+
 def test_swe_grading_uses_real_upstream_parser_on_candidate_patch(
     tmp_path, monkeypatch, docker_transport, repository_case
 ):
@@ -682,3 +761,184 @@ async def test_shared_cli_reads_frozen_tasks_and_runs_eval(tmp_path, monkeypatch
     summary = json.loads((output / "summary.json").read_text())
     assert summary["completed"] == summary["correct"] == 1
     assert summary["infrastructure_errors"] == 0
+
+
+@pytest.mark.parametrize("case", ["actor", "rollout", "joint"])
+def test_reconfiguration_prepare_freezes_twelve_tasks_without_services(
+    tmp_path, monkeypatch, case
+):
+    from argparse import Namespace
+
+    from examples.task_workflows.reconfiguration import prepare
+
+    for name in (
+        "AREAL_TASK_RUN_ROOT",
+        "AREAL_TASK_STATE_ROOT",
+        "AREAL_MODEL_PATH",
+        "AREAL_CHECKPOINT_ESTIMATED_BYTES",
+        "AREAL_INFERENCE_ADMIN_KEY",
+        "AREAL_ACTOR_ADMIN_KEY",
+    ):
+        monkeypatch.setenv(name, "acceptance-private-key")
+    model = tmp_path / "model"
+    model.mkdir()
+    tasks = [
+        MathTask(question_id(f"Compute {i}+1."), f"Compute {i}+1.", str(i + 1))
+        for i in range(14)
+    ]
+    write_splits(
+        tasks, tmp_path / "tasks", source={}, seed=1, pilot=1, train=12, evaluation=1
+    )
+    args = Namespace(
+        case=case,
+        devices=list(range(8)),
+        model=model,
+        tasks=tmp_path / "tasks/train.jsonl",
+        output=tmp_path / case,
+        estimate_gib=8,
+        context_length=8192,
+        max_new_tokens=512,
+    )
+    config, selected, targets, output = prepare(args)
+    plan = json.loads((output / "plan.json").read_text())
+    assert len(selected) == 12 and len(targets) == 2
+    assert plan["updates"] == config.total_train_steps == 3
+    assert plan["ordered_task_ids"] == [task.task_id for task in selected]
+    assert config.actor_lifecycle.mode == "on_demand"
+    assert (
+        config.train_dataset.batch_size == 4 and config.rollout.backend == "sglang:d4"
+    )
+    assert "acceptance-private-key" not in (output / "config.json").read_text()
+    assert sorted(path.name for path in output.iterdir()) == [
+        "config.json",
+        "plan.json",
+    ]
+    again = prepare(args)
+    assert [task.task_id for task in again[1]] == plan["ordered_task_ids"]
+
+
+@pytest.mark.asyncio
+async def test_shared_client_reuses_rl_credentials_without_starting_new_session(
+    tmp_path,
+):
+    from unittest.mock import AsyncMock
+
+    task = MathTask(
+        question_id("Compute six times seven."), "Compute six times seven.", "42"
+    )
+    credentials = {
+        "session_id": "retained",
+        "session_api_key": "retained-key",
+        "areal_episode": {"incarnation_id": "incarnation", "trajectory_id": 1},
+    }
+    paths = []
+
+    def respond(request):
+        paths.append(request.url.path)
+        body = json.loads(request.content)
+        if request.url.path == "/v1/responses":
+            assert body["session_api_key"] == credentials["session_api_key"]
+            assert body["inf_episode"] == credentials["areal_episode"]
+            return httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": r"\boxed{42}"}],
+                        }
+                    ],
+                    "metadata": {"completed": True, "environment": {"calls": []}},
+                },
+            )
+        if request.url.path == "/rl/set_reward":
+            assert body["areal_episode"]["trajectory_id"] == 1
+            return httpx.Response(
+                200, json={"trajectory_id": 1, "trajectory_ready": True}
+            )
+        assert request.url.path == "/sessions/close"
+        return httpx.Response(200, json={"status": "closed"})
+
+    settings = ClientSettings(
+        "http://agent",
+        "http://inference",
+        "admin",
+        "inference",
+        "math",
+        "on_demand",
+        tmp_path,
+        state_root=tmp_path.absolute(),
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        client = EpisodeClient(settings, http)
+        client._admit = AsyncMock()
+        client._handoff = AsyncMock(return_value={"verified": True})
+        row = await client.run_task(task, credentials=credentials)
+    assert row["status"] == "completed" and row["session_id"] == "retained"
+    assert row["handoff"]["verified"]
+    assert "/rl/start_session" not in paths
+    assert "retained-key" not in json.dumps(row)
+
+
+def test_reconfiguration_telemetry_requires_correlated_phases_and_backend_calls(
+    tmp_path,
+):
+    import time
+
+    from examples.task_workflows.reconfiguration import validate_telemetry
+
+    from areal.elastic.control.transition_timing import TransitionTiming
+
+    phases = (
+        "checkpoint",
+        "actor_release",
+        "actor_start",
+        "actor_restore",
+        "awex_connect",
+        "publish",
+        "application_and_commit",
+        "admission_open",
+        "generation_resume",
+        "total",
+    )
+    for index in (1, 2):
+        timing = TransitionTiming(
+            tmp_path,
+            f"accept-actor-{index}",
+            {"weights_version": index},
+            {"world_size": 4 if index == 1 else 2},
+        )
+        timing.record("begin", source=timing.source, target=timing.target)
+        for phase in phases:
+            with timing.phase(phase):
+                pass
+        timing.record("end", status="applied", generation=index)
+        now = time.monotonic()
+        timing.record(
+            "first_inference_snapshot",
+            proxies=[
+                {
+                    "proxy": "fixture",
+                    "first_call": {
+                        "transition_id": timing.transition_id,
+                        "status": "completed",
+                        "admitted_to_response_seconds": 0.1,
+                        "response_ready_monotonic": now + 0.1,
+                        "backend_attempts": [
+                            {
+                                "status": "completed",
+                                "version": index,
+                                "input_tokens": 12,
+                                "output_tokens": 4,
+                                "seconds": 0.1,
+                                "response_monotonic": now + 0.1,
+                            }
+                        ],
+                    },
+                }
+            ],
+        )
+    result = validate_telemetry(tmp_path, "actor")
+    assert result["status"] == "complete"
+    assert [row["observed_proxies"] for row in result["transitions"]] == [1, 1]

@@ -25,6 +25,7 @@ from .joint import (
 )
 from .optimizer import JointModel, JointOptimizer, LifecycleOptimizer
 from .policy import BasicPolicy, IdleTimeoutPolicy, JointPolicy
+from .serving import ServingMetrics, ServingSLO
 from .simulator import JointSimulator
 
 __all__ = [
@@ -40,6 +41,8 @@ __all__ = [
     "JointScenario",
     "JointSearchResult",
     "JointSimulator",
+    "ServingMetrics",
+    "ServingSLO",
     "JointTransitionModel",
     "RolloutConfig",
     "RolloutCostModel",

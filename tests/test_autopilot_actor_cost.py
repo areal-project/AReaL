@@ -66,6 +66,158 @@ from areal.elastic.policy.basic.cost_model.packing import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def qwen4b_components(*, dp=1, tp=1, replicas=1, rollout_tp=1):
+    return expert.Catalog().assemble(
+        hardware="h20",
+        system="h20-actor8-rollout8",
+        model="qwen3-4b-instruct-2507",
+        actor="megatron-qwen3-4b-ppo",
+        rollout="sglang-qwen3-4b",
+        actor_parallel=expert.ParallelLayout(dp=dp, tp=tp),
+        rollout_tp=rollout_tp,
+        rollout_replicas=replicas,
+        kv_capacity_tokens=65536,
+    )
+
+
+def test_expert_qwen4b_model_and_megatron_recipe_match_target():
+    """Dense Qwen3 dimensions include shared embedding and no router weights."""
+    bundle = qwen4b_components(dp=3)
+    shape = bundle.actor.model
+    assert shape.total_parameters == 4_022_468_096
+    assert shape.mlp_type == "dense" and shape.tied_embeddings
+    assert shape.router_parameters_per_layer == 0
+    parsed = expert.ActorConfig.from_areal(
+        {
+            "backend": "megatron:d3t1",
+            "dtype": "bfloat16",
+            "mb_spec": {"n_mbs": 1, "max_tokens_per_mb": 32768},
+            "optimizer": {"type": "adam", "weight_decay": 0.017},
+            "gradient_checkpointing": True,
+            "recompute_logprob": True,
+            "use_decoupled_loss": True,
+            "megatron": {
+                "use_precision_aware_optimizer": True,
+                "main_grads_dtype": "bfloat16",
+                "main_params_dtype": "float32",
+                "exp_avg_dtype": "float32",
+                "exp_avg_sq_dtype": "float32",
+                "enable_chunked_logits": True,
+                "entropy_requires_grad": False,
+                "ddp": {
+                    "grad_reduce_in_fp32": False,
+                    "use_distributed_optimizer": True,
+                    "overlap_grad_reduce": True,
+                },
+            },
+        }
+    )
+    assert parsed == bundle.config.actor
+    assert parsed.optimizer_master_storage_bytes is None
+    workload = WorkloadStats(3, 3072, sequence_lengths=(1024,) * 3)
+    estimate = bundle.actor.estimate(parsed, workload)
+    assert dict(estimate.stages)["train_step"].seconds > 0
+    assert estimate.total.seconds is None  # Unmeasured advantage is not a zero cost.
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+def test_expert_dense_tp_partitions_ffn_and_keeps_replicated_norms(tp):
+    """Dense weights shard over TP and all gradient traffic uses the true DP group."""
+    from areal.elastic.policy.reference.cost_model._actor.components import (
+        Communications as ExpertCommunications,
+    )
+    from areal.elastic.policy.reference.cost_model._actor.components import (
+        Context as ExpertContext,
+    )
+    from areal.elastic.policy.reference.cost_model._actor.components import (
+        Operators as ExpertOperators,
+    )
+    from areal.elastic.policy.reference.cost_model._actor.components import (
+        Transformer as ExpertTransformer,
+    )
+
+    bundle = qwen4b_components(tp=tp)
+    cfg, model = bundle.config.actor, bundle.actor.model
+    op = ExpertOperators(bundle.actor.hardware)
+    ctx = ExpertContext(cfg, model, op, model.layers, True, True)
+    dense, experts = ctx.owned_parameters
+    replicated = (
+        model.layers * (2 * model.hidden_size + 2 * model.head_dim) + model.hidden_size
+    )
+    assert experts == 0
+    assert tp * dense == model.total_parameters + (tp - 1) * replicated
+    # Changing MoE efficiency cannot change the dense FFN's roofline.
+    mb = expert.Microbatch(128, 128, 128**2, 0)
+    before = ExpertTransformer().forward(ctx, mb)
+    slow_moe = replace(
+        op, efficiency=replace(op.efficiency, moe=0.01, moe_imbalance=10)
+    )
+    assert ExpertTransformer().forward(replace(ctx, operators=slow_moe), mb) == before
+    assert before["moe"] == before["raw_ep"] == 0
+    dp = 2 if tp < 8 else 1
+    cfg = replace(cfg, parallel=expert.ParallelLayout(dp=dp, tp=tp))
+    ctx = replace(ctx, config=cfg)
+    assert ExpertCommunications().gradient_sync(ctx) == pytest.approx(
+        op.collective(dense * cfg.grad_bytes, dp, "dense_dp", dp * tp)
+    )
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+def test_expert_dense_rollout_reuses_single_replica_calibration_and_kv_width(tp):
+    """Per-TP service calibration transfers across replica counts, not phases."""
+    bundle = qwen4b_components(rollout_tp=tp)
+    model, cfg = bundle.rollout, bundle.config.rollout
+    multi = replace(cfg, replicas=8 // tp)
+    assert model.profile_key(cfg) == model.profile_key(multi)
+    batches = {
+        "prefill": (expert.ServiceSlice("p", 0, 32, "prefill", True),),
+        "decode": (expert.ServiceSlice("d", 128, 1, "decode", True),),
+        "mixed": (
+            expert.ServiceSlice("p", 0, 32, "prefill", True),
+            expert.ServiceSlice("d", 128, 1, "decode", True),
+        ),
+    }
+    for index, (phase, batch) in enumerate(batches.items(), start=2):
+        raw = model.estimate(cfg, expert.ServiceState(128), batch)
+        assert dict(raw.features)["kv_bytes_per_token_per_rank"] == 144 * 1024 // tp
+        calibration = expert.PhaseCalibration(
+            "unit-only",
+            raw.profile,
+            phase,
+            index,
+            tuple((key, value, value) for key, value in raw.features),
+            (f"unit-{phase}",),
+            timing_boundary=model.timing_boundary,
+        )
+        fitted = replace(model, calibration=(calibration,))
+        estimate = fitted.estimate(multi, expert.ServiceState(128), batch)
+        assert estimate.duration.evidence == "calibrated"
+        assert estimate.duration.seconds == pytest.approx(raw.duration.seconds * index)
+
+
+def test_expert_new_dense_adapter_preserves_old_moe_numerics():
+    """Pre-change 30B vectors are frozen; no calibration is loaded or refitted."""
+    catalog = expert.Catalog()
+    shape = catalog.model("qwen3-30b-a3b")
+    hardware = catalog.hardware("h20", "h20-8gpu-r10")
+    assert shape.total_parameters == 30_532_122_624
+    actor = expert.ExpertActorModel(shape, hardware, "old-numeric-audit")
+    cfg = expert.ActorConfig(
+        "megatron",
+        expert.ParallelLayout(),
+        recompute_logprob=True,
+        gradient_checkpointing=True,
+    )
+    estimate = actor.estimate(cfg, WorkloadStats(2, 256, sequence_lengths=(128, 128)))
+    assert dict(estimate.stages)["recompute_logp"].seconds == pytest.approx(
+        0.038880961748146384
+    )
+    assert dict(estimate.stages)["train_step"].seconds == pytest.approx(
+        0.49711008666829815
+    )
+    assert estimate.static_memory_gb == pytest.approx((549.578170368,))
+
+
 @pytest.fixture
 def expert_catalog_copy(tmp_path):
     source = Path(expert.__file__).parent

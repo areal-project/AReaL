@@ -22,6 +22,7 @@ from .joint import (
     JointSearchResult,
     JointWindow,
 )
+from .serving import ServingSLO
 from .simulator import (
     HistorySnapshot,
     PlanStep,
@@ -61,6 +62,8 @@ class JointOptimizer:
     max_evaluations: int = 128
     max_seconds: float | None = None
     switch_margin: float = 0.05
+    serving_slo: ServingSLO | None = None
+    expected_serving_requests: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "candidates", tuple(dict.fromkeys(self.candidates)))
@@ -72,6 +75,10 @@ class JointOptimizer:
             raise ValueError("Switch margin must be in [0, 1)")
         if self.max_seconds is not None:
             nonnegative("max_seconds", self.max_seconds, positive=True)
+        if self.serving_slo is not None:
+            positive_int("expected_serving_requests", self.expected_serving_requests)
+        elif self.expected_serving_requests is not None:
+            raise ValueError("expected_serving_requests requires serving_slo")
         identities = {
             (c.rollout.model_id, c.rollout.hardware_id, c.rollout.sampling_id)
             for c in self.candidates
@@ -114,6 +121,10 @@ class JointOptimizer:
                 reason = "Prediction did not complete the identical workload window"
             elif self.max_seconds is not None and prediction.seconds > self.max_seconds:
                 reason = "Prediction exceeds job time bound"
+            elif self.serving_slo is not None:
+                reason = self.serving_slo.rejection(
+                    prediction.serving, self.expected_serving_requests
+                )
             evaluated.append(
                 JointCandidateResult(config, prediction, not reason, reason)
             )

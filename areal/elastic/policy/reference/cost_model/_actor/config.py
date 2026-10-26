@@ -48,6 +48,17 @@ class ParallelLayout:
         fsdp = re.fullmatch(r"fsdp:d(\d+)", text)
         if fsdp:
             return "fsdp", cls(dp=int(fsdp.group(1)))
+        dense = re.fullmatch(r"(megatron|archon):([dptc0-9]+)", text)
+        if dense:
+            parts = re.findall(r"([dptc])(\d+)", dense.group(2))
+            if "".join(k + n for k, n in parts) != dense.group(2) or len(
+                {k for k, _ in parts}
+            ) != len(parts):
+                raise ValueError("Malformed or repeated parallel dimension")
+            dimensions = {
+                dict(d="dp", t="tp", p="pp", c="cp")[k]: int(n) for k, n in parts
+            }
+            return dense.group(1), cls(**dimensions)
         if ":(" in text and text.endswith(")"):
             text = text.replace(":(", ":", 1)[:-1]
         match = re.fullmatch(
@@ -126,15 +137,20 @@ class ModelShape:
     top_k: int
     vocab_size: int
     tied_embeddings: bool = False
+    mlp_type: str = "moe"
 
     def __post_init__(self) -> None:
         for field in fields(self):
-            if field.name != "tied_embeddings":
+            if field.name not in {"tied_embeddings", "mlp_type"}:
                 value = getattr(self, field.name)
                 if type(value) is not int or value < 1:
                     raise ValueError(f"{field.name} must be a positive integer")
         if self.top_k > self.experts or self.attention_heads % self.kv_heads:
             raise ValueError("Invalid top_k or grouped-query attention dimensions")
+        if self.mlp_type not in {"dense", "moe"} or (
+            self.mlp_type == "dense" and (self.experts, self.top_k) != (1, 1)
+        ):
+            raise ValueError("Dense MLP requires experts=top_k=1 and no router")
 
     @property
     def attention_parameters_per_layer(self) -> int:
@@ -151,7 +167,7 @@ class ModelShape:
 
     @property
     def router_parameters_per_layer(self) -> int:
-        return self.hidden_size * self.experts
+        return self.hidden_size * self.experts if self.mlp_type == "moe" else 0
 
     @property
     def head_parameters(self) -> int:
@@ -208,12 +224,37 @@ class ActorConfig:
     optimizer_weight_decay: bool = True
     fsdp_root_reshard_after_forward: bool = True
     fsdp_parameter_tensors: int | None = None
+    precision_aware_optimizer: bool = False
+    main_grad_bytes: int = 4
+    # None excludes master/remainder storage from the static lower bound.
+    optimizer_master_storage_bytes: int | None = None
+    enable_chunked_logits: bool = False
+    lm_head_loss_chunk_size: int = 0
+    entropy_requires_grad: bool = True
 
     def __post_init__(self) -> None:
         if self.pipeline_layers is not None:
             object.__setattr__(self, "pipeline_layers", tuple(self.pipeline_layers))
         if self.backend not in {"megatron", "archon", "fsdp"}:
             raise ValueError("Actor cost model supports megatron, archon and fsdp")
+        if self.precision_aware_optimizer and self.backend != "megatron":
+            raise ValueError("Precision-aware Adam component requires Megatron")
+        if (
+            type(self.lm_head_loss_chunk_size) is not int
+            or self.lm_head_loss_chunk_size < 0
+        ):
+            raise ValueError("LM-head loss chunk size must be a nonnegative integer")
+        if self.lm_head_loss_chunk_size > 0 and (
+            not self.enable_chunked_logits or self.entropy_requires_grad
+        ):
+            raise ValueError(
+                "LM-head chunking requires chunked logits without entropy gradients"
+            )
+        if self.main_grad_bytes not in {
+            2,
+            4,
+        } or self.optimizer_master_storage_bytes not in {None, 2, 4}:
+            raise ValueError("Unknown main-gradient or master/remainder storage width")
         if self.optimizer_type not in {
             "adam",
             "adam_bf16",
@@ -274,6 +315,9 @@ class ActorConfig:
             "offload_params",
             "optimizer_weight_decay",
             "fsdp_root_reshard_after_forward",
+            "precision_aware_optimizer",
+            "enable_chunked_logits",
+            "entropy_requires_grad",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
@@ -371,6 +415,19 @@ class ActorConfig:
                     "Expert currently supports non-interleaved 1F1B without virtual stages"
                 )
         ddp = megatron.get("ddp", {})
+        precision_aware = backend == "megatron" and megatron.get(
+            "use_precision_aware_optimizer", False
+        )
+        if precision_aware and (
+            megatron.get("main_grads_dtype", "float32") not in {"bfloat16", "float32"}
+            or any(
+                megatron.get(key, "float32") != "float32"
+                for key in ("main_params_dtype", "exp_avg_dtype", "exp_avg_sq_dtype")
+            )
+        ):
+            raise ValueError(
+                "Precision-aware profile requires FP32 master/moments and BF16/FP32 gradients"
+            )
         optimizer = actor.get("optimizer", {})
         optimizer_type = (optimizer or {}).get("type", "adam")
         optimizer_dtype = actor.get("optimizer_dtype", "float32")
@@ -448,6 +505,11 @@ class ActorConfig:
         return cls(
             backend,
             parallel,
+            precision_aware_optimizer=precision_aware,
+            main_grad_bytes=2 if megatron.get("main_grads_dtype") == "bfloat16" else 4,
+            enable_chunked_logits=megatron.get("enable_chunked_logits", False),
+            lm_head_loss_chunk_size=megatron.get("lm_head_loss_chunk_size", 0),
+            entropy_requires_grad=megatron.get("entropy_requires_grad", True),
             optimizer_type=optimizer_type,
             optimizer_dtype=optimizer_dtype,
             offload_params=actor.get("fsdp", {}).get("offload_params", False)

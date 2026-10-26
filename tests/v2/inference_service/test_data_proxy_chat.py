@@ -528,7 +528,10 @@ async def test_start_session_wrong_admin_key(client):
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_with_session_key(client, mock_areal_client):
+async def test_chat_completions_with_session_key(
+    client, mock_areal_client, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("AREAL_ROLLOUT_TRACE_DIR", str(tmp_path))
     # Start session first
     resp = await client.post(
         "/rl/start_session",
@@ -551,6 +554,15 @@ async def test_chat_completions_with_session_key(client, mock_areal_client):
     assert data["object"] == "chat.completion"
     assert data["choices"][0]["message"]["content"] == "Hello!"
     mock_areal_client.chat.completions.create.assert_called_once()
+    rows = [
+        json.loads(line)
+        for path in tmp_path.glob("model-calls-*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    assert len(rows) == 1 and rows[0]["status"] == "completed"
+    assert rows[0]["session_id"] and rows[0]["incarnation_id"]
+    assert rows[0]["admission_wait_seconds"] >= 0
+    assert "armed_monotonic" not in rows[0]
 
 
 @pytest.mark.asyncio
@@ -2475,8 +2487,21 @@ async def test_resource_drain_rebind_preserves_session_and_sampling(
         assert response.status_code == 200
         new_bridge.set_version.assert_called_once_with(7)
         old_bridge.aclose.assert_awaited_once()
+        armed = await client.post(
+            "/reconfiguration/observe",
+            headers=admin_headers(),
+            json={"transition_id": "resume-normal"},
+        )
+        assert armed.json()["status"] == "armed"
         await client.post("/reconfiguration/open", headers=admin_headers())
         assert (await second).status_code == 200
+        metrics = (
+            await client.get("/reconfiguration/metrics", headers=admin_headers())
+        ).json()
+        assert metrics["first_call"]["transition_id"] == "resume-normal"
+        assert metrics["first_call"]["status"] == "completed"
+        assert metrics["first_call"]["admitted_to_response_seconds"] >= 0
+        assert metrics["first_call"]["admission_wait_seconds"] >= 0
     assert store.get_session_by_api_key(key) is session
     assert session._next_sampling_request_index == 2
     assert len(session.active_completions) == 2

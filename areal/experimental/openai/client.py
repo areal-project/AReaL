@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import datetime
 import json
 import os
@@ -58,6 +59,7 @@ from areal.experimental.openai.tool_call_parser import process_tool_calls
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging
 from areal.utils.hf_utils import apply_chat_template
+from areal.utils.workload_trace import append_trace
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
@@ -903,6 +905,16 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         )
 
         # Call inference engine
+        if os.environ.get("AREAL_ROLLOUT_TRACE_DIR"):
+            await asyncio.to_thread(
+                append_trace,
+                "model-requests",
+                {
+                    "completion_id": completion_id,
+                    "request_id": model_request.rid,
+                    "input_tokens": len(prompt_token_ids),
+                },
+            )
         response = await self.engine.agenerate(model_request)
         output_text = self.tokenizer.decode(response.output_tokens_without_stop)
 

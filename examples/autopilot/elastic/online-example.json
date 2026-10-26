@@ -1,0 +1,34 @@
+{
+  "description": "Fixed 120-second serving window, switching plus target GPU residency cost, and 80% SLO target. Startup/state/link assumptions are not measurements.",
+  "input_closes_at": 1800,
+  "initial_layout": {"actor_dp": 4, "actor_tp": 2, "rollout_replicas": 8, "rollout_tp": 1},
+  "slo": {"ttft_seconds": 5, "tbt_seconds": 0.1, "minimum_request_fraction": 0.8},
+  "run": {
+    "batch_size": 40, "staleness": 2, "client_concurrency": 32,
+    "tool_capacities": [["python", 32], ["terminal", 32]],
+    "max_new_tokens": 32768, "max_context_tokens": 65536,
+    "max_events": 8000000, "max_simulated_seconds": 20000
+  },
+  "handoff": {
+    "node_gpus": [8, 8, 8, 8],
+    "actor_startup_seconds": 30, "rollout_startup_seconds": 30,
+    "actor_warmup_seconds": 5, "rollout_warmup_seconds": 5,
+    "actor_state_bytes": 56314553344, "weight_bytes": 8044936192,
+    "effective_bandwidth_GBps": 50,
+    "actor_sync_setup_seconds": 1, "rollout_sync_setup_seconds": 0.1,
+    "provenance": "ILLUSTRATIVE ASSUMPTIONS: 4x8 pool; startup30s/warmup5s; Adam checkpoint14bytes/parameter; serialized50GBps; immutable published snapshot materialization included in setup. Not measured reconfiguration costs."
+  },
+  "replay": {
+    "history_seconds": 120, "feature_window_seconds": 30,
+    "change_ratio": 0.5, "change_checks": 2,
+    "initial_regime_seconds": 120, "max_new_tokens": 32768,
+    "unseen_tool_residual_seconds": 5
+  },
+  "policy": {
+    "check_interval_seconds": 10, "slo_window_seconds": 120,
+    "pressure_request_fraction": 0.8, "slack_request_fraction": 0.9,
+    "cooldown_seconds": 0, "deduplicate_searches": false,
+    "decision_delay_seconds": 1, "minimum_completed_requests": 8, "max_evaluations": 165
+  },
+  "tool_seconds_per_unit": {"synthetic-python-work-v1": 1, "synthetic-terminal-work-v1": 1}
+}

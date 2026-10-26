@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "kind": "rollout",
+  "id": "sglang-qwen3-4b",
+  "version": "1",
+  "values": {
+    "config": {
+      "replicas": 1,
+      "tp": 1,
+      "max_batch_sequences": 64,
+      "max_batch_tokens": 8192,
+      "kv_capacity_tokens": 65536,
+      "backend": "sglang",
+      "weight_bytes": 2,
+      "kv_bytes": 2,
+      "cache_mode": "none"
+    },
+    "rates": {
+      "dense": 0.45,
+      "attention": 0.3,
+      "hbm": 0.65,
+      "network": 0.65,
+      "launch_seconds": 5e-06
+    },
+    "runtime_revision": "areal2.1.0-sglang0.5.10.post1-bf16-chunk8192-prefix-off-v1",
+    "policy": "decode_first_full_reservation_v1",
+    "model_options": {
+      "version": "expert-rollout-dense-v2",
+      "calibration_scope": "replica",
+      "separate_phases": true,
+      "timing_boundary": "sglang_forward_cuda_event_span"
+    },
+    "execution": {
+      "software": {
+        "areal": "2.1.0",
+        "sglang": "0.5.10.post1",
+        "torch": "2.9.1+cu129"
+      },
+      "observer_sha256": "5e36af3ff5500f08d1f11bf928017ed5d8586c34896fcc7cd6bd91d1db177963",
+      "recipe_sha256": "126a110de2a9c5bb56ebce346703f7fbd883c26e745bd52b851f2e08a37d5973",
+      "timing": "one SGLang forward CUDA event span; not pure kernel busy or HTTP wall"
+    },
+    "model_profile": "qwen3-4b-instruct-2507"
+  },
+  "provenance": {
+    "evidence": "assumed",
+    "scope": "Single-replica TP1/2/4/8 service priors. KV template65536 is illustrative only; Catalog.assemble requires explicit per-TP capacity from max_total_num_tokens. No KV quantization or prefix reuse.",
+    "scheduler": "Legacy decode-first/full-reservation simulator policy is an explicit assumption, not verified SGLang0.5.10 scheduling.",
+    "calibration_status": "pending GPU prefill/decode/mixed iteration labels; no inferred RPC or tool timings"
+  }
+}

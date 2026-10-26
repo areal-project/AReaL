@@ -11,6 +11,11 @@ from .config import ActorConfig, ModelShape
 def mesh_is_valid(config: ActorConfig, model: ModelShape) -> bool:
     p, m = config.parallel, model
     invalid = m.experts % p.ep or m.attention_heads % p.tp
+    if m.mlp_type == "dense":
+        invalid = invalid or p.ep != 1 or m.intermediate_size % p.tp
+        if config.backend == "megatron":
+            # Initial dense adapter covers the planned TP1/2/4/8, no KV replication.
+            invalid = invalid or m.kv_heads % p.tp or p.pp != 1 or p.cp != 1
     if config.backend == "archon":
         invalid = invalid or m.kv_heads % p.tp or (m.attention_heads // p.tp) % p.cp
         kv = m.kv_heads // p.tp

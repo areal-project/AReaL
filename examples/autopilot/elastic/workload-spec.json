@@ -1,0 +1,48 @@
+{
+  "schema_version": "synthetic-workload-v2",
+  "seed": 20261024,
+  "duration_s": 1800,
+  "arrivals": [
+    {"until_s": 600, "rate_per_s": 0.1},
+    {"until_s": 1200, "rate_per_s": 1.0},
+    {"until_s": 1800, "rate_per_s": 0.1}
+  ],
+  "composition": [
+    {"until_s": 1800, "weights": {"short": 0.4, "long_decode": 0.3, "tool_heavy": 0.3}}
+  ],
+  "families": [
+    {
+      "name": "short",
+      "prompt": {"median": 512, "sigma": 0.4, "minimum": 128, "maximum": 4096},
+      "output": {"median": 128, "sigma": 0.5, "minimum": 32, "maximum": 512},
+      "tool_output": {"median": 256, "sigma": 0.6, "minimum": 64, "maximum": 1024},
+      "tool_work": {"median": 0.2, "sigma": 1.0, "minimum": 0.01, "maximum": 120},
+      "mean_turns": 1.5,
+      "max_turns": 4,
+      "tool_type": "python",
+      "tool_reference": "synthetic-python-work-v1"
+    },
+    {
+      "name": "long_decode",
+      "prompt": {"median": 2048, "sigma": 0.4, "minimum": 128, "maximum": 4096},
+      "output": {"median": 1024, "sigma": 0.5, "minimum": 256, "maximum": 4096},
+      "tool_output": {"median": 256, "sigma": 0.6, "minimum": 64, "maximum": 1024},
+      "tool_work": {"median": 0.5, "sigma": 1.0, "minimum": 0.01, "maximum": 120},
+      "mean_turns": 3,
+      "max_turns": 8,
+      "tool_type": "python",
+      "tool_reference": "synthetic-python-work-v1"
+    },
+    {
+      "name": "tool_heavy",
+      "prompt": {"median": 1024, "sigma": 0.4, "minimum": 128, "maximum": 4096},
+      "output": {"median": 256, "sigma": 0.5, "minimum": 64, "maximum": 1024},
+      "tool_output": {"median": 1024, "sigma": 0.6, "minimum": 256, "maximum": 4096},
+      "tool_work": {"median": 5, "sigma": 1.0, "minimum": 0.01, "maximum": 120},
+      "mean_turns": 6,
+      "max_turns": 12,
+      "tool_type": "terminal",
+      "tool_reference": "synthetic-terminal-work-v1"
+    }
+  ]
+}

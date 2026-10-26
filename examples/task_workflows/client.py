@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -95,6 +97,7 @@ class ClientSettings:
     request_timeout: float = 900.0
     handoff_timeout: float = 180.0
     benchmark: str = "dapo_math"
+    arrival_offsets: tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in ("on_demand", "resident", "eval"):
@@ -109,6 +112,11 @@ class ClientSettings:
             raise ValueError("Concurrency and timeouts must be positive")
         if not self.agent_key or not self.inference_key:
             raise ValueError("Agent and inference API keys are required")
+        if self.arrival_offsets is not None and (
+            any(not math.isfinite(value) or value < 0 for value in self.arrival_offsets)
+            or tuple(sorted(self.arrival_offsets)) != self.arrival_offsets
+        ):
+            raise ValueError("Arrival offsets must be finite, nonnegative and sorted")
 
 
 class EpisodeClient:
@@ -126,6 +134,7 @@ class EpisodeClient:
         )
         self._admission_lock = asyncio.Lock()
         self._starting: dict[str, dict] = {}
+        self.run_id = os.environ.get("AREAL_TRACE_RUN_ID", settings.output.name)
 
     async def _post(
         self,
@@ -186,30 +195,38 @@ class EpisodeClient:
     def _task_result(self, response: dict) -> TaskResult:
         return TaskResult.from_response(response)
 
-    async def run_task(self, task: Any) -> dict[str, Any]:
+    async def run_task(
+        self, task: Any, *, credentials: dict | None = None
+    ) -> dict[str, Any]:
         started = time.time()
         clock = time.perf_counter()
         request_id = self.benchmark.request_prefix + "-" + uuid.uuid4().hex
-        credentials = None
+        if credentials is not None and self.settings.mode == "eval":
+            raise ValueError("Retained RL credentials require a training client")
         rewarded = False
         agent_finished = False
         result: dict[str, Any] = {
+            "run_id": self.run_id,
             "task_id": task.task_id,
             "request_id": request_id,
             "started": started,
+            "started_monotonic": clock,
         }
         try:
             settings = self.settings
             if settings.mode != "eval":
-                response = await self._post(
-                    settings.inference_url,
-                    "/rl/start_session",
-                    settings.inference_key,
-                    {"task_id": request_id},
-                )
-                if len(response["sessions"]) != 1:
-                    raise RuntimeError("Independent task requests require one session")
-                credentials = response["sessions"][0]
+                if credentials is None:
+                    response = await self._post(
+                        settings.inference_url,
+                        "/rl/start_session",
+                        settings.inference_key,
+                        {"task_id": request_id},
+                    )
+                    if len(response["sessions"]) != 1:
+                        raise RuntimeError(
+                            "Independent task requests require one session"
+                        )
+                    credentials = response["sessions"][0]
                 if settings.mode == "on_demand" and not credentials.get(
                     "areal_episode"
                 ):
@@ -219,8 +236,11 @@ class EpisodeClient:
                 result.update(
                     session_id=credentials["session_id"],
                     episode=credentials.get("areal_episode"),
+                    session_ready=time.time(),
                 )
+                result["client_admission_started"] = time.time()
                 await self._admit(credentials)
+                result["client_admitted"] = time.time()
             task_input = self.benchmark.prepare(task)
             result["submitted"] = time.time()
             payload = {
@@ -349,10 +369,18 @@ class EpisodeClient:
     async def run(self, tasks: list[Any]) -> dict[str, Any]:
         semaphore = asyncio.Semaphore(self.settings.concurrency)
         available_at = time.time()
+        origin = time.perf_counter()
+        offsets = self.settings.arrival_offsets or (0.0,) * len(tasks)
+        if len(offsets) != len(tasks):
+            raise ValueError("Arrival schedule must contain one offset per task")
         failed = asyncio.Event()
         progress = tqdm(total=len(tasks), desc="Task episodes", unit="episode")
 
         async def one(index: int, task: Any) -> dict:
+            await asyncio.sleep(
+                max(0.0, offsets[index] - (time.perf_counter() - origin))
+            )
+            observed_at = time.time()
             async with semaphore:
                 if failed.is_set():
                     row = {"task_id": task.task_id, "status": "not_submitted"}
@@ -360,7 +388,15 @@ class EpisodeClient:
                     row = await self.run_task(task)
                     if row["status"] != "completed":
                         failed.set()
-                row.update(task_index=index, available_at=available_at)
+                row.update(
+                    run_id=self.run_id,
+                    task_index=index,
+                    available_at=available_at + offsets[index],
+                    arrival_observed_at=observed_at,
+                    arrival_mode="scheduled"
+                    if self.settings.arrival_offsets is not None
+                    else "all_ready",
+                )
                 async with self._write_lock:
                     await asyncio.to_thread(self._append_episode, row)
                 progress.update(1)
@@ -405,6 +441,19 @@ async def _main(args: argparse.Namespace) -> int:
         if args.limit < 1 or args.limit > len(tasks):
             raise ValueError("Limit must fit the frozen task file")
         tasks = tasks[: args.limit]
+    schedule = getattr(args, "arrival_schedule", None)
+    offsets = None
+    schedule_digest = None
+    if schedule is not None:
+        data = schedule.read_bytes()
+        offsets = tuple(
+            float(json.loads(line)["available_at"])
+            for line in data.splitlines()
+            if line.strip()
+        )
+        if args.limit is not None:
+            offsets = offsets[: args.limit]
+        schedule_digest = hashlib.sha256(data).hexdigest()
     settings = ClientSettings(
         agent_url=args.agent_url.rstrip("/"),
         inference_url=args.inference_url.rstrip("/"),
@@ -418,6 +467,7 @@ async def _main(args: argparse.Namespace) -> int:
         request_timeout=args.request_timeout,
         handoff_timeout=args.handoff_timeout,
         benchmark=benchmark.name,
+        arrival_offsets=offsets,
     )
     settings.output.mkdir(parents=True, exist_ok=False)
     (settings.output / "tasks-manifest.json").write_text(
@@ -433,6 +483,12 @@ async def _main(args: argparse.Namespace) -> int:
                 "model": settings.model,
                 "concurrency": settings.concurrency,
                 "task_ids": [task.task_id for task in tasks],
+                "arrival_schedule": None
+                if schedule is None
+                else str(schedule.resolve()),
+                "arrival_schedule_sha256": schedule_digest,
+                "arrival_offsets": offsets,
+                "run_id": os.environ.get("AREAL_TRACE_RUN_ID", settings.output.name),
             },
             indent=2,
         )
@@ -464,6 +520,11 @@ def main() -> None:
     )
     parser.add_argument("--state-root", type=Path)
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--arrival-schedule",
+        type=Path,
+        help="Frozen JSONL with one relative available_at (seconds) per task",
+    )
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--request-timeout", type=float, default=900)
     parser.add_argument("--handoff-timeout", type=float, default=180)

@@ -20,6 +20,7 @@ import traceback
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
@@ -1124,27 +1125,54 @@ class RolloutControllerV2:
             raise RuntimeError("Rollout was not initialized with a resource pool")
         self._managed_replicas.stop()
 
-    def rebuild_inference_replicas(self, devices) -> None:
+    def rebuild_inference_replicas(self, devices, *, timing=None) -> None:
         from areal.infra.utils.concurrent import run_async_task
 
         if self._managed_replicas is None:
             raise RuntimeError("Rollout was not initialized with a resource pool")
-        run_async_task(self._managed_replicas.launch, tuple(devices))
+        phase = timing or (lambda name: nullcontext())
+        with phase("rollout_start"):
+            run_async_task(self._managed_replicas.launch, tuple(devices))
         # Preserve every session store and router assignment; only replace bridges.
-        for index, address in enumerate(self._data_proxy_addrs):
+        with phase("proxy_rebind"):
+            for index, address in enumerate(self._data_proxy_addrs):
+                response = self._sync_client.post(
+                    f"{address}/configure_backend",
+                    json={
+                        "backend_addr": self._inf_addrs[index % len(self._inf_addrs)]
+                    },
+                    headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+                )
+                response.raise_for_status()
+                if (
+                    response.json().get("backend_addr")
+                    != self._inf_addrs[index % len(self._inf_addrs)]
+                ):
+                    raise RuntimeError(
+                        "Data proxy did not acknowledge its replacement backend"
+                    )
+
+    def arm_reconfiguration_observation(self, transition_id: str) -> None:
+        for address in self._data_proxy_addrs:
             response = self._sync_client.post(
-                f"{address}/configure_backend",
-                json={"backend_addr": self._inf_addrs[index % len(self._inf_addrs)]},
+                f"{address}/reconfiguration/observe",
+                json={"transition_id": transition_id},
                 headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
             )
             response.raise_for_status()
-            if (
-                response.json().get("backend_addr")
-                != self._inf_addrs[index % len(self._inf_addrs)]
-            ):
-                raise RuntimeError(
-                    "Data proxy did not acknowledge its replacement backend"
-                )
+            if response.json() != {"status": "armed", "transition_id": transition_id}:
+                raise RuntimeError("Data proxy did not acknowledge observation marker")
+
+    def reconfiguration_metrics(self) -> list[dict]:
+        rows = []
+        for address in self._data_proxy_addrs:
+            response = self._sync_client.get(
+                f"{address}/reconfiguration/metrics",
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
+            response.raise_for_status()
+            rows.append({"proxy": address, **response.json()})
+        return rows
 
     def configure_online_training(
         self,

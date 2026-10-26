@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "kind": "actor",
+  "id": "megatron-qwen3-4b-ppo",
+  "version": "1",
+  "values": {
+    "config": {
+      "backend": "megatron",
+      "parallel": {
+        "dp": 1,
+        "tp": 1,
+        "pp": 1,
+        "cp": 1,
+        "ep": 1,
+        "etp": 1
+      },
+      "max_tokens_per_mb": 32768,
+      "n_mbs": 1,
+      "dtype": "bfloat16",
+      "gradient_checkpointing": true,
+      "recompute_logprob": true,
+      "use_decoupled_loss": true,
+      "prox_logp_method": "recompute",
+      "ppo_n_minibatches": 1,
+      "distributed_optimizer": true,
+      "grad_bytes": 2,
+      "overlap_grad_reduce": true,
+      "precision_aware_optimizer": true,
+      "main_grad_bytes": 2,
+      "optimizer_master_storage_bytes": null,
+      "enable_chunked_logits": true,
+      "lm_head_loss_chunk_size": 0,
+      "entropy_requires_grad": false
+    },
+    "runtime_revision": "areal2.1.0-mcore0.17.0-mbridge0.15.1-torch2.9.1-cu129-ppo-calibration-v1",
+    "efficiency": {
+      "dense": 0.45,
+      "moe": 0.28,
+      "attention": 0.3,
+      "hbm": 0.65,
+      "network": 0.65,
+      "moe_imbalance": 1.15,
+      "kernel_launch_us": 5.0,
+      "fsdp_overlap": 0.5,
+      "ep_overlap": 0.25
+    },
+    "dispatch": {
+      "mode": "controller",
+      "group_size": 1
+    },
+    "advantage": null,
+    "parallel_dimensions": [
+      "dp",
+      "tp"
+    ],
+    "execution": {
+      "software": {
+        "areal": "2.1.0",
+        "megatron_core": "0.17.0",
+        "mbridge": "0.15.1",
+        "torch": "2.9.1+cu129",
+        "transformers": "5.3.0"
+      },
+      "source_sha256": {
+        "areal/engine/megatron_engine.py": "7e60a40ceffc4675e5c5e5047bdec79d269c33640e51ba2c0521f3803a0e965b",
+        "areal/trainer/ppo/actor.py": "eb16cd0cefdf1a03fef6be50ae6aebcbf01bc4d84b335753d2f14c914f161712"
+      },
+      "recipe_sha256": "160cff73978944d8ded3c81428c1d1dbfd387363d120b4a1bb6dee81eab2082e",
+      "input_contract": "fixed token-ID case, one sequence/trajectory, response last1/8, rewards0/1, no KL/normalization/dropout; weights/moments advance across cases",
+      "timing": "outer step wall with final CUDA synchronization; preparation/hash/stats export excluded; inner CUDA events and host enqueue recorded separately"
+    },
+    "model_profile": "qwen3-4b-instruct-2507"
+  },
+  "provenance": {
+    "evidence": "assumed",
+    "scope": "New dense analytical priors; no R10 or single-card pilot coefficients loaded/fitted. CP/PP/EP/ETP=1. BF16 parameters/main gradients, FP32 logical master/moments; physical master/remainder storage not observed.",
+    "timing_boundary": "Pilot CUDA spans/host enqueue are not trainer_host_wall_with_stats. LM-head logits chunk flag is true but joint loss chunk size is0; do not assume full logits disappear.",
+    "calibration_status": "pending DP/TP measurements, phase-boundary audit and held-out validation; advantage remains unsupported"
+  }
+}

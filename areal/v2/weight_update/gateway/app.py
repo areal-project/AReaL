@@ -25,6 +25,10 @@ from areal.v2.weight_update.gateway.config import (
     WeightUpdateResult,
 )
 from areal.v2.weight_update.gateway.kv_store import WeightMetaStore
+from areal.v2.weight_update.gateway.metadata import (
+    inference_metadata_template,
+    merge_parameter_metadata,
+)
 from areal.v2.weight_update.gateway.pair_registry import PairRegistry
 
 logger = logging.getLogger("WeightUpdateGateway")
@@ -167,39 +171,8 @@ def _get_own_ip() -> str:
 
 
 def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
-    """Merge serialized training ParameterMeta entries by parameter name.
-
-    Each FSDP worker reports metadata for its own local shard only.
-    With ``dp_size > 1`` the same parameter name appears once per worker,
-    each carrying a single shard.  The ``TransferPlanBuilder`` indexes
-    parameters with ``{meta.name: meta}``, so duplicates silently shadow
-    earlier entries.  We merge them here so the builder sees one
-    ``ParameterMeta`` per name with all shards in a single replica.
-    """
-    by_name: dict[str, dict] = {}
-    overflow: list[dict] = []
-    for pm in meta_list:
-        data = pm.get("data", pm) if isinstance(pm, dict) else pm
-        name = data.get("name") if isinstance(data, dict) else None
-        if name is None:
-            logger.warning("Found parameter metadata with no name: %s", pm)
-            overflow.append(pm)
-            continue
-
-        if name not in by_name:
-            by_name[name] = pm
-        else:
-            existing_data = by_name[name].get("data", by_name[name])
-            existing_data.setdefault("shards", []).extend(data.get("shards", []))
-            ex_replicas = existing_data.get("replicas", [])
-            new_replicas = data.get("replicas", [])
-            if ex_replicas and new_replicas:
-                ex_rep_data = ex_replicas[0].get("data", ex_replicas[0])
-                new_rep_data = new_replicas[0].get("data", new_replicas[0])
-                ex_rep_data.setdefault("shards", []).extend(
-                    new_rep_data.get("shards", [])
-                )
-    return list(by_name.values()) + overflow
+    """Normalize both partitioned FSDP tensors and replicated Megatron tensors."""
+    return merge_parameter_metadata(meta_list)
 
 
 def _validate_wire_dtypes(
@@ -496,13 +469,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             else:
                 training_params_meta.append(meta)
 
-        infer_params_meta = []
-        for result in infer_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                infer_params_meta.extend(meta)
-            else:
-                infer_params_meta.append(meta)
+        infer_params_meta = inference_metadata_template(infer_meta_resps)
 
         _validate_wire_dtypes(training_params_meta, infer_params_meta)
         training_params_meta = _merge_training_meta_by_name(training_params_meta)
@@ -630,13 +597,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             else:
                 training_params_meta.append(meta)
 
-        infer_params_meta = []
-        for result in infer_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                infer_params_meta.extend(meta)
-            else:
-                infer_params_meta.append(meta)
+        infer_params_meta = inference_metadata_template(infer_meta_resps)
 
         _validate_wire_dtypes(training_params_meta, infer_params_meta)
         training_params_meta = _merge_training_meta_by_name(training_params_meta)

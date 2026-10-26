@@ -80,8 +80,8 @@ def test_batch_observer_counts_chunked_prefill_and_overlap_decode(
 ):
     """Full prompt totals differ from prefill chunks; overlap lengths beat stale outputs."""
     reqs = [
-        SimpleNamespace(origin_input_ids=list(range(size)), output_ids=[])
-        for size in [10, 8]
+        SimpleNamespace(rid=f"r-{i}", origin_input_ids=list(range(size)), output_ids=[])
+        for i, size in enumerate([10, 8])
     ]
     batch = SimpleNamespace(
         forward_mode=SimpleNamespace(name=mode),
@@ -91,6 +91,7 @@ def test_batch_observer_counts_chunked_prefill_and_overlap_decode(
         decoding_reqs=[reqs[1]],
     )
     result = batch_observer.snapshot_batch(batch)
+    original_lengths = list(lengths)
     lengths[:] = [100, 200]
     reqs[0].origin_input_ids.append(999)
     for phase, values in expected.items():
@@ -106,6 +107,12 @@ def test_batch_observer_counts_chunked_prefill_and_overlap_decode(
                 values,
             )
         )
+    assert [req["request_id"] for req in result["requests"]] == ["r-0", "r-1"]
+    for req, length in zip(result["requests"], original_lengths):
+        assert req["sequence_tokens"] == length
+        q = req["query_tokens"]
+        assert req["past_tokens"] == length - q
+        assert req["attention_pairs"] == q * (length - q) + q * (q + 1) // 2
 
 
 def test_batch_observer_drains_last_gpu_event_during_idle(
@@ -145,6 +152,8 @@ def test_batch_observer_drains_last_gpu_event_during_idle(
         record_forward_metrics=lambda batch: nullcontext(native_calls.append(batch)),
         recv_requests=lambda: ["next request"],
         process_batch_result=lambda value: value,
+        max_total_num_tokens=128,
+        token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 64),
     )
     monkeypatch.setenv(batch_observer.TRACE_DIR_ENV, str(tmp_path))
     observer = batch_observer.bind_batch_observer(scheduler)
@@ -171,6 +180,7 @@ def test_batch_observer_drains_last_gpu_event_during_idle(
     assert rows[0]["gpu_id"] == 4
     assert rows[1]["timing_status"] == "complete"
     assert rows[1]["decode"]["context_tokens"] == 7
+    assert rows[1]["kv_allocated_tokens_at_forward_entry"] == 64
     assert rows[1]["gpu_start_ms"] == 2
     assert rows[1]["gpu_end_ms"] == 5
     assert rows[1]["gpu_seconds"] == pytest.approx(0.003)

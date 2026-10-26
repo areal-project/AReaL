@@ -4,6 +4,10 @@
 [PROGRESS.md](../../PROGRESS.md)，Expert 接口与边界见
 [Reference](../../areal/elastic/policy/reference/README.md)。设计长文与历史进度保留在本地归档。
 
+当前在线重配置见[在线模拟](elastic/ONLINE_RECONFIGURATION.md)：历史负载回放、80%目标、候选严格剪枝、重复搜索抑制及CPU搜索／复核延迟通过50项正常检查；165候选快照4worker复用11.3→7.1秒，所选配置一致。新完整单峰守恒通过，但动态SLO51.94%低于固定63.65%，部署选择质量待改；旧95%实验独立保留，真实服务交接仍待验收。
+
+共享16卡稳态预算／TP≤8的条件探索已完成68组预定＋6组追加验证，原fit不变，56项正常CPU检查通过。[8类负载对照](../../../artifacts/elastic-workload-regimes-20261025/README.md)中，低负载和大输入资源调整的节省在两种子复现，联合搜索仍有失败；跨节点Actor收益、网络争用和真实引擎交接尚未验收。
+
 [M2 历史快照](../../../artifacts/repository-archive-20261021/files/examples/autopilot/elastic/milestones/m2/README.md)
 保留旧串行执行器的代码身份与证据。 [架构图](elastic/README.md#policy-and-revision-loops) 区分 policy
 loop、cost-model revision 和 optimizer revision；当前执行入口为原生 PPOTrainer，联合配置模型保留作离线参考。

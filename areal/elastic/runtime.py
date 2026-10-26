@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from functools import wraps
 from pathlib import Path
@@ -41,6 +41,7 @@ from areal.elastic.control.resource_reconfiguration import (
 from areal.elastic.control.resource_reconfiguration import (
     poll_request as poll_resource_request,
 )
+from areal.elastic.control.transition_timing import TransitionTiming
 from areal.elastic.monitor.collector import ElasticMonitor
 from areal.elastic.policy import build_policy
 from areal.elastic.policy.adapter import PolicyAdapter
@@ -64,6 +65,46 @@ def _serialized(method):
     def call(self, *args, **kwargs):
         with self._lifecycle_lock:
             return method(self, *args, **kwargs)
+
+    return call
+
+
+def _timed_reconfiguration(method):
+    @wraps(method)
+    def call(self, **kwargs):
+        request_id = kwargs["request_id"]
+        for name in ("actor-reconfiguration", "resource-reconfiguration"):
+            path = self.root / name / "state.json"
+            if path.exists() and request_id in json.loads(path.read_text())["receipts"]:
+                return method(self, **kwargs)
+        self._record_post_reconfiguration()
+        target = kwargs.get(
+            "target", ActorDPConfig(kwargs.get("world_size", self.actor_world_size))
+        )
+        timing = TransitionTiming(
+            self.root,
+            request_id,
+            {
+                "layout": dataclasses.asdict(self.resource_layout),
+                "weights_version": self.applied_version,
+                "cursor": self.consumer.cursor.copy(),
+            },
+            dataclasses.asdict(target),
+        )
+        self._transition_timing = timing
+        timing.record("begin", source=timing.source, target=timing.target)
+        try:
+            with timing.phase("total"):
+                result = method(self, **kwargs)
+            timing.record(
+                "end", status=result["status"], generation=result["generation"]
+            )
+            return result
+        except BaseException:
+            timing.record("end", status="failed")
+            raise
+        finally:
+            self._transition_timing = None
 
     return call
 
@@ -197,8 +238,11 @@ class OnDemandActor:
         self.rollout_devices = tuple(self.options.rollout_devices)
         self.resource_reservation = self.actor_devices + self.rollout_devices
         self._actor_pool_setter = actor_pool_setter
+        self.resource_planner = None
         self.resource_config_application = None
         self._resource_transition_incomplete = False
+        self._transition_timing = self._pending_transition_timing = None
+        self.last_restore_reports = self.last_restore_plan = None
         build_policy(self.options.policy, idle_timeout=self.options.idle_timeout)
         self.checkpoint_frequency = EpochStepTimeFreqCtl(
             freq_epoch=config.recover.freq_epochs,
@@ -460,6 +504,7 @@ class OnDemandActor:
         self.allocation = ModelAllocation.from_str(self._actor_backend)
 
     @_serialized
+    @_timed_reconfiguration
     def reconfigure_actor(
         self,
         *,
@@ -498,16 +543,24 @@ class OnDemandActor:
                 )
             # ConfigApplication's source boundary includes the checkpoint ID.
             # Complete this save before its durable intent captures that boundary.
-            self.save_checkpoint(reason="reconfigure")
+            with self._reconfiguration_phase("checkpoint"):
+                self.save_checkpoint(reason="reconfigure")
             if self.checkpoint_version != self.applied_version:
                 raise RuntimeError("Actor DP source checkpoint is not current")
         self.inbox.set_admission_open(False)
-        receipt = application.apply(request)
+        with self._reconfiguration_phase("application_and_commit"):
+            receipt = application.apply(request)
         if not self.control_snapshot().boundary_ready:
             raise RuntimeError(
                 "Actor DP application left an incomplete training boundary"
             )
-        self.inbox.set_admission_open(True)
+        if receipt["status"] != "unchanged":
+            self._arm_post_reconfiguration()
+        with self._reconfiguration_phase("generation_resume"):
+            self.rollout.continue_generation()
+            self.rollout.resume()
+        with self._reconfiguration_phase("admission_open"):
+            self.inbox.set_admission_open(True)
         return receipt
 
     def _switch_actor_dp(self, world_size: int) -> None:
@@ -521,16 +574,16 @@ class OnDemandActor:
         if self.active is not None or self.checkpoint_version != self.applied_version:
             raise RuntimeError("Actor DP switch requires the saved completed update")
         self._event("RECONFIGURING", target_world_size=world_size)
-        self._release()
+        with self._reconfiguration_phase("actor_release"):
+            self._release()
         self._set_actor_dp(world_size)
         # Fixed-layout measurements must not be reused for a different DP size.
         self.monitor = ElasticMonitor(self)
         self.policy_adapter.rebind_actor_layout(self)
         self.ensure_actor()
         self.rollout.pause()
-        self._publish()
-        self.rollout.continue_generation()
-        self.rollout.resume()
+        with self._reconfiguration_phase("publish"):
+            self._publish()
         self._checkpoint_dirty = True
         self._event("RECONFIGURED", serving_versions=self.rollout.serving_versions())
 
@@ -619,6 +672,7 @@ class OnDemandActor:
         return self.resource_config_application
 
     @_serialized
+    @_timed_reconfiguration
     def reconfigure_resources(
         self,
         *,
@@ -626,9 +680,14 @@ class OnDemandActor:
         request_id: str,
         expected_generation: int,
         expected_weights_version: int,
+        policy_bundle_id: str = "manual",
     ):
         request = ConfigRequest(
-            request_id, target, expected_generation, expected_weights_version, "manual"
+            request_id,
+            target,
+            expected_generation,
+            expected_weights_version,
+            policy_bundle_id,
         )
         self.validate_resource_layout(target)
         if not self.control_snapshot().boundary_ready:
@@ -649,17 +708,23 @@ class OnDemandActor:
         if request_id in application.state()["receipts"]:
             return application.apply(request)
         if target != self.resource_layout:
-            self.save_checkpoint(reason="resource-reconfigure")
+            with self._reconfiguration_phase("checkpoint"):
+                self.save_checkpoint(reason="resource-reconfigure")
             if self.checkpoint_version != self.applied_version:
                 raise RuntimeError("Resource source checkpoint is not current")
         # The durable intent precedes closing ANY model-call gate. A partial
         # drain therefore rolls back/reopens through the same transaction.
-        receipt = application.apply(request)
+        with self._reconfiguration_phase("application_and_commit"):
+            receipt = application.apply(request)
         if not self.control_snapshot().boundary_ready:
             raise RuntimeError("Resource transaction left an incomplete boundary")
-        self.rollout.continue_generation()
-        self.inbox.set_admission_open(True)
-        self.rollout.open_model_calls()
+        if receipt["status"] != "unchanged":
+            self._arm_post_reconfiguration()
+        with self._reconfiguration_phase("generation_resume"):
+            self.rollout.continue_generation()
+        with self._reconfiguration_phase("admission_open"):
+            self.inbox.set_admission_open(True)
+            self.rollout.open_model_calls()
         return receipt
 
     def _switch_resources(self, target: ResourceLayout) -> None:
@@ -668,23 +733,60 @@ class OnDemandActor:
             return
         if self.active is not None or self.checkpoint_version != self.applied_version:
             raise RuntimeError("Resource changes require the saved completed update")
-        self.rollout.drain_model_calls()
+        with self._reconfiguration_phase("drain"):
+            self.rollout.drain_model_calls()
         # An admitted call can still acquire its episode lease while draining.
         self.inbox.set_admission_open(False)
         self._resource_transition_incomplete = True
         self._event("RECONFIGURING", resource_target=dataclasses.asdict(target))
         # AWEX must disconnect while its old inference peers still exist.
-        self._release()
-        self.rollout.stop_inference_replicas()
-        self._set_resource_layout(target)
-        self.rollout.rebuild_inference_replicas(target.rollout_devices)
+        with self._reconfiguration_phase("actor_release"):
+            self._release()
+        with self._reconfiguration_phase("rollout_stop"):
+            self.rollout.stop_inference_replicas()
+        with self._reconfiguration_phase("placement"):
+            self._set_resource_layout(target)
+        self.rollout.rebuild_inference_replicas(
+            target.rollout_devices, timing=self._reconfiguration_phase
+        )
         self.monitor = ElasticMonitor(self)
         self.policy_adapter.rebind_actor_layout(self)
         self.ensure_actor()
-        self._publish()
+        with self._reconfiguration_phase("publish"):
+            self._publish()
         self._resource_transition_incomplete = False
         self._checkpoint_dirty = True
         self._event("RECONFIGURED", serving_versions=self.rollout.serving_versions())
+
+    def _reconfiguration_phase(self, name: str):
+        return (
+            nullcontext()
+            if self._transition_timing is None
+            else self._transition_timing.phase(name)
+        )
+
+    def _arm_post_reconfiguration(self) -> None:
+        timing = self._transition_timing
+        if timing is not None and callable(
+            getattr(self.rollout, "arm_reconfiguration_observation", None)
+        ):
+            try:
+                with timing.phase("arm_first_inference"):
+                    self.rollout.arm_reconfiguration_observation(timing.transition_id)
+                self._pending_transition_timing = timing
+            except Exception:
+                logger.warning("First-inference observation unavailable", exc_info=True)
+
+    def _record_post_reconfiguration(self) -> None:
+        timing = self._pending_transition_timing
+        if timing is None:
+            return
+        try:
+            rows = self.rollout.reconfiguration_metrics()
+            timing.record("first_inference_snapshot", proxies=rows)
+            self._pending_transition_timing = None
+        except Exception:
+            logger.warning("Cannot collect first-inference observation", exc_info=True)
 
     def _read_latest(self) -> dict[str, Any] | None:
         if not (self.store.root / "latest.json").exists():
@@ -786,6 +888,8 @@ class OnDemandActor:
             rollout.continue_generation()
         elif (self.root / "actor-reconfiguration" / "state.json").exists():
             self.actor_config_application.recover()
+            rollout.continue_generation()
+            rollout.resume()
         self.inbox.set_admission_open(True)
         if self.resource_config_application is not None:
             rollout.open_model_calls()
@@ -822,15 +926,17 @@ class OnDemandActor:
         actor_config.backend = self.actor_backend
         for spec in actor_config.scheduling_spec:
             spec.env_vars[OWNER_ENV] = self.owner
-        self.actor = self.actor_factory(actor_config)
-        self.actor.create_process_group(parallel_strategy=self.allocation.parallel)
-        self.actor.initialize(
-            role="actor",
-            addr=None,
-            ft_spec=self.ft_spec,
-            wait=True,
-            worker_seed=self.config.seed,
-        )
+        self.last_restore_reports = self.last_restore_plan = None
+        with self._reconfiguration_phase("actor_start"):
+            self.actor = self.actor_factory(actor_config)
+            self.actor.create_process_group(parallel_strategy=self.allocation.parallel)
+            self.actor.initialize(
+                role="actor",
+                addr=None,
+                ft_spec=self.ft_spec,
+                wait=True,
+                worker_seed=self.config.seed,
+            )
         if self.latest_path is not None:
             restore_options = {}
             if self.latest_manifest["world_size"] != self.actor_world_size:
@@ -853,14 +959,17 @@ class OnDemandActor:
                         ),
                     )
                 )
-            reports = self.actor.full_checkpoint(
-                "load",
-                path=str(self.latest_path),
-                backend=self.allocation.backend,
-                identity_sha256=self.identity,
-                version=self.applied_version,
-                **restore_options,
-            )
+            self.last_restore_plan = restore_options.get("restore_plan")
+            with self._reconfiguration_phase("actor_restore"):
+                reports = self.actor.full_checkpoint(
+                    "load",
+                    path=str(self.latest_path),
+                    backend=self.allocation.backend,
+                    identity_sha256=self.identity,
+                    version=self.applied_version,
+                    **restore_options,
+                )
+            self.last_restore_reports = reports
             if isinstance(reports, list):
                 self._event(
                     "RESTORED",
@@ -868,7 +977,8 @@ class OnDemandActor:
                 )
         if self.config.perf_tracer is not None:
             self.actor.config_perf_tracer(self.config.perf_tracer, role="actor")
-        self.actor.connect_engine(self.rollout, self.weight_meta)
+        with self._reconfiguration_phase("awex_connect"):
+            self.actor.connect_engine(self.rollout, self.weight_meta)
         self.ready_since = time.monotonic()
         self.idle_since = self.ready_since
         self._event("READY", startup_seconds=self.ready_since - self.started_at)
@@ -895,6 +1005,8 @@ class OnDemandActor:
             raise RuntimeError("The previous native PPO update is still active")
         poll_request(self)
         poll_resource_request(self)
+        if self.resource_planner is not None:
+            self.resource_planner.poll(self)
         if self._policy_hooks_bound:
             self.policy_hooks.poll()
         if self.inbox.status()["published_version"] != self.applied_version:
@@ -1067,6 +1179,7 @@ class OnDemandActor:
         self._checkpoint_dirty = True
         self.idle_since = time.monotonic()
         self.monitor.complete_update()
+        self._record_post_reconfiguration()
         self._event("READY", serving_versions=self.rollout.serving_versions())
 
     def _publish(self) -> None:
@@ -1258,6 +1371,8 @@ class OnDemandActor:
         self.monitor.complete_update()
         if journal.exists():
             application.recover()
+            self.rollout.continue_generation()
+            self.rollout.resume()
         self.inbox.set_admission_open(True)
         if self.resource_config_application is not None:
             self.rollout.open_model_calls()
@@ -1267,6 +1382,7 @@ class OnDemandActor:
         if self._closed:
             return
         errors = []
+        self._record_post_reconfiguration()
         try:
             self.inbox.set_admission_open(False)
         except Exception as error:

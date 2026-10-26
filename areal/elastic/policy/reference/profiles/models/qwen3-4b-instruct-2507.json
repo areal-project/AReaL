@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "kind": "models",
+  "id": "qwen3-4b-instruct-2507",
+  "version": "1",
+  "values": {
+    "architecture": "qwen3",
+    "shape": {
+      "hidden_size": 2560,
+      "intermediate_size": 9728,
+      "layers": 36,
+      "attention_heads": 32,
+      "kv_heads": 8,
+      "head_dim": 128,
+      "experts": 1,
+      "top_k": 1,
+      "vocab_size": 151936,
+      "tied_embeddings": true,
+      "mlp_type": "dense"
+    },
+    "hf_config": {
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ],
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "bos_token_id": 151643,
+      "eos_token_id": 151645,
+      "head_dim": 128,
+      "hidden_act": "silu",
+      "hidden_size": 2560,
+      "initializer_range": 0.02,
+      "intermediate_size": 9728,
+      "max_position_embeddings": 262144,
+      "max_window_layers": 36,
+      "model_type": "qwen3",
+      "num_attention_heads": 32,
+      "num_hidden_layers": 36,
+      "num_key_value_heads": 8,
+      "rms_norm_eps": 1e-06,
+      "rope_scaling": null,
+      "rope_theta": 5000000,
+      "sliding_window": null,
+      "tie_word_embeddings": true,
+      "torch_dtype": "bfloat16",
+      "transformers_version": "4.51.0",
+      "use_cache": true,
+      "use_sliding_window": false,
+      "vocab_size": 151936
+    },
+    "hf_revision": "cdbee75f17c01a7cc42f958dc650907174af0554"
+  },
+  "provenance": {
+    "config_source_sha256": "5beea1a4a34c62782bfb2f911c606741a3bab8f92d80a118fa053c28af12e8ba",
+    "source": "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/blob/cdbee75f17c01a7cc42f958dc650907174af0554/config.json",
+    "scope": "Qwen3 dense SwiGLU, GQA Q/K norms, tied embedding; exact logical parameter count 4022468096. Runtime padding/buffers are separate."
+  }
+}

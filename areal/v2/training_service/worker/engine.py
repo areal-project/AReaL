@@ -93,7 +93,12 @@ def create_engine_module(
                 return jsonify({"error": str(e)}), 400
 
             def create_in_engine_thread():
-                return engine_class(*init_args, **init_kwargs)
+                engine = engine_class(*init_args, **init_kwargs)
+                if os.environ.get("AREAL_ROLLOUT_TRACE_DIR"):
+                    from areal.elastic.monitor.actor import install_actor_observer
+
+                    install_actor_observer(engine)
+                return engine
 
             engine = submit_to_engine_thread("create_engine", create_in_engine_thread)
             set_engine(engine)

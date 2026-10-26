@@ -154,3 +154,5 @@ AREAL_SWE_EVALUATOR_ROOT=/absolute/path/to/swe-evaluator \
 测试真实执行 OpenAI SDK、Claude Agent SDK `0.1.71`／自带 CLI `2.1.123`、MCP 工具、v2 Anthropic 请求转换、临时
 Git 仓库、patch、pytest 和上游解析评分。Hermes agent、模型响应与 Docker 传输使用替身；真实 Docker／Hermes／模型／GPU
 训练待实测。SDK 可见 transcript 与逐调用时间均有记录；未强制触发 CC 压缩或子 agent。
+
+原生Actor／Rollout的三组重配置验收及切换计时见[八卡验收](RECONFIGURATION_ACCEPTANCE.md)，提供不启动服务的`--prepare-only`模式；真实GPU验收待运行。

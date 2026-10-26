@@ -708,3 +708,41 @@ class TestVLLMBridgeBackend:
         assert bridge._send_request.call_count == 3
         assert resp.stop_reason == "length"
         assert len(resp.output_tokens) == 3  # 1 token per retry
+
+
+@pytest.mark.asyncio
+async def test_first_inference_observation_records_dispatch_response_and_lengths():
+    import time
+
+    from areal.v2.inference_service.data_proxy.resume_observation import (
+        ResumeObservation,
+        current_observation,
+    )
+
+    observation = ResumeObservation()
+    observation.arm("transition-normal")
+    row = observation.claim(time.monotonic())
+    bridge = _make_bridge(version=4)
+    backend_response = _make_sglang_response([(-0.2, 11), (-0.3, 12)])
+    backend_response["meta_info"].update(
+        id="sglang-rid", cached_tokens=2, queue_time=0.25
+    )
+    bridge._send_request = AsyncMock(return_value=backend_response)
+    token = current_observation.set(row)
+    try:
+        response = await bridge.agenerate(_make_request(input_ids=[1, 2, 3]))
+    finally:
+        current_observation.reset(token)
+        await bridge.aclose()
+    attempt = row["backend_attempts"][0]
+    assert attempt["input_tokens"] == 3 and attempt["output_tokens"] == 2
+    assert attempt["version"] == 4 and attempt["status"] == "completed"
+    assert attempt["backend_request_id"] == "sglang-rid"
+    assert attempt["cached_tokens"] == 2 and attempt["queue_time"] == 0.25
+    assert (
+        attempt["seconds"]
+        == attempt["response_monotonic"] - attempt["dispatch_monotonic"]
+    )
+    assert attempt["dispatch_monotonic"] >= row["admitted_monotonic"]
+    assert response.output_tokens == [11, 12]
+    assert observation.claim(time.monotonic()) is None

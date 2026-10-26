@@ -128,6 +128,22 @@ class Context:
     def owned_parameters(self) -> tuple[float, float]:
         """Full local dense/expert tensors, BEFORE DP sharding, AFTER TP/EP/PP."""
         m, p = self.model, self.config.parallel
+        if m.mlp_type == "dense":
+            # Linear weights are TP-sharded; Q/K and residual norms are replicated.
+            dense = self.layers * (
+                (m.attention_parameters_per_layer + m.expert_parameters_per_layer)
+                / p.tp
+                + 2 * m.hidden_size
+                + 2 * m.head_dim
+            )
+            heads = (
+                self.first
+                + self.last
+                - int(m.tied_embeddings and self.first and self.last)
+            )
+            dense += heads * m.head_parameters / p.tp
+            dense += m.hidden_size if self.last else 0
+            return dense, 0.0
         dense = (
             self.layers
             * (
@@ -155,7 +171,7 @@ class Communications:
         p, m, op = ctx.config.parallel, ctx.model, ctx.operators
         t = mb.compute_tokens
         tp = (
-            (1 if ctx.config.backend == "megatron" else 2)
+            (1 if ctx.config.backend == "megatron" and m.mlp_type == "moe" else 2)
             * ctx.layers
             * op.collective(
                 t / p.cp * m.hidden_size * 2, p.tp, "tp", p.world_size, allreduce=True
@@ -239,13 +255,16 @@ class Communications:
                 + op.memory(2 * (dense + expert) * cfg.grad_bytes)
             )
         sharded = cfg.distributed_optimizer or cfg.backend in {"archon", "fsdp"}
-        return op.collective(
+        dense_sync = op.collective(
             dense * cfg.grad_bytes,
             p.dp * p.cp,
             "dense_dp",
             p.world_size,
             allreduce=not sharded,
-        ) + op.collective(
+        )
+        if not expert:
+            return dense_sync
+        return dense_sync + op.collective(
             expert * cfg.grad_bytes,
             p.expert_dp,
             "expert_dp",
@@ -310,15 +329,21 @@ class Transformer:
         dense_params = ctx.layers * (
             m.attention_parameters_per_layer + m.router_parameters_per_layer
         )
+        if m.mlp_type == "dense":
+            dense_params += ctx.layers * m.expert_parameters_per_layer
         if ctx.last:
             dense_params += m.head_parameters
         dense = op.roofline(2 * t * dense_params, 2 * dense_params / p.tp, "dense")
         moe_params = ctx.layers * m.expert_parameters_per_layer / p.ep
         # Full expert weights may be touched even though FLOPs use top_k experts.
-        moe = op.roofline(
-            2 * t * ctx.layers * active_experts * op.efficiency.moe_imbalance,
-            2 * moe_params,
-            "moe",
+        moe = (
+            0.0
+            if m.mlp_type == "dense"
+            else op.roofline(
+                2 * t * ctx.layers * active_experts * op.efficiency.moe_imbalance,
+                2 * moe_params,
+                "moe",
+            )
         )
         attention = op.roofline(
             2
@@ -438,14 +463,23 @@ class AdamUpdate:
         owned = dense / (dense_dp if sharded else 1) + expert / (
             expert_dp if sharded else 1
         )
-        optimizer = op.memory(owned * 30)  # Adam moments/master/grad reads+writes.
+        traffic = 30
+        if cfg.precision_aware_optimizer:
+            # FP32 m/v read+write, BF16 parameter read+write, main grad read.
+            # Unknown remainder storage uses a full-master traffic prior only.
+            master = cfg.optimizer_master_storage_bytes or 4
+            traffic = 16 + 4 + cfg.main_grad_bytes + 2 * master
+        optimizer = op.memory(owned * traffic)
         # Gradient reduce-scatter + updated parameter gather for distributed Adam;
         # ordinary DDP instead performs a full gradient allreduce.
         sync = Communications().gradient_sync(ctx) if cfg.backend == "megatron" else 0.0
         gather = 0.0
         if sharded and cfg.backend == "megatron":
             gather += op.collective(dense * 2, dense_dp, "dense_dp", p.world_size)
-            gather += op.collective(expert * 2, expert_dp, "expert_dp", p.world_size)
+            if expert:
+                gather += op.collective(
+                    expert * 2, expert_dp, "expert_dp", p.world_size
+                )
         return {
             "optimizer": optimizer,
             "gradient_sync_raw": sync,

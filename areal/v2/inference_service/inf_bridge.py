@@ -19,6 +19,7 @@ import numpy as np
 from areal.api.io_struct import HttpRequest
 from areal.utils import logging
 from areal.v2.inference_service.backend import InfBridgeBackend
+from areal.v2.inference_service.data_proxy.resume_observation import current_observation
 
 if TYPE_CHECKING:
     from areal.api.io_struct import ModelRequest, ModelResponse
@@ -220,8 +221,44 @@ class InfBridge:
             # is in flight. Attribute this attempt's tokens to its dispatch
             # version; an abort/resubmit snapshots the new version separately.
             generation_version = self._version
-            data = await self._send_request(http_req)
-            result = self.backend.parse_generation_response(data)
+            observation = current_observation.get()
+            attempt = None
+            if observation is not None:
+                attempt = {
+                    "attempt_index": _attempt,
+                    "request_id": req.rid,
+                    "backend": self.backend_addr,
+                    "version": generation_version,
+                    "input_tokens": len(req.input_ids) + len(accumulated_tokens),
+                    "dispatch_monotonic": time.monotonic(),
+                    "status": "running",
+                }
+                observation["backend_attempts"].append(attempt)
+            try:
+                data = await self._send_request(http_req)
+                if attempt is not None:
+                    received = time.monotonic()
+                    meta = data.get("meta_info") or {}
+                    attempt.update(
+                        response_monotonic=received,
+                        seconds=received - attempt["dispatch_monotonic"],
+                        backend_request_id=meta.get("id"),
+                        cached_tokens=meta.get("cached_tokens"),
+                        queue_time=meta.get("queue_time"),
+                        request_received_ts=meta.get("request_received_ts"),
+                        request_finished_ts=meta.get("request_finished_ts"),
+                    )
+                result = self.backend.parse_generation_response(data)
+                if attempt is not None:
+                    attempt.update(
+                        status="completed",
+                        output_tokens=len(result.output_tokens),
+                        stop_reason=result.stop_reason,
+                    )
+            except BaseException:
+                if attempt is not None:
+                    attempt.update(status="failed")
+                raise
 
             accumulated_tokens.extend(result.output_tokens)
             accumulated_logprobs.extend(result.output_logprobs)

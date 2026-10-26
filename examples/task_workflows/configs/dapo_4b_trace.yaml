@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0
+defaults:
+  - dapo
+  - _self_
+
+experiment_name: h20-training-trace
+trial_name: ${oc.env:AREAL_TRACE_RUN_ID,trace0}
+
+actor:
+  backend: megatron:d1t4
+  grad_reduce_dtype: bfloat16
+  weight_update_mode: awex
+  mb_spec:
+    n_mbs: 1
+    max_tokens_per_mb: 65536
+  optimizer:
+    warmup_steps_proportion: 0.0
+  megatron:
+    bridge_type: mbridge
+    use_precision_aware_optimizer: true
+    main_grads_dtype: bfloat16
+    main_params_dtype: float32
+    exp_avg_dtype: float32
+    exp_avg_sq_dtype: float32
+    enable_chunked_logits: true
+    entropy_requires_grad: false
+    ddp:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      use_distributed_optimizer: true
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: &actor_env
+        PYTHONPATH: ${oc.env:PYTHONPATH}
+        AREAL_ROLLOUT_TRACE_DIR: ${oc.env:AREAL_ROLLOUT_TRACE_DIR}
+        AREAL_TRACE_RUN_ID: ${trial_name}
+        DTE_DELTA_TRANSFER: "0"
+        DTE_SEPARATION_WEIGHT_UPDATE: "0"
+        AWEX_DELTA_TRANSFER: "0"
+        AWEX_SEPARATION_WEIGHT_UPDATE: "0"
+        AWEX_WU_USE_GROUP: "1"
+        NCCL_CUMEM_ENABLE: "0"
+        NCCL_NVLS_ENABLE: "0"
+        OMP_NUM_THREADS: "4"
+        PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+        PYTORCH_ALLOC_CONF: expandable_segments:True
+
+rollout:
+  backend: sglang:d4t1
+  max_concurrent_rollouts: 8
+  agent:
+    reasoning_parser: ""
+    engine_max_tokens: 65536
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        <<: *actor_env
+        PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+        PYTORCH_ALLOC_CONF: expandable_segments:False
+
+# Keep the durable coordinator and exact consumption identity, with fixed layout.
+# No idle release occurs during this bounded run; no reconfiguration planner.
+actor_lifecycle:
+  mode: on_demand
+  rollout_devices: [4, 5, 6, 7]
+  idle_timeout: 86400.0
+  checkpoint_keep: 1
+  checkpoint_estimated_bytes: 68719476736
+
+sglang:
+  context_length: 65536
+  mem_fraction_static: 0.75
+  max_running_requests: 8
+  chunked_prefill_size: 8192
+  disable_radix_cache: true
+
+saver:
+  freq_steps: 4
+recover:
+  mode: auto
+  freq_steps: 4
+perf_tracer:
+  enabled: true
+  session_tracer:
+    enabled: true

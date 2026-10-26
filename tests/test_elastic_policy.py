@@ -218,6 +218,546 @@ def _simulate(scenario, steps, transitions=None):
     return expert.ExpertSimulator(models).simulate(scenario, tuple(steps))
 
 
+@pytest.mark.parametrize("dp,replicas", [(1, 1), (8, 8)])
+def test_expert_qwen4b_megatron_request_tool_chain_completes_with_explicit_priors(
+    dp, replicas
+):
+    """Both roles remain node-local; fixture overheads are not target calibration."""
+    bundle = expert.Catalog().assemble(
+        hardware="h20",
+        system="h20-actor8-rollout8",
+        model="qwen3-4b-instruct-2507",
+        actor="megatron-qwen3-4b-ppo",
+        rollout="sglang-qwen3-4b",
+        actor_parallel=expert.ParallelLayout(dp=dp),
+        rollout_tp=1,
+        rollout_replicas=replicas,
+        kv_capacity_tokens=65536,
+    )
+    cfg = bundle.config
+    assert len(cfg.actor_devices) <= 8 and len(cfg.rollout_devices) <= 8
+    assert {d.split("/")[0] for d in cfg.actor_devices} == {"actor-node"}
+    assert {d.split("/")[0] for d in cfg.rollout_devices} == {"rollout-node"}
+    advantage = expert.AdvantageModel(
+        "unit-only-gpu-advantage",
+        "cuda",
+        "single",
+        "token",
+        tuple(
+            expert.AdvantageTerm(name, ((feature, coefficient),), ("unit-only",))
+            for name, feature, coefficient in (
+                ("batching", "padded_slots", 1e-8),
+                ("recurrence", "gae_iterations", 1e-6),
+                ("normalization", "constant", 1e-5),
+                ("transport", "constant", 1e-4),
+                ("diagnostics", "constant", 1e-4),
+            )
+        ),
+    )
+    groups = tuple(
+        expert.Group(
+            f"q{i}",
+            (
+                expert.Request("first", 24, 8),
+                expert.ExternalCall(
+                    "tool", "tools", expert.Estimate(0.01, "assumed"), ("first",)
+                ),
+                expert.Request("second", 48, 16, ("tool",)),
+            ),
+            WorkloadStats(2, 96, loss_tokens=24, sequence_lengths=(32, 64)),
+            1,
+        )
+        for i in range(8)
+    )
+    scenario = _expert_scenario(
+        cfg,
+        groups,
+        groups_per_batch=8,
+        consumer_batch_size=8,
+        max_concurrent_groups=8,
+        runner_concurrency=8,
+        pending_limit=8,
+        runner_queue_limit=8,
+    )
+    models = expert.ExpertModels(
+        replace(bundle.actor, advantage_model=advantage),
+        bundle.rollout,
+        _expert_transitions(cfg),
+    )
+    simulator = expert.ExpertSimulator(models)
+    result = simulator.simulate(scenario, (expert.PlanStep(cfg),))
+    assert result == simulator.simulate(scenario, (expert.PlanStep(cfg),))
+    assert result.status == "complete" and result.completed_updates == 1
+    assert result.accepted_total == 8 and not result.remaining_devices
+    assert result.actor_gpu_seconds == pytest.approx(dp * result.seconds)
+    assert result.rollout_gpu_seconds == pytest.approx(replicas * result.seconds)
+    assert result.evidence == "assumed"
+
+
+@pytest.mark.parametrize("workload_kind", ["handcrafted", "poisson"])
+def test_basic_joint_optimizer_uses_frozen_expert_request_simulator(
+    tmp_path, workload_kind
+):
+    """Real Expert physics/scheduling and Basic search; no GPU or fitted new labels."""
+    from dataclasses import asdict
+
+    from areal.autopilot.domains.elastic.expert_planning import (
+        ExpertJointModel,
+        ExpertJointWindow,
+        expert_groups_from_workload,
+    )
+    from areal.elastic.contracts import TrainingConfig
+    from areal.elastic.policy.basic import JointConfig, JointOptimizer, RolloutConfig
+    from areal.elastic.policy.reference.core import fingerprint
+    from areal.utils.atomic import atomic_json
+
+    catalog = expert.Catalog()
+    shape = catalog.model("qwen3-30b-a3b")
+    hardware = catalog.hardware("h20", "h20-8gpu-r10")
+    actor_values = catalog.profile("actor", "fsdp-dp4-offload")["values"]
+    system = catalog.profile("systems", "h20-8gpu-r10")["values"]
+    rollout_values = catalog.profile("rollout", "sglang-dp2-tp2")["values"]
+    advantage = expert.AdvantageModel(
+        "synthetic-advantage-prior-v1",
+        "cpu",
+        "single",
+        "token",
+        tuple(
+            expert.AdvantageTerm(
+                name, ((feature, coefficient),), ("explicit-unmeasured-prior",)
+            )
+            for name, feature, coefficient in (
+                ("batching", "padded_slots", 1e-8),
+                ("recurrence", "gae_iterations", 1e-6),
+                ("normalization", "constant", 1e-5),
+                ("transport", "constant", 1e-4),
+                ("diagnostics", "constant", 1e-4),
+            )
+        ),
+    )
+    actor = expert.ExpertActorModel(
+        shape,
+        hardware,
+        actor_values["runtime_revision"],
+        efficiency=expert.Efficiency(**actor_values["efficiency"]),
+        dispatch=expert.DispatchConfig(**actor_values["dispatch"]),
+        fsdp_host_rates=expert.FSDPHostRates(**system["host_rates"]),
+        advantage_model=advantage,
+    )
+    rollout = expert.ExpertRolloutModel(
+        shape,
+        hardware,
+        expert.InferenceRates(**rollout_values["rates"]),
+        rollout_values["runtime_revision"],
+    )
+    executions = tuple(
+        expert.ExecutionConfig(
+            replace(
+                catalog.actor("fsdp-dp4-offload"), parallel=expert.ParallelLayout(dp=n)
+            ),
+            replace(catalog.rollout("sglang-dp2-tp2"), replicas=8 - n, tp=1),
+            tuple(f"gpu{i}" for i in range(n)),
+            tuple(f"gpu{i}" for i in range(n, 8)),
+        )
+        for n in (4, 2)
+    )
+    profiles = [p for c in executions for p in _expert_transitions(c).profiles]
+    for source, target in (
+        (executions[0], executions[1]),
+        (executions[1], executions[0]),
+    ):
+        profiles.append(
+            expert.TransitionProfile(
+                "reconfigure",
+                source.key,
+                target.key,
+                (
+                    expert.TransferTask(
+                        "rebuild",
+                        measured=expert.Estimate(
+                            2,
+                            "assumed",
+                            source_ids=("synthetic-rebuild-prior",),
+                        ),
+                    ),
+                ),
+                tuple(
+                    expert.AllocationChange("rebuild", "end", action, role, devices)
+                    for action, config in (("release", source), ("acquire", target))
+                    for role, devices in (
+                        ("actor", config.actor_devices),
+                        ("rollout", config.rollout_devices),
+                    )
+                ),
+                blocks=("actor", "generation", "admission"),
+            )
+        )
+    simulator = expert.ExpertSimulator(
+        expert.ExpertModels(
+            actor,
+            rollout,
+            expert.ExpertTransitionModel(tuple(profiles)),
+        )
+    )
+    bindings = tuple(
+        (
+            JointConfig(
+                TrainingConfig(c.actor.parallel.world_size, actor.profile_key(c.actor)),
+                RolloutConfig(
+                    fingerprint(shape),
+                    fingerprint(hardware),
+                    rollout.runtime_revision,
+                    "synthetic-fixed-sampling",
+                    c.rollout.replicas,
+                    c.rollout.tp,
+                    c.rollout.max_batch_sequences,
+                    c.rollout.max_batch_tokens,
+                    c.rollout.kv_capacity_tokens,
+                    3,
+                ),
+            ),
+            c,
+        )
+        for c in executions
+    )
+    groups = []
+    for i in range(12):
+        prompt, output = 128 + 32 * (i % 4), 16 + 8 * (i % 3)
+        lengths = (prompt + output, prompt + 2 * output + 16)
+        groups.append(
+            expert.Group(
+                f"episode-{i}",
+                (
+                    expert.Request("first", prompt, output),
+                    expert.ExternalCall(
+                        "tool",
+                        "tools",
+                        expert.Estimate(0.25 + 0.1 * (i % 5), "assumed"),
+                        ("first",),
+                    ),
+                    expert.Request("second", prompt + output + 16, output, ("tool",)),
+                ),
+                WorkloadStats(
+                    2, sum(lengths), loss_tokens=2 * output, sequence_lengths=lengths
+                ),
+                1,
+                available_at=(i // 4) * 0.03 + (i % 4) * 0.005,
+                task_id=i,
+            )
+        )
+    manifest, selection = None, None
+    if workload_kind == "poisson":
+        from areal.elastic.workload import (
+            ArrivalPhase,
+            CompositionPhase,
+            LogNormal,
+            generate,
+            write_workload,
+        )
+
+        spec = _synthetic_workload_spec()
+        # Small normal-path physics fixture; approved 30-minute traces stay intact.
+        spec = replace(
+            spec,
+            duration_s=30,
+            arrivals=(ArrivalPhase(30, 0.4),),
+            composition=(CompositionPhase(30, spec.composition[0].weights),),
+            families=tuple(
+                replace(
+                    family,
+                    prompt=LogNormal(128, 0.2, 64, 256),
+                    output=LogNormal(16, 0.2, 8, 32),
+                    tool_output=LogNormal(32, 0.2, 16, 64),
+                )
+                for family in spec.families
+            ),
+        )
+        episodes = generate(spec)
+        manifest = write_workload(tmp_path / "workload", spec, episodes)
+        count = len(episodes) // 4 * 4
+        assert count >= 4
+        # Selection is an explicit experiment boundary; never edit/pad the trace.
+        selection = {
+            "policy": "complete-batch-prefix-only",
+            "selected_ids": [e["episode_id"] for e in episodes[:count]],
+            "tail_ids": [e["episode_id"] for e in episodes[count:]],
+            "full_stream_evaluated": count == len(episodes),
+        }
+        groups = expert_groups_from_workload(
+            episodes[:count],
+            tool_seconds_per_unit={
+                "synthetic-python-work-v1": 1.0,
+                "synthetic-terminal-work-v1": 1.0,
+            },
+        )
+    updates = len(groups) // 4
+    scenario = _expert_scenario(
+        executions[0],
+        groups,
+        initial=expert.InitialState(
+            executions[0],
+            provider_version=1,
+            training_version=1,
+            serving_version=1,
+            accepted_total=4,
+        ),
+        groups_per_batch=4,
+        consumer_batch_size=4,
+        max_concurrent_groups=8,
+        runner_concurrency=8,
+        pending_limit=16,
+        runner_queue_limit=16,
+        staleness=2,
+        selection="task_id",
+        workflow="v2_inline",
+        external_pools=tuple(
+            (pool, 3)
+            for pool in sorted(
+                {
+                    n.pool
+                    for g in groups
+                    for n in g.nodes
+                    if isinstance(n, expert.ExternalCall)
+                }
+            )
+        ),
+    )
+    window = ExpertJointWindow(
+        scenario,
+        bindings[0][0],
+        (expert.PlanStep(executions[0], checkpoint=True, inflight="drain"),) * updates,
+        tuple(f"gpu{i}" for i in range(8)),
+        "handcrafted-request-dag-v1" if manifest is None else manifest["trace_sha256"],
+    )
+    model = ExpertJointModel(simulator, bindings)
+    frozen = simulator.models.snapshot_id
+    search = JointOptimizer(tuple(c for c, _ in bindings), switch_margin=0).optimize(
+        window, model
+    )
+    assert search.config is not None and search.exhaustive
+    assert all(c.eligible for c in search.candidates)
+    assert search.prediction.total_gpu_seconds == min(
+        c.prediction.total_gpu_seconds for c in search.candidates
+    )
+    assert simulator.models.snapshot_id == frozen
+    results = []
+    for candidate in search.candidates:
+        result = model.results[model.query_id(window, candidate.config)]
+        assert result.completed_updates == updates and result.accepted_total == 4 + len(
+            groups
+        )
+        assert candidate.prediction.samples == len(groups)
+        assert candidate.prediction.sequence_tokens == sum(
+            g.workload.sequence_tokens for g in groups
+        )
+        assert not result.remaining_devices
+        kinds = {e.kind for e in result.events}
+        assert {
+            "request_complete",
+            "external_start",
+            "external_complete",
+            "service_start",
+            "actor_start",
+            "weights_published",
+        } <= kinds
+        assert result.evidence == "assumed"
+        results.append({"config": asdict(candidate.config), "expert": asdict(result)})
+    atomic_json(
+        tmp_path / "expert-joint-trace.json",
+        {
+            "model_snapshot": model.snapshot_id,
+            "models": asdict(simulator.models),
+            "numerical_environment": model.numerical_environment,
+            "profiles": [
+                {
+                    "kind": kind,
+                    "id": name,
+                    "snapshot_sha256": fingerprint(catalog.profile(kind, name)),
+                    "profile": catalog.profile(kind, name),
+                }
+                for kind, name in (
+                    ("models", "qwen3-30b-a3b"),
+                    ("hardware", "h20"),
+                    ("systems", "h20-8gpu-r10"),
+                    ("actor", "fsdp-dp4-offload"),
+                    ("rollout", "sglang-dp2-tp2"),
+                )
+            ],
+            "window": asdict(window),
+            "bindings": [(asdict(c), asdict(e)) for c, e in bindings],
+            "search": asdict(search),
+            "expert_results": results,
+            "scope": "Offline Qwen3-30B-A3B/H20 analytical model, synthetic requests and unmeasured timing priors; no GPU execution or calibration refit",
+            "workload_manifest": manifest,
+            "selection": selection,
+            "conversion_assumptions": {
+                "trajectories": "individual inference calls; all generated tokens are loss tokens",
+                "samples_per_episode": 1,
+                "accepted": "all; no reward prediction",
+                "cache": "disabled; no observed prefix reuse",
+                "tool_seconds_per_reference_unit": {
+                    "synthetic-python-work-v1": 1.0,
+                    "synthetic-terminal-work-v1": 1.0,
+                }
+                if manifest
+                else None,
+                "external_pool_capacities": list(scenario.external_pools),
+            },
+        },
+    )
+
+
+def _synthetic_workload_spec(profile="single-peak"):
+    import json
+    from pathlib import Path
+
+    from areal.elastic.workload import ArrivalPhase, WorkloadSpec
+
+    path = Path(__file__).parents[1] / "examples/autopilot/elastic/workload-spec.json"
+    spec = WorkloadSpec.decode(json.loads(path.read_text()))
+    if profile != "single-peak":
+        phases = json.loads(
+            (path.parent / "workload-arrivals" / f"{profile}.json").read_text()
+        )
+        spec = replace(spec, arrivals=tuple(ArrivalPhase(**p) for p in phases))
+    return spec
+
+
+@pytest.mark.parametrize("profile", ["single-peak", "periodic", "short-bursts"])
+def test_synthetic_workload_preserves_seed_dag_and_roundtrip(tmp_path, profile):
+    """Frozen business inputs stay causal and contain no execution placement."""
+    from areal.elastic.workload import (
+        WorkloadSpec,
+        arrival_times,
+        generate,
+        read_workload,
+        write_workload,
+    )
+
+    spec = _synthetic_workload_spec(profile)
+    episodes = generate(spec)
+    assert episodes == generate(WorkloadSpec.decode(spec.encode()))
+    first = write_workload(tmp_path / "first", spec, episodes)
+    second = write_workload(tmp_path / "second", spec, generate(spec))
+    assert first["trace_sha256"] == second["trace_sha256"]
+    assert (tmp_path / "first/workload.jsonl").read_bytes() == (
+        tmp_path / "second/workload.jsonl"
+    ).read_bytes()
+    manifest, loaded = read_workload(tmp_path / "first")
+    assert manifest == first and loaded == episodes
+    assert len(episodes) == len(arrival_times(spec)) == manifest["episodes"]
+    assert manifest["tool_calls"] == manifest["inference_requests"] - len(episodes)
+    families = {f.name: f for f in spec.families}
+    for index, episode in enumerate(episodes):
+        assert set(episode) == {
+            "episode_id",
+            "task_id",
+            "available_at",
+            "family",
+            "nodes",
+        }
+        assert episode["task_id"] == index
+        assert 0 <= episode["available_at"] < spec.duration_s
+        turns = sum(n["kind"] == "inference" for n in episode["nodes"])
+        assert [n["kind"] for n in episode["nodes"]] == ["inference", "tool"] * (
+            turns - 1
+        ) + ["inference"]
+        known, previous, prompt = set(), [], None
+        family = families[episode["family"]]
+        for node in episode["nodes"]:
+            assert node["predecessors"] == previous
+            assert node["id"] not in known
+            if node["kind"] == "inference":
+                if prompt is not None:
+                    assert node["input_tokens"] == prompt
+                assert (
+                    family.output.minimum
+                    <= node["output_tokens"]
+                    <= family.output.maximum
+                )
+                prompt = (
+                    node["input_tokens"]
+                    + node["output_tokens"]
+                    + family.message_overhead_tokens
+                )
+            else:
+                assert node["kind"] == "tool" and node["work_units"] > 0
+                assert (
+                    family.tool_output.minimum
+                    <= node["output_tokens"]
+                    <= family.tool_output.maximum
+                )
+                prompt += node["output_tokens"]
+            known.add(node["id"])
+            previous = [node["id"]]
+
+
+def test_synthetic_workload_arrival_and_composition_axes_are_independent():
+    """Composition cannot perturb the arrival stream or scheduling-independent draws."""
+    from areal.elastic.workload import ArrivalPhase, CompositionPhase, generate
+
+    spec = _synthetic_workload_spec()
+    constant_mix = replace(
+        spec, composition=(CompositionPhase(spec.duration_s, (("short", 1.0),)),)
+    )
+    varied = generate(spec)
+    fixed = generate(constant_mix)
+    assert [e["available_at"] for e in varied] == [e["available_at"] for e in fixed]
+    faster = generate(
+        replace(
+            constant_mix,
+            arrivals=tuple(
+                ArrivalPhase(p.until_s, p.rate_per_s * 2) for p in spec.arrivals
+            ),
+        )
+    )
+    for first, second in zip(fixed, faster):
+        assert first["episode_id"] == second["episode_id"]
+        assert first["nodes"] == second["nodes"]
+    assert len(faster) > len(fixed)
+    start, intensity = 0, 0
+    for phase in constant_mix.arrivals:
+        intensity += (phase.until_s - start) * phase.rate_per_s
+        start = phase.until_s
+    uniform = generate(
+        replace(
+            constant_mix,
+            arrivals=(ArrivalPhase(spec.duration_s, intensity / spec.duration_s),),
+        )
+    )
+    assert len(uniform) == len(fixed)
+    assert [e["nodes"] for e in uniform] == [e["nodes"] for e in fixed]
+    # The approved profiles use the same finite-window intensity and task content.
+    baseline = generate(spec)
+    for profile in ("periodic", "short-bursts"):
+        other = generate(_synthetic_workload_spec(profile))
+        assert len(other) == len(baseline)
+        assert [e["available_at"] for e in other] != [
+            e["available_at"] for e in baseline
+        ]
+        assert [{k: v for k, v in e.items() if k != "available_at"} for e in other] == [
+            {k: v for k, v in e.items() if k != "available_at"} for e in baseline
+        ]
+
+
+def test_synthetic_workload_poisson_counts_match_mean_and_variance():
+    """Independent fixed-duration windows exercise count dispersion, not exact totals."""
+    from statistics import mean, pvariance
+
+    from areal.elastic.workload import ArrivalPhase, CompositionPhase, arrival_times
+
+    spec = replace(
+        _synthetic_workload_spec(),
+        duration_s=10,
+        arrivals=(ArrivalPhase(10, 4),),
+        composition=(CompositionPhase(10, (("short", 1.0),)),),
+    )
+    counts = [len(arrival_times(replace(spec, seed=seed))) for seed in range(1024)]
+    # E[N]=Var[N]=lambda*T=40. Broad, deterministic Monte Carlo checks.
+    assert abs(mean(counts) - 40) < 1
+    assert abs(pvariance(counts) - 40) < 8
+
+
 def test_expert_overlap_counts_residency_once_and_cleans_terminal_resources():
     """Rollout prefetch overlaps actor compute; cost follows ownership, not phase sum."""
     config = _expert_config()

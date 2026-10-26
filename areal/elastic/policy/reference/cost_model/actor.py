@@ -144,6 +144,7 @@ class ExpertActorModel:
     advantage_model: AdvantageModel | AggregateAdvantageModel | None = None
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     fsdp_host_rates: FSDPHostRates | None = None
+    execution_identity: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "group_gbps", tuple(tuple(x) for x in self.group_gbps))
@@ -176,7 +177,7 @@ class ExpertActorModel:
     def profile_key(self, config: ActorConfig) -> str:
         import numpy as np
 
-        return fingerprint(
+        identity = (
             code_revision(),
             ("numpy-argsort", np.__version__),
             self.version,
@@ -192,6 +193,9 @@ class ExpertActorModel:
             if isinstance(self.advantage_model, AggregateAdvantageModel)
             else self.advantage_model,
         )
+        if self.execution_identity:
+            identity += (self.execution_identity,)
+        return fingerprint(*identity)
 
     def observe_packing(
         self,
@@ -393,6 +397,13 @@ class ExpertActorModel:
                     else (dense + expert) * 18
                 )
             )
+            if config.precision_aware_optimizer:
+                # BF16 parameters and reduction buffers stay local; Adam m/v
+                # are DP-sharded. Master/remainder storage must be observed.
+                owned = sharded if config.distributed_optimizer else dense + expert
+                stored = (dense + expert) * (2 + config.grad_bytes) + owned * (
+                    8 + (config.optimizer_master_storage_bytes or 0)
+                )
             memory.append(stored / 1e9)
         impossible = max(memory) > self.hardware.memory_gb
         gpu_working_set = ()
@@ -431,6 +442,17 @@ class ExpertActorModel:
         if config.overlap_grad_reduce:
             notes += (
                 "overlap_grad_reduce is a serial communication upper prior; its benefit requires per-profile calibration",
+            )
+        if m.mlp_type == "dense" and p.tp > 1:
+            notes += (
+                "Dense TP uses two all-reduce-equivalent volumes per layer; sequence-parallel AG/RS latency and overlap remain priors",
+            )
+        if (
+            config.precision_aware_optimizer
+            and config.optimizer_master_storage_bytes is None
+        ):
+            notes += (
+                "Precision-aware Adam master/remainder storage is unknown and excluded from the static memory lower bound; optimizer traffic uses a full-master prior",
             )
         stages = []
         for name in STAGES:

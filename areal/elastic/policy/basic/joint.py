@@ -14,6 +14,7 @@ from .cost_model.rollout import (
     nonnegative,
     positive_int,
 )
+from .serving import ServingMetrics
 
 
 @dataclass(frozen=True)
@@ -203,6 +204,7 @@ class JointPrediction:
     events: tuple[JointEvent, ...] = ()
     assumptions: tuple[str, ...] = ()
     source_ids: tuple[str, ...] = ()
+    serving: ServingMetrics | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"complete", "unsupported", "incomplete", "infeasible"}:

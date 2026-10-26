@@ -645,7 +645,7 @@ def observe_inference(agent: Any, sampling: dict[str, Any]) -> Any:
         def sampled(*args: Any, **kwargs: Any) -> Any:
             clock = time.perf_counter()
             record = {"started": time.time(), "finished": None, "seconds": None}
-            agent._areal_call_trace.request(record)
+            agent._areal_call_trace.request(record, messages=kwargs.get("messages"))
 
             def finish() -> None:
                 if record["finished"] is None:
