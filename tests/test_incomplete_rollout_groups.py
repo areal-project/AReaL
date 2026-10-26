@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
@@ -74,15 +74,18 @@ async def test_grouped_rollout_keeps_each_usable_member_once(rollout_stats):
     assert result is not None
     assert workflow.calls == 3
     torch.testing.assert_close(result["input_ids"], torch.tensor([[11], [22]]))
-    rollout_stats.scalar.assert_called_once_with(
-        target_slot_count=3,
-        usable_slot_count=2,
-        trainable_slot_count=2,
-        fully_masked_group=False,
-        singleton_slot_group=False,
-        pre_filter_usable_slot_yield=2 / 3,
-        pre_filter_trainable_slot_yield=2 / 3,
-    )
+    assert rollout_stats.scalar.call_args_list == [
+        call(incomplete_trajectories=1, incomplete_group=1.0),
+        call(
+            target_slot_count=3,
+            usable_slot_count=2,
+            trainable_slot_count=2,
+            fully_masked_group=False,
+            singleton_slot_group=False,
+            pre_filter_usable_slot_yield=2 / 3,
+            pre_filter_trainable_slot_yield=2 / 3,
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -96,15 +99,18 @@ async def test_grouped_rollout_marks_empty_group_unusable(rollout_stats):
     result = await grouped.arun_episode(MagicMock(), {})
 
     assert result is None
-    rollout_stats.scalar.assert_called_once_with(
-        target_slot_count=3,
-        usable_slot_count=0,
-        trainable_slot_count=0,
-        fully_masked_group=True,
-        singleton_slot_group=False,
-        pre_filter_usable_slot_yield=0.0,
-        pre_filter_trainable_slot_yield=0.0,
-    )
+    assert rollout_stats.scalar.call_args_list == [
+        call(incomplete_trajectories=3, incomplete_group=1.0),
+        call(
+            target_slot_count=3,
+            usable_slot_count=0,
+            trainable_slot_count=0,
+            fully_masked_group=True,
+            singleton_slot_group=False,
+            pre_filter_usable_slot_yield=0.0,
+            pre_filter_trainable_slot_yield=0.0,
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -119,15 +125,18 @@ async def test_grouped_rollout_applies_estimator_minimum(rollout_stats):
     result = await grouped.arun_episode(MagicMock(), {})
 
     assert result is None
-    rollout_stats.scalar.assert_called_once_with(
-        target_slot_count=3,
-        usable_slot_count=1,
-        trainable_slot_count=0,
-        fully_masked_group=False,
-        singleton_slot_group=True,
-        pre_filter_usable_slot_yield=1 / 3,
-        pre_filter_trainable_slot_yield=0.0,
-    )
+    assert rollout_stats.scalar.call_args_list == [
+        call(incomplete_trajectories=2, incomplete_group=1.0),
+        call(
+            target_slot_count=3,
+            usable_slot_count=1,
+            trainable_slot_count=0,
+            fully_masked_group=False,
+            singleton_slot_group=True,
+            pre_filter_usable_slot_yield=1 / 3,
+            pre_filter_trainable_slot_yield=0.0,
+        ),
+    ]
 
 
 @pytest.mark.asyncio

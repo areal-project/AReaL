@@ -82,6 +82,7 @@ def qwen_reasoning_parser(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("validate_response", [False, True])
 @pytest.mark.parametrize(
     "text,force_reasoning,expected_reasoning,expected_content,has_tool",
     [
@@ -110,6 +111,7 @@ def qwen_reasoning_parser(monkeypatch):
 async def test_create_preserves_reasoning_tools_and_cache(
     qwen_reasoning_parser,
     stream,
+    validate_response,
     text,
     force_reasoning,
     expected_reasoning,
@@ -138,6 +140,7 @@ async def test_create_preserves_reasoning_tools_and_cache(
         api_key="test",
         tool_call_parser="qwen3_coder",
         reasoning_parser="qwen3",
+        **({} if validate_response else {"response_validator": None}),
     )
     tools = [
         {
@@ -212,10 +215,26 @@ async def test_create_preserves_reasoning_tools_and_cache(
                 message.model_dump(exclude_none=True),
                 {"role": "user", "content": "continue"},
             ],
+            tools=tools if has_tool else [],
             max_tokens=32,
             extra_body={"chat_template_kwargs": {"enable_thinking": force_reasoning}},
         )
         assert client.get_interaction(followup.id).parent is interaction
+        parsed = client.get_interaction(followup.id).metadata["response_parse"]
+        assert parsed["has_content"] == bool(expected_content)
+        assert parsed["has_tool_calls"] == has_tool
+        client.set_last_reward(3.0)
+        exported = client.export_interactions(style="individual")
+        leaf = exported[followup.id]
+        invalid_response = validate_response and not expected_content and not has_tool
+        assert leaf.reward == (0.0 if invalid_response else 3.0)
+        if invalid_response:
+            assert (
+                leaf.metadata["reward_validation_error"] == "empty_assistant_response"
+            )
+            assert leaf.metadata["reward_before_response_validation"] == 3.0
+        else:
+            assert "reward_validation_error" not in leaf.metadata
     finally:
         await client.close()
 

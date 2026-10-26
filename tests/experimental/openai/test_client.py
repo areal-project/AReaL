@@ -309,6 +309,8 @@ async def test_multi_round_conversation_concat_style_export(openai_client):
     Rewards are explicitly set (no propagation). Export should return only leaves.
     """
     openai_client: ArealOpenAI
+    # Test reward storage independently of generated final-response validity.
+    openai_client.response_validator = None
     openai_client.chat_template_type = "concat"
     openai_client.chat.completions.chat_template_type = "concat"
     # Base conversation
@@ -539,6 +541,8 @@ async def test_multi_round_conversation_end_with_length(openai_client):
     Rewards are explicitly set (no propagation). Export should return only leaves.
     """
     openai_client: ArealOpenAI
+    # Deliberate truncation can leave reasoning only; this test checks concat.
+    openai_client.response_validator = None
     openai_client.chat_template_type = "concat"
     openai_client.chat.completions.chat_template_type = "concat"
     # Base conversation

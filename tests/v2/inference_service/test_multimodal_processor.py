@@ -61,12 +61,13 @@ class TestDataProxyMultimodalClient:
         assert areal_openai.call_args.kwargs["processor"] is None
         assert areal_openai.call_args.kwargs["require_multimodal_processor"] is True
 
-    def test_multimodal_client_injects_processor_and_requires_it(self):
+    @pytest.mark.parametrize("allow_recovery", [False, True])
+    def test_multimodal_client_injects_processor_and_requires_it(self, allow_recovery):
         bridge = MagicMock()
         tokenizer = MagicMock()
         processor = MagicMock()
         tok = MagicMock(_tok=tokenizer, processor=processor)
-        config = DataProxyConfig()
+        config = DataProxyConfig(tool_call_parser_allow_recovery=allow_recovery)
 
         with patch(
             "areal.v2.inference_service.data_proxy.app.ArealOpenAI"
@@ -79,6 +80,7 @@ class TestDataProxyMultimodalClient:
             tokenizer=tokenizer,
             processor=processor,
             tool_call_parser=config.tool_call_parser,
+            tool_call_parser_allow_recovery=allow_recovery,
             reasoning_parser=config.reasoning_parser,
             engine_max_tokens=config.engine_max_tokens,
             chat_template_type=config.chat_template_type,
