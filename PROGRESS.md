@@ -1,6 +1,6 @@
 # AutoPilot 进度
 
-更新：2026-10-26（香港时间）。分支 `lws/feat/elastic-reconfig`。
+更新：2026-10-27（香港时间）。分支 `lws/feat/elastic-reconfig`。
 [开发交接](examples/autopilot/DEVELOPMENT.md)／[架构](areal/elastic/README.md)／[研究计划](examples/autopilot/PLAN.md)。
 
 **已验证**
@@ -22,9 +22,10 @@
    已设为PAUSED，等待明确恢复。最后09:36检查8卡仍由原计算进程占用、数据盘约85G可用，未启动新实验。后续候选约1万不同题、batch40、客户端并发64，固定TP4
    Actor＋4×TP1
    Rollout；目标规模／64K／采集开销仍待验收。[计划](examples/task_workflows/TRAIN_TRACE_PLAN.md)／[监控记录](../artifacts/h20-training-trace-20261025-f28c1811/monitor/state.json)。
-1. **当前实现登记为policy
-   v1**（标签`elastic-policy-v1`）：固定120秒Serving评价、压力\<80%／宽裕>90%、`K＋120×目标GPU数`；首次及交接全部完成后再积累120秒。规则、对照表与已知问题已纳入[版本记录](areal/elastic/policy/basic/VERSIONS.md)，下一版先讨论optimizer的持续吞吐／积压与恢复判断，本次未改策略。
-1. **v1的16组CPU实验已审计**：23,704请求、368次更新守恒，8组达到80%SLO；程序总耗时约13分钟。长输出受发布暂停影响；多轮长输入的120秒评价被剩余额度及旧Actor工作掩盖，缩容后积压，反复重配置使成本退化。[结果](../artifacts/elastic-rerun-16-20261026/README.md)／[审计](../artifacts/elastic-rerun-16-20261026/audit.json)／[精确重放诊断](../artifacts/elastic-slo-diagnosis-20261026/README.md)。保留原发布暂停、冻结fit与旧固定对照。
+1. **policy
+   v2冻结提交，后续策略修改从v3开始**：候选须同时满足120秒SLO与目标Actor持续补充额度能力`μ≥λ`；压力下全不合格时先比较SLO，再按额度缺口、成本打平。保留触发、成本公式、发布暂停及冻结fit；记录窗口额度和额度阻塞时间。v1标签仍为`elastic-policy-v1`。[版本与规则](areal/elastic/policy/basic/VERSIONS.md)。
+1. **剩余4条负载16组已审计，未达标原因已定位**：v2＋仅10%显存余量下6/16达80%；长输入88两组87.7%／85.2%、慢工具四组99.6%。长平台早期Actor被“完整batch／目标更新覆盖”检查拦住；长短平台TBT失败又受历史滞后与120秒禁搜影响。长输入44的200秒124候选已逐一复现0/183：182个TTFT失败，恢复快慢被二元SLO掩盖，打平后选TP8的8＋1。12组显存等待均0；4组原决策逐batch回放与原请求时间完全一致。仅诊断，未改策略。[完整表](../artifacts/elastic-policy-v2-remaining-20261027/table.md)／[审计](../artifacts/elastic-policy-v2-remaining-20261027/audit.json)／[诊断](../artifacts/elastic-policy-v2-remaining-diagnosis-20261027/README.md)。
+1. **显存余量对照已审计**：多轮长输入88联合，原v2为66.4%／8.27GPU·h；全部历史＋10%余量、仅原候选评估加10%余量均为88.56%／5.76，显存等待和额度阻塞归零。原830秒候选batch94.82GiB超过90%预算86.02GiB，余量单独即可拦住5卡TP1。93项正常CPU检查通过；单例条件模拟，非GPU保证。原模式／示例／结果均纳入v2冻结。[对照证据](../artifacts/elastic-policy-memory-margin-only-20261026/README.md)。
 1. 历史负例独立保留：旧687题／17更新／尾7题单峰中，动态SLO51.94%低于固定63.65%；旧95%动态单峰未完成。旧全trace搜索保持暂停。[搜索／延迟](../artifacts/elastic-online-search-20261025/README.md)／[模拟器加速](../artifacts/elastic-deferred-state-20261025/README.md)／[原95%](../artifacts/elastic-online-campaign-qwen4b-h20-20261025/README.md)／[安全等待](../artifacts/elastic-online-safe-wait-20261025/README.md)。
 1. Web trace viewer尚未实现。跨节点、mixed、HTTP尾延迟、发布中止重算及未见形状显存仍属条件模型，后续需验证。
 1. 真实GPU引擎验收等待资源；不启动旧1.7B正式训练。其旧运行仅3次更新，第4次反传OOM，无checkpoint；微批／allocator修复仍未验证。
@@ -32,4 +33,4 @@
    接沙箱后，验收stdout／stderr、清理和评分，再跑16题评测／4更新训练；SWE先验证参考补丁。[2×2操作](examples/task_workflows/RUN_2X2_8GPU.md)／[Singularity](examples/task_workflows/RUN_SLURM_SINGULARITY.md)。
 
 共同基线为 `lws/feat/elastic`；`origin`官方仓库、`fork`个人仓库，旧分支保留。本地reconfig历史提交
-`7e0c7bea`／`862819fc`；当前基线以`elastic-policy-v1`保存，本轮仅本地提交，不推送。历史细节见[推进前快照](../artifacts/elastic-simulation-qwen4b-h20-20261025/progress-before-simulation.md)。
+`7e0c7bea`／`862819fc`；v1以`elastic-policy-v1`保存，v2在当前分支以`feat: freeze online elastic policy v2`提交固定，后续策略修改从v3开始；未推送。历史细节见[推进前快照](../artifacts/elastic-simulation-qwen4b-h20-20261025/progress-before-simulation.md)。

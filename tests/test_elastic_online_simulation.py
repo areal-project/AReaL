@@ -28,6 +28,7 @@ from areal.elastic.policy.basic.forecast import (
 )
 from areal.elastic.policy.basic.history import HistoricalReplay, HistoryReplayConfig
 from areal.elastic.policy.basic.online import (
+    ActorSupply,
     CandidatePrediction,
     OnlinePolicy,
     OnlinePolicyConfig,
@@ -1188,6 +1189,234 @@ def test_window_cost_ranks_gpu_count_and_switching_without_a_card_count_shortcut
         select_prediction((score(more, 30), score(same_size, 20)), INITIAL, 0.8).layout
         == same_size
     )
+
+
+class _CreditCosts(_AffineCosts):
+    """A 40-episode cycle costs 149 seconds on a two-GPU Actor."""
+
+    def actor(self, layout, batch):
+        return (("train", 149 * 2 / layout.actor_gpus),)
+
+
+def credit_simulation(initial=INITIAL, *, accelerated=False):
+    return OnlineSimulation(
+        episodes(300, spacing=1.5),
+        initial,
+        _CreditCosts(),
+        replace(config(), batch_size=40),
+        replace(
+            handoff(),
+            actor_startup_seconds=30,
+            rollout_startup_seconds=30,
+            actor_warmup_seconds=5,
+            rollout_warmup_seconds=5,
+        ),
+        ServingSLO(5, 0.1, 0.8),
+        input_closes_at=448.5,
+        coalesce_decode=accelerated,
+    )
+
+
+def test_actor_supply_blocks_buffered_short_window_scale_down():
+    """Old work/credit can pass window SLO without validating the new Actor rate."""
+    sim = credit_simulation()
+    sim.run(until=120)
+    view = sim.observe()
+    forecasts = history_policy(history_seconds=120).forecaster.predict(view, 0)
+    model = OnlineForecastModel(sim.models, sim.config, sim.handoff, sim.slo)
+    keep, shrink = model.evaluate_many(view, forecasts, (INITIAL, SMALL))
+    assert shrink.supported and shrink.worst_request_fraction >= 0.8
+    assert shrink.mean_gpu_seconds < keep.mean_gpu_seconds
+    supply = shrink.actor_supply[0]
+    assert supply.offered_episodes == 80
+    assert supply.arrival_rate == pytest.approx(80 / 120)
+    assert supply.actor_seconds_per_batch == 149
+    assert supply.capacity_rate == pytest.approx(40 / (149 + 0.002))
+    assert supply.credit_balance_rate < 0 and supply.sustainable is False
+    assert keep.actor_supply[0].sustainable is True
+    assert select_prediction((keep, shrink), INITIAL, 0.8, trigger="slack") == keep
+    legacy = tuple(replace(p, actor_supply=()) for p in (keep, shrink))
+    assert select_prediction(legacy, INITIAL, 0.8, trigger="slack").layout == SMALL
+    bounded = model.search(view, forecasts, (INITIAL, SMALL), trigger="slack")
+    assert select_prediction(bounded, INITIAL, 0.8, trigger="slack") == keep
+
+
+class _HeadroomCosts(_AffineCosts):
+    """Declared physical footprints; all shapes fit, some lack policy headroom."""
+
+    def actor_memory(self, layout, batch):
+        long = max(t.input_tokens for e in batch for t in e) >= 2048
+        return (94.0 if long and layout.actor_tp == 1 else 60.0), 100.0, False
+
+
+def test_memory_reserve_uses_completed_history_beyond_the_serving_window():
+    """Old observed shapes constrain new layouts without reading future episodes."""
+    workload = tuple(
+        EpisodeSample(
+            f"episode-{i:02}",
+            "math",
+            float(i if i < 8 else 180 + i),
+            (Turn(2048 if i < 4 else 16, 4),),
+        )
+        for i in range(16)
+    ) + (EpisodeSample("future", "math", 400, (Turn(60000, 4),)),)
+    sim = OnlineSimulation(
+        workload,
+        INITIAL,
+        _HeadroomCosts(),
+        config(),
+        handoff(),
+        SLO,
+        input_closes_at=400,
+    )
+    sim.run(until=200)
+    view = sim.observe()
+    forecasts = history_policy(history_seconds=120).forecaster.predict(view, 0)
+    target = OnlineLayout(2, 1, 2, 1)
+    model = OnlineForecastModel(
+        sim.models,
+        sim.config,
+        sim.handoff,
+        SLO,
+        actor_memory_reserve_fraction=0.1,
+    )
+    keep, shrink = model.evaluate_many(view, forecasts, (INITIAL, target))
+    guard = shrink.actor_memory
+    assert keep.supported and keep.actor_memory.admissible
+    assert not shrink.supported and not guard.admissible
+    assert guard.peak_gib == 94 and guard.allowed_gib == 90
+    assert guard.checked_batches == 4
+    assert guard.worst_batch == tuple(f"episode-{i:02}" for i in range(4))
+    assert guard.observed_through == 200
+    assert all(e.completed_at < 80 for e in view.episodes[:4])
+    # Same physical simulation remains executable when only the policy margin is off.
+    unguarded = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO)
+    assert unguarded.evaluate(view, forecasts, target).supported
+    fallback = replace(keep, worst_request_fraction=0.7)
+    assert select_prediction((fallback, shrink), INITIAL, 0.8) == fallback
+    assert select_prediction((keep, shrink), INITIAL, 0.8, trigger="slack") == keep
+    bounded = model.search(view, forecasts, (INITIAL, target), trigger="slack")
+    assert select_prediction(bounded, INITIAL, 0.8, trigger="slack") == keep
+    # The ablation checks only the original evaluator's workload, so the old
+    # long batch is never requested and cannot affect this candidate.
+    local = OnlineForecastModel(
+        sim.models,
+        sim.config,
+        sim.handoff,
+        SLO,
+        actor_memory_reserve_fraction=0.1,
+        actor_memory_scope="evaluation",
+    )
+    local_prediction = local.evaluate(view, forecasts, target)
+    assert local_prediction.supported and local_prediction.actor_memory.admissible
+    assert local_prediction.actor_memory.scope == "evaluation"
+    assert local_prediction.actor_memory.peak_gib == 60
+    assert local_prediction.actor_memory.allowed_gib == 90
+    assert local._memory_batches == {}
+
+
+def test_evaluation_reserve_checks_target_calls_without_changing_physical_model():
+    """Ordinary evaluated shapes apply headroom to the target Actor only."""
+    from areal.autopilot.domains.elastic.online_memory import EvaluationMemoryModels
+
+    physical = _HeadroomCosts()
+    target = OnlineLayout(2, 1, 2, 1)
+    small = ((Turn(16, 4),),) * 4
+    large = ((Turn(2048, 4),),) * 4
+    guarded = EvaluationMemoryModels(physical, target, 0.1, 200)
+    assert guarded.actor(INITIAL, large) == physical.actor(INITIAL, large)
+    assert guarded.report.checked_batches == 0
+    assert guarded.actor(target, small) == physical.actor(target, small)
+    assert guarded.report.admissible and guarded.report.checked_batches == 1
+    with pytest.raises(ValueError, match="memory safety budget"):
+        guarded.actor(target, large)
+    assert guarded.report.peak_gib == 94 and not guarded.report.admissible
+    assert physical.actor(target, large)  # The outer physical model still fits.
+
+
+def test_memory_reserve_is_carried_into_latest_state_verification():
+    """The measured decision clock uses the same configured guard for revalidation."""
+    controller = history_policy(history_seconds=120)
+    controller.config = replace(
+        controller.config,
+        actor_memory_reserve_fraction=0.1,
+        actor_memory_scope="evaluation",
+    )
+    sim = OnlineSimulation(
+        episodes(16),
+        INITIAL,
+        _HeadroomCosts(),
+        config(),
+        handoff(),
+        SLO,
+        input_closes_at=15,
+        policy=controller,
+        measured_search_time=True,
+    )
+    assert sim.control.model(1).actor_memory_reserve_fraction == 0.1
+    assert sim.control.model(1).actor_memory_scope == "evaluation"
+
+
+def test_actor_supply_counts_waiting_arrivals_and_preserves_credit_clock():
+    """Admission throttling cannot lower measured demand; decode coalescing agrees."""
+    sims = [credit_simulation(SMALL, accelerated=fast) for fast in (False, True)]
+    for sim in sims:
+        sim.run(until=300)
+        view = sim.observe()
+        recent = [e for e in view.episodes if 180 <= e.available_at < 300]
+        assert any(not e.admitted for e in recent)
+        forecasts = history_policy(history_seconds=120).forecaster.predict(view, 0)
+        model = OnlineForecastModel(sim.models, sim.config, sim.handoff, sim.slo)
+        score = model.evaluate(view, forecasts, SMALL)
+        assert score.actor_supply[0].arrival_rate == pytest.approx(len(recent) / 120)
+        assert score.actor_supply[0].offered_episodes == len(recent)
+        assert score.admission_credit_blocked_seconds > 0
+        assert score.admission_credits_start == sim.admission_credits()
+        assert sim.admission_credit_blocked_seconds > 0
+    assert sims[0].admission_credit_blocked_seconds == pytest.approx(
+        sims[1].admission_credit_blocked_seconds, abs=1e-8
+    )
+
+
+@pytest.mark.parametrize("fraction", [0.7, 0.9])
+def test_supply_deficit_breaks_pressure_ties_before_cost_and_cannot_prune(fraction):
+    """A cheap buffer-depleting incumbent cannot prune a sustainable replacement."""
+    deficit = ActorSupply(
+        80,
+        120,
+        2 / 3,
+        149,
+        1,
+        40 / 150,
+        40 / 150 - 2 / 3,
+        False,
+        2,
+        0,
+        0,
+        False,
+        "Independent capacity oracle",
+    )
+    cheap = CandidatePrediction(
+        SMALL, True, fraction, 100, ("same-history",), actor_supply=(deficit,)
+    )
+    enough = replace(
+        deficit,
+        actor_seconds_per_batch=39,
+        capacity_rate=1,
+        credit_balance_rate=1 - 2 / 3,
+        sustainable=True,
+    )
+    current = replace(
+        cheap, layout=INITIAL, mean_gpu_seconds=200, actor_supply=(enough,)
+    )
+    assert select_prediction((current, cheap), INITIAL, 0.8) == current
+    assert not SearchBound(("view",), 0.8, cheap, fraction_pruning=False).rejection(
+        1.0, 201
+    )
+    assert select_prediction((current, cheap), INITIAL, 0.8, trigger="slack") == current
+    # If both deficit and SLO tie, the original GPU cost rule still applies.
+    equally_slow = replace(current, actor_supply=(deficit,))
+    assert select_prediction((equally_slow, cheap), INITIAL, 0.8) == cheap
 
 
 @pytest.mark.parametrize("horizon", [2, 20, 120])

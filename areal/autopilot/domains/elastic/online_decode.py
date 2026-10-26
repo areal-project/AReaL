@@ -226,5 +226,4 @@ def advance_decode(sim: OnlineSimulation, until: float | None) -> None:
     sim.processed_events += skipped
     sim.decode_steps_skipped += skipped
     sim.decode_segments += len(changes)
-    sim.now = max(run.end(steps) for run, steps in changes)
-    sim.pool.advance(sim.now)
+    sim.advance(max(run.end(steps) for run, steps in changes))

@@ -18,7 +18,7 @@ from .forecast import (
     ReplayWindow,
 )
 from .history import HistoricalReplay, WorkloadFeatures
-from .search import select_prediction
+from .search import meets_target, select_prediction
 from .serving import ServingSLO
 
 
@@ -39,6 +39,8 @@ class OnlinePolicyConfig:
     deduplicate_searches: bool = True
     pressure_request_fraction: float = 0.8
     slack_request_fraction: float = 0.9
+    actor_memory_reserve_fraction: float = 0.0
+    actor_memory_scope: str = "all_completed"
 
     def __post_init__(self):
         for name in ("check_interval_seconds", "slo_window_seconds"):
@@ -49,6 +51,10 @@ class OnlinePolicyConfig:
             raise ValueError(
                 "Require 0 <= pressure_request_fraction < slack_request_fraction <= 1"
             )
+        if not 0 <= self.actor_memory_reserve_fraction < 1:
+            raise ValueError("Actor memory reserve must be in [0, 1)")
+        if self.actor_memory_scope not in ("all_completed", "evaluation"):
+            raise ValueError("Actor memory scope must be all_completed or evaluation")
         for name in (
             "pressure_checks",
             "slack_checks",
@@ -114,6 +120,41 @@ def rolling_slo(view: OnlineObservation, slo: ServingSLO, seconds: float) -> Rol
 
 
 @dataclass(frozen=True)
+class ActorSupply:
+    """Conditional target-only capacity; excludes old Actor work and idle time."""
+
+    offered_episodes: int
+    history_seconds: float
+    arrival_rate: float
+    actor_seconds_per_batch: float | None
+    publication_seconds_per_batch: float | None
+    capacity_rate: float | None
+    credit_balance_rate: float | None
+    sustainable: bool | None
+    representative_batches: int
+    padded_episodes: int
+    substituted_episodes: int
+    input_closed: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class ActorMemorySafety:
+    """Candidate-only margin; evaluation batches can contain replay templates."""
+
+    admissible: bool
+    reserve_fraction: float
+    checked_batches: int
+    peak_gib: float | None
+    capacity_gib: float | None
+    allowed_gib: float | None
+    worst_batch: tuple[str, ...]
+    observed_through: float
+    reason: str
+    scope: str = "all_completed"
+
+
+@dataclass(frozen=True)
 class CandidatePrediction:
     """Historical mean_gpu_seconds aliases score_gpu_seconds (K + H * GPUs).
 
@@ -145,6 +186,11 @@ class CandidatePrediction:
     failed_pending_requests: int | None = None
     completed_updates: int | None = None
     retained_episodes: int | None = None
+    actor_supply: tuple[ActorSupply, ...] = ()
+    admission_credits_start: int | None = None
+    admission_credits_end: float | None = None
+    admission_credit_blocked_seconds: float | None = None
+    actor_memory: ActorMemorySafety | None = None
 
 
 class OnlineModel(Protocol):
@@ -370,9 +416,9 @@ class OnlinePolicy:
                     predictions,
                     seeds,
                 )
-            if best.worst_request_fraction + 1e-12 >= slo.minimum_request_fraction:
+            if meets_target(best, slo.minimum_request_fraction):
                 reason = (
-                    "Minimum switching plus fixed-window GPU cost among SLO-target candidates; "
+                    "Minimum switching plus fixed-window GPU cost among SLO-target and sustainable-Actor candidates; "
                     + (
                         "current excluded when a feasible replacement exists"
                         if trigger == "pressure"
@@ -380,11 +426,9 @@ class OnlinePolicy:
                     )
                 )
             elif trigger == "slack":
-                reason = (
-                    "No SLO-target candidate under slack; retain current deployment"
-                )
+                reason = "No SLO-target and sustainable-Actor candidate under slack; retain current deployment"
             else:
-                reason = "Best executable request fraction below SLO target, then minimum switching plus fixed-window GPU cost; target remains unmet"
+                reason = "Best executable request fraction, then minimum credit deficit and switching plus fixed-window GPU cost; SLO/capacity target remains unmet"
             if self.forecaster.features is not None:
                 self._winners = (
                     self._winners + [(self.forecaster.features, best.layout)]

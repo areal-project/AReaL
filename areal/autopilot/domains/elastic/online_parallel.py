@@ -48,7 +48,20 @@ def evaluate_chunk(job):
         _identity = identity
         _search = None
     context = payload[10] if len(payload) > 10 else None
-    key = identity, config, handoff, slo, delay, prune, coalesce, context
+    reserve = payload[11] if len(payload) > 11 else 0.0
+    scope = payload[12] if len(payload) > 12 else "all_completed"
+    key = (
+        identity,
+        config,
+        handoff,
+        slo,
+        delay,
+        prune,
+        coalesce,
+        context,
+        reserve,
+        scope,
+    )
     if context is None or _search is None or _search[0] != key:
         evaluator = OnlineForecastModel(
             _models,
@@ -58,6 +71,8 @@ def evaluate_chunk(job):
             delay,
             prune_irreversible_slo=prune,
             coalesce_decode=coalesce,
+            actor_memory_reserve_fraction=reserve,
+            actor_memory_scope=scope,
         )
         if context is not None:
             # Keep the first immutable DTOs for this content identity. Repeated
@@ -67,8 +82,8 @@ def evaluate_chunk(job):
         _, evaluator, view, forecasts = _search
     before = getattr(evaluator, "input_preparations", 0)
     predictions = tuple(
-        evaluator.evaluate(view, forecasts, layout, bound=payload[11])
-        if len(payload) > 11
+        evaluator.evaluate(view, forecasts, layout, bound=payload[13])
+        if len(payload) > 13
         else evaluator.evaluate(view, forecasts, layout)
         for _, layout in indexed
     )

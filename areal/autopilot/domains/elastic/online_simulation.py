@@ -31,6 +31,8 @@ from areal.elastic.policy.basic.forecast import (
     Turn,
 )
 from areal.elastic.policy.basic.online import (
+    ActorMemorySafety,
+    ActorSupply,
     CandidatePrediction,
     OnlinePolicy,
     rolling_slo,
@@ -50,6 +52,7 @@ from areal.elastic.policy.reference.cost_model.rollout import RolloutConfig
 from areal.elastic.policy.reference.scenario import Request
 
 from .online_inputs import ForecastInputs, WorkInputs
+from .online_memory import EvaluationMemoryModels
 from .online_state import ReplicaState, RequestState
 from .online_transitions import (
     ActorMemoryRejected,
@@ -253,6 +256,7 @@ class OnlineSimulation:
         self._tool_episodes: dict[str, _Episode] = {}
         self._episode_order: dict[str, int] = {}
         self._active_episodes = self._completed_episodes = self._admission_cursor = 0
+        self.admission_credit_blocked_seconds = 0.0
         self.actor_batch: tuple[str, ...] = ()
         self.actor_wait: ActorWaitView | None = None
         self.actor_wait_seconds = 0.0
@@ -357,8 +361,7 @@ class OnlineSimulation:
                     advance_decode(self, until)
                 when = self.heap[0][0]
                 if until is not None and when > until:
-                    self.pool.advance(until)
-                    self.now = until
+                    self.advance(until)
                     paused = True
                     break
                 if when > self.config.max_simulated_seconds:
@@ -372,8 +375,7 @@ class OnlineSimulation:
                         ),
                     )
                     break
-                self.pool.advance(when)
-                self.now = when
+                self.advance(when)
                 local_services = set()
                 service_only = (
                     self.coalesce_decode
@@ -597,13 +599,26 @@ class OnlineSimulation:
                 self.release_deployment(identity)
             self.done = True
 
-    def admit(self):
-        active, accepted = self._active_episodes, self._completed_episodes
-        credits = (
+    def admission_credits(self):
+        return (
             (self.config.staleness + self.provider_version + 1) * self.config.batch_size
-            - accepted
-            - active
+            - self._completed_episodes
+            - self._active_episodes
         )
+
+    def advance(self, when):
+        # Count only intervals with tasks waiting for staleness admission credit.
+        if (
+            self._admission_cursor < len(self.arrival_order)
+            and self.admission_credits() <= 0
+        ):
+            self.admission_credit_blocked_seconds += when - self.now
+        self.pool.advance(when)
+        self.now = when
+
+    def admit(self):
+        active = self._active_episodes
+        credits = self.admission_credits()
         while self._admission_cursor < len(self.arrival_order):
             identity = self.arrival_order[self._admission_cursor]
             episode = self.episodes[identity]
@@ -1352,6 +1367,8 @@ class OnlineSimulation:
             self.slo,
             self.policy.config.decision_delay_seconds,
             executor=self.candidate_executor,
+            actor_memory_reserve_fraction=self.policy.config.actor_memory_reserve_fraction,
+            actor_memory_scope=self.policy.config.actor_memory_scope,
         )
         decision = self.policy.decide(view, model)
         record = asdict(decision)
@@ -1402,6 +1419,8 @@ class OnlineSimulation:
             actor_wait_seconds=self.actor_wait_seconds
             + (self.now - self.actor_wait.since if self.actor_wait else 0.0),
             retained_episodes=len(self.arrival_order) - self.consumed,
+            admission_credits=self.admission_credits(),
+            admission_credit_blocked_seconds=self.admission_credit_blocked_seconds,
             ready_requests=len(rows),
             completed_requests=len(complete),
             jointly_passed_requests=len(passed),
@@ -1623,12 +1642,20 @@ class OnlineForecastModel:
         prune_irreversible_slo: bool = True,
         coalesce_decode: bool = True,
         executor: Executor | None = None,
+        actor_memory_reserve_fraction: float = 0.0,
+        actor_memory_scope: str = "all_completed",
     ):
         self.models, self.config, self.handoff, self.slo = models, config, handoff, slo
         self.delay = decision_delay_seconds
         self.prune_irreversible_slo = prune_irreversible_slo
         self.coalesce_decode = coalesce_decode
         self.executor = executor
+        if not 0 <= actor_memory_reserve_fraction < 1:
+            raise ValueError("Actor memory reserve must be in [0, 1)")
+        self.actor_memory_reserve_fraction = actor_memory_reserve_fraction
+        if actor_memory_scope not in ("all_completed", "evaluation"):
+            raise ValueError("Actor memory scope must be all_completed or evaluation")
+        self.actor_memory_scope = actor_memory_scope
         self._view = None
         self._forecasts = None
         self._work_ids = ()
@@ -1649,7 +1676,13 @@ class OnlineForecastModel:
             fingerprint(view),
             self._work_ids,
             fingerprint(
-                self.config, self.handoff, self.slo, self.delay, self.source_ids
+                self.config,
+                self.handoff,
+                self.slo,
+                self.delay,
+                self.source_ids,
+                self.actor_memory_reserve_fraction,
+                self.actor_memory_scope,
             ),
         )
         self._prepared = {}
@@ -1661,6 +1694,8 @@ class OnlineForecastModel:
             sum(len(e.turns) for e in f.episodes) - len(self._past) for f in forecasts
         )
         self._known_batch = ()
+        self._memory_checks = {}
+        self._memory_batches = {}
         if self._historical:
             completed = {
                 e.episode_id: e.completed_turns
@@ -1678,6 +1713,154 @@ class OnlineForecastModel:
                 self._known_batch = tuple(
                     list(completed.values())[-self.config.batch_size :]
                 )
+        if (
+            self.actor_memory_reserve_fraction
+            and self.actor_memory_scope == "all_completed"
+        ):
+            # Preserve the real arrival-order batch boundaries, including holes
+            # caused by unfinished episodes. Never fill them with future turns.
+            ordered = sorted(
+                view.episodes, key=lambda e: (e.available_at, e.episode_id)
+            )
+            size = self.config.batch_size
+            for start in range(0, len(ordered) - size + 1, size):
+                rows = ordered[start : start + size]
+                if all(
+                    e.completed_at is not None and e.completed_at <= view.now
+                    for e in rows
+                ):
+                    self._memory_batches[tuple(e.episode_id for e in rows)] = tuple(
+                        e.completed_turns for e in rows
+                    )
+            if self._known_batch:
+                identities = identities or tuple(list(completed)[-size:])
+                self._memory_batches[tuple(identities)] = self._known_batch
+
+    def actor_memory_safety(self, view, layout):
+        reserve = self.actor_memory_reserve_fraction
+        if not reserve:
+            return None
+        key = layout.actor_dp, layout.actor_tp
+        if key in self._memory_checks:
+            return self._memory_checks[key]
+        peak = capacity = allowed = None
+        worst, count, admissible = (), 0, True
+        reason = "All completed historical batches retain the configured memory reserve"
+        estimate = getattr(self.models, "actor_memory", None)
+        if estimate is None or not self._memory_batches:
+            admissible = False
+            reason = "Actor memory safety unknown: need memory estimates and a completed observed batch"
+        else:
+            try:
+                for ids, batch in self._memory_batches.items():
+                    used, limit, measured_oom = estimate(layout, batch)
+                    if (
+                        not math.isfinite(used)
+                        or used < 0
+                        or not math.isfinite(limit)
+                        or limit <= 0
+                    ):
+                        raise ValueError("Invalid Actor memory estimate")
+                    count += 1
+                    if peak is None or used > peak:
+                        peak, capacity, allowed, worst = (
+                            used,
+                            limit,
+                            limit * (1 - reserve),
+                            ids,
+                        )
+                    if measured_oom or used > limit * (1 - reserve):
+                        admissible = False
+                        reason = "Historical Actor shape exceeds the memory safety budget or has a measured OOM"
+            except ValueError as exc:
+                admissible = False
+                reason = f"Actor memory safety unavailable: {exc}"
+        result = ActorMemorySafety(
+            admissible, reserve, count, peak, capacity, allowed, worst, view.now, reason
+        )
+        self._memory_checks[key] = result
+        return result
+
+    def actor_supply(self, view, forecast, layout, *, models=None):
+        """Estimate ongoing demand from offered arrivals and causal turn templates.
+
+        Incomplete final batches wrap to the start of the same historical sequence
+        and carry fractional batch weight. This estimates a repeated workload's
+        capacity, not extra training in the serving window or an exact queue bound.
+        """
+        models = models or self.models
+        replay = forecast.replay
+        recent = sorted(
+            (
+                e
+                for e in view.episodes
+                if replay.template_started_at <= e.available_at < view.now
+            ),
+            key=lambda e: (e.available_at, e.episode_id),
+        )
+        rate = (
+            len(recent) / replay.template_seconds
+            if replay.template_seconds > 0
+            else 0.0
+        )
+        if view.input_closed:
+            rate = 0.0
+        templates = {e.episode_id: e.turns for e in forecast.episodes}
+        rows = tuple(templates[e.episode_id] for e in recent) or self._known_batch
+        batch_size = self.config.batch_size
+        actor_seconds = publication_seconds = capacity = balance = None
+        sustainable = True if rate == 0 else None
+        batches = padded = 0
+        reason = (
+            "No ongoing offered arrivals"
+            if rate == 0
+            else "No historical Actor workload"
+        )
+        if rows:
+            weighted_seconds = weight = 0.0
+            try:
+                for offset in range(0, len(rows), batch_size):
+                    count = min(batch_size, len(rows) - offset)
+                    batch = tuple(
+                        rows[(offset + i) % len(rows)] for i in range(batch_size)
+                    )
+                    stages = models.actor(layout, batch)
+                    if not stages:
+                        raise ValueError("Actor model supplied no capacity stages")
+                    seconds = sum(seconds for _, seconds in stages)
+                    if not math.isfinite(seconds) or seconds <= 0:
+                        raise ValueError(
+                            "Actor capacity requires a positive finite cycle"
+                        )
+                    weighted_seconds += seconds * count / batch_size
+                    weight += count / batch_size
+                    batches += 1
+                    padded += batch_size - count
+                actor_seconds = weighted_seconds / weight
+                publication_seconds = models.publication(layout, (layout,))
+                if not math.isfinite(publication_seconds) or publication_seconds < 0:
+                    raise ValueError("Publication capacity requires a finite duration")
+                capacity = batch_size / (actor_seconds + publication_seconds)
+                balance = capacity - rate
+                sustainable = balance >= -1e-12
+                reason = "Target-only historical Actor stages plus steady-layout publication; excludes input waiting, cutover and old Actor work"
+            except ValueError as exc:
+                reason = f"Actor supply estimate unavailable: {exc}"
+        return ActorSupply(
+            len(recent),
+            replay.template_seconds,
+            rate,
+            actor_seconds,
+            publication_seconds,
+            capacity,
+            balance,
+            sustainable,
+            batches,
+            padded,
+            sum(e.completed_at is None for e in recent),
+            view.input_closed,
+            reason,
+        )
 
     def search(self, view, forecasts, layouts, *, preferred=(), trigger="pressure"):
         self.prepare_context(view, forecasts)
@@ -1751,6 +1934,8 @@ class OnlineForecastModel:
             view,
             forecasts,
             self._context_id,
+            self.actor_memory_reserve_fraction,
+            self.actor_memory_scope,
         )
         # Score current first for the below-target fallback, not as a pressure
         # cost incumbent: any feasible replacement takes precedence over it.
@@ -1830,6 +2015,8 @@ class OnlineForecastModel:
             view,
             forecasts,
             self._context_id,
+            self.actor_memory_reserve_fraction,
+            self.actor_memory_scope,
         )
         indexed = tuple(enumerate(layouts))
         jobs = ((payload, indexed[i : i + 8]) for i in range(0, len(indexed), 8))
@@ -1858,6 +2045,51 @@ class OnlineForecastModel:
         bound: SearchBound | None = None,
     ) -> CandidatePrediction:
         self.prepare_context(view, forecasts)
+        if (
+            self.actor_memory_reserve_fraction
+            and self.actor_memory_scope == "evaluation"
+        ):
+            models = EvaluationMemoryModels(
+                self.models, layout, self.actor_memory_reserve_fraction, view.now
+            )
+            prediction = self._evaluate(
+                view, forecasts, layout, bound=bound, models=models
+            )
+            memory = models.report
+            if not memory.admissible:
+                prediction = replace(
+                    prediction,
+                    supported=False,
+                    worst_request_fraction=None,
+                    mean_gpu_seconds=None,
+                    reason=memory.reason,
+                    actor_coverage="evaluation_memory_rejected",
+                    pruned=False,
+                )
+            return replace(prediction, actor_memory=memory)
+        memory = self.actor_memory_safety(view, layout)
+        if memory is not None and not memory.admissible:
+            return CandidatePrediction(
+                layout,
+                False,
+                None,
+                None,
+                self._work_ids,
+                memory.reason,
+                self.source_ids,
+                actor_coverage="historical_memory_rejected",
+                actor_memory=memory,
+            )
+        prediction = self._evaluate(view, forecasts, layout, bound=bound)
+        return (
+            replace(prediction, actor_memory=memory)
+            if memory is not None
+            else prediction
+        )
+
+    def _evaluate(self, view, forecasts, layout, *, bound=None, models=None):
+        models = models or self.models
+        self.prepare_context(view, forecasts)
         work_ids = self._work_ids
         if bound is not None and bound.context_id != self._context_id:
             bound = None
@@ -1866,10 +2098,15 @@ class OnlineForecastModel:
         historical = self._historical
         coverage = "legacy_sampled_execution"
         known_batch = self._known_batch
+        supply = (
+            tuple(self.actor_supply(view, f, layout, models=models) for f in forecasts)
+            if historical
+            else ()
+        )
         if historical:
             if known_batch:
                 try:
-                    if not self.models.actor(layout, known_batch):
+                    if not models.actor(layout, known_batch):
                         raise ValueError("Actor model supplied no update stages")
                 except ValueError as exc:
                     return CandidatePrediction(
@@ -1881,6 +2118,7 @@ class OnlineForecastModel:
                         str(exc),
                         self.models.source_ids,
                         actor_coverage="known_batch_rejected",
+                        actor_supply=supply,
                     )
                 coverage = "known_complete_batch_capacity_checked"
         past = self._past
@@ -1930,7 +2168,7 @@ class OnlineForecastModel:
                 simulation = OnlineSimulation.from_forecast(
                     view,
                     forecast,
-                    self.models,
+                    models,
                     self.config,
                     self.handoff,
                     self.slo,
@@ -1997,6 +2235,7 @@ class OnlineForecastModel:
                     work_ids,
                     str(exc),
                     self.models.source_ids,
+                    actor_supply=supply,
                 )
             if result["status"] == "candidate_pruned":
                 guard = simulation._candidate_guard
@@ -2017,6 +2256,7 @@ class OnlineForecastModel:
                         bound.best.worst_request_fraction,
                         bound.best.mean_gpu_seconds,
                     ),
+                    actor_supply=supply,
                 )
             if (
                 result["status"]
@@ -2037,6 +2277,7 @@ class OnlineForecastModel:
                     if result["status"] not in ("complete", "running")
                     else "No spare GPUs for TP-local overlap",
                     self.models.source_ids,
+                    actor_supply=supply,
                 )
             if historical and not known_batch:
                 changes_actor = (layout.actor_dp, layout.actor_tp) != (
@@ -2069,6 +2310,7 @@ class OnlineForecastModel:
                         "Actor capacity unknown: no observed full batch or post-cutover complete update",
                         self.models.source_ids,
                         actor_coverage="unknown_no_complete_batch",
+                        actor_supply=supply,
                     )
                 coverage = (
                     "post_cutover_complete_update"
@@ -2134,6 +2376,24 @@ class OnlineForecastModel:
             if historical
             else None,
             retained_episodes=sum(r["retained_episodes"] for r in window_results)
+            if historical
+            else None,
+            actor_supply=supply,
+            admission_credits_start=(
+                (self.config.staleness + view.provider_version + 1)
+                * self.config.batch_size
+                - sum(e.admitted for e in view.episodes)
+            )
+            if historical
+            else None,
+            admission_credits_end=sum(r["admission_credits"] for r in window_results)
+            / len(window_results)
+            if historical
+            else None,
+            admission_credit_blocked_seconds=sum(
+                r["admission_credit_blocked_seconds"] for r in window_results
+            )
+            / len(window_results)
             if historical
             else None,
         )

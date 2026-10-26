@@ -56,6 +56,8 @@ class OnlineControl:
             sim.slo,
             delay,
             executor=sim.candidate_executor,
+            actor_memory_reserve_fraction=sim.policy.config.actor_memory_reserve_fraction,
+            actor_memory_scope=sim.policy.config.actor_memory_scope,
         )
 
     def observe_history(self, view, *, confirm_change=True):

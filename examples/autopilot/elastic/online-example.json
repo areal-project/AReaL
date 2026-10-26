@@ -27,6 +27,7 @@
   "policy": {
     "check_interval_seconds": 10, "slo_window_seconds": 120,
     "pressure_request_fraction": 0.8, "slack_request_fraction": 0.9,
+    "actor_memory_reserve_fraction": 0.1,
     "cooldown_seconds": 0, "deduplicate_searches": false,
     "decision_delay_seconds": 1, "minimum_completed_requests": 8, "max_evaluations": 165
   },

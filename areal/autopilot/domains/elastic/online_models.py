@@ -157,8 +157,24 @@ class CalibratedOnlineModels:
     def actor(self, layout: OnlineLayout, batch: tuple[tuple[Turn, ...], ...]):
         return self._actor(layout.actor_dp, layout.actor_tp, batch)
 
+    def actor_memory(self, layout, batch):
+        """Expose the unchanged physical estimate for policy-only headroom checks."""
+        _, peak, limit, measured_oom = self._actor_estimate(
+            layout.actor_dp, layout.actor_tp, batch
+        )
+        return peak, limit, measured_oom
+
     @lru_cache(maxsize=512)
     def _actor(self, dp: int, tp: int, batch: tuple[tuple[Turn, ...], ...]):
+        stages, peak, limit, measured_oom = self._actor_estimate(dp, tp, batch)
+        if peak > limit or measured_oom:
+            raise ActorMemoryRejected(
+                f"Conditional Actor memory rejection: {peak:.3f}GiB / {limit:.3f}GiB; measured_shape_oom={measured_oom}"
+            )
+        return stages
+
+    @lru_cache(maxsize=4096)
+    def _actor_estimate(self, dp: int, tp: int, batch: tuple[tuple[Turn, ...], ...]):
         base = self.cal_actor.base
         if dp * tp > 8:
             if self.inter_node_dp_GBps is None:
@@ -204,10 +220,6 @@ class CalibratedOnlineModels:
         measured_oom = any(
             (dp, tp, tuple(sorted(row))) in self.cal_actor.oom_shapes for row in rows
         )
-        if peak > limit or measured_oom:
-            raise ActorMemoryRejected(
-                f"Conditional Actor memory rejection: {peak:.3f}GiB / {limit:.3f}GiB; measured_shape_oom={measured_oom}"
-            )
         result = []
         for phase, values in features.items():
             fit = next(
@@ -217,7 +229,7 @@ class CalibratedOnlineModels:
             )
             seconds, _ = fit.evaluate(values, extrapolate=True)
             result.append((phase, seconds))
-        return tuple(result)
+        return tuple(result), peak, limit, measured_oom
 
     def _memory_features(self, config, work, raw):
         base = self.cal_actor.base

@@ -5,11 +5,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import inf
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .forecast import OnlineLayout
     from .online import CandidatePrediction
+
+
+def meets_target(prediction: CandidatePrediction, target: float) -> bool:
+    """Historical candidates must meet SLO and replenish admission credits."""
+    return (
+        (prediction.actor_memory is None or prediction.actor_memory.admissible)
+        and prediction.worst_request_fraction is not None
+        and prediction.worst_request_fraction + 1e-12 >= target
+        and all(s.sustainable is True for s in prediction.actor_supply)
+    )
+
+
+def credit_deficit(prediction: CandidatePrediction) -> float:
+    """Only deficits break SLO ties; surplus capacity does not earn free GPUs."""
+    return max(
+        (
+            max(0.0, -s.credit_balance_rate)
+            if s.credit_balance_rate is not None
+            else (0.0 if s.sustainable else inf)
+            for s in prediction.actor_supply
+        ),
+        default=0.0,  # Legacy sampled forecasts have no supply constraint.
+    )
 
 
 def select_prediction(predictions, current, target, *, trigger="pressure"):
@@ -21,12 +45,13 @@ def select_prediction(predictions, current, target, *, trigger="pressure"):
         p
         for p in predictions
         if p.supported
+        and (p.actor_memory is None or p.actor_memory.admissible)
         and not p.pruned
         and p.work_ids == work
         and p.worst_request_fraction is not None
         and p.mean_gpu_seconds is not None
     ]
-    eligible = [p for p in runnable if p.worst_request_fraction + 1e-12 >= target]
+    eligible = [p for p in runnable if meets_target(p, target)]
     if trigger == "pressure":
         eligible = [p for p in eligible if p.layout != current]
     if eligible:
@@ -39,6 +64,7 @@ def select_prediction(predictions, current, target, *, trigger="pressure"):
         runnable,
         key=lambda p: (
             -p.worst_request_fraction,
+            credit_deficit(p),
             p.mean_gpu_seconds,
             p.layout != current,
             p.layout,
@@ -56,13 +82,14 @@ class SearchBound:
 
     def rejection(self, fraction_upper: float, mean_cost_lower: float) -> str:
         best = self.best
-        if best.worst_request_fraction + 1e-12 >= self.target:
+        if meets_target(best, self.target):
             if self.fraction_pruning and fraction_upper + 1e-12 < self.target:
                 return "Request-fraction upper bound is below an eligible incumbent"
             if mean_cost_lower > best.mean_gpu_seconds + 1e-8:
                 return "Score lower bound exceeds eligible incumbent"
         elif (
-            self.fraction_pruning
+            not best.actor_supply
+            and self.fraction_pruning
             and fraction_upper + 1e-12 < best.worst_request_fraction
         ):
             return "Request-fraction upper bound is below the best runnable incumbent"
