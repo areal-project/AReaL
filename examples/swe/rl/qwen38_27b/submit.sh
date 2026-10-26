@@ -24,9 +24,10 @@ if [[ ${1:-} != --from-snapshot ]]; then
     esac
   done
   snapshot=$(realpath -m "${QWEN_SYNC_DIR:-$QWEN_RUN_DIR/source}")
-  privilege=()
+  # Bash 4.2 treats an empty array as unset under nounset.
+  privilege=(env)
   if (( EUID != 0 )); then
-    privilege=(sudo)
+    privilege=(sudo env)
   fi
   source_revision=$("${privilege[@]}" python3 "$recipe_dir/source_snapshot.py" stage \
     --source "$local_repo" --profile "$QWEN_ENV_FILE" --destination "$snapshot")
@@ -35,7 +36,7 @@ if [[ ${1:-} != --from-snapshot ]]; then
     exit 0
   fi
   # Carry only routing/provenance here. Credentials are read from the staged profile.
-  exec "${privilege[@]}" env \
+  exec "${privilege[@]}" \
     QWEN_ENV_FILE="$snapshot/code/examples/swe/rl/qwen38_27b/site.env" \
     QWEN_SUBMITTED_ENV_FILE="$snapshot/code/examples/swe/rl/qwen38_27b/site.env" \
     QWEN_SUBMITTED_REPO="$snapshot/code" \
@@ -61,13 +62,16 @@ done
 log_dir="$QWEN_OUTPUT_ROOT/logs/$QWEN_RUN_USER/$QWEN_EXPERIMENT_NAME/$QWEN_ARENA_TRIAL"
 mkdir -p "$EXPERIMENT_ROOT" "$log_dir"
 # The staged profile selects a recipe-local YAML; the runtime path stays train.yaml.
-config_name=${QWEN_TRAIN_CONFIG:-train.yaml}
+config_name=${QWEN_TRAIN_CONFIG:-train_fine_released64_bs16.yaml}
 if [[ $config_name != "$(basename -- "$config_name")" || $config_name != *.yaml ]]; then
   echo 'QWEN_TRAIN_CONFIG must name a YAML file in the recipe directory' >&2
   exit 1
 fi
 config_source="$recipe_dir/$config_name"
 test -f "$config_source"
+printf 'Experiment: %s\nTrial: %s\nConfig: %s\nReservation: %s\nNodes: %s\n' \
+  "$QWEN_EXPERIMENT_NAME" "$QWEN_ARENA_TRIAL" "$config_name" \
+  "$QWEN_RESERVATION" "$QWEN_NODELIST"
 if [[ -f $QWEN_CONFIG ]]; then
   cmp "$config_source" "$QWEN_CONFIG"
   test "$(cat "$EXPERIMENT_ROOT/source-revision")" = "$QWEN_SOURCE_REVISION"

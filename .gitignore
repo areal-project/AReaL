@@ -157,6 +157,7 @@ celerybeat.pid
 
 # Environments
 .env
+examples/swe/rl/qwen38_27b/site.env
 .venv
 env/
 venv/
