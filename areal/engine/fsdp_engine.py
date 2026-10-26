@@ -2024,10 +2024,11 @@ class FSDPEngine(TrainEngine):
                 slice_model_inputs=slice_model_inputs,
             )
         else:
-            inputs = mb_item.padded_mb
+            inputs = dict(mb_item.padded_mb)
             trie_node = inputs.pop("trie_node", None)
             ulysses_pad_size = 0
 
+        inputs.pop("unit_weights", None)
         ctx = FSDPTrainContext(
             model_inputs=inputs,
             mb_input=mb_item.orig_mb,

@@ -874,6 +874,36 @@ class WorkflowExecutor:
         return head, tail, rle
 
     @staticmethod
+    def _compute_trajectory_row_metadata(
+        trajectory_starts: list[int], batch_size: int
+    ) -> tuple[list[int], list[int]]:
+        """Map flattened rows back to their grouped rollout trajectories."""
+        if len(trajectory_starts) != batch_size:
+            raise ValueError(
+                "begin_of_trajectory length "
+                f"{len(trajectory_starts)} != batch size {batch_size}"
+            )
+
+        trajectory_indices: list[int] = []
+        row_indices: list[int] = []
+        trajectory_idx = -1
+        row_idx = -1
+        for start in trajectory_starts:
+            if start == 1:
+                trajectory_idx += 1
+                row_idx = 0
+            else:
+                if trajectory_idx < 0:
+                    raise ValueError(
+                        "the first row must begin a trajectory, but "
+                        "begin_of_trajectory[0] is 0"
+                    )
+                row_idx += 1
+            trajectory_indices.append(trajectory_idx)
+            row_indices.append(row_idx)
+        return trajectory_indices, row_indices
+
+    @staticmethod
     def _split_trajectory_for_dump(
         ids: list[int], mask: list[int], tokenizer
     ) -> dict[str, Any]:
@@ -989,6 +1019,16 @@ class WorkflowExecutor:
 
             # Handle batched trajectories
             batch_size = input_ids.shape[0]
+            trajectory_starts = traj.get("begin_of_trajectory")
+            if trajectory_starts is None:
+                # Legacy workflows return one rollout sample per batch row.
+                begin_flags = [1] * batch_size
+            else:
+                begin_flags = trajectory_starts.reshape(-1).tolist()
+            begin_flags = [int(bool(flag)) for flag in begin_flags]
+            trajectory_indices, row_indices = self._compute_trajectory_row_metadata(
+                begin_flags, batch_size
+            )
 
             file_path = os.path.join(version_dir, f"{task_id}.jsonl")
             async with aiofiles.open(file_path, "a") as f:
@@ -1017,6 +1057,9 @@ class WorkflowExecutor:
 
                     record = {
                         "task_id": task_id,
+                        "begin_of_trajectory": begin_flags[i],
+                        "trajectory_idx": trajectory_indices[i],
+                        "row_idx_in_trajectory": row_indices[i],
                         "sample_idx": i,
                         "seqlen": seqlen,
                         "prompt_len": split["prompt_end"],
@@ -1193,6 +1236,20 @@ class WorkflowExecutor:
                     isinstance(v, InteractionWithTokenLogpReward) for v in traj.values()
                 ):
                     traj = interactions_to_trajectory(traj)
+
+                # One episode may export several rows in either tensor format.
+                # Grouped workflows already carry their per-episode boundaries.
+                if isinstance(traj, dict) and "begin_of_trajectory" not in traj:
+                    input_ids = traj.get("input_ids")
+                    if torch.is_tensor(input_ids) and input_ids.shape[0] > 0:
+                        traj = dict(traj)
+                        trajectory_starts = torch.zeros(
+                            input_ids.shape[0],
+                            dtype=torch.int32,
+                            device=input_ids.device,
+                        )
+                        trajectory_starts[0] = 1
+                        traj["begin_of_trajectory"] = trajectory_starts
 
                 assert traj is None or isinstance(traj, dict), traj
 

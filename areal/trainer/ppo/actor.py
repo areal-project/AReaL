@@ -6,12 +6,13 @@ from typing import Any
 import torch
 
 from areal.api import TrainEngine
-from areal.api.cli_args import MicroBatchSpec, PPOActorConfig, RejectionSamplingConfig
+from areal.api.cli_args import PPOActorConfig, RejectionSamplingConfig
 from areal.experimental.training_service.controller.controller import (
     GatewayTrainController,
 )
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
+from areal.trainer.ppo.loss_reduction import prepare_policy_gradient_batch
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
@@ -27,15 +28,20 @@ from areal.utils.constants import (
 from areal.utils.data import (
     KLEstimator,
     Normalization,
+    TrajBatchMeta,
     batched_call,
+    concat_batch,
     is_multi_modal_key,
-    split_padded_tensor_dict_into_mb_list,
+    normalize_rollout_rewards,
+    split_batch,
+    split_training_batch_into_microbatches,
 )
 from areal.utils.functional import (
     ppo_actor_loss_fn,
     reward_overlong_penalty,
     sapo_loss_fn,
 )
+from areal.utils.functional.loss_aggregation import PolicyGradientReduction
 from areal.utils.perf_tracer import trace_perf
 
 logger = logging.getLogger("PPOActor")
@@ -141,17 +147,23 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return batched_call(self._compute_advantages, data)
+        batched, meta = concat_batch(data)
+        return split_batch(self._compute_advantages(batched, meta), meta)
 
-    def _compute_advantages(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _compute_advantages(
+        self, data: dict[str, Any], meta: TrajBatchMeta
+    ) -> dict[str, Any]:
         bs = data["input_ids"].shape[0]
         max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
         )
 
+        unpenalized_rewards = None
         # Reward Penalty on length
         if self.config.overlong_reward_penalty:
+            if self.reward_norm and data.get("begin_of_trajectory") is not None:
+                unpenalized_rewards = data["rewards"].clone()
             overlong_tokens = self.config.overlong_tokens
             overlong_penalty_factor = self.config.overlong_penalty_factor
 
@@ -171,7 +183,35 @@ class PPOActor:
             reward_score, max=self.reward_clip, min=-self.reward_clip
         )
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score)
+            if any(
+                r is not None
+                for group in meta.rollout_rewards
+                if group is not None
+                for r in group
+            ):
+                reward_score = normalize_rollout_rewards(
+                    data["rewards"],
+                    self.reward_norm,
+                    meta,
+                    reward_bias=self.reward_bias,
+                    reward_scaling=self.reward_scaling,
+                    reward_clip=self.reward_clip,
+                    unpenalized_rewards=unpenalized_rewards,
+                    traj_starts=data.get("begin_of_trajectory"),
+                )
+            else:
+                if unpenalized_rewards is not None:
+                    unpenalized_rewards = (
+                        (unpenalized_rewards + self.reward_bias) * self.reward_scaling
+                    ).clamp(min=-self.reward_clip, max=self.reward_clip)
+                # Compute one reference per trajectory, but apply the normalization
+                # to each row so branch-local length penalties remain intact.
+                reward_score = self.reward_norm(
+                    reward_score,
+                    traj_starts=data.get("begin_of_trajectory"),
+                    group_sizes=meta.traj_group_sizes,
+                    unpenalized_rewards=unpenalized_rewards,
+                )
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -252,9 +292,12 @@ class PPOActor:
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
-        batched_call(self._ppo_update, data, unpack=False)
+        batched, meta = concat_batch(data)
+        self._ppo_update(batched, meta)
 
-    def _ppo_update(self, data: dict[str, Any]) -> None:
+    def _ppo_update(
+        self, data: dict[str, Any], meta: TrajBatchMeta | None = None
+    ) -> None:
         attn_mask = data["attention_mask"]
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
@@ -330,20 +373,38 @@ class PPOActor:
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
-        for key in ["rewards", "tot_rewards", "kl_rewards"]:
+        group_sizes = None
+        if self.config.loss_aggregation == "traj-mean":
+            group_sizes = _trajectory_row_counts(
+                data.get("begin_of_trajectory"), data["loss_mask"].shape[0]
+            )
+        elif self.config.loss_aggregation == "prompt-mean":
+            group_sizes = meta.traj_group_sizes if meta is not None else None
+        prepared_loss = prepare_policy_gradient_batch(
+            data,
+            mode=self.config.loss_aggregation,
+            divisor=self.config.loss_aggregation_divisor,
+            group_sizes=group_sizes,
+        )
+        for key in ["rewards", "tot_rewards", "kl_rewards", "begin_of_trajectory"]:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
-        mb_inputs = split_padded_tensor_dict_into_mb_list(
+        mb_inputs = split_training_batch_into_microbatches(
             data,
-            mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
+            n_mbs=self.config.ppo_n_minibatches,
+            group=self.engine.data_parallel_group,
+        )
+        loss_steps = prepared_loss.for_steps(
+            mb_inputs,
+            dp_group=self.engine.data_parallel_group,
+            device=self.engine.device,
         )
 
         with stats_tracker.scope("update"):
             # Get current version for proximal approximation metrics
             current_version = self.engine.get_version()
-
-            for mb in mb_inputs.mbs:
+            for mb, loss_step in zip(mb_inputs, loss_steps, strict=True):
                 train_stat = self.engine.train_batch(
                     mb,
                     loss_fn=functools.partial(
@@ -360,8 +421,9 @@ class PPOActor:
                         sapo_tau_pos=self.config.sapo_tau_pos,
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_decoupled_loss=self.config.use_decoupled_loss,
+                        pg_reduction=loss_step,
                     ),
-                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                    loss_weight_fn=loss_step.normalizer_fn,
                 )
                 stats_tracker.scalar(**train_stat)
 
@@ -452,6 +514,48 @@ class PPOActorControllerV2(GatewayTrainController):
         self._gateway_post("/ppo/actor/update", payload)
 
 
+def _trajectory_row_counts(
+    begin_of_trajectory: torch.Tensor | None,
+    n_rows: int,
+) -> list[int]:
+    """Return contiguous row counts for logical trajectory metadata."""
+    if begin_of_trajectory is None:
+        return [1] * n_rows
+
+    starts = begin_of_trajectory.reshape(-1)
+    boundaries = torch.nonzero(starts, as_tuple=False).reshape(-1)
+    boundary_rows = boundaries.cpu().tolist()
+    return [
+        end - start for start, end in zip(boundary_rows, [*boundary_rows[1:], n_rows])
+    ]
+
+
+def trajectory_token_weights(
+    loss_mask: torch.Tensor,
+    begin_of_trajectory: torch.Tensor | None,
+    trajectories_per_group: int = 1,
+) -> torch.Tensor:
+    """Return full-unit coefficients through the shared preparation kernel.
+
+    This helper keeps the existing complete-group interface. Actor training
+    uses actual prompt metadata so failed samples never shift group boundaries.
+    """
+    sizes = _trajectory_row_counts(begin_of_trajectory, loss_mask.shape[0])
+    if trajectories_per_group > 1:
+        if len(sizes) % trajectories_per_group:
+            raise ValueError(
+                f"{len(sizes)} trajectories do not divide into groups of "
+                f"{trajectories_per_group}; a rollout group lost members."
+            )
+        sizes = [
+            sum(sizes[i : i + trajectories_per_group])
+            for i in range(0, len(sizes), trajectories_per_group)
+        ]
+    data = {"loss_mask": loss_mask}
+    prepare_policy_gradient_batch(data, mode="traj-mean", group_sizes=sizes)
+    return data["unit_weights"]
+
+
 def grpo_loss_fn(
     logprobs: torch.Tensor,
     entropy: torch.Tensor,
@@ -468,6 +572,7 @@ def grpo_loss_fn(
     sapo_tau_pos: float = 1.0,
     sapo_tau_neg: float = 1.05,
     use_decoupled_loss: bool = False,
+    pg_reduction: PolicyGradientReduction | None = None,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
 ):
@@ -475,7 +580,8 @@ def grpo_loss_fn(
     pipeline micro batches, returns loss and logging stats."""
     old_logp = input_data["logprobs"]
     advantages = input_data["advantages"]
-    loss_mask = input_data["loss_mask"].bool()
+    denominator_mask = input_data["loss_mask"].bool()
+    loss_mask = denominator_mask
     prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
     entropy = entropy.detach()
@@ -494,6 +600,8 @@ def grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
+    pg_reduction = PolicyGradientReduction() if pg_reduction is None else pg_reduction
+
     # Use SAPO or PPO loss
     if use_sapo_loss:
         if use_decoupled_loss:
@@ -510,6 +618,9 @@ def grpo_loss_fn(
             loss_mask=loss_mask,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            pg_reduction=pg_reduction,
+            denominator_mask=denominator_mask,
+            unit_weights=input_data.get("unit_weights"),
         )
     else:
         loss, stat = ppo_actor_loss_fn(
@@ -524,12 +635,20 @@ def grpo_loss_fn(
             rejection_sampling=rejection_sampling,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            pg_reduction=pg_reduction,
+            denominator_mask=denominator_mask,
+            unit_weights=input_data.get("unit_weights"),
         )
 
     # Joint Distillation KL Loss
     teacher_logp = input_data.get("teacher_logp")
     rkl_stat = None
     if teacher_logp is not None:
+        if pg_reduction.mode != "token-mean":
+            raise ValueError(
+                "teacher_logp distillation is only supported with "
+                "loss_aggregation='token-mean'."
+            )
         # Coefficients for RL and Knowledge Distillation
         rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
         distill_loss_weight = input_data.get("distill_loss_weight", 0.005)

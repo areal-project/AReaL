@@ -23,19 +23,40 @@ class _MicroBatches(list):
         return self
 
 
+def _bind_per_token_loss_methods(engine, namespace):
+    """Bind the scalar normalization helpers on the lightweight engine fixture."""
+    engine._per_token_count = _load_function(
+        ENGINE_SOURCE, "_per_token_count", namespace
+    ).__func__
+    engine._compute_loss_totals = functools.partial(
+        _load_function(ENGINE_SOURCE, "_compute_loss_totals", namespace), engine
+    )
+
+
 @pytest.mark.parametrize("per_token", [False, True])
 @pytest.mark.parametrize("cp_size", [1, 8])
 @pytest.mark.parametrize("dp_size", [1, 2])
 @pytest.mark.parametrize("n_mbs", [1, 3])
 @pytest.mark.parametrize("loss_scale", [1.0, 128.0])
+@pytest.mark.parametrize("aggregation", ["token-mean", "traj-mean", "prompt-mean"])
 def test_train_gradient_matches_global_mean(
-    per_token, cp_size, dp_size, n_mbs, loss_scale
+    per_token, cp_size, dp_size, n_mbs, loss_scale, aggregation
 ):
     """Unequal and empty microbatches retain one global normalization."""
     parameter = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
     batches = [
         _MicroBatches(
-            {"weight": torch.tensor(float(w)), "target": float(rank + i)}
+            {
+                "weight": torch.tensor(
+                    float(w)
+                    if aggregation == "token-mean"
+                    else (i + 1) / (16 + rank)
+                    if w
+                    else 0.0
+                ),
+                "loss_mask": torch.ones(w, dtype=torch.bool),
+                "target": float(rank + i),
+            }
             for i, w in enumerate([7] if n_mbs == 1 else [3, 0, 4 + rank])
         )
         for rank in range(dp_size)
@@ -45,6 +66,9 @@ def test_train_gradient_matches_global_mean(
         return inputs["weight"]
 
     total_weight = sum(weight_fn(mb) for batch in batches for mb in batch)
+    total_tokens = sum(
+        mb["loss_mask"].count_nonzero() for batch in batches for mb in batch
+    )
     reference = (
         sum(
             (parameter - mb["target"]).square() * weight_fn(mb)
@@ -66,6 +90,12 @@ def test_train_gradient_matches_global_mean(
             ]
             namespace = {
                 "torch": torch,
+                "dist": SimpleNamespace(
+                    all_reduce=lambda totals, group: totals.copy_(
+                        torch.stack((total_weight.float(), total_tokens.float()))
+                        * cp_size
+                    )
+                ),
                 "get_model_config": lambda model: model.config,
                 "mpu": SimpleNamespace(
                     get_data_parallel_group=lambda **kw: None,
@@ -73,7 +103,10 @@ def test_train_gradient_matches_global_mean(
                     get_context_parallel_world_size=lambda: cp_size,
                     get_context_parallel_rank=lambda: cp_rank,
                 ),
-                "compute_total_loss_weight": lambda *args: total_weight * cp_size,
+                "compute_total_loss_weight": lambda mbs, fn, group: sum(
+                    fn(mb) for batch in batches for mb in batch
+                )
+                * cp_size,
             }
             train = _load_function(ENGINE_SOURCE, "train_batch", namespace)
             compute = _load_function(
@@ -94,7 +127,7 @@ def test_train_gradient_matches_global_mean(
                 model=[SimpleNamespace(config=config) for config in configs],
                 # Bridge can mutate the model config without changing tf_config.
                 tf_config=SimpleNamespace(calculate_per_token_loss=not per_token),
-                config=SimpleNamespace(is_critic=True),
+                config=SimpleNamespace(is_critic=True, loss_aggregation=aggregation),
                 enable_tree_training=False,
                 device="cpu",
                 optimizer=SimpleNamespace(
@@ -105,7 +138,10 @@ def test_train_gradient_matches_global_mean(
             engine._compute_logprobs_and_loss = lambda *a, **kw: compute(
                 engine, *a, **kw
             )
-            engine._build_per_token_loss_output = lambda *a: build_output(engine, *a)
+            engine._build_per_token_loss_output = lambda *a, **kw: build_output(
+                engine, *a, **kw
+            )
+            _bind_per_token_loss_methods(engine, namespace)
             set_scale(engine)
 
             def forward_backward(mbs, process_output, forward_only):
@@ -138,7 +174,7 @@ def test_train_gradient_matches_global_mean(
     loss = sum(scheduled_losses)
     if per_token:
         count = sum(counts)
-        torch.testing.assert_close(count.float(), total_weight, rtol=0, atol=0)
+        torch.testing.assert_close(count.float(), total_tokens.float(), rtol=0, atol=0)
         loss = loss / count
     gradient = torch.autograd.grad(loss / loss_scale, parameter)[0]
     torch.testing.assert_close(gradient, reference_grad, rtol=1e-6, atol=1e-7)
@@ -163,7 +199,15 @@ def test_per_token_output_preserves_weight_and_gradient(weight, cp_size, dtype):
     )
     outputs = []
     for rank in range(cp_size):
-        outputs.append(build_output(None, loss, torch.tensor(weight, dtype=dtype), 1.0))
+        outputs.append(
+            build_output(
+                None,
+                loss,
+                torch.tensor(weight, dtype=dtype),
+                1.0,
+                token_count=torch.tensor(weight, dtype=dtype),
+            )
+        )
     numerators, counts = zip(*outputs)
     assert all(count.dtype == torch.int64 for count in counts)
     assert sum(counts) == weight
@@ -268,21 +312,13 @@ def test_main_and_auxiliary_gradients_share_optimizer_scale(per_token, loss_scal
 @pytest.mark.parametrize("per_token", [False, True])
 def test_train_all_zero_weight_batch_is_rejected(per_token):
     """Retain the positive global-weight guard before any forward/backward work."""
-    compute_weight = _load_function(
-        "areal/engine/core/train_engine.py",
-        "compute_total_loss_weight",
-        {"torch": torch, "dist": SimpleNamespace(all_reduce=lambda *a, **kw: None)},
-    )
-    train = _load_function(
-        ENGINE_SOURCE,
-        "train_batch",
-        {
-            "torch": torch,
-            "mpu": SimpleNamespace(get_data_parallel_group=lambda **kw: None),
-            "compute_total_loss_weight": compute_weight,
-            "get_model_config": lambda model: model.config,
-        },
-    )
+    namespace = {
+        "torch": torch,
+        "dist": SimpleNamespace(all_reduce=lambda *args, **kwargs: None),
+        "mpu": SimpleNamespace(get_data_parallel_group=lambda **kwargs: None),
+        "get_model_config": lambda model: model.config,
+    }
+    train = _load_function(ENGINE_SOURCE, "train_batch", namespace)
     engine = SimpleNamespace(
         _ensure_ready=lambda: None,
         optimizer_zero_grad=lambda: None,
@@ -293,10 +329,89 @@ def test_train_all_zero_weight_batch_is_rejected(per_token):
         ],
         device="cpu",
     )
+    _bind_per_token_loss_methods(engine, namespace)
     with pytest.raises(
         AssertionError, match="Global total loss weight must be positive"
     ):
         train(engine, {}, None, lambda mb: mb["weight"])
+
+
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("aggregation", ["traj-mean", "prompt-mean"])
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize("global_tokens", [0, 5])
+def test_train_all_masked_rank_uses_global_valid_token_guard(
+    per_token, aggregation, cp_size, global_tokens
+):
+    """Reject globally empty steps before routing, but allow an empty DP rank."""
+    dp_group = object()
+    dp_cp_group = object()
+    reductions = []
+    calls = []
+    batches = _MicroBatches(
+        [{"loss_mask": torch.zeros(3, dtype=torch.bool), "weight": torch.tensor(1.0)}]
+    )
+
+    def all_reduce(totals, group):
+        assert group is dp_cp_group
+        reductions.append(group)
+        totals.copy_(torch.tensor([2.0, float(global_tokens)]) * cp_size)
+
+    namespace = {
+        "torch": torch,
+        "dist": SimpleNamespace(all_reduce=all_reduce),
+        "mpu": SimpleNamespace(
+            get_data_parallel_group=lambda with_context_parallel=False: (
+                dp_cp_group if with_context_parallel else dp_group
+            ),
+            get_data_parallel_world_size=lambda: 2,
+            get_context_parallel_world_size=lambda: cp_size,
+        ),
+        "compute_total_loss_weight": lambda *args: torch.tensor(2.0 * cp_size),
+        "get_model_config": lambda model: model.config,
+    }
+    train = _load_function(ENGINE_SOURCE, "train_batch", namespace)
+    engine = SimpleNamespace(
+        _ensure_ready=lambda: None,
+        optimizer_zero_grad=lambda: None,
+        _normalize_batch_input=lambda inputs: (inputs, None),
+        _prepare_mb_list=lambda inputs: batches,
+        model=[
+            SimpleNamespace(config=SimpleNamespace(calculate_per_token_loss=per_token))
+        ],
+        config=SimpleNamespace(loss_aggregation=aggregation),
+        # Real routers see input tokens even when every action mask is zero.
+        forward_backward_batch=lambda *args, **kwargs: calls.append("router"),
+        optimizer_step=lambda: calls.append("optimizer") or {},
+        device="cpu",
+    )
+    _bind_per_token_loss_methods(engine, namespace)
+
+    if global_tokens == 0:
+        with pytest.raises(
+            ValueError, match="Global valid token count must be positive"
+        ):
+            train(engine, {}, None, lambda mb: mb["weight"])
+        assert calls == []
+    else:
+        train(engine, {}, None, lambda mb: mb["weight"])
+        assert calls == ["router", "optimizer"]
+    assert reductions == [dp_cp_group]
+
+
+def test_valid_token_guard_keeps_reward_model_count_contract():
+    """No-mask reward batches retain their callback's weight units."""
+    namespace = {
+        "torch": torch,
+        "dist": SimpleNamespace(all_reduce=lambda *args, **kwargs: None),
+        "mpu": SimpleNamespace(get_data_parallel_group=lambda **kwargs: None),
+    }
+    engine = SimpleNamespace(device="cpu")
+    _bind_per_token_loss_methods(engine, namespace)
+    weight, tokens = engine._compute_loss_totals(
+        _MicroBatches([{}]), lambda mb: torch.tensor(2.0)
+    )
+    torch.testing.assert_close(tokens / weight, torch.tensor(1.0), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("with_count", [False, True])

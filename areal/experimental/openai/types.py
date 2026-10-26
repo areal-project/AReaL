@@ -2,6 +2,7 @@
 
 from __future__ import annotations  # noqa
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -103,6 +104,9 @@ class InteractionWithTokenLogpReward:
 
     # Interaction ID cache (used for deserialization)
     _interaction_id: str | None = None
+
+    # One explicit normalization reference per logical rollout, when row scores differ.
+    rollout_reward: float | None = None
 
     @property
     def has_tensor_data(self) -> bool:
@@ -285,6 +289,22 @@ def concat_string_interactions(
     }
 
 
+def _interaction_rollout_reward(
+    interactions: list[InteractionWithTokenLogpReward],
+) -> float | None:
+    references = {
+        v.rollout_reward for v in interactions if v.rollout_reward is not None
+    }
+    if len(references) > 1:
+        raise ValueError("Interactions in one rollout must share rollout_reward")
+    reference = next(iter(references), None)
+    if reference is not None and (
+        type(reference) not in (int, float) or not math.isfinite(reference)
+    ):
+        raise ValueError("rollout_reward must be finite")
+    return reference
+
+
 def interactions_to_trajectory(
     interactions: dict[str, InteractionWithTokenLogpReward],
 ) -> dict:
@@ -295,6 +315,11 @@ def interactions_to_trajectory(
         trajectory = concat_padded_tensors(
             [interaction.to_tensor_dict() for interaction in interactions.values()]
         )
+        if interactions:
+            from areal.utils.data import get_batch_size
+
+            reference = _interaction_rollout_reward(list(interactions.values()))
+            trajectory["rollout_rewards"] = [reference] * get_batch_size(trajectory)
     else:
         trajectory = concat_string_interactions(interactions)
 
