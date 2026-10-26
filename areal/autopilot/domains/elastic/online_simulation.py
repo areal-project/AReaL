@@ -1050,6 +1050,8 @@ class OnlineSimulation:
         self.provider_version = version
         self.publication = "idle"
         self.emit("weights_published", version=version, recipients=identities)
+        if self.control is not None:
+            self.control.publication_complete()
 
     def request_handoff(self, target: OnlineLayout):
         if target.actor_gpus + target.rollout_gpus > 16:

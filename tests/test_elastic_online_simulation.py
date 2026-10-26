@@ -6,6 +6,7 @@ from dataclasses import asdict, replace
 
 import pytest
 
+from areal.autopilot.domains.elastic.online_control import OnlineControl, _Search
 from areal.autopilot.domains.elastic.online_decode import _Run
 from areal.autopilot.domains.elastic.online_simulation import (
     OnlineForecastModel,
@@ -30,6 +31,7 @@ from areal.elastic.policy.basic.history import HistoricalReplay, HistoryReplayCo
 from areal.elastic.policy.basic.online import (
     ActorSupply,
     CandidatePrediction,
+    OnlineDecision,
     OnlinePolicy,
     OnlinePolicyConfig,
     rolling_slo,
@@ -1757,6 +1759,82 @@ class _DecisionClock:
             self.value += self.seconds
         self.started = not self.started
         return self.value
+
+
+@pytest.mark.parametrize(
+    "stage,available_at",
+    [("search", 3.6), ("application_wait", 3.6), ("application_wait", 4.8)],
+)
+def test_normal_publication_keeps_candidate_and_hands_off_latest_state(
+    stage, available_at
+):
+    """Real update/publication events advance while a scored decision arrives."""
+
+    class Costs(_KnownCosts):
+        def publication(self, layout, recipients):
+            return 1.0
+
+    class Scores(_ScoredReplay):
+        execution_stats = {}
+
+        def evaluate_many(self, view, forecasts, layouts):
+            return tuple(self.evaluate(view, forecasts, layout) for layout in layouts)
+
+    sim = OnlineSimulation(
+        episodes(16), INITIAL, Costs(), config(), handoff(), SLO, input_closes_at=15
+    )
+    sim.run(until=3.2)
+    view = sim.observe()
+    assert view.actor.batch and view.training_version == 0
+    sim.policy = history_policy()
+    sim.policy.config = replace(
+        sim.policy.config, check_interval_seconds=10, decision_delay_seconds=0.05
+    )
+    control = sim.control = OnlineControl(sim, clock=_DecisionClock(0))
+    regime = control.observe_history(view)
+    scores = Scores({INITIAL: (1.0, 100, 100), SMALL: (1.0, 50, 50)})
+    predictions = scores.evaluate_many(view, (), (INITIAL, SMALL))
+    scores.calls.clear()
+    control.model = lambda delay: scores
+    decision = OnlineDecision(
+        view.now, "slack", SMALL, predictions, (), rolling_slo(view, SLO, 20), 0, "test"
+    )
+    control.pending = _Search(
+        1,
+        view,
+        decision,
+        dict(asdict(decision), search_wall_seconds=available_at - view.now),
+        regime,
+        stage=stage,
+        validation=predictions if stage == "application_wait" else (),
+        validation_view=view if stage == "application_wait" else None,
+    )
+    sim.schedule_at(
+        available_at,
+        "search_complete" if stage == "search" else "decision_ready",
+        1,
+        priority=9,
+    )
+    result = sim.run()
+    assert result["status"] == "complete" and result["completed_updates"] == 4
+    assert result["completed_episodes"] == result["trained_episodes"] == 16
+    assert len(sim.decisions) == 1
+    applied = sim.decisions[0]
+    assert applied["application_status"] == "applied"
+    assert applied["target"] == asdict(SMALL)
+    assert applied["application_state"] == dict(
+        training_version=1, provider_version=1, consumed_episodes=4
+    )
+    assert scores.calls == ([INITIAL, SMALL] if stage == "search" else [])
+    assert control.stats["publication_waits"] == (available_at == 3.6)
+    published = next(e for e in sim.events if e["kind"] == "weights_published")
+    expected = max(available_at, published["time"])
+    if stage == "search":
+        expected += 0.05
+    assert applied["applied_at"] == pytest.approx(expected)
+    assert control.stats["discarded"] == 0
+    cutover = next(e for e in sim.events if e["kind"] == "actor_cutover")
+    assert cutover["version"] >= 1 and cutover["cursor"] >= 4
 
 
 @pytest.mark.parametrize("interval", [1, 2.5])

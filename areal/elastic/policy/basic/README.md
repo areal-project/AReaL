@@ -1,7 +1,7 @@
 # Basic policy
 
-当前实现冻结为 **policy v2**，包含Actor持续补充准入额度检查与两种可选显存余量筛选。后续策略行为修改从 **v3**
-开始；v1基线保留在原标签`elastic-policy-v1`。规则、结果与已知问题见[版本记录](VERSIONS.md)。
+当前实现冻结为 **policy
+v3.1**：正常训练／发布不再丢弃已选方案，发布完成后继续接管最新状态。v2冻结于`922ae995`，v1保留原标签`elastic-policy-v1`；容量及显存余量规则沿用v2。规则、结果与已知问题见[版本记录](VERSIONS.md)。
 
 原生 `on_demand` 通过 `policy/adapter.py::PolicyAdapter` 统一装配和调用策略，默认使用
 `IdleTimeoutPolicy`。默认空闲 60s 后请求释放， 支持零超时；最短驻留、发布、保存与进程清理由 Runtime 约束。完整 Basic 尚未成为默认策略。

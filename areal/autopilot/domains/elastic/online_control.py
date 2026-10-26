@@ -24,6 +24,8 @@ class _Search:
     validation_view: object = None
     validation_features: object = None
     elapsed: float = 0.0
+    publication_wait_started: float | None = None
+    publication_resume_stage: str | None = None
 
 
 class OnlineControl:
@@ -40,6 +42,8 @@ class OnlineControl:
             verifications=0,
             verification_wall_seconds=0.0,
             application_wait_seconds=0.0,
+            publication_waits=0,
+            publication_wait_seconds=0.0,
             applied=0,
             discarded=0,
             cancelled=0,
@@ -120,16 +124,23 @@ class OnlineControl:
             return
         self.delay_estimate = job.record["search_wall_seconds"]
         job.record["search_available_at"] = sim.now
-        view = sim.observe()
-        regime = self.observe_history(view, confirm_change=False)
         sim.emit(
             "search_complete",
             search=identity,
             observed_at=job.view.now,
             seconds=self.delay_estimate,
         )
+        self.verify(identity)
+
+    def verify(self, identity):
+        job, sim = self.pending, self.sim
+        if job is None or job.identity != identity or job.stage != "search":
+            return
+        view = sim.observe()
+        regime = self.observe_history(view, confirm_change=False)
         if (
-            view.busy
+            sim.pending_handoff is not None
+            or sim.decision_pending
             or view.layout != job.view.layout
             or view.leases != job.view.leases
             or regime != job.regime
@@ -138,11 +149,13 @@ class OnlineControl:
             self.finish(
                 "discarded",
                 view.layout,
-                "Deployment/publication or workload regime changed during search",
+                "Deployment or workload regime changed during search",
             )
             return
         if job.decision.target == view.layout:
             self.finish("retained", view.layout, "Search retained current deployment")
+            return
+        if self.wait_for_publication("search"):
             return
         forecaster = sim.policy.forecaster
         forecasts = (
@@ -190,16 +203,53 @@ class OnlineControl:
 
     @staticmethod
     def preconditions(view):
+        # Normal training progress does not invalidate a deployment choice.
+        # The handoff layer binds the latest complete state at its own boundary.
         return (
             view.layout,
             view.leases,
-            view.training_version,
-            view.provider_version,
-            view.consumed_episodes,
-            view.actor.batch,
             view.actor.waiting,
             view.input_closed,
         )
+
+    def wait_for_publication(self, resume_stage):
+        job, sim = self.pending, self.sim
+        if sim.publication == "idle":
+            return False
+        job.publication_wait_started = sim.now
+        job.publication_resume_stage = resume_stage
+        job.stage = "publication_wait"
+        self.stats["publication_waits"] += 1
+        sim.emit("decision_publication_wait", search=job.identity, stage=resume_stage)
+        return True
+
+    def publication_complete(self):
+        job, sim = self.pending, self.sim
+        if job is None or job.stage != "publication_wait":
+            return
+        seconds = sim.now - job.publication_wait_started
+        stage = job.publication_resume_stage
+        key = (
+            "verification_publication_wait_seconds"
+            if stage == "search"
+            else "application_publication_wait_seconds"
+        )
+        job.record[key] = job.record.get(key, 0.0) + seconds
+        self.stats["publication_wait_seconds"] += seconds
+        job.stage = stage
+        job.publication_wait_started = job.publication_resume_stage = None
+        sim.emit(
+            "decision_publication_resume",
+            search=job.identity,
+            stage=stage,
+            seconds=seconds,
+            version=sim.provider_version,
+            cursor=sim.consumed,
+        )
+        if stage == "search":
+            self.verify(job.identity)
+        else:
+            self.ready(job.identity)
 
     def verified(self, identity):
         job, sim = self.pending, self.sim
@@ -235,11 +285,14 @@ class OnlineControl:
         view = sim.observe()
         regime = self.observe_history(view, confirm_change=False)
         if (
-            view.busy
+            sim.pending_handoff is not None
+            or sim.decision_pending
             or regime != job.regime
             or self.changed_features(job.validation_features)
             or self.preconditions(view) != self.preconditions(job.validation_view)
-            or sim.now - job.validation_view.now
+            or sim.now
+            - job.validation_view.now
+            - job.record.get("application_publication_wait_seconds", 0.0)
             > sim.policy.config.check_interval_seconds
         ):
             self.finish(
@@ -268,7 +321,14 @@ class OnlineControl:
                 view.layout,
                 "Latest-state verification retained current deployment",
             )
+        elif self.wait_for_publication("application_wait"):
+            return
         elif sim.request_handoff(best.layout):
+            job.record["application_state"] = dict(
+                training_version=view.training_version,
+                provider_version=view.provider_version,
+                consumed_episodes=view.consumed_episodes,
+            )
             self.stats["applied"] += 1
             self.finish(
                 "applied", best.layout, "Latest-state verification accepted target"
