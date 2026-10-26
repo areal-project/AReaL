@@ -275,7 +275,9 @@ def test_npu_pointer_head_scores_packed_loss():
         loss = compute_packed_decision_loss(projected, input_)
     q_all, k_all = projected.detach().chunk(2, dim=-1)
     z = (k_all[[1, 2]] @ q_all[4]) * head.scale
-    torch.testing.assert_close(loss, F.cross_entropy(z[None], torch.tensor([1], device=device)))
+    torch.testing.assert_close(
+        loss, F.cross_entropy(z[None], torch.tensor([1], device=device))
+    )
     loss.backward()
     assert head.q.weight.grad is not None
     assert hidden.grad is not None
@@ -349,7 +351,19 @@ def test_npu_cu_seqlens_host_cache_survives_device_move():
         "max_seqlen": 6,
         "input_ids": torch.arange(11, dtype=torch.int32),
         "token_roles": torch.tensor(
-            [0, ROLE_OPT, 0, ROLE_OPT, ROLE_DECIDE, 0, ROLE_OPT, 0, ROLE_OPT, 0, ROLE_DECIDE]
+            [
+                0,
+                ROLE_OPT,
+                0,
+                ROLE_OPT,
+                ROLE_DECIDE,
+                0,
+                ROLE_OPT,
+                0,
+                ROLE_OPT,
+                0,
+                ROLE_DECIDE,
+            ]
         ),
     }
     padded, _, _, _ = pad_packed_tensor_dict(data, pad_to_length=256, seq_align_to=8)
@@ -456,7 +470,10 @@ def test_npu_2d_cp_reassemble_unpad_and_decision_loss():
     with patch("areal.trainer.sft.decision.stats_tracker", tracker):
         loss = compute_packed_decision_loss(unpadded, orig)
     expected = torch.stack(
-        [question_loss(z0, 1, _CHOICE, None, 0.0), question_loss(z1, 0, _CHOICE, None, 0.0)]
+        [
+            question_loss(z0, 1, _CHOICE, None, 0.0),
+            question_loss(z1, 0, _CHOICE, None, 0.0),
+        ]
     ).mean()
     torch.testing.assert_close(loss, expected)
     loss.backward()

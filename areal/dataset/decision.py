@@ -792,9 +792,7 @@ def get_decision_sft_dataset(
     split = split or "train"
     do_augment = (split == "train") if augment is None else bool(augment)
     records = select_labelled_records(
-        load_labelled_path(
-            path, split=split, source=source, verify_suite=verify_suite
-        ),
+        load_labelled_path(path, split=split, source=source, verify_suite=verify_suite),
         n_per_source=n_per_source,
         max_records=max_records,
     )

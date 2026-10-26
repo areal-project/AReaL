@@ -109,9 +109,7 @@ def _known_cu_seqlens() -> bool:
         "mindspeed.core.ssm.npu_chunk_gated_delta_rule"
     )
     patched = False
-    if npu_causal_conv1d is not None and hasattr(
-        npu_causal_conv1d, "_query_start_loc"
-    ):
+    if npu_causal_conv1d is not None and hasattr(npu_causal_conv1d, "_query_start_loc"):
         npu_causal_conv1d._query_start_loc = cu_seqlens_host_list
         patched = True
     if npu_chunk_gated_delta_rule is not None:
