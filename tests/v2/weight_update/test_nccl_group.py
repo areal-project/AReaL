@@ -261,7 +261,16 @@ def test_awex_adapters_use_sidecar_for_completion_barrier(
     adapter._weights_update_group_gloo = sidecar_group
     adapter._transfer_rank = 0
     adapter.get_local_shard_parameters = MagicMock(return_value={})
-    ops = [MagicMock(name="payload_op")]
+    ops = [
+        MagicMock(
+            name="payload_op",
+            peer=0,
+            tensor=torch.empty(0, dtype=torch.float32),
+        )
+    ]
+    plan_op = MagicMock()
+    plan_op.recv_shard_meta.dtype = torch.float32
+    adapter._transfer_plan.operations = {0: [plan_op]}
     monkeypatch.setattr(module, build_ops_name, lambda *args, **kwargs: (ops, [], None))
     monkeypatch.setattr(module, "awex_wu_use_group", lambda: use_group)
     events = []
