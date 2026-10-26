@@ -445,12 +445,6 @@ def make_mcore_model(
 
     if bridge is not None and bridge_type == "megatron-bridge":
         provider = bridge.to_megatron_provider(load_weights=False)
-        is_qwen_vl = getattr(hf_config, "model_type", None) in (
-            "qwen3_vl",
-            "qwen3_vl_moe",
-            "qwen3_5",
-            "qwen3_5_moe",
-        )
         vpp_size = mcore_config.virtual_pipeline_parallel_size or 0
 
         provider.tensor_model_parallel_size = mpu.get_tensor_model_parallel_world_size()
@@ -564,7 +558,12 @@ def make_mcore_model(
 
         provider.finalize()
 
-        if is_qwen_vl:
+        if getattr(hf_config, "model_type", None) in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        ):
             provider.register_pre_wrap_hook(install_qwen3_vl_token_mask)
 
         if mcore_config.mtp_only:
