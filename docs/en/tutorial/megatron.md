@@ -45,9 +45,11 @@ actor:
 
 The equivalent CLI overrides are `actor.megatron.freeze_vision_model=true` and
 `actor.megatron.freeze_vision_projection=true`. These settings reach the native model
-provider before DDP and optimizer construction. Setting only `freeze_vision_model`
-allows Qwen3.5's merger to remain trainable; set both to keep cached visual embeddings
-valid across language-model updates, assuming the image preprocessing is unchanged.
+provider before DDP and optimizer construction. To freeze only the encoder while keeping
+the merger trainable, set `freeze_vision_model: true` and
+`freeze_vision_projection: false`. Freeze both components to keep cached visual
+embeddings valid across language-model updates, assuming the image preprocessing is
+unchanged.
 
 Both options default to `null`: Qwen3-VL/Qwen3.5 resolve this to `true`, while other
 models preserve their provider's freezing policy. Set either option to `false` to train
