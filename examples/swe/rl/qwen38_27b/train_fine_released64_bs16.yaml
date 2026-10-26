@@ -284,17 +284,8 @@ econfig:
   arena_streams_file: ''
   arena_mixture_epoch_size: 0
   arena_streams:
-  - name: fine-released64
-    stream_id: fine-released64-clean-20261018
-    sampling_weight: 1
-    harness: areal-harness@0.1.4-oss-image-preview-recovery-v9
-    llm_protocol: chat_completions
-    task_envs:
-      DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
-    # This release uses a single Stream-default oracle router for all tasks.
-    expected_reward_ref:
-      key: fine-rl64-oracle-router-20261018
-      version: 1.2.0-timeout-2h
+  - name: train
+    stream_id: your-stream-id
 sglang:
   model_path: ${tokenizer_path}
   random_seed: 42
