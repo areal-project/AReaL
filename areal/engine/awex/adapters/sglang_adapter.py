@@ -4,13 +4,10 @@
 
 from __future__ import annotations
 
-import gc
 import math
 import os
-import time
 from typing import Any
 
-import httpx
 import torch
 import torch.distributed as dist
 
@@ -48,10 +45,6 @@ from awex.transfer.transfer_plan import (  # noqa: E402
     slice_tensor,
 )
 from awex.util.common import AttrDict, simple_hf_config  # noqa: E402
-from awex.util.tensor_util import (  # noqa: E402
-    cuda_ipc_deserialize,
-    reconstruct_tensors_from_groups,
-)
 
 from areal.engine.awex.adapters.inference_adapter import (  # noqa: E402
     AwexInferenceAdapter,
@@ -241,7 +234,9 @@ class _SingleInstanceMetaResolver(ParamMetaResolver):
 
 
 class AwexSGLangAdapter(AwexInferenceAdapter):
-    """Shared SGLang adapter for v1 colocate and v2 separated transfer."""
+    """Shared SGLang adapter for v1/v2 colocation and separated transfer."""
+
+    _SGLANG_MEMORY_TAGS = {"weights", "kv_cache", "cuda_graph"}
 
     def __init__(self, scheduler: Any):
         self._scheduler = scheduler
@@ -257,10 +252,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._parameter_layout: str | None = None
         self._parameters: dict[str, torch.Tensor] | None = None
         self._released_tags: set[str] = set()
-        self._colocate_admin_api_key: str = "areal-admin-key"
-        self._colocate_http_client: httpx.Client | None = None
         self._colocate_timeout_s: float = 120.0
-        self._colocate_transport = None
         self._train_to_infer_device_mapping: dict | None = None
         self._infer_to_train_device_mapping: dict | None = None
         self._dte_config = DTERuntimeConfig.from_env()
@@ -281,6 +273,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._qwen4_frozen_binder = None
         self._qwen4_parameter_identity = None
         self._initialized = False
+        self._colocate_init_fingerprint = None
+        self._separation_init_fingerprint = None
 
     def _get_model(self) -> torch.nn.Module:
         return self._scheduler.tp_worker.model_runner.model
@@ -776,6 +770,55 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         num_engines: int,
         timeout_s: float = 300.0,
     ) -> None:
+        fingerprint = (
+            pair_name,
+            master_addr,
+            master_port,
+            transfer_rank,
+            world_size,
+            kv_store_url,
+            infer_world_size,
+            train_world_size,
+            num_engines,
+            timeout_s,
+        )
+        if self._colocate_init_fingerprint is not None:
+            raise RuntimeError("AWEX colocation is already initialized")
+        if self._separation_init_fingerprint is not None:
+            if fingerprint == self._separation_init_fingerprint:
+                return
+            raise RuntimeError("AWEX separation is already initialized differently")
+        try:
+            self._initialize_separation_group(
+                pair_name,
+                master_addr,
+                master_port,
+                transfer_rank,
+                world_size,
+                kv_store_url,
+                infer_world_size,
+                train_world_size,
+                num_engines,
+                timeout_s,
+            )
+        except Exception:
+            self.teardown_weight_update_group()
+            raise
+        self._separation_init_fingerprint = fingerprint
+
+    def _initialize_separation_group(
+        self,
+        pair_name: str,
+        master_addr: str,
+        master_port: int,
+        transfer_rank: int,
+        world_size: int,
+        kv_store_url: str,
+        infer_world_size: int,
+        train_world_size: int,
+        num_engines: int,
+        timeout_s: float = 300.0,
+    ) -> None:
         if self._dte_config.enabled:
             validate_dte_world_size(world_size, infer_world_size, train_world_size)
 
@@ -990,6 +1033,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         )
 
     def teardown_weight_update_group(self) -> None:
+        self._separation_init_fingerprint = None
+        self.teardown()
         if self._weights_update_group is not None and dist.is_initialized():
             dist.destroy_process_group(self._weights_update_group)
         if self._weights_update_group_gloo is not None and dist.is_initialized():
@@ -1005,12 +1050,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._weight_converter = None
         self._parameter_layout = None
         self._parameters = None
-        if self._colocate_http_client is not None:
-            self._colocate_http_client.close()
-            self._colocate_http_client = None
-        self._colocate_transport = None
-        self._train_to_infer_device_mapping = None
-        self._infer_to_train_device_mapping = None
 
     def initialize(
         self,
@@ -1152,7 +1191,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         torch.cuda.synchronize()
         logger.info("post_load_weights() re-derived SGLang weights")
 
-    def wait_for_training_offloaded(self, version: int) -> None:
+    def wait_for_training_offloaded(self, version: int | None = None) -> None:
         del version
         from areal.engine.awex.utils import awex_colocate_timeout_s
 
@@ -1161,7 +1200,11 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._legacy_meta_server_client.wait_set_until_size(
             "all_training_offloaded_weights",
             self._legacy_train_world_size,
-            timeout=awex_colocate_timeout_s(),
+            timeout=(
+                self._colocate_timeout_s
+                if self._colocate_init_fingerprint is not None
+                else awex_colocate_timeout_s()
+            ),
         )
 
     def wait_for_weights_ready(
@@ -1192,175 +1235,110 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         )
 
     def teardown(self) -> None:
-        self._legacy_reader = None
-
-    # ── Colocated weight transfer methods ─────────────────────────────────
+        """Reset transport metadata without modifying scheduler memory state."""
+        for name in (
+            "_legacy_reader",
+            "_legacy_meta_server_client",
+            "_legacy_transfer_rank",
+            "_legacy_local_gpu_id",
+            "_legacy_infer_world_size",
+            "_legacy_train_world_size",
+            "_legacy_meta_server_addr",
+            "_legacy_instance_world_size",
+            "_legacy_num_infer_engines",
+            "_legacy_engine_rank",
+            "_legacy_instance_local_rank",
+            "_legacy_infer_conf",
+            "_legacy_infer_params_meta",
+            "_colocate_init_fingerprint",
+        ):
+            setattr(self, name, None)
+        self._initialized = False
 
     def init_colocate_weight_update(
         self,
+        *,
         pair_name: str,
-        kv_store_url: str,
+        meta_server_addr: str,
         transfer_rank: int,
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
-        master_port: int,
-        admin_api_key: str = "areal-admin-key",
-        timeout_s: float = 120.0,
+        timeout_s: float = 300.0,
     ) -> None:
-        if infer_world_size != train_world_size:
-            raise ValueError(
-                f"Colocate mode requires infer_world_size == train_world_size. "
-                f"Got infer_world_size={infer_world_size}, "
-                f"train_world_size={train_world_size}"
-            )
-        self._colocate_pair_name = pair_name
-        self._colocate_kv_store_url = kv_store_url
-        self._transfer_rank = transfer_rank
-        self._colocate_infer_world_size = infer_world_size
-        self._colocate_train_world_size = train_world_size
-        self._colocate_admin_api_key = admin_api_key
-        self._colocate_timeout_s = timeout_s
-        if self._colocate_http_client is None:
-            self._colocate_http_client = httpx.Client()
+        from areal.engine.awex.utils import resolve_physical_gpu_id
 
-        infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
-
-        builder = TransferPlanBuilder(
-            infer_world_size=infer_world_size,
-            train_world_size=train_world_size,
-            num_infer_engines=num_engines,
-        )
-
-        train_to_infer = {}
-        infer_to_train = {}
-        for i in range(min(infer_world_size, train_world_size)):
-            train_rank = infer_world_size + i
-            train_to_infer[train_rank] = i
-            infer_to_train[i] = train_rank
-        self._train_to_infer_device_mapping = train_to_infer
-        self._infer_to_train_device_mapping = infer_to_train
-
-        self._send_transfer_plan = builder.build_local_transfer_plan(
-            infer_meta,
-            train_meta,
-            global_transfer_rank=infer_to_train[transfer_rank],
-        )
-        self._recv_transfer_plan = builder.build_local_transfer_plan(
-            infer_meta,
-            train_meta,
-            global_transfer_rank=transfer_rank,
-        )
-
-        os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
-        self._weights_update_group = init_weights_update_group(
-            master_address="127.0.0.1",
-            master_port=master_port,
-            rank=transfer_rank,
-            world_size=infer_world_size,
-            group_name=f"awex_colocate_{pair_name}",
-            role="inference",
-        )
-
-        self._colocate_transport = NcclColocateStreamBatchTransport(
-            transfer_rank, infer_world_size
-        )
-
-        logger.info(
-            "Initialized colocate weight update for pair '%s', "
-            "transfer_rank=%d, infer_world_size=%d",
+        context = self._get_model_context()
+        tp_size, pp_size = int(context["tp_size"]), int(context["pp_size"])
+        instance_world = tp_size * pp_size
+        if (
+            infer_world_size <= 0
+            or infer_world_size != train_world_size
+            or instance_world <= 0
+            or infer_world_size % instance_world
+            or num_engines != infer_world_size // instance_world
+            or transfer_rank < 0
+            or transfer_rank % instance_world
+            or transfer_rank + instance_world > infer_world_size
+        ):
+            raise ValueError("Invalid colocated inference topology")
+        local_rank = int(context["pp_rank"]) * tp_size + int(context["tp_rank"])
+        if not 0 <= local_rank < instance_world:
+            raise ValueError("Invalid inference instance-local rank")
+        actual_rank = transfer_rank + local_rank
+        fingerprint = (
             pair_name,
-            transfer_rank,
+            meta_server_addr,
+            actual_rank,
             infer_world_size,
+            train_world_size,
+            num_engines,
+            timeout_s,
         )
+        if self._separation_init_fingerprint is not None:
+            raise RuntimeError("AWEX separation is already initialized")
+        if self._colocate_init_fingerprint is not None:
+            if self._colocate_init_fingerprint == fingerprint:
+                return
+            raise RuntimeError("AWEX colocation is already initialized differently")
+        try:
+            self._colocate_timeout_s = timeout_s
+            self.initialize(
+                meta_server_addr=meta_server_addr,
+                transfer_rank=actual_rank,
+                infer_world_size=infer_world_size,
+                train_world_size=train_world_size,
+                local_gpu_id=resolve_physical_gpu_id(self._scheduler.gpu_id),
+                timeout_s=timeout_s,
+            )
+            if actual_rank == 0:
+                self._legacy_meta_server_client.put_object(
+                    "infer_params_meta", self._legacy_infer_params_meta
+                )
+        except Exception:
+            self.teardown()
+            raise
+        self._colocate_init_fingerprint = fingerprint
 
     def execute_colocate_weight_update(self, version: int) -> None:
-        kv_store_url = self._colocate_kv_store_url
-        pair_name = self._colocate_pair_name
-        transfer_rank = self._transfer_rank
-        assert self._colocate_http_client is not None, (
-            "init_colocate_weight_update must be called first"
-        )
-        assert self._infer_to_train_device_mapping is not None
-        client = self._colocate_http_client
-        auth_headers = {"Authorization": f"Bearer {self._colocate_admin_api_key}"}
-        timeout_s = self._colocate_timeout_s
-
-        paired_train_rank = self._infer_to_train_device_mapping[transfer_rank]
-        kv_key = f"colocate_weights_rank{paired_train_rank}_{version}"
-
-        deadline = time.monotonic() + timeout_s
-        serialized_hex = None
-        poll_count = 0
-        last_status = -1
-        while time.monotonic() < deadline:
-            resp = client.get(
-                f"{kv_store_url}/weight_meta/{pair_name}/{kv_key}",
-                timeout=5.0,
-            )
-            last_status = resp.status_code
-            if resp.status_code == 200:
-                serialized_hex = resp.json()["value"]
-                break
-            poll_count += 1
-            time.sleep(0.1)
-        if serialized_hex is None:
-            raise TimeoutError(
-                f"Training did not put colocate weights within {timeout_s}s "
-                f"(waiting_key={kv_key}, polls={poll_count}, "
-                f"last_status={last_status})"
-            )
-
-        serialized_weights = bytes.fromhex(serialized_hex)
-        group_shared, metadata, names = cuda_ipc_deserialize(serialized_weights)
+        if self._colocate_init_fingerprint is None:
+            raise RuntimeError("AWEX colocation is not initialized")
+        self.wait_for_training_offloaded(version)
+        self.resume_memory(["weights"])
         torch.cuda.synchronize()
-        tensors = reconstruct_tensors_from_groups(group_shared, metadata)
-        torch.cuda.synchronize()
-        deserialized_weights = dict(zip(names, tensors))
-
-        recv_parameters = self.get_local_shard_parameters()
-
-        rank_info = self._build_rank_info()
-        rank_coordinate = f"infer_{rank_info.global_rank}"
-
-        assert self._colocate_transport is not None
-        self._colocate_transport.update_weights_in_colocate_mode(
-            self._train_to_infer_device_mapping,
-            self._infer_to_train_device_mapping,
-            transfer_rank,
-            rank_coordinate,
-            self._colocate_infer_world_size,
-            self._send_transfer_plan,
-            self._recv_transfer_plan,
-            self._weights_update_group,
-            deserialized_weights,
-            recv_parameters,
-            step_id=version,
-        )
-
-        done_key = f"colocate_done_rank{paired_train_rank}_{version}"
-        client.put(
-            f"{kv_store_url}/weight_meta/{pair_name}/{done_key}",
-            json={"value": True},
-            headers=auth_headers,
-            timeout=10.0,
-        )
-
-        del deserialized_weights, group_shared, tensors, serialized_weights
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        logger.info(
-            "Colocate weight update completed for v%d, rank %d",
-            version,
-            transfer_rank,
-        )
+        self.update_weights(version)
+        self.signal_finished_weights_update()
 
     def release_memory(self, tags: list[str] | None = None) -> None:
         from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
 
-        tags = tags or ["kv_cache"]
+        tags = (
+            (tags or [])
+            if self._colocate_init_fingerprint is not None
+            else (tags or ["kv_cache"])
+        )
+        if self._colocate_init_fingerprint is not None:
+            tags = [tag for tag in tags if tag in self._SGLANG_MEMORY_TAGS]
         tags_to_release = [tag for tag in tags if tag not in self._released_tags]
         if tags_to_release:
             req = ReleaseMemoryOccupationReqInput(tags=tags_to_release)
@@ -1371,8 +1349,16 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     def resume_memory(self, tags: list[str] | None = None) -> None:
         from sglang.srt.managers.io_struct import ResumeMemoryOccupationReqInput
 
-        tags = tags or ["kv_cache"]
-        tags_to_resume = [tag for tag in tags if tag in self._released_tags]
+        tags = (
+            (tags or [])
+            if self._colocate_init_fingerprint is not None
+            else (tags or ["kv_cache"])
+        )
+        if self._colocate_init_fingerprint is not None:
+            # V2 releases memory through the controller, outside this adapter.
+            tags_to_resume = [tag for tag in tags if tag in self._SGLANG_MEMORY_TAGS]
+        else:
+            tags_to_resume = [tag for tag in tags if tag in self._released_tags]
         if tags_to_resume:
             req = ResumeMemoryOccupationReqInput(tags=tags_to_resume)
             self._scheduler.resume_memory_occupation(req)

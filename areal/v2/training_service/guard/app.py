@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 from areal.infra.rpc.guard.app import GuardState, create_app
 from areal.infra.rpc.guard.app import cleanup_forked_children as _cleanup_impl
 from areal.utils import logging
@@ -11,6 +13,9 @@ from areal.utils import logging
 logger = logging.getLogger("TrainRPCGuard")
 
 _state = GuardState()
+_state.register_health_hook(
+    lambda: {"cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
+)
 
 app = create_app(_state)
 

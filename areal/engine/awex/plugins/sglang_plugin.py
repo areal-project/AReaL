@@ -38,6 +38,7 @@ from typing import Any
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
 from areal.engine.awex.metadata import serialize_metadata_gc
 from areal.engine.awex.parallel import resolve_scheduler_parallel_attr
+from areal.engine.awex.utils import validate_memory_saver_allocator
 
 # Must run before importing SGLang. Its scheduler may import Megatron while
 # initializing the model, and Megatron otherwise switches torch-memory-saver
@@ -45,18 +46,7 @@ from areal.engine.awex.parallel import resolve_scheduler_parallel_attr
 patch_tms_hook_mode()
 
 
-def assert_alloc_conf_supports_memory_saver(conf: str) -> None:
-    """Reject allocator configs that silently disable SGLang's memory saver."""
-    if "expandable_segments:true" in conf.lower().replace(" ", ""):
-        raise RuntimeError(
-            "SGLang's memory saver cannot unmap/remap expandable segments, so "
-            f"it would disable itself (PYTORCH_CUDA_ALLOC_CONF={conf!r}). Give "
-            "the rollout role its own scheduling_spec env_vars without "
-            "expandable_segments instead of sharing the actor's."
-        )
-
-
-assert_alloc_conf_supports_memory_saver(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
+validate_memory_saver_allocator(os.environ)
 
 from areal.utils import pkg_version  # noqa: E402
 from areal.utils.environ import get_float_env_var  # noqa: E402

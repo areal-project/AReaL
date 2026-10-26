@@ -6,10 +6,8 @@ from __future__ import annotations
 import gc
 import os
 import threading
-import time
 from typing import TYPE_CHECKING
 
-import httpx
 import torch
 import torch.distributed as dist
 from awex.meta.weight_meta import ParameterMeta
@@ -84,9 +82,6 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._separation_wire_dtypes: tuple[torch.dtype, ...] | None = None
         self._transfer_rank: int | None = None
         self._colocate_lock = threading.Lock()
-        self._colocate_admin_api_key: str = "areal-admin-key"
-        self._colocate_http_client: httpx.Client | None = None
-        self._colocate_timeout_s: float = 120.0
         self._dte_config = DTERuntimeConfig.from_env()
         self._delta_tracker = None
         self._delta_detector = None
@@ -98,6 +93,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._legacy_transfer_rank: int | None = None
         self._legacy_timeout_s: float = awex_colocate_timeout_s()
         self._legacy_initialized = False
+        self._colocate_init_fingerprint = None
+        self._separation_init_fingerprint = None
         self._legacy_ip_address: str | None = None
         self._legacy_physical_gpu_id: int | None = None
         self._legacy_infer_world_size: int | None = None
@@ -375,6 +372,55 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 self.release_memory(tags=["weights"])
 
     def init_weight_update_group(
+        self,
+        pair_name: str,
+        master_addr: str,
+        master_port: int,
+        transfer_rank: int,
+        world_size: int,
+        kv_store_url: str,
+        infer_world_size: int,
+        train_world_size: int,
+        num_engines: int,
+        timeout_s: float = 300.0,
+    ) -> None:
+        fingerprint = (
+            pair_name,
+            master_addr,
+            master_port,
+            transfer_rank,
+            world_size,
+            kv_store_url,
+            infer_world_size,
+            train_world_size,
+            num_engines,
+            timeout_s,
+        )
+        if self._colocate_init_fingerprint is not None:
+            raise RuntimeError("AWEX colocation is already initialized")
+        if self._separation_init_fingerprint is not None:
+            if fingerprint == self._separation_init_fingerprint:
+                return
+            raise RuntimeError("AWEX separation is already initialized differently")
+        try:
+            self._initialize_separation_group(
+                pair_name,
+                master_addr,
+                master_port,
+                transfer_rank,
+                world_size,
+                kv_store_url,
+                infer_world_size,
+                train_world_size,
+                num_engines,
+                timeout_s,
+            )
+        except Exception:
+            self.teardown_weight_update_group()
+            raise
+        self._separation_init_fingerprint = fingerprint
+
+    def _initialize_separation_group(
         self,
         pair_name: str,
         master_addr: str,
@@ -688,6 +734,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
     def teardown_weight_update_group(self) -> None:
+        self._separation_init_fingerprint = None
         if self._weights_update_group is not None and dist.is_initialized():
             dist.destroy_process_group(self._weights_update_group)
         if self._weights_update_group_gloo is not None and dist.is_initialized():
@@ -701,9 +748,6 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._separation_wire_dtypes = None
         self._delta_tracker = None
         self._delta_detector = None
-        if self._colocate_http_client is not None:
-            self._colocate_http_client.close()
-            self._colocate_http_client = None
 
     def _iter_hf_params(
         self,
@@ -790,9 +834,14 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             return optimizer.optimizers
         return [optimizer]
 
-    @torch.no_grad()
     def execute_legacy_colocate_weight_update(self, version: int) -> None:
-        """Publish v1 colocate weights until the reader acknowledges the IPC export."""
+        self._execute_meta_colocate_weight_update(version)
+
+    @torch.no_grad()
+    def _execute_meta_colocate_weight_update(
+        self, version: int, *, colocate_v2: bool = False
+    ) -> None:
+        """Keep exported storage alive until the reader acknowledges consumption."""
         from awex.util.tensor_util import (
             release_tensors,
         )
@@ -849,9 +898,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             f"_{self._legacy_ip_address}_{self._legacy_physical_gpu_id}_{version}"
         )
 
-        self._legacy_meta_server_client.add_object_to_set(
-            "all_training_offloaded_weights", self._legacy_logical_train_rank
-        )
+        if not colocate_v2:
+            self._legacy_meta_server_client.add_object_to_set(
+                "all_training_offloaded_weights", self._legacy_logical_train_rank
+            )
 
         group_shared = [tensor.share_memory_() for tensor in group_tensors]
         # Keep exported storage alive until the reader has closed its IPC mapping.
@@ -869,6 +919,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             serialized_weights_key,
             (self._legacy_logical_train_rank, self._rank_info, serialized_weights),
         )
+        if colocate_v2:
+            self._legacy_meta_server_client.add_object_to_set(
+                "all_training_offloaded_weights", self._legacy_logical_train_rank
+            )
 
         update_finished_key = f"weights_update_finished{key_suffix}"
         try:
@@ -932,109 +986,131 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     # ── Colocated weight transfer methods ─────────────────────────────────
 
+    def enable_colocate_memory_management(self) -> None:
+        """Share the engine's residency state with the v2 transport."""
+        if self._separation_init_fingerprint is not None:
+            raise RuntimeError("AWEX separation is already initialized")
+        residency = self._engine._ensure_weight_residency()
+        if self._residency is not residency and self._residency.released_tags:
+            raise RuntimeError("Cannot replace residency after memory was released")
+        self._residency = residency
+        self._engine._awex_adapter = self
+
     def init_colocate_weight_update(
         self,
+        *,
         pair_name: str,
-        kv_store_url: str,
+        meta_server_addr: str,
         transfer_rank: int,
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
-        master_port: int,
-        admin_api_key: str = "areal-admin-key",
-        timeout_s: float = 120.0,
+        timeout_s: float = 300.0,
     ) -> None:
-        self._colocate_pair_name = pair_name
-        self._colocate_kv_store_url = kv_store_url
-        self._colocate_transfer_rank = transfer_rank
-        self._colocate_infer_world_size = infer_world_size
-        self._colocate_admin_api_key = admin_api_key
-        self._colocate_timeout_s = timeout_s
-        if self._colocate_http_client is None:
-            self._colocate_http_client = httpx.Client()
-        logger.info(
-            "Initialized colocate weight update for pair '%s', transfer_rank=%d",
+        actual_world = dist.get_world_size(group=self._engine.cpu_group)
+        if train_world_size != actual_world or infer_world_size != train_world_size:
+            raise ValueError(
+                "Colocation requires matching training and inference worlds"
+            )
+        if (
+            num_engines <= 0
+            or not infer_world_size <= transfer_rank < 2 * infer_world_size
+        ):
+            raise ValueError("Invalid colocated transfer rank or engine count")
+        fingerprint = (
             pair_name,
+            meta_server_addr,
             transfer_rank,
+            infer_world_size,
+            train_world_size,
+            num_engines,
+            timeout_s,
         )
+        if self._separation_init_fingerprint is not None:
+            raise RuntimeError("AWEX separation is already initialized")
+        if self._colocate_init_fingerprint is not None:
+            if fingerprint == self._colocate_init_fingerprint:
+                return
+            raise RuntimeError("AWEX colocation is already initialized differently")
+        try:
+            self.enable_colocate_memory_management()
+            self.init_legacy_colocate_weight_update(
+                meta_server_addr=meta_server_addr,
+                pair_name=pair_name,
+                transfer_rank=transfer_rank,
+                timeout_s=timeout_s,
+            )
+        except Exception:
+            self.teardown_colocate_weight_update()
+            raise
+        self._colocate_init_fingerprint = fingerprint
 
     def execute_colocate_weight_update(self, version: int) -> None:
+        if self._colocate_init_fingerprint is None:
+            raise RuntimeError("AWEX colocation is not initialized")
         with self._colocate_lock:
-            self._execute_colocate_weight_update_locked(version)
+            weights_released = self._residency.is_released("weights")
+            try:
+                self._execute_meta_colocate_weight_update(version, colocate_v2=True)
+            except BaseException:
+                if weights_released and not self._residency.is_released("weights"):
+                    self.release_memory(tags=["weights"])
+                raise
 
-    def _execute_colocate_weight_update_locked(self, version: int) -> None:
-        kv_store_url = self._colocate_kv_store_url
-        pair_name = self._colocate_pair_name
-        transfer_rank = self._colocate_transfer_rank
-        assert self._colocate_http_client is not None, (
-            "init_colocate_weight_update must be called first"
+    def finish_colocate_weight_update(self, training_world_size: int) -> None:
+        client = self._legacy_meta_server_client
+        if client is None or self._legacy_num_infer_engines is None:
+            raise RuntimeError("AWEX colocation is not initialized")
+        group = self._engine.cpu_group
+        if dist.get_world_size(group=group) != training_world_size:
+            raise RuntimeError("Training world size changed during colocate update")
+        dist.barrier(group=group)
+        completion_status: list[str | None] = [None]
+        completion_error: Exception | None = None
+        if dist.get_rank(group=group) == 0:
+            try:
+                client.wait_set_until_size(
+                    "finished_weights_update_engines",
+                    self._legacy_num_infer_engines,
+                    timeout=self._legacy_timeout_s,
+                )
+                client.delete_if_exists("finished_weights_update_engines")
+                client.delete_if_exists("all_training_offloaded_weights")
+            except Exception as exc:
+                completion_error = exc
+                completion_status[0] = f"{type(exc).__name__}: {exc}"
+        # All ranks must observe a failed wait or cleanup instead of leaving
+        # peers stranded in a barrier that rank zero never reaches.
+        dist.broadcast_object_list(
+            completion_status, src=dist.get_global_rank(group, 0), group=group
         )
-        client = self._colocate_http_client
-        auth_headers = {"Authorization": f"Bearer {self._colocate_admin_api_key}"}
-        timeout_s = self._colocate_timeout_s
+        if completion_status[0] is not None:
+            raise RuntimeError(
+                f"AWEX colocate completion failed: {completion_status[0]}"
+            ) from completion_error
 
-        weights_offloaded = "weights" in self._released_tags
-        if weights_offloaded:
-            self.resume_memory(tags=["weights"])
-
-        params = self.get_local_shard_parameters()
-        tensors = list(params.values())
-        names = list(params.keys())
-
-        group_tensors, metadata = group_tensors_by_shape_and_dtype(tensors)
-        torch.cuda.synchronize()
-
-        del tensors
-
-        group_shared = [t.share_memory_() for t in group_tensors]
-        serialized_weights = cuda_ipc_serialize((group_shared, metadata, names))
-        torch.cuda.synchronize()
-
-        kv_key = f"colocate_weights_rank{transfer_rank}_{version}"
-
-        client.put(
-            f"{kv_store_url}/weight_meta/{pair_name}/{kv_key}",
-            json={"value": serialized_weights.hex()},
-            headers=auth_headers,
-            timeout=timeout_s,
-        )
-
-        logger.info(
-            "Serialized %d params (%d groups) for colocate transfer v%d, rank %d",
-            len(names),
-            len(group_shared),
-            version,
-            transfer_rank,
-        )
-
-        done_key = f"colocate_done_rank{transfer_rank}_{version}"
-        deadline = time.monotonic() + timeout_s
-        poll_count = 0
-        last_status = -1
-        while time.monotonic() < deadline:
-            resp = client.get(
-                f"{kv_store_url}/weight_meta/{pair_name}/{done_key}",
-                timeout=5.0,
+    def teardown_colocate_weight_update(self) -> None:
+        """Clear transport state without forgetting offloaded memory ownership."""
+        if self._pending_ipc_export is not None:
+            raise RuntimeError(
+                "Cannot tear down AWEX while a CUDA IPC export awaits reader acknowledgement"
             )
-            last_status = resp.status_code
-            if resp.status_code == 200:
-                break
-            poll_count += 1
-            time.sleep(0.1)
-        else:
-            raise TimeoutError(
-                f"Inference did not signal completion within {timeout_s}s "
-                f"(waiting_key={done_key}, put_key={kv_key}, "
-                f"polls={poll_count}, last_status={last_status})"
-            )
-
-        del group_shared, group_tensors, serialized_weights
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        if weights_offloaded:
-            self.release_memory(tags=["weights"])
+        for name in (
+            "_legacy_meta_server_addr",
+            "_legacy_meta_server_client",
+            "_legacy_transfer_rank",
+            "_legacy_ip_address",
+            "_legacy_physical_gpu_id",
+            "_legacy_infer_world_size",
+            "_legacy_num_infer_engines",
+            "_legacy_logical_train_rank",
+            "_weight_converter",
+            "_parameters_meta",
+            "_rank_info",
+            "_colocate_init_fingerprint",
+        ):
+            setattr(self, name, None)
+        self._legacy_initialized = False
 
     def _prepare_residency_for_publish(self) -> None:
         """Free optimizer/grad memory before making weights resident."""

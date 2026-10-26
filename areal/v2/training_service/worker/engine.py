@@ -244,6 +244,20 @@ def create_engine_module(
 
     # -- lifecycle routes --------------------------------------------------
 
+    @bp.route("/wait_async_saves", methods=["POST"])
+    def wait_async_saves():
+        def action():
+            engine = require_engine()
+            checkpointer = getattr(engine, "checkpointer", None)
+            if checkpointer is not None:
+                checkpointer.wait_async_saves()
+
+        return run_endpoint(
+            "wait_async_saves",
+            lambda: submit_to_engine_thread("wait_async_saves", action),
+            return_result=False,
+        )
+
     @bp.route("/destroy_engine", methods=["POST"])
     def destroy_engine():
         """Gracefully destroy the engine and release distributed resources.
@@ -280,6 +294,9 @@ def create_engine_module(
     _register_engine_route("/get_version", "get_version", methods=["GET"])
     _register_engine_route("/save", "save")
     _register_engine_route("/load", "load")
+    _register_engine_route(
+        "/init_weight_residency_adapter", "init_weight_residency_adapter"
+    )
     _register_engine_route("/offload", "offload")
     _register_engine_route("/onload", "onload")
     _register_engine_route("/optimizer_zero_grad", "optimizer_zero_grad")

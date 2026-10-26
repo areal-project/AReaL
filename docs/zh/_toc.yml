@@ -44,6 +44,7 @@ parts:
   - caption: 参考
     chapters:
     - file: reference/checkpointing
+    - file: reference/v2_colocation
     - file: reference/metrics_tracking
     - file: reference/moe_visualization
     - file: reference/alloc_mode

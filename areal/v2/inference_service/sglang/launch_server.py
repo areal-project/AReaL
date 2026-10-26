@@ -13,6 +13,36 @@ from __future__ import annotations
 import os
 import sys
 
+from areal.engine.awex.utils import validate_memory_saver_allocator
+
+
+def physical_base_from_cvd(cvd: str) -> int:
+    entries = [e.strip() for e in cvd.split(",") if e.strip()]
+    if not entries:
+        raise ValueError(f"CUDA_VISIBLE_DEVICES is empty: {cvd!r}")
+    ids = [int(e) for e in entries]
+    if ids[0] < 0 or ids != list(range(ids[0], ids[0] + len(ids))):
+        raise ValueError(
+            f"CUDA_VISIBLE_DEVICES must be nonnegative and contiguous in the given order: {cvd!r}"
+        )
+    return ids[0]
+
+
+def unmask_gpus_for_awex_colocate(server_args) -> None:
+    """Restore the v1 GPU layout: full visibility + physical base_gpu_id.
+
+    AWEX colocate keys every per-device MetaServer entry on
+    ``torch.cuda.current_device()``, which must equal the physical GPU id
+    (unique per host). A CVD mask makes it a logical id and collides across
+    same-host servers, so translate the mask into ``base_gpu_id`` and drop it
+    before SGLang forks its scheduler subprocesses.
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not cvd:
+        return
+    server_args.base_gpu_id += physical_base_from_cvd(cvd)
+    del os.environ["CUDA_VISIBLE_DEVICES"]
+
 
 def areal_launch_server(server_args) -> None:
     # ---- BEGIN AREAL ----
@@ -90,6 +120,10 @@ def areal_launch_server(server_args) -> None:
 
 
 if __name__ == "__main__":
+    awex_colocate = os.environ.get("AREAL_AWEX_COLOCATE") == "1"
+    if awex_colocate:
+        validate_memory_saver_allocator(os.environ)
+
     from sglang.srt.server_args import prepare_server_args
     from sglang.srt.utils import kill_process_tree
     from sglang.srt.utils.common import suppress_noisy_warnings
@@ -97,6 +131,9 @@ if __name__ == "__main__":
     suppress_noisy_warnings()
 
     server_args = prepare_server_args(sys.argv[1:])
+
+    if awex_colocate:
+        unmask_gpus_for_awex_colocate(server_args)
 
     try:
         areal_launch_server(server_args)

@@ -18,9 +18,7 @@ from areal.utils.recover import (
     check_if_recover,
 )
 from areal.utils.saver import Saver
-from areal.v2.training_service.controller.controller import (
-    GatewayTrainController,
-)
+from areal.v2.training_service.controller.controller import GatewayTrainController
 
 
 class TestRecoverConfig:
@@ -238,7 +236,11 @@ class TestRecoverHandler:
 
     @staticmethod
     def _make_gateway_controller() -> GatewayTrainController:
-        return GatewayTrainController.__new__(GatewayTrainController)
+        controller = GatewayTrainController.__new__(GatewayTrainController)
+        controller.config = SimpleNamespace(
+            backend="megatron:d1p1t1", megatron=SimpleNamespace(async_save=True)
+        )
+        return controller
 
     @staticmethod
     def _dump_dependencies():
@@ -270,6 +272,31 @@ class TestRecoverHandler:
         engine = Mock()
         engine.config = SimpleNamespace(
             backend="fsdp:d1", megatron=SimpleNamespace(async_save=False)
+        )
+
+        handler.dump(
+            engine,
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert checkpoint_pointer.read_latest(save_root).global_step == 3
+        meta = engine.save.call_args.args[0]
+        assert meta.path == checkpoint_pointer.payload_dir(
+            checkpoint_pointer.generation_dir(save_root, 3), "default"
+        )
+        assert meta.checkpoint_pointer_path is None
+
+    def test_dump_sync_gateway_publishes_transactional_generation(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        engine = self._make_gateway_controller()
+        engine.save = Mock()
+        engine.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=False)
         )
 
         handler.dump(
@@ -445,46 +472,22 @@ class TestRecoverHandler:
         )
         assert checkpoint_pointer.read_latest(save_root) is None
 
-    @pytest.mark.parametrize("mode", ["on", "auto"])
-    def test_load_rejects_gateway_train_controller(self, mode):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            handler = self._make_handler(tmpdir, mode)
+    def test_dump_async_gateway_defers_publication(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        engine = self._make_gateway_controller()
+        engine.save = Mock()
 
-            with pytest.raises(NotImplementedError) as exc_info:
-                handler.load(
-                    self._make_gateway_controller(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                )
+        handler.dump(engine, self._step_info(handler), *self._dump_dependencies())
 
-            assert "GatewayTrainController" in str(exc_info.value)
-            assert '`_version="v2"`' in str(exc_info.value)
-
-    @pytest.mark.parametrize("mode", ["on", "auto"])
-    def test_dump_rejects_gateway_train_controller(self, mode):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            handler = self._make_handler(tmpdir, mode)
-            step_info = StepInfo(
-                epoch=0,
-                epoch_step=0,
-                global_step=0,
-                steps_per_epoch=handler.ft_spec.steps_per_epoch,
-            )
-
-            with pytest.raises(NotImplementedError) as exc_info:
-                handler.dump(
-                    self._make_gateway_controller(),
-                    step_info,
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                )
-
-            assert "GatewayTrainController" in str(exc_info.value)
-            assert "recover.mode" in str(exc_info.value)
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert checkpoint_pointer.read_latest(save_root) is None
+        meta = engine.save.call_args.args[0]
+        assert meta.checkpoint_pointer_path == checkpoint_pointer.latest_path(save_root)
+        assert meta.checkpoint_pointer_value is not None
+        assert meta.wait_for_async_save is False
 
     @pytest.mark.parametrize("no_save_optim", [False, True])
     def test_save_checkpoint_passes_with_optim_from_config(self, no_save_optim):
@@ -808,7 +811,7 @@ def test_recover_awex_restores_generation_only_after_success(
         load.side_effect = RuntimeError("checkpoint load failed")
     elif failure == "update":
         engine.update_weights.side_effect = RuntimeError("weight update failed")
-    meta = Mock(type="awex")
+    meta = Mock(type="awex", colocate=False)
     kwargs = dict(
         inference_engine=rollout, weight_update_meta=meta, colocated_rollout=colocated
     )

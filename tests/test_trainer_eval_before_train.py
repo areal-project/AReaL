@@ -15,6 +15,7 @@ from areal.trainer.rw_trainer import RWTrainer
 from areal.trainer.sft_trainer import SFTTrainer
 from areal.utils import stats_logger as stats_logger_module
 from areal.utils.stats_logger import StatsLogger
+from areal.v2.training_service.controller.controller import GatewayTrainController
 
 
 class _StopAfterFirstUpdate(Exception):
@@ -86,6 +87,9 @@ class _FailingUpdateActor:
 
 
 class _FailingPPOActor:
+    def train_phase(self, **kwargs):
+        return nullcontext()
+
     parallel_strategy = SimpleNamespace(dp_size=1)
 
     def __init__(self, events: list[tuple]):
@@ -156,6 +160,7 @@ def _build_supervised_trainer(
 
 def _build_ppo_trainer(events: list[tuple], *, recovered: bool = False):
     trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer._is_v2_awex_colocate = False
     trainer.mopd_execution_plan = None
     trainer.config = SimpleNamespace(
         total_train_epochs=1,
@@ -460,6 +465,7 @@ def test_ppo_initial_eval_offloads_rollout_when_evaluation_fails(monkeypatch):
     _disable_timing_contexts(monkeypatch, rl_trainer)
     events: list[str] = []
     trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer._is_v2_awex_colocate = False
     trainer.eval_rollout = object()
     trainer.valid_dataloader = object()
     trainer.evaluator = _CallbackEvaluator()
@@ -486,6 +492,7 @@ def test_ppo_consumes_initial_eval_without_complete_evaluation_inputs():
     """PPO should consume the baseline when no evaluation workflow is provided."""
     evaluator = _RecordingEvaluator()
     trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer._is_v2_awex_colocate = False
     trainer.eval_rollout = object()
     trainer.valid_dataloader = object()
     trainer.evaluator = evaluator
@@ -540,3 +547,81 @@ def test_initial_eval_stats_use_step_zero_before_first_update(monkeypatch):
 
     assert logged_steps == [0, 1]
     assert stats_logger.state_dict() == {"last_commit_step": 1}
+
+
+@pytest.mark.parametrize("role", ["ref", "critic", "teacher", None])
+def test_v2_train_auxiliary_scoring_runs_between_rollout_release_and_actor_onload(
+    monkeypatch, role
+):
+    """Exercise the trainer and the real phase controller with shared GPU owners."""
+    _disable_timing_contexts(monkeypatch, rl_trainer)
+    trainer = _build_ppo_trainer([])
+    trainer.config.actor._version = "v2"
+    trainer._is_v2_awex_colocate = True
+    controller = object.__new__(GatewayTrainController)
+    controller._colocate = True
+    controller._parallel_strategy = SimpleNamespace(dp_size=1)
+    for method in (
+        "prepare_batch",
+        "compute_advantages",
+        "get_device_stats",
+        "ppo_update",
+    ):
+        setattr(controller, method, getattr(trainer.actor, method))
+    trainer.actor = controller
+    rollout = Mock()
+    trainer.rollout = controller.rollout = rollout
+    released = set()
+    memory_tags = {"kv_cache", "cuda_graph", "weights"}
+    actor_resumes = []
+    auxiliary = Mock(parallel_strategy=SimpleNamespace(dp_size=1))
+
+    def release_rollout(*, tags):
+        rollout.pause.assert_called_once()
+        rollout.pause_generation_sync.assert_called_once()
+        released.update(tags)
+
+    rollout.offload.side_effect = release_rollout
+
+    def check_auxiliary_memory():
+        assert released == memory_tags, "rollout memory is still resident"
+        assert not actor_resumes, "actor memory was restored before auxiliary scoring"
+
+    def score(batch):
+        check_auxiliary_memory()
+        return [object() for _ in batch]
+
+    auxiliary.onload.side_effect = check_auxiliary_memory
+    auxiliary.compute_logp.side_effect = score
+    auxiliary.compute_values.side_effect = score
+    if role is not None:
+        setattr(trainer, role, auxiliary)
+        setattr(trainer, f"_should_offload_{role}", True)
+    if role == "teacher":
+        trainer.config.teacher = SimpleNamespace(
+            engine_type="train", rl_loss_weight=1.0, distill_loss_weight=1.0
+        )
+
+    def actor_memory(op, tags):
+        if op == "resume_memory":
+            assert released == memory_tags
+            if role is not None:
+                scorer = (
+                    auxiliary.compute_values
+                    if role == "critic"
+                    else auxiliary.compute_logp
+                )
+                scorer.assert_called_once()
+                if role != "critic":
+                    auxiliary.offload.assert_called_once()
+            actor_resumes.append(tags)
+
+    controller._broadcast_awex_memory_op = actor_memory
+
+    with pytest.raises(_StopAfterFirstUpdate):
+        trainer.train(workflow=object())
+
+    assert actor_resumes == [["weights", "optimizer"]]
+    assert rollout.offload.call_count == 3
+    rollout.continue_generation.assert_not_called()
+    rollout.resume.assert_not_called()

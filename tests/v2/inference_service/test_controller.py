@@ -1274,12 +1274,16 @@ class TestMultiNodeConfig:
         assert len(data_proxy_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_async_initialize_multinode_fork_path(self, monkeypatch):
+    @pytest.mark.parametrize("awex_colocate", [False, True])
+    async def test_async_initialize_multinode_fork_path(
+        self, monkeypatch, awex_colocate
+    ):
         """Exercise the full multi-node fork path (server_infos=None)."""
         from areal.api.cli_args import SchedulingSpec
 
         monkeypatch.setenv("TRITON_CACHE_DIR", "/tmp/controller-triton-dir")
         monkeypatch.setenv("TRITON_CACHE_PATH", "/tmp/controller-triton-path")
+        monkeypatch.setenv("TMS_INIT_ENABLE", "1")
 
         worker0 = MagicMock()
         worker0.ip = "10.0.0.1"
@@ -1302,6 +1306,8 @@ class TestMultiNodeConfig:
             admin_api_key="test-key",
         )
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
+        controller.awex_colocate = awex_colocate
+        controller._inference_launch_allowed.set()
         controller._callback_host = "127.0.0.1"
         controller._callback_port = 19000
 
@@ -1369,6 +1375,12 @@ class TestMultiNodeConfig:
             {"count": 1, "role": "inf-server", "worker_index": 1},
         ]
         assert len(fork_calls) == 2  # 1 per node in the group
+        for fork_call in fork_calls:
+            if awex_colocate:
+                assert fork_call["env"]["TMS_INIT_ENABLE"] == "0"
+                assert fork_call["env"]["AREAL_AWEX_COLOCATE"] == "1"
+            else:
+                assert "TMS_INIT_ENABLE" not in fork_call["env"]
 
         # Verify fork payloads have correct worker_index and role
         assert fork_calls[0]["role"] == "inf-server"
