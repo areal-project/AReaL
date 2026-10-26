@@ -765,33 +765,48 @@ def _concat_prompt_token_ids_with_parent(
     parent_tokens: list[int] = []
     all_message_list: list[dict] = []
     eos_token_id = tokenizer.eos_token_id
+    # Parent and child templates must see the same tools, including iterators.
+    tools = list(tools) if tools is not None else None
 
-    # To ensure compatibility across different models, we adopted the following padding scheme:
-    # Apply the chat template to the full-text message_list of the new input, then count the number of eos tokens
-    # in the parent tokens. Locate the final index where the same number of eos tokens appears in the child_all_tokens,
-    # all tokens after this index correspond to the newly input tokens for the current round.
-
+    parent_eos_num = 0
     if parent is not None:
         if parent.model_response is None:
             raise ValueError("Parent interaction has no model_response.")
-        # TODO: (yulangz) how to handle here when stop is set?
+        # Preserve every sampled action, including PAD and repeated stop tokens:
+        # the parent's logprobs and loss mask will be inherited at these indices.
         parent_tokens = (
-            parent.model_response.input_tokens
-            + parent.model_response.output_tokens_without_stop  # without stop tokens
+            parent.model_response.input_tokens + parent.model_response.output_tokens
         )
         all_message_list += parent.messages if parent.messages is not None else []
         all_message_list += (
             parent.output_message_list if parent.output_message_list is not None else []
         )
 
-        # If the parent terminates due to output exceeding length limits or being aborted, it will not have an EOS token.
-        # We will add an extra EOS token to align with the chat template. During training, this added EOS will be treated
-        # as part of the child message's prompt rather than the parent message's output, and therefore will be masked out
-        # by the loss_mask.
-        # If the parent terminated with an EOS token, it will be removed by parent.model_response.output_tokens_without_stop, and
-        # we add it here.
-        # TODO: should we mask this extra eos token in loss_mask during training?
-        parent_tokens += [eos_token_id]
+        # Close a PAD-ended, truncated, aborted, or empty assistant turn. This
+        # synthetic token belongs to the child's prompt and receives loss_mask=0.
+        if (
+            not parent.model_response.output_tokens
+            or parent.model_response.output_tokens[-1] != eos_token_id
+        ):
+            parent_tokens.append(eos_token_id)
+
+        # Locate the new messages using canonical template boundaries, rather
+        # than raw sampled EOS counts. Multiple sampled stop tokens must not
+        # consume a later message's boundary, including in subsequent turns.
+        parent_template_tokens = apply_chat_template(
+            tokenizer,
+            _parse_tool_call_arguments(all_message_list),
+            tools=tools,
+            add_generation_prompt=False,
+            tokenize=True,
+            **extra_body.get("chat_template_kwargs", {}),
+        )
+        parent_eos_num = parent_template_tokens.count(eos_token_id)
+        if parent_eos_num == 0:
+            raise RuntimeError(
+                "Failed to align child tokens with parent tokens in concat prompt: "
+                "the parent chat template contains no EOS boundaries."
+            )
 
     all_message_list += message_list
     all_message_list = _parse_tool_call_arguments(all_message_list)
@@ -807,7 +822,6 @@ def _concat_prompt_token_ids_with_parent(
         )
     else:
         all_tokens = full_prompt_token_ids
-    parent_eos_num = parent_tokens.count(eos_token_id)
     if parent_eos_num > 0:
         child_tokens_truncate_idx = _find_kth(all_tokens, eos_token_id, parent_eos_num)
         if child_tokens_truncate_idx == -1 or child_tokens_truncate_idx + 1 >= len(
@@ -1934,8 +1948,12 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
 
         interaction.response = deepcopy(response)
         interaction.model_response = engine_resp
+        # Cache the same representation used for incoming Responses items so a
+        # caller can return response.output and retain the sampled parent prefix.
         interaction.output_message_list = [
-            o.model_dump(exclude_none=True) for o in resp_output
+            message
+            for item in resp_output
+            for message in _build_messages_list(item.model_dump(exclude_none=True))
         ]
         if invalid_tool_call_error is not None:
             raise invalid_tool_call_error
