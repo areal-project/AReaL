@@ -1,0 +1,113 @@
+# Full 45-layer, four-node SFT baseline; use torchrun in SPMD mode.
+# Supply the original model, output, and unique name-resolution paths.
+experiment_name: chucai-accelerate-glm53-sft
+trial_name: full45-tp4-dp8-ep32-pp1-fp32-b24-step3
+seed: 1
+enable_offload: false
+total_train_epochs: 1
+total_train_steps: 3
+tokenizer_path: ${actor.path}
+allocation_mode: megatron:(attn:d8p1t4c1|ffn:d1p1t1e32)
+cluster:
+  n_nodes: 4
+  n_gpus_per_node: 8
+  fileroot: ???
+  name_resolve:
+    type: nfs
+    nfs_record_root: ???
+scheduler:
+  type: null
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  backend: ${allocation_mode}
+  path: ???
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    max_tokens_per_mb: 512
+    granularity: 1
+  optimizer:
+    type: adam
+    lr: 1.0e-06
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1.0e-08
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+  megatron:
+    bridge_type: mbridge
+    use_mbridge_save: false
+    enable_mtp: false
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_token_dispatcher_type: alltoall
+    moe_router_dtype: fp32
+    moe_router_bias_update_rate: 0.0
+    moe_z_loss_coeff: 0.0
+    main_params_dtype: float32
+    exp_avg_dtype: float32
+    exp_avg_sq_dtype: float32
+    cpu_staged_offload:
+      enabled: true
+      buffer_count: 2
+      bucket_size_mb: 128
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+profile:
+  fake_seq_len: 512
+  fake_dataset_size: 72
+  fake_loss_start_ratio: 0.5
+train_dataset:
+  batch_size: 24
+  shuffle: false
+  pin_memory: true
+  num_workers: 0
+  drop_last: true
+  path: fake://profile/glm5-next-smoke
+  type: sft
+  max_length: 512
+valid_dataset: null
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled

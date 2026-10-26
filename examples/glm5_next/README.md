@@ -2,13 +2,16 @@
 
 This is an experimental text actor integration for `Glm5NextForConditionalGeneration`
 (`glm5_next`, nested `glm5_next_text`). CPU architecture tests, focused CUDA kernel
-tests, a reduced four-layer distributed SFT smoke, and a no-update forward of the
-original 45-layer model have passed. The smoke covered TP1/EP8 and three-node TP4/EP12,
-HF export, DCP save, and a follow-up optimizer/model/LR/RNG reload from global step 3.
-The original model's profile512 NLL was 1.87--1.89 across three data-parallel replicas
-on TP4/EP12; this is the first full-model loss evidence. HF logps and per-layer routing
-have been captured for the same input, but HF/SGLang numerical parity, routing replay,
-and live weight transfer still require validation before production RL.
+tests, a reduced four-layer distributed SFT smoke, and three optimizer updates of the
+original 45-layer model with FP32 master weights and moments have passed. The reduced
+smoke covered TP1/EP8 and three-node TP4/EP12, HF export, DCP save, and a follow-up
+optimizer/model/LR/RNG reload from global step 3. The original model's profile512 NLL
+was 1.87--1.89 across three data-parallel replicas on TP4/EP12; this is the first
+full-model loss evidence. HF logps and per-layer routing have been captured for the same
+input, but HF/SGLang numerical parity, routing replay, and live weight transfer still
+require validation before production RL. The
+[full-model FP32 SFT baseline](#full-model-fp32-sft-baseline) below records the
+completed training run separately from those RL gates.
 
 ## Architecture and runtime
 
@@ -127,6 +130,58 @@ repeat-to-repeat variation. Cross-replica differences remained, starting with sm
 output differences before the first MoE layer. This diagnostic does not change the
 production accumulator or establish HF parity.
 
+## Full-model FP32 SFT baseline
+
+[`sft_full_fp32.yaml`](sft_full_fp32.yaml) preserves the successful 45-layer run from
+2026-10-26 (Slurm job 985824, code `fd3b290d2cfc8984abe11f868737479763ea80b8`). It uses
+four nodes with eight GPUs each, TP4/DP8/EP32, PP1/CP1, full activation recompute, batch
+size 24, and the deterministic 512-token profile. Model compute is BF16; gradients,
+optimizer master weights, and both Adam moments are FP32. The optional BF16 optimizer
+moments mode is explicitly disabled by this recipe's dtype settings.
+
+| Step | Loss   | Grad norm | Successful update | Train step (s) |
+| ---- | ------ | --------- | ----------------- | -------------- |
+| 1    | 1.8964 | 21.450    | 1                 | 76.123         |
+| 2    | 1.8147 | 20.211    | 1                 | 35.820         |
+| 3    | 1.6599 | 21.599    | 1                 | 37.558         |
+
+The job completed with exit code 0 in 379 seconds. Runtime assertions inspected both
+optimizer leaves on all 32 ranks: all 64 records had CPU FP32 master weights, `exp_avg`,
+and `exp_avg_sq`. Those three arrays occupied about 915.94 GiB per node, before
+pinned-allocation rounding and other host overhead. The tested nodes had 1.5 TiB host
+memory and GPUs reporting 143,771 MiB each. The launch gate required at least 1,100 GiB
+available host memory per node. Budget for initialization as well as training: sampled
+driver memory reached about 134 GiB during initialization, versus about 99 GiB after
+training steps.
+
+Use the runtime described above and provide paths for the original full checkpoint,
+outputs, and a unique NFS name-resolution directory. On each of the four allocated
+nodes, with its corresponding `NODE_RANK` and a shared rendezvous address/port, run:
+
+```bash
+export AREAL_SPMD_MODE=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+torchrun --nnodes=4 --nproc-per-node=8 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+  examples/profile/train_sft_profile.py \
+  --config examples/glm5_next/sft_full_fp32.yaml \
+  actor.path="$GLM53_MODEL" \
+  cluster.fileroot="$GLM53_OUTPUT" \
+  cluster.name_resolve.nfs_record_root="$GLM53_NAME_ROOT"
+```
+
+Select network interfaces and cache directories for the actual cluster. The measured run
+warmed KDA/DSA kernel caches before training; these times are not a cold-start
+benchmark. Its external resource monitors timed out in `nvidia-smi` at shutdown; the
+training steps and Slurm exit status were successful. A subsequent node check found no
+remaining GPU processes and host memory returned to the prior baseline.
+
+This is a three-step synthetic SFT validation, not a convergence or long-context quality
+result. Checkpoint saving is disabled here; the save/reload evidence above comes from
+the reduced model. It does not validate RL rollout, reward, SGLang logp parity,
+multimodal training, or live weight transfer.
+
 ## Numerical and RL gates
 
 1. Run `pytest -q -m slow tests/test_glm5_next_kernels.py` on CUDA. This checks packed
@@ -168,5 +223,6 @@ production accumulator or establish HF parity.
    checkpoint's FP8 policy. Receiver loading is still a GPU validation gate, especially
    for absorbed MLA weights.
 
-1. Only then run the full-model SFT/RL sequence. No training job is submitted by these
-   preparation or comparison commands.
+1. Complete these checks before production RL. The full-model SFT baseline above has
+   already passed its separate three-step training check. No training job is submitted
+   by these preparation or comparison commands.
