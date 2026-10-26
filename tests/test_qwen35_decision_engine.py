@@ -3,9 +3,12 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tests.test_megatron_bridge_config import _load_function
+
+pytest.importorskip("megatron.core")
 
 from areal.models.mcore.qwen35_decision import DecisionHeadMeta
 
