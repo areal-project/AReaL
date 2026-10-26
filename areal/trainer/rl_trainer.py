@@ -1326,6 +1326,9 @@ class PPOTrainer:
                     prepared_stats=prepared_stats,
                 )
 
+            # Flush and stop every role before the next rollout can resume.
+            self._save_perf_tracer(step=global_step)
+
             # Resume rollout only when another train step will consume it.
             #
             # The dispatcher may have queued overlap rollouts while producing
@@ -1342,8 +1345,6 @@ class PPOTrainer:
                     "(global_step=%s)",
                     global_step,
                 )
-
-            self._save_perf_tracer(step=global_step)
 
     def _save_training_state(
         self,
@@ -1443,19 +1444,26 @@ class PPOTrainer:
             return
         perf_tracer.configure(self.config.perf_tracer, rank=rank, role="master")
 
-        if not is_single_controller():
-            return
+        if is_single_controller():
+            self.actor.config_perf_tracer(self.config.perf_tracer, role="actor")
+            if self.critic is not None:
+                self.critic.config_perf_tracer(self.config.perf_tracer, role="critic")
+            if self.ref is not None:
+                self.ref.config_perf_tracer(self.config.perf_tracer, role="ref")
+            self.rollout.config_perf_tracer(self.config.perf_tracer, role="rollout")
+            if self.eval_rollout is not None:
+                self.eval_rollout.config_perf_tracer(
+                    self.config.perf_tracer, role="eval-rollout"
+                )
 
-        self.actor.config_perf_tracer(self.config.perf_tracer, role="actor")
-        if self.critic is not None:
-            self.critic.config_perf_tracer(self.config.perf_tracer, role="critic")
-        if self.ref is not None:
-            self.ref.config_perf_tracer(self.config.perf_tracer, role="ref")
-        self.rollout.config_perf_tracer(self.config.perf_tracer, role="rollout")
-        if self.eval_rollout is not None:
-            self.eval_rollout.config_perf_tracer(
-                self.config.perf_tracer, role="eval-rollout"
-            )
+        profile_steps = self.config.perf_tracer.profile_steps
+        if (
+            self.recover_info is not None
+            and profile_steps
+            and self.recover_info.last_step_info.global_step >= max(profile_steps)
+        ):
+            # A recovered run may start after the final requested trace step.
+            self._save_perf_tracer(step=self.recover_info.last_step_info.global_step)
 
     def _save_perf_tracer(self, step: int):
         self.actor.save_perf_tracer(step=step)

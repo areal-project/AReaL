@@ -1328,6 +1328,8 @@ class PerfTracer:
         )
         self._save_interval = _normalize_save_interval(config)
         self._profile_steps = self._normalize_profile_steps(config.profile_steps)
+        self._last_profile_step = max(self._profile_steps, default=None)
+        self._stopped_after_step = False
         self._session_tracer: SessionTracer | None = None
         self._configure_session_tracer(config, rank=rank, role=role)
 
@@ -1339,7 +1341,7 @@ class PerfTracer:
         return self._enabled
 
     def set_enabled(self, flag: bool) -> None:
-        self._enabled = flag
+        self._enabled = flag and not self._stopped_after_step
 
     def _configure_session_tracer(
         self, config: PerfTracerConfig, *, rank: int, role: str | None = None
@@ -1371,7 +1373,7 @@ class PerfTracer:
 
     @property
     def session_tracer(self) -> SessionTracer | None:
-        return self._session_tracer
+        return None if self._stopped_after_step else self._session_tracer
 
     # ------------------------------------------------------------------
     # Core recording API
@@ -1609,10 +1611,23 @@ class PerfTracer:
     # Persistence helpers
     # ------------------------------------------------------------------
     def save(self, *, step: int | None = None, force: bool = False) -> None:
-        if self._session_tracer is not None and force:
+        stop_after_step = (
+            step is not None
+            and self._last_profile_step is not None
+            and step >= self._last_profile_step
+        )
+        if stop_after_step:
+            # End recording before flushing so concurrent scopes cannot add events
+            # from the next training step while this rank writes the final trace.
+            self._enabled = False
+            self._stopped_after_step = True
+
+        if self._session_tracer is not None and (force or stop_after_step):
             self._session_tracer.flush(force=True)
 
-        if not self._enabled:
+        if not self._enabled and not (
+            stop_after_step or (force and self._stopped_after_step)
+        ):
             return
 
         # Save only on the last step of each interval (0-indexed).
@@ -1620,6 +1635,7 @@ class PerfTracer:
         interval = self._save_interval
         if (
             not force
+            and not stop_after_step
             and step is not None
             and interval > 1
             and ((step + 1) % interval) != 0
@@ -1662,6 +1678,7 @@ class PerfTracer:
             self._enabled = self._config.enabled and rank_in_env_filter(
                 "AREAL_PERF_TRACER_RANKS", self._rank
             )
+            self._stopped_after_step = False
             self._save_interval = _normalize_save_interval(self._config)
 
     # ------------------------------------------------------------------

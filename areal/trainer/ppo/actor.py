@@ -37,7 +37,7 @@ from areal.trainer.ppo.loss_reduction import (
     prepare_policy_gradient_batch,
 )
 from areal.trainer.ppo.stats import infer_token_denominator
-from areal.utils import logging, stats_tracker
+from areal.utils import logging, perf_tracer, stats_tracker
 from areal.utils.constants import (
     PROX_APPROX_METHOD_LINEAR,
     PROX_APPROX_METHOD_LOGLINEAR,
@@ -55,6 +55,7 @@ from areal.utils.data import (
     is_multi_modal_key,
     split_training_batch_into_microbatches,
 )
+from areal.utils.environ import get_bool_env_var
 from areal.utils.functional import (
     apply_rejection_sampling,
     cispo_loss_fn,
@@ -65,7 +66,7 @@ from areal.utils.functional.loss_aggregation import (
     LossAggregationMode,
     TokenMean,
 )
-from areal.utils.perf_tracer import trace_perf
+from areal.utils.perf_tracer import Category, trace_perf
 from areal.utils.stats_tracker import ReduceType
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -410,8 +411,21 @@ class PPOActor:
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
-        batched, meta = concat_batch(data)
-        self._ppo_update(batched, meta)
+        with perf_tracer.trace_scope(
+            "ppo_actor.train",
+            category=Category.COMPUTE,
+            enable_profiler=True,
+            profiler_args={
+                "record_shapes": True,
+                "with_stack": False,
+                "profile_memory": get_bool_env_var(
+                    "AREAL_TORCH_PROFILER_PROFILE_MEMORY", default="true"
+                ),
+            },
+            args={"global_step": self.engine.get_version()},
+        ):
+            batched, meta = concat_batch(data)
+            self._ppo_update(batched, meta)
 
     def _ppo_update(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None

@@ -529,6 +529,76 @@ def test_profiler_only_runs_on_configured_steps(tmp_path, monkeypatch):
     assert counters["enter"] == 1
 
 
+def test_profile_step_cutoff_flushes_and_stops_basic_trace(tmp_path):
+    config = _make_config(tmp_path, experiment="profile", trial="cutoff")
+    config.profile_steps = [1, 3]
+    config.save_interval = 10
+    tracer = perf_tracer.PerfTracer(config, rank=0)
+    trace_path = _expected_trace_path(config, rank=0)
+
+    tracer.instant("before-cutoff")
+    tracer.save(step=1)
+    assert not trace_path.exists()
+
+    tracer.instant("at-cutoff")
+    tracer.save(step=3)
+    assert not tracer.enabled
+    tracer.instant("after-cutoff")
+    tracer.save(step=4, force=True)
+
+    names = {event["name"] for event in _load_trace_events(trace_path)}
+    assert "before-cutoff" in names
+    assert "at-cutoff" in names
+    assert "after-cutoff" not in names
+
+
+def test_profile_step_cutoff_stops_session_trace(tmp_path):
+    config = _make_config(tmp_path, experiment="profile", trial="sessions")
+    config.profile_steps = [0]
+    config.session_tracer = SessionTracerConfig(enabled=True, flush_threshold=10)
+    tracer = perf_tracer.PerfTracer(config, rank=0)
+    session_tracer = tracer.session_tracer
+    assert session_tracer is not None
+    session_tracer.register_task(7)
+    session_tracer.register_session(7)
+
+    tracer.save(step=0)
+
+    assert tracer.session_tracer is None
+    session_path = _expected_session_trace_path(config, rank=0)
+    assert len(_load_trace_events(session_path)) == 1
+
+
+def test_ppo_actor_profiles_only_selected_global_steps(tmp_path, monkeypatch):
+    from areal.trainer.ppo.actor import PPOActor
+
+    counters = _install_fake_profiler(monkeypatch)
+    config = _make_config(tmp_path, experiment="profile", trial="ppo")
+    config.profile_steps = [1]
+    perf_tracer.configure(config, rank=0, role="actor")
+    monkeypatch.setattr(
+        "areal.trainer.ppo.actor.concat_batch", lambda data: (data, None)
+    )
+
+    class FakeEngine:
+        version = 1
+
+        def get_version(self):
+            return self.version
+
+    actor = object.__new__(PPOActor)
+    actor.engine = FakeEngine()
+    updates = []
+    actor._ppo_update = lambda batch, meta: updates.append((batch, meta))
+
+    actor.ppo_update([{"sample": 1}])
+    actor.engine.version = 2
+    actor.ppo_update([{"sample": 2}])
+
+    assert counters["enter"] == 1
+    assert len(updates) == 2
+
+
 def test_profiler_request_is_skipped_when_active(tmp_path, monkeypatch):
     counters = _install_fake_profiler(monkeypatch)
     config = _make_config(tmp_path, experiment="profile", trial="nesting")
