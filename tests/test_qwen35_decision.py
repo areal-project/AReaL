@@ -12,8 +12,11 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.nn.functional as F
-from megatron.core.models.gpt.gpt_model import GPTModel
 from torch import nn
+
+pytest.importorskip("megatron.core")
+
+from megatron.core.models.gpt.gpt_model import GPTModel
 
 from areal.dataset.decision import (
     QUESTION_TYPE_IDS,

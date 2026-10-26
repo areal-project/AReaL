@@ -12,8 +12,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from megatron.core.models.gpt.gpt_model import GPTModel
 from torch import nn
+
+pytest.importorskip("megatron.core")
+
+from megatron.core.models.gpt.gpt_model import GPTModel
 
 from areal.models.mcore import qwen35_decision as decision
 from areal.models.mcore.qwen35_decision import (
