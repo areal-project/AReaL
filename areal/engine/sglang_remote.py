@@ -553,20 +553,29 @@ class SGLangBackend:
         awex_transfer_rank_base = server_args.pop("_awex_transfer_rank_base", None)
         if awex_gpus_per_server is not None:
             fallback_base_gpu_id = int(server_args.get("base_gpu_id", 0))
-            awex_transfer_rank_base = fallback_base_gpu_id
             base_gpu_id, source = _resolve_colocated_base_gpu_id(
                 os.environ,
                 int(awex_gpus_per_server),
                 fallback_base_gpu_id,
             )
             server_args["base_gpu_id"] = base_gpu_id
+            if awex_transfer_rank_base is None:
+                # Isolated devices start at logical zero but retain a dense
+                # transfer offset. Otherwise follow actual worker placement:
+                # controller enumeration need not match Slurm's local order.
+                awex_transfer_rank_base = (
+                    fallback_base_gpu_id
+                    if source == current_platform.device_control_env_var
+                    else base_gpu_id
+                )
             logger.info(
                 "AWEX colocate base_gpu_id=%s resolved from %s "
-                "(gpus_per_server=%s, requested=%s)",
+                "(gpus_per_server=%s, requested=%s, transfer_rank_base=%s)",
                 base_gpu_id,
                 source,
                 awex_gpus_per_server,
                 fallback_base_gpu_id,
+                awex_transfer_rank_base,
             )
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
