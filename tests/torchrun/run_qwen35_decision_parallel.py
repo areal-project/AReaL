@@ -27,7 +27,6 @@ from areal.engine.megatron_utils.packed_context_parallel import (
 from areal.infra.platforms import current_platform
 from areal.models.mcore.qwen35_decision import (
     DecisionHeadMeta,
-    PointerHead,
     _agree_flag,
     load_decision_pointer_head,
     replace_output_layer_with_pointer_head,

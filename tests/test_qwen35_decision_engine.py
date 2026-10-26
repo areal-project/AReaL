@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import torch
 
-from areal.models.mcore.qwen35_decision import DecisionHeadMeta
-
 from tests.test_megatron_bridge_config import _load_function
+
+from areal.models.mcore.qwen35_decision import DecisionHeadMeta
 
 ENGINE_SOURCE = "areal/engine/megatron_engine.py"
 
@@ -256,9 +256,9 @@ def test_save_hf_writes_head_and_relaxes_lm_head_export():
         bridge=Bridge(),
         _mtp_head_dropped=False,
         _rebuild_index_from_saved_shards=lambda path: calls.setdefault("index", path),
-        _decision_head_checkpoint_meta=_method("_decision_head_checkpoint_meta").__get__(
-            None, object
-        ),
+        _decision_head_checkpoint_meta=_method(
+            "_decision_head_checkpoint_meta"
+        ).__get__(None, object),
         cpu_group=None,
     )
     engine._decision_head_checkpoint_meta = lambda: _method(

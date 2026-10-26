@@ -8,9 +8,8 @@ The required column names (keys) and data format depend on the specific implemen
 of the agent workflow (for online reinforcement learning) or the training engines (for
 offline training, such as `LMEngine` for Supervised Fine-Tuning (SFT)).
 
-Decision-model SFT (choose among options rather than generate tokens) uses a
-different JSONL schema and different batch columns. See
-[Decision Dataset](decision_dataset.md).
+Decision-model SFT (choose among options rather than generate tokens) uses a different
+JSONL schema and different batch columns. See [Decision Dataset](decision_dataset.md).
 
 Here are two concrete examples from the existing implementation:
 

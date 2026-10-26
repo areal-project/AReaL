@@ -769,9 +769,7 @@ class MicroBatchList:
             _move_tensor_container_remembering_cu_seqlens(mb, *args, **kwargs)
             for mb in self.mbs
         ]
-        data = _move_tensor_container_remembering_cu_seqlens(
-            self.data, *args, **kwargs
-        )
+        data = _move_tensor_container_remembering_cu_seqlens(self.data, *args, **kwargs)
         padded_mbs = None
         if self.padded_mbs is not None:
             padded_mbs = [

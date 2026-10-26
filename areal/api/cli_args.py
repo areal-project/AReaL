@@ -1235,9 +1235,7 @@ class TrainEngineConfig:
     )
     focal_gamma: float = field(
         default=0.0,
-        metadata={
-            "help": "Hard-label CE multiplier (1-p_y)^gamma; 0 is ordinary CE"
-        },
+        metadata={"help": "Hard-label CE multiplier (1-p_y)^gamma; 0 is ordinary CE"},
     )
     temperature: float = field(
         default=1.0, metadata={"help": "Temperature during generation."}

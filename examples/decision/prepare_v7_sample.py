@@ -21,7 +21,10 @@ _REPO = Path(__file__).resolve().parents[2]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from areal.dataset.decision import load_labelled_path, select_labelled_records
+from areal.dataset.decision import (  # noqa: E402
+    load_labelled_path,
+    select_labelled_records,
+)
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:

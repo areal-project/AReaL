@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -117,7 +118,9 @@ def _hybrid_lora_classes(monkeypatch):
         provider = _ensure_module(
             monkeypatch, "megatron.bridge.models.qwen_vl.qwen35_vl_provider"
         )
-        if not hasattr(provider, "get_transformer_block_with_experimental_attention_variant_spec"):
+        if not hasattr(
+            provider, "get_transformer_block_with_experimental_attention_variant_spec"
+        ):
             provider.get_transformer_block_with_experimental_attention_variant_spec = (
                 lambda *a, **k: None
             )
@@ -334,7 +337,9 @@ def _pack_question(z, label, qtype, soft=None, dp=8):
 def test_question_loss_matches_definitions(qtype, opts):
     z = torch.tensor([0.4, -0.7, 1.2])
     y = torch.tensor([1])
-    expected = F.cross_entropy(z[None], y, label_smoothing=opts.get("label_smoothing", 0.0))
+    expected = F.cross_entropy(
+        z[None], y, label_smoothing=opts.get("label_smoothing", 0.0)
+    )
     if opts.get("brier_w"):
         target = F.one_hot(y[0], 3).float()
         expected = expected + opts["brier_w"] * (z.softmax(-1) - target).square().sum()
@@ -444,7 +449,9 @@ def test_npu_pointer_head_forward_backward():
     device = _require_npu()
     torch.manual_seed(0)
     head = PointerHead(8, dp=4).to(device)
-    hidden = torch.randn(5, 3, 8, dtype=torch.bfloat16, device=device, requires_grad=True)
+    hidden = torch.randn(
+        5, 3, 8, dtype=torch.bfloat16, device=device, requires_grad=True
+    )
     projected, extra = head(hidden)
     assert extra is None
     assert projected.shape == (5, 3, 8)

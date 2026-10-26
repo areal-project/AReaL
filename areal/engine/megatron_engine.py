@@ -858,9 +858,7 @@ class MegatronEngine(TrainEngine):
 
         if self.config.init_from_scratch:
             self.logger.info("init_from_scratch=True; skipping HF weight loading.")
-            self._sync_decision_pointer_head(
-                "/nonexistent-decision-pointer-head"
-            )
+            self._sync_decision_pointer_head("/nonexistent-decision-pointer-head")
         else:
             with self.device:
                 self._load_model_from_hf(self.config.path)

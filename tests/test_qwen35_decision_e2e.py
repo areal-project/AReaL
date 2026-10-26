@@ -114,7 +114,10 @@ def test_prepare_decision_sample_writes_one_record_per_source(tmp_path):
 
 def test_npu_poc_yaml_loads_as_single_npu_decision_sft():
     config, _ = load_expr_config(
-        ["--config", str(_REPO / "examples/decision/qwen3_5_decision_sft_npu_poc.yaml")],
+        [
+            "--config",
+            str(_REPO / "examples/decision/qwen3_5_decision_sft_npu_poc.yaml"),
+        ],
         SFTConfig,
     )
     assert config.actor.is_decision_model
@@ -140,9 +143,10 @@ def test_qwen35_decision_sft_single_npu_poc(tmp_path):
         pytest.skip("NPU is not available")
     if _MODEL is None or not _MODEL.is_dir():
         pytest.skip("set DECISION_MODEL to a local Qwen3.5 checkpoint to run this test")
-    if not (_MODEL / "model.safetensors.index.json").exists() and not (
-        _MODEL / "config.json"
-    ).exists():
+    if (
+        not (_MODEL / "model.safetensors.index.json").exists()
+        and not (_MODEL / "config.json").exists()
+    ):
         pytest.skip(f"Qwen3.5 checkpoint is not available: {_MODEL}")
 
     data_dir = tmp_path / "data"
@@ -218,9 +222,7 @@ def test_qwen35_decision_sft_single_npu_poc(tmp_path):
             log_blobs.append(_read_text(extra))
     output = "\n".join(log_blobs)
     if result.returncode != 0:
-        pytest.fail(
-            f"decision NPU PoC exited {result.returncode}\n{output[-8000:]}"
-        )
+        pytest.fail(f"decision NPU PoC exited {result.returncode}\n{output[-8000:]}")
     assert _SUCCESS.search(output), output[-4000:]
     assert "decision_loss" in output
     checkpoints = list((fileroot / "checkpoints").rglob("head.pt"))
@@ -249,7 +251,10 @@ def test_qwen35_decision_sft_multi_npu(parallel, backend, n_devices, tmp_path):
     """Two-step decision SFT for DP, TP+SP, and CP, same checks as 1 NPU."""
     from areal.infra.platforms import current_platform
 
-    if current_platform.device_type != "npu" or current_platform.device_count() < n_devices:
+    if (
+        current_platform.device_type != "npu"
+        or current_platform.device_count() < n_devices
+    ):
         pytest.skip(f"need {n_devices} NPUs for {parallel}")
     if _MODEL is None or not _MODEL.is_dir():
         pytest.skip("set DECISION_MODEL to a local Qwen3.5 checkpoint to run this test")
