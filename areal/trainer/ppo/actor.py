@@ -624,6 +624,7 @@ class PPOActor:
                     sapo_tau_neg=self.config.sapo_tau_neg,
                     use_cispo_loss=self.config.use_cispo_loss,
                     use_decoupled_loss=self.config.use_decoupled_loss,
+                    entropy_coeff=self.config.entropy_coeff,
                     loss_step=loss_step,
                     mopd_loss_config=self._mopd_loss_config,
                 )
@@ -877,6 +878,7 @@ def grpo_loss_fn(
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
+    entropy_coeff: float = 0.0,
 ):
     """Compute loss and logging stats using the actor's assembled reduction."""
     denominator_mask = input_data["loss_mask"].bool()
@@ -953,7 +955,8 @@ def grpo_loss_fn(
     advantages = input_data["advantages"]
     prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
-    entropy = entropy.detach()
+    if entropy_coeff == 0.0:
+        entropy = entropy.detach()
 
     if ProxLogpMethod(prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP:
         prox_logp_gt = logprobs.detach()
@@ -1093,6 +1096,14 @@ def grpo_loss_fn(
             loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
             rkl_stat = rkl_penalty_per_token
 
+    # The entropy bonus shares the policy-gradient reduction so the engine
+    # weight from pg_reduction.normalizer() stays matched to the composed loss.
+    entropy_stat = None
+    if entropy_coeff > 0.0:
+        entropy_loss = -pg_reduction.aggregate(entropy, loss_mask)
+        loss = loss + entropy_coeff * entropy_loss
+        entropy_stat = -entropy.detach() * loss_mask
+
     # Match the engine's aggregation across microbatches and data-parallel ranks.
     stats_tracker.weighted_mean(
         "actor_loss/avg",
@@ -1124,13 +1135,19 @@ def grpo_loss_fn(
                 denominator="n_valid_tokens",
             )
 
+    if entropy_stat is not None:
+        stats_tracker.stat(
+            entropy_loss=entropy_stat,
+            denominator="n_valid_tokens",
+        )
+
     logp_diff = (old_logp - logprobs.detach()) * loss_mask
     stats_tracker.stat(
         importance_weight=stat["importance_weight"],
         approx_kl=stat["approx_kl"],
         new_logp=logprobs.detach(),
         old_logp=old_logp,
-        entropy=entropy.float(),
+        entropy=entropy.detach().float(),
         actor_loss_token_mean=stat["loss"].float(),
         clip_ratio=stat["clip_mask"].float(),
         dual_clip_ratio=stat["dual_clip_mask"].float(),
