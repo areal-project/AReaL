@@ -71,6 +71,10 @@ from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCallCache
 from areal.utils import logging
 from areal.utils.hf_utils import apply_chat_template
+from areal.utils.qwen_vl_image import (
+    prepare_sglang_qwen_images,
+    sglang_qwen_image_kwargs,
+)
 
 if TYPE_CHECKING:
     from transformers.processing_utils import ProcessorMixin
@@ -129,6 +133,7 @@ class _PreparedPrompt:
     input_ids: list[int]
     mm_token_type_ids: list[int] | None = None
     multi_modal_input: dict[str, torch.Tensor] | None = None
+    image_data: list[str] | None = None
 
     def copy_for_consumer(self) -> "_PreparedPrompt":
         """Copy mutable containers while sharing immutable processor tensors."""
@@ -144,6 +149,7 @@ class _PreparedPrompt:
                 if self.multi_modal_input is not None
                 else None
             ),
+            image_data=list(self.image_data) if self.image_data is not None else None,
         )
 
 
@@ -185,6 +191,9 @@ def _process_multimodal_prompt(
     image_data: list[str],
     tools: Iterable[ChatCompletionToolParam] | None,
     chat_template_kwargs: dict[str, Any],
+    *,
+    align_sglang_images: bool = False,
+    processor_cache: ProcessorCallCache | None = None,
 ) -> _PreparedPrompt:
     """Build prompt tokens and vision tensors from inline base64 images only.
 
@@ -198,6 +207,7 @@ def _process_multimodal_prompt(
     from PIL import Image
     from transformers.image_utils import load_image
 
+    image_kwargs = sglang_qwen_image_kwargs(processor) if align_sglang_images else None
     images = []
     for encoded_image in image_data:
         match = _DATA_URI_RE.match(encoded_image)
@@ -212,11 +222,25 @@ def _process_multimodal_prompt(
         try:
             image_bytes = base64.b64decode(payload, validate=True)
             with Image.open(BytesIO(image_bytes)) as image:
-                images.append(load_image(image))
+                # Match SGLang's PIL branch, including retaining raw EXIF
+                # orientation. HF load_image would transpose EXIF here.
+                images.append(
+                    image.convert("RGB")
+                    if image_kwargs is not None
+                    else load_image(image)
+                )
         except (binascii.Error, OSError, ValueError) as exc:
             raise ValueError(
                 "Local multimodal processing requires valid base64-encoded image data."
             ) from exc
+
+    wire_image_data = None
+    if align_sglang_images:
+        aligned_images = prepare_sglang_qwen_images(
+            processor, images, cache=processor_cache, image_keys=image_data
+        )
+        if aligned_images is not None:
+            images, wire_image_data = aligned_images
 
     prompt_text = apply_chat_template(
         tokenizer,
@@ -231,11 +255,17 @@ def _process_multimodal_prompt(
             "The tokenizer chat template must return text before VLM processing."
         )
 
-    processed = processor(
+    from areal.experimental.openai.vision_tokens import protect_vision_tokens
+
+    text_processor, prompt_text, restore_ids = protect_vision_tokens(
+        processor, tokenizer, messages, tools, chat_template_kwargs, prompt_text
+    )
+    processed = text_processor(
         text=[prompt_text],
         images=images,
         padding=False,
         return_tensors="pt",
+        **({"images_kwargs": image_kwargs} if image_kwargs is not None else {}),
     )
     input_ids_tensor = processed.get("input_ids")
     if not torch.is_tensor(input_ids_tensor) or input_ids_tensor.ndim != 2:
@@ -251,7 +281,8 @@ def _process_multimodal_prompt(
     if token_type_ids is None:
         token_type_ids = processed.get("token_type_ids")
     if token_type_ids is None:
-        mm_token_type_ids = [0] * len(input_ids)
+        image_id = getattr(processor, "image_token_id", None)
+        mm_token_type_ids = [int(token == image_id) for token in input_ids]
     else:
         if not torch.is_tensor(token_type_ids) or token_type_ids.ndim != 2:
             raise ValueError("The VLM processor token type IDs must be 2D.")
@@ -261,6 +292,17 @@ def _process_multimodal_prompt(
                 "The VLM processor returned token type IDs that do not align "
                 f"with input_ids: {len(mm_token_type_ids)} != {len(input_ids)}."
             )
+
+    # Temporary escape IDs exist only inside HF preprocessing. They never enter
+    # the model context, sampled trajectory, or training tensors.
+    for marker_id in restore_ids:
+        marker = str(text_processor.tokenizer.added_tokens_decoder[marker_id])
+        if input_ids.count(marker_id) != prompt_text.count(marker):
+            raise ValueError("VLM processor did not preserve visual text escapes")
+    for index, token in enumerate(input_ids):
+        if token in restore_ids:
+            input_ids[index] = restore_ids[token]
+            mm_token_type_ids[index] = 0
 
     multi_modal_input = {
         key: processed[key].detach().cpu()
@@ -275,6 +317,7 @@ def _process_multimodal_prompt(
         input_ids=input_ids,
         mm_token_type_ids=mm_token_type_ids,
         multi_modal_input=multi_modal_input,
+        image_data=wire_image_data,
     )
 
 
@@ -548,6 +591,17 @@ def _extract_images_from_messages(
         vision_messages_for_vllm.append(vllm_msg)
 
     return image_data, messages_for_tokenizer, vision_messages_for_vllm
+
+
+def _is_sglang_backend(engine: TRolloutEngine) -> bool:
+    """Recognize configured engines, legacy SGLang engines, and v2 bridges."""
+    backend = getattr(getattr(engine, "config", None), "backend", "")
+    if isinstance(backend, str) and backend:
+        return backend.split(":", maxsplit=1)[0].lower() == "sglang"
+    return any(
+        "sglang" in type(impl).__name__.lower()
+        for impl in (engine, getattr(engine, "backend", None))
+    )
 
 
 def _validate_multimodal_agent_backend(
@@ -839,6 +893,7 @@ async def _prepare_prompt(
     extra_body: Body,
     require_multimodal_processor: bool = False,
     processor_cache: ProcessorCallCache | None = None,
+    align_sglang_images: bool = False,
 ) -> _PreparedPrompt:
     """Prepare text or multimodal prompt data for one agent interaction."""
     chat_template_kwargs = extra_body.get("chat_template_kwargs", {})
@@ -858,6 +913,8 @@ async def _prepare_prompt(
                 image_data,
                 tools,
                 chat_template_kwargs,
+                align_sglang_images=align_sglang_images,
+                processor_cache=processor_cache,
             )
             if processor_cache is not None:
                 prompt = _share_multimodal_tensors(
@@ -870,6 +927,7 @@ async def _prepare_prompt(
         else:
             cache_key = processor_cache.make_key(
                 "openai_multimodal",
+                align_sglang_images,
                 id(processor),
                 id(tokenizer),
                 tokenizer_messages,
@@ -909,6 +967,9 @@ async def _prepare_prompt(
                 processed_prompt.multi_modal_input
                 if processed_prompt is not None
                 else {}
+            ),
+            image_data=(
+                processed_prompt.image_data if processed_prompt is not None else None
             ),
         )
 
@@ -962,6 +1023,7 @@ async def _prepare_prompt(
         input_ids=input_ids,
         mm_token_type_ids=mm_token_type_ids,
         multi_modal_input=processed_prompt.multi_modal_input,
+        image_data=processed_prompt.image_data,
     )
 
 
@@ -1218,6 +1280,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             extra_body=extra_body,
             require_multimodal_processor=self.require_multimodal_processor,
             processor_cache=processor_cache,
+            align_sglang_images=_is_sglang_backend(self.engine),
         )
         prompt_token_ids = prepared_prompt.input_ids
         if interaction is not None and self.processor is not None:
@@ -1320,14 +1383,27 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             ),
         )
 
+        from areal.utils.sglang_image import image_prompt_metadata
+
+        request_metadata = image_prompt_metadata(
+            metadata if not is_omitted(metadata) else {},
+            prompt_token_ids,
+            prepared_prompt.mm_token_type_ids if has_images else None,
+            image_data
+            if has_images and sglang_qwen_image_kwargs(self.processor) is not None
+            else None,
+            self.processor,
+        )
         model_request = ModelRequest(
             input_ids=prompt_token_ids,
             gconfig=gconfig,
             rid=str(uuid.uuid4()),
-            metadata=metadata if not is_omitted(metadata) else {},
+            metadata=request_metadata,
             tokenizer=self.tokenizer,
             processor=self.processor,
-            image_data=image_data if has_images else None,
+            image_data=(prepared_prompt.image_data or image_data)
+            if has_images
+            else None,
             vision_msg_vllm=([vision_messages_for_vllm] if has_images else None),
         )
 
@@ -1743,6 +1819,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             extra_body=extra_body,
             require_multimodal_processor=self.require_multimodal_processor,
             processor_cache=processor_cache,
+            align_sglang_images=_is_sglang_backend(self.engine),
         )
         prompt_token_ids = prepared_prompt.input_ids
         if self.processor is not None:
@@ -1802,14 +1879,27 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             ),
         )
 
+        from areal.utils.sglang_image import image_prompt_metadata
+
+        request_metadata = image_prompt_metadata(
+            metadata if not is_omitted(metadata) else {},
+            prompt_token_ids,
+            prepared_prompt.mm_token_type_ids if has_images else None,
+            image_data
+            if has_images and sglang_qwen_image_kwargs(self.processor) is not None
+            else None,
+            self.processor,
+        )
         model_request = ModelRequest(
             input_ids=prompt_token_ids,
             gconfig=gconfig,
             rid=str(uuid.uuid4()),
-            metadata=metadata if not is_omitted(metadata) else {},
+            metadata=request_metadata,
             tokenizer=self.tokenizer,
             processor=self.processor,
-            image_data=image_data if has_images else None,
+            image_data=(prepared_prompt.image_data or image_data)
+            if has_images
+            else None,
             vision_msg_vllm=([vision_messages_for_vllm] if has_images else None),
         )
 

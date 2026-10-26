@@ -36,7 +36,7 @@ def wrap_server_command(command: list[str]) -> list[str]:
 
 
 def apply_model_patches(server_args: Sequence[str]) -> None:
-    """Patch Qwen Flash Next (qwen4_exp), independent of model path or workflow."""
+    """Apply model-specific preprocessing fixes, independent of model path."""
     if "--help" in server_args or "-h" in server_args:
         return
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
@@ -68,6 +68,34 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
             )
         except (OSError, ValueError):
             return  # Let the original entry point handle other config formats.
+    from areal.engine import sglang_qwen_vl_cpu
+
+    if config.get("model_type") in sglang_qwen_vl_cpu.MODEL_TYPES:
+        # Native tokenizer workers import this package themselves, including
+        # spawned workers. No parent-process monkeypatch or new user setting.
+        package = "areal.engine.sglang_processors"
+        existing = os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE")
+        if existing and existing != package:
+            raise RuntimeError(
+                "AReaL Qwen image alignment requires its external multimodal "
+                "processor; another processor package is already configured"
+            )
+        os.environ["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"] = package
+        root = installed_sglang_root()
+        install_source_patches(
+            [
+                (
+                    root / sglang_qwen_vl_cpu.TARGET_RELATIVE,
+                    sglang_qwen_vl_cpu.patched_source,
+                ),
+                (
+                    root / sglang_qwen_vl_cpu.BASE_RELATIVE,
+                    sglang_qwen_vl_cpu.patched_base_source,
+                ),
+            ],
+            lock_path=root / ".areal-sglang-patches.lock",
+        )
+        return
     if config.get("model_type") != "qwen4_exp":
         return
 

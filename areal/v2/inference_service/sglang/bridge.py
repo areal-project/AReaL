@@ -13,6 +13,7 @@ from areal.api.io_struct import (
     HttpRequest,
     get_versioned_lora_name,
 )
+from areal.utils.sglang_image import image_request_kwargs
 
 if TYPE_CHECKING:
     from areal.api.io_struct import ModelRequest
@@ -63,7 +64,7 @@ class SGLangBridgeBackend:
             sampling_params["sampling_seed"] = gconfig.seed
 
         payload: dict[str, Any] = {
-            "input_ids": list(req.input_ids),
+            **image_request_kwargs(req),
             "image_data": req.image_data,
             "sampling_params": sampling_params,
             "return_logprob": True,
@@ -165,5 +166,6 @@ class SGLangBridgeBackend:
         accumulated_tokens: list[int],
         remaining_tokens: int,
     ) -> None:
-        http_req.payload["input_ids"] = list(req.input_ids) + accumulated_tokens
+        http_req.payload.pop("mm_sampling_kwargs", None)
+        http_req.payload.update(image_request_kwargs(req, accumulated_tokens))
         http_req.payload["sampling_params"]["max_new_tokens"] = remaining_tokens

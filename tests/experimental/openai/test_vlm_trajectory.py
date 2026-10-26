@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -64,7 +65,7 @@ class _FakeVLLMEngine(_FakeEngine):
 class _FakeProcessor:
     image_processor = SimpleNamespace(image_processor_type="fake")
 
-    def __call__(self, *, text, images, padding, return_tensors):
+    def __call__(self, *, text, images, padding, return_tensors, **kwargs):
         assert padding is False
         assert return_tensors == "pt"
         assert len(text) == 1
@@ -511,3 +512,54 @@ async def test_prepare_prompt_changed_text_shares_identical_vision_tensors():
     assert prompts[1].mm_token_type_ids == [1, 1, 1, 0, 0, 2]
     for name, tensor in prompts[0].multi_modal_input.items():
         assert tensor is prompts[1].multi_modal_input[name]
+
+
+@pytest.mark.asyncio
+async def test_prepare_prompt_changed_text_reuses_resize_without_encoding(
+    tmp_path, monkeypatch
+):
+    class Qwen3VLProcessor(_FakeProcessor):
+        image_processor = SimpleNamespace(
+            patch_size=16,
+            merge_size=2,
+            size={"shortest_edge": 65536, "longest_edge": 16777216},
+        )
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    tokenizer = _FakeTokenizer()
+    tokenizer.name_or_path = str(tmp_path)
+    processor = Qwen3VLProcessor()
+    processor.tokenizer = tokenizer
+    images = [_png_base64()]
+    cache = ProcessorCallCache()
+    calls = []
+    resize = Image.Image.resize
+
+    def counted_resize(self, *args, **kwargs):
+        calls.append(self.size)
+        return resize(self, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "resize", counted_resize)
+    monkeypatch.setattr(Image.Image, "save", lambda *a, **k: pytest.fail("re-encoding"))
+    message = {"role": "user", "content": [{"type": "image"}]}
+    results = []
+    for messages in ([message], [message, {"role": "user", "content": "Again"}]):
+        results.append(
+            await _prepare_prompt(
+                tokenizer=tokenizer,
+                processor=processor,
+                tokenizer_messages=messages,
+                concat_messages=messages,
+                image_data=images,
+                parent=None,
+                chat_template_type="hf",
+                tools=None,
+                extra_body={},
+                processor_cache=cache,
+                align_sglang_images=True,
+            )
+        )
+    assert len(calls) == 1
+    assert results[0].input_ids != results[1].input_ids
+    assert results[0].image_data == results[1].image_data
+    assert results[0].image_data == images
