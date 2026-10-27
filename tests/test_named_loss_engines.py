@@ -59,6 +59,7 @@ def _namespace(monkeypatch, cp_size=1, cp_rank=0):
     # Collective math is covered separately using real CPU/Gloo processes.
     distributed = SimpleNamespace(all_reduce=lambda tensor, group: None)
     return {
+        "nullcontext": nullcontext,
         "torch": torch,
         "dist": distributed,
         "TRANSPORT_DUMMY_KEY": TRANSPORT_DUMMY_KEY,
