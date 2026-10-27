@@ -7,7 +7,7 @@ from unittest import mock
 import pytest
 import torch
 
-from areal.api.cli_args import MegatronEngineConfig
+from areal.api.cli_args import FP8EngineConfig, MegatronEngineConfig
 
 
 class _FinalizeReached(RuntimeError):
@@ -15,6 +15,9 @@ class _FinalizeReached(RuntimeError):
 
 
 class _FakeProvider(SimpleNamespace):
+    def register_pre_wrap_hook(self, hook) -> None:
+        self.pre_wrap_hook = hook
+
     def finalize(self) -> None:
         self.config_at_finalize = (
             self.deterministic_mode,
@@ -72,6 +75,8 @@ def _run_until_provider_finalize(
     provider: _FakeProvider,
     *,
     deterministic: bool,
+    fp8_config: FP8EngineConfig | None = None,
+    hf_model_type: str | None = None,
 ) -> None:
     pytest.importorskip("mbridge")
     pytest.importorskip("megatron.core")
@@ -79,6 +84,7 @@ def _run_until_provider_finalize(
 
     tf_config = SimpleNamespace(params_dtype=None)
     mcore_config = _make_mcore_config(deterministic=deterministic)
+    mcore_config.fp8_config = fp8_config
 
     with (
         mock.patch.multiple(
@@ -94,7 +100,7 @@ def _run_until_provider_finalize(
         for getter in mpu_mocks.values():
             getter.return_value = 1
         make_mcore_model(
-            hf_config=SimpleNamespace(),
+            hf_config=SimpleNamespace(model_type=hf_model_type),
             tf_config=tf_config,
             mcore_config=mcore_config,
             bridge=_FakeBridge(provider),
@@ -130,6 +136,26 @@ def test_megatron_bridge_provider_applies_fusion_config_when_nondeterministic():
         True,
         True,
     )
+
+
+def test_megatron_bridge_fp8_reaches_provider_before_finalize():
+    """FP8 must reach the fresh provider used to build the actual TE modules."""
+    provider = _make_provider(attention_backend=object())
+    provider.fp8 = None
+    provider.fp8_recipe = "delayed"
+    provider.fp8_param = True
+    _run_until_provider_finalize(
+        provider,
+        deterministic=False,
+        fp8_config=FP8EngineConfig(recipe="blockwise", param=False),
+        hf_model_type="qwen3_5",
+    )
+    assert provider.fp8 == "e4m3"
+    assert provider.fp8_recipe == "blockwise"
+    assert provider.fp8_param is False
+    from areal.engine.megatron_utils.qwen3_5_fp8 import Qwen35FP8Training
+
+    assert provider.pre_wrap_hook is Qwen35FP8Training.prepare_model
 
 
 @pytest.mark.parametrize("fusion_enabled", [False, True])

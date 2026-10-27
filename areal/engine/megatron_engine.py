@@ -2801,29 +2801,7 @@ class MegatronEngine(TrainEngine):
         if not self.enable_fp8:
             return
         fp8_config = self.fp8_config
-        special_mappings = {"mode": "fp8"}
-        # Fields that use the same name in both configs (no prefix needed)
-        same_fields = {
-            "tp_only_amax_red",
-            "first_last_layers_bf16",
-            "num_layers_at_start_in_bf16",
-            "num_layers_at_end_in_bf16",
-        }
-        # All other fields get the `fp8_` prefix
-        for field in dataclasses.fields(fp8_config):
-            fp8_field = field.name
-            if fp8_field in special_mappings:
-                tf_field = special_mappings[fp8_field]
-            elif fp8_field in same_fields:
-                tf_field = fp8_field
-            else:
-                tf_field = f"fp8_{fp8_field}"
-            if hasattr(self.tf_config, tf_field):
-                setattr(self.tf_config, tf_field, getattr(fp8_config, fp8_field))
-            else:
-                self.logger.warning(
-                    f"Unknown FP8 field in TransformerConfig: {fp8_field}"
-                )
+        fp8_config.apply_to(self.tf_config)
         self.logger.info(
             f"FP8 training enabled: mode={fp8_config.mode}, "
             f"recipe={fp8_config.recipe}, "
@@ -2832,12 +2810,29 @@ class MegatronEngine(TrainEngine):
         # fp8_param_gather is passed from make_mcore_model()
 
     def _validate_fp8_consistency(self):
-        """Validate that FP8 configuration is consistent.
-
-        If either training uses FP8, quantization_config must exist
-        and quant_method must be "fp8" (weights must be FP8).
-        """
+        """Validate source storage separately from FP8 compute precision."""
         train_fp8 = self.enable_fp8
+        if (
+            train_fp8
+            and self.bridge_cls == "megatron-bridge"
+            and self.hf_config.model_type in ("qwen3_5", "qwen3_5_text")
+        ):
+            if (
+                self.dtype != torch.bfloat16
+                or self.fp8_config.param
+                or self.mcore_config.ddp.fp8_param_gather
+            ):
+                raise ValueError(
+                    "Qwen3.5 FP8 with Megatron-Bridge requires BF16 parameter "
+                    "storage: set dtype=bfloat16, fp8_config.param=false and "
+                    "ddp.fp8_param_gather=false."
+                )
+            if self.quantization_config:
+                raise ValueError(
+                    "Load a BF16 Qwen3.5 checkpoint for FP8 training; configure the "
+                    "FP8 rollout checkpoint separately in sglang.model_path."
+                )
+            return
         weights_fp8 = (
             self.quantization_config is not None
             and self.quantization_config.get("quant_method", None) == "fp8"
