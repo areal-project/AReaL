@@ -236,12 +236,10 @@ def actor_frozen_binder(engine: Any) -> McoreFrozenBinder:
 
 
 def build_awex_train_info(engine: Any, world_size: int) -> dict[str, Any]:
-    info: dict[str, Any] = {"train_world_size": world_size}
-    if engine.hf_config.architectures == ["Qwen4ExpForConditionalGeneration"]:
-        binder = actor_frozen_binder(engine)
-        info["qwen4_exp_frozen_contract"] = binder.contract.to_dict()
-        info["qwen4_exp_frozen_proof"] = engine._qwen4_awex_frozen_proof
-    return info
+    # Keep the previous import path for callers outside the shared adapters.
+    from areal.engine.awex.metadata import build_awex_train_info as build_info
+
+    return build_info(engine, world_size)
 
 
 class SglangFrozenBinder:
