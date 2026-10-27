@@ -142,6 +142,8 @@ rollout:
       enabled: false
   return_routed_experts: false
   _version: v1
+  load_balance_policy: least_groups
+  load_balance_scope: node
 actor:
   min_usable_group_size: 8
   backend: megatron:d1p4t4c4e1
