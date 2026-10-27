@@ -448,8 +448,13 @@ def compute_binary_kl_divergence(
     Treats each element as a Bernoulli: P = [p, 1-p], Q = [q, 1-q].
     KL(P||Q) = p*log(p/q) + (1-p)*log((1-p)/(1-q))
     """
-    p = torch.clamp(torch.exp(log_p), eps, 1.0 - eps)
-    q = torch.clamp(torch.exp(log_q), eps, 1.0 - eps)
+    dtype = torch.promote_types(
+        torch.promote_types(log_p.dtype, log_q.dtype), torch.float32
+    )
+    # Keep 1 - eps representably below 1, including when exp(log_p) rounds to 1.
+    max_probability = 1.0 - max(eps, torch.finfo(dtype).eps)
+    p = torch.clamp(torch.exp(log_p.to(dtype)), eps, max_probability)
+    q = torch.clamp(torch.exp(log_q.to(dtype)), eps, max_probability)
     return p * torch.log(p / q) + (1 - p) * torch.log((1 - p) / (1 - q))
 
 

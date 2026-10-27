@@ -1,8 +1,10 @@
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from areal.api.cli_args import RejectionSamplingConfig
 from areal.utils.functional import apply_rejection_sampling
+from areal.utils.functional.functional import compute_binary_kl_divergence
 
 
 class TestRejectionSamplingConfig:
@@ -39,6 +41,88 @@ class TestRejectionSamplingConfig:
         """action='clamp' without explicit lower should default to 0.0."""
         config = RejectionSamplingConfig(action="clamp", metric="ratio", upper=5.0)
         assert config.lower == 0.0
+
+
+class TestBinaryKL:
+    """KPop configuration, bidirectional filtering, and probability boundaries."""
+
+    def test_binary_kl_config_omegaconf_round_trip_succeeds(self):
+        """The documented KPop metric survives structured config instantiation."""
+        config = OmegaConf.structured(RejectionSamplingConfig)
+        config.metric = "binary_kl"
+        config.upper = 2.0
+
+        result = OmegaConf.to_object(config)
+
+        assert isinstance(result, RejectionSamplingConfig)
+        assert (result.metric, result.action, result.lower) == (
+            "binary_kl",
+            "mask",
+            None,
+        )
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"upper": 0.0}, "finite and positive"),
+            ({"upper": -1.0}, "finite and positive"),
+            ({"upper": float("nan")}, "finite and positive"),
+            ({"upper": float("inf")}, "finite and positive"),
+            ({"lower": 0.0}, "lower must be None"),
+            ({"action": "clamp"}, "only supports metric='ratio'"),
+        ],
+    )
+    def test_binary_kl_invalid_config_raises(self, overrides, message):
+        """Reject unsupported KPop bounds and truncation before training."""
+        with pytest.raises(ValueError, match=message):
+            RejectionSamplingConfig(
+                **({"metric": "binary_kl", "upper": 2.0} | overrides)
+            )
+
+    def test_binary_kl_masks_either_direction_and_preserves_importance_weights(self):
+        """Both KL directions matter; kept tokens retain detached behavior correction."""
+        p = torch.tensor(
+            [[0.8, 0.01, 0.02, 0.5, 0.5]], dtype=torch.float32, requires_grad=True
+        )
+        q = torch.tensor([[0.01, 0.8, 0.01, 0.5, 0.5]], dtype=torch.float32)
+        loss_mask = torch.tensor([[True, True, True, True, False]])
+
+        result = apply_rejection_sampling(
+            p.log(),
+            q.log(),
+            loss_mask,
+            cu_seqlens=None,
+            config=RejectionSamplingConfig(metric="binary_kl", upper=2.0),
+        )
+
+        torch.testing.assert_close(
+            result.loss_mask,
+            torch.tensor([[False, False, True, True, False]]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            result.behave_imp_weight,
+            torch.tensor([[0.0, 0.0, 2.0, 1.0, 0.0]]),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        assert result.filtered_fraction == pytest.approx(0.5)
+        assert not result.behave_imp_weight.requires_grad
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
+    def test_binary_kl_zero_one_probabilities_stay_finite(self, dtype):
+        """Exactly equal endpoint probabilities must not produce NaN and be rejected."""
+        p = torch.tensor([0.0, 1.0, 0.0, 1.0], dtype=dtype)
+        q = torch.tensor([0.0, 1.0, 1.0, 0.0], dtype=dtype)
+
+        result = compute_binary_kl_divergence(p.log(), q.log())
+
+        assert torch.isfinite(result).all()
+        torch.testing.assert_close(
+            result[:2], torch.zeros_like(result[:2]), rtol=0, atol=0
+        )
+        assert (result[2:] > 2.0).all()
 
 
 class TestRejectionSamplingMask:

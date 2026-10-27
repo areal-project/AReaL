@@ -1807,7 +1807,7 @@ class RejectionSamplingConfig:
 
         _VALID_LEVELS = ("token", "sequence")
         _VALID_ACTIONS = ("mask", "clamp")
-        _VALID_METRICS = ("ratio", "kl_k1", "kl_k2", "kl_k3")
+        _VALID_METRICS = ("ratio", "kl_k1", "kl_k2", "kl_k3", "binary_kl")
         _VALID_AGGS = ("sum", "mean", "max")
 
         # Validate enum-like fields.
@@ -1825,6 +1825,17 @@ class RejectionSamplingConfig:
             )
         if self.agg not in _VALID_AGGS:
             raise ValueError(f"agg must be one of {_VALID_AGGS}, got '{self.agg}'")
+
+        if self.metric == "binary_kl":
+            if not math.isfinite(self.upper) or self.upper <= 0:
+                raise ValueError(
+                    "upper must be finite and positive for 'binary_kl' metric, "
+                    f"got {self.upper}"
+                )
+            if self.lower is not None:
+                raise ValueError(
+                    "lower must be None for 'binary_kl' metric; KPop uses only upper"
+                )
 
         # Validate lower <= upper when both are set.
         if self.lower is not None and self.lower > self.upper:
