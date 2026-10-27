@@ -41,6 +41,54 @@ The existing BF16 defaults are unchanged. Checkpoint saving and recovery use the
 training model; rollout-only FP8 weights and scales are derived again from the current
 training weights at each AWEX synchronization.
 
+## KPop filtering
+
+Both FP8 recipes enable token-level KPop with the following settings. The TP recipe
+inherits them from the single-GPU recipe.
+
+```yaml
+actor:
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  prox_logp_method: recompute
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: binary_kl
+    upper: 2.0
+    lower: null
+```
+
+`upper` bounds the maximum of forward and reverse Bernoulli KL for each generated token.
+It is not a probability-ratio cap or a reference-model KL coefficient. The initial value
+`2.0` follows `gsm8k_kpop.yaml`; it has not been tuned for Qwen3.5 FP8. Smaller values
+reject more tokens. Keep `lower: null`: KPop only uses an upper bound.
+
+The recipes retain AReaL's existing `recompute` proximal policy: KPop compares a cached
+training forward before optimization with rollout logprobs. To instead compare the
+current training forward with rollout, use `actor.prox_logp_method=reuse_train_logp` and
+`actor.recompute_logprob=false`, keeping `actor.ppo_n_minibatches=1`. This changes the
+PPO ratio semantics and skips the extra proximal forward; it is not required to enable
+KPop. AReaL still normalizes policy loss by the original valid token count.
+
+Start with `upper=2.0`. For a threshold comparison, keep all other settings fixed and
+try `1.0` and `0.5` as stricter candidates, not validated presets. Track
+`behave_filtered_ratio`, `rs_filtered_fraction`, the unfiltered `logp_abs_diff`, reward,
+and gradient norms. Do not target a fixed rejection percentage or infer that the
+original mismatch disappeared from filtered-only KL statistics. A sudden increase in
+rejection calls for checking weight versions, synchronization, and logprob settings
+before changing the threshold.
+
+For example, override the threshold in the existing GPU script:
+
+```bash
+bash examples/math/run_qwen35_fp8_e2e.sh actor.rejection_sampling.upper=1.0
+```
+
+KPop acts on the policy loss; FP8 quantization and AWEX weight synchronization remain
+independently controlled. These settings have not been validated by a GPU training run.
+
 ## Prepare the rollout checkpoint
 
 Use local model directories. The destination must not already exist. Conversion reads
@@ -94,7 +142,8 @@ execution in the target environment before treating this path as validated. No
 convergence, throughput, or reward-parity claim is made.
 
 ```bash
-pytest tests/test_qwen35_fp8.py tests/test_megatron_bridge_deterministic.py
+pytest tests/test_qwen35_fp8.py tests/test_megatron_bridge_deterministic.py \
+  tests/test_rejection_sampling.py
 ```
 
 Coverage includes provider propagation, the GDN BF16 recipe, exclusions, replicated KV
