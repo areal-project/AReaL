@@ -142,6 +142,7 @@ LOGGER_COLORS_EXACT = {
     # AWEX weight exchange - cyan (compute backend)
     "AwexMegatronAdapter": "light_cyan",
     "AwexSGLangAdapter": "light_cyan",
+    "Qwen35FP8Checkpoint": "light_cyan",
     "AwexFSDPAdapter": "light_cyan",
     "MegatronResidency": "light_cyan",
     "MOPDTeacherPhase": "light_cyan",
