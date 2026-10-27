@@ -1,26 +1,13 @@
 # Qwen3.8-27B Arena RL
 
-This recipe uses the dense 27B training settings from the 19-task Graybox experiment and
-selects the 64-task Whitebox B Stream for the next run. The branch starts from upstream
-`main` at `448de523`. Arena categorized retries, RPC/checkpoint fixes and
-required-recovery checks are already upstream. The additional core fix carries
+This recipe selects the 64-task Whitebox B Stream for a Qwen3.8-27B run. The branch
+starts from upstream `main` at `448de523`. Arena categorized retries, RPC/checkpoint
+fixes and required-recovery checks are already upstream. The additional core fix carries
 `de8d6796`: resolve rollout dump paths without importing metrics SDKs in inference
 workers.
 
-The new files provide the dense controller/actor entry points, the exact training
-parameters and Slurm submission preflights. They do not modify the running trial.
-
-| Setting       | Value                                                               |
-| ------------- | ------------------------------------------------------------------- |
-| Sampling      | temperature 1, top-p 1, top-k 100000                                |
-| Batch / group | bs16 / gs12; consumer batch 16; rollout concurrency 1500; queue 256 |
-| Training      | TP4 / PP4 / CP4 / EP1; CPU Adam offload                             |
-| Inference     | 16 TP4 replicas; CUDA graph, memory saver and radix cache enabled   |
-| Attention     | dense provider `auto`; native GDN defaults; no PLE override         |
-| LM head       | native projection; chunked logits disabled                          |
-| Reward        | group normalization uses standard deviation                         |
-| R3            | disabled                                                            |
-| Recovery      | auto; model/optimizer/LR/RNG state retained; save every two hours   |
+The new files provide the controller and actor entry points and Slurm submission
+preflights. They do not modify the running trial.
 
 Actor/controller use **areal-dev-sglang-0821.sif**, with the historical dependency
 overlay providing **Megatron-Core 0.18.2**, **megatron-bridge 0.5.1** and **AWEX
