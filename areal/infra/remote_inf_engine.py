@@ -602,6 +602,7 @@ class RemoteInfEngine(InferenceEngine):
         self._version = 0
 
         self.lock = Lock()
+        self._inflight_generation_requests: dict[str, int] = {}
 
         self._workflow_executor: WorkflowExecutor | None = None
         self._initialized = False
@@ -797,6 +798,27 @@ class RemoteInfEngine(InferenceEngine):
         """Get the current weight version."""
         with self.lock:
             return self._version
+
+    def inflight_generation_counts(self) -> dict[str, int]:
+        """Snapshot HTTP generation requests currently awaiting a backend."""
+        with self.lock:
+            return self._inflight_generation_requests.copy()
+
+    @contextmanager
+    def _track_inflight_generation(self, address: str) -> Iterator[None]:
+        with self.lock:
+            self._inflight_generation_requests[address] = (
+                self._inflight_generation_requests.get(address, 0) + 1
+            )
+        try:
+            yield
+        finally:
+            with self.lock:
+                remaining = self._inflight_generation_requests[address] - 1
+                if remaining:
+                    self._inflight_generation_requests[address] = remaining
+                else:
+                    del self._inflight_generation_requests[address]
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
         results: list[torch.Tensor] = []
@@ -1191,15 +1213,16 @@ class RemoteInfEngine(InferenceEngine):
             )
 
             # Loop until the generation is complete
-            result = await arequest_with_retry(
-                session=session,
-                addr=server_addr,
-                endpoint=http_req.endpoint,
-                payload=http_req.payload,
-                method=http_req.method,
-                max_retries=self.config.request_retries,
-                timeout=self.config.request_timeout,
-            )
+            with self._track_inflight_generation(server_addr):
+                result = await arequest_with_retry(
+                    session=session,
+                    addr=server_addr,
+                    endpoint=http_req.endpoint,
+                    payload=http_req.payload,
+                    method=http_req.method,
+                    max_retries=self.config.request_retries,
+                    timeout=self.config.request_timeout,
+                )
 
             # Assert response is JSON dict (not text/binary from error pages)
             if not isinstance(result, dict):

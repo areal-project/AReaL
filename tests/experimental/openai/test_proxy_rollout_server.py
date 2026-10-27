@@ -173,7 +173,6 @@ async def test_session_generation_defaults_respect_explicit_limits(
 def _reset_server_globals(monkeypatch):
     """Reset all module-level globals before each test."""
     monkeypatch.setattr(srv, "_session_cache", {})
-    monkeypatch.setattr(srv, "_backend_inflight_requests", {})
     monkeypatch.setattr(srv, "_api_key_to_session", {})
     monkeypatch.setattr(srv, "_session_to_api_key", {})
     monkeypatch.setattr(srv, "_capacity", 0)
@@ -359,18 +358,21 @@ async def test_group_session_routing_counts_only_inflight_generations(
         srv._call_client_create(create_fn, {}, "busy", stream=True)
     )
     await asyncio.wait_for(started.wait(), timeout=1)
-    assert srv._backend_inflight_requests == {remote.addresses[0]: 1}
+    # The proxy can be preparing a VLM prompt without occupying an inference
+    # server. Only the actual backend request should influence placement.
+    assert remote.inflight_generation_counts() == {}
 
-    async with _client() as client:
-        response = await client.post(
-            "/rl/start_session",
-            headers=_admin_headers(),
-            json={
-                "task_id": "new",
-                "sample_idx": 0,
-                "processor_cache_group_size": 2,
-            },
-        )
+    with remote._track_inflight_generation(remote.addresses[0]):
+        async with _client() as client:
+            response = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={
+                    "task_id": "new",
+                    "sample_idx": 0,
+                    "processor_cache_group_size": 2,
+                },
+            )
     assert response.status_code == 200
     assert (
         srv._session_cache[response.json()["session_id"]].backend_address
@@ -388,7 +390,7 @@ async def test_group_session_routing_counts_only_inflight_generations(
                 await task
         else:
             assert await task == remote.addresses[0]
-    assert srv._backend_inflight_requests == {}
+    assert remote.inflight_generation_counts() == {}
 
 
 @pytest.mark.asyncio
