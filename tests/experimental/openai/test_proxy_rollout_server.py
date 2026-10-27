@@ -269,6 +269,63 @@ def test_group_sample_fanout_preserves_prefix_locality(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_group_sessions_rebalance_around_active_sessions(monkeypatch):
+    config = InferenceEngineConfig(load_balance_policy="least_groups")
+    remote = RemoteInfEngine(config, backend=MagicMock())
+    remote.addresses = ["node-a:30000", "node-a:30001"]
+    monkeypatch.setattr(srv, "_engine", SimpleNamespace(config=config, _engine=remote))
+    monkeypatch.setattr(srv, "_capacity", 4)
+    for idx in range(2):
+        sid = f"older-{idx}"
+        srv._session_cache[sid] = SessionData(
+            session_id=sid, backend_address=remote.addresses[0]
+        )
+
+    async with _client() as client:
+        selected = []
+        for sample_idx in range(2):
+            response = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={
+                    "task_id": f"new-{sample_idx}",
+                    "sample_idx": sample_idx,
+                    "processor_cache_group_size": 2,
+                },
+            )
+            assert response.status_code == 200
+            selected.append(
+                srv._session_cache[response.json()["session_id"]].backend_address
+            )
+
+        assert selected == [remote.addresses[1], remote.addresses[1]]
+        for idx in range(2):
+            srv._session_cache[f"older-{idx}"].finish()
+
+        for sample_idx in range(2, 4):
+            response = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={
+                    "task_id": f"new-{sample_idx}",
+                    "sample_idx": sample_idx,
+                    "processor_cache_group_size": 2,
+                },
+            )
+            assert response.status_code == 200
+            selected.append(
+                srv._session_cache[response.json()["session_id"]].backend_address
+            )
+
+    assert selected == [
+        remote.addresses[1],
+        remote.addresses[1],
+        remote.addresses[0],
+        remote.addresses[0],
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tensor_payload", [False, True])
 async def test_export_restores_session_and_interaction_metadata(
     monkeypatch, tensor_payload

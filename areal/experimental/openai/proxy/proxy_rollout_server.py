@@ -583,7 +583,11 @@ def _cleanup_stale_sessions():
 
 
 def _session_backend_address(sample_idx: int | None, group_size: int) -> str | None:
-    """Choose one backend for all turns of a grouped proxy session."""
+    """Choose the least occupied backend for a grouped proxy session.
+
+    Call this under ``_lock`` so concurrent session starts see each other's
+    placements. Ties retain the sample-index spread within the group.
+    """
     if (
         _engine is None
         or getattr(_engine.config, "routing_strategy", None) != "least_active_groups"
@@ -595,7 +599,16 @@ def _session_backend_address(sample_idx: int | None, group_size: int) -> str | N
     # The controller supplies an ordered node-local or global pool. Limit
     # fanout to the group size so siblings can still reuse common prefixes.
     fanout = max(1, min(group_size, len(remote_engine.addresses)))
-    return remote_engine.addresses[(sample_idx or 0) % fanout]
+    candidates = remote_engine.addresses[:fanout]
+    active = {address: 0 for address in candidates}
+    for session in _session_cache.values():
+        if not session.is_completed and session.backend_address in active:
+            active[session.backend_address] += 1
+    preferred = (sample_idx or 0) % fanout
+    return min(
+        enumerate(candidates),
+        key=lambda item: (active[item[1]], (item[0] - preferred) % fanout),
+    )[1]
 
 
 @app.post(f"/{RL_START_SESSION_PATHNAME}", dependencies=[Depends(_require_admin_key)])
@@ -609,9 +622,6 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
     """
     global _capacity
     task_id = request.task_id
-    backend_address = _session_backend_address(
-        request.sample_idx, request.processor_cache_group_size
-    )
 
     if (
         request.processor_cache_group_id is not None
@@ -631,6 +641,10 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
                 status_code=429,
                 detail="No available capacity to start a new session",
             )
+
+        backend_address = _session_backend_address(
+            request.sample_idx, request.processor_cache_group_size
+        )
 
         # Generate unique session ID
         idx = 0
