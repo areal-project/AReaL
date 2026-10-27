@@ -30,8 +30,6 @@ from areal.infra.workflow_executor import (
     WorkflowContractFailure,
 )
 from areal.utils.hf_utils import load_hf_tokenizer
-from areal.utils.rollout_metrics import capture_metrics
-from areal.utils.stats_tracker import DistributedStatsTracker
 
 
 def create_test_config(backend="sglang:d2", **kwargs):
@@ -1544,35 +1542,23 @@ class TestRolloutControllerExportStats:
         controller.destroy()
 
     def test_export_stats_includes_consumed_rejected_samples_once(self):
-        """Controller keeps generated and dequeued reward windows separate."""
+        """Controller exports the pre-filter denominator as a visible count."""
         controller = RolloutController(
             inf_engine=MockInferenceEngine,
             config=create_test_config(),
             scheduler=MockScheduler(),
         )
-        controller._collective_rpc = Mock(
-            return_value=[{"rollout/reward": 0.5, "rollout/reward__count": 2}]
+        controller._collective_rpc = Mock(return_value=[{}])
+        controller.consumed_metrics.consume(
+            _RolloutResult(0, {}, {"rollout/reward": [1.0, 1.0]})
         )
         controller.consumed_metrics.consume(
-            _RolloutResult(0, {}, {"rollout/consumed_reward": [1.0, 1.0]})
-        )
-        controller.consumed_metrics.consume(
-            _RolloutResult(1, None, {"rollout/consumed_reward": [0.0]})
+            _RolloutResult(1, None, {"rollout/reward": [0.0]})
         )
         stats = controller.export_stats()
-        assert stats["rollout/reward"] == pytest.approx(0.5)
-        assert stats["rollout/consumed_reward"] == pytest.approx(2 / 3)
-        assert stats["rollout/consumed_reward_sample_count"] == 3
-        assert controller.export_stats() == {"rollout/reward": 0.5}
-
-    def test_reward_capture_keeps_generation_side_metric(self):
-        tracker = DistributedStatsTracker("rollout")
-        with capture_metrics() as captured:
-            tracker.scalar(reward=1.0)
-            tracker.scalar(reward=0.0)
-
-        assert tracker.stats["rollout/reward"] == [1.0, 0.0]
-        assert captured == {"rollout/consumed_reward": [1.0, 0.0]}
+        assert stats["rollout/reward"] == pytest.approx(2 / 3)
+        assert stats["rollout/reward_sample_count"] == 3
+        assert controller.export_stats() == {}
 
 
 class TestRolloutControllerRolloutStats:
