@@ -163,6 +163,28 @@ def _build_tool_call(
     )
 
 
+def _escape_invalid_tool_json(text: str) -> str:
+    """Preserve literal backslashes in otherwise complete tool-call JSON."""
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as exc:
+        if exc.msg != "Invalid \\escape":
+            return text
+        escaped = re.sub(
+            r"\\(.)",
+            lambda match: match[0] if match[1] in '"\\/bfnrtu' else "\\" + match[0],
+            text,
+            flags=re.DOTALL,
+        )
+        try:
+            json.loads(escaped)
+        except json.JSONDecodeError:
+            return text
+        logger.warning("Escaped invalid JSON backslashes in a tool call")
+        return escaped
+    return text
+
+
 def _process_tool_calls_qwen3_coder_xml(
     text: str,
     tools: list[Any],
@@ -304,6 +326,13 @@ def _process_tool_calls_sglang(
         if finish_reason == "stop":
             finish_reason = "tool_calls"
         try:
+            if tool_call_parser in {"qwen", "qwen25"}:
+                content_text = _QWEN3_CODER_TOOL_CALL_RE.sub(
+                    lambda match: match[0].replace(
+                        match["body"], _escape_invalid_tool_json(match["body"]), 1
+                    ),
+                    content_text,
+                )
             content_text, call_info_list = parser_p.parse_non_stream(content_text)
 
             if use_responses:

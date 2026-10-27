@@ -148,6 +148,51 @@ def _run_process_tool_calls(text: str):
     )
 
 
+def test_tool_json_invalid_escapes_preserve_literal_backslashes():
+    arguments = r'{"code":"# angle 90^\circ; existing \\circ; newline\n"}'
+
+    escaped = parser_module._escape_invalid_tool_json(arguments)
+
+    assert json.loads(escaped) == {
+        "code": "# angle 90^\\circ; existing \\circ; newline\n"
+    }
+    assert parser_module._escape_invalid_tool_json(escaped) == escaped
+
+
+def test_tool_json_other_syntax_is_not_repaired():
+    text = r'{"code":"90^\circ"'
+
+    assert parser_module._escape_invalid_tool_json(text) == text
+
+
+@pytest.mark.sglang
+@pytest.mark.parametrize("use_responses", [False, True])
+@pytest.mark.parametrize("tool_call_parser", ["qwen", "qwen25"])
+def test_sglang_tool_call_invalid_escape(use_responses, tool_call_parser):
+    pytest.importorskip("sglang.srt.function_call.function_call_parser")
+    text = (
+        "<tool_call>\n"
+        + r'{"name":"search","arguments":{"query":"90^\circ"}}'
+        + "\n</tool_call>"
+    )
+    tools = (
+        [{"type": "function", **tool["function"]} for tool in TOOLS]
+        if use_responses
+        else TOOLS
+    )
+
+    calls, content, finish = parser_module.process_tool_calls(
+        text, tools, tool_call_parser, "", "stop", use_responses
+    )
+
+    assert finish == "tool_calls"
+    assert len(calls) == 1
+    function = calls[0] if use_responses else calls[0].function
+    assert function.name == "search"
+    assert json.loads(function.arguments) == {"query": r"90^\circ"}
+    assert "<tool_call>" not in content
+
+
 def test_process_tool_calls_qwen3_coder_xml_parameters_without_sglang():
     tool_calls, new_text, new_finish_reason = parser_module.process_tool_calls(
         text=QWEN3_CODER_TEXT,
