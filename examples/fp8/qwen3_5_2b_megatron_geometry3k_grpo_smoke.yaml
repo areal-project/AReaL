@@ -1,0 +1,46 @@
+# Two image-conditioned GRPO steps on one Hopper/Blackwell GPU.
+defaults:
+  - qwen3_5_2b_megatron_geometry3k_grpo
+  - _self_
+
+experiment_name: qwen3-5-2b-fp8-geometry3k-smoke
+enable_offload: true
+total_train_steps: 2
+
+cluster:
+  n_gpus_per_node: 1
+
+actor:
+  backend: "megatron:d1p1t1"
+
+rollout:
+  backend: "sglang:d1t1p1"
+  max_concurrent_rollouts: 4
+  scheduling_strategy:
+    type: colocation
+    target: actor
+    fork: true
+  dump_to_file: false
+
+sglang:
+  context_length: 4096
+  max_running_requests: 4
+  mem_fraction_static: 0.5
+
+gconfig:
+  n_samples: 2
+  max_new_tokens: 128
+
+train_dataset:
+  batch_size: 2
+  num_workers: 0
+
+valid_dataset:
+  batch_size: 2
+  num_workers: 0
+
+evaluator:
+  freq_epochs: null
+
+saver:
+  freq_epochs: null
