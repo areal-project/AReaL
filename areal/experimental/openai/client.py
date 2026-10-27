@@ -73,6 +73,7 @@ from areal.utils import logging
 from areal.utils.hf_utils import apply_chat_template
 from areal.utils.qwen_vl_image import (
     prepare_sglang_qwen_images,
+    sglang_image_alignment_enabled,
     sglang_qwen_image_kwargs,
 )
 
@@ -904,6 +905,9 @@ async def _prepare_prompt(
             "available for this rollout model."
         )
     if image_data and processor is not None:
+        # Resolve the switch before looking up cached prompts so disabling
+        # alignment cannot reuse tensors produced by the SGLang policy.
+        align_sglang_images = align_sglang_images and sglang_image_alignment_enabled()
 
         def process_prompt() -> _PreparedPrompt:
             prompt = _process_multimodal_prompt(
@@ -928,6 +932,12 @@ async def _prepare_prompt(
             cache_key = processor_cache.make_key(
                 "openai_multimodal",
                 align_sglang_images,
+                (
+                    os.environ.get("SGLANG_VLM_QWEN_LIMIT_PIXEL", "true"),
+                    os.environ.get("SGLANG_RESIZE_RESAMPLE", ""),
+                )
+                if align_sglang_images
+                else None,
                 id(processor),
                 id(tokenizer),
                 tokenizer_messages,

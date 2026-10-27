@@ -30,6 +30,18 @@
 1. **构建对话树**用于多轮奖励传播
 1. **导出训练就绪的张量**并正确归因奖励
 
+### SGLang 图片预处理
+
+对于支持的 Qwen VLM，OpenAI proxy 默认在准备训练输入时对齐 SGLang 的图片缩放规则。 该行为覆盖 Chat
+Completions、Responses、缓存 prompt 和 concat 历史。 发送给 SGLang 的仍是原始图片字节，不会重新编码。
+
+在 proxy/rollout worker 的环境中设置 `AREAL_VLM_ALIGN_SGLANG=false`，可恢复原来的 Hugging Face
+图片预处理流程。默认值为 `true`，也支持 `1` 和 `0`。 这个开关不会修改 SGLang 的配置，也不会关闭 HF Processor 自身的缩放；
+关闭对齐后，训练和推理使用的图片输入可能不同。
+
+开启对齐时，proxy 和 SGLang 必须使用相同的 `SGLANG_VLM_QWEN_LIMIT_PIXEL` 和 `SGLANG_RESIZE_RESAMPLE`
+设置。这个开关不提供独立的像素预算或 JPEG 质量设置。 请在启动 worker 前设置环境变量，无需修改 YAML。
+
 ## 与 RolloutWorkflow 的关系
 
 代理工作流不是单独的抽象——它们通过 `OpenAIProxyWorkflow` 自动包装为 `RolloutWorkflow`：

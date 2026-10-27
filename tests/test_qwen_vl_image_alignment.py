@@ -13,6 +13,7 @@ from areal.infra.processor_cache import ProcessorCallCache
 from areal.utils.qwen_vl_image import (
     _sglang_image_size,
     prepare_sglang_qwen_images,
+    sglang_image_alignment_enabled,
     sglang_qwen_image_kwargs,
 )
 
@@ -29,10 +30,51 @@ class Qwen3VLProcessor:
 
 @pytest.fixture
 def aligned_processor(monkeypatch, tmp_path):
+    monkeypatch.delenv("AREAL_VLM_ALIGN_SGLANG", raising=False)
     monkeypatch.delenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", raising=False)
     monkeypatch.delenv("SGLANG_RESIZE_RESAMPLE", raising=False)
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
     return Qwen3VLProcessor(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, True),
+        ("true", True),
+        (" TRUE ", True),
+        ("1", True),
+        ("yes", True),
+        ("y", True),
+        ("false", False),
+        (" FALSE ", False),
+        ("0", False),
+        ("no", False),
+        ("n", False),
+    ],
+)
+def test_alignment_switch_accepts_boolean_values(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("AREAL_VLM_ALIGN_SGLANG", raising=False)
+    else:
+        monkeypatch.setenv("AREAL_VLM_ALIGN_SGLANG", value)
+    assert sglang_image_alignment_enabled() is expected
+
+
+@pytest.mark.parametrize("value", ["", "treu", "2"])
+def test_alignment_switch_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("AREAL_VLM_ALIGN_SGLANG", value)
+    with pytest.raises(ValueError, match="AREAL_VLM_ALIGN_SGLANG"):
+        sglang_image_alignment_enabled()
+
+
+def test_disabled_alignment_keeps_sglang_metadata_policy(
+    aligned_processor, monkeypatch
+):
+    monkeypatch.setenv("AREAL_VLM_ALIGN_SGLANG", "false")
+    assert not sglang_image_alignment_enabled()
+    assert sglang_qwen_image_kwargs(aligned_processor) is not None
+    assert aligned_processor.image_processor.size["longest_edge"] == 16777216
 
 
 @pytest.mark.parametrize(

@@ -37,6 +37,24 @@ don't expose token IDs and log probabilities. AReaL solves this by:
 1. **Building conversation trees** for multi-turn reward propagation
 1. **Exporting training-ready tensors** with proper reward attribution
 
+### SGLang image preprocessing
+
+For supported Qwen VLMs, the OpenAI proxy follows SGLang's image resizing by default
+when preparing training inputs. This applies to Chat Completions and Responses,
+including cached prompts and concat history. Original image bytes are forwarded to
+SGLang without re-encoding.
+
+Set `AREAL_VLM_ALIGN_SGLANG=false` in the proxy/rollout worker environment to use the
+original Hugging Face image preprocessing instead. The default is `true`; `1` and `0`
+are also accepted. This switch does not change SGLang's settings or disable the HF
+processor's own resizing. Disabling alignment can produce different training and
+inference image inputs.
+
+When alignment is enabled, the proxy and SGLang must use the same
+`SGLANG_VLM_QWEN_LIMIT_PIXEL` and `SGLANG_RESIZE_RESAMPLE` settings. This switch does
+not provide an independent pixel budget or JPEG quality setting. Set these variables
+before starting workers; no YAML change is required.
+
 ## Relationship with RolloutWorkflow
 
 Agent workflows are not a separate abstraction—they are automatically wrapped into

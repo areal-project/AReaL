@@ -18,6 +18,7 @@ from areal.experimental.openai.client import (
     _prepare_prompt,
 )
 from areal.infra.processor_cache import ProcessorCallCache
+from areal.utils.sglang_image import IMAGE_SPANS_KEY, image_request_kwargs
 
 
 class Qwen3VLProcessor:
@@ -25,6 +26,7 @@ class Qwen3VLProcessor:
 
     def __init__(self, model_path):
         self.tokenizer = SimpleNamespace(name_or_path=str(model_path))
+        self.image_token_id = 3
         self.image_processor = SimpleNamespace(
             patch_size=16,
             merge_size=2,
@@ -47,7 +49,10 @@ class Qwen3VLProcessor:
 
 
 @pytest.fixture
-def processor(tmp_path):
+def processor(tmp_path, monkeypatch):
+    monkeypatch.delenv("AREAL_VLM_ALIGN_SGLANG", raising=False)
+    monkeypatch.delenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", raising=False)
+    monkeypatch.delenv("SGLANG_RESIZE_RESAMPLE", raising=False)
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
     return Qwen3VLProcessor(tmp_path)
 
@@ -81,9 +86,23 @@ async def test_cached_prompt_keeps_wire_images_with_training_tensors(
         first = await _prepare_prompt(**kwargs)
         second = await _prepare_prompt(**kwargs)
         unaligned = await _prepare_prompt(**{**kwargs, "align_sglang_images": False})
+        monkeypatch.setenv("AREAL_VLM_ALIGN_SGLANG", "false")
+        disabled = await _prepare_prompt(**kwargs)
+        monkeypatch.setenv("AREAL_VLM_ALIGN_SGLANG", "true")
+        reenabled = await _prepare_prompt(**kwargs)
 
     assert processor.calls == 2
     assert unaligned.image_data is None
+    assert disabled.image_data is None
+    assert reenabled.image_data == first.image_data
+    assert (
+        disabled.multi_modal_input["pixel_values"]
+        is unaligned.multi_modal_input["pixel_values"]
+    )
+    assert (
+        reenabled.multi_modal_input["pixel_values"]
+        is first.multi_modal_input["pixel_values"]
+    )
     assert unaligned.multi_modal_input["pixel_values"].shape == (1200, 1600, 3)
     assert first.image_data == second.image_data
     assert first.image_data is not second.image_data
@@ -107,10 +126,22 @@ async def test_cached_prompt_keeps_wire_images_with_training_tensors(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api", ["chat", "responses"])
 @pytest.mark.parametrize("backend", ["sglang", "vllm"])
-async def test_create_forwards_images_for_backend(monkeypatch, api, backend, processor):
+@pytest.mark.parametrize("alignment", [None, "false"])
+async def test_create_forwards_images_for_backend(
+    monkeypatch, api, backend, alignment, processor
+):
+    if alignment is not None:
+        monkeypatch.setenv("AREAL_VLM_ALIGN_SGLANG", alignment)
     monkeypatch.delenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", raising=False)
     tokenizer = MagicMock(eos_token_id=2, pad_token_id=0)
     tokenizer.decode.return_value = "done"
+    tokenizer.convert_tokens_to_ids.side_effect = {
+        "<|image_pad|>": 3,
+        "<|video_pad|>": 4,
+        "<|vision_start|>": 5,
+        "<|vision_end|>": 6,
+    }.get
+    processor.tokenizer.convert_tokens_to_ids = tokenizer.convert_tokens_to_ids
     requests = []
 
     class Engine:
@@ -167,12 +198,21 @@ async def test_create_forwards_images_for_backend(monkeypatch, api, backend, pro
                 )
         assert len(requests) == 1
         request = requests[0]
+        # A sampled image_pad is text, even when resize alignment is disabled.
+        # Retain real-image provenance so SGLang can distinguish the two.
+        assert request.metadata[IMAGE_SPANS_KEY] == [[2, 2]]
         if backend == "sglang":
+            wire = image_request_kwargs(request, accumulated_tokens=[3])
+            assert wire["input_ids"] == request.input_ids + [3]
+            assert wire["mm_sampling_kwargs"][IMAGE_SPANS_KEY] == [[2, 2]]
+        if backend == "sglang" and alignment != "false":
             assert request.image_data == [original]
             expected_size = (1152, 864)
+            assert processor.image_kwargs[0]["size"]["longest_edge"] == 1048576
         else:
             assert request.image_data == [original]
             expected_size = (1600, 1200)
+            assert processor.image_kwargs[0] is None
         with Image.open(
             BytesIO(base64.b64decode(request.image_data[0].split(",", 1)[1]))
         ) as wire:
@@ -187,6 +227,60 @@ async def test_create_forwards_images_for_backend(monkeypatch, api, backend, pro
             )
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_cached_prompt_respects_sglang_pixel_and_resampling_settings(
+    monkeypatch, processor
+):
+    """A policy change cannot reuse a prompt from a different resize policy."""
+    buffer = BytesIO()
+    image = Image.fromarray(
+        np.random.default_rng(0).integers(0, 256, (1200, 1600, 3), dtype=np.uint8)
+    )
+    image.save(buffer, format="PNG")
+    cache = ProcessorCallCache()
+    kwargs = dict(
+        processor=processor,
+        tokenizer=SimpleNamespace(eos_token_id=2),
+        tokenizer_messages=[],
+        concat_messages=[],
+        image_data=[base64.b64encode(buffer.getvalue()).decode()],
+        parent=None,
+        chat_template_type="hf",
+        tools=None,
+        extra_body={},
+        processor_cache=cache,
+        align_sglang_images=True,
+    )
+    try:
+        with patch(
+            "areal.experimental.openai.client.apply_chat_template",
+            return_value="prompt",
+        ):
+            first = await _prepare_prompt(**kwargs)
+            monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", "false")
+            full_budget = await _prepare_prompt(**kwargs)
+            monkeypatch.delenv("SGLANG_VLM_QWEN_LIMIT_PIXEL")
+            monkeypatch.setenv("SGLANG_RESIZE_RESAMPLE", "NEAREST")
+            nearest = await _prepare_prompt(**kwargs)
+            repeated = await _prepare_prompt(**kwargs)
+
+        assert processor.calls == 3
+        assert first.multi_modal_input["pixel_values"].shape == (864, 1152, 3)
+        assert full_budget.multi_modal_input["pixel_values"].shape == (1216, 1600, 3)
+        assert nearest.multi_modal_input["pixel_values"].shape == (864, 1152, 3)
+        assert not torch.equal(
+            first.multi_modal_input["pixel_values"],
+            nearest.multi_modal_input["pixel_values"],
+        )
+        assert (
+            repeated.multi_modal_input["pixel_values"]
+            is nearest.multi_modal_input["pixel_values"]
+        )
+        assert first.image_data == full_budget.image_data == nearest.image_data
+    finally:
+        cache.close()
 
 
 @pytest.mark.asyncio

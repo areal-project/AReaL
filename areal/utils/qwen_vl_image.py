@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Follow SGLang's CPU/PIL Qwen image pipeline without changing wire images."""
+"""Follow SGLang's CPU/PIL Qwen image pipeline without changing wire images.
+
+``AREAL_VLM_ALIGN_SGLANG`` defaults to true. Set it to false to use the
+original HF image preprocessing in the OpenAI proxy. This does not change
+SGLang's image settings or disable the HF processor's own resizing.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +18,16 @@ if TYPE_CHECKING:
     from PIL.Image import Image
 
     from areal.infra.processor_cache import ProcessorCallCache
+
+
+def sglang_image_alignment_enabled() -> bool:
+    """Read the AReaL image-alignment switch without changing server settings."""
+    value = os.environ.get("AREAL_VLM_ALIGN_SGLANG", "true").strip().lower()
+    if value not in ("true", "false", "1", "0", "yes", "no", "y", "n"):
+        raise ValueError(
+            "Invalid AREAL_VLM_ALIGN_SGLANG boolean value; use true or false"
+        )
+    return value in ("true", "1", "yes", "y")
 
 
 @lru_cache(maxsize=8)
@@ -95,6 +110,8 @@ def sglang_qwen_image_kwargs(processor: Any) -> dict[str, Any] | None:
     SGLang reduces its own processor's maximum once at startup. The proxy keeps
     its shared processor unchanged and passes the effective bounds per call,
     so repeated requests cannot apply the pixel reduction more than once.
+    This describes SGLang's policy independently of AREAL_VLM_ALIGN_SGLANG:
+    callers also use it to recognize models requiring real-image metadata.
     """
     policy = _image_policy(processor)
     if policy is None:
