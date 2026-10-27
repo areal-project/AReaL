@@ -25,12 +25,11 @@ files.
    `QWEN_REPO` identifies the local source checkout; it does not have to be clean.
 
 1. Set a new experiment/trial and shared run directory. `QWEN_RUN_DIR` stores the
-   config, reward mapping, and reports. `QWEN_OUTPUT_ROOT` defaults to
-   `/storage/openpsi/experiments`; logs and checkpoints use
+   config, reward mapping, and reports. Set `QWEN_OUTPUT_ROOT` to a shared directory
+   visible to every role; logs and checkpoints use
    `logs/<user>/<experiment_name>/<trial_name>/` and
    `checkpoints/<user>/<experiment_name>/<trial_name>/`. The submitting user is
-   preserved in these paths even though submission uses `sudo`, as in the previous sxj
-   wrapper.
+   preserved in these paths even though submission uses `sudo`.
 
 1. Run from the local checkout:
 

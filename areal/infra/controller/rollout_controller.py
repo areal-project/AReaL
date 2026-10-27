@@ -1549,7 +1549,11 @@ class RolloutController:
                 k: v
                 for k, v in consumed.items()
                 if k.endswith("__count")
-                or k in {"rollout/reward_sample_count", "rollout/group_attempt_count"}
+                or k
+                in {
+                    "rollout/consumed_reward_sample_count",
+                    "rollout/group_attempt_count",
+                }
             }
         )
         return merged
