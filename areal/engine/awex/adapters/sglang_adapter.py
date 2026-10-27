@@ -651,8 +651,36 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         ):
             raise RuntimeError("Qwen4Exp metadata requires matching frozen contracts")
         if self._legacy_infer_params_meta is None:
+            fp8_policy = self._configure_qwen35_fp8()
             self._legacy_infer_params_meta = self._build_legacy_instance_params_meta()
+            if fp8_policy is not None:
+                fp8_policy.validate_metadata(self._legacy_infer_params_meta)
         return self._legacy_infer_params_meta
+
+    def _configure_qwen35_fp8(self):
+        from areal.engine.awex.qwen3_5_fp8 import Qwen35FP8Policy
+
+        if self._get_model_arch_name() not in Qwen35FP8Policy.architectures:
+            return None
+        policy = Qwen35FP8Policy.from_config(self._get_awex_hf_config())
+        if policy is not None:
+            if self._dte_config.enabled:
+                raise ValueError(
+                    "Qwen3.5 FP8 AWEX requires full weight transfer; disable DTE delta transfer"
+                )
+            policy.validate_runtime(self._get_model(), self._scheduler.server_args)
+            policy.register_awex()
+            converter = self._get_weight_converter(self._build_rank_info())
+            for name, parameter in self._get_model().named_parameters():
+                for canonical, tensor in converter.convert_param(name, parameter.data):
+                    if canonical.endswith("_scale_inv"):
+                        continue
+                    expected_fp8 = policy.quantizes(canonical)
+                    if expected_fp8 != (tensor.dtype == torch.float8_e4m3fn):
+                        raise ValueError(
+                            f"Qwen3.5 AWEX precision mismatch for {canonical}: got {tensor.dtype}, FP8 expected={expected_fp8}"
+                        )
+        return policy
 
     def get_weight_metadata(self, parameter_layout: str = "hf") -> list[ParameterMeta]:
         if self._legacy_engine_rank is not None:
@@ -665,6 +693,9 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 f"{self._parameter_layout}, got {parameter_layout}"
             )
         self._parameter_layout = parameter_layout
+        fp8_policy = self._configure_qwen35_fp8()
+        if fp8_policy is not None and parameter_layout != "awex":
+            raise ValueError("Qwen3.5 FP8 requires the native AWEX parameter layout")
         rank_info = self._build_rank_info()
         strategy = self._build_sharding_strategy(rank_info)
         self._rank_info = rank_info
@@ -738,6 +769,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 )
             )
 
+        if fp8_policy is not None:
+            fp8_policy.validate_metadata(metadata)
         return metadata
 
     def get_local_shard_parameters(
