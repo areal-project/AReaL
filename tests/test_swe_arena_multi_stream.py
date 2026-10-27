@@ -52,6 +52,7 @@ def test_load_arena_stream_configs_preserves_reward_specs(tmp_path, source):
             },
             "reward_threshold": 0.98,
             "reward_transform_fn": "examples.swe.reward_transforms.astra_partial_reward",
+            "dataset_snapshot_file": " /snapshots/astra.json ",
         },
         {
             "name": "tbench",
@@ -81,6 +82,8 @@ def test_load_arena_stream_configs_preserves_reward_specs(tmp_path, source):
     )
     assert streams[0].task_envs == {"COMMON": "1"}
     assert streams[1].reward_transform_fn == ""
+    assert streams[0].dataset_snapshot_file == "/snapshots/astra.json"
+    assert streams[1].dataset_snapshot_file == ""
 
 
 @pytest.mark.parametrize("source", ["file", "base64"])

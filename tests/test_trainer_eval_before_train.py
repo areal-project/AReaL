@@ -435,7 +435,7 @@ def test_initial_eval_stats_use_step_zero_before_first_update(monkeypatch):
     monkeypatch.setattr(
         stats_logger_module.wandb,
         "log",
-        lambda _data, *, step: logged_steps.append(step),
+        lambda _data, *, step, commit=None: logged_steps.append(step),
     )
     monkeypatch.setattr(
         stats_logger_module.swanlab,

@@ -116,6 +116,9 @@ def parse_arena_stream_config(value: Any) -> ArenaStreamConfig:
         raw.get("expected_reward_ref"), stream_name=name
     )
     reward_mapping_file = str(raw.get("reward_mapping_file") or "").strip()
+    dataset_snapshot_file = raw.get("dataset_snapshot_file", "")
+    if not isinstance(dataset_snapshot_file, str):
+        raise ValueError("dataset_snapshot_file must be a path string")
     if reward_mapping_file and expected_reward_ref.key:
         raise ValueError(
             "reward_mapping_file and expected_reward_ref are mutually exclusive"
@@ -130,6 +133,7 @@ def parse_arena_stream_config(value: Any) -> ArenaStreamConfig:
         task_envs=dict(task_envs),
         expected_reward_ref=expected_reward_ref,
         reward_mapping_file=reward_mapping_file,
+        dataset_snapshot_file=dataset_snapshot_file.strip(),
         reward_threshold=threshold,
         reward_transform_fn=str(raw.get("reward_transform_fn") or "").strip(),
     )

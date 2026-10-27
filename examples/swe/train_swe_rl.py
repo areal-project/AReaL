@@ -20,6 +20,7 @@ from examples.swe.arena_config import (
     build_weighted_arena_rows,
     load_arena_stream_configs,
 )
+from examples.swe.arena_dataset_snapshot import load_arena_dataset_snapshot
 from examples.swe.arena_reward_mapping import (
     load_harness_mapping,
     prepare_reward_mapping,
@@ -157,7 +158,16 @@ def _resolve_arena_stream(
             else actual_reward_ref
         ),
     )
-    rows = client.get_all_dataset_rows(resolved_stream_id, llm_protocol)
+    rows = (
+        load_arena_dataset_snapshot(
+            client,
+            configured.dataset_snapshot_file,
+            resolved_stream_id,
+            llm_protocol,
+        )
+        if configured.dataset_snapshot_file
+        else client.get_all_dataset_rows(resolved_stream_id, llm_protocol)
+    )
     mapping = (
         prepare_reward_mapping(
             client,

@@ -488,6 +488,17 @@ def _arena_task_type(data: dict[str, Any]) -> str:
     return arena_task_type.strip()
 
 
+class _ArenaTaskWaitTimeout(TimeoutError):
+    """The local result deadline expired after a confirmed Arena task launch."""
+
+    def __init__(self, task_id: str, timeout_seconds: float) -> None:
+        self.task_id = task_id
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            f"Arena task {task_id} exceeded local wait of {timeout_seconds}s"
+        )
+
+
 class ArenaStreamAgentWorkflow:
     """Launch an Arena online task and use its returned reward for RL."""
 
@@ -1338,14 +1349,16 @@ class ArenaStreamAgentWorkflow:
 
     def should_reject_failed_sample(self, error: Exception, disposition: str) -> bool:
         """Drop a failed Arena sample while retaining healthy group siblings."""
-        if not self.reject_terminal_task_failures or not isinstance(
-            error, ArenaTaskFailedError
-        ):
+        if not self.reject_terminal_task_failures:
             return False
-        # Setup and grader failures leave this task unscored without
+        if isinstance(error, _ArenaTaskWaitTimeout):
+            return disposition == "system_failure_reject"
+        if not isinstance(error, ArenaTaskFailedError):
+            return False
+        # Setup, collection, and grader failures leave this task unscored without
         # invalidating healthy siblings. Proxy service errors are still
         # propagated by OpenAIProxyWorkflow before applying this hook.
-        if error.status in {"SETUP_FAILED", "EVAL_FAILED"}:
+        if error.status in {"SETUP_FAILED", "COLLECT_FAILED", "EVAL_FAILED"}:
             return disposition == "system_failure_reject"
         return (
             error.status in {"HARNESS_FAILED", "NO_OUTPUT", "TIMEOUT"}
@@ -1803,9 +1816,10 @@ class ArenaStreamAgentWorkflow:
             if stream_config.reward_mapping_file:
                 ref = self._expected_reward_ref(data, stream_config)
                 reward_kwargs["reward"] = f"{ref.key}@{ref.version}"
+            task_deadline = asyncio.timeout(self.timeout)
             try:
-                task_result_or_score = await asyncio.wait_for(
-                    self.client.launch_one_task_result(
+                async with task_deadline:
+                    task_result_or_score = await self.client.launch_one_task_result(
                         stream_id=stream_id,
                         data_id=data_id,
                         model_name=registered_model_id,
@@ -1819,9 +1833,7 @@ class ArenaStreamAgentWorkflow:
                         client=client,
                         on_launch_success=record_launch_success,
                         **reward_kwargs,
-                    ),
-                    timeout=self.timeout,
-                )
+                    )
             except ArenaTaskFailedError as exc:
                 _record_arena_metrics(**{"arena/terminal_success": 0.0})
                 _record_arena_metrics(**{"arena/call_success": 0.0})
@@ -1882,7 +1894,16 @@ class ArenaStreamAgentWorkflow:
                     data_id,
                 )
                 raise
-            except (TimeoutError, asyncio.TimeoutError) as exc:  # noqa: UP041
+            except TimeoutError as exc:
+                if launch_recorded:
+                    _record_arena_metrics(**{"arena/terminal_success": 0.0})
+                else:
+                    _record_arena_metrics(**{"arena/launch_success": 0.0})
+                _record_arena_metrics(**{"arena/call_success": 0.0})
+                # An inner client timeout can also arrive after launch. Only
+                # our own expired deadline identifies a sample-local failure.
+                if not task_deadline.expired():
+                    raise
                 await audit_incomplete_task("LOCAL_WAIT_TIMEOUT")
                 logger.warning(
                     "Arena task wait timed out: task_id=%s data_id=%s "
@@ -1891,12 +1912,9 @@ class ArenaStreamAgentWorkflow:
                     data_id,
                     self.timeout,
                 )
-                if launch_recorded:
-                    _record_arena_metrics(**{"arena/terminal_success": 0.0})
-                else:
-                    _record_arena_metrics(**{"arena/launch_success": 0.0})
-                _record_arena_metrics(**{"arena/call_success": 0.0})
-                raise TimeoutError from exc
+                if launch_recorded and launched_task_id:
+                    raise _ArenaTaskWaitTimeout(launched_task_id, self.timeout) from exc
+                raise
             except Exception:
                 if launch_recorded:
                     _record_arena_metrics(**{"arena/terminal_success": 0.0})

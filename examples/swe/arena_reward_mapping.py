@@ -180,13 +180,16 @@ def prepare_reward_mapping(
         raise ArenaAPIError("Arena Harness mapping must cover every data_id")
     # A frozen snapshot must not silently drop or contradict declared Stream pins.
     for data_id, binding in bindings.items():
-        if _binding_ref(binding.get("reward_ref")) != mapping[data_id]:
+        reward = binding.get("reward_ref")
+        if reward is not None and _binding_ref(reward) != mapping[data_id]:
             raise ArenaAPIError(f"Frozen Arena reward binding mismatch for {data_id!r}")
-        ref = _binding_ref(binding.get("harness_ref"))
-        if harnesses.get(data_id) != f"{ref.key}@{ref.version}":
-            raise ArenaAPIError(
-                f"Frozen Arena Harness binding mismatch for {data_id!r}"
-            )
+        harness = binding.get("harness_ref")
+        if harness is not None:
+            ref = _binding_ref(harness)
+            if harnesses.get(data_id) != f"{ref.key}@{ref.version}":
+                raise ArenaAPIError(
+                    f"Frozen Arena Harness binding mismatch for {data_id!r}"
+                )
     for harness in sorted(set(harnesses.values())):
         ref = parse_version_ref(harness)
         arena.get_published_version("harnesses", ref.key, ref.version, client=client)

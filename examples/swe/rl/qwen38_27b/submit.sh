@@ -17,10 +17,17 @@ if [[ ${1:-} != --from-snapshot ]]; then
   local_repo=${QWEN_REPO:-$(cd "$recipe_dir/../../../.." && pwd)}
   : "${QWEN_RUN_DIR:?Set the run directory in site.env}"
   : "${QWEN_OUTPUT_ROOT:?Set the output root in site.env}"
+  checkout_root=$(realpath "$local_repo")
+  for output_dir in "$QWEN_RUN_DIR" "$QWEN_OUTPUT_ROOT"; do
+    case "$(realpath -m "$output_dir")/" in
+      "$checkout_root/"*) echo 'Keep run files and output outside the Git checkout' >&2; exit 1 ;;
+    esac
+  done
   snapshot=$(realpath -m "${QWEN_SYNC_DIR:-$QWEN_RUN_DIR/source}")
-  privilege=()
+  # Bash 4.2 treats an empty array as unset under nounset.
+  privilege=(env)
   if (( EUID != 0 )); then
-    privilege=(sudo)
+    privilege=(sudo env)
   fi
   source_revision=$("${privilege[@]}" python3 "$recipe_dir/source_snapshot.py" stage \
     --source "$local_repo" --profile "$QWEN_ENV_FILE" --destination "$snapshot")
@@ -29,7 +36,7 @@ if [[ ${1:-} != --from-snapshot ]]; then
     exit 0
   fi
   # Carry only routing/provenance here. Credentials are read from the staged profile.
-  exec "${privilege[@]}" env \
+  exec "${privilege[@]}" \
     QWEN_ENV_FILE="$snapshot/code/examples/swe/rl/qwen38_27b/site.env" \
     QWEN_SUBMITTED_ENV_FILE="$snapshot/code/examples/swe/rl/qwen38_27b/site.env" \
     QWEN_SUBMITTED_REPO="$snapshot/code" \

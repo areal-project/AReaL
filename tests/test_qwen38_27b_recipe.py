@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,12 +12,34 @@ import yaml
 
 from examples.swe.rl.qwen38_27b.qwen27_actor_worker import _install_cpu_optimizer
 from examples.swe.rl.qwen38_27b.qwen27_train_rl import decorate_dense_controller
+from examples.swe.rl.qwen38_27b.source_snapshot import stage, verify
 
 
 @pytest.fixture
 def submit_env(tmp_path):
     checkout = tmp_path / "checkout"
     checkout.mkdir()
+    recipe = Path("examples/swe/rl/qwen38_27b")
+    shutil.copytree(Path(__file__).parents[1] / recipe, checkout / recipe)
+    (checkout / "areal").mkdir()
+    (checkout / "areal/obsolete.py").touch()
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
     for name in (
         "model/config.json",
         "awex/awex/models/qwen3_5.py",
@@ -33,6 +56,7 @@ def submit_env(tmp_path):
         "AWEX_RUNTIME_ROOT": str(tmp_path / "awex"),
         "QWEN_DENSE_RUNTIME": str(tmp_path / "dense"),
         "QWEN_ARENA_TRIAL": "q27-bs8gs12-1013-1",
+        "QWEN_EXPERIMENT_NAME": "chucai-qwen27-test",
     }
     for key in (
         "QWEN_ACTOR_IMAGE",
@@ -61,13 +85,9 @@ def submit_env(tmp_path):
 
     binaries = tmp_path / "bin"
     binaries.mkdir()
-    git = binaries / "git"
-    git.write_text(
-        f"#!{sys.executable}\nimport os, sys\n"
-        "if 'rev-parse' in sys.argv: print('test-revision')\n"
-        "elif os.getenv('QWEN_TEST_DIRTY'): print(' M tracked.py')\n"
-    )
-    git.chmod(0o700)
+    sudo = binaries / "sudo"
+    sudo.write_text('#!/bin/sh\nexec "$@"\n')
+    sudo.chmod(0o700)
     sbatch = binaries / "sbatch"
     sbatch.write_text(
         f"#!{sys.executable}\nimport json, os, sys\n"
@@ -103,13 +123,21 @@ def test_submit_rejects_output_in_checkout_before_sbatch(submit_env, field):
     assert not Path(env["QWEN_TEST_SBATCH_ARGS"]).exists()
 
 
-def test_submit_rejects_dirty_source_before_sbatch(submit_env):
-    _, env, run = submit_env
-    env["QWEN_TEST_DIRTY"] = "1"
+def test_submit_freezes_local_edits_and_deletions(submit_env):
+    """The snapshot captures local source without changing the checkout."""
+    values, _, run = submit_env
+    checkout = Path(values["QWEN_REPO"])
+    (checkout / "areal/obsolete.py").unlink()
+    (checkout / "areal/new.py").write_text("# local edit\n")
+    (checkout / "scratch.txt").write_text("excluded")
     result = run()
-    assert result.returncode != 0
-    assert "Commit the reviewed source" in result.stderr
-    assert not Path(env["QWEN_TEST_SBATCH_ARGS"]).exists()
+    assert result.returncode == 0, result.stderr
+    code = Path(values["QWEN_RUN_DIR"]) / "source/code"
+    assert (code / "areal/new.py").read_text() == "# local edit\n"
+    assert not (code / "areal/obsolete.py").exists()
+    assert not (code / "scratch.txt").exists()
+    assert not (code / ".git").exists()
+    assert (checkout / "areal/new.py").exists()
 
 
 def test_submit_snapshots_config_and_pins_source(submit_env):
@@ -118,12 +146,69 @@ def test_submit_snapshots_config_and_pins_source(submit_env):
     assert result.returncode == 0, result.stderr
     args = json.loads(Path(env["QWEN_TEST_SBATCH_ARGS"]).read_text())
     assert "--export=ALL" in args
-    assert "--job-name=gray19-q27-bs8gs12-1013-1" in args
+    assert "--job-name=chucai-qwen27-test-q27-bs8gs12-1013-1" in args
     root = Path(values["QWEN_RUN_DIR"])
-    assert (root / "source-revision").read_text().strip() == "test-revision"
+    revision = (root / "source-revision").read_text().strip()
+    assert verify(root / "source", revision) == revision
+    assert (
+        root / "source/code/examples/swe/rl/qwen38_27b/site.env"
+    ).stat().st_mode & 0o777 == 0o600
     assert (root / "train.yaml").exists()
     result = run()
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("change", ["profile", "source", "extra_file"])
+def test_submit_rejects_changed_snapshot_before_sbatch(submit_env, change):
+    """Neither changed inputs nor tampered shared files can overwrite a trial."""
+    values, env, run = submit_env
+    assert run().returncode == 0
+    root = Path(values["QWEN_RUN_DIR"])
+    original = (root / "source/manifest.json").read_bytes()
+    Path(env["QWEN_TEST_SBATCH_ARGS"]).unlink()
+    if change == "profile":
+        values["QWEN_PARTITION"] = "changed"
+    else:
+        relative = (
+            "examples/swe/rl/qwen38_27b/train.yaml"
+            if change == "source"
+            else "unexpected.py"
+        )
+        (root / "source/code" / relative).write_text("changed")
+    result = run()
+    assert result.returncode != 0
+    assert "manifest mismatch" in result.stderr
+    assert (root / "source/manifest.json").read_bytes() == original
+    assert not Path(env["QWEN_TEST_SBATCH_ARGS"]).exists()
+
+
+def test_snapshot_rejects_symlink_escape(submit_env, tmp_path):
+    """Copied code cannot depend on a link outside the frozen directory."""
+    values, _, _ = submit_env
+    source = Path(values["QWEN_REPO"])
+    (tmp_path / "site.env").write_text("QWEN_TEST=1\n")
+    (tmp_path / "outside.py").touch()
+    (source / "areal/escape.py").symlink_to("../../outside.py")
+    with pytest.raises(ValueError, match="symlink escapes"):
+        stage(source, tmp_path / "site.env", tmp_path / "snapshot")
+    assert not (tmp_path / "snapshot").exists()
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_snapshot_rejects_symlink_parent_before_writing(submit_env, tmp_path, external):
+    values, _, _ = submit_env
+    source = Path(values["QWEN_REPO"])
+    profile = tmp_path / "site.env"
+    profile.write_text("QWEN_TEST=1\n")
+    target = (tmp_path if external else source) / "target"
+    shutil.move(source / "areal", target)
+    sentinel = target / "obsolete.py"
+    sentinel.write_text("must remain unchanged\n")
+    (source / "areal").symlink_to("../target" if external else "target")
+    with pytest.raises(ValueError, match="symlink"):
+        stage(source, profile, tmp_path / "snapshot")
+    assert sentinel.read_text() == "must remain unchanged\n"
+    assert not (tmp_path / "snapshot").exists()
 
 
 def test_dense_controller_preserves_native_backends_and_input():
@@ -205,8 +290,10 @@ def test_graybox_config_retains_sampling_cache_and_full_recovery():
         assert config[name]["top_k"] == 100000
     assert config["gconfig"]["n_samples"] == 12
     assert config["gconfig"]["reward_normalization_use_std"] is True
-    assert config["train_dataset"]["batch_size"] == 8
-    assert config["rollout"]["max_concurrent_rollouts"] == 16
+    assert config["train_dataset"]["batch_size"] == 16
+    assert config["rollout"]["consumer_batch_size"] == 16
+    assert config["rollout"]["max_concurrent_rollouts"] == 1500
+    assert config["rollout"]["queue_size"] == 256
     assert config["rollout"]["return_routed_experts"] is False
     assert config["sglang"]["disable_radix_cache"] is False
     assert config["sglang"]["disable_cuda_graph"] is False
