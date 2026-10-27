@@ -1,0 +1,22 @@
+# Four-GPU Dense recipe: training TP=2, inference TP=4, repeated AWEX updates.
+defaults:
+  - qwen3_5_fp8_grpo
+  - _self_
+
+experiment_name: qwen3-5-dense-fp8-grpo-tp
+total_train_steps: 4
+
+cluster:
+  n_gpus_per_node: 4
+
+actor:
+  backend: "megatron:d2p1t2"
+  mb_spec:
+    max_tokens_per_mb: 2048
+
+rollout:
+  backend: "sglang:d1t4p1"
+  max_concurrent_rollouts: 8
+
+train_dataset:
+  batch_size: 8
