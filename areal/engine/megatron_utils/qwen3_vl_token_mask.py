@@ -74,14 +74,15 @@ def install_qwen3_vl_token_mask(
                     return original(self, *args, **kwargs)
                 lookup_ids = visual_lookup_ids(input_ids, types, self)
                 packed_types = None
+                has_visual_grid = False
 
                 def typed_reorganize(*call_args, **call_kwargs):
-                    nonlocal packed_types
+                    nonlocal packed_types, has_visual_grid
                     ids = call_kwargs.get(
                         "input_ids", call_args[0] if call_args else None
                     )
                     if ids is input_ids:
-                        return reorganize(
+                        vision_data, vision_grid, vision_mask = reorganize(
                             **{
                                 **call_kwargs,
                                 "input_ids": lookup_ids,
@@ -89,11 +90,23 @@ def install_qwen3_vl_token_mask(
                                 "video_input_mask": lookup_ids == self.video_token_id,
                             }
                         )
+                        # Bridge creates deepstack features only for a nonempty
+                        # grid. Keep its visual mask absent in the same case.
+                        has_visual_grid = (
+                            vision_grid is not None and vision_grid.shape[0] > 0
+                        )
+                        return (
+                            vision_data,
+                            vision_grid,
+                            vision_mask if has_visual_grid else None,
+                        )
                     # The native forward's second call only consumes the mask
                     # after packing/CP. Reorganizing full image grids using a
                     # CP-local ID subset would also break mixed image/video.
                     if values.get("packed_seq_params") is None:
                         raise ValueError("Unexpected native Qwen-VL visual ID layout")
+                    if not has_visual_grid:
+                        return None, None, None
                     if packed_types is None:
                         mask = values.get("attention_mask")
                         if mask is None:
