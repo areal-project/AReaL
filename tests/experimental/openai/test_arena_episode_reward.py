@@ -280,6 +280,7 @@ async def test_proxy_episode_return_requires_opt_in_and_preserves_prm(
     session.finish()
     monkeypatch.setattr(server_module, "_session_cache", {"episode": session})
     monkeypatch.setattr(server_module, "_prm_runner", Mock() if prm_enabled else None)
+    monkeypatch.setattr(server_module, "_prm_required", prm_enabled)
     scorer = AsyncMock(side_effect=lambda interactions, *args, **kwargs: interactions)
     monkeypatch.setattr(server_module, "_score_prm_branches", scorer)
 
