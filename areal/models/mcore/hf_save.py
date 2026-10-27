@@ -608,7 +608,7 @@ def save_weights_to_hf_with_mbridge_fast(
         for n, p in zip(converted_names, converted_params):
             assert n not in non_expert_sd, n
             non_expert_sd[n] = p.cpu()
-    torch.cuda.empty_cache()
+    current_platform.clear_memory()
     # Split the state dict into shards and save the process's own shard.
     shards = split_state_dict_into_shards(non_expert_sd, n_shards)
 
@@ -763,7 +763,7 @@ def save_weights_to_hf_with_mbridge_fast(
         # Free per-rank tensors before the NCCL metadata gather: comm setup
         # for ep_pp_group needs scratch GPU memory.
         del shards, expert_sd, all_gather_outputs
-        torch.cuda.empty_cache()
+        current_platform.clear_memory()
         ep_pp_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
         weight_map_list = [None for _ in range(dist.get_world_size(ep_pp_group))]
         dist.all_gather_object(

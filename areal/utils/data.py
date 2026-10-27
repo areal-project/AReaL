@@ -399,6 +399,9 @@ def split_and_unpad_tensor(
 
     When traj_seqlens is None and result is a dict with attention_mask,
     seqlens are auto-derived via attention_mask.sum(-1).max() per group.
+    Multimodal lists (``multi_modal_input*``) contain one entry per batch row
+    and are split by trajectory group. Other non-tensor metadata is copied
+    unchanged into each trajectory.
     """
     if result is None:
         return None
@@ -447,6 +450,17 @@ def split_and_unpad_tensor(
                 )
                 for i, s in enumerate(splits):
                     split_result[i][key] = s
+            elif is_multi_modal_key(key) and isinstance(value, list):
+                if len(value) != total:
+                    raise ValueError(
+                        f"{key} must contain {total} batch rows, got {len(value)}"
+                    )
+                offset = 0
+                for i, group_size in enumerate(traj_group_sizes):
+                    split_result[i][key] = copy.deepcopy(
+                        value[offset : offset + group_size]
+                    )
+                    offset += group_size
             else:
                 for i in range(n_trajs):
                     split_result[i][key] = copy.deepcopy(value)

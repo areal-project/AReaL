@@ -9,11 +9,15 @@ from litellm import completion_cost
 from litellm.main import ModelResponse
 from loguru import logger
 from pydantic import BaseModel
-from tau2.data_model.message import Message
+from tau2.data_model.message import Message, ParticipantMessageBase
 from tau2.data_model.simulation import RewardInfo
 from tau2.data_model.tasks import Task
 
+from examples.tau2.message_compat import install_participant_message_validation_patch
+
 from areal.api.cli_args import PPOConfig
+
+install_participant_message_validation_patch(ParticipantMessageBase)
 
 
 @dataclass
