@@ -18,6 +18,17 @@ actor:
   backend: "megatron:d1p1t1"
   path: ${oc.env:MODEL_PATH}
   weight_update_mode: awex
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  prox_logp_method: recompute
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: binary_kl
+    # Initial KPop threshold from gsm8k_kpop; not tuned for Qwen3.5 FP8.
+    upper: 2.0
+    lower: null
   optimizer:
     lr: 1.0e-6
   megatron:
