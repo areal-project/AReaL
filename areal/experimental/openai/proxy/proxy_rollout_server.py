@@ -345,6 +345,16 @@ async def invalid_tool_call_error_response(
     )
 
 
+def _reject_retry_after_invalid_tool_call(session_id: str) -> None:
+    with _lock:
+        invalid_tool_error = _session_invalid_tool_errors.get(session_id)
+    if invalid_tool_error is not None:
+        logger.warning(
+            "Rejecting retry for session %s after invalid tool JSON", session_id
+        )
+        raise InvalidToolCallError(invalid_tool_error)
+
+
 @app.get("/health")
 def health():
     return {
@@ -1181,13 +1191,7 @@ async def chat_completions(
             detail='Proxy server not initialized. Send requests to /create_engine then /call "initialize" first.',
         )
 
-    with _lock:
-        invalid_tool_error = _session_invalid_tool_errors.get(session_id)
-    if invalid_tool_error is not None:
-        logger.warning(
-            "Rejecting retry for session %s after invalid tool JSON", session_id
-        )
-        raise InvalidToolCallError(invalid_tool_error)
+    _reject_retry_after_invalid_tool_call(session_id)
 
     # CompletionCreateParams is a TypedDict (dict subclass), so use dict access.
     is_streaming = request.get("stream") is True
@@ -1447,6 +1451,8 @@ async def anthropic_messages(
             detail='Proxy server not initialized. Send requests to /create_engine then /call "initialize" first.',
         )
 
+    _reject_retry_after_invalid_tool_call(session_id)
+
     # Parse Anthropic request
     anthropic_request = await raw_request.json()
 
@@ -1500,7 +1506,7 @@ async def anthropic_messages(
                     "X-Accel-Buffering": "no",
                 },
             )
-        except HTTPException:
+        except (HTTPException, InvalidToolCallError):
             raise
         except Exception as e:
             # Clean up stream on error during setup
