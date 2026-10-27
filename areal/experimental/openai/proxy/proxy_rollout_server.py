@@ -124,6 +124,9 @@ _prm_runner = None
 # Session management
 _session_cache: dict[str, SessionData] = {}
 _session_invalid_tool_errors: dict[str, str] = {}
+# Count only model calls currently awaiting generation. A session can spend most
+# of its lifetime waiting for tools or the environment instead of using a GPU.
+_backend_inflight_requests: dict[str, int] = {}
 _lock = threading.Lock()
 _capacity = 0
 _last_cleanup_time: float = 0
@@ -583,10 +586,11 @@ def _cleanup_stale_sessions():
 
 
 def _session_backend_address(sample_idx: int | None, group_size: int) -> str | None:
-    """Choose the least occupied backend for a grouped proxy session.
+    """Choose the least busy backend for a grouped proxy session.
 
     Call this under ``_lock`` so concurrent session starts see each other's
-    placements. Ties retain the sample-index spread within the group.
+    placements. In-flight generations take priority over session counts;
+    ties retain the sample-index spread within the group.
     """
     if (
         _engine is None
@@ -607,7 +611,11 @@ def _session_backend_address(sample_idx: int | None, group_size: int) -> str | N
     preferred = (sample_idx or 0) % fanout
     return min(
         enumerate(candidates),
-        key=lambda item: (active[item[1]], (item[0] - preferred) % fanout),
+        key=lambda item: (
+            _backend_inflight_requests.get(item[1], 0),
+            active[item[1]],
+            (item[0] - preferred) % fanout,
+        ),
     )[1]
 
 
@@ -1123,8 +1131,23 @@ async def _call_client_create(
         }
         if supports_processor_cache:
             client_kwargs["processor_cache"] = session_data.processor_cache
-        with use_server_for_session(session_data.backend_address):
-            return await create_fn(**client_kwargs)
+        backend_address = session_data.backend_address
+        if backend_address is not None:
+            with _lock:
+                _backend_inflight_requests[backend_address] = (
+                    _backend_inflight_requests.get(backend_address, 0) + 1
+                )
+        try:
+            with use_server_for_session(backend_address):
+                return await create_fn(**client_kwargs)
+        finally:
+            if backend_address is not None:
+                with _lock:
+                    remaining = _backend_inflight_requests[backend_address] - 1
+                    if remaining:
+                        _backend_inflight_requests[backend_address] = remaining
+                    else:
+                        del _backend_inflight_requests[backend_address]
     except InvalidToolCallError as exc:
         # A streaming response has already sent HTTP 200 by the time the model
         # output can be validated. Poison the session so an SDK retry receives

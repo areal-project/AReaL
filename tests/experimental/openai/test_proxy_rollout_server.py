@@ -173,6 +173,7 @@ async def test_session_generation_defaults_respect_explicit_limits(
 def _reset_server_globals(monkeypatch):
     """Reset all module-level globals before each test."""
     monkeypatch.setattr(srv, "_session_cache", {})
+    monkeypatch.setattr(srv, "_backend_inflight_requests", {})
     monkeypatch.setattr(srv, "_api_key_to_session", {})
     monkeypatch.setattr(srv, "_session_to_api_key", {})
     monkeypatch.setattr(srv, "_capacity", 0)
@@ -323,6 +324,71 @@ async def test_group_sessions_rebalance_around_active_sessions(monkeypatch):
         remote.addresses[0],
         remote.addresses[0],
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+async def test_group_session_routing_counts_only_inflight_generations(
+    monkeypatch, outcome
+):
+    config = InferenceEngineConfig(load_balance_policy="least_groups")
+    remote = RemoteInfEngine(config, backend=MagicMock())
+    remote.addresses = ["node-a:30000", "node-a:30001"]
+    monkeypatch.setattr(srv, "_engine", SimpleNamespace(config=config, _engine=remote))
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_capacity", 1)
+    srv._session_cache["busy"] = SessionData(
+        session_id="busy", backend_address=remote.addresses[0]
+    )
+    for index in range(2):
+        srv._session_cache[f"idle-{index}"] = SessionData(
+            session_id=f"idle-{index}", backend_address=remote.addresses[1]
+        )
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def create_fn(**kwargs):
+        started.set()
+        await release.wait()
+        if outcome == "error":
+            raise ValueError("generation failed")
+        return remote.choose_server()
+
+    task = asyncio.create_task(
+        srv._call_client_create(create_fn, {}, "busy", stream=True)
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert srv._backend_inflight_requests == {remote.addresses[0]: 1}
+
+    async with _client() as client:
+        response = await client.post(
+            "/rl/start_session",
+            headers=_admin_headers(),
+            json={
+                "task_id": "new",
+                "sample_idx": 0,
+                "processor_cache_group_size": 2,
+            },
+        )
+    assert response.status_code == 200
+    assert (
+        srv._session_cache[response.json()["session_id"]].backend_address
+        == remote.addresses[1]
+    )
+
+    if outcome == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        release.set()
+        if outcome == "error":
+            with pytest.raises(Exception, match="generation failed"):
+                await task
+        else:
+            assert await task == remote.addresses[0]
+    assert srv._backend_inflight_requests == {}
 
 
 @pytest.mark.asyncio
