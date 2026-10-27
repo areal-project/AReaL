@@ -648,10 +648,6 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
                 detail="No available capacity to start a new session",
             )
 
-        backend_address = _session_backend_address(
-            request.sample_idx, request.processor_cache_group_size
-        )
-
         # Generate unique session ID
         idx = 0
         while (session_id := f"{task_id}-{idx}") in _session_cache:
@@ -699,7 +695,8 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
             sampling_seed_identity=task_id,
             processor_cache=processor_cache,
             processor_cache_group_id=request.processor_cache_group_id,
-            backend_address=backend_address,
+            routing_sample_idx=request.sample_idx,
+            routing_group_size=request.processor_cache_group_size,
             metadata=request.metadata,
         )
         _session_invalid_tool_errors.pop(session_id, None)
@@ -1129,7 +1126,23 @@ async def _call_client_create(
         }
         if supports_processor_cache:
             client_kwargs["processor_cache"] = session_data.processor_cache
-        with use_server_for_session(session_data.backend_address):
+        backend_address = session_data.backend_address
+        if (
+            backend_address is None
+            and _engine is not None
+            and getattr(_engine.config, "routing_strategy", None)
+            == "least_active_groups"
+        ):
+            with _lock:
+                # Bind once when the first model call arrives; keep later turns
+                # on the same backend to preserve prefix-cache locality.
+                if session_data.backend_address is None:
+                    session_data.backend_address = _session_backend_address(
+                        session_data.routing_sample_idx,
+                        session_data.routing_group_size,
+                    )
+                backend_address = session_data.backend_address
+        with use_server_for_session(backend_address):
             return await create_fn(**client_kwargs)
     except InvalidToolCallError as exc:
         # A streaming response has already sent HTTP 200 by the time the model

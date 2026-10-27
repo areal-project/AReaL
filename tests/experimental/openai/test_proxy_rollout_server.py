@@ -236,7 +236,7 @@ async def test_group_samples_use_distinct_pinned_backends_and_one_processor_cach
             session_ids.append(response.json()["session_id"])
 
     sessions = [srv._session_cache[sid] for sid in session_ids]
-    assert [session.backend_address for session in sessions] == remote.addresses
+    assert all(session.backend_address is None for session in sessions)
     assert sessions[0].processor_cache is sessions[1].processor_cache
     assert sessions[1].processor_cache is sessions[2].processor_cache
 
@@ -254,6 +254,7 @@ async def test_group_samples_use_distinct_pinned_backends_and_one_processor_cach
         assert dict(zip(order, routed, strict=True)) == dict(
             zip(session_ids, remote.addresses, strict=True)
         )
+    assert [session.backend_address for session in sessions] == remote.addresses
     assert remote.choose_server() == remote.addresses[0]
 
 
@@ -269,11 +270,50 @@ def test_group_sample_fanout_preserves_prefix_locality(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_group_session_binds_at_first_generation_with_current_load(monkeypatch):
+    config = InferenceEngineConfig(load_balance_policy="least_groups")
+    remote = RemoteInfEngine(config, backend=MagicMock())
+    remote.addresses = ["node-a:30000", "node-a:30001"]
+    monkeypatch.setattr(srv, "_engine", SimpleNamespace(config=config, _engine=remote))
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_capacity", 1)
+
+    async with _client() as client:
+        response = await client.post(
+            "/rl/start_session",
+            headers=_admin_headers(),
+            json={
+                "task_id": "late-binding",
+                "sample_idx": 0,
+                "processor_cache_group_size": 2,
+            },
+        )
+    assert response.status_code == 200
+    session_id = response.json()["session_id"]
+    session = srv._session_cache[session_id]
+    assert session.backend_address is None
+
+    async def create_fn(**kwargs):
+        return remote.choose_server()
+
+    with remote._track_inflight_generation(remote.addresses[0]):
+        assert (
+            await srv._call_client_create(create_fn, {}, session_id)
+            == remote.addresses[1]
+        )
+    assert session.backend_address == remote.addresses[1]
+    assert (
+        await srv._call_client_create(create_fn, {}, session_id) == remote.addresses[1]
+    )
+
+
+@pytest.mark.asyncio
 async def test_group_sessions_rebalance_around_active_sessions(monkeypatch):
     config = InferenceEngineConfig(load_balance_policy="least_groups")
     remote = RemoteInfEngine(config, backend=MagicMock())
     remote.addresses = ["node-a:30000", "node-a:30001"]
     monkeypatch.setattr(srv, "_engine", SimpleNamespace(config=config, _engine=remote))
+    monkeypatch.setattr(srv, "_openai_client", object())
     monkeypatch.setattr(srv, "_capacity", 4)
     for idx in range(2):
         sid = f"older-{idx}"
@@ -294,9 +334,13 @@ async def test_group_sessions_rebalance_around_active_sessions(monkeypatch):
                 },
             )
             assert response.status_code == 200
-            selected.append(
-                srv._session_cache[response.json()["session_id"]].backend_address
-            )
+            session_id = response.json()["session_id"]
+            assert srv._session_cache[session_id].backend_address is None
+
+            async def create_fn(**kwargs):
+                return remote.choose_server()
+
+            selected.append(await srv._call_client_create(create_fn, {}, session_id))
 
         assert selected == [remote.addresses[1], remote.addresses[1]]
         for idx in range(2):
@@ -314,7 +358,9 @@ async def test_group_sessions_rebalance_around_active_sessions(monkeypatch):
             )
             assert response.status_code == 200
             selected.append(
-                srv._session_cache[response.json()["session_id"]].backend_address
+                await srv._call_client_create(
+                    create_fn, {}, response.json()["session_id"]
+                )
             )
 
     assert selected == [
@@ -373,6 +419,16 @@ async def test_group_session_routing_counts_only_inflight_generations(
                     "processor_cache_group_size": 2,
                 },
             )
+        session_id = response.json()["session_id"]
+        assert srv._session_cache[session_id].backend_address is None
+
+        async def route_fn(**kwargs):
+            return remote.choose_server()
+
+        assert (
+            await srv._call_client_create(route_fn, {}, session_id)
+            == remote.addresses[1]
+        )
     assert response.status_code == 200
     assert (
         srv._session_cache[response.json()["session_id"]].backend_address

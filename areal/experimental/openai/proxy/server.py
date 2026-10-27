@@ -136,12 +136,16 @@ class SessionData:
         processor_cache_group_id: str | None = None,
         backend_address: str | None = None,
         metadata: dict[str, Any] | None = None,
+        routing_sample_idx: int | None = None,
+        routing_group_size: int = 1,
     ):
         self.session_id = session_id
         self.sampling_seed_identity = sampling_seed_identity or session_id
         self.processor_cache = processor_cache
         self.processor_cache_group_id = processor_cache_group_id
         self.backend_address = backend_address
+        self.routing_sample_idx = routing_sample_idx
+        self.routing_group_size = routing_group_size
         self.metadata = dict(metadata or {})
 
         self._completed = False
