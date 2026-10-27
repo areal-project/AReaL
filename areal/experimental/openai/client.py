@@ -231,7 +231,12 @@ def _process_multimodal_prompt(
             "The tokenizer chat template must return text before VLM processing."
         )
 
-    processed = processor(
+    from areal.experimental.openai.vision_tokens import protect_vision_tokens
+
+    text_processor, prompt_text, restore_ids = protect_vision_tokens(
+        processor, tokenizer, messages, tools, chat_template_kwargs, prompt_text
+    )
+    processed = text_processor(
         text=[prompt_text],
         images=images,
         padding=False,
@@ -251,7 +256,8 @@ def _process_multimodal_prompt(
     if token_type_ids is None:
         token_type_ids = processed.get("token_type_ids")
     if token_type_ids is None:
-        mm_token_type_ids = [0] * len(input_ids)
+        image_id = getattr(processor, "image_token_id", None)
+        mm_token_type_ids = [int(token == image_id) for token in input_ids]
     else:
         if not torch.is_tensor(token_type_ids) or token_type_ids.ndim != 2:
             raise ValueError("The VLM processor token type IDs must be 2D.")
@@ -261,6 +267,16 @@ def _process_multimodal_prompt(
                 "The VLM processor returned token type IDs that do not align "
                 f"with input_ids: {len(mm_token_type_ids)} != {len(input_ids)}."
             )
+
+    # Restore literal visual tokens to the text domain after HF preprocessing.
+    for marker_id in restore_ids:
+        marker = str(text_processor.tokenizer.added_tokens_decoder[marker_id])
+        if input_ids.count(marker_id) != prompt_text.count(marker):
+            raise ValueError("VLM processor did not preserve visual text escapes")
+    for index, token in enumerate(input_ids):
+        if token in restore_ids:
+            input_ids[index] = restore_ids[token]
+            mm_token_type_ids[index] = 0
 
     multi_modal_input = {
         key: processed[key].detach().cpu()
@@ -1334,11 +1350,25 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             ),
         )
 
+        from areal.utils.sglang_image import (
+            image_prompt_metadata,
+            supports_qwen_image_spans,
+        )
+
+        request_metadata = image_prompt_metadata(
+            metadata if not is_omitted(metadata) else {},
+            prompt_token_ids,
+            prepared_prompt.mm_token_type_ids if has_images else None,
+            image_data
+            if has_images and supports_qwen_image_spans(self.processor)
+            else None,
+            self.processor,
+        )
         model_request = ModelRequest(
             input_ids=prompt_token_ids,
             gconfig=gconfig,
             rid=str(uuid.uuid4()),
-            metadata=metadata if not is_omitted(metadata) else {},
+            metadata=request_metadata,
             tokenizer=self.tokenizer,
             processor=self.processor,
             image_data=image_data if has_images else None,
@@ -1816,11 +1846,25 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             ),
         )
 
+        from areal.utils.sglang_image import (
+            image_prompt_metadata,
+            supports_qwen_image_spans,
+        )
+
+        request_metadata = image_prompt_metadata(
+            metadata if not is_omitted(metadata) else {},
+            prompt_token_ids,
+            prepared_prompt.mm_token_type_ids if has_images else None,
+            image_data
+            if has_images and supports_qwen_image_spans(self.processor)
+            else None,
+            self.processor,
+        )
         model_request = ModelRequest(
             input_ids=prompt_token_ids,
             gconfig=gconfig,
             rid=str(uuid.uuid4()),
-            metadata=metadata if not is_omitted(metadata) else {},
+            metadata=request_metadata,
             tokenizer=self.tokenizer,
             processor=self.processor,
             image_data=image_data if has_images else None,

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -23,6 +24,11 @@ from areal.engine import (
 from areal.engine import (
     sglang_qwen4_vl as qwen,
 )
+
+
+@pytest.fixture(autouse=True)
+def clean_processor_package(monkeypatch):
+    monkeypatch.delenv("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", raising=False)
 
 
 @pytest.fixture
@@ -320,3 +326,35 @@ def test_recipe_uses_automatic_model_dispatch_and_preserves_group_filter():
         for command in commands
     )
     assert config["should_accept_fn"] == "examples.swe.filter_function.filter_function"
+
+
+@pytest.mark.parametrize(
+    "model_type", ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
+)
+def test_native_qwen_registers_token_processor_without_image_source_patches(
+    tmp_path, monkeypatch, model_type
+):
+    model = tmp_path / "native"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": model_type}))
+    monkeypatch.setattr(
+        startup,
+        "installed_sglang_root",
+        lambda: pytest.fail("Image source was patched"),
+    )
+    args = ["--model-path", str(model)]
+    startup.apply_model_patches(args)
+    startup.apply_model_patches(args)
+    assert (
+        os.environ["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"]
+        == "areal.engine.sglang_processors"
+    )
+
+
+def test_native_qwen_rejects_conflicting_external_processor(tmp_path, monkeypatch):
+    model = tmp_path / "native"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    monkeypatch.setenv("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", "another.processor")
+    with pytest.raises(RuntimeError, match="another processor package"):
+        startup.apply_model_patches(["--model-path", str(model)])

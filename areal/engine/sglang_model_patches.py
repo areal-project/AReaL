@@ -68,6 +68,23 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
             )
         except (OSError, ValueError):
             return  # Let the original entry point handle other config formats.
+    if config.get("model_type") in (
+        "qwen3_vl",
+        "qwen3_vl_moe",
+        "qwen3_5",
+        "qwen3_5_moe",
+    ):
+        # Workers load the processor package themselves. Its image processing
+        # inherits SGLang's existing decode/resize path without any source patch.
+        package = "areal.engine.sglang_processors"
+        existing = os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE")
+        if existing and existing != package:
+            raise RuntimeError(
+                "AReaL Qwen visual-token handling requires its external multimodal "
+                "processor; another processor package is already configured"
+            )
+        os.environ["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"] = package
+        return
     if config.get("model_type") != "qwen4_exp":
         return
 
