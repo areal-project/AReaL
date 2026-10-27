@@ -168,18 +168,20 @@ def _resolve_transfer_rank(
     node_id: int,
     nnodes: int,
     instance_world_size: int,
+    server_base_gpu_id: int = 0,
 ) -> int:
     """Resolve the inference rank in AWEX's global transfer world.
 
     A one-GPU SGLang server can use the colocated actor's inherited global
     rank when CUDA device isolation remaps its only GPU to device zero. For a
-    multi-GPU server, every TP/PP scheduler inherits the same environment, so
-    its scheduler-local physical GPU identity must be used instead.
+    multi-GPU server, every TP/PP scheduler inherits the same environment.
+    Subtract the server's logical base GPU before adding the dense transfer base.
     """
     explicit_rank = os.environ.get("AWEX_TRANSFER_RANK")
     if explicit_rank is not None:
         transfer_rank = int(explicit_rank)
     else:
+        explicit_base = os.environ.get("AWEX_TRANSFER_RANK_BASE")
         env_rank = os.environ.get("RANK")
         env_world_size = os.environ.get("WORLD_SIZE")
         if (
@@ -189,6 +191,12 @@ def _resolve_transfer_rank(
             and int(env_world_size) == infer_world_size
         ):
             transfer_rank = int(env_rank)
+        elif explicit_base is not None:
+            n_gpus_per_node = max(1, infer_world_size // nnodes)
+            local_gpu_rank = gpu_id - server_base_gpu_id
+            transfer_rank = (
+                node_id * n_gpus_per_node + int(explicit_base) + local_gpu_rank
+            )
         else:
             n_gpus_per_node = max(1, infer_world_size // nnodes)
             transfer_rank = node_id * n_gpus_per_node + gpu_id
@@ -235,6 +243,10 @@ class AwexSchedulerPlugin:
         self._initialization_error: Exception | None = None
         self._weight_queue: queue.Queue = queue.Queue()
         self._version = 0
+        # Positive actor-side proof is published during receiver initialization.
+        # Unknown/legacy senders retain conservative visual-cache invalidation.
+        self._visual_embeddings_frozen = False
+        self._visual_embeddings_initialized = False
         self._paused_poll_interval_s = max(
             0.0, get_float_env_var("AWEX_PAUSED_POLL_INTERVAL_S", 0.01)
         )
@@ -392,7 +404,24 @@ class AwexSchedulerPlugin:
 
             def _flush(*args, **kwargs):
                 with _retract_memory_idle(scheduler, owner):
-                    return original_flush(*args, **kwargs)
+                    success = original_flush(*args, **kwargs)
+                    if success and (
+                        not self._visual_embeddings_frozen
+                        or not self._visual_embeddings_initialized
+                    ):
+                        # SGLang's native flush only invalidates KV/pool state.
+                        # Image hashes have no visual weight version. Establish
+                        # the actor checkpoint once, then reuse features only
+                        # when every visual parameter is known to be frozen.
+                        mm_utils = importlib.import_module(
+                            "sglang.srt.managers.mm_utils"
+                        )
+                        if mm_utils.embedding_cache is not None:
+                            mm_utils.embedding_cache.clear()
+                        self._visual_embeddings_initialized = (
+                            self._visual_embeddings_frozen
+                        )
+                    return success
 
             scheduler.flush_cache = _flush
             if owner is not scheduler and hasattr(owner, "flush_cache"):
@@ -996,6 +1025,9 @@ class AwexSchedulerPlugin:
             timeout=awex_colocate_timeout_s(),
         )
         train_world_size = train_info["train_world_size"]
+        self._visual_embeddings_frozen = (
+            train_info.get("frozen_visual_embeddings") is True
+        )
         # In colocate mode train and infer share the same N physical GPUs, so the
         # global infer NCCL world spans the same N ranks (numerically == train
         # world). This is a *physical* coincidence (same GPUs), NOT a requirement
@@ -1010,6 +1042,9 @@ class AwexSchedulerPlugin:
             node_id=node_id,
             nnodes=nnodes,
             instance_world_size=self._instance_world_size(),
+            server_base_gpu_id=self._int_attr(
+                self._scheduler.server_args, "base_gpu_id", 0
+            ),
         )
 
         logger.info(

@@ -1130,6 +1130,31 @@ class MegatronEngineConfig:
         },
     )
 
+    freeze_vision_model: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Freeze the vision encoder before DDP/optimizer construction "
+                "(megatron-bridge only). Set freeze_vision_projection=True as well "
+                "to freeze the complete visual feature path. None freezes "
+                "Qwen3-VL/Qwen3.5 vision by default and preserves other providers' "
+                "defaults. Set False explicitly to train the encoder."
+            )
+        },
+    )
+
+    freeze_vision_projection: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Freeze the vision projector/merger, including deepstack mergers, "
+                "before DDP/optimizer construction (megatron-bridge only). "
+                "None freezes Qwen3-VL/Qwen3.5 mergers by default and preserves "
+                "other providers' defaults. Set False explicitly to train them."
+            )
+        },
+    )
+
     freeze_ple_table: bool = field(
         default=True,
         metadata={
@@ -1174,6 +1199,15 @@ class MegatronEngineConfig:
     )
 
     def __post_init__(self) -> None:
+        if (
+            self.freeze_vision_model is not None
+            or self.freeze_vision_projection is not None
+        ) and self.bridge_type != "megatron-bridge":
+            raise ValueError(
+                "freeze_vision_model and freeze_vision_projection require "
+                "bridge_type='megatron-bridge'; Qwen4-Exp with mcore-bridge "
+                "already freezes its complete visual module by default"
+            )
         if self.enable_mtp_training and not self.enable_mtp:
             raise ValueError("enable_mtp_training requires enable_mtp=True")
         if self.mtp_only:

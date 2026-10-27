@@ -72,6 +72,65 @@ def _compact_image_tokens(req: ModelRequest) -> list[int]:
     return compact_ids
 
 
+def _has_isolated_device_namespace(
+    env: Mapping[str, str], gpus_per_server: int
+) -> bool:
+    visible_devices = env.get(current_platform.device_control_env_var, "")
+    return (
+        len([device for device in visible_devices.split(",") if device.strip()])
+        == gpus_per_server
+    )
+
+
+def _resolve_colocated_base_gpu_id(
+    env: Mapping[str, str],
+    gpus_per_server: int,
+    fallback_base_gpu_id: int,
+) -> tuple[int, str]:
+    """Resolve SGLang's logical base GPU for a colocated worker.
+
+    Schedulers normally isolate each worker with their device visibility
+    variable. In that namespace the first assigned device is always logical
+    device 0, regardless of its node-local or physical ID. An explicit AReaL
+    override supports launchers without device isolation, while
+    ``SLURM_LOCALID`` remains a compatibility fallback for older Slurm setups.
+    """
+    if gpus_per_server <= 0:
+        raise ValueError(f"gpus_per_server must be positive, got {gpus_per_server}")
+
+    def _nonnegative_int(value: str | int, source: str) -> int:
+        parsed = int(value)
+        if parsed < 0:
+            raise ValueError(f"{source} must be non-negative, got {parsed}")
+        return parsed
+
+    device_control_env_var = current_platform.device_control_env_var
+    isolated_devices = _has_isolated_device_namespace(env, gpus_per_server)
+
+    explicit_base_gpu_id = env.get("AREAL_SGLANG_BASE_GPU_ID")
+    if explicit_base_gpu_id is not None:
+        resolved = _nonnegative_int(explicit_base_gpu_id, "AREAL_SGLANG_BASE_GPU_ID")
+        if isolated_devices and resolved != 0:
+            raise ValueError(
+                "AREAL_SGLANG_BASE_GPU_ID must be 0 when the worker has an "
+                f"isolated {device_control_env_var} namespace"
+            )
+        return resolved, "AREAL_SGLANG_BASE_GPU_ID"
+
+    if isolated_devices:
+        return 0, device_control_env_var
+
+    slurm_local_id = env.get("SLURM_LOCALID")
+    if slurm_local_id is not None:
+        local_id = _nonnegative_int(slurm_local_id, "SLURM_LOCALID")
+        return local_id * gpus_per_server, "SLURM_LOCALID"
+
+    return (
+        _nonnegative_int(fallback_base_gpu_id, "fallback_base_gpu_id"),
+        "controller fallback",
+    )
+
+
 class SGLangBackend:
     """SGLang-specific backend implementation for remote inference."""
 
@@ -487,31 +546,44 @@ class SGLangBackend:
         self._readiness_endpoint = (
             "/model_info" if awex_colocate or awex_meta_addr else "/health"
         )
-        # Colocate placement: derive base_gpu_id from SLURM_LOCALID so two SGLang
-        # servers sharing a node never claim the same GPU range. The controller
-        # cannot do this reliably because its global rank -> node-slot mapping is
-        # not guaranteed by SLURM task dispatch (a collision degrades the
-        # TP group into an unsharded single-GPU load -> OOM). SLURM_LOCALID is the
-        # only id guaranteed unique per node-slot, and only the worker sees it at
-        # runtime. `_awex_gpus_per_server` is injected by the controller exclusively
-        # for real colocation, so its presence doubles as the colocate gate; it is
-        # absent for separated mode (where CVD isolation keeps base_gpu_id at 0).
+        # `_awex_gpus_per_server` is injected by the controller exclusively for
+        # real colocation. Resolve base_gpu_id in the worker because scheduler
+        # device isolation is only observable here, after Local/Slurm/Ray launch.
         awex_gpus_per_server = server_args.pop("_awex_gpus_per_server", None)
+        awex_transfer_rank_base = server_args.pop("_awex_transfer_rank_base", None)
         if awex_gpus_per_server is not None:
-            slurm_localid = os.environ.get("SLURM_LOCALID")
-            if slurm_localid is not None:
-                base_gpu_id = int(slurm_localid) * int(awex_gpus_per_server)
-                server_args["base_gpu_id"] = base_gpu_id
-                logger.info(
-                    "AWEX colocate base_gpu_id override: SLURM_LOCALID=%s x "
-                    "gpus_per_server=%s -> base_gpu_id=%s",
-                    slurm_localid,
-                    awex_gpus_per_server,
-                    base_gpu_id,
+            fallback_base_gpu_id = int(server_args.get("base_gpu_id", 0))
+            base_gpu_id, source = _resolve_colocated_base_gpu_id(
+                os.environ,
+                int(awex_gpus_per_server),
+                fallback_base_gpu_id,
+            )
+            server_args["base_gpu_id"] = base_gpu_id
+            if awex_transfer_rank_base is None:
+                # Isolated devices start at logical zero but retain a dense
+                # transfer offset. Otherwise follow actual worker placement:
+                # controller enumeration need not match Slurm's local order.
+                awex_transfer_rank_base = (
+                    fallback_base_gpu_id
+                    if _has_isolated_device_namespace(
+                        os.environ, int(awex_gpus_per_server)
+                    )
+                    else base_gpu_id
                 )
+            logger.info(
+                "AWEX colocate base_gpu_id=%s resolved from %s "
+                "(gpus_per_server=%s, requested=%s, transfer_rank_base=%s)",
+                base_gpu_id,
+                source,
+                awex_gpus_per_server,
+                fallback_base_gpu_id,
+                awex_transfer_rank_base,
+            )
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
         _env.setdefault("PYTHONFAULTHANDLER", "1")
+        if awex_transfer_rank_base is not None:
+            _env["AWEX_TRANSFER_RANK_BASE"] = str(awex_transfer_rank_base)
 
         awex_graph_memory_saver = bool(
             (awex_colocate or awex_meta_addr)

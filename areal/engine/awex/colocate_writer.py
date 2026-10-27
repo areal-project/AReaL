@@ -130,7 +130,7 @@ class AwexWeightPublisher:
         # Keep the writer/reader/plugin on one env-controlled timeout to avoid
         # split-brain diagnostics.
         self._timeout_s = awex_colocate_timeout_s() if timeout_s is None else timeout_s
-        from areal.models.mcore.qwen4_exp_awex_binding import build_awex_train_info
+        from areal.engine.awex.metadata import build_awex_train_info
 
         train_info = build_awex_train_info(self._engine, dist.get_world_size())
         if dist.get_rank() == 0:
@@ -147,7 +147,7 @@ class AwexWeightPublisher:
         addr = meta_server_addr or os.environ.get("AWEX_META_SERVER_ADDR", "")
         if not addr:
             return
-        from areal.models.mcore.qwen4_exp_awex_binding import build_awex_train_info
+        from areal.engine.awex.metadata import build_awex_train_info
 
         is_qwen = self._engine.hf_config.architectures == [
             "Qwen4ExpForConditionalGeneration"

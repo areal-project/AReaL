@@ -20,6 +20,7 @@ from transformers import AutoConfig, PretrainedConfig
 from areal.api.cli_args import MegatronEngineConfig
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.mtp_only import freeze_non_mtp_parameters
+from areal.engine.megatron_utils.qwen3_vl_token_mask import install_qwen3_vl_token_mask
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
@@ -444,6 +445,25 @@ def make_mcore_model(
 
     if bridge is not None and bridge_type == "megatron-bridge":
         provider = bridge.to_megatron_provider(load_weights=False)
+        # Native VLM providers apply these policies in provide(), before DDP
+        # allocates gradient buffers and the optimizer selects parameters.
+        is_qwen_vl = getattr(hf_config, "model_type", None) in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        )
+        for option in ("freeze_vision_model", "freeze_vision_projection"):
+            freeze = getattr(mcore_config, option)
+            if freeze is None and is_qwen_vl:
+                freeze = True
+            if freeze is not None:
+                if not hasattr(provider, option):
+                    raise ValueError(
+                        f"{type(provider).__name__} does not support {option}; "
+                        "use a compatible vision-language model provider"
+                    )
+                setattr(provider, option, freeze)
         vpp_size = mcore_config.virtual_pipeline_parallel_size or 0
 
         provider.tensor_model_parallel_size = mpu.get_tensor_model_parallel_world_size()
@@ -535,6 +555,9 @@ def make_mcore_model(
             set_deterministic_algorithms(provider, prebuild=True)
 
         provider.finalize()
+
+        if is_qwen_vl:
+            provider.register_pre_wrap_hook(install_qwen3_vl_token_mask)
 
         if mcore_config.mtp_only:
             if getattr(provider, "moe_router_enable_expert_bias", False):
