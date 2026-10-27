@@ -186,23 +186,27 @@ async def test_arena_compacted_episode_scores_all_actions_once(
 
 
 @pytest.mark.parametrize(
-    "ambiguity",
+    ("ambiguity", "reason"),
     [
-        "shared_ancestor",
-        "scalar_conflict",
-        "reference_conflict",
-        "original_reward_conflict",
-        "token_rewards",
-        "ancestor_reward",
-        "matching_ancestor_reward",
-        "incomplete",
-        "missing_id",
-        "duplicate_id",
-        "non_concat",
-        "cycle",
+        ("shared_ancestor", "shared_ancestor"),
+        ("scalar_conflict", "reward_conflict"),
+        ("reference_conflict", "rollout_reward_conflict"),
+        ("original_reward_conflict", "original_reward_conflict"),
+        ("token_rewards", "token_rewards"),
+        ("ancestor_reward", "ancestor_reward"),
+        ("matching_ancestor_reward", "ancestor_reward"),
+        ("incomplete", "incomplete"),
+        ("missing_id", "missing_id"),
+        ("duplicate_id", "duplicate_id"),
+        ("non_concat", "non_concat"),
+        ("cycle", "cycle"),
     ],
 )
-def test_arena_episode_reward_leaves_ambiguous_exports_unchanged(ambiguity):
+def test_arena_episode_reward_leaves_ambiguous_exports_unchanged(
+    monkeypatch, ambiguity, reason
+):
+    warning = Mock()
+    monkeypatch.setattr("areal.experimental.openai.cache.logger.warning", warning)
     cache = _compacted_session()
     cache.set_last_reward(0.5)
     leaves = cache.export_interactions(style="concat")
@@ -237,6 +241,32 @@ def test_arena_episode_reward_leaves_ambiguous_exports_unchanged(ambiguity):
         (x.reward, x.rollout_reward, x.original_reward) for x in cache.values()
     ] == before
     assert leaves["71"].reward is None
+    warning.assert_called_once()
+    assert warning.call_args.args[2] == reason
+    assert warning.call_args.args[-1] == len(leaves)
+
+
+def test_arena_episode_reward_rejection_log_bounds_ids_without_message_content(
+    monkeypatch,
+):
+    warning = Mock()
+    monkeypatch.setattr("areal.experimental.openai.cache.logger.warning", warning)
+    cache = _compacted_session(chain_lengths=(1, 1))
+    leaf = cache["1"]
+    leaf.interaction_id = "x" * 1000
+    leaf.messages = [{"role": "user", "content": "private-image-payload"}]
+    leaf.token_rewards = torch.tensor([0.25])
+
+    InteractionCache.from_dict({"leaf": leaf}).assign_episode_reward(0.5)
+
+    warning.assert_called_once()
+    fmt, *args = warning.call_args.args
+    message = fmt % tuple(args)
+    assert "reason=token_rewards" in message
+    assert "x" * 80 in message
+    assert "x" * 81 not in message
+    assert "private-image-payload" not in message
+    assert leaf.reward is None
 
 
 @pytest.mark.parametrize("status", ["HARNESS_FAILED", "EVAL_FAILED", "RUNNING"])

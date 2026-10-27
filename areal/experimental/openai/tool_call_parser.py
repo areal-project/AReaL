@@ -249,6 +249,15 @@ def _build_tool_call(
     arguments: str,
     use_responses: bool,
 ) -> ChatCompletionMessageFunctionToolCall | ResponseFunctionToolCall:
+    # json.loads accepts unpaired surrogate escapes in structured parameters.
+    # Treat them as malformed model actions before the response reaches the
+    # UTF-8 serializer, which would otherwise turn them into retryable 500s.
+    try:
+        arguments.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise InvalidToolCallError(
+            "invalid_tool_json: model emitted a malformed tool call"
+        ) from exc
     if use_responses:
         return ResponseFunctionToolCall(
             type="function_call",

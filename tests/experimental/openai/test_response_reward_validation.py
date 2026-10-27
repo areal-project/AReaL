@@ -67,13 +67,17 @@ def _child(
     *,
     error: str | None = None,
 ) -> InteractionWithTokenLogpReward:
-    return _interaction(
+    child = _interaction(
         name,
         messages=parent.messages
         + parent.output_message_list
         + [{"role": "user", "content": "continue"}],
         error=error,
     )
+    # Concat inherits action metadata only for an unchanged sampled prefix.
+    prefix = parent.model_response.input_tokens + parent.model_response.output_tokens
+    child.model_response.input_tokens[: len(prefix)] = prefix
+    return child
 
 
 def _client_with_cache(cache: InteractionCache) -> ArealOpenAI:
