@@ -59,13 +59,23 @@ _QWEN3_CODER_TOOL_CALL_RE = re.compile(
     re.DOTALL,
 )
 _QWEN3_CODER_FUNCTION_RE = re.compile(
-    r"<function=(?P<name>[^>\s]+)>\s*(?P<body>.*?)\s*</function>",
+    r"<function=(?P<name>[^/>\s]+)(?:\s*/\s*>|>\s*(?P<body>.*?)\s*</function>)",
     re.DOTALL,
 )
 _QWEN3_CODER_PARAMETER_RE = re.compile(
     r"<parameter=(?P<name>[^>\s]+)>(?P<value>.*?)</parameter>",
     re.DOTALL,
 )
+# Only the five predefined XML entities are decoded. HTML5 named entities are
+# deliberately left untouched so literal command or file content survives.
+_QWEN3_CODER_XML_ENTITIES = {
+    "&lt;": "<",
+    "&gt;": ">",
+    "&amp;": "&",
+    "&quot;": '"',
+    "&apos;": "'",
+}
+_QWEN3_CODER_XML_ENTITY_RE = re.compile("|".join(_QWEN3_CODER_XML_ENTITIES))
 _QWEN3_CODER_MISLABELED_FUNCTION_OPEN_RE = re.compile(
     r"\A(?P<leading>\s*)<parameter=(?P<name>[^>\s]+)>",
     re.DOTALL,
@@ -144,6 +154,24 @@ def _tool_argument_schemas(tools: list[Any]) -> dict[str, dict[str, dict[str, An
     return schemas
 
 
+def _tool_required_parameters(tools: list[Any]) -> dict[str, set[str]]:
+    required_map: dict[str, set[str]] = {}
+    for tool_def in _iter_tool_definitions(tools):
+        name = tool_def.get("name")
+        if not isinstance(name, str):
+            continue
+        parameters = tool_def.get("parameters")
+        if isinstance(parameters, dict):
+            req = parameters.get("required")
+            if isinstance(req, list):
+                required_map[name] = {str(r) for r in req if isinstance(r, str)}
+            else:
+                required_map[name] = set()
+        else:
+            required_map[name] = set()
+    return required_map
+
+
 def _repair_qwen3_coder_mislabeled_function_open(
     body: str,
     tool_names: set[str],
@@ -174,7 +202,9 @@ def _clean_qwen3_coder_parameter(raw_value: str) -> str:
         raw_value = raw_value[1:]
     if raw_value.endswith("\n"):
         raw_value = raw_value[:-1]
-    return raw_value
+    return _QWEN3_CODER_XML_ENTITY_RE.sub(
+        lambda m: _QWEN3_CODER_XML_ENTITIES[m.group(0)], raw_value
+    )
 
 
 def _coerce_qwen3_coder_parameter(
@@ -252,6 +282,7 @@ def _process_tool_calls_qwen3_coder_xml(
         text, "<think>", "</think>"
     )
     arg_schemas = _tool_argument_schemas(tools)
+    required_params = _tool_required_parameters(tools)
     tool_names = {
         tool_def["name"]
         for tool_def in _iter_tool_definitions(tools)
@@ -271,7 +302,7 @@ def _process_tool_calls_qwen3_coder_xml(
         )
         for fn_match in _QWEN3_CODER_FUNCTION_RE.finditer(body):
             tool_name = fn_match.group("name")
-            fn_body = fn_match.group("body")
+            fn_body = fn_match.group("body") or ""
             # A parameter value that itself contains a literal "</parameter>"
             # makes the non-greedy regex truncate at the wrong tag, silently
             # producing wrong arguments. When opening/closing tags are unbalanced
@@ -280,29 +311,48 @@ def _process_tool_calls_qwen3_coder_xml(
             if fn_body.count("<parameter=") != fn_body.count("</parameter>"):
                 return None, text, finish_reason
             args: dict[str, Any] = {}
-            for param_match in _QWEN3_CODER_PARAMETER_RE.finditer(fn_body):
-                param_name = param_match.group("name")
-                raw_param_value = param_match.group("value")
-                # A balanced count of tags still hides nested pairs, e.g. a
-                # value that contains its own "<parameter=...>...</parameter>".
-                # The non-greedy regex truncates the outer value at the inner
-                # closing tag, so treat any parameter marker inside the value as
-                # ambiguous and delegate the complete response to the backend.
-                if (
-                    "<parameter=" in raw_param_value
-                    or "</parameter>" in raw_param_value
-                ):
+            if "<parameter=" in fn_body:
+                for param_match in _QWEN3_CODER_PARAMETER_RE.finditer(fn_body):
+                    param_name = param_match.group("name")
+                    raw_param_value = param_match.group("value")
+                    # A balanced count of tags still hides nested pairs, e.g. a
+                    # value that contains its own "<parameter=...>...</parameter>".
+                    # The non-greedy regex truncates the outer value at the inner
+                    # closing tag, so treat any parameter marker inside the value as
+                    # ambiguous and delegate the complete response to the backend.
+                    if (
+                        "<parameter=" in raw_param_value
+                        or "</parameter>" in raw_param_value
+                    ):
+                        return None, text, finish_reason
+                    param_value = _clean_qwen3_coder_parameter(raw_param_value)
+                    args[param_name] = _coerce_qwen3_coder_parameter(
+                        param_value,
+                        arg_schemas.get(tool_name, {}).get(param_name),
+                    )
+                if not args:
                     return None, text, finish_reason
-                param_value = _clean_qwen3_coder_parameter(raw_param_value)
-                args[param_name] = _coerce_qwen3_coder_parameter(
-                    param_value,
-                    arg_schemas.get(tool_name, {}).get(param_name),
-                )
+            elif fn_body.strip():
+                # Only a genuinely empty body is a zero-argument call. A
+                # non-empty body must decode to a JSON object; anything else
+                # is malformed and is delegated with the complete response so
+                # optional arguments are never silently discarded.
+                try:
+                    decoded = json.loads(fn_body.strip())
+                except (TypeError, ValueError):
+                    return None, text, finish_reason
+                if not isinstance(decoded, dict):
+                    return None, text, finish_reason
+                args = decoded
 
-            # SGLang accepts argument-less functions as ``{}``, regardless of
-            # the tool schema. Delegate the whole response so mixed calls retain
-            # the same behavior instead of silently dropping the empty call.
-            if not args:
+            # Delegate the complete response when the call is not valid for its
+            # tool, so a valid sibling call in the same block cannot cause the
+            # incomplete one to be dropped. An empty args dict is accepted only
+            # for a declared tool that requires no parameters.
+            if tool_name not in required_params:
+                if not args:
+                    return None, text, finish_reason
+            elif required_params[tool_name] - set(args.keys()):
                 return None, text, finish_reason
 
             arguments = json.dumps(args, ensure_ascii=False)
