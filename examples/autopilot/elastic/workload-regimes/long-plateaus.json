@@ -1,0 +1,127 @@
+{
+  "arrivals": [
+    {
+      "rate_per_s": 0.05,
+      "until_s": 600
+    },
+    {
+      "rate_per_s": 0.4,
+      "until_s": 1200
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 1800
+    }
+  ],
+  "composition": [
+    {
+      "until_s": 1800,
+      "weights": {
+        "long_decode": 0.2,
+        "short": 0.6,
+        "tool_heavy": 0.2
+      }
+    }
+  ],
+  "duration_s": 1800,
+  "families": [
+    {
+      "max_turns": 4,
+      "mean_turns": 1.5,
+      "message_overhead_tokens": 16,
+      "name": "short",
+      "output": {
+        "maximum": 512,
+        "median": 128,
+        "minimum": 32,
+        "sigma": 0.5
+      },
+      "prompt": {
+        "maximum": 4096,
+        "median": 512,
+        "minimum": 128,
+        "sigma": 0.4
+      },
+      "tool_output": {
+        "maximum": 1024,
+        "median": 256,
+        "minimum": 64,
+        "sigma": 0.6
+      },
+      "tool_reference": "synthetic-python-work-v1",
+      "tool_type": "python",
+      "tool_work": {
+        "maximum": 120,
+        "median": 0.2,
+        "minimum": 0.01,
+        "sigma": 1.0
+      }
+    },
+    {
+      "max_turns": 8,
+      "mean_turns": 3,
+      "message_overhead_tokens": 16,
+      "name": "long_decode",
+      "output": {
+        "maximum": 4096,
+        "median": 1024,
+        "minimum": 256,
+        "sigma": 0.5
+      },
+      "prompt": {
+        "maximum": 4096,
+        "median": 2048,
+        "minimum": 128,
+        "sigma": 0.4
+      },
+      "tool_output": {
+        "maximum": 1024,
+        "median": 256,
+        "minimum": 64,
+        "sigma": 0.6
+      },
+      "tool_reference": "synthetic-python-work-v1",
+      "tool_type": "python",
+      "tool_work": {
+        "maximum": 120,
+        "median": 0.5,
+        "minimum": 0.01,
+        "sigma": 1.0
+      }
+    },
+    {
+      "max_turns": 12,
+      "mean_turns": 6,
+      "message_overhead_tokens": 16,
+      "name": "tool_heavy",
+      "output": {
+        "maximum": 1024,
+        "median": 256,
+        "minimum": 64,
+        "sigma": 0.5
+      },
+      "prompt": {
+        "maximum": 4096,
+        "median": 1024,
+        "minimum": 128,
+        "sigma": 0.4
+      },
+      "tool_output": {
+        "maximum": 4096,
+        "median": 1024,
+        "minimum": 256,
+        "sigma": 0.6
+      },
+      "tool_reference": "synthetic-terminal-work-v1",
+      "tool_type": "terminal",
+      "tool_work": {
+        "maximum": 120,
+        "median": 5,
+        "minimum": 0.01,
+        "sigma": 1.0
+      }
+    }
+  ],
+  "schema_version": "synthetic-workload-v2",
+  "seed": 20261024
+}

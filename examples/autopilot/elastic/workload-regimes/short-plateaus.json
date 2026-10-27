@@ -1,0 +1,235 @@
+{
+  "arrivals": [
+    {
+      "rate_per_s": 0.05,
+      "until_s": 60
+    },
+    {
+      "rate_per_s": 0.4,
+      "until_s": 120
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 180
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 240
+    },
+    {
+      "rate_per_s": 0.4,
+      "until_s": 300
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 360
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 420
+    },
+    {
+      "rate_per_s": 0.4,
+      "until_s": 480
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 540
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 600
+    },
+    {
+      "rate_per_s": 0.4,
+      "until_s": 660
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 720
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 780
+    },
+    {
+      "rate_per_s": 0.4,
+      "until_s": 840
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 900
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 960
+    },
+    {
+      "rate_per_s": 0.4,
+      "until_s": 1020
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 1080
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 1140
+    },
+    {
+      "rate_per_s": 0.4,
+      "until_s": 1200
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 1260
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 1320
+    },
+    {
+      "rate_per_s": 0.4,
+      "until_s": 1380
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 1440
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 1500
+    },
+    {
+      "rate_per_s": 0.4,
+      "until_s": 1560
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 1620
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 1680
+    },
+    {
+      "rate_per_s": 0.4,
+      "until_s": 1740
+    },
+    {
+      "rate_per_s": 0.05,
+      "until_s": 1800
+    }
+  ],
+  "composition": [
+    {
+      "until_s": 1800,
+      "weights": {
+        "long_decode": 0.2,
+        "short": 0.6,
+        "tool_heavy": 0.2
+      }
+    }
+  ],
+  "duration_s": 1800,
+  "families": [
+    {
+      "max_turns": 4,
+      "mean_turns": 1.5,
+      "message_overhead_tokens": 16,
+      "name": "short",
+      "output": {
+        "maximum": 512,
+        "median": 128,
+        "minimum": 32,
+        "sigma": 0.5
+      },
+      "prompt": {
+        "maximum": 4096,
+        "median": 512,
+        "minimum": 128,
+        "sigma": 0.4
+      },
+      "tool_output": {
+        "maximum": 1024,
+        "median": 256,
+        "minimum": 64,
+        "sigma": 0.6
+      },
+      "tool_reference": "synthetic-python-work-v1",
+      "tool_type": "python",
+      "tool_work": {
+        "maximum": 120,
+        "median": 0.2,
+        "minimum": 0.01,
+        "sigma": 1.0
+      }
+    },
+    {
+      "max_turns": 8,
+      "mean_turns": 3,
+      "message_overhead_tokens": 16,
+      "name": "long_decode",
+      "output": {
+        "maximum": 4096,
+        "median": 1024,
+        "minimum": 256,
+        "sigma": 0.5
+      },
+      "prompt": {
+        "maximum": 4096,
+        "median": 2048,
+        "minimum": 128,
+        "sigma": 0.4
+      },
+      "tool_output": {
+        "maximum": 1024,
+        "median": 256,
+        "minimum": 64,
+        "sigma": 0.6
+      },
+      "tool_reference": "synthetic-python-work-v1",
+      "tool_type": "python",
+      "tool_work": {
+        "maximum": 120,
+        "median": 0.5,
+        "minimum": 0.01,
+        "sigma": 1.0
+      }
+    },
+    {
+      "max_turns": 12,
+      "mean_turns": 6,
+      "message_overhead_tokens": 16,
+      "name": "tool_heavy",
+      "output": {
+        "maximum": 1024,
+        "median": 256,
+        "minimum": 64,
+        "sigma": 0.5
+      },
+      "prompt": {
+        "maximum": 4096,
+        "median": 1024,
+        "minimum": 128,
+        "sigma": 0.4
+      },
+      "tool_output": {
+        "maximum": 4096,
+        "median": 1024,
+        "minimum": 256,
+        "sigma": 0.6
+      },
+      "tool_reference": "synthetic-terminal-work-v1",
+      "tool_type": "terminal",
+      "tool_work": {
+        "maximum": 120,
+        "median": 5,
+        "minimum": 0.01,
+        "sigma": 1.0
+      }
+    }
+  ],
+  "schema_version": "synthetic-workload-v2",
+  "seed": 20261024
+}

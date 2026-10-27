@@ -29,6 +29,7 @@
     "pressure_request_fraction": 0.8, "slack_request_fraction": 0.9,
     "actor_memory_reserve_fraction": 0.1,
     "cooldown_seconds": 0, "deduplicate_searches": false,
+    "independent_role_history": true,
     "decision_delay_seconds": 1, "minimum_completed_requests": 8, "max_evaluations": 165
   },
   "tool_seconds_per_unit": {"synthetic-python-work-v1": 1, "synthetic-terminal-work-v1": 1}

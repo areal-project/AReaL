@@ -204,6 +204,7 @@ def main():
             "areal/autopilot/domains/elastic/online_decode.py",
             "areal/autopilot/domains/elastic/online_inputs.py",
             "areal/autopilot/domains/elastic/online_control.py",
+            "areal/autopilot/domains/elastic/online_lifecycle.py",
             "areal/autopilot/domains/elastic/online_state.py",
             "areal/autopilot/domains/elastic/online_parallel.py",
             "areal/autopilot/domains/elastic/online_simulation.py",

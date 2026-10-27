@@ -141,11 +141,22 @@ class ActorWaitView:
 
 
 @dataclass(frozen=True)
+class ActorLifecycleView:
+    state: str
+    first_check_at: float
+    first_check_done: bool
+    check_pending: bool = False
+    wake_at: float | None = None
+    snapshot: tuple[int, int, int] | None = None
+
+
+@dataclass(frozen=True)
 class ActorView:
     batch: tuple[str, ...] = ()
     phase: int = 0
     phase_started_at: float = 0.0
     waiting: ActorWaitView | None = None
+    lifecycle: ActorLifecycleView | None = None
 
 
 @dataclass(frozen=True)

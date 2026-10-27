@@ -1,0 +1,53 @@
+{
+  "arrivals": [
+    {
+      "rate_per_s": 0.8,
+      "until_s": 1800
+    }
+  ],
+  "composition": [
+    {
+      "until_s": 1800,
+      "weights": {
+        "decode": 1
+      }
+    }
+  ],
+  "duration_s": 1800,
+  "families": [
+    {
+      "max_turns": 1,
+      "mean_turns": 1,
+      "message_overhead_tokens": 16,
+      "name": "decode",
+      "output": {
+        "maximum": 8192,
+        "median": 4096,
+        "minimum": 2048.0,
+        "sigma": 0.3
+      },
+      "prompt": {
+        "maximum": 1024,
+        "median": 512,
+        "minimum": 256.0,
+        "sigma": 0.3
+      },
+      "tool_output": {
+        "maximum": 256,
+        "median": 128,
+        "minimum": 64.0,
+        "sigma": 0.3
+      },
+      "tool_reference": "synthetic-python-work-v1",
+      "tool_type": "python",
+      "tool_work": {
+        "maximum": 0.1,
+        "median": 0.05,
+        "minimum": 0.025,
+        "sigma": 0.5
+      }
+    }
+  ],
+  "schema_version": "synthetic-workload-v2",
+  "seed": 20261024
+}

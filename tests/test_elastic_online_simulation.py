@@ -851,6 +851,201 @@ def history_policy(candidates=(INITIAL, SMALL), *, history_seconds=20):
     )
 
 
+@pytest.mark.parametrize("measured", [False, True])
+def test_actor_residency_saves_restores_and_preserves_training_and_cost(measured):
+    """Low arrival rate permits sleep without changing layouts or training work."""
+    work = episodes(12, spacing=20)
+    controller = history_policy((INITIAL,), history_seconds=10)
+    controller.config = replace(controller.config, check_interval_seconds=5)
+    cfg = replace(
+        config(), actor_lifecycle_enabled=True, actor_lifecycle_history_seconds=10
+    )
+    sim = OnlineSimulation(
+        work,
+        INITIAL,
+        _KnownCosts(),
+        cfg,
+        handoff(),
+        SLO,
+        input_closes_at=220,
+        policy=controller,
+        measured_search_time=measured,
+    )
+    result = sim.run()
+    assert result["status"] == "complete"
+    assert result["completed_updates"] == result["published_version"] == 3
+    assert result["trained_episodes"] == result["completed_episodes"] == 12
+    assert result["retained_episodes"] == 0 and not result["remaining_leases"]
+    assert result["actor_lifecycle"]["suspends"] >= 2
+    assert result["actor_lifecycle"]["suspends"] == result["actor_lifecycle"]["resumes"]
+    assert not sim.counters["handoff_start"]
+    sleeps = [e for e in sim.events if e["kind"] == "actor_suspended"]
+    resumes = [e for e in sim.events if e["kind"] == "actor_resumed"]
+    for sleep, resume in zip(sleeps, resumes, strict=True):
+        assert sleep["snapshot"] == resume["snapshot"]
+        assert not any(
+            sleep["time"] <= e["time"] < resume["time"]
+            and e["kind"] in {"actor_start", "search_start", "handoff_start"}
+            for e in sim.events
+        )
+    births = {0: 0.0}
+    births.update(
+        {
+            e["deployment"]: e["time"]
+            for e in sim.events
+            if e["kind"] == "actor_resume_start"
+        }
+    )
+    charged = sum(
+        (e["time"] - births[e["deployment"]]) * INITIAL.actor_gpus
+        for e in sim.events
+        if e["kind"] == "deployment_release" and e["role"] == "actor"
+    )
+    assert result["actor_gpu_seconds"] == pytest.approx(charged)
+    assert charged < result["seconds"] * INITIAL.actor_gpus
+    assert controller.last_switch < 0  # Sleep/wake never resets serving history.
+    flattened = [e for record in sim.training_records for e in record["episodes"]]
+    assert flattened == [e.episode_id for e in work]
+
+
+def test_candidate_residency_uses_original_check_time_and_actual_gpu_integral():
+    """The inner current branch reproduces lifecycle timing and its occupancy cost."""
+    cfg = replace(config(), actor_lifecycle_enabled=True)
+    sim = OnlineSimulation(
+        episodes(16, spacing=20),
+        INITIAL,
+        _KnownCosts(),
+        cfg,
+        handoff(),
+        SLO,
+        input_closes_at=300,
+    )
+    sim.run(until=90)
+    view = sim.observe()
+    forecaster = HistoricalReplay(HistoryReplayConfig(80, 20, 0.5, 2, 120, 4096, 1))
+    forecasts = forecaster.predict(view, 0)
+    assert len(forecasts) == 1
+    forecast = forecasts[0]
+    branch = OnlineSimulation.from_forecast(
+        view, forecast, _KnownCosts(), cfg, handoff(), SLO
+    )
+    assert branch.lifecycle.check_pending == sim.lifecycle.check_pending
+    expected = branch.run(until=forecast.input_closes_at)
+    model = OnlineForecastModel(_KnownCosts(), cfg, handoff(), SLO, 0)
+    prediction = model.evaluate(view, forecasts, INITIAL)
+    assert prediction.supported and prediction.switching_gpu_seconds == 0
+    assert branch.lifecycle.first_check_at == 120
+    assert branch.counters["actor_suspended"] > 0
+    assert prediction.mean_gpu_seconds == pytest.approx(expected["total_gpu_seconds"])
+    assert prediction.mean_gpu_seconds == pytest.approx(prediction.running_gpu_seconds)
+    assert prediction.mean_gpu_seconds < 80 * (
+        INITIAL.actor_gpus + INITIAL.rollout_gpus
+    )
+
+
+def test_actor_residency_waits_for_existing_handoff_before_saving():
+    """A normal layout transition completes before lifecycle takes authority."""
+    cfg = replace(
+        config(), actor_lifecycle_enabled=True, actor_lifecycle_history_seconds=10
+    )
+    sim = OnlineSimulation(
+        episodes(12, spacing=20),
+        INITIAL,
+        _KnownCosts(),
+        cfg,
+        handoff(),
+        SLO,
+        input_closes_at=220,
+    )
+    sim.schedule_at(9, "decision_apply", SMALL)
+    result = sim.run()
+    assert result["status"] == "complete" and result["completed_updates"] == 3
+    end = next(e["time"] for e in sim.events if e["kind"] == "handoff_complete")
+    assert sim.counters["actor_suspended"] > 0
+    assert all(
+        e["time"] >= end for e in sim.events if e["kind"] == "actor_suspend_start"
+    )
+    assert sim.layout == SMALL
+
+
+def test_actor_residency_decisions_ignore_unseen_future_lengths():
+    """Changing an unarrived episode cannot change the sleep/wake prefix."""
+    prefixes = []
+    for output in (4, 400):
+        work = episodes(3, spacing=20) + (
+            EpisodeSample("later", "math", 80, (Turn(16, output),)),
+        )
+        cfg = replace(
+            config(), actor_lifecycle_enabled=True, actor_lifecycle_history_seconds=10
+        )
+        sim = OnlineSimulation(
+            work, INITIAL, _KnownCosts(), cfg, handoff(), SLO, input_closes_at=80
+        )
+        sim.run(until=50)
+        prefixes.append([e for e in sim.events if e["kind"].startswith("actor_")])
+    assert prefixes[0] == prefixes[1]
+
+
+@pytest.mark.parametrize("rollout_tp", [1, 2])
+def test_stopped_actor_allows_rollout_search_and_recovers_during_handoff(rollout_tp):
+    """Rollout changes independently while the original Actor wakes on time."""
+    cfg = replace(
+        config(),
+        actor_lifecycle_enabled=True,
+        actor_lifecycle_history_seconds=10,
+        actor_stopped_rollout_reconfig=True,
+    )
+    work = episodes(12, spacing=20)
+    sim = OnlineSimulation(
+        work, INITIAL, _KnownCosts(), cfg, handoff(), SLO, input_closes_at=220
+    )
+    sim.run(until=24)
+    view = sim.observe()
+    assert view.actor.lifecycle.state == "stopped" and not view.busy
+    assert sim.actor_id not in sim.deployments
+    target = OnlineLayout(
+        INITIAL.actor_dp, INITIAL.actor_tp, 2 // rollout_tp, rollout_tp
+    )
+    policy = history_policy((INITIAL, SMALL, target), history_seconds=10)
+    policy.config = replace(
+        policy.config, minimum_completed_requests=1, slo_window_seconds=120
+    )
+    model = OnlineForecastModel(_KnownCosts(), cfg, handoff(), SLO, 0)
+    decision = policy.decide(view, model)
+    assert decision.target == target
+    assert {p.layout for p in decision.predictions} == {INITIAL, target}
+    forecasts = policy.forecaster.predict(view, policy.decision_index)
+    branch = OnlineSimulation.from_forecast(
+        view, forecasts[0], _KnownCosts(), cfg, handoff(), SLO
+    )
+    assert branch.lifecycle.observe() == view.actor.lifecycle
+    assert branch.pool.count("actor") == 0 and branch.actor_id not in branch.deployments
+    assert branch.request_handoff(target)
+    branch.run(until=forecasts[0].input_closes_at)
+    assert branch.layout == target and branch.pending_handoff is None
+    assert branch.counters["actor_resume_start"] == 1
+    assert sim.request_handoff(target)
+    result = sim.run()
+    assert result["status"] == "complete" and result["completed_updates"] == 3
+    assert result["trained_episodes"] == 12 and not result["remaining_leases"]
+    begun = next(e for e in sim.events if e["kind"] == "actor_resume_start")
+    end = next(e for e in sim.events if e["kind"] == "handoff_complete")
+    assert begun["time"] == view.actor.lifecycle.wake_at
+    assert begun["time"] < end["time"]
+    assert not sim.counters["handoff_deferred"]
+    handoff_event = next(e for e in sim.events if e["kind"] == "handoff_start")
+    assert handoff_event["actor_stopped"]
+    recovery = handoff_event["actor_recovery_placement"]
+    assert len(recovery) == INITIAL.actor_gpus
+    occupied = {
+        tuple(gpu) for _, devices in handoff_event["leases"].values() for gpu in devices
+    }
+    assert occupied.isdisjoint(recovery)
+    assert [e for r in sim.training_records for e in r["episodes"]] == [
+        e.episode_id for e in work
+    ]
+
+
 def test_history_replay_preserves_real_arrival_slots_and_turn_shapes():
     """Observed history repeats without random arrivals or deployment timings."""
     sim = simulation(episodes(8, spacing=1))
@@ -939,6 +1134,77 @@ def _service_trigger_snapshot(passed, *, now=120):
     )
 
 
+@pytest.mark.parametrize("changed_role", ["actor", "rollout"])
+@pytest.mark.parametrize("passed", [13, 19])
+def test_role_history_only_locks_the_changed_side(changed_role, passed):
+    """Pressure and slack can change the untouched side during the other wait."""
+    actor = OnlineLayout(1, 2, 8, 1)
+    rollout = OnlineLayout(4, 2, 2, 1)
+    controller = history_policy((INITIAL, actor, rollout, SMALL), history_seconds=120)
+    controller.config = replace(
+        controller.config, independent_role_history=True, deduplicate_searches=False
+    )
+    controller.role_switched(changed_role, 110)
+    controller.switched(110)
+    scores = _ScoredReplay(
+        {
+            INITIAL: (0.9, 100, 100),
+            actor: (0.9, 50, 50),
+            rollout: (0.9, 50, 50),
+            SMALL: (0.9, 40, 40),
+        }
+    )
+    view = _service_trigger_snapshot(passed)
+    decision = controller.decide(view, scores)
+    expected = rollout if changed_role == "actor" else actor
+    assert decision.target == expected and scores.calls == [INITIAL, expected]
+    controller.role_switched("rollout" if changed_role == "actor" else "actor", 110)
+    decision = controller.decide(view, scores)
+    assert not decision.predictions and scores.calls == [INITIAL, expected]
+
+
+@pytest.mark.parametrize("joint", [False, True])
+def test_role_history_starts_at_each_old_deployment_release(joint):
+    """Real transfer/drain events clock each side before the whole handoff ends."""
+    sim = simulation(episodes(120))
+    sim.run(until=20)
+    controller = history_policy((INITIAL,), history_seconds=10)
+    controller.config = replace(controller.config, independent_role_history=True)
+    sim.policy = controller
+    target = SMALL if joint else OnlineLayout(1, 2, 8, 1)
+    assert sim.request_handoff(target)
+    sim.run(stop_after_handoff=True)
+    role_events = {
+        e["role"]: e for e in sim.events if e["kind"] == "role_handoff_complete"
+    }
+    assert controller.last_role_switch["actor"] == role_events["actor"]["time"]
+    assert max(event["time"] for event in role_events.values()) == sim.now
+    if joint:
+        assert controller.last_role_switch["rollout"] == role_events["rollout"]["time"]
+        earlier = min(role_events, key=lambda role: role_events[role]["time"])
+        later = "rollout" if earlier == "actor" else "actor"
+        assert role_events[earlier]["time"] < role_events[later]["time"]
+        sim.run(until=controller.last_role_switch[earlier] + 10)
+        assert controller.allowed_roles(sim.now) == {earlier: True, later: False}
+        next_role = earlier
+        next_layout = (
+            OnlineLayout(2, 2, 2, 1) if earlier == "actor" else OnlineLayout(1, 2, 4, 1)
+        )
+    else:
+        assert controller.last_role_switch["rollout"] == -float("inf")
+        assert controller.allowed_roles(sim.now) == dict(actor=False, rollout=True)
+        next_role, later = "rollout", "actor"
+        next_layout = OnlineLayout(1, 2, 4, 1)
+    unchanged_clock = controller.last_role_switch[later]
+    assert sim.request_handoff(next_layout)
+    sim.run(stop_after_handoff=True)
+    assert controller.last_role_switch[next_role] == sim.now
+    assert controller.last_role_switch[later] == unchanged_clock
+    result = sim.run()
+    assert result["status"] == "complete" and result["completed_updates"] == 30
+    assert result["trained_episodes"] == 120 and not result["remaining_leases"]
+
+
 @pytest.mark.parametrize(
     "passed,trigger",
     [
@@ -1013,8 +1279,11 @@ def test_simulation_first_search_follows_full_120_second_history(measured_search
 
 
 @pytest.mark.parametrize("passed", [13, 19])
-def test_example_policy_waits_after_handoff_then_searches_each_matching_poll(passed):
-    """Every completed switch needs fresh history, then ordinary polling resumes."""
+@pytest.mark.parametrize("independent", [False, True])
+def test_example_policy_waits_after_handoff_then_searches_each_matching_poll(
+    passed, independent
+):
+    """Joint completion clocks both roles; legacy and role polling resume at H."""
     import json
     from pathlib import Path
 
@@ -1023,9 +1292,14 @@ def test_example_policy_waits_after_handoff_then_searches_each_matching_poll(pas
         / "examples/autopilot/elastic/online-example.json"
     )
     controller = history_policy(history_seconds=120)
-    controller.config = OnlinePolicyConfig(**json.loads(path.read_text())["policy"])
+    controller.config = replace(
+        OnlinePolicyConfig(**json.loads(path.read_text())["policy"]),
+        independent_role_history=independent,
+    )
     scores = _ScoredReplay({INITIAL: (0.9, 100, 200), SMALL: (0.9, 110, 220)})
     for completed_at in (120, 300):
+        controller.role_switched("actor", completed_at)
+        controller.role_switched("rollout", completed_at)
         controller.switched(completed_at)
         before = len(scores.calls)
         for elapsed in (0, 10, 119, 120, 130):
@@ -1034,7 +1308,9 @@ def test_example_policy_waits_after_handoff_then_searches_each_matching_poll(pas
             if elapsed < 120:
                 assert decision.trigger == "none" and not decision.predictions
                 assert len(scores.calls) == before
-                assert "completed handoff" in decision.reason
+                assert (
+                    "each role's own" if independent else "completed handoff"
+                ) in decision.reason
             else:
                 assert decision.predictions and decision.target == (
                     SMALL if passed == 13 else INITIAL

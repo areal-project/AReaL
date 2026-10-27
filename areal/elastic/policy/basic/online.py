@@ -41,6 +41,7 @@ class OnlinePolicyConfig:
     slack_request_fraction: float = 0.9
     actor_memory_reserve_fraction: float = 0.0
     actor_memory_scope: str = "all_completed"
+    independent_role_history: bool = False
 
     def __post_init__(self):
         for name in ("check_interval_seconds", "slo_window_seconds"):
@@ -232,6 +233,7 @@ class OnlinePolicy:
         self.forecaster, self.config, self.slo = forecaster, config, slo
         self.decision_index = 0
         self.last_switch = -math.inf
+        self.last_role_switch = {"actor": -math.inf, "rollout": -math.inf}
         self.last_search = -math.inf
         self._last_search_state = None
         self._winners = []
@@ -273,6 +275,10 @@ class OnlinePolicy:
         )
 
     def redundant_search(self, view, model):
+        if self.config.independent_role_history and self.allowed_roles(
+            view.now
+        ) != self.allowed_roles(self.last_search):
+            return False
         old = self._last_search_state
         state = self.search_state(view, model)
         if old is None or state[:5] != old[:5] or state[7] != old[7]:
@@ -291,6 +297,35 @@ class OnlinePolicy:
     def switched(self, when: float):
         """Called after handoff completion, including old-deployment release."""
         self.last_switch = when
+
+    def role_switched(self, role: str, when: float):
+        """One changed side has taken over and its old deployment is released."""
+        self.last_role_switch[role] = when
+        if self.config.independent_role_history:
+            self.search_invalidated()
+
+    def allowed_roles(self, when: float) -> dict[str, bool]:
+        seconds = max(
+            self.config.cooldown_seconds,
+            self.forecaster.config.history_seconds
+            if isinstance(self.forecaster, HistoricalReplay)
+            else 0.0,
+        )
+        return {
+            role: when - max(0.0, completed) >= seconds
+            for role, completed in self.last_role_switch.items()
+        }
+
+    def role_history_status(self, when: float):
+        if not self.config.independent_role_history:
+            return None
+        return dict(
+            last_completed={
+                r: t if math.isfinite(t) else None
+                for r, t in self.last_role_switch.items()
+            },
+            allowed=self.allowed_roles(when),
+        )
 
     def _trigger(self, stats: RollingSLO) -> str:
         if stats.fraction is None:
@@ -327,15 +362,22 @@ class OnlinePolicy:
                 workload_features=self.forecaster.features if historical else None,
             )
 
+        roles = self.allowed_roles(view.now) if cfg.independent_role_history else None
+        if roles is not None and not any(roles.values()):
+            return keep("Waiting for each role's own full history window")
         if (
-            historical
+            not cfg.independent_role_history
+            and historical
             and view.now - max(0.0, self.last_switch)
             < self.forecaster.config.history_seconds
         ):
             return keep(
                 "Waiting for a full history window since startup or completed handoff before judging service"
             )
-        if view.busy or view.now - self.last_switch < cfg.cooldown_seconds:
+        if view.busy or (
+            not cfg.independent_role_history
+            and view.now - self.last_switch < cfg.cooldown_seconds
+        ):
             return keep("Transition/publication/decision pending or switch cooldown")
         trigger = self._trigger(stats)
         if trigger == "none":
@@ -361,7 +403,34 @@ class OnlinePolicy:
         candidates = (view.layout,) + tuple(
             c for c in self.candidates if c != view.layout
         )
+        if roles is not None:
+            candidates = tuple(
+                c
+                for c in candidates
+                if (
+                    roles["actor"]
+                    or (c.actor_dp, c.actor_tp)
+                    == (view.layout.actor_dp, view.layout.actor_tp)
+                )
+                and (
+                    roles["rollout"]
+                    or (c.rollout_replicas, c.rollout_tp)
+                    == (view.layout.rollout_replicas, view.layout.rollout_tp)
+                )
+            )
+        if view.actor.lifecycle is not None and view.actor.lifecycle.state == "stopped":
+            candidates = tuple(
+                c
+                for c in candidates
+                if (c.actor_dp, c.actor_tp)
+                == (view.layout.actor_dp, view.layout.actor_tp)
+            )
         layouts = candidates[: cfg.max_evaluations]
+        if cfg.independent_role_history and len(layouts) == 1:
+            return keep(
+                "No alternative layout under role history and lifecycle constraints",
+                trigger,
+            )
         evaluate_many = getattr(model, "evaluate_many", None)
         search = getattr(model, "search", None)
         preferred = ()

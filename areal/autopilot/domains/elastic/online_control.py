@@ -96,6 +96,12 @@ class OnlineControl:
                 evaluation=dict(model.execution_stats),
                 search_wall_seconds=elapsed,
                 delay_estimate_seconds=self.delay_estimate,
+                actor_lifecycle_state=(
+                    view.actor.lifecycle.state
+                    if view.actor.lifecycle is not None
+                    else None
+                ),
+                role_history=policy.role_history_status(view.now),
             )
             if not decision.predictions:
                 record["application_status"] = "no_search"
@@ -210,6 +216,7 @@ class OnlineControl:
             view.leases,
             view.actor.waiting,
             view.input_closed,
+            view.actor.lifecycle.state if view.actor.lifecycle is not None else None,
         )
 
     def wait_for_publication(self, resume_stage):

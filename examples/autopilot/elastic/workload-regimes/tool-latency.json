@@ -1,0 +1,53 @@
+{
+  "arrivals": [
+    {
+      "rate_per_s": 0.15,
+      "until_s": 1800
+    }
+  ],
+  "composition": [
+    {
+      "until_s": 1800,
+      "weights": {
+        "tool": 1
+      }
+    }
+  ],
+  "duration_s": 1800,
+  "families": [
+    {
+      "max_turns": 6,
+      "mean_turns": 4,
+      "message_overhead_tokens": 16,
+      "name": "tool",
+      "output": {
+        "maximum": 128,
+        "median": 64,
+        "minimum": 32.0,
+        "sigma": 0.3
+      },
+      "prompt": {
+        "maximum": 1024,
+        "median": 512,
+        "minimum": 256.0,
+        "sigma": 0.3
+      },
+      "tool_output": {
+        "maximum": 256,
+        "median": 128,
+        "minimum": 64.0,
+        "sigma": 0.3
+      },
+      "tool_reference": "synthetic-python-work-v1",
+      "tool_type": "python",
+      "tool_work": {
+        "maximum": 60,
+        "median": 30,
+        "minimum": 15.0,
+        "sigma": 0.5
+      }
+    }
+  ],
+  "schema_version": "synthetic-workload-v2",
+  "seed": 20261024
+}

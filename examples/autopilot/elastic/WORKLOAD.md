@@ -285,3 +285,20 @@ python -m pytest -q \
 计数均值／方差、随机轴独立、上下文递推及输入摘要一致。
 
 实验计时须区分：**模拟器程序运行时间**与**模型预测任务完成时间／GPU秒**；数据生成本身不产生推理起止时间。
+
+## v3八种负载
+
+当前32格矩阵使用的8份完整参数保存在[workload-regimes/](workload-regimes/)，仍为seed=20261024、1800秒、严格交替。它们独立于GPU和部署，可直接替换上述生成命令的`--spec`；生成结果与实验原输入逐字节核对。
+
+| 参数文件                    | 特征         |
+| --------------------------- | ------------ |
+| `low-flat.json`             | 低负载       |
+| `long-plateaus.json`        | 长平台       |
+| `short-plateaus.json`       | 短平台       |
+| `decode-load.json`          | 长输出       |
+| `prefill-load.json`         | 长输入       |
+| `multiturn-prefill.json`    | 多轮长输入   |
+| `tool-latency.json`         | 慢工具       |
+| `mixed-prefill-decode.json` | 输入输出混合 |
+
+[结果与实验条件](RESULTS_V3.md)；原始trace／模型校准仍需另行提供，参数入库不代表真实业务采集。

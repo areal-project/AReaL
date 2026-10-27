@@ -87,6 +87,10 @@ class OnlineRunConfig:
     max_context_tokens: int
     max_events: int
     max_simulated_seconds: float
+    actor_lifecycle_enabled: bool = False
+    actor_lifecycle_history_seconds: float = 120.0
+    actor_lifecycle_margin_seconds: float = 5.0
+    actor_stopped_rollout_reconfig: bool = False
 
     def __post_init__(self):
         for name in (
@@ -103,6 +107,15 @@ class OnlineRunConfig:
             raise ValueError("Explicit staleness and simulation budget are required")
         if not self.tool_capacities or any(n < 1 for _, n in self.tool_capacities):
             raise ValueError("Explicit positive tool pool capacities are required")
+        if (
+            not math.isfinite(self.actor_lifecycle_history_seconds)
+            or self.actor_lifecycle_history_seconds <= 0
+            or not math.isfinite(self.actor_lifecycle_margin_seconds)
+            or self.actor_lifecycle_margin_seconds < 0
+        ):
+            raise ValueError(
+                "Lifecycle needs a positive history and nonnegative margin"
+            )
 
 
 @dataclass(init=False)
@@ -218,6 +231,7 @@ class OnlineSimulation:
         _work: WorkInputs | None = None,
         measured_search_time: bool = False,
         search_clock: Callable[[], float] | None = None,
+        _lifecycle_view=None,
     ):
         if config.batch_size % initial.actor_dp:
             raise ValueError("Actor DP must divide the episode batch")
@@ -295,6 +309,11 @@ class OnlineSimulation:
             from .online_control import OnlineControl
 
             self.control = OnlineControl(self, search_clock)
+        self.lifecycle = None
+        if config.actor_lifecycle_enabled:
+            from .online_lifecycle import ActorLifecycle
+
+            self.lifecycle = ActorLifecycle(self, _lifecycle_view)
         if policy:
             self.schedule_at(
                 start_time + policy.config.check_interval_seconds, "policy", priority=10
@@ -303,17 +322,28 @@ class OnlineSimulation:
 
     @property
     def layout(self):
-        if (
-            self.actor_id not in self.deployments
-            or self.rollout_id not in self.deployments
-        ):
+        if self.rollout_id not in self.deployments:
             return self._last_layout
-        actor = self.deployments[self.actor_id].layout
+        actor = (
+            self.deployments[self.actor_id].layout
+            if self.actor_id in self.deployments
+            else self._last_layout
+        )
         rollout = self.deployments[self.rollout_id].layout
         self._last_layout = OnlineLayout(
             actor.actor_dp, actor.actor_tp, rollout.rollout_replicas, rollout.rollout_tp
         )
         return self._last_layout
+
+    def reconfiguration_allowed(self):
+        return (
+            self.lifecycle is None
+            or self.lifecycle.state == "running"
+            or (
+                self.lifecycle.state == "stopped"
+                and self.config.actor_stopped_rollout_reconfig
+            )
+        )
 
     def emit(self, kind: str, **data):
         self.counters[kind] += 1
@@ -491,6 +521,13 @@ class OnlineSimulation:
             self.finish_actor_phase()
         elif kind == "publication_complete":
             self.finish_publication(data)
+        elif kind == "actor_lifecycle_check":
+            self.lifecycle.request_check()
+        elif kind == "actor_lifecycle_saved":
+            self.lifecycle.saved()
+        elif kind == "actor_lifecycle_wake":
+            if self.lifecycle.wake_at == data:
+                self.lifecycle.wake("estimated_batch_ready")
         elif kind == "policy":
             self.poll_policy()
         elif kind == "search_complete":
@@ -578,6 +615,8 @@ class OnlineSimulation:
             self.admit()
             self.start_tools()
             self.service()
+            if self.lifecycle is not None:
+                self.lifecycle.tick()
             self.start_actor()
         else:
             self.start_tools()  # Tool execution remains independent of GPU publication.
@@ -591,6 +630,9 @@ class OnlineSimulation:
             and self.publication == "idle"
             and self.pending_handoff is None
             and not self.decision_pending
+            and (
+                self.lifecycle is None or self.lifecycle.state in {"running", "stopped"}
+            )
             and len(self.arrival_order) - self.consumed < self.config.batch_size
         ):
             if self.control is not None:
@@ -895,6 +937,8 @@ class OnlineSimulation:
         self.new_request(episode, self.now)
 
     def start_actor(self):
+        if self.lifecycle is not None and self.lifecycle.state != "running":
+            return
         if self.actor_batch or self.publication != "idle":
             return
         pending = self.pending_handoff
@@ -1050,10 +1094,14 @@ class OnlineSimulation:
         self.provider_version = version
         self.publication = "idle"
         self.emit("weights_published", version=version, recipients=identities)
+        if self.lifecycle is not None:
+            self.lifecycle.request_check()
         if self.control is not None:
             self.control.publication_complete()
 
     def request_handoff(self, target: OnlineLayout):
+        if not self.reconfiguration_allowed():
+            return False
         if target.actor_gpus + target.rollout_gpus > 16:
             raise ValueError(
                 "Target Actor and Rollout share a sixteen-GPU steady budget"
@@ -1063,6 +1111,24 @@ class OnlineSimulation:
         if self.config.batch_size % target.actor_dp:
             raise ValueError("Target Actor DP must divide the configured episode batch")
         current = self.layout
+        if self.policy is not None and self.policy.config.independent_role_history:
+            allowed = self.policy.allowed_roles(self.now)
+            if (
+                not allowed["actor"]
+                and (target.actor_dp, target.actor_tp)
+                != (current.actor_dp, current.actor_tp)
+            ) or (
+                not allowed["rollout"]
+                and (target.rollout_replicas, target.rollout_tp)
+                != (current.rollout_replicas, current.rollout_tp)
+            ):
+                return False
+        stopped = self.lifecycle is not None and self.lifecycle.state == "stopped"
+        if stopped and (target.actor_dp, target.actor_tp) != (
+            current.actor_dp,
+            current.actor_tp,
+        ):
+            return False
         roles = []
         if (current.actor_dp, current.actor_tp) != (target.actor_dp, target.actor_tp):
             roles.append(("actor", target.actor_gpus))
@@ -1088,6 +1154,26 @@ class OnlineSimulation:
                 )
                 return False
             acquired[role] = identity
+        recovery_placement = None
+        if stopped:
+            # Probe recovery while both Rollout generations still occupy GPUs.
+            # This is a feasibility check, not a charged or persistent lease.
+            actual_peak = self.pool.peak_gpus
+            recovery_placement = self.pool.acquire(
+                "actor-recovery-probe", "actor", current.actor_gpus, tp=current.actor_tp
+            )
+            if recovery_placement is None:
+                for previous in acquired.values():
+                    self.pool.release(str(previous))
+                self.pool.peak_gpus = previous_peak
+                self.emit(
+                    "handoff_deferred",
+                    target=asdict(target),
+                    reason="Rollout overlap would prevent Actor recovery",
+                )
+                return False
+            self.pool.release("actor-recovery-probe")
+            self.pool.peak_gpus = actual_peak
         self.pending_handoff = dict(
             target=target,
             new_actor=acquired.get("actor"),
@@ -1120,6 +1206,8 @@ class OnlineSimulation:
             source=asdict(current),
             target=asdict(target),
             leases=dict(self.pool.leases),
+            actor_stopped=stopped,
+            actor_recovery_placement=recovery_placement,
         )
         return True
 
@@ -1153,11 +1241,19 @@ class OnlineSimulation:
         )
         self.schedule_at(end, "deployment_loaded", (identity, self.provider_version))
 
+    def add_restoring_actor(self, identity):
+        self.deployments[identity] = _Deployment(
+            identity, "actor", self.layout, "preparing", self.provider_version
+        )
+
     def prepared(self, identity: int, version: int):
         deployment = self.deployments[identity]
         deployment.version, deployment.status = version, "prepared"
         if deployment.role == "actor":
-            self.pending_handoff["actor_ready"] = True
+            if self.lifecycle is not None and self.lifecycle.restore_id == identity:
+                self.lifecycle.prepared(identity)
+            else:
+                self.pending_handoff["actor_ready"] = True
         self.emit(
             "deployment_prepared",
             deployment=identity,
@@ -1293,6 +1389,18 @@ class OnlineSimulation:
             role=deployment.role,
             leases=dict(self.pool.leases),
         )
+        if (
+            self.pending_handoff is not None
+            and str(identity) in self._handoff_old_costs
+        ):
+            self.emit(
+                "role_handoff_complete",
+                role=deployment.role,
+                source=identity,
+                target=self.actor_id if deployment.role == "actor" else self.rollout_id,
+            )
+            if self.policy is not None:
+                self.policy.role_switched(deployment.role, self.now)
 
     def maybe_finish_handoff(self):
         pending = self.pending_handoff
@@ -1301,7 +1409,14 @@ class OnlineSimulation:
         actor_done = (
             pending["new_actor"] is None or pending["new_actor"] == self.actor_id
         )
-        if actor_done and pending["rollout_switched"] and len(self.deployments) == 2:
+        active = {self.actor_id, self.rollout_id}
+        if self.lifecycle is not None and self.lifecycle.restore_id is not None:
+            active.add(self.lifecycle.restore_id)
+        if (
+            actor_done
+            and pending["rollout_switched"]
+            and set(self.deployments) <= active
+        ):
             self.emit("handoff_complete", layout=asdict(self.layout))
             self.pending_handoff = None
             if self.policy:
@@ -1340,13 +1455,15 @@ class OnlineSimulation:
                 self.actor_phase,
                 self.actor_phase_started,
                 self.actor_wait,
+                self.lifecycle.observe() if self.lifecycle is not None else None,
             ),
             self.consumed,
             self.training_version,
             self.provider_version,
             self.pending_handoff is not None
             or self.publication != "idle"
-            or self.decision_pending,
+            or self.decision_pending
+            or not self.reconfiguration_allowed(),
             self.input_closed,
             self.actor_id,
             self.rollout_id,
@@ -1359,6 +1476,8 @@ class OnlineSimulation:
     def poll_policy(self):
         if not self.policy or self.done:
             return
+        if self.lifecycle is not None:
+            self.lifecycle.tick()
         if self.control is not None:
             return self.control.poll()
         view = self.observe()
@@ -1374,6 +1493,10 @@ class OnlineSimulation:
         )
         decision = self.policy.decide(view, model)
         record = asdict(decision)
+        record["actor_lifecycle_state"] = (
+            view.actor.lifecycle.state if view.actor.lifecycle is not None else None
+        )
+        record["role_history"] = self.policy.role_history_status(view.now)
         record["observation_id"] = fingerprint(view)
         record["evaluation"] = model.execution_stats
         self.decisions.append(record)
@@ -1446,6 +1569,13 @@ class OnlineSimulation:
         )
         if self.control is not None:
             result["control"] = dict(clock="measured", **self.control.stats)
+        if self.lifecycle is not None:
+            result["actor_lifecycle"] = dict(
+                state=self.lifecycle.state,
+                suspends=self.counters["actor_suspended"],
+                resumes=self.counters["actor_resumed"],
+                snapshot=self.lifecycle.snapshot,
+            )
         return result
 
     @classmethod
@@ -1483,7 +1613,15 @@ class OnlineSimulation:
             start_time=view.now,
             coalesce_decode=coalesce_decode,
             _work=prepared.work,
+            _lifecycle_view=view.actor.lifecycle,
         )
+        stopped = (
+            view.actor.lifecycle is not None and view.actor.lifecycle.state == "stopped"
+        )
+        if stopped:
+            if simulation.lifecycle is None:
+                raise ValueError("Stopped Actor observation requires lifecycle support")
+            del simulation.deployments[0]
         owners = {
             view.actor_deployment: (
                 "0",
@@ -1530,7 +1668,7 @@ class OnlineSimulation:
                     )
                 occupied.add((node, rank))
             leases[owner] = role, devices
-        if set(leases) != {"0", "1"}:
+        if set(leases) != ({"1"} if stopped else {"0", "1"}):
             raise ValueError("Forecast requires complete current GPU placement")
         simulation.pool.leases = leases
         simulation.pool.peak_gpus = len(occupied)
@@ -2093,9 +2231,28 @@ class OnlineForecastModel:
         models = models or self.models
         self.prepare_context(view, forecasts)
         work_ids = self._work_ids
+        if (
+            view.actor.lifecycle is not None
+            and view.actor.lifecycle.state == "stopped"
+            and (layout.actor_dp, layout.actor_tp)
+            != (view.layout.actor_dp, view.layout.actor_tp)
+        ):
+            return CandidatePrediction(
+                layout,
+                False,
+                None,
+                None,
+                work_ids,
+                "Stopped Actor retains its recovery DP/TP; only Rollout may change",
+                self.source_ids,
+            )
         if bound is not None and bound.context_id != self._context_id:
             bound = None
+        if self.config.actor_lifecycle_enabled:
+            # Constant target-residency lower bounds do not hold during sleep.
+            bound = None
         costs, fractions, window_costs = [], [], []
+        running_costs = []
         switching_costs, horizons, window_stats, window_results = [], [], [], []
         historical = self._historical
         coverage = "legacy_sampled_execution"
@@ -2204,6 +2361,11 @@ class OnlineForecastModel:
                 if historical:
                     result = simulation.run(until=forecast.input_closes_at)
                     window_costs.append(result["total_gpu_seconds"])
+                    if self.config.actor_lifecycle_enabled:
+                        running_cost = (
+                            result["total_gpu_seconds"]
+                            - simulation.switching_gpu_seconds()
+                        )
                     window_results.append(result)
                     window_stats.append(
                         rolling_slo(
@@ -2324,6 +2486,7 @@ class OnlineForecastModel:
                 switching_costs.append(cost)
                 horizons.append(horizon)
                 costs.append(cost + running_cost)
+                running_costs.append(running_cost)
                 fractions.append(window_stats[-1].fraction)
                 continue
             future = [
@@ -2343,7 +2506,9 @@ class OnlineForecastModel:
             min(fractions) if all(f is not None for f in fractions) else None,
             sum(costs) / len(costs),
             work_ids,
-            "Fixed serving window; score = switching GPU seconds + window seconds * target GPU count; target tail not scored"
+            "Fixed serving window; score = switching GPU seconds + actual target residency integral; lifecycle enabled"
+            if historical and self.config.actor_lifecycle_enabled
+            else "Fixed serving window; score = switching GPU seconds + window seconds * target GPU count; target tail not scored"
             if historical
             else "Sampled arrivals close at horizon; all sampled serving and full training batches drain afterwards",
             self.models.source_ids,
@@ -2353,15 +2518,11 @@ class OnlineForecastModel:
             switching_gpu_seconds=sum(switching_costs) / len(costs)
             if historical
             else None,
-            running_gpu_seconds_per_second=layout.actor_gpus + layout.rollout_gpus
+            running_gpu_seconds_per_second=sum(running_costs) / sum(horizons)
             if historical
             else None,
             evaluation_seconds=sum(horizons) / len(costs) if historical else None,
-            running_gpu_seconds=(layout.actor_gpus + layout.rollout_gpus)
-            * sum(horizons)
-            / len(costs)
-            if historical
-            else None,
+            running_gpu_seconds=sum(running_costs) / len(costs) if historical else None,
             score_gpu_seconds=sum(costs) / len(costs) if historical else None,
             completed_requests=sum(s.completed for s in window_stats)
             if historical
