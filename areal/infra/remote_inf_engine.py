@@ -49,6 +49,7 @@ from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names, stats_tracker
 from areal.utils.data import RolloutGroup, concat_padded_tensors, get_batch_size
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.episode_turns import observe_generated_response, track_episode_turns
 from areal.utils.network import (
     find_free_ports,
     format_hostport,
@@ -134,7 +135,8 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                     processor_cache=shared_processor_cache,
                 )
             )
-            result = await self.workflow.arun_episode(engine, data)
+            with track_episode_turns():
+                result = await self.workflow.arun_episode(engine, data)
             completed_results[sample_idx] = result
             return sample_idx, result
 
@@ -180,6 +182,10 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         results = [result if result else None for result in completed_results]
         valid_results = [r for r in results if r is not None]
         usable_slot_count = len(valid_results)
+        stats_tracker.get(workflow_context.stat_scope()).scalar(
+            incomplete_trajectories=self.group_size - usable_slot_count,
+            incomplete_group=float(usable_slot_count < self.group_size),
+        )
 
         interaction_group = not valid_results or all(
             isinstance(result, dict)
@@ -754,6 +760,13 @@ class RemoteInfEngine(InferenceEngine):
         """Set the workflow executor of the inference engine."""
         self._workflow_executor = workflow_executor
 
+    def export_stats(self) -> dict[str, float]:
+        """Export worker stats and this process's consumed rollout observations."""
+        result = stats_tracker.export_all(reduce_group=None)
+        if self._workflow_executor is not None:
+            result.update(self._workflow_executor.export_consumed_metrics())
+        return result
+
     @property
     def initialized(self) -> bool:
         return self._initialized
@@ -1261,6 +1274,7 @@ class RemoteInfEngine(InferenceEngine):
             processor=req.processor,
             routed_experts=final_routed_experts,
         )
+        observe_generated_response(response.output_len)
         return response
 
     def init_weights_update_group(
@@ -1512,7 +1526,7 @@ class RemoteInfEngine(InferenceEngine):
         # Keep successful payloads visible to the RPC guard's RTensor traversal.
         if result is None or isinstance(result, WorkflowContractFailure):
             return result
-        return result.trajectory
+        return {"trajectory": result.trajectory, "metrics": result.metrics}
 
     def rollout_batch(
         self,

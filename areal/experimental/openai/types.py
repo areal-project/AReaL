@@ -393,8 +393,12 @@ def _interaction_rollout_reward(
 
 def concat_tensor_interactions(
     interactions: dict[str, InteractionWithTokenLogpReward],
+    *,
+    require_harness_status: bool = False,
 ) -> dict[str, Any]:
     """Export tensor rows while retaining the wrapper's logical membership."""
+    from areal.utils.rollout_stats import with_rollout_turn_stats
+
     batches = []
     counts: list[int] = []
     rewards: list[float | None] = []
@@ -405,7 +409,15 @@ def concat_tensor_interactions(
         )
         members.setdefault(index, []).append(interaction)
     for member in members.values():
-        tensors = [v.to_tensor_dict() for v in member]
+        tensors = [
+            with_rollout_turn_stats(
+                v.to_tensor_dict(),
+                v.metadata,
+                interaction=v,
+                require_harness_status=require_harness_status,
+            )
+            for v in member
+        ]
         batches.extend(tensors)
         counts.append(sum(get_batch_size(t) for t in tensors))
         rewards.append(_interaction_rollout_reward(member))

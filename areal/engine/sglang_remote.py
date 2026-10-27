@@ -34,7 +34,7 @@ from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.infra.workflow_executor import WorkflowTaskResult
-from areal.utils import perf_tracer, stats_tracker
+from areal.utils import perf_tracer
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, format_host_for_url
 
@@ -895,7 +895,7 @@ class RemoteSGLangEngine(InferenceEngine):
         return self._engine.onload(tags=tags)
 
     def export_stats(self) -> dict[str, float]:
-        return stats_tracker.export_all(reduce_group=None)
+        return self._engine.export_stats()
 
     @classmethod
     def as_controller(cls, config: InferenceEngineConfig, scheduler: Scheduler):

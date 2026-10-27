@@ -40,6 +40,7 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding, stats_tracker
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.episode_turns import count_generated_responses
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, gethostip
@@ -677,6 +678,7 @@ def end_session(session_id: str = Depends(_require_session_key)):
             )
         session = _session_cache[session_id]
         interaction_count = len(session.completions)
+        generated_turn_count = count_generated_responses(session.completions)
 
     # finish() outside lock to avoid holding lock during potential I/O
     session.finish()
@@ -686,6 +688,7 @@ def end_session(session_id: str = Depends(_require_session_key)):
     return {
         "message": "success",
         "interaction_count": interaction_count,
+        "generated_turn_count": generated_turn_count,
         "context_overflow": session.context_overflow,
         "context_overflow_message": session.context_overflow_message,
         "system_error": session.system_error,
@@ -1531,6 +1534,7 @@ async def export_trajectories(
             status_code=400, detail="Episode reward assignment requires concat export"
         )
 
+    generated_turn_count = count_generated_responses(session_data.completions)
     # Export interactions
     interactions = session_data.export_interactions(
         discount=request.discount,
@@ -1607,6 +1611,7 @@ async def export_trajectories(
     )
     return ExportTrajectoriesResponse(
         interactions=serialized,
+        generated_turn_count=generated_turn_count,
         tensor_reference_group_id=tensor_reference_group_id,
     )
 

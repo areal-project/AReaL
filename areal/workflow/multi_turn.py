@@ -125,9 +125,7 @@ class MultiTurnWorkflow(RolloutWorkflow):
         reward = float(reward * discount)
 
         # Log reward.
-        stats_tracker.get(workflow_context.stat_scope()).scalar(
-            reward=reward, num_turns=t
-        )
+        stats_tracker.get(workflow_context.stat_scope()).scalar(reward=reward)
 
         res = dict(
             input_ids=torch.tensor(seq, dtype=torch.int32),

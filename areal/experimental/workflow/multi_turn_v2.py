@@ -88,9 +88,7 @@ class MultiTurnWorkflow(RolloutWorkflow):
         reward = float(reward * discount)
 
         # Log reward.
-        stats_tracker.get(workflow_context.stat_scope()).scalar(
-            reward=reward, num_turns=t
-        )
+        stats_tracker.get(workflow_context.stat_scope()).scalar(reward=reward)
 
         client.set_reward(_comp.id, reward)
         return client.export_interactions()

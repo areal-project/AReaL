@@ -114,6 +114,7 @@ class ExportTrajectoriesResponse(BaseModel):
     """Response containing serialized interactions."""
 
     interactions: dict[str, Any]
+    generated_turn_count: int | None = None
     tensor_reference_group_id: str | None = None
 
 
@@ -266,11 +267,17 @@ def serialize_interactions(
         topk=r3_topk,
     )
 
+    from areal.utils.rollout_stats import with_rollout_turn_stats
+
     result = {}
     for key, interaction in interactions.items():
         if interaction.has_tensor_data:
             result[key] = {
-                "tensor_dict": interaction.to_tensor_dict(),
+                "tensor_dict": with_rollout_turn_stats(
+                    interaction.to_tensor_dict(),
+                    interaction.metadata,
+                    interaction=interaction,
+                ),
                 "reward": interaction.reward,
                 "interaction_id": interaction.interaction_id,
             }

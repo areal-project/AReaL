@@ -34,7 +34,7 @@ from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.infra.workflow_executor import WorkflowTaskResult
-from areal.utils import logging, perf_tracer, stats_tracker
+from areal.utils import logging, perf_tracer
 from areal.utils.network import format_host_for_url
 from areal.utils.vllm_response import parse_vllm_generation_response
 
@@ -560,7 +560,7 @@ class RemotevLLMEngine(InferenceEngine):
         return self._engine.onload(tags=tags)
 
     def export_stats(self) -> dict[str, float]:
-        return stats_tracker.export_all(reduce_group=None)
+        return self._engine.export_stats()
 
     @classmethod
     def as_controller(cls, config: InferenceEngineConfig, scheduler: Scheduler):

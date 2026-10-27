@@ -58,7 +58,7 @@ def test_rollout_group_size_contract_rejects_invalid_threshold(
 def rollout_stats(monkeypatch):
     tracker = MagicMock()
     monkeypatch.setattr(
-        "areal.infra.remote_inf_engine.stats_tracker.get", lambda _: tracker
+        "areal.infra.remote_inf_engine.stats_tracker.get", lambda _=None: tracker
     )
     workflow_context.set(WorkflowContext(is_eval=False))
     return tracker
@@ -74,7 +74,7 @@ async def test_grouped_rollout_keeps_each_usable_member_once(rollout_stats):
     assert result is not None
     assert workflow.calls == 3
     torch.testing.assert_close(result["input_ids"], torch.tensor([[11], [22]]))
-    rollout_stats.scalar.assert_called_once_with(
+    rollout_stats.scalar.assert_any_call(
         target_slot_count=3,
         usable_slot_count=2,
         trainable_slot_count=2,
@@ -96,7 +96,7 @@ async def test_grouped_rollout_marks_empty_group_unusable(rollout_stats):
     result = await grouped.arun_episode(MagicMock(), {})
 
     assert result is None
-    rollout_stats.scalar.assert_called_once_with(
+    rollout_stats.scalar.assert_any_call(
         target_slot_count=3,
         usable_slot_count=0,
         trainable_slot_count=0,
@@ -119,7 +119,7 @@ async def test_grouped_rollout_applies_estimator_minimum(rollout_stats):
     result = await grouped.arun_episode(MagicMock(), {})
 
     assert result is None
-    rollout_stats.scalar.assert_called_once_with(
+    rollout_stats.scalar.assert_any_call(
         target_slot_count=3,
         usable_slot_count=1,
         trainable_slot_count=0,
@@ -370,3 +370,17 @@ def test_fixed_collection_rejects_undersized_batch():
             dynamic_bs=False,
             min_batch_size=2,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [0, 1, 3])
+async def test_incomplete_metrics_include_complete_groups(rollout_stats, missing):
+    grouped = GroupedRolloutWorkflow(
+        _SequenceWorkflow([None] * missing + [_trajectory(1)] * (3 - missing)),
+        group_size=3,
+        logger=MagicMock(),
+    )
+    await grouped.arun_episode(MagicMock(), {})
+    rollout_stats.scalar.assert_any_call(
+        incomplete_trajectories=missing, incomplete_group=float(missing > 0)
+    )

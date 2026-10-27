@@ -12,6 +12,7 @@ import torch.distributed as dist
 
 from areal.infra.platforms import current_platform
 from areal.utils import logging
+from areal.utils.scalar_capture import capture_scalar
 from areal.utils.seqpack import flat2d
 
 logger = logging.getLogger("StatsTracker")
@@ -128,6 +129,8 @@ class DistributedStatsTracker:
         with self.lock:
             for key, value in kwargs.items():
                 full_key = self._get_full_key(key)
+                if reduce_group is None and capture_scalar(full_key, value):
+                    continue
                 self._set_reduce_type(full_key, ReduceType.SCALAR)
                 self.stats[full_key].append(float(value))
                 if reduce_group is not None:

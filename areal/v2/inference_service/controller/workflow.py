@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -15,6 +16,7 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.http import async_http_retry
 from areal.utils import logging, stats_tracker
+from areal.utils.episode_turns import record_episode_turns
 
 if TYPE_CHECKING:
     from areal.api.engine_api import InferenceEngine
@@ -130,6 +132,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         remove_session: bool = True,
         export_session_ids: list[str] | None = None,
         min_usable_group_size: int = 1,
+        session_metadata: dict[str, dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "session_ids": session_ids,
@@ -144,9 +147,21 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "is_eval": workflow_context.get().is_eval,
             "min_usable_group_size": min_usable_group_size,
         }
+        if session_metadata is not None:
+            payload["session_metadata"] = session_metadata
         if export_session_ids is not None:
             payload["export_session_ids"] = export_session_ids
-        data = await self._request_export(session, payload)
+        observations = {}
+        try:
+            data = await self._request_export(session, payload)
+            observations = data.get("episode_turns") or {}
+        finally:
+            for sid in dict.fromkeys(session_ids):
+                record_episode_turns(
+                    observations.get(sid),
+                    (session_metadata or {}).get(sid),
+                    require_status=True,
+                )
         traj = deserialize_value(data["traj"])
         if data.get("prm_stats") is not None:
             from pydantic import TypeAdapter
@@ -168,6 +183,30 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             return await resp.json()
+
+    async def _get_agent_episode_metadata(self) -> dict[str, str]:
+        """Read bounded classification fields in the completing session's context."""
+        getter = getattr(self.agent, "get_episode_metadata", None)
+        if not callable(getter):
+            return {}
+        try:
+            metadata = getter()
+            if inspect.isawaitable(metadata):
+                metadata = await metadata
+            if not isinstance(metadata, dict):
+                raise TypeError("get_episode_metadata must return a dict")
+            # Only these string-valued fields are needed for turn classification;
+            # do not serialize arbitrary agent state in the export request.
+            return {
+                key: metadata[key]
+                for key in ("arena_status", "harness_outcome_code")
+                if isinstance(metadata.get(key), str)
+            }
+        except Exception:
+            logger.warning(
+                "Failed to collect optional agent episode metadata.", exc_info=True
+            )
+            return {}
 
     async def arun_episode(
         self,
@@ -205,6 +244,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
 
         assert self.agent is not None
         http_client = await workflow_context.get_httpx_client()
+        session_metadata: dict[str, dict[str, str]] = {}
 
         async def _run_one(
             member_index: int,
@@ -270,6 +310,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                 # retries. Group export still handles session cleanup.
                 return None
             finally:
+                session_metadata[session_id] = await self._get_agent_episode_metadata()
                 logger.debug(
                     "V2 rollout member finish: task_id=%s group_id=%s member=%d "
                     "session_id=%s version=%s mode=%s",
@@ -303,6 +344,14 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             for session_id, result in zip(session_ids, results)
             if result is not None
         ]
+        tracker = stats_tracker.get(workflow_context.stat_scope())
+        for reward in results:
+            if reward is not None:
+                tracker.scalar(reward=reward)
+        tracker.scalar(
+            incomplete_trajectories=len(sessions) - len(successful_session_ids),
+            incomplete_group=float(len(successful_session_ids) < len(sessions)),
+        )
         n_succeeded = len(successful_session_ids)
         n_failed = len(sessions) - n_succeeded
         discard_group = n_failed > 0 and self.drop_incomplete_group
@@ -314,6 +363,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "group_id": group_id,
             "discard_trajectory": discard_group,
         }
+        if any(session_metadata.values()):
+            export_kwargs["session_metadata"] = session_metadata
         if not discard_group and len(sessions) > 1:
             export_kwargs["export_session_ids"] = successful_session_ids
             export_kwargs["min_usable_group_size"] = (
@@ -346,11 +397,6 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             )
         if not traj:
             return None
-
-        tracker = stats_tracker.get(workflow_context.stat_scope())
-        for r in results:
-            if r is not None:
-                tracker.scalar(reward=r)
 
         return traj
 
