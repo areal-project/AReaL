@@ -490,10 +490,9 @@ def test_mean_leave1out_single_element():
 
     normalized = adv_norm(advantages, loss_mask)
 
-    # With single element, leave-one-out should return zero (no other elements to compute mean)
-    assert torch.allclose(
-        normalized, torch.tensor([[5.0]])
-    )  # Should remain unchanged since mean=0
+    # With a single element there is no peer to leave out, so it becomes its own
+    # baseline and normalizes to zero (same rule as a singleton group).
+    assert torch.allclose(normalized, torch.tensor([[0.0]]))
 
 
 def test_mean_leave1out_with_mask():
@@ -839,9 +838,9 @@ def test_mask_edge_cases():
 
     normalized = adv_norm(advantages, loss_mask)
     assert torch.isfinite(normalized).all()
-    # With single effective element, leave-one-out mean is 0, std is 1 (for stability)
-    # So result should be approximately (original_value - 0) / 1 = original_value
-    assert torch.allclose(normalized[0, 0], torch.tensor(1.0), atol=1e-4)
+    # With a single effective element there is no peer to leave out, so it becomes its
+    # own baseline and normalizes to zero, matching the singleton-group behaviour.
+    assert torch.allclose(normalized[0, 0], torch.tensor(0.0), atol=1e-4)
 
     # Test with no elements masked (all zeros mask)
     loss_mask = torch.zeros_like(advantages)
