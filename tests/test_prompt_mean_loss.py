@@ -282,7 +282,7 @@ def test_m2_mask_narrows_numerator_but_preserves_original_denominator():
 
     with (
         patch(
-            "areal.trainer.ppo.actor._apply_m2po_masking",
+            "areal.trainer.ppo.policy_loss._apply_m2po_masking",
             return_value=filtered_mask,
         ),
         patch("areal.trainer.ppo.actor.stats_tracker"),

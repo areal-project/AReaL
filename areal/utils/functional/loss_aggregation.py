@@ -11,7 +11,9 @@ from typing import Literal, Protocol
 
 import torch
 
-LossAggregationMode = Literal["token_mean", "seq_mean", "prompt_mean", "constant"]
+LossAggregationMode = Literal[
+    "token_mean", "seq_mean", "prompt_mean", "constant", "turn_mean"
+]
 GroupSizes = Sequence[int]
 
 
@@ -227,3 +229,24 @@ def _reduce_unit_means(
         torch.zeros_like(numerator),
     )
     return unit_means.sum() / active.count_nonzero().clamp_min(1)
+
+
+@dataclass(frozen=True, slots=True)
+class TurnMean:
+    """Average supported-token means over original active turns."""
+
+    token_weights: torch.Tensor
+    turn_counts: torch.Tensor
+
+    def normalizer(self) -> torch.Tensor:
+        return self.turn_counts.sum()
+
+    def aggregate(
+        self, loss: torch.Tensor, numerator_mask: torch.Tensor
+    ) -> torch.Tensor:
+        if loss.shape != numerator_mask.shape or loss.shape != self.token_weights.shape:
+            raise ValueError("Turn weights, loss and mask must have matching shapes")
+        numerator = (
+            torch.where(numerator_mask.bool(), loss, 0).float() * self.token_weights
+        ).sum()
+        return numerator / self.normalizer().clamp_min(1)

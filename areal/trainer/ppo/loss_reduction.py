@@ -11,6 +11,7 @@ from typing import Any, Protocol
 import torch
 import torch.distributed as dist
 
+from areal.trainer.ppo.turn_utils import count_active_turns, inverse_turn_lengths
 from areal.utils.data import TRANSPORT_DUMMY_KEY, get_batch_size
 from areal.utils.functional.loss_aggregation import (
     ConstantLength,
@@ -20,10 +21,12 @@ from areal.utils.functional.loss_aggregation import (
     PromptMean,
     SequenceMean,
     TokenMean,
+    TurnMean,
 )
 
 PG_TOKEN_WEIGHTS = "_pg_token_weights"
-_MODES = ("token_mean", "seq_mean", "prompt_mean", "constant")
+PG_TURN_COUNTS = "_pg_turn_counts"
+_MODES = ("token_mean", "seq_mean", "prompt_mean", "constant", "turn_mean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +73,7 @@ class _IndependentSteps:
 @dataclass(frozen=True, slots=True)
 class _PromptMeanBatch:
     local_active_groups: torch.Tensor
+    allow_empty_groups: bool = False
 
     def for_steps(
         self,
@@ -108,11 +112,11 @@ class _PromptMeanBatch:
         if dist.is_initialized():
             dist.all_reduce(counts, group=dp_group)
         active_groups, *global_rows = counts.cpu().tolist()
-        if active_groups == 0:
+        if active_groups == 0 and not self.allow_empty_groups:
             raise ValueError("Prompt mean requires active prompt groups in the update.")
         if any(rows <= 0 for rows in global_rows):
             raise ValueError("Every optimizer step must contain real responses.")
-        step_scale = len(microbatches) / active_groups
+        step_scale = len(microbatches) / active_groups if active_groups else 0.0
         return [
             PreparedLossStep(
                 functools.partial(
@@ -129,6 +133,7 @@ def prepare_policy_gradient_batch(
     mode: LossAggregationMode,
     divisor: float | None = None,
     group_sizes: GroupSizes | None = None,
+    allow_empty_groups: bool = False,
 ) -> PreparedLossBatch:
     """Prepare loss metadata before response-level splitting.
 
@@ -151,6 +156,14 @@ def prepare_policy_gradient_batch(
     if mode == "seq_mean":
         return _IndependentSteps(PreparedLossStep(_bind_sequence_mean))
     mask = data["loss_mask"].bool()
+    if mode == "turn_mean":
+        if "turn_ids" not in data:
+            raise ValueError("turn_mean requires token-aligned rollout turn_ids")
+        ids = torch.roll(data["turn_ids"], shifts=-1, dims=-1)
+        ids[..., -1] = -1
+        data[PG_TOKEN_WEIGHTS] = inverse_turn_lengths(mask, ids)
+        data[PG_TURN_COUNTS] = count_active_turns(mask, ids, require_nonempty=False)
+        return _IndependentSteps(PreparedLossStep(_bind_turn_mean))
     if mask.ndim != 2:
         raise ValueError("Preparing prompt mean requires a 2D loss_mask.")
     if group_sizes is None:
@@ -171,7 +184,7 @@ def prepare_policy_gradient_batch(
     counts = torch.zeros(len(sizes), dtype=torch.int64, device=mask.device)
     counts.scatter_add_(0, ids, mask.sum(dim=-1, dtype=torch.int64))
     data[PG_TOKEN_WEIGHTS] = mask.float() / counts[ids].unsqueeze(-1).clamp_min(1)
-    return _PromptMeanBatch(counts.count_nonzero())
+    return _PromptMeanBatch(counts.count_nonzero(), allow_empty_groups)
 
 
 def _bind_token_mean(data: dict[str, Any]) -> TokenMean:
@@ -199,3 +212,7 @@ def _bind_prompt_mean(
         )
     rows = 0 if data.get(TRANSPORT_DUMMY_KEY) is True else get_batch_size(data)
     return PromptMean(weights, step_scale, rows / global_rows)
+
+
+def _bind_turn_mean(data: dict[str, Any]) -> TurnMean:
+    return TurnMean(data[PG_TOKEN_WEIGHTS], data[PG_TURN_COUNTS])

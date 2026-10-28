@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -39,6 +39,8 @@ def mopd_loss_fn(
     loss_mask: torch.Tensor,
     normalization_mask: torch.Tensor | None = None,
     importance_ratio_cap: float = DEFAULT_MOPD_IMPORTANCE_RATIO_CAP,
+    *,
+    reduction: Literal["mean", "none"] = "mean",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute a truncated-IS multi-teacher reverse-KL surrogate.
 
@@ -48,6 +50,8 @@ def mopd_loss_fn(
     ratio is capped with a stop-gradient weight to prevent exponential
     overflow while retaining the score-function gradient.
     """
+    if reduction not in {"mean", "none"}:
+        raise ValueError("MOPD reduction must be mean or none")
     if (
         not isinstance(importance_ratio_cap, (int, float))
         or isinstance(importance_ratio_cap, bool)
@@ -127,7 +131,7 @@ def mopd_loss_fn(
         ),
         "reverse_kl": torch.where(mask, reverse_kl, torch.zeros_like(reverse_kl)),
     }
-    return loss, stats
+    return (masked_per_token_loss if reduction == "none" else loss), stats
 
 
 def compose_mopd_loss(
