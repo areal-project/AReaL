@@ -1001,6 +1001,17 @@ def grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
+    # Legacy single-teacher on-policy distillation inputs
+    teacher_logp = input_data.get("teacher_logp")
+    rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
+    distill_loss_weight = input_data.get("distill_loss_weight", 0.005)
+    pure_distill = teacher_logp is not None and rl_loss_weight == 0
+    if pure_distill:
+        # Pure KD: the per-token reverse-KL reward log pi_T - log pi_theta replaces
+        # the task advantage, so the policy loss below clips its importance ratio
+        # and applies rejection sampling exactly as it does for RL.
+        advantages = (teacher_logp.detach() - logprobs.detach()) * loss_mask
+
     # Score centering uses the explicit REINFORCE surrogate, not clipped PPO.
     if use_score_centering:
         if sc_correction is None:
@@ -1081,7 +1092,6 @@ def grpo_loss_fn(
 
     # Multi-teacher on-policy distillation. Legacy single-teacher numerators
     # retain their post-M2, pre-rejection mask; both use the original denominator.
-    teacher_logp = input_data.get("teacher_logp")
     mopd_teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
     rkl_stat = None
     mopd_stats = {}
@@ -1115,28 +1125,19 @@ def grpo_loss_fn(
         if mopd_loss_config.distillation_coefficient != 0:
             raise RuntimeError("MOPD distillation is enabled but targets are missing")
         loss = mopd_loss_config.rl_coefficient * loss
+    elif pure_distill:
+        loss = distill_loss_weight * loss
+        rkl_stat = -advantages
     elif teacher_logp is not None:
-        rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
-        distill_loss_weight = input_data.get("distill_loss_weight", 0.005)
-        teacher_logp = teacher_logp.detach()
-
-        if rl_loss_weight == 0:
-            rkl_reward = teacher_logp - logprobs.detach()
-            importance_weight = torch.exp(logprobs - old_logp)
-            rkl_weighted_term = importance_weight * rkl_reward * loss_mask
-            loss = (
-                -distill_loss_weight
-                * rkl_weighted_term.sum()
-                / denominator_mask.sum().clamp(min=1)
-            )
-            rkl_stat = -rkl_weighted_term
-        else:
-            rkl_penalty_per_token = (logprobs - teacher_logp) * loss_mask
-            rkl_penalty = rkl_penalty_per_token.sum() / denominator_mask.sum().clamp(
-                min=1
-            )
-            loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
-            rkl_stat = rkl_penalty_per_token
+        # KDRL joint loss. The teacher term of log pi_theta - log pi_T is constant,
+        # so backpropagating it drops the teacher. The k2 estimate
+        # 0.5 * (log pi_theta - log pi_T)^2 has the reverse-KL gradient
+        # (log pi_theta - log pi_T) * grad log pi_theta on student samples.
+        log_ratio = logprobs - teacher_logp.detach()
+        rkl_penalty = (0.5 * log_ratio.square() * loss_mask).sum()
+        rkl_penalty = rkl_penalty / denominator_mask.sum().clamp(min=1)
+        loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
+        rkl_stat = log_ratio.detach() * loss_mask
 
     # Match the engine's aggregation across microbatches and data-parallel ranks.
     stats_tracker.weighted_mean(
