@@ -298,10 +298,50 @@ class VLLMBackend:
             endpoint = "/wake_up"
         return HttpRequest(endpoint=endpoint, payload={}, method="POST")
 
+    def _consume_colocation_placement(
+        self, server_args: dict[str, Any], env: dict[str, str]
+    ) -> dict[str, Any]:
+        """Drop colocation keys that vLLM's server parser rejects.
+
+        The rollout controller adds ``base_gpu_id``, ``nccl_port`` and
+        ``_awex_gpus_per_server`` for every colocated backend. SGLang consumes
+        them. Passing them through ``get_py_cmd`` produces
+        ``--base-gpu-id``, ``--nccl-port`` and ``---awex-gpus-per-server``,
+        and vLLM exits 2 with ``unrecognized arguments``. ``nccl_port`` becomes
+        ``VLLM_PORT`` for the server's distributed init. A forked local worker
+        is already pinned to one device, so that pin is left alone. An
+        unpinned process gets the same placement through the device-visibility
+        variable instead of a flag this vLLM build does not have.
+        """
+        args = dict(server_args)
+        gpus_per_server = args.pop("_awex_gpus_per_server", None)
+        base_gpu_id = args.pop("base_gpu_id", None)
+        nccl_port = args.pop("nccl_port", None)
+        if nccl_port is not None and not env.get("VLLM_PORT"):
+            # The per-replica reserved port; vLLM otherwise probes a random
+            # port and races the other replicas starting on the node.
+            env["VLLM_PORT"] = str(nccl_port)
+        if gpus_per_server is not None:
+            slurm_localid = env.get("SLURM_LOCALID")
+            if slurm_localid not in (None, ""):
+                base_gpu_id = int(slurm_localid) * int(gpus_per_server)
+        if base_gpu_id is None:
+            return args
+        visible_var = current_platform.device_control_env_var or "CUDA_VISIBLE_DEVICES"
+        visible = env.get(visible_var, "")
+        visible_ids = [part for part in visible.split(",") if part.strip()]
+        if len(visible_ids) == 1:
+            return args
+        width = int(gpus_per_server or 1)
+        start = int(base_gpu_id)
+        env[visible_var] = ",".join(str(start + offset) for offset in range(width))
+        return args
+
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch vLLM server subprocess."""
-        cmd = vLLMConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
+        server_args = self._consume_colocation_placement(server_args, _env)
+        cmd = vLLMConfig.build_cmd_from_args(server_args)
 
         logger.info(f"Launching vLLM server with command: {' '.join(cmd)}")
         return subprocess.Popen(

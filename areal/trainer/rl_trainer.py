@@ -688,7 +688,20 @@ class PPOTrainer:
         self, meta: WeightUpdateMeta, new_version: int
     ) -> None:
         """Update weights, publish their version, and discard stale AWEX requests."""
-        self.actor.update_weights(meta)
+        # A colocated SGLang server is fully released here, and
+        # /update_weights_from_disk loads in place into the released pool.
+        wake_rollout_weights = (
+            self._should_offload_rollout
+            and meta.type == "disk"
+            and self.rollout_alloc.backend == "sglang"
+        )
+        if wake_rollout_weights:
+            self.rollout.onload(tags=["weights"])
+        try:
+            self.actor.update_weights(meta)
+        finally:
+            if wake_rollout_weights:
+                self.rollout.offload(tags=["weights"])
 
         self.actor.set_version(new_version)
         if self.critic is not None:
@@ -1682,6 +1695,14 @@ class PPOTrainer:
                 # teachers and the actor, so this is a correctness requirement
                 # rather than an optional inference tuning flag.
                 server_args["enable_memory_saver"] = True
+            elif self._should_offload_rollout and server_args.get(
+                "enable_memory_saver", False
+            ):
+                # Non-AWEX colocation releases every SGLang memory region each
+                # step and resumes it before the next rollout. Without a CPU
+                # backup the resumed weights pool is uninitialized, and the
+                # rollout samples from garbage (vLLM's level-1 sleep keeps one).
+                server_args["enable_weights_cpu_backup"] = True
         elif rollout_backend == "vllm":
             if self.config.rollout.return_routed_experts:
                 raise ValueError(

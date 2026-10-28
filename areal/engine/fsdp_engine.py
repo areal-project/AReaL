@@ -370,6 +370,11 @@ class FSDPEngine(TrainEngine):
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
+        # Offloaded (TMS-paused) device memory cannot back new allocations, so
+        # RPC payloads are broadcast over this gloo mirror of ``mp_group`` while
+        # the engine is offloaded (see ``resolve_broadcast_target``).
+        self._cpu_model_parallel_group = self._new_gloo_mirror(self.mp_group)
+
         self.dp_head = dist.get_process_group_ranks(self.mp_group)[0]
         self.dp_rank = dist.get_rank(self.dp_group)
 
@@ -524,6 +529,27 @@ class FSDPEngine(TrainEngine):
     @property
     def context_and_model_parallel_group(self) -> dist.ProcessGroup:
         return self.mp_group
+
+    @property
+    def cpu_model_parallel_group(self) -> dist.ProcessGroup | None:
+        return getattr(self, "_cpu_model_parallel_group", None)
+
+    def _new_gloo_mirror(self, group: dist.ProcessGroup) -> dist.ProcessGroup:
+        # new_group is collective over the world: every rank creates every
+        # distinct mirror in the same order and keeps the one it belongs to.
+        all_ranks: list[list[int] | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(
+            all_ranks, dist.get_process_group_ranks(group), group=self._cpu_group
+        )
+        mine = None
+        for ranks in sorted({tuple(r) for r in all_ranks}):
+            mirror = dist.new_group(
+                list(ranks), timeout=DIST_GROUP_DEFAULT_TIMEOUT, backend="gloo"
+            )
+            if dist.get_rank() in ranks:
+                mine = mirror
+        assert mine is not None
+        return mine
 
     @property
     def cpu_group(self) -> dist.ProcessGroup:
@@ -1029,6 +1055,10 @@ class FSDPEngine(TrainEngine):
             raise RuntimeError(
                 "torch_memory_saver requires `enable_offload=True` in yaml config."
             )
+        # Colocated trainers offload the actor before rollout init and again in
+        # the initial offload policy; a second TMS pause calls exit(1).
+        if self.is_offload:
+            return
 
         self.get_device_stats().log("before offload model")
 
@@ -1047,6 +1077,8 @@ class FSDPEngine(TrainEngine):
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/fsdp_utils/actor.py
         """
+        if not self.is_offload:
+            return
 
         torch_memory_saver.resume()
 
