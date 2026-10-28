@@ -12,6 +12,7 @@ from areal.experimental.openai import InteractionWithTokenLogpReward
 from areal.infra import dist_rollout, workflow_context
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
+from areal.utils import stats_tracker
 
 
 class _ListWorkflow(RolloutWorkflow):
@@ -126,7 +127,7 @@ async def test_grouped_rollout_workflow_drops_incomplete_group():
     result = await workflow.arun_episode(engine=None, data={})
 
     assert result is None
-    assert "dropping entire group" in logger.messages[0]
+    assert any("dropping entire group" in message for message in logger.messages)
 
 
 @pytest.mark.asyncio
@@ -454,3 +455,27 @@ async def test_group_metrics_observe_rewards_before_normalization():
     assert metrics == [[0.0, 1.0]]
     assert result["first"].reward == pytest.approx(-1.0)
     assert result["second"].reward == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_incomplete_group_metrics_include_complete_groups_in_denominator():
+    """A complete group contributes zero to failure counts and rates."""
+    stats_tracker.get("rollout").export()
+    workflow = GroupedRolloutWorkflow(
+        _ListWorkflow(
+            [
+                {"a": _interaction(1.0)},
+                {"b": _interaction(2.0)},
+                {"c": _interaction(1.0)},
+                None,
+            ]
+        ),
+        group_size=2,
+        logger=_Logger(),
+    )
+    await workflow.arun_episode(engine=None, data={})
+    await workflow.arun_episode(engine=None, data={})
+    stats = stats_tracker.get("rollout").export()
+    assert stats["rollout/incomplete_trajectories"] == 0.5
+    assert stats["rollout/incomplete_group"] == 0.5
+    assert stats["rollout/incomplete_group__count"] == 2

@@ -37,6 +37,8 @@ class ArenaTaskResult:
     artifacts_uri: str | None = None
     trace_id: str | None = None
     computed_at: str | None = None
+    # Optional telemetry is validated separately from the authoritative score.
+    sub_scores: Any = None
 
 
 def _arena_task_type_from_tags(tags: Any) -> str:
@@ -71,6 +73,7 @@ class ArenaTaskFailedError(ArenaAPIError):
         self.payload = dict(payload or {})
         self.result = result
         self.harness_result: dict[str, Any] | None = None
+        self.whitebox_lifecycle: dict[str, Any] | None = None
         super().__init__(f"Arena task {task_id!r} failed with {status}")
 
 
@@ -228,6 +231,7 @@ def _parse_task_result(
         artifacts_uri=_optional_string(result_payload, "artifacts_uri"),
         trace_id=_optional_string(result_payload, "trace_id"),
         computed_at=_optional_string(result_payload, "computed_at"),
+        sub_scores=result_payload.get("sub_scores"),
     )
 
 
@@ -322,8 +326,28 @@ class ArenaOpenAPIClient:
     ) -> dict[str, Any]:
         """Fetch the terminal Harness receipt for one failed task."""
 
+        return await self._get_failure_artifact_async(
+            task_id, "harness_result.json", client=client, timeout=timeout
+        )
+
+    async def get_whitebox_lifecycle_async(
+        self, task_id: str, *, client: httpx.AsyncClient, timeout: float
+    ) -> dict[str, Any]:
+        """Fetch the bridge supervisor receipt without inferring from exit codes."""
+        return await self._get_failure_artifact_async(
+            task_id, "whitebox-lifecycle.json", client=client, timeout=timeout
+        )
+
+    async def _get_failure_artifact_async(
+        self,
+        task_id: str,
+        artifact: Literal["harness_result.json", "whitebox-lifecycle.json"],
+        *,
+        client: httpx.AsyncClient,
+        timeout: float,
+    ) -> dict[str, Any]:
         encoded_task_id = quote(task_id, safe="")
-        url = f"{self.base_url}/api/artifacts/{encoded_task_id}/harness_result.json"
+        url = f"{self.base_url}/api/artifacts/{encoded_task_id}/{artifact}"
         response = await self._async_request(
             client, "GET", url, headers=self._headers, timeout=timeout
         )
@@ -434,6 +458,37 @@ class ArenaOpenAPIClient:
         if not isinstance(items, list):
             raise ArenaAPIError("Stream list response is missing an 'items' array")
         return [dict(item) for item in items if isinstance(item, Mapping)]
+
+    def get_published_version(
+        self,
+        kind: Literal["envs", "rewards", "harnesses"],
+        key: str,
+        version: str,
+        *,
+        client: httpx.Client | None = None,
+    ) -> dict[str, Any]:
+        """Read an exact published Env, reward, or Harness version for startup pinning."""
+        if kind not in {"envs", "rewards", "harnesses"}:
+            raise ValueError(f"Unsupported Arena version kind: {kind!r}")
+        response = self._sync_request(
+            "GET",
+            f"{self.base_url}/openapi/v1/{kind}/{quote(key, safe='')}/versions/"
+            f"{quote(version, safe='')}",
+            client=client,
+            headers=self._headers,
+        )
+        payload = _response_json(response)
+        if isinstance(payload, Mapping) and "data" in payload:
+            payload = payload["data"]
+        if not isinstance(payload, Mapping) or (
+            payload.get("key"),
+            payload.get("version"),
+            payload.get("status"),
+        ) != (key, version, "PUBLISHED"):
+            raise ArenaAPIError(
+                f"Arena {kind} {key}@{version} did not return the exact PUBLISHED version"
+            )
+        return dict(payload)
 
     def resolve_stream(
         self,
@@ -926,6 +981,7 @@ class ArenaOpenAPIClient:
         *,
         session_id: str = "",
         harness: str = "",
+        reward: str = "",
         task_envs: Mapping[str, str] | None = None,
         experiment: str = "",
         metadata: Mapping[str, str] | None = None,
@@ -947,6 +1003,7 @@ class ArenaOpenAPIClient:
             proxy_api_key=proxy_api_key,
             session_id=session_id,
             harness=harness,
+            reward=reward,
             task_envs=task_envs,
             experiment=experiment,
             metadata=metadata,
@@ -967,6 +1024,7 @@ class ArenaOpenAPIClient:
         *,
         session_id: str = "",
         harness: str = "",
+        reward: str = "",
         task_envs: Mapping[str, str] | None = None,
         experiment: str = "",
         metadata: Mapping[str, str] | None = None,
@@ -1006,6 +1064,8 @@ class ArenaOpenAPIClient:
             request["session_id"] = session_id
         if harness:
             request["harness"] = harness
+        if reward:
+            request["reward"] = reward
         if experiment:
             request["experiment"] = experiment
         if launch_metadata:

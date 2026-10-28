@@ -1669,7 +1669,10 @@ class RolloutControllerV2:
 
     def export_stats(self) -> dict[str, float]:
         """Export and reset statistics recorded by the local workflow executor."""
-        return stats_tracker.export_all()
+        stats = stats_tracker.export_all()
+        if self._workflow_executor is not None:
+            stats.update(self._workflow_executor.consumed_metrics.export())
+        return stats
 
     def config_perf_tracer(self, config: Any = None, role: str = "") -> None:
         """No-op — gateway does not have per-worker perf tracing."""

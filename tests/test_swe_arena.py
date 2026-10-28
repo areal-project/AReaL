@@ -3,11 +3,12 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
-from examples.swe.arena_agent import ArenaStreamAgentWorkflow
+from examples.swe.arena_agent import ArenaStreamAgentWorkflow, _ArenaTaskWaitTimeout
 from examples.swe.arena_client import (
     ArenaAPIError,
     ArenaOpenAPIClient,
@@ -42,7 +43,16 @@ def _reset_stats() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_harness_result_fetches_authenticated_terminal_artifact(monkeypatch):
+@pytest.mark.parametrize(
+    "artifact, method",
+    [
+        ("harness_result.json", "get_harness_result_async"),
+        ("whitebox-lifecycle.json", "get_whitebox_lifecycle_async"),
+    ],
+)
+async def test_get_harness_result_fetches_authenticated_terminal_artifact(
+    monkeypatch, artifact, method
+):
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
     task_id = "job:env:0"
     receipt = {
@@ -56,15 +66,13 @@ async def test_get_harness_result_fetches_authenticated_terminal_artifact(monkey
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/artifacts/job:env:0/harness_result.json"
+        assert request.url.path == f"/api/artifacts/job:env:0/{artifact}"
         assert request.headers["Authorization"] == "Bearer test-token"
         return httpx.Response(200, json=receipt)
 
     client = ArenaOpenAPIClient(base_url="https://arena.example")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-        actual = await client.get_harness_result_async(
-            task_id, client=http_client, timeout=5.0
-        )
+        actual = await getattr(client, method)(task_id, client=http_client, timeout=5.0)
     assert actual == receipt
 
 
@@ -1960,14 +1968,27 @@ def test_agent_records_arena_terminal_failure_metrics(monkeypatch):
     assert stats["rollout/arena/call_success__count"] == 1
 
 
-def test_agent_timeout_logs_task_and_data_ids(monkeypatch):
+@pytest.mark.parametrize(
+    "failure,task_id",
+    [
+        ("deadline", "task-123"),
+        ("deadline", None),
+        ("before_launch", None),
+        ("client", "task-123"),
+        ("cancel", "task-123"),
+    ],
+)
+def test_agent_timeout_preserves_failure_scope(monkeypatch, failure, task_id):
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "test-llm-key")
     _reset_stats()
     workflow = ArenaStreamAgentWorkflow(
-        econfig={"arena_base_url": "https://arena.example", "timeout": 0.01}
+        econfig={"arena_base_url": "https://arena.example", "timeout": 0.01},
+        reject_terminal_task_failures=True,
     )
+    workflow._dump_task_result = AsyncMock()
     warnings: list[tuple[str, tuple[object, ...]]] = []
+    inner_error = TimeoutError("client poll timed out")
 
     async def register_proxy(**_kwargs):
         return (
@@ -1976,7 +1997,12 @@ def test_agent_timeout_logs_task_and_data_ids(monkeypatch):
         )
 
     async def launch_task(*, on_launch_success, **_kwargs):
-        on_launch_success("task-123")
+        if failure != "before_launch":
+            on_launch_success(task_id)
+        if failure == "client":
+            raise inner_error
+        if failure == "cancel":
+            raise asyncio.CancelledError
         await asyncio.Event().wait()
 
     async def delete_proxy(*_args, **_kwargs):
@@ -1999,15 +2025,45 @@ def test_agent_timeout_logs_task_and_data_ids(monkeypatch):
                 arena_http_client=http_client,
             )
 
-    with pytest.raises(TimeoutError):
+    expected_type = asyncio.CancelledError if failure == "cancel" else TimeoutError
+    with pytest.raises(expected_type) as caught:
         asyncio.run(run_agent())
 
-    assert warnings == [
-        (
-            "Arena task wait timed out: task_id=%s data_id=%s timeout_seconds=%s",
-            ("task-123", "data-456", 0.01),
+    is_local_task_timeout = failure == "deadline" and task_id is not None
+    assert isinstance(caught.value, _ArenaTaskWaitTimeout) == is_local_task_timeout
+    if failure != "cancel":
+        assert (
+            workflow.should_reject_failed_sample(caught.value, "system_failure_reject")
+            == is_local_task_timeout
         )
-    ]
+    if failure == "client":
+        assert caught.value is inner_error
+        assert warnings == []
+    elif failure == "cancel":
+        assert warnings == [
+            (
+                "Arena task wait cancelled locally: task_id=%s data_id=%s",
+                ("task-123", "data-456"),
+            )
+        ]
+    else:
+        assert warnings == [
+            (
+                "Arena task wait timed out: task_id=%s data_id=%s timeout_seconds=%s",
+                (task_id or "unknown", "data-456", 0.01),
+            )
+        ]
+    if task_id and failure != "client":
+        workflow._dump_task_result.assert_awaited_once()
+        dump = workflow._dump_task_result.await_args
+        assert dump.args[2].task_id == task_id
+        assert dump.args[2].status == (
+            "LOCAL_WAIT_CANCELLED" if failure == "cancel" else "LOCAL_WAIT_TIMEOUT"
+        )
+        assert dump.args[2].score is None
+        assert dump.kwargs["training_score"] is None
+    else:
+        workflow._dump_task_result.assert_not_awaited()
 
 
 def test_agent_cleanup_failure_does_not_mask_registration_failure(monkeypatch):

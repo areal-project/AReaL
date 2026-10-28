@@ -180,6 +180,19 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         results = [result if result else None for result in completed_results]
         valid_results = [r for r in results if r is not None]
         usable_slot_count = len(valid_results)
+        failed_slot_count = self.group_size - usable_slot_count
+        is_incomplete = failed_slot_count > 0
+        if is_incomplete:
+            self.logger.warning(
+                "GroupedRolloutWorkflow: "
+                f"{failed_slot_count}/{self.group_size} trajectories are incomplete"
+            )
+        # Include complete groups in the denominator, rather than reporting
+        # a conditional mean over incomplete groups only.
+        stats_tracker.get(workflow_context.stat_scope()).scalar(
+            incomplete_trajectories=failed_slot_count,
+            incomplete_group=float(is_incomplete),
+        )
 
         interaction_group = not valid_results or all(
             isinstance(result, dict)
@@ -1496,6 +1509,18 @@ class RemoteInfEngine(InferenceEngine):
         return self.workflow_executor.wait(
             count, timeout=timeout, raise_timeout=raise_timeout
         )
+
+    def get_rollout_result(
+        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+    ) -> dict[str, Any] | None:
+        """Transfer a result and its metrics without consuming them on the worker."""
+        result = self.workflow_executor.dispatcher.wait_for_task(
+            task_id, timeout, raise_timeout, consume=False, raise_terminal_error=False
+        )
+        if result is None or isinstance(result, WorkflowContractFailure):
+            return result
+        # Keep tensors inside plain containers for RPC RTensor.remotize.
+        return {"trajectory": result.trajectory, "metrics": result.metrics}
 
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True

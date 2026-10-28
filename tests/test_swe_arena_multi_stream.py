@@ -49,6 +49,7 @@ def test_load_arena_stream_configs_preserves_reward_specs(tmp_path, source):
             },
             "reward_threshold": 0.98,
             "reward_transform_fn": "examples.swe.reward_transforms.astra_partial_reward",
+            "dataset_snapshot_file": " /snapshots/astra.json ",
         },
         {
             "name": "tbench",
@@ -78,6 +79,8 @@ def test_load_arena_stream_configs_preserves_reward_specs(tmp_path, source):
     )
     assert streams[0].task_envs == {"COMMON": "1"}
     assert streams[1].reward_transform_fn == ""
+    assert streams[0].dataset_snapshot_file == "/snapshots/astra.json"
+    assert streams[1].dataset_snapshot_file == ""
 
 
 @pytest.mark.parametrize("source", ["file", "base64"])
@@ -629,6 +632,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
             task_id="task-b",
             status="DONE",
             score=0.5,
+            sub_scores={"quality": 0.25},
             raw={"exit_code": 0, "reward_txt": "ok"},
             trace_id="trace-b",
         )
@@ -671,10 +675,13 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
     assert stats["rollout/training_score"] == pytest.approx(0.75)
     assert stats["rollout/arena_raw_present"] == 1.0
     assert stats["rollout/stream/b/arena_score"] == pytest.approx(0.5)
+    assert stats["rollout/reward_sub_score/quality"] == pytest.approx(0.25)
+    assert stats["rollout/stream/b/reward_sub_score/quality"] == pytest.approx(0.25)
     dump_files = list((tmp_path / "arena-results").glob("arena_results_*.jsonl"))
     assert len(dump_files) == 1
     dump_record = json.loads(dump_files[0].read_text(encoding="utf-8"))
     assert dump_record["raw"] == {"exit_code": 0, "reward_txt": "ok"}
+    assert dump_record["sub_scores"] == {"quality": 0.25}
     assert dump_record["expected_reward_ref"] == {
         "key": "reward-b",
         "version": "2",
@@ -922,6 +929,11 @@ def _core_model_failure_error(
             "provider_length_stop",
             "model stopped with reason: length",
         ),
+        (
+            "LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED",
+            "provider_length_stop",
+            "provider terminal response includes final usage",
+        ),
     ],
 )
 def test_core_model_failure_with_matching_native_receipt_keeps_zero(
@@ -1041,8 +1053,13 @@ def test_core_context_budget_exhaustion_keeps_zero_with_matching_native_receipt(
     )
 
 
+@pytest.mark.parametrize(
+    "failure",
+    ["legacy_context", "current_context", "provider_context", "whitebox_deadline"],
+)
 def test_context_budget_failure_fetches_native_receipt_before_classification(
     monkeypatch,
+    failure,
 ):
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
@@ -1052,9 +1069,23 @@ def test_context_budget_failure_fetches_native_receipt_before_classification(
             "arena_streams": [{"name": "a", "stream_id": "stream-a"}],
         }
     )
-    error = _core_context_failure_error()
-    receipt = error.harness_result
-    error.harness_result = None
+    if failure == "whitebox_deadline":
+        workflow.stream_configs["a"].harness = "whitebox-unified-b-areal@0.1.0"
+        error = _whitebox_deadline_error()
+        receipt = error.whitebox_lifecycle
+        error.whitebox_lifecycle = None
+        fetch_method = "get_whitebox_lifecycle_async"
+    else:
+        error = (
+            _current_core_context_failure_error()
+            if failure == "current_context"
+            else _core_context_failure_error()
+        )
+        if failure == "provider_context":
+            error = _provider_context_failure_error()
+        receipt = error.harness_result
+        error.harness_result = None
+        fetch_method = "get_harness_result_async"
     fetched = []
 
     async def register(**_kwargs):
@@ -1073,7 +1104,7 @@ def test_context_budget_failure_fetches_native_receipt_before_classification(
 
     monkeypatch.setattr(workflow.client, "register_llm_proxy_async", register)
     monkeypatch.setattr(workflow.client, "launch_one_task_result", launch)
-    monkeypatch.setattr(workflow.client, "get_harness_result_async", get_receipt)
+    monkeypatch.setattr(workflow.client, fetch_method, get_receipt)
     monkeypatch.setattr(workflow.client, "delete_llm_proxy_async", delete)
 
     with pytest.raises(ArenaTaskFailedError) as caught:
@@ -2112,3 +2143,63 @@ def test_healthy_native_receipt_cannot_hide_explicit_system_failure(
         )
         == "unknown_failure_reject"
     )
+
+
+def _provider_context_failure_error(source="provider_stream"):
+    error = _core_context_failure_error()
+    outcome = {
+        "code": "LLM_CONTEXT_WINDOW_EXCEEDED",
+        "class": "agent",
+        "source": source,
+        "details": {
+            "code": "context_length_exceeded",
+            "errorShape": "object",
+            "errorType": "context_length_exceeded",
+            "eventType": "error",
+            "reason": None,
+        },
+    }
+    error.result.raw["outcome"] = outcome
+    error.harness_result["error"][0] = {
+        "message": "provider stream error: context_length_exceeded",
+        "outcome": outcome.copy(),
+    }
+    error.harness_result["raw"]["outcome"] = outcome.copy()
+    return error
+
+
+def _current_core_context_failure_error(reason="compaction is disabled"):
+    error = _core_context_failure_error()
+    details = {"estimatedTokens": 189066, "inputLimit": 188416, "reason": reason}
+    error.result.raw["outcome"]["details"] = details
+    for outcome in (
+        error.harness_result["error"][0]["outcome"],
+        error.harness_result["raw"]["outcome"],
+    ):
+        outcome["details"] = details.copy()
+    error.harness_result["error"][0]["message"] = (
+        f"context window limit exceeded: {reason} "
+        "(189066 estimated tokens / 188416 input tokens)"
+    )
+    return error
+
+
+def _whitebox_deadline_error():
+    error = _core_context_failure_error()
+    error.result = replace(
+        error.result,
+        raw={
+            "error": "harness agent phase exited with code 1",
+            "harness": {"phase": "agent", "exit_code": 1},
+        },
+    )
+    error.harness_result = None
+    error.whitebox_lifecycle = {
+        "schema": "whitebox-runner-lifecycle/v1",
+        "status": "INTERRUPTED",
+        "trigger": "BRIDGE_EXECUTION_DEADLINE",
+        "native_exit_code": -9,
+        "remaining_pids": [],
+        "native_receipt_synthesized": False,
+    }
+    return error

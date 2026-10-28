@@ -46,6 +46,7 @@ from areal.utils.data import cycle_dataloader
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.rollout_metrics import ConsumedMetrics
 
 from ..staleness_manager import StalenessManager
 from ..workflow_executor import (
@@ -171,6 +172,7 @@ class RolloutController:
         self.inf_engine = inf_engine
         self.config = config
         self.scheduler = scheduler
+        self.consumed_metrics = ConsumedMetrics()
 
         # Parse allocation from config.backend
         self.rollout_alloc = ModelAllocation.from_str(config.backend)
@@ -347,6 +349,11 @@ class RolloutController:
         ](
             max_queue_size=qsize,
             task_factory=self._create_submit_callback,
+            consume_result=lambda result: (
+                result
+                if isinstance(result, WorkflowContractFailure)
+                else self.consumed_metrics.consume(result)
+            ),
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
             terminal_error_fn=get_workflow_result_error,
@@ -1134,7 +1141,7 @@ class RolloutController:
                 # Fetch the result
                 result = await self.scheduler.async_call_engine(
                     worker.id,
-                    "_wait_for_task_result",
+                    "get_rollout_result",
                     engine_name=engine_name,
                     task_id=engine_task_id,
                     timeout=0.1,  # A short time to prevent blocking other requests
@@ -1146,7 +1153,7 @@ class RolloutController:
                     manager.on_rollout_rejected()
                     return result
 
-                traj = result
+                traj = result["trajectory"] if result is not None else None
                 if traj is not None:
                     traj = self._propagate_mopd_route(pending_task.mopd_route, traj)
                     manager.on_rollout_accepted()
@@ -1154,12 +1161,16 @@ class RolloutController:
                         logger.info(
                             f"Finish and accept rollout. {self._rollout_stats()}"
                         )
-                    return _RolloutResult(task_id=task_id, trajectory=traj)
+                    return _RolloutResult(
+                        task_id=task_id, trajectory=traj, metrics=result["metrics"]
+                    )
 
                 manager.on_rollout_rejected()
                 if self.config.enable_rollout_tracing:
                     logger.info(f"Finish but reject rollout. {self._rollout_stats()}")
-                return None
+                return _RolloutResult(
+                    task_id, None, result["metrics"] if result is not None else None
+                )
 
             except TimeoutError:
                 if task_id is not None:
@@ -1530,7 +1541,18 @@ class RolloutController:
             all_raw_stats += self._proxy_collective_rpc(
                 method="export_stats", http_timeout=60.0
             )
-        return _merge_worker_stats(all_raw_stats)
+        consumed = self.consumed_metrics.export()
+        merged = _merge_worker_stats([*all_raw_stats, consumed])
+        # Expose denominators for batch-aligned quality metrics.
+        merged.update(
+            {
+                k: v
+                for k, v in consumed.items()
+                if k.endswith("__count")
+                or k in {"rollout/reward_sample_count", "rollout/group_attempt_count"}
+            }
+        )
+        return merged
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
         async def _call():

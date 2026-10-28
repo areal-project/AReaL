@@ -26,6 +26,7 @@ parts:
     - file: best_practices/debugging
     - file: best_practices/handling_oom
     - file: best_practices/perf_profiling
+    - file: best_practices/fsdp_train_step_benchmark
   - caption: 定制指南
     chapters:
     - file: customization/dataset

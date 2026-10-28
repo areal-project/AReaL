@@ -9,7 +9,7 @@ import random
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, Protocol
 from collections.abc import Generator
 from collections import deque
@@ -30,6 +30,7 @@ from .async_task_runner import (
     TimedResult,
 )
 from .staleness_manager import StalenessManager
+from areal.utils.rollout_metrics import ConsumedMetrics, Metrics, capture_metrics
 from areal.infra import workflow_context
 from .workflow_context import WorkflowContext
 from areal.experimental.openai.types import (
@@ -246,7 +247,8 @@ class _RolloutTaskInput:
 @dataclass(frozen=True)
 class _RolloutResult:
     task_id: int
-    trajectory: dict[str, Any]
+    trajectory: dict[str, Any] | None
+    metrics: Metrics | None = None
 
 
 class WorkflowContractError(ValueError):
@@ -355,11 +357,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         enable_tracing: bool = False,
         terminal_error_fn: Callable[[TResult], Exception | None] | None = None,
         deterministic_order: bool = False,
+        consume_result: Callable[[TResult | None], TResult | None] | None = None,
     ):
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
             enable_tracing=enable_tracing,
         )
+        self.consume_result = consume_result or (lambda result: result)
         self.task_factory = task_factory
         self.staleness_manager = staleness_manager
         self.enable_tracing = enable_tracing
@@ -686,7 +690,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             for r in selected:
                 self._active_task_ids.discard(r.task_id)
 
-        return [r.data for r in selected]
+        return [self.consume_result(r.data) for r in selected]
 
     def wait_for_task(
         self,
@@ -694,6 +698,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         timeout: float | None = None,
         raise_timeout: bool = True,
         raise_terminal_error: bool = True,
+        *,
+        consume: bool = True,
     ) -> TResult | None:
         """Wait for a specific task result by task_id."""
         start_time = time.perf_counter()
@@ -725,7 +731,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             found_result = self._pending_results.pop(task_id)
             self._active_task_ids.remove(task_id)
             self._result_cv.notify_all()
-            return found_result.data
+            result = found_result.data
+        return self.consume_result(result) if consume else result
 
     def _pop_terminal_error_locked(
         self, task_id: int | None = None
@@ -937,9 +944,7 @@ class WorkflowExecutor:
         if not config.fileroot or not config.experiment_name or not config.trial_name:
             return None
 
-        from areal.utils.stats_logger import StatsLogger
-
-        log_path = StatsLogger.get_log_path(
+        log_path = logging.get_experiment_log_path(
             experiment_name=self.config.experiment_name,
             trial_name=self.config.trial_name,
             fileroot=self.config.fileroot,
@@ -1217,9 +1222,15 @@ class WorkflowExecutor:
 
         # Create and initialize the dispatcher
         qsize = self.config.queue_size or self.max_concurrent_rollouts * 16
+        self.consumed_metrics = ConsumedMetrics()
         self._dispatcher = BatchTaskDispatcher[_RolloutTaskInput, WorkflowTaskResult](
             max_queue_size=qsize,
             task_factory=self._create_workflow_task,
+            consume_result=lambda result: (
+                result
+                if isinstance(result, WorkflowContractFailure)
+                else self.consumed_metrics.consume(result)
+            ),
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
             terminal_error_fn=get_workflow_result_error,
@@ -1431,7 +1442,9 @@ class WorkflowExecutor:
 
                 if should_accept_traj:
                     manager.on_rollout_accepted()
-                    stats_tracker.get("rollout").scalar(accepted=1)
+                    stats_tracker.get(workflow_context.stat_scope()).scalar(
+                        accepted=1, rejected=0
+                    )
                     trace_session_event(
                         "mark_finalized",
                         task_id=task_id,
@@ -1445,7 +1458,9 @@ class WorkflowExecutor:
                     return _RolloutResult(task_id=task_id, trajectory=traj)
 
                 manager.on_rollout_rejected()
-                stats_tracker.get("rollout").scalar(rejected=1)
+                stats_tracker.get(workflow_context.stat_scope()).scalar(
+                    accepted=0, rejected=1
+                )
                 trace_session_event(
                     "mark_finalized",
                     task_id=task_id,
@@ -1475,7 +1490,9 @@ class WorkflowExecutor:
                 return WorkflowContractFailure(message=str(exc))
             except Exception as exc:  # pragma: no cover - workflow execution errors
                 manager.on_rollout_rejected()
-                stats_tracker.get("rollout").scalar(rejected=1)
+                stats_tracker.get(workflow_context.stat_scope()).scalar(
+                    accepted=0, rejected=1
+                )
                 trace_session_event(
                     "mark_finalized",
                     task_id=task_id,
@@ -1489,7 +1506,16 @@ class WorkflowExecutor:
                 await self._clear_rejected_trajectory(traj)
                 return None
 
-        return _execute_workflow
+        async def _execute_with_metrics() -> WorkflowTaskResult:
+            with capture_metrics() as metrics:
+                result = await _execute_workflow()
+            if result is None:
+                return _RolloutResult(pending_task.task_id, None, metrics)
+            if isinstance(result, WorkflowContractFailure):
+                return result
+            return replace(result, metrics=metrics)
+
+        return _execute_workflow if pending_task.is_eval else _execute_with_metrics
 
     def submit(
         self,

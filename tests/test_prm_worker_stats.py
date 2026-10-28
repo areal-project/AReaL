@@ -11,6 +11,7 @@ from areal.infra.controller.rollout_controller import (
     RolloutController,
     _merge_worker_stats,
 )
+from areal.utils.rollout_metrics import ConsumedMetrics
 from areal.utils.stats_tracker import DistributedStatsTracker, ReduceType
 
 
@@ -54,6 +55,7 @@ def test_worker_stats_do_not_guess_custom_distribution_denominators():
 
 def test_rollout_controller_includes_proxy_scorer_stats():
     controller = RolloutController.__new__(RolloutController)
+    controller.consumed_metrics = ConsumedMetrics()
     controller.config = SimpleNamespace(
         agent=SimpleNamespace(
             prm=PRMConfig(scorers=[PRMScorerConfig(path="test.Scorer")])
@@ -79,6 +81,7 @@ def test_rollout_controller_includes_proxy_scorer_stats():
 def test_export_stats_without_active_prm_skips_proxy_rpc(enabled, scorer_enabled):
     """PRM-off exports must not depend on an available proxy worker."""
     controller = RolloutController.__new__(RolloutController)
+    controller.consumed_metrics = ConsumedMetrics()
     controller.config = SimpleNamespace(
         agent=SimpleNamespace(
             prm=PRMConfig(

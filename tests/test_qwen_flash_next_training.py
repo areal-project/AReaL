@@ -51,6 +51,7 @@ def test_arena_training_preserves_rows_and_cycles_tail(batch_size, monkeypatch):
     source = Dataset.from_list([{"data_id": str(index)} for index in range(19)])
     config = SWEPPOConfig()
     config.experiment_name = "arena-test-experiment"
+    config.trial_name = "arena-test-trial"
     config.train_dataset.batch_size = batch_size
     config.should_accept_fn = "examples.swe.filter_function.filter_function"
     monkeypatch.setattr(cli_args, "load_expr_config", lambda *_: (config, None))
@@ -78,7 +79,8 @@ def test_arena_training_preserves_rows_and_cycles_tail(batch_size, monkeypatch):
         def train(self, **kwargs):
             assert kwargs["dynamic_filter_fn"] == config.should_accept_fn
             assert (
-                kwargs["workflow_kwargs"]["experiment_name"] == config.experiment_name
+                kwargs["workflow_kwargs"]["experiment_name"]
+                == "arena-test-experiment-arena-test-trial"
             )
             raise TrainerBoundaryReached
 
@@ -237,6 +239,23 @@ def test_qwen_training_accepts_frozen_host_ple(qwen_model_with_embeddings):
         parameter.requires_grad for parameter in layer.ple.value_proj.parameters()
     )
     assert not any("ngram_embedding" in name for name in frozen)
+
+
+def test_qwen_visual_encoder_and_mergers_are_frozen(qwen_model_with_embeddings):
+    model, layer = qwen_model_with_embeddings
+    model.visual = torch.nn.Module()
+    model.visual.encoder = torch.nn.Linear(2, 2)
+    model.visual.merger = torch.nn.Linear(2, 2)
+    model.visual.deepstack_merger_list = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+
+    frozen = _configure_qwen4_exp_parameters(model)
+
+    assert all(not parameter.requires_grad for parameter in model.visual.parameters())
+    assert all(
+        f"visual.{name}" in frozen for name, _ in model.visual.named_parameters()
+    )
+    assert model.language_model.embedding.word_embeddings.weight.requires_grad
+    assert layer.self_attention.linear_qkv.weight.requires_grad
 
 
 def test_qwen_freeze_ple_table_keeps_small_parameters_trainable(

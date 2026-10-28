@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -8,13 +7,10 @@ import pytest
 from areal.engine import sglang_remote
 
 
-@pytest.fixture
-def cuda_platform(monkeypatch):
-    """Exercise CUDA namespace rules without requiring a physical accelerator."""
+@pytest.fixture(autouse=True)
+def _cuda_device_namespace(monkeypatch):
     monkeypatch.setattr(
-        sglang_remote,
-        "current_platform",
-        SimpleNamespace(device_control_env_var="CUDA_VISIBLE_DEVICES"),
+        sglang_remote.current_platform, "device_control_env_var", "CUDA_VISIBLE_DEVICES"
     )
 
 
@@ -50,93 +46,135 @@ def test_launch_server_allocates_only_unspecified_communication_port(
     assert launched_args["port"] == 19000
 
 
-@pytest.mark.parametrize("isolated", [False, True])
-def test_colocated_cyclic_worker_order_assigns_all_64_ranks(
-    monkeypatch, isolated, cuda_platform
+@pytest.mark.parametrize("nnodes", [1, 8])
+def test_colocated_launch_registers_unique_ranks_with_reordered_workers(
+    monkeypatch, nnodes
 ):
-    """Two TP4 servers per node keep distinct ranks under cyclic Slurm placement."""
+    """Slurm placement overrides stale controller offsets for every TP rank."""
     from areal.engine.awex.plugins.sglang_plugin import _resolve_transfer_rank
 
-    build_cmd = MagicMock(return_value=["sglang-server"])
-    popen = MagicMock()
-    monkeypatch.setattr(sglang_remote.SGLangConfig, "build_cmd_from_args", build_cmd)
-    monkeypatch.setattr(sglang_remote.subprocess, "Popen", popen)
-    monkeypatch.delenv("AWEX_TRANSFER_RANK", raising=False)
-    monkeypatch.delenv("AREAL_SGLANG_BASE_GPU_ID", raising=False)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+    for name in ("AREAL_SGLANG_BASE_GPU_ID", "AWEX_TRANSFER_RANK", "RANK"):
+        monkeypatch.delenv(name, raising=False)
+    commands = []
+    children = []
+    monkeypatch.setattr(
+        sglang_remote.SGLangConfig,
+        "build_cmd_from_args",
+        lambda args: commands.append(args.copy()) or ["sglang-server"],
+    )
+    monkeypatch.setattr(
+        sglang_remote.subprocess,
+        "Popen",
+        lambda *args, **kwargs: children.append(kwargs["env"]) or MagicMock(),
+    )
     ranks = []
-
-    for worker_index in range(16):
-        node_id, local_id = worker_index % 8, worker_index // 8
-        monkeypatch.setenv("SLURM_LOCALID", str(local_id))
-        visible_devices = (
-            ",".join(str(local_id * 4 + i) for i in range(4)) if isolated else ""
-        )
-        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible_devices)
-        sglang_remote.SGLangBackend().launch_server(
-            {
-                "nccl_port": 19000,
-                "awex_colocate_mode": True,
-                "_awex_gpus_per_server": 4,
-                "base_gpu_id": (worker_index % 2) * 4,
-            }
-        )
-        args = build_cmd.call_args.args[0]
-        env = popen.call_args.kwargs["env"]
-        assert args["base_gpu_id"] == (0 if isolated else local_id * 4)
-        assert env["AWEX_TRANSFER_RANK_BASE"] == str(local_id * 4)
-        monkeypatch.setenv("AWEX_TRANSFER_RANK_BASE", env["AWEX_TRANSFER_RANK_BASE"])
-        for tp_rank in range(4):
-            ranks.append(
+    for node in range(nnodes):
+        for local_id in range(2):
+            monkeypatch.setenv("SLURM_LOCALID", str(local_id))
+            sglang_remote.SGLangBackend().launch_server(
+                {
+                    "port": 19000,
+                    "nccl_port": 19001,
+                    "base_gpu_id": (1 - local_id) * 4,
+                    "_awex_gpus_per_server": 4,
+                }
+            )
+            base = commands[-1]["base_gpu_id"]
+            monkeypatch.setenv(
+                "AWEX_TRANSFER_RANK_BASE", children[-1]["AWEX_TRANSFER_RANK_BASE"]
+            )
+            ranks.extend(
                 _resolve_transfer_rank(
-                    infer_world_size=64,
-                    gpu_id=args["base_gpu_id"] + tp_rank,
-                    node_id=node_id,
-                    nnodes=8,
+                    infer_world_size=8 * nnodes,
+                    gpu_id=base + tp_rank,
+                    node_id=node,
+                    nnodes=nnodes,
                     instance_world_size=4,
-                    server_base_gpu_id=args["base_gpu_id"],
+                    server_base_gpu_id=base,
                 )
+                for tp_rank in range(4)
             )
 
-    assert sorted(ranks) == list(range(64))
+    assert ranks == list(range(8 * nnodes))
 
 
-@pytest.mark.parametrize(
-    ("env", "base", "fallback", "expected"),
-    [
-        ({"CUDA_VISIBLE_DEVICES": "2,5,6,7"}, 0, 4, 4),
-        ({"CUDA_VISIBLE_DEVICES": "2,5,6,7", "SLURM_LOCALID": "1"}, 0, 0, 4),
-        ({"AREAL_SGLANG_BASE_GPU_ID": "4"}, 4, 0, 4),
-        ({}, 4, 4, 4),
-    ],
-)
-def test_colocated_transfer_base_preserves_device_namespace(
-    env, base, fallback, expected, cuda_platform
+@pytest.mark.parametrize("nnodes", [1, 8])
+@pytest.mark.parametrize("explicit_base", [None, "0"])
+def test_colocated_isolated_replicas_keep_unique_transfer_ranks(
+    monkeypatch, nnodes, explicit_base
 ):
-    """Device isolation and explicit placement keep a dense transfer coordinate."""
-    assert (
-        sglang_remote._resolve_colocated_transfer_rank_base(env, 4, base, fallback)
-        == expected
-    )
+    """Logical GPU zero must preserve each isolated replica's dense offset."""
+    from areal.engine.awex.plugins.sglang_plugin import _resolve_transfer_rank
+
+    for name in ("AWEX_TRANSFER_RANK", "RANK", "AREAL_SGLANG_BASE_GPU_ID"):
+        monkeypatch.delenv(name, raising=False)
+    if explicit_base is not None:
+        monkeypatch.setenv("AREAL_SGLANG_BASE_GPU_ID", explicit_base)
+    build_cmd = MagicMock(return_value=["sglang-server"])
+    launch = MagicMock()
+    monkeypatch.setattr(sglang_remote.SGLangConfig, "build_cmd_from_args", build_cmd)
+    monkeypatch.setattr(sglang_remote.subprocess, "Popen", launch)
+    ranks = []
+
+    for node in range(nnodes):
+        for replica in range(2):
+            transfer_base = replica * 4
+            monkeypatch.setenv(
+                "CUDA_VISIBLE_DEVICES",
+                ",".join(str(transfer_base + rank) for rank in range(4)),
+            )
+            monkeypatch.setenv("SLURM_LOCALID", str(1 - replica))
+            sglang_remote.SGLangBackend().launch_server(
+                {
+                    "port": 19000,
+                    "nccl_port": 19001,
+                    "base_gpu_id": transfer_base,
+                    "_awex_gpus_per_server": 4,
+                }
+            )
+            assert build_cmd.call_args.args[0]["base_gpu_id"] == 0
+            child_env = launch.call_args.kwargs["env"]
+            assert child_env["AWEX_TRANSFER_RANK_BASE"] == str(transfer_base)
+            monkeypatch.setenv(
+                "AWEX_TRANSFER_RANK_BASE", child_env["AWEX_TRANSFER_RANK_BASE"]
+            )
+            ranks.extend(
+                _resolve_transfer_rank(
+                    infer_world_size=8 * nnodes,
+                    gpu_id=tp_rank,
+                    node_id=node,
+                    nnodes=nnodes,
+                    instance_world_size=4,
+                    server_base_gpu_id=0,
+                )
+                for tp_rank in range(4)
+            )
+
+    assert ranks == list(range(8 * nnodes))
 
 
-def test_colocated_transfer_base_rejects_negative_isolated_slurm_slot(cuda_platform):
-    """An isolated namespace must not hide an invalid Slurm task slot."""
-    with pytest.raises(ValueError, match="SLURM_LOCALID must be non-negative"):
-        sglang_remote._resolve_colocated_transfer_rank_base(
-            {"CUDA_VISIBLE_DEVICES": "0,1,2,3", "SLURM_LOCALID": "-1"}, 4, 0, 0
-        )
-
-
-def test_separated_launch_preserves_explicit_transfer_base(monkeypatch):
-    """The colocate placement fix does not replace separated worker ranks."""
-    popen = MagicMock()
-    monkeypatch.setattr(
-        sglang_remote.SGLangConfig, "build_cmd_from_args", lambda args: ["server"]
-    )
-    monkeypatch.setattr(sglang_remote.subprocess, "Popen", popen)
+@pytest.mark.parametrize("visible_devices", ["2,5", "0,1,2,3,4,5,6,7"])
+def test_colocated_launch_preserves_explicit_dense_transfer_base(
+    monkeypatch, visible_devices
+):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible_devices)
+    monkeypatch.setenv("SLURM_LOCALID", "1")
+    monkeypatch.delenv("AREAL_SGLANG_BASE_GPU_ID", raising=False)
+    build_cmd = MagicMock(return_value=["sglang-server"])
+    launch = MagicMock()
+    monkeypatch.setattr(sglang_remote.SGLangConfig, "build_cmd_from_args", build_cmd)
+    monkeypatch.setattr(sglang_remote.subprocess, "Popen", launch)
 
     sglang_remote.SGLangBackend().launch_server(
-        {"nccl_port": 19000, "_awex_transfer_rank_base": 12}
+        {
+            "port": 19000,
+            "nccl_port": 19001,
+            "base_gpu_id": 0,
+            "_awex_gpus_per_server": 2,
+            "_awex_transfer_rank_base": 4,
+        }
     )
 
-    assert popen.call_args.kwargs["env"]["AWEX_TRANSFER_RANK_BASE"] == "12"
+    assert launch.call_args.kwargs["env"]["AWEX_TRANSFER_RANK_BASE"] == "4"
+    assert "_awex_transfer_rank_base" not in build_cmd.call_args.args[0]
