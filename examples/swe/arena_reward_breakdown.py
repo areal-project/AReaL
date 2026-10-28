@@ -34,6 +34,75 @@ def _number(value: Any) -> float:
     return value
 
 
+def _metric_path(name: Any) -> str:
+    """Keep verifier-defined Unicode names and bounded hierarchical IDs."""
+    if not isinstance(name, str) or not 0 < len(name) <= 256 or not name.isprintable():
+        raise ValueError("Invalid reward metric name")
+    parts = name.split("/")
+    if len(parts) > _MAX_DEPTH or any(
+        not part or not (part[0].isalnum() or part[0] == "_") for part in parts
+    ):
+        raise ValueError("Invalid reward metric path")
+    return name
+
+
+def _observation_metrics(observation: Any) -> dict[str, float]:
+    """Export supplied schema-v1 measurements without deriving missing values."""
+    prefix = "reward_observation"
+    metrics = {
+        f"{prefix}/present": float(observation is not None),
+        f"{prefix}/valid": 0.0,
+        f"{prefix}/invalid_entries": 0.0,
+    }
+    if observation is None:
+        return metrics
+    if (
+        not isinstance(observation, Mapping)
+        or type(observation.get("schema_version")) is not int
+        or observation["schema_version"] != 1
+    ):
+        metrics[f"{prefix}/invalid_entries"] = 1.0
+        return metrics
+    components = observation.get("components", {})
+    diagnostics = observation.get("diagnostics", {})
+    if (
+        not isinstance(components, Mapping)
+        or len(components) > _MAX_NODES
+        or not isinstance(diagnostics, Mapping)
+        or len(diagnostics) > _MAX_NODES
+    ):
+        metrics[f"{prefix}/invalid_entries"] = 1.0
+        return metrics
+    metrics[f"{prefix}/valid"] = 1.0
+    invalid = 0
+    for name, component in components.items():
+        try:
+            path = _metric_path(name)
+            if not isinstance(component, Mapping):
+                raise ValueError("Invalid reward observation component")
+        except (TypeError, ValueError):
+            invalid += 1
+            continue
+        for field in ("value", "weight", "contribution", "share"):
+            value = component.get(field)
+            if value is None:
+                continue
+            try:
+                metrics[f"{prefix}/components/{path}/{field}"] = _number(value)
+            except (TypeError, ValueError, OverflowError):
+                invalid += 1
+    for name, value in diagnostics.items():
+        if value is None:
+            continue
+        try:
+            path = _metric_path(name)
+            metrics[f"{prefix}/diagnostics/{path}"] = _number(value)
+        except (TypeError, ValueError, OverflowError):
+            invalid += 1
+    metrics[f"{prefix}/invalid_entries"] = float(invalid)
+    return metrics
+
+
 def _same(actual: Any, expected: float) -> None:
     if not math.isclose(_number(actual), expected, rel_tol=1e-8, abs_tol=1e-10):
         raise ValueError("Reward breakdown disagrees with measured scores")
@@ -357,17 +426,27 @@ def arena_reward_metrics(
     """
     metrics: dict[str, float] = {}
     invalid = 0
+    display = raw.get("reward_display") if isinstance(raw, Mapping) else None
+    component_ids = (
+        display.get("component_ids") if isinstance(display, Mapping) else None
+    )
+    if not isinstance(component_ids, Mapping) or len(component_ids) > _MAX_NODES:
+        component_ids = {}
     if isinstance(sub_scores, Mapping) and len(sub_scores) <= 128:
         for key, value in sub_scores.items():
             try:
-                if not isinstance(key, str) or not _NAME.fullmatch(key):
-                    raise ValueError("Invalid sub-score name")
-                metrics[f"reward_sub_score/{key}"] = _number(value)
+                name = _metric_path(component_ids.get(key, key))
+                metric = f"reward_sub_score/{name}"
+                if name == "invalid_entries" or metric in metrics:
+                    raise ValueError("Duplicate or reserved sub-score name")
+                metrics[metric] = _number(value)
             except (TypeError, ValueError, OverflowError):
                 invalid += 1
     elif sub_scores is not None:
         invalid += 1
     metrics["reward_sub_score/invalid_entries"] = float(invalid)
+    observation = raw.get("reward_observation") if isinstance(raw, Mapping) else None
+    metrics.update(_observation_metrics(observation))
     breakdown = raw.get("reward_breakdown") if isinstance(raw, Mapping) else None
     metrics["reward_breakdown/present"] = float(breakdown is not None)
     metrics["reward_breakdown/valid"] = 0.0

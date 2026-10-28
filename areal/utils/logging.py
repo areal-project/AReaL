@@ -122,6 +122,7 @@ LOGGER_COLORS_EXACT = {
     "AReaL-SWEAgent": "light_purple",
     "ArenaStreamAgent": "light_purple",
     "SWETrain": "light_green",
+    "BlenderOverfit": "light_green",
     "SWEPrefixMatcher": "light_yellow",
     # Agent Service - purple
     "AgentGateway": "light_purple",

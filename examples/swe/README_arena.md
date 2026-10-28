@@ -120,10 +120,38 @@ shards are written under `arena_result_dump_dir` when configured.
 
 The client preserves the result envelope's `sub_scores`. Finite named entries are logged
 as `rollout/reward_sub_score/<name>` and
-`rollout/stream/<stream>/reward_sub_score/<name>`. These metrics describe the verifier
-score before any training reward transform. They do not change the reward used by GRPO.
-Sub-scores are also included in private result audit shards. Both `raw` and `sub_scores`
-are independently omitted from audit shards when their encoded size exceeds
+`rollout/stream/<stream>/reward_sub_score/<name>`. If the verifier supplies
+`raw.reward_display.component_ids`, display labels (including Chinese labels) are
+resolved to those stable component IDs. Without that mapping, bounded printable Unicode
+names are preserved. Component IDs may contain `/` to describe nested metrics. Invalid
+or duplicate names and non-finite values are counted in
+`rollout/reward_sub_score/invalid_entries`.
+
+The adapter also reads the generic `raw.reward_observation` contract when
+`schema_version` is `1`. Component names are defined by the verifier; they are not
+restricted to a particular reward formula. Supplied finite numeric fields are logged as:
+
+| Source                           | W&B metric                                                  |
+| -------------------------------- | ----------------------------------------------------------- |
+| `components.<name>.value`        | `rollout/reward_observation/components/<name>/value`        |
+| `components.<name>.weight`       | `rollout/reward_observation/components/<name>/weight`       |
+| `components.<name>.contribution` | `rollout/reward_observation/components/<name>/contribution` |
+| `components.<name>.share`        | `rollout/reward_observation/components/<name>/share`        |
+| `diagnostics.<name>`             | `rollout/reward_observation/diagnostics/<name>`             |
+
+These metrics are also recorded under `rollout/stream/<stream>/reward_observation/`.
+`null` or missing measurements are omitted, never replaced with zero or derived from
+other fields. For example, a nonlinear component may have a measured `value` but no
+defined `weight` or `contribution`. The `share` metric is the mean of the verifier's
+per-result shares, not a ratio of batch-mean contribution and batch-mean score.
+`reward_observation/present`, `valid`, and `invalid_entries` report observation coverage
+and malformed telemetry. Unsupported schemas or invalid entries cannot reject an
+otherwise valid rollout.
+
+These metrics describe the verifier score before any training reward transform. The
+top-level `score` remains the reward source; observations do not change the reward used
+by GRPO. Sub-scores are also included in private result audit shards. Both `raw` and
+`sub_scores` are independently omitted from audit shards when their encoded size exceeds
 `arena_result_dump_max_bytes`; presence, size, and truncation flags remain available for
 each field.
 
