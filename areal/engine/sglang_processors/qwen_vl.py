@@ -19,7 +19,6 @@ class AReaLQwenImageProcessor(QwenVLImageProcessor):
         in (
             "Qwen3VLForConditionalGeneration",
             "Qwen3VLMoeForConditionalGeneration",
-            "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
         )
     ]
@@ -93,3 +92,26 @@ class AReaLQwenImageProcessor(QwenVLImageProcessor):
             mrope_positions=positions.squeeze(1),
             mrope_position_delta=delta,
         )
+
+
+class AReaLQwen35ImageProcessor(AReaLQwenImageProcessor):
+    """Decode original images with PIL for the patched CPU HF processing path."""
+
+    models = [
+        model
+        for model in QwenVLImageProcessor.models
+        if model.__name__ == "Qwen3_5ForConditionalGeneration"
+    ]
+    gpu_image_decode = False
+
+    def __init__(self, *args, **kwargs):
+        from sglang.srt.multimodal.processors.base_processor import (
+            SGL_PREPROCESS_USE_IMAGE_TENSOR,
+        )
+
+        if SGL_PREPROCESS_USE_IMAGE_TENSOR:
+            raise ValueError(
+                "Qwen3.5 training alignment requires "
+                "SGLANG_PREPROCESS_USE_IMAGE_TENSOR=false for PIL decoding"
+            )
+        super().__init__(*args, **kwargs)

@@ -98,7 +98,7 @@ def test_flash_next_startup_patches_all_sources_and_repeated_start_is_write_free
     assert all(target.stat().st_mtime_ns == mtime for target, mtime in mtimes.items())
 
 
-@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_vl", "llama", None])
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "llama", None])
 def test_other_model_types_skip_sglang_even_with_flash_next_directory_name(
     tmp_path, monkeypatch, model_type
 ):
@@ -328,9 +328,7 @@ def test_recipe_uses_automatic_model_dispatch_and_preserves_group_filter():
     assert config["should_accept_fn"] == "examples.swe.filter_function.filter_function"
 
 
-@pytest.mark.parametrize(
-    "model_type", ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
-)
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen3_vl_moe", "qwen3_5_moe"])
 def test_native_qwen_registers_token_processor_without_image_source_patches(
     tmp_path, monkeypatch, model_type
 ):

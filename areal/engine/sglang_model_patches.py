@@ -36,7 +36,7 @@ def wrap_server_command(command: list[str]) -> list[str]:
 
 
 def apply_model_patches(server_args: Sequence[str]) -> None:
-    """Patch Qwen Flash Next (qwen4_exp), independent of model path or workflow."""
+    """Apply model-specific patches independent of model path or workflow."""
     if "--help" in server_args or "-h" in server_args:
         return
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
@@ -74,14 +74,30 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
         "qwen3_5",
         "qwen3_5_moe",
     ):
-        # Workers load the processor package themselves. Its image processing
-        # inherits SGLang's existing decode/resize path without any source patch.
+        # Workers load the token-preserving processor package themselves.
         package = "areal.engine.sglang_processors"
         existing = os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE")
         if existing and existing != package:
             raise RuntimeError(
                 "AReaL Qwen visual-token handling requires its external multimodal "
                 "processor; another processor package is already configured"
+            )
+        if config.get("model_type") == "qwen3_5":
+            from areal.engine import sglang_qwen35_vl
+
+            root = installed_sglang_root()
+            install_source_patches(
+                [
+                    (
+                        root / sglang_qwen35_vl.TARGET_RELATIVE,
+                        sglang_qwen35_vl.patched_source,
+                    ),
+                    (
+                        root / sglang_qwen35_vl.BASE_RELATIVE,
+                        sglang_qwen35_vl.patched_base_source,
+                    ),
+                ],
+                lock_path=root / ".areal-sglang-patches.lock",
             )
         os.environ["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"] = package
         return

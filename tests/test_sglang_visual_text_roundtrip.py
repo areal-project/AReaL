@@ -31,7 +31,10 @@ def qwen_runtime():
     from sglang.srt.multimodal.processors import base_processor
     from transformers import AutoConfig, AutoProcessor
 
-    from areal.engine.sglang_processors.qwen_vl import AReaLQwenImageProcessor
+    from areal.engine.sglang_processors.qwen_vl import (
+        AReaLQwen35ImageProcessor,
+        AReaLQwenImageProcessor,
+    )
 
     hf = AutoProcessor.from_pretrained(path, local_files_only=True, use_fast=True)
     sg_hf = AutoProcessor.from_pretrained(path, local_files_only=True, use_fast=True)
@@ -53,8 +56,13 @@ def qwen_runtime():
     )
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(server_args, "_global_server_args", args)
-        patch.setattr(base_processor, "_is_cpu", True)
-        processor = AReaLQwenImageProcessor(
+        patch.setattr(base_processor, "_is_cpu", config.model_type != "qwen3_5")
+        processor_cls = (
+            AReaLQwen35ImageProcessor
+            if config.model_type == "qwen3_5"
+            else AReaLQwenImageProcessor
+        )
+        processor = processor_cls(
             config, args, sg_hf, transport_mode="default", skip_mm_pool=True
         )
         try:
@@ -75,16 +83,17 @@ def qwen_runtime():
     ["<|image_pad|>", "<|video_pad|>", "<|vision_start|><|image_pad|><|vision_end|>"],
 )
 @pytest.mark.parametrize("image_count", [1, 2])
+@pytest.mark.parametrize("image_size", [(511, 257), (1055, 1025)])
 def test_real_generated_visual_tokens_keep_full_ids_features_and_offsets(
-    qwen_runtime, literal, image_count, caplog
+    qwen_runtime, literal, image_count, image_size, caplog
 ):
     hf, sg = qwen_runtime
     images = []
     for index in range(image_count):
         buffer = BytesIO()
-        Image.new("RGB", (511 + index * 2, 257), (20, 90, 150)).save(
-            buffer, format="JPEG"
-        )
+        Image.effect_mandelbrot(
+            (image_size[0] + index * 2, image_size[1]), (-2.0, -1.0, 1.0, 1.0), 32
+        ).convert("RGB").save(buffer, format="JPEG")
         images.append(
             "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
         )
@@ -123,7 +132,16 @@ def test_real_generated_visual_tokens_keep_full_ids_features_and_offsets(
     logical_bytes = sum(
         item.feature.numel() * item.feature.element_size() for item in result.mm_items
     )
-    assert len(pickle.dumps(result)) < logical_bytes + 64 * 1024
+    # Position tensors and token lists grow with image resolution. Account for
+    # them separately while still detecting duplicated feature storage.
+    position_bytes = (
+        result.mrope_positions.numel() * result.mrope_positions.element_size()
+    )
+    token_bytes = 16 * len(result.input_ids)
+    assert (
+        len(pickle.dumps(result))
+        < logical_bytes + position_bytes + token_bytes + 64 * 1024
+    )
     for item in result.mm_items:
         assert item.feature.untyped_storage().nbytes() == (
             item.feature.numel() * item.feature.element_size()
@@ -198,7 +216,9 @@ def test_external_processor_registration_uses_native_plugin_interface(qwen_runti
     )
     from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 
-    from areal.engine.sglang_processors.qwen_vl import AReaLQwenImageProcessor
+    from areal.engine.sglang_processors.qwen_vl import (
+        AReaLQwenImageProcessor,
+    )
 
     # Token preservation must inherit the installed native decoder policy.
     assert "gpu_image_decode" not in AReaLQwenImageProcessor.__dict__
