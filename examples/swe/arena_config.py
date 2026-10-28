@@ -132,6 +132,7 @@ def parse_arena_stream_config(value: Any) -> ArenaStreamConfig:
         reward_mapping_file=reward_mapping_file,
         reward_threshold=threshold,
         reward_transform_fn=str(raw.get("reward_transform_fn") or "").strip(),
+        _harness_is_fallback=raw.get("_harness_is_fallback", False),
     )
 
 
@@ -228,6 +229,8 @@ def load_arena_stream_configs(econfig: Any) -> list[ArenaStreamConfig]:
         replace(
             stream,
             harness=stream.harness or common_harness,
+            _harness_is_fallback=stream._harness_is_fallback
+            or (not stream.harness and bool(common_harness)),
             task_envs={**common_task_envs, **stream.task_envs},
         )
         for stream in streams

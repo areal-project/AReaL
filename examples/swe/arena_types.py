@@ -29,7 +29,14 @@ class ArenaStreamConfig:
     reward_threshold: float | None = None
     reward_transform_fn: str = ""
     # Shared snapshot of per-data-id rewards and optional Harness bindings.
-    # Per-task Harness pins take precedence over the Stream-level harness.
+    # An explicit Stream harness overrides per-task pins; arena_harness is a fallback.
     # Created before training if absent; reused and checked on subsequent starts.
     # Mutually exclusive with expected_reward_ref (the Stream-default mode).
     reward_mapping_file: str = ""
+    # Preserve inherited arena_harness provenance across controller/worker serialization.
+    _harness_is_fallback: bool = False
+
+    @property
+    def harness_override(self) -> str:
+        """Return the explicit Stream Harness, excluding the common fallback."""
+        return "" if self._harness_is_fallback else self.harness

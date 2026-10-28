@@ -244,10 +244,14 @@ published Env metadata (`source_reward_ref` or `reward_ref`, plus optional
 `harness_ref`). Conflicting sources fail before rollout. Each distinct reward and
 Harness version must be published, and references must include an exact version.
 
-When Harness bindings are present, they must cover every dataset row. Each task uses its
-pinned Harness in preference to the Stream-level `harness`; its LLM protocol is inferred
-from that Harness using the existing protocol inference rules. Snapshots without Harness
-bindings retain the Stream-level Harness and protocol behavior.
+When Harness bindings are present, they must cover every dataset row. An explicit
+`arena_streams[].harness` (or `harness` in a Stream file) takes priority over the task's
+pinned Harness. Without that override, the task's pinned Harness takes priority over the
+common `arena_harness` fallback. Tasks using their pinned Harness infer the LLM protocol
+from it; an explicit Stream Harness uses the Stream's `llm_protocol` when set, otherwise
+its protocol is inferred from that Harness. Snapshots without Harness bindings retain
+the Stream-level Harness and protocol behavior. Changing the explicit Stream Harness
+takes effect without rewriting the snapshot.
 
 Subsequent starts reuse the snapshot, check exact dataset coverage, verify the pinned
 versions remain published, and check declared Stream bindings for drift. An invalid or

@@ -1626,7 +1626,11 @@ class ArenaStreamAgentWorkflow:
         self._validate_row_reward_ref(data, stream_config)
         harness = self._expected_harness(data, stream_config)
         if self.harness_mappings.get(stream_config.name):
-            expected_protocol = infer_llm_protocol_from_harness(harness)
+            expected_protocol = (
+                stream_config.llm_protocol
+                if stream_config.harness_override and stream_config.llm_protocol
+                else infer_llm_protocol_from_harness(harness)
+            )
             llm_protocol = data.get("llm_protocol", expected_protocol)
             if llm_protocol != expected_protocol:
                 raise ValueError("Arena row LLM protocol mismatch with task Harness")
@@ -2062,9 +2066,11 @@ class ArenaStreamAgentWorkflow:
         data_id = str(data.get("data_id") or "")
         if mapping and data_id not in mapping:
             raise ValueError(f"Arena Harness mapping has no data_id {data_id!r}")
-        expected = mapping[data_id] if mapping else stream_config.harness
+        expected = stream_config.harness_override or (
+            mapping[data_id] if mapping else stream_config.harness
+        )
         if data.get("harness") and data["harness"] != expected:
-            raise ValueError("Arena row Harness mismatch with frozen binding")
+            raise ValueError("Arena row Harness mismatch with effective binding")
         return expected
 
     def _expected_reward_ref(

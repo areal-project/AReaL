@@ -176,8 +176,12 @@ def _resolve_arena_stream(
     )
     for row in rows:
         if harnesses:
-            row["harness"] = harnesses[row["data_id"]]
-            row["llm_protocol"] = infer_llm_protocol_from_harness(row["harness"])
+            row["harness"] = configured.harness_override or harnesses[row["data_id"]]
+            row["llm_protocol"] = (
+                llm_protocol
+                if configured.harness_override
+                else infer_llm_protocol_from_harness(row["harness"])
+            )
         reward_ref = mapping[row["data_id"]] if mapping else actual_reward_ref
         row.update(
             {
