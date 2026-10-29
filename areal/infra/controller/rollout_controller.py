@@ -8,7 +8,7 @@ import threading
 import traceback
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from threading import Lock
 from typing import Any
 
@@ -55,7 +55,6 @@ from ..workflow_executor import (
     WorkflowContractFailure,
     WorkflowTaskResult,
     _RolloutResult,
-    clear_rejected_trajectory,
     get_workflow_result_error,
     unwrap_workflow_result,
     validate_rollout_group_sizes,
@@ -350,7 +349,11 @@ class RolloutController:
         ](
             max_queue_size=qsize,
             task_factory=self._create_submit_callback,
-            consume_result=self._consume_rollout_result,
+            consume_result=lambda result: (
+                result
+                if isinstance(result, WorkflowContractFailure)
+                else self.consumed_metrics.consume(result)
+            ),
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
             terminal_error_fn=get_workflow_result_error,
@@ -1088,36 +1091,6 @@ class RolloutController:
             f"rejected: {stats.rejected}."
         )
 
-    def _rollout_is_stale(self, result: _RolloutResult) -> bool:
-        return (
-            not result.is_eval
-            and result.min_generated_version is not None
-            and (
-                result.min_generated_version < 0
-                or self.get_version() - result.min_generated_version
-                > self.config.max_head_offpolicyness
-            )
-        )
-
-    def _consume_rollout_result(self, result: WorkflowTaskResult | None):
-        if isinstance(result, WorkflowContractFailure):
-            return result
-        if (
-            result is not None
-            and result.trajectory is not None
-            and self._rollout_is_stale(result)
-        ):
-            self.staleness_manager.on_rollout_dropped_after_accept()
-            run_async_task(clear_rejected_trajectory, result.trajectory)
-            logger.warning(
-                "Rejecting queued rollout %s after policy version advanced",
-                result.task_id,
-            )
-            metrics = dict(result.metrics or {})
-            metrics["rollout/stale_at_consumption"] = [1.0]
-            result = replace(result, trajectory=None, metrics=metrics)
-        return self.consumed_metrics.consume(result)
-
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
         async def _submit_then_wait() -> WorkflowTaskResult | None:
             # Choose worker via round-robin
@@ -1183,34 +1156,14 @@ class RolloutController:
                 traj = result["trajectory"] if result is not None else None
                 if traj is not None:
                     traj = self._propagate_mopd_route(pending_task.mopd_route, traj)
-                    min_version = result.get("min_generated_version")
-                    if "min_generated_version" not in result and "input_ids" in traj:
-                        min_version = -1
-                    if min_version is not None and type(min_version) is not int:
-                        min_version = -1
-                    rollout_result = _RolloutResult(
-                        task_id=task_id,
-                        trajectory=traj,
-                        metrics=result["metrics"],
-                        min_generated_version=min_version,
-                        is_eval=pending_task.is_eval,
-                    )
-                    if self._rollout_is_stale(rollout_result):
-                        manager.on_rollout_rejected()
-                        await clear_rejected_trajectory(traj)
-                        logger.warning(
-                            "Rejecting completed rollout %s with old policy tokens",
-                            task_id,
-                        )
-                        metrics = dict(rollout_result.metrics or {})
-                        metrics["rollout/stale_at_completion"] = [1.0]
-                        return replace(rollout_result, trajectory=None, metrics=metrics)
                     manager.on_rollout_accepted()
                     if self.config.enable_rollout_tracing:
                         logger.info(
                             f"Finish and accept rollout. {self._rollout_stats()}"
                         )
-                    return rollout_result
+                    return _RolloutResult(
+                        task_id=task_id, trajectory=traj, metrics=result["metrics"]
+                    )
 
                 manager.on_rollout_rejected()
                 if self.config.enable_rollout_tracing:

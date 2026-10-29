@@ -49,7 +49,6 @@ if TYPE_CHECKING:
 
 
 _REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS = 5.0
-logger = logging.getLogger("WorkflowExecutor")
 
 
 def check_trajectory_format(
@@ -245,78 +244,11 @@ class _RolloutTaskInput:
     is_eval: bool = False
 
 
-def minimum_generated_version(trajectory: dict[str, Any]) -> int | None:
-    """Summarize generated policy versions before tensor RPC transfer.
-
-    Non-tensor workflows and zero-generation batches have no policy lag.
-    Malformed tensor training payloads fail closed via the invalid version -1.
-    """
-    if "input_ids" not in trajectory:
-        return None
-    versions = trajectory.get("versions")
-    loss_mask = trajectory.get("loss_mask")
-    if not isinstance(versions, torch.Tensor) or not isinstance(
-        loss_mask, torch.Tensor
-    ):
-        return -1
-    if (
-        versions.shape != loss_mask.shape
-        or versions.device != loss_mask.device
-        or versions.is_meta
-        or versions.layout != torch.strided
-        or loss_mask.layout != torch.strided
-        or versions.dtype
-        not in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
-    ):
-        return -1
-    generated = versions[loss_mask > 0]
-    return int(generated.min().item()) if generated.numel() else None
-
-
-async def clear_rejected_trajectory(
-    traj: dict[str, Any] | None, cleanup_logger: Logger | None = None
-) -> None:
-    """Best-effort cleanup for remote shards that will not reach training."""
-    cleanup_logger = logger if cleanup_logger is None else cleanup_logger
-    shards_by_node = RTensor.collect_shards(traj)
-    if not shards_by_node:
-        return
-
-    async def _clear_node(node_addr: str, shard_ids: list[Any]) -> None:
-        await asyncio.wait_for(
-            RTensor.clear_node(node_addr, shard_ids),
-            timeout=_REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
-        )
-
-    results = await asyncio.gather(
-        *(
-            _clear_node(node_addr, shard_ids)
-            for node_addr, shard_ids in shards_by_node.items()
-        ),
-        return_exceptions=True,
-    )
-    for node_addr, result in zip(shards_by_node, results):
-        if isinstance(result, TimeoutError):
-            cleanup_logger.warning(
-                "Timed out after %.1fs clearing rejected trajectory shards on %s",
-                _REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
-                node_addr,
-            )
-        elif isinstance(result, BaseException):
-            cleanup_logger.warning(
-                "Failed to clear rejected trajectory shards on %s: %s",
-                node_addr,
-                result,
-            )
-
-
 @dataclass(frozen=True)
 class _RolloutResult:
     task_id: int
     trajectory: dict[str, Any] | None
     metrics: Metrics | None = None
-    min_generated_version: int | None = None
-    is_eval: bool = False
 
 
 class WorkflowContractError(ValueError):
@@ -1343,7 +1275,37 @@ class WorkflowExecutor:
         )
 
     async def _clear_rejected_trajectory(self, traj: dict[str, Any] | None) -> None:
-        await clear_rejected_trajectory(traj, cleanup_logger=self.logger)
+        """Best-effort cleanup for remote shards that will not reach training."""
+        shards_by_node = RTensor.collect_shards(traj)
+        if not shards_by_node:
+            return
+
+        async def _clear_node(node_addr: str, shard_ids: list[Any]) -> None:
+            await asyncio.wait_for(
+                RTensor.clear_node(node_addr, shard_ids),
+                timeout=_REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
+            )
+
+        results = await asyncio.gather(
+            *(
+                _clear_node(node_addr, shard_ids)
+                for node_addr, shard_ids in shards_by_node.items()
+            ),
+            return_exceptions=True,
+        )
+        for node_addr, result in zip(shards_by_node, results):
+            if isinstance(result, TimeoutError):
+                self.logger.warning(
+                    "Timed out after %.1fs clearing rejected trajectory shards on %s",
+                    _REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
+                    node_addr,
+                )
+            elif isinstance(result, BaseException):
+                self.logger.warning(
+                    "Failed to clear rejected trajectory shards on %s: %s",
+                    node_addr,
+                    result,
+                )
 
     def _create_workflow_task(
         self, pending_task: _RolloutTaskInput
@@ -1479,11 +1441,6 @@ class WorkflowExecutor:
                         )
 
                 if should_accept_traj:
-                    min_generated_version = (
-                        None
-                        if pending_task.is_eval
-                        else minimum_generated_version(traj)
-                    )
                     manager.on_rollout_accepted()
                     stats_tracker.get(workflow_context.stat_scope()).scalar(
                         accepted=1, rejected=0
@@ -1498,12 +1455,7 @@ class WorkflowExecutor:
                             f"Finish and accept rollout. {self._rollout_stats()}",
                         )
                     assert traj is not None
-                    return _RolloutResult(
-                        task_id=task_id,
-                        trajectory=traj,
-                        min_generated_version=min_generated_version,
-                        is_eval=pending_task.is_eval,
-                    )
+                    return _RolloutResult(task_id=task_id, trajectory=traj)
 
                 manager.on_rollout_rejected()
                 stats_tracker.get(workflow_context.stat_scope()).scalar(

@@ -1520,11 +1520,7 @@ class RemoteInfEngine(InferenceEngine):
         if result is None or isinstance(result, WorkflowContractFailure):
             return result
         # Keep tensors inside plain containers for RPC RTensor.remotize.
-        return {
-            "trajectory": result.trajectory,
-            "metrics": result.metrics,
-            "min_generated_version": result.min_generated_version,
-        }
+        return {"trajectory": result.trajectory, "metrics": result.metrics}
 
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
