@@ -112,7 +112,7 @@ def _trainer(teacher: Any, engine_type: str = "rollout") -> PPOTrainer:
     trainer.config = SimpleNamespace(
         total_train_epochs=1,
         total_train_steps=None,
-        rollout=SimpleNamespace(agent=None, _version="v1"),
+        rollout=SimpleNamespace(agent=None, _version="v1", mask_stale_tokens=False),
         teacher=SimpleNamespace(
             engine_type=engine_type, rl_loss_weight=1.0, distill_loss_weight=0.01
         ),
