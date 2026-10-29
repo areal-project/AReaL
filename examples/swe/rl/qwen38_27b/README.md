@@ -1,13 +1,16 @@
 # Qwen3.8-27B Arena RL
 
-This recipe selects the 64-task Whitebox B Stream for a Qwen3.8-27B run. The branch
-starts from upstream `main` at `448de523`. Arena categorized retries, RPC/checkpoint
-fixes and required-recovery checks are already upstream. The additional core fix carries
-`de8d6796`: resolve rollout dump paths without importing metrics SDKs in inference
-workers.
+The default submission selects `train_fine_released64_bs16.yaml`, a bs16/gs12 training
+preset. Vision encoder and projection are frozen, and SGLang's visual embedding cache
+uses 100 MB. The cache setting is applied after the site profile so an inherited
+`SGLANG_VLM_CACHE_SIZE_MB=0` cannot disable it. `train.yaml` retains the earlier preset
+and can be selected explicitly with `QWEN_TRAIN_CONFIG=train.yaml` in the site profile.
 
-The new files provide the controller and actor entry points and Slurm submission
-preflights. They do not modify the running trial.
+The example profile uses experiment `qwen38-27b-arena-rl` and generates a dated trial
+name. Choose a unique trial name for each new run. W&B, Slurm names, and log directories
+use this same experiment/trial identity.
+
+The recipe provides controller and actor entry points and Slurm submission preflights.
 
 Actor/controller use **areal-dev-sglang-0821.sif**, with the historical dependency
 overlay providing **Megatron-Core 0.18.2**, **megatron-bridge 0.5.1** and **AWEX
@@ -29,7 +32,7 @@ files.
    visible to every role; logs and checkpoints use
    `logs/<user>/<experiment_name>/<trial_name>/` and
    `checkpoints/<user>/<experiment_name>/<trial_name>/`. The submitting user is
-   preserved in these paths even though submission uses `sudo`.
+   preserved in these paths even when submission uses `sudo`.
 
 1. Run from the local checkout:
 
@@ -65,11 +68,11 @@ in every role. An existing trial snapshot is reused only if identical; changed c
 profile requires a new trial/run directory, so active workers' code is never
 overwritten.
 
-The YAML selects `whitebox-b-overfit64-20261013` with
-`whitebox-unified-b-areal@0.1.1-no-budget`. Dataset setup generates
-`$QWEN_RUN_DIR/reward-mapping.json` from each published Env version's original reward
-reference and checks reward publication before creating rollout workers. Keep this
-mapping when recovering; all roles must be able to read it.
+Before submitting, replace `your-stream-id` under `econfig.arena_streams` in the default
+YAML with an active Arena Stream ID. The default preset uses the selected Stream's
+harness, LLM protocol, and reward reference. Verify that the Stream has suitable
+defaults for your tasks. If you explicitly configure a `reward_mapping_file`, keep that
+file when recovering and make it readable by all roles.
 
 The controller verifies the source snapshot and durable storage before starting the
 training entrypoint. Configuration and dependencies follow normal AReaL initialization.

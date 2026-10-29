@@ -1,0 +1,121 @@
+# AMD ROCm counterpart of Dockerfile. Supports sglang and vllm variants via the VARIANT build argument.
+#
+# Usage:
+#   docker build -f Dockerfile.rocm -t areal-runtime:dev-rocm-sglang .                        # default (sglang)
+#   docker build -f Dockerfile.rocm --build-arg VARIANT=vllm -t areal-runtime:dev-rocm-vllm .  # vllm variant
+#
+# Unlike Dockerfile, both variants keep the base image's ROCm torch: PyPI torch wheels are
+# CUDA-only, so every package below is installed --no-deps or compiled against that torch.
+# Validated on 8 x MI308X (gfx942), ROCm 7.15.
+
+FROM rocm/primus:v26.5
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Inference backend selector: sglang (default) or vllm
+ARG VARIANT=sglang
+ARG GPU_ARCH=gfx942
+ARG SITE_PACKAGES=/opt/venv/lib/python3.12/site-packages
+
+# The base sets GPU_ARCHS=native, which aiter cannot resolve, so its JIT kernels would build for gfx906.
+ENV PYTORCH_ROCM_ARCH=${GPU_ARCH} \
+    AMDGPU_TARGET=${GPU_ARCH} \
+    GPU_ARCHS=${GPU_ARCH}
+
+##############################################################
+# Python dependencies (pure-Python delta versus the base image)
+##############################################################
+
+COPY requirements-rocm.txt /tmp/requirements-rocm.txt
+RUN pip install --no-deps --no-cache-dir --pre -r /tmp/requirements-rocm.txt \
+    && pip install --no-deps --no-cache-dir "uv_build>=0.9.18,<0.10.0"
+
+# amdsmi ships inside the ROCm SDK wheel; expose it as a top-level module.
+RUN ln -sfn "$(ls -d ${SITE_PACKAGES}/_rocm_sdk_*/share/amd_smi/amdsmi | head -1)" ${SITE_PACKAGES}/amdsmi
+
+##############################################################
+# Training stack
+##############################################################
+
+# torch memory saver, built for HIP. PR #112 (HIP VMM host access) is in no tag yet.
+RUN pip install --no-deps --no-build-isolation --no-cache-dir \
+    git+https://github.com/fzyzcjy/torch_memory_saver.git@118b09b3bc7b0cf386745db1eac2601d4aa7e681
+
+RUN pip install --no-deps --no-build-isolation --no-cache-dir \
+    git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.19.0 \
+    git+https://github.com/ISEEKYAN/mbridge.git@310e8fb35ccf4fcd4419d32973e563a6d43ee5fb
+
+##############################################################
+# Inference backend (variant-specific, built from source for ROCm)
+##############################################################
+
+# sglang: sgl-kernel via setup_rocm.py, then SGLang with its ROCm pyproject.
+RUN if [ "$VARIANT" = "sglang" ]; then \
+      pip install --no-deps --no-cache-dir \
+        airportsdata==20260905 asttokens==3.0.2 blobfile==3.0.0 executing==2.3.0 \
+        grpcio-health-checking==1.84.0 ipython==9.17.1 ipython_pygments_lexers==1.1.1 \
+        iree-base-compiler==3.8.0 iree-base-runtime==3.8.0 jedi==0.20.0 matplotlib-inline==0.2.2 \
+        modelscope-hub==0.4.6 modelscope==1.40.2 nest-asyncio==1.6.0 outlines==0.1.11 parso==0.8.7 \
+        petit_kernel==0.0.2 pexpect==4.9.0 ptyprocess==0.7.0 pure_eval==0.2.4 \
+        smg-grpc-proto==0.4.26 smg-grpc-servicer==0.13.6 stack-data==0.6.3 traitlets==5.16.1 \
+        wave-lang==3.8.2 \
+      && git clone --depth 1 -b v0.5.10.post1 https://github.com/sgl-project/sglang.git /sglang \
+      && cd /sglang/sgl-kernel && python setup_rocm.py install \
+      && cp /sglang/python/pyproject_other.toml /sglang/python/pyproject.toml \
+      && pip install --no-deps --no-build-isolation --no-cache-dir /sglang/python \
+      && rm -rf /sglang; \
+    fi
+
+# vllm: built against the base torch. vllm#41802 (released in v0.21.0) fixes the ambiguous GPTQ
+# atomicAdd on ROCm >= 7.13; drop the cherry-pick once AReaL pins vllm >= 0.21.0.
+RUN if [ "$VARIANT" = "vllm" ]; then \
+      pip install --no-deps --no-cache-dir \
+        astor==0.8.1 blake3==1.0.11 cbor2==6.1.5 depyf==0.20.0 ijson==3.5.1 \
+        lm-format-enforcer==0.11.3 model-hosting-container-standards==0.1.16 \
+        opencv-python-headless==5.0.0.93 opentelemetry-exporter-http-transport==0.66b1 \
+        opentelemetry-exporter-otlp-common==0.66b1 opentelemetry-exporter-otlp-proto-common==1.45.1 \
+        opentelemetry-exporter-otlp-proto-grpc==1.45.1 opentelemetry-exporter-otlp-proto-http==1.45.1 \
+        opentelemetry-exporter-otlp==1.45.1 opentelemetry-semantic-conventions-ai==0.5.1 \
+        prometheus-fastapi-instrumentator==8.1.0 python-json-logger==4.2.0 supervisor==4.3.0 \
+        watchfiles==1.3.0 \
+      && git clone --depth 1 -b v0.19.1 https://github.com/vllm-project/vllm.git /vllm \
+      && cd /vllm \
+      && git fetch --depth 2 origin 6881c754e1ce4b154ad48e8532d4680e3a54096c \
+      && git cherry-pick --no-commit 6881c754e1ce4b154ad48e8532d4680e3a54096c \
+      && cd / \
+      && VLLM_TARGET_DEVICE=rocm SETUPTOOLS_SCM_PRETEND_VERSION=0.19.1 \
+         pip install --no-deps --no-build-isolation --no-cache-dir /vllm \
+      && rm -rf /vllm; \
+    fi
+
+##############################################################
+# Runtime environment (workarounds for values baked into the base image)
+##############################################################
+
+# One libLLVM: loading torch_memory_saver or transformer_engine otherwise aborts with
+# "spirv-expand-step registered more than once".
+ENV LD_LIBRARY_PATH=${SITE_PACKAGES}/_rocm_sdk_core/lib:${SITE_PACKAGES}/_rocm_sdk_core/lib/llvm/lib:${SITE_PACKAGES}/_rocm_sdk_core/lib/host-math/lib:${SITE_PACKAGES}/_rocm_sdk_core/lib/rocm_sysdeps/lib:${SITE_PACKAGES}/_rocm_sdk_libraries/lib:/opt/openmpi/lib
+# The base sets NVTE_FLASH_ATTN=0; megatron-core's attention_backend=auto requires both on.
+ENV NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=1
+# vLLM 0.19.1 serves /sleep and /wake_up, which colocation calls, only in dev mode. Dev mode also
+# exposes unauthenticated debug endpoints, so do not publish the vLLM port to untrusted networks.
+# SGLang ignores this variable.
+ENV VLLM_SERVER_DEV_MODE=1
+
+##############################################################
+# Install AReaL from local source (last for fast iteration)
+##############################################################
+
+COPY . /AReaL
+RUN pip install --no-deps --no-build-isolation --no-cache-dir -e /AReaL
+
+# SGLang 0.5.10.post1 ROCm fix (aiter MoE layout on weight update); refuses any other SGLang source.
+RUN if [ "$VARIANT" = "sglang" ]; then cd / && python -m areal.engine.sglang_aiter_moe_layout; fi
+
+# Fail the build if the ROCm torch was replaced or a backend does not import.
+RUN cd / && python -c "import torch, areal, torch_memory_saver, megatron.core, mbridge, ${VARIANT}; \
+    assert torch.version.hip, torch.__version__; print('OK', torch.__version__, ${VARIANT}.__version__)"
+
+WORKDIR /AReaL
+ENTRYPOINT []
+CMD ["/bin/bash"]

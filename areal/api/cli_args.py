@@ -1108,8 +1108,9 @@ class MegatronEngineConfig:
             "help": "Sequence chunk size for AReaL's chunked LM Head loss. A "
             "positive value requires enable_chunked_logits=True and "
             "entropy_requires_grad=False, and computes LM Head logits and their "
-            "backward one chunk at a time. The chunked path only supports packed "
-            "text actor models without MTP; 0 disables it."
+            "backward one chunk at a time. Supports text actors and the "
+            "Qwen3.5 model-owned / Qwen4Exp wrapper-owned THD multimodal paths "
+            "without MTP; 0 disables it."
         },
     )
     enable_fp32_lm_head: bool = field(
@@ -1175,6 +1176,31 @@ class MegatronEngineConfig:
         },
     )
 
+    freeze_vision_model: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Freeze the vision encoder before DDP/optimizer construction "
+                "(megatron-bridge only). Set freeze_vision_projection=True as well "
+                "to freeze the complete visual feature path. None freezes "
+                "Qwen3-VL/Qwen3.5 vision by default and preserves other providers' "
+                "defaults. Set False explicitly to train the encoder."
+            )
+        },
+    )
+
+    freeze_vision_projection: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Freeze the vision projector/merger, including deepstack mergers, "
+                "before DDP/optimizer construction (megatron-bridge only). "
+                "None freezes Qwen3-VL/Qwen3.5 mergers by default and preserves "
+                "other providers' defaults. Set False explicitly to train them."
+            )
+        },
+    )
+
     freeze_ple_table: bool = field(
         default=True,
         metadata={
@@ -1219,6 +1245,15 @@ class MegatronEngineConfig:
     )
 
     def __post_init__(self) -> None:
+        if (
+            self.freeze_vision_model is not None
+            or self.freeze_vision_projection is not None
+        ) and self.bridge_type != "megatron-bridge":
+            raise ValueError(
+                "freeze_vision_model and freeze_vision_projection require "
+                "bridge_type='megatron-bridge'; Qwen4-Exp with mcore-bridge "
+                "already freezes its complete visual module by default"
+            )
         if self.cpu_staged_offload.enabled and self.async_save:
             raise ValueError(
                 "megatron.async_save is not supported with "
@@ -2541,6 +2576,14 @@ class SGLangConfig:
     random_seed: int = 1
     skip_tokenizer_init: bool = False
     disable_cuda_graph: bool = False
+    disable_prefill_cuda_graph: bool | None = field(
+        default=None,
+        metadata={
+            "help": "Disable only prefill CUDA graphs while retaining decode graphs. "
+            "None omits the flag for compatibility with older SGLang versions; "
+            "requires a runtime supporting --disable-prefill-cuda-graph."
+        },
+    )
     disable_radix_cache: bool = True
     disable_cuda_graph_padding: bool = False
     enable_nccl_nvls: bool = False
