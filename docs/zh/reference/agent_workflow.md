@@ -32,18 +32,20 @@
 
 ### SGLang 图片预处理
 
-对于支持的 Qwen VLM，OpenAI proxy 可以在准备训练输入时对齐 SGLang 的图片缩放规则。该行为覆盖 Chat
+对于支持的 Qwen VLM，OpenAI proxy 默认在准备训练输入时对齐 SGLang 的图片缩放规则。该行为覆盖 Chat
 Completions、Responses、缓存 prompt 和 concat 历史。 发送给 SGLang 的仍是原始图片字节，不会重新编码。
 
-默认使用原来的 Hugging Face 图片预处理流程。在 proxy/rollout worker 的环境中设置 `AREAL_VLM_ALIGN_SGLANG=true`
-可启用 SGLang 对齐；也支持 `1` 和 `0`。这个开关不会修改 SGLang 的配置， 也不会关闭 HF Processor
+在 proxy/rollout worker 的环境中设置 `AREAL_VLM_ALIGN_SGLANG=false`，可恢复原来的 Hugging Face
+图片预处理流程。默认值为 `true`，也支持 `1` 和 `0`。这个开关不会修改 SGLang 的配置， 也不会关闭 HF Processor
 自身的缩放。关闭对齐后，训练和推理使用的图片输入可能不同。
 
-开启对齐时，也需要启用下文的 AReaL SGLang 处理器。proxy 和 SGLang 必须使用相同的 `SGLANG_VLM_QWEN_LIMIT_PIXEL` 和
-`SGLANG_RESIZE_RESAMPLE` 设置。这个开关不提供独立的像素预算或 JPEG 质量设置。 请在启动 worker 前设置环境变量，无需修改 YAML。
+`SGLANG_VLM_QWEN_LIMIT_PIXEL` 独立控制 SGLang 的像素压缩：默认的 `true` 将符合条件的最大像素预算缩小 16 倍， `false`
+则保留完整预算。开启 proxy 对齐时，这两种设置都会按 SGLang 的实际值处理。proxy 和 SGLang 必须使用相同的
+`SGLANG_VLM_QWEN_LIMIT_PIXEL` 和 `SGLANG_RESIZE_RESAMPLE` 设置。对齐开关不另设像素预算或 JPEG 质量参数。 请在启动
+worker 前设置这些环境变量，无需修改 YAML。
 
-SGLang 服务端的 AReaL Qwen3-VL/Qwen3.5 处理器需要显式启用。如果采样文本中可能包含字面视觉 token， 并且需要保留真实图片的位置，请在
-SGLang 服务端环境中设置
+SGLang 服务端的 AReaL Qwen3-VL/Qwen3.5 处理器是独立的显式选项。如需经过验证的 CPU/PIL 服务端路径，或采样文本中可能包含字面视觉
+token、需要保留真实图片的位置，请在 SGLang 服务端环境中设置
 `SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=areal.engine.sglang_processors`。未设置时，该
 Qwen3-VL/Qwen3.5 集成不会修改 SGLang 源码，也不会覆盖已有的第三方处理器。该服务端设置独立于控制 proxy 图片预处理的
 `AREAL_VLM_ALIGN_SGLANG`。

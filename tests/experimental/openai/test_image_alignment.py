@@ -50,7 +50,7 @@ class Qwen3VLProcessor:
 
 @pytest.fixture
 def processor(tmp_path, monkeypatch):
-    monkeypatch.setenv("AREAL_VLM_ALIGN_SGLANG", "true")
+    monkeypatch.delenv("AREAL_VLM_ALIGN_SGLANG", raising=False)
     monkeypatch.delenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", raising=False)
     monkeypatch.delenv("SGLANG_RESIZE_RESAMPLE", raising=False)
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
@@ -131,7 +131,7 @@ async def test_create_forwards_images_for_backend(
     monkeypatch, api, backend, alignment, processor
 ):
     if alignment is None:
-        monkeypatch.delenv("AREAL_VLM_ALIGN_SGLANG")
+        monkeypatch.delenv("AREAL_VLM_ALIGN_SGLANG", raising=False)
     else:
         monkeypatch.setenv("AREAL_VLM_ALIGN_SGLANG", alignment)
     monkeypatch.delenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", raising=False)
@@ -207,7 +207,7 @@ async def test_create_forwards_images_for_backend(
             wire = image_request_kwargs(request, accumulated_tokens=[3])
             assert wire["input_ids"] == request.input_ids + [3]
             assert wire["mm_sampling_kwargs"][IMAGE_SPANS_KEY] == [[2, 2]]
-        if backend == "sglang" and alignment == "true":
+        if backend == "sglang" and alignment != "false":
             assert request.image_data == [original]
             expected_size = (1152, 864)
             assert processor.image_kwargs[0]["size"]["longest_edge"] == 1048576

@@ -55,7 +55,7 @@ def cpu_runtime(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("processor_package", [None, "third_party.processor"])
-@pytest.mark.parametrize("alignment", [None, "false"])
+@pytest.mark.parametrize("alignment", [None, "false", "true"])
 def test_qwen_server_without_opt_in_preserves_existing_installation(
     cpu_runtime, tmp_path, monkeypatch, processor_package, alignment
 ):
