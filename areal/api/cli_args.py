@@ -1108,8 +1108,9 @@ class MegatronEngineConfig:
             "help": "Sequence chunk size for AReaL's chunked LM Head loss. A "
             "positive value requires enable_chunked_logits=True and "
             "entropy_requires_grad=False, and computes LM Head logits and their "
-            "backward one chunk at a time. The chunked path only supports packed "
-            "text actor models without MTP; 0 disables it."
+            "backward one chunk at a time. Supports text actors and the "
+            "Qwen3.5 model-owned / Qwen4Exp wrapper-owned THD multimodal paths "
+            "without MTP; 0 disables it."
         },
     )
     enable_fp32_lm_head: bool = field(
@@ -2575,6 +2576,14 @@ class SGLangConfig:
     random_seed: int = 1
     skip_tokenizer_init: bool = False
     disable_cuda_graph: bool = False
+    disable_prefill_cuda_graph: bool | None = field(
+        default=None,
+        metadata={
+            "help": "Disable only prefill CUDA graphs while retaining decode graphs. "
+            "None omits the flag for compatibility with older SGLang versions; "
+            "requires a runtime supporting --disable-prefill-cuda-graph."
+        },
+    )
     disable_radix_cache: bool = True
     disable_cuda_graph_padding: bool = False
     enable_nccl_nvls: bool = False

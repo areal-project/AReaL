@@ -9,3 +9,7 @@ compatible with the current codebase. For reference, you can still access the le
 configs and run experiments within `realhf` by reverting to commit `820ca49` or earlier.
 
 Updated benchmark results for the new codebase will be available soon.
+
+For a reproducible, single-node measurement of actual AReaL FSDP training steps and a
+bounded microbatch/gradient-checkpointing sweep, see the
+[FSDP training-step benchmark guide](../docs/en/best_practices/fsdp_train_step_benchmark.md).

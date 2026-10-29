@@ -2078,30 +2078,26 @@ class MegatronEngine(TrainEngine):
                 and self.sequence_packing_mode == SequencePackingMode.WRAPPER_THD
                 and self.hf_config.architectures == ["Qwen4ExpForConditionalGeneration"]
             )
-            qwen35_text_thd = (
-                self.use_model_packed_seq
-                and is_qwen3_5_model(self.hf_config.model_type)
-                and not has_vision_inputs
+            qwen35_model_thd = self.use_model_packed_seq and is_qwen3_5_model(
+                self.hf_config.model_type
             )
-            # Qwen4Exp's wrapper retains the visual embedding forward while
-            # bypassing only the inner language model's final projection. Its
-            # mRoPE and token masks are prepared before the shared THD/CP split.
+            # Both wrappers retain visual embedding/fusion and mRoPE before
+            # their THD/CP split. Hidden-state mode bypasses only the inner
+            # language model's final projection, so image/video inputs do not
+            # change the chunked LM Head's hidden-state or label contract.
             if (
                 use_chunked_lm_head
-                and not qwen4_wrapper_thd
+                and not (qwen4_wrapper_thd or qwen35_model_thd)
                 and (
                     has_vision_inputs
-                    or (
-                        self.is_vision_model
-                        and not self.use_padded_seq
-                        and not qwen35_text_thd
-                    )
+                    or (self.is_vision_model and not self.use_padded_seq)
                 )
             ):
                 raise NotImplementedError(
-                    "chunked LM Head vision inputs require the Qwen4Exp "
-                    "mcore-bridge WRAPPER_THD path; text-only Qwen3.5 supports "
-                    "padded BSHD and model-owned THD"
+                    "chunked LM Head vision inputs require Qwen3.5 "
+                    "megatron-bridge model-owned THD or Qwen4Exp "
+                    "mcore-bridge wrapper-owned THD; text-only Qwen3.5 "
+                    "also supports padded BSHD"
                 )
 
             # MTP training: pass the token loss mask through the model's actual
