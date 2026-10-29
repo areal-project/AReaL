@@ -310,6 +310,25 @@ class TestRolloutLifecycle:
         assert stats.accepted == 0  # NOT incremented (key difference from accept)
         assert stats.rejected == 1
 
+    def test_drop_after_accept_restores_capacity_without_touching_running(self):
+        """A queued result rejected after aging must release one accepted slot."""
+        manager = StalenessManager(
+            version_provider=MockVersionProvider(0),
+            max_concurrent_rollouts=100,
+            consumer_batch_size=4,
+            max_staleness=1,
+        )
+        manager.on_rollout_enqueued()
+        manager.on_rollout_submitted()
+        manager.on_rollout_accepted()
+        capacity_before_drop = manager.get_capacity()
+
+        manager.on_rollout_dropped_after_accept()
+
+        stats = manager.get_stats()
+        assert (stats.accepted, stats.rejected, stats.running) == (0, 1, 0)
+        assert manager.get_capacity() == capacity_before_drop + 1
+
     def test_multiple_rollouts_lifecycle(self):
         """Test multiple rollouts going through their lifecycle."""
         version_provider = MockVersionProvider(0)

@@ -1,5 +1,6 @@
 import asyncio
-from unittest.mock import Mock
+import time
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import requests
@@ -127,7 +128,11 @@ class MockScheduler:
                 and task_id in self._pending_results[worker_id]
             ):
                 result = self._pending_results[worker_id].pop(task_id)
-                return {"trajectory": result, "metrics": None}
+                return {
+                    "trajectory": result,
+                    "metrics": None,
+                    "min_generated_version": 0,
+                }
             return None
         elif method == "wait":
             # Return a result from pending results if available
@@ -184,6 +189,20 @@ class MockScheduler:
         self.workers.clear()
         self._pending_results.clear()
         self._task_counter = 0
+
+
+class VersionedMockScheduler(MockScheduler):
+    """Return the generated-token version summary produced by a rollout worker."""
+
+    def __init__(self, min_generated_version: int):
+        super().__init__()
+        self.min_generated_version = min_generated_version
+
+    async def async_call_engine(self, worker_id, method, *args, **kwargs):
+        result = await super().async_call_engine(worker_id, method, *args, **kwargs)
+        if method == "get_rollout_result" and isinstance(result, dict):
+            result["min_generated_version"] = self.min_generated_version
+        return result
 
 
 class MockInferenceEngine:
@@ -621,6 +640,246 @@ class TestRolloutControllerWorkerSelection:
 
 
 class TestRolloutControllerSubmitAndWait:
+    def test_worker_rpc_queue_aging_replaces_stale_group_in_full_batch(self):
+        """Exercise real worker version extraction through batch replacement."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from tests.test_workflow_executor_filtering import _TrajectoryWorkflow
+
+        from areal.infra.remote_inf_engine import RemoteInfEngine
+        from areal.infra.workflow_executor import WorkflowExecutor, _RolloutTaskInput
+
+        class WorkerResultScheduler(MockScheduler):
+            async def async_call_engine(self, worker_id, method, *args, **kwargs):
+                result = await super().async_call_engine(
+                    worker_id, method, *args, **kwargs
+                )
+                if method != "get_rollout_result" or result is None:
+                    return result
+                version = controller.get_version()
+                trajectory = {
+                    "input_ids": torch.tensor([[1, 2, 3]]),
+                    "attention_mask": torch.ones(1, 3, dtype=torch.bool),
+                    "loss_mask": torch.tensor([[0, 1, 1]]),
+                    "versions": torch.tensor([[-1, version, version]]),
+                    "rewards": torch.tensor([1.0]),
+                }
+                executor = WorkflowExecutor(
+                    config=create_test_config(dump_to_file=False),
+                    inference_engine=MagicMock(),
+                    staleness_manager=MagicMock(),
+                )
+                worker_result = await executor._create_workflow_task(
+                    _RolloutTaskInput(
+                        task_id=kwargs["task_id"],
+                        data={},
+                        workflow=_TrajectoryWorkflow(trajectory),
+                    )
+                )()
+                dispatcher = Mock()
+                dispatcher.wait_for_task.return_value = worker_result
+                engine = SimpleNamespace(
+                    workflow_executor=SimpleNamespace(dispatcher=dispatcher)
+                )
+                return RemoteInfEngine.get_rollout_result(engine, kwargs["task_id"])
+
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=create_test_config(consumer_batch_size=1, max_head_offpolicyness=1),
+            scheduler=WorkerResultScheduler(),
+        )
+        controller.initialize(role="rollout", server_args={})
+        controller.set_version(1)
+        try:
+            controller.submit({"id": 0}, workflow="tests.utils.TestWorkflow")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with controller.dispatcher._result_cv:
+                    if controller.dispatcher._pending_results:
+                        break
+                time.sleep(0.01)
+            else:
+                pytest.fail("Initial group did not reach the result queue")
+            controller.set_version(3)
+            dataloader = _CyclingDataLoader()
+            dataloader.batch_size = 1
+            batch = controller.prepare_batch(dataloader, "tests.utils.TestWorkflow")
+            assert len(batch) == 1
+            assert batch[0]["versions"][batch[0]["loss_mask"] > 0].tolist() == [3, 3]
+            stats = controller.staleness_manager.get_stats()
+            assert stats.rejected == 1
+        finally:
+            controller.destroy()
+
+    def test_completed_group_older_than_limit_is_rejected(self):
+        """A finished long-running group must not enter a newer actor batch."""
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=create_test_config(max_head_offpolicyness=1),
+            scheduler=VersionedMockScheduler(min_generated_version=0),
+        )
+        controller.initialize(role="rollout", server_args={})
+        controller.set_version(2)
+        try:
+            controller.submit({"id": 0}, workflow="tests.utils.TestWorkflow")
+            assert controller.wait(count=1, timeout=5.0) == [None]
+            stats = controller.staleness_manager.get_stats()
+            assert (stats.accepted, stats.rejected, stats.running) == (0, 1, 0)
+        finally:
+            controller.destroy()
+
+    @pytest.mark.parametrize("summary", ["missing", "0", False, 0.5, -1])
+    def test_invalid_worker_summary_is_rejected_and_cleared(self, summary):
+        """Missing or malformed worker metadata must not bypass the gate."""
+
+        class InvalidSummaryScheduler(MockScheduler):
+            async def async_call_engine(self, worker_id, method, *args, **kwargs):
+                result = await super().async_call_engine(
+                    worker_id, method, *args, **kwargs
+                )
+                if method == "get_rollout_result" and isinstance(result, dict):
+                    if summary == "missing":
+                        result.pop("min_generated_version")
+                    else:
+                        result["min_generated_version"] = summary
+                return result
+
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=create_test_config(max_head_offpolicyness=1),
+            scheduler=InvalidSummaryScheduler(),
+        )
+        controller.initialize(role="rollout", server_args={})
+        try:
+            with patch(
+                "areal.infra.controller.rollout_controller.clear_rejected_trajectory",
+                new_callable=AsyncMock,
+            ) as cleanup:
+                controller.submit({"id": 0}, workflow="tests.utils.TestWorkflow")
+                assert controller.wait(count=1, timeout=5.0) == [None]
+                cleanup.assert_awaited_once()
+                assert "input_ids" in cleanup.await_args.args[0]
+            stats = controller.staleness_manager.get_stats()
+            assert (stats.accepted, stats.rejected, stats.running) == (0, 1, 0)
+            metrics = controller.consumed_metrics.export()
+            assert metrics["rollout/stale_at_completion"] == 1.0
+        finally:
+            controller.destroy()
+
+    def test_group_that_ages_in_result_queue_is_rejected(self):
+        """Recheck version when consuming an earlier accepted group."""
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=create_test_config(max_head_offpolicyness=1),
+            scheduler=VersionedMockScheduler(min_generated_version=1),
+        )
+        controller.initialize(role="rollout", server_args={})
+        controller.set_version(2)
+        try:
+            controller.submit({"id": 0}, workflow="tests.utils.TestWorkflow")
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                stats = controller.staleness_manager.get_stats()
+                with controller.dispatcher._result_cv:
+                    queued = bool(controller.dispatcher._pending_results)
+                if stats.accepted == 1 and queued:
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("The rollout did not reach the accepted result queue")
+
+            controller.set_version(3)
+            with patch(
+                "areal.infra.controller.rollout_controller.clear_rejected_trajectory",
+                new_callable=AsyncMock,
+            ) as cleanup:
+                assert controller.wait(count=1, timeout=5.0) == [None]
+                cleanup.assert_awaited_once()
+                assert "input_ids" in cleanup.await_args.args[0]
+            metrics = controller.consumed_metrics.export()
+            assert metrics["rollout/stale_at_consumption"] == 1.0
+            stats = controller.staleness_manager.get_stats()
+            assert (stats.accepted, stats.rejected, stats.running) == (0, 1, 0)
+        finally:
+            controller.destroy()
+
+    def test_group_within_version_limit_remains_accepted(self):
+        """The gate must retain a group exactly one version behind."""
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=create_test_config(max_head_offpolicyness=1),
+            scheduler=VersionedMockScheduler(min_generated_version=1),
+        )
+        controller.initialize(role="rollout", server_args={})
+        controller.set_version(2)
+        try:
+            controller.submit({"id": 0}, workflow="tests.utils.TestWorkflow")
+            results = controller.wait(count=1, timeout=5.0)
+            assert len(results) == 1 and isinstance(results[0], dict)
+            stats = controller.staleness_manager.get_stats()
+            assert (stats.accepted, stats.rejected, stats.running) == (1, 0, 0)
+        finally:
+            controller.destroy()
+
+    @pytest.mark.parametrize("tensor_payload", [False, True])
+    def test_result_without_generated_tokens_has_no_staleness(self, tensor_payload):
+        """String workflows and zero-generation batches need no policy version."""
+
+        class NoGeneratedTokensScheduler(MockScheduler):
+            async def async_call_engine(self, worker_id, method, *args, **kwargs):
+                result = await super().async_call_engine(
+                    worker_id, method, *args, **kwargs
+                )
+                if method == "get_rollout_result" and isinstance(result, dict):
+                    if tensor_payload:
+                        trajectory = result["trajectory"]
+                        trajectory["loss_mask"] = torch.zeros_like(
+                            trajectory["loss_mask"]
+                        )
+                        trajectory["versions"] = torch.full_like(
+                            trajectory["input_ids"], -1
+                        )
+                        result["min_generated_version"] = None
+                    else:
+                        result["trajectory"] = {"text": "external API response"}
+                        result.pop("min_generated_version")
+                return result
+
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=create_test_config(max_head_offpolicyness=1),
+            scheduler=NoGeneratedTokensScheduler(),
+        )
+        controller.initialize(role="rollout", server_args={})
+        controller.set_version(5)
+        try:
+            controller.submit({"id": 0}, workflow="tests.utils.TestWorkflow")
+            results = controller.wait(count=1, timeout=5.0)
+            assert len(results) == 1 and isinstance(results[0], dict)
+            stats = controller.staleness_manager.get_stats()
+            assert (stats.accepted, stats.rejected, stats.running) == (1, 0, 0)
+        finally:
+            controller.destroy()
+
+    def test_eval_group_is_not_rejected_by_training_staleness_limit(self):
+        """Evaluation rollouts use their own version semantics."""
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=create_test_config(max_head_offpolicyness=1),
+            scheduler=VersionedMockScheduler(min_generated_version=0),
+        )
+        controller.initialize(role="rollout", server_args={})
+        controller.set_version(2)
+        try:
+            controller.submit(
+                {"id": 0}, workflow="tests.utils.TestWorkflow", is_eval=True
+            )
+            results = controller.wait(count=1, timeout=5.0)
+            assert len(results) == 1 and isinstance(results[0], dict)
+        finally:
+            controller.destroy()
+
     def test_wait_returns_distributed_batch(self):
         config = create_test_config(consumer_batch_size=16, max_concurrent_rollouts=50)
         scheduler = MockScheduler()

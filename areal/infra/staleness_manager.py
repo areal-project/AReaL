@@ -165,6 +165,12 @@ class StalenessManager:
             self.rollout_stat.running -= 1
             self.rollout_stat.rejected += 1
 
+    def on_rollout_dropped_after_accept(self) -> None:
+        """Release an accepted result that became stale while queued."""
+        with self.lock:
+            self.rollout_stat.accepted -= 1
+            self.rollout_stat.rejected += 1
+
     def get_stats(self) -> RolloutStat:
         """Get a snapshot of current rollout statistics.
 
