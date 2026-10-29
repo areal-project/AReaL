@@ -605,6 +605,36 @@ class TestAwexRecoverRestore:
             info,
         )
 
+    @pytest.mark.parametrize("multiple_engines", [False, True])
+    def test_load_without_inference_restores_training_versions(
+        self, tmp_path, monkeypatch, multiple_engines
+    ):
+        """Offline resume must align policy versions before another PPO update."""
+        handler, actor, _, dependencies, events, info = self.prepare(
+            tmp_path, monkeypatch
+        )
+        engines = {"default": actor, "critic": Mock()} if multiple_engines else actor
+        if multiple_engines:
+            monkeypatch.setattr(
+                checkpoint_pointer,
+                "resolve_checkpoint",
+                lambda *_: SimpleNamespace(
+                    manifest="manifest",
+                    label="generation17",
+                    payloads={"default": "payload", "critic": "critic-payload"},
+                    transactional=True,
+                ),
+            )
+
+        assert handler.load(engines, *dependencies) is info
+
+        actor.set_version.assert_called_once_with(18)
+        if multiple_engines:
+            engines["critic"].set_version.assert_called_once_with(18)
+        events.inference.assert_not_called()
+        actor.connect_engine.assert_not_called()
+        actor.update_weights.assert_not_called()
+
     @pytest.mark.parametrize("async_continue", [False, True])
     def test_load_colocated_awex_restores_before_admission(
         self, tmp_path, monkeypatch, async_continue

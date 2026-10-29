@@ -71,6 +71,7 @@ from areal.utils.perf_tracer import Category
 from areal.utils.recover import RecoverHandler
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
+from areal.utils.trajectory import TrajectoryStore
 from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
 )
@@ -227,6 +228,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        self._trajectory_store = self._create_trajectory_store()
         self._r3_moe_config: R3MoEConfig | None = None
         self.mopd_execution_plan = MOPDExecutionPlan.from_config(config)
         self._apply_dte_config_envvars()
@@ -262,6 +264,7 @@ class PPOTrainer:
             if self.mopd_execution_plan is not None
             else config.actor.kl_ctl > 0 and config.ref is not None
         )
+        requires_ref = requires_ref and not self._replay_full
         self._should_offload_critic = bool(
             requires_critic and config.critic is not None and config.critic.offload
         )
@@ -269,7 +272,9 @@ class PPOTrainer:
             requires_ref and config.ref is not None and config.ref.offload
         )
         self._should_offload_teacher = (
-            config.teacher is not None and config.teacher.offload
+            config.teacher is not None
+            and config.teacher.offload
+            and not self._replay_full
         )
         # In colocate (awex) mode the GPU switch between rollout and training
         # is managed by the AWEX adapter (manual offload/onload + tagged SGLang
@@ -295,7 +300,7 @@ class PPOTrainer:
             )
 
         # -- Dataset loading --------------------------------------------------
-        if not self._online_mode and train_dataset is None:
+        if not self._online_mode and not self._replay_mode and train_dataset is None:
             raise ValueError(
                 "train_dataset must be provided unless using online RL mode "
                 "(agent.mode='online')."
@@ -316,7 +321,7 @@ class PPOTrainer:
 
         self.teacher = None
         self.teacher_alloc = None
-        if config.teacher is not None:
+        if config.teacher is not None and not self._replay_full:
             if config.teacher.engine_type == "rollout":
                 self.teacher_alloc = ModelAllocation.from_str(
                     config.teacher.rollout.backend, name="teacher"
@@ -333,7 +338,15 @@ class PPOTrainer:
 
         steps_per_epoch: int | None = None
         self.train_dataloader: StatefulDataLoader | _EmptyDataLoader
-        if self._online_mode:
+        if self._replay_mode:
+            manifest = self._trajectory_store.replay_manifest(
+                batch_size=config.train_dataset.batch_size
+            )
+            self.train_dataloader = _EmptyDataLoader(
+                batch_size=config.train_dataset.batch_size,
+                steps_per_epoch=manifest["steps_per_epoch"],
+            )
+        elif self._online_mode:
             if config.total_train_steps is None:
                 raise ValueError(
                     "total_train_steps must be set for online mode. "
@@ -416,6 +429,11 @@ class PPOTrainer:
                 train_batch_size=config.train_dataset.batch_size,
             )
         self._ft_spec = ft_spec
+        if self._trajectory_store is not None and not self._replay_mode:
+            self._trajectory_store.initialize_dump(
+                steps_per_epoch=len(self.train_dataloader),
+                batch_size=config.train_dataset.batch_size,
+            )
 
         # Initialize engines first — the scheduler must know about roles
         # before the data controller can colocate with them.
@@ -431,6 +449,7 @@ class PPOTrainer:
         if (
             self.config.teacher is not None
             and self.config.teacher.engine_type == "train"
+            and not self._replay_full
         ):
             assert self.config.teacher.train is not None
             self.teacher = self._create_train_engine(
@@ -438,6 +457,57 @@ class PPOTrainer:
             )
             self.teacher.initialize(**engine_init_kwargs, role="teacher")
 
+        self.rollout = None
+        self.eval_rollout = None
+        self.weight_update_meta = None
+        self._awex_meta_server_addr = None
+        self.mopd_teacher_manager = None
+        self.mopd_teacher_phase = None
+        self._proxy_started = False
+        if not self._replay_mode:
+            self._initialize_rollout_services()
+
+        # Set up evaluation (skip in online mode)
+        self.evaluator = Evaluator(config.evaluator, ft_spec)
+
+        # Set up save as HF model
+        self.saver = Saver(config.saver, ft_spec)
+        self.recover_handler = RecoverHandler(config.recover, ft_spec)
+
+        # Set up statistics logging (wandb, tensoboard, etc.)
+        self.stats_logger = StatsLogger(config, ft_spec)
+
+        # Set up checkpointing for recover
+        self.recover_info = self.recover_handler.load(
+            self._recover_engines(),
+            self.saver,
+            self.evaluator,
+            self.stats_logger,
+            self.train_dataloader,
+            inference_engine=self.rollout,
+            weight_update_meta=self.weight_update_meta,
+            # Recompute placement instead of reusing _should_offload_rollout:
+            # AWEX clears that flag because it drives the handover itself.
+            colocated_rollout=self._is_actor_rollout_colocated(config),
+        )
+
+        # After recovery, sync the staleness manager so its capacity formula
+        # stays bounded despite the version jumping from 0 to recovery_version.
+        if self.recover_info is not None and self.rollout is not None:
+            recovery_version = self.recover_info.last_step_info.global_step + 1
+            if is_single_controller():
+                sm = self.rollout.staleness_manager
+            else:
+                sm = self.rollout.workflow_executor.staleness_manager
+            if sm is not None:
+                sm.on_version_recovered(recovery_version)
+
+        self._config_perf_tracer()
+        self._apply_initial_offload_policy()
+
+    def _initialize_rollout_services(self) -> None:
+        """Initialize the online side only; replay owns no inference services."""
+        config = self.config
         # Save initial LoRA weights if enabled (for inference server pre-loading)
         initial_lora_path = self._save_initial_lora_weights()
 
@@ -586,43 +656,90 @@ class PPOTrainer:
 
         self.actor.connect_engine(self.rollout, self.weight_update_meta)
 
-        # Set up evaluation (skip in online mode)
-        self.evaluator = Evaluator(config.evaluator, ft_spec)
+    @property
+    def _replay_mode(self) -> bool:
+        debug = getattr(getattr(self, "config", None), "trajectory_debug", None)
+        return debug is not None and debug.mode == "replay"
 
-        # Set up save as HF model
-        self.saver = Saver(config.saver, ft_spec)
-        self.recover_handler = RecoverHandler(config.recover, ft_spec)
+    @property
+    def _replay_full(self) -> bool:
+        return self._replay_mode and self.config.trajectory_debug.scope == "full"
 
-        # Set up statistics logging (wandb, tensoboard, etc.)
-        self.stats_logger = StatsLogger(config, ft_spec)
-
-        # Set up checkpointing for recover
-        self.recover_info = self.recover_handler.load(
-            self._recover_engines(),
-            self.saver,
-            self.evaluator,
-            self.stats_logger,
-            self.train_dataloader,
-            inference_engine=self.rollout,
-            weight_update_meta=self.weight_update_meta,
-            # Recompute placement instead of reusing _should_offload_rollout:
-            # AWEX clears that flag because it drives the handover itself.
-            colocated_rollout=self._is_actor_rollout_colocated(config),
+    def _create_trajectory_store(self) -> TrajectoryStore | None:
+        debug = self.config.trajectory_debug
+        if debug.mode == "off":
+            return None
+        if not is_single_controller():
+            raise ValueError("trajectory_debug requires single-controller RL")
+        if ModelAllocation.from_str(self.config.rollout.backend).backend != "sglang":
+            raise ValueError("trajectory_debug currently supports SGLang only")
+        if self.config.mopd is not None:
+            raise ValueError("trajectory_debug does not support MOPD")
+        agent = self.config.rollout.agent
+        if agent is not None and agent.mode == "online":
+            raise ValueError("trajectory_debug requires dataset-based RL")
+        if self._replay_mode:
+            if self.config.valid_dataset is not None:
+                raise ValueError("Offline replay requires valid_dataset=null")
+            if (
+                self.config.teacher is not None
+                and self.config.teacher.engine_type == "rollout"
+                and not self._replay_full
+            ):
+                raise ValueError("Rollout-engine teachers require full-scope replay")
+        path = debug.path or os.path.join(
+            self.config.cluster.fileroot,
+            self.config.experiment_name,
+            self.config.trial_name,
+            "debug_trajectories",
         )
+        identity = {
+            "actor_version": self.config.actor._version,
+            "actor_backend": self.config.actor.backend,
+            "actor_path": self.config.actor.path,
+            "critic_backend": self.config.critic.backend
+            if self.config.critic
+            else None,
+            "n_samples": self.config.gconfig.n_samples,
+        }
+        store = TrajectoryStore(path, scope=debug.scope, identity=identity)
+        if self._replay_mode:
+            store.replay_manifest(batch_size=self.config.train_dataset.batch_size)
+        return store
 
-        # After recovery, sync the staleness manager so its capacity formula
-        # stays bounded despite the version jumping from 0 to recovery_version.
-        if self.recover_info is not None:
-            recovery_version = self.recover_info.last_step_info.global_step + 1
-            if is_single_controller():
-                sm = self.rollout.staleness_manager
-            else:
-                sm = self.rollout.workflow_executor.staleness_manager
-            if sm is not None:
-                sm.on_version_recovered(recovery_version)
+    def _capture_trajectory(
+        self, batch: list[dict[str, Any]], step: int, *, scope: str
+    ) -> None:
+        store = getattr(self, "_trajectory_store", None)
+        if store is None or self._replay_mode:
+            return
+        debug = self.config.trajectory_debug
+        if debug.scope == scope and (debug.steps is None or step in debug.steps):
+            with stats_tracker.record_timing("trajectory_dump"):
+                path = store.save(batch, step)
+            logger.info("Saved %s trajectory batch at step %d to %s", scope, step, path)
 
-        self._config_perf_tracer()
-        self._apply_initial_offload_policy()
+    def _validate_replay_batch(self, batch: list[dict[str, Any]]) -> None:
+        minimum = _minimum_consumer_batch_size(
+            self.actor, self.critic, self.ref, self.teacher
+        )
+        if len(batch) < minimum:
+            raise ValueError(
+                f"Replay needs at least {minimum} groups, got {len(batch)}"
+            )
+        if not self._replay_full:
+            return
+        required = []
+        if self.config.critic is not None:
+            required.append("values")
+        if self.config.ref is not None and self.config.actor.kl_ctl > 0:
+            required.append("ref_logp")
+        if self.config.teacher is not None:
+            required.extend(("teacher_logp", "rl_loss_weight", "distill_loss_weight"))
+        if self.config.actor.should_compute_prox_logp():
+            required.append("prox_logp")
+        if any(key not in trajectory for trajectory in batch for key in required):
+            raise ValueError(f"Full replay snapshot needs scoring fields {required}")
 
     def _should_initialize_eval_rollout(self) -> bool:
         """Return whether this trainer has evaluation data to serve."""
@@ -639,6 +756,8 @@ class PPOTrainer:
         )
 
     def _is_actor_rollout_colocated(self, config: PPOConfig) -> bool:
+        if self._replay_mode:
+            return False
         actor_s = config.actor.scheduling_strategy
         rollout_s = config.rollout.scheduling_strategy
         return (self._is_colocation(actor_s) and actor_s.target == "rollout") or (
@@ -661,7 +780,9 @@ class PPOTrainer:
         forever.
         """
         return (
-            config.actor._version == "v1" and config.actor.weight_update_mode == "awex"
+            not self._replay_mode
+            and config.actor._version == "v1"
+            and config.actor.weight_update_mode == "awex"
         )
 
     def _onload_model(self, engine, role: str) -> None:
@@ -895,36 +1016,40 @@ class PPOTrainer:
             raise ValueError(f"Total epochs must be positive: {total_epochs}")
         steps_per_epoch = len(self.train_dataloader)
         max_steps = total_epochs * steps_per_epoch
-        workflow_kwargs = self._maybe_inject_r3_workflow_kwargs(
-            workflow, workflow_kwargs
-        )
-        eval_workflow_kwargs = self._maybe_inject_r3_workflow_kwargs(
-            eval_workflow, eval_workflow_kwargs
-        )
-
-        # Initialize proxy workers if not using RolloutWorkflow
-        if workflow is None:
-            agent_cfg = self.config.rollout.agent
-            if agent_cfg is not None and agent_cfg.mode == "online":
-                self._ensure_proxy_started()
-            else:
-                raise ValueError(
-                    "workflow must be specified for train() unless "
-                    "agent.mode='online' is configured. "
-                    "Pass a RolloutWorkflow, AgentWorkflow, or callable."
-                )
-        elif self._requires_proxy_workflow(workflow):
-            self._ensure_proxy_started()
-
-        if self.recover_info is None and self._evaluate_before_train(
-            eval_workflow=eval_workflow,
-            eval_workflow_kwargs=eval_workflow_kwargs,
-        ):
-            self._export_and_commit_stats(
-                epoch=-1,
-                epoch_step=-1,
-                global_step=-1,
+        if self._replay_mode:
+            stop_step = min(max_steps, config.total_train_steps or max_steps)
+            self._trajectory_store.validate_steps(start_step, stop_step)
+        else:
+            workflow_kwargs = self._maybe_inject_r3_workflow_kwargs(
+                workflow, workflow_kwargs
             )
+            eval_workflow_kwargs = self._maybe_inject_r3_workflow_kwargs(
+                eval_workflow, eval_workflow_kwargs
+            )
+
+            # Initialize proxy workers if not using RolloutWorkflow
+            if workflow is None:
+                agent_cfg = self.config.rollout.agent
+                if agent_cfg is not None and agent_cfg.mode == "online":
+                    self._ensure_proxy_started()
+                else:
+                    raise ValueError(
+                        "workflow must be specified for train() unless "
+                        "agent.mode='online' is configured. "
+                        "Pass a RolloutWorkflow, AgentWorkflow, or callable."
+                    )
+            elif self._requires_proxy_workflow(workflow):
+                self._ensure_proxy_started()
+
+            if self.recover_info is None and self._evaluate_before_train(
+                eval_workflow=eval_workflow,
+                eval_workflow_kwargs=eval_workflow_kwargs,
+            ):
+                self._export_and_commit_stats(
+                    epoch=-1,
+                    epoch_step=-1,
+                    global_step=-1,
+                )
 
         for global_step in range(start_step, max_steps):
             if (
@@ -948,29 +1073,34 @@ class PPOTrainer:
                     },
                 ),
             ):
-                prepare_kwargs = dict(
-                    workflow=workflow,
-                    workflow_kwargs=workflow_kwargs,
-                    should_accept_fn=dynamic_filter_fn,
-                    group_size=config.gconfig.n_samples,
-                    dynamic_bs=config.dynamic_bs,
-                    reward_normalization=config.gconfig.reward_normalization,
-                    drop_incomplete_group=config.gconfig.drop_incomplete_group,
-                    min_usable_group_size=min_usable_group_size,
-                )
-                if is_v1_rollout:
-                    prepare_kwargs["reward_normalization_use_std"] = (
-                        config.gconfig.reward_normalization_use_std
+                if self._replay_mode:
+                    rollout_batch = self._trajectory_store.load(global_step)
+                    self._validate_replay_batch(rollout_batch)
+                else:
+                    prepare_kwargs = dict(
+                        workflow=workflow,
+                        workflow_kwargs=workflow_kwargs,
+                        should_accept_fn=dynamic_filter_fn,
+                        group_size=config.gconfig.n_samples,
+                        dynamic_bs=config.dynamic_bs,
+                        reward_normalization=config.gconfig.reward_normalization,
+                        drop_incomplete_group=config.gconfig.drop_incomplete_group,
+                        min_usable_group_size=min_usable_group_size,
                     )
-                rollout_batch = _collect_trainable_rollout_batch(
-                    functools.partial(
-                        self.actor.prepare_batch,
-                        self.train_dataloader,
-                        **prepare_kwargs,
-                    ),
-                    dynamic_bs=config.dynamic_bs,
-                    min_batch_size=min_consumer_batch_size,
-                )
+                    if is_v1_rollout:
+                        prepare_kwargs["reward_normalization_use_std"] = (
+                            config.gconfig.reward_normalization_use_std
+                        )
+                    rollout_batch = _collect_trainable_rollout_batch(
+                        functools.partial(
+                            self.actor.prepare_batch,
+                            self.train_dataloader,
+                            **prepare_kwargs,
+                        ),
+                        dynamic_bs=config.dynamic_bs,
+                        min_batch_size=min_consumer_batch_size,
+                    )
+            self._capture_trajectory(rollout_batch, global_step, scope="rollout")
             if self._should_offload_rollout:
                 self._offload_rollout()
             elif self._is_v1_awex_colocate(self.config):
@@ -986,7 +1116,7 @@ class PPOTrainer:
                 logger.info("[AWEX] colocate: offload cuda_graph...")
                 self.rollout.offload(tags=["cuda_graph"])
 
-            if self.critic is not None:
+            if self.critic is not None and not self._replay_full:
                 if self._should_offload_critic:
                     self._onload_model(self.critic, role="critic")
                 with (
@@ -1090,7 +1220,7 @@ class PPOTrainer:
                 if self.mopd_execution_plan is not None
                 else config.actor.should_compute_prox_logp()
             )
-            if should_compute_prox_logp:
+            if should_compute_prox_logp and not self._replay_full:
                 with (
                     stats_tracker.record_timing("recompute_logp"),
                     perf_tracer.trace_scope(
@@ -1103,6 +1233,8 @@ class PPOTrainer:
                     for traj, logp in zip(rollout_batch, prox_logps):
                         traj["prox_logp"] = logp
                     self.actor.get_device_stats().log("recompute logp")
+
+            self._capture_trajectory(rollout_batch, global_step, scope="full")
 
             with (
                 stats_tracker.record_timing("compute_advantage"),
@@ -1169,6 +1301,8 @@ class PPOTrainer:
                 logger.info(f"Memory snapshots saved to {snapshot_dir}")
 
             if self.critic is not None:
+                if self._replay_full and self._should_offload_critic:
+                    self._onload_model(self.critic, role="critic")
                 with (
                     stats_tracker.record_timing("critic_train_step"),
                     perf_tracer.trace_scope(
@@ -1212,24 +1346,31 @@ class PPOTrainer:
             if self._is_v1_awex_colocate(config):
                 actor_stats_before_exchange = self.actor.export_stats()
 
-            # pause inference for updating weights, save, and evaluation
-            self.rollout.pause()
+            if self.rollout is not None:
+                # pause inference for updating weights, save, and evaluation
+                self.rollout.pause()
 
-            # Actor already onloaded; engine-internal _offload_aware_context
-            # calls in update_weights/save are no-ops.
+                # Actor already onloaded; engine-internal _offload_aware_context
+                # calls in update_weights/save are no-ops.
 
-            with (
-                stats_tracker.record_timing("update_weights"),
-                perf_tracer.trace_scope(
-                    "train.update_weights",
-                    category=Category.COMM,
-                    args={"global_step": global_step},
-                ),
-            ):
-                # Use versioned path for weight updates
-                new_version = global_step + 1
-                versioned_meta = self.weight_update_meta.with_version(new_version)
-                self._update_weights_and_publish_version(versioned_meta, new_version)
+                with (
+                    stats_tracker.record_timing("update_weights"),
+                    perf_tracer.trace_scope(
+                        "train.update_weights",
+                        category=Category.COMM,
+                        args={"global_step": global_step},
+                    ),
+                ):
+                    # Use versioned path for weight updates
+                    new_version = global_step + 1
+                    versioned_meta = self.weight_update_meta.with_version(new_version)
+                    self._update_weights_and_publish_version(
+                        versioned_meta, new_version
+                    )
+            else:
+                self.actor.set_version(global_step + 1)
+                if self.critic is not None:
+                    self.critic.set_version(global_step + 1)
 
             if not self._is_v1_awex_colocate(config):
                 self._save_training_state(
@@ -1332,11 +1473,11 @@ class PPOTrainer:
             # the current batch. Resuming it after the final step lets those
             # stale tasks hit the inference server while close() is already
             # tearing workers down, producing noisy ConnectionRefused errors.
-            if not self._is_final_train_step(
+            if self.rollout is not None and not self._is_final_train_step(
                 global_step=global_step, max_steps=max_steps
             ):
                 self.rollout.resume()
-            else:
+            elif self.rollout is not None:
                 logger.info(
                     "Skipping rollout resume after final training step "
                     "(global_step=%s)",
@@ -1451,7 +1592,8 @@ class PPOTrainer:
             self.critic.config_perf_tracer(self.config.perf_tracer, role="critic")
         if self.ref is not None:
             self.ref.config_perf_tracer(self.config.perf_tracer, role="ref")
-        self.rollout.config_perf_tracer(self.config.perf_tracer, role="rollout")
+        if self.rollout is not None:
+            self.rollout.config_perf_tracer(self.config.perf_tracer, role="rollout")
         if self.eval_rollout is not None:
             self.eval_rollout.config_perf_tracer(
                 self.config.perf_tracer, role="eval-rollout"
@@ -1465,7 +1607,8 @@ class PPOTrainer:
             self.critic.save_perf_tracer(step=step)
         if self.eval_rollout is not None:
             self.eval_rollout.save_perf_tracer(step=step)
-        self.rollout.save_perf_tracer(step=step)
+        if self.rollout is not None:
+            self.rollout.save_perf_tracer(step=step)
         perf_tracer.save(step=step)
 
     def _init_scheduler(self) -> Scheduler:
@@ -1980,7 +2123,8 @@ class PPOTrainer:
         # Upload statistics to the logger (e.g., wandb)
         stats = dict(actor_stats_before_exchange or {})
         stats.update(self.actor.export_stats())
-        stats.update(self.rollout.export_stats())
+        if self.rollout is not None:
+            stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
         self._commit_stats(epoch, epoch_step, global_step, stats)
@@ -2160,7 +2304,8 @@ class PPOTrainer:
                 f"actor._version ('{actor_version}') and rollout._version "
                 f"('{rollout_version}') must match. Both must be 'v1' or both 'v2'."
             )
-        self._validate_weight_update_model()
+        if not self._replay_mode:
+            self._validate_weight_update_model()
         if self.config.mopd is not None:
             requires_teacher_scoring = (
                 self.mopd_execution_plan is not None

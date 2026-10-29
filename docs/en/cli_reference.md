@@ -99,6 +99,7 @@ For detailed examples, see the experiment configurations in the `examples/` dire
 - [SchedulingStrategy](section-scheduling-strategy)
 - [SessionTracer Configuration](section-session-tracer)
 - [Teacher Configuration](section-teacher)
+- [TrajectoryDebug Configuration](section-trajectory-debug)
 
 ______________________________________________________________________
 
@@ -172,6 +173,7 @@ A dummy place holder of GRPO config for backward compatibility.
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`                      | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
 | `mopd`               | [`MOPDConfig`](section-mopd) \| None                                      | `None`                      | Optional multi-teacher on-policy distillation config.                                                                                                                                                                                                               |
 | `dynamic_bs`         | boolean                                                                   | `False`                     | Enable dynamic batch sizing in prepare_batch. When True, batch collection stops when (accepted + rejected) >= batch_size, returning only accepted results. This results in variable-sized batches of valid data.                                                    |
+| `trajectory_debug`   | [`TrajectoryDebugConfig`](section-trajectory-debug)                       | *TrajectoryDebugConfig*     | Optional single-controller SGLang RL batch dump/replay.                                                                                                                                                                                                             |
 
 (section-ppo)=
 
@@ -212,6 +214,7 @@ Configuration for Proximal Policy Optimization (PPO) reinforcement learning expe
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`                      | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
 | `mopd`               | [`MOPDConfig`](section-mopd) \| None                                      | `None`                      | Optional multi-teacher on-policy distillation config.                                                                                                                                                                                                               |
 | `dynamic_bs`         | boolean                                                                   | `False`                     | Enable dynamic batch sizing in prepare_batch. When True, batch collection stops when (accepted + rejected) >= batch_size, returning only accepted results. This results in variable-sized batches of valid data.                                                    |
+| `trajectory_debug`   | [`TrajectoryDebugConfig`](section-trajectory-debug)                       | *TrajectoryDebugConfig*     | Optional single-controller SGLang RL batch dump/replay.                                                                                                                                                                                                             |
 
 (section-rw)=
 
@@ -1536,3 +1539,20 @@ Configuration class: TeacherConfig
 | `offload`             | boolean                                                     | `False`     | Whether to offload teacher rollout model between steps                                                                                           |
 | `rl_loss_weight`      | float                                                       | `1.0`       | RL loss weight                                                                                                                                   |
 | `distill_loss_weight` | float                                                       | `0.005`     | Distillation loss weight                                                                                                                         |
+
+(section-trajectory-debug)=
+
+## TrajectoryDebug Configuration
+
+Optional single-controller RL batch capture and offline replay.
+
+Replay requires a directory produced by dump mode with the same controller version,
+model, training topology, and scope. Files contain training inputs, not model,
+optimizer, or RNG checkpoints.
+
+| Parameter | Type                    | Default     | Description                                                                                                                                       |
+| --------- | ----------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`    | string                  | `"off"`     | Capture training batches or replay them without inference services. **Choices:** `off`, `dump`, `replay`                                          |
+| `path`    | string \| None          | `None`      | Snapshot directory. Required for replay; dump defaults to \<cluster.fileroot>/\<experiment_name>/\<trial_name>/debug_trajectories.                |
+| `scope`   | string                  | `"rollout"` | Capture after rollout collection, or after auxiliary/prox-logp scoring (full). Replay must use the captured scope. **Choices:** `rollout`, `full` |
+| `steps`   | list of integer \| None | `None`      | Nonnegative global steps to capture. None captures every step. Replay reads original global step numbers without cycling.                         |
