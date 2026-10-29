@@ -71,16 +71,12 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
     from areal.engine import sglang_qwen_vl_cpu
 
     if config.get("model_type") in sglang_qwen_vl_cpu.MODEL_TYPES:
-        # Native tokenizer workers import this package themselves, including
-        # spawned workers. No parent-process monkeypatch or new user setting.
+        # Let existing SGLang installations and third-party processors run
+        # unchanged. Users explicitly select this integration in the server
+        # environment; spawned tokenizer workers inherit that selection.
         package = "areal.engine.sglang_processors"
-        existing = os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE")
-        if existing and existing != package:
-            raise RuntimeError(
-                "AReaL Qwen image alignment requires its external multimodal "
-                "processor; another processor package is already configured"
-            )
-        os.environ["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"] = package
+        if os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE") != package:
+            return
         root = installed_sglang_root()
         install_source_patches(
             [

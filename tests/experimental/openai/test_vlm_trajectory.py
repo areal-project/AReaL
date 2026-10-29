@@ -518,6 +518,8 @@ async def test_prepare_prompt_changed_text_shares_identical_vision_tensors():
 async def test_prepare_prompt_changed_text_reuses_resize_without_encoding(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setenv("AREAL_VLM_ALIGN_SGLANG", "true")
+
     class Qwen3VLProcessor(_FakeProcessor):
         image_processor = SimpleNamespace(
             patch_size=16,

@@ -40,7 +40,7 @@ def aligned_processor(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (None, True),
+        (None, False),
         ("true", True),
         (" TRUE ", True),
         ("1", True),

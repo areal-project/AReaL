@@ -39,21 +39,44 @@ don't expose token IDs and log probabilities. AReaL solves this by:
 
 ### SGLang image preprocessing
 
-For supported Qwen VLMs, the OpenAI proxy follows SGLang's image resizing by default
-when preparing training inputs. This applies to Chat Completions and Responses,
-including cached prompts and concat history. Original image bytes are forwarded to
-SGLang without re-encoding.
+For supported Qwen VLMs, the OpenAI proxy can follow SGLang's image resizing when
+preparing training inputs. This applies to Chat Completions and Responses, including
+cached prompts and concat history. Original image bytes are forwarded to SGLang without
+re-encoding.
 
-Set `AREAL_VLM_ALIGN_SGLANG=false` in the proxy/rollout worker environment to use the
-original Hugging Face image preprocessing instead. The default is `true`; `1` and `0`
-are also accepted. This switch does not change SGLang's settings or disable the HF
-processor's own resizing. Disabling alignment can produce different training and
-inference image inputs.
+The default is the original Hugging Face image preprocessing. Set
+`AREAL_VLM_ALIGN_SGLANG=true` in the proxy/rollout worker environment to enable SGLang
+alignment; `1` and `0` are also accepted. This switch does not change SGLang's settings
+or disable the HF processor's own resizing. The proxy and server can use different image
+inputs while alignment is disabled.
 
-When alignment is enabled, the proxy and SGLang must use the same
-`SGLANG_VLM_QWEN_LIMIT_PIXEL` and `SGLANG_RESIZE_RESAMPLE` settings. This switch does
-not provide an independent pixel budget or JPEG quality setting. Set these variables
-before starting workers; no YAML change is required.
+When alignment is enabled, also enable the AReaL SGLang processor below. The proxy and
+SGLang must use the same `SGLANG_VLM_QWEN_LIMIT_PIXEL` and `SGLANG_RESIZE_RESAMPLE`
+settings. This switch does not provide an independent pixel budget or JPEG quality
+setting. Set these variables before starting workers; no YAML change is required.
+
+The AReaL Qwen3-VL/Qwen3.5 processor on the SGLang server is opt-in. To preserve
+real-image spans when sampled text contains literal visual tokens, set
+`SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=areal.engine.sglang_processors` in the SGLang
+server environment. Without it, this Qwen3-VL/Qwen3.5 integration leaves SGLang's source
+and any existing external processor unchanged. This server setting is independent of
+`AREAL_VLM_ALIGN_SGLANG`, which controls proxy-side image preparation.
+
+The server integration is validated against the Qwen example's SGLang
+`0.5.18.dev10+g85b539146` runtime. On opt-in startup, AReaL checks the SHA-256 of
+`srt/multimodal/processors/qwen_vl.py` and `base_processor.py` before changing either
+file; an unknown source fails startup. The first installation needs a writable SGLang
+package. For a read-only runtime, set `MODEL_PATH` to a Qwen3-VL or Qwen3.5 checkpoint
+with `config.json`, then run this in a writable image build with the same AReaL and
+SGLang versions:
+
+```bash
+export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=areal.engine.sglang_processors
+python -c 'import os; from areal.engine.sglang_model_patches import apply_model_patches; apply_model_patches(["--model-path", os.environ["MODEL_PATH"]])'
+```
+
+Ship the resulting SGLang package read-only; startup validates both files and does not
+write again. Keep the AReaL processor package importable in SGLang's tokenizer workers.
 
 ## Relationship with RolloutWorkflow
 

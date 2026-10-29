@@ -12,6 +12,9 @@ from areal.engine import sglang_qwen_vl_cpu as patch
 
 @pytest.fixture
 def cpu_runtime(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", "areal.engine.sglang_processors"
+    )
     root = tmp_path / "sglang"
     qwen = (
         "class Processor:\n"
@@ -49,6 +52,34 @@ def cpu_runtime(tmp_path, monkeypatch):
         target.write_bytes(source)
     monkeypatch.setattr(startup, "installed_sglang_root", lambda: root)
     return root, qwen, base
+
+
+@pytest.mark.parametrize("processor_package", [None, "third_party.processor"])
+@pytest.mark.parametrize("alignment", [None, "false"])
+def test_qwen_server_without_opt_in_preserves_existing_installation(
+    cpu_runtime, tmp_path, monkeypatch, processor_package, alignment
+):
+    root, qwen, base = cpu_runtime
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    for name, value in (
+        ("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", processor_package),
+        ("AREAL_VLM_ALIGN_SGLANG", alignment),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        startup, "installed_sglang_root", lambda: pytest.fail("SGLang was accessed")
+    )
+
+    startup.apply_model_patches(["--model-path", str(model)])
+
+    assert (root / patch.TARGET_RELATIVE).read_bytes() == qwen
+    assert (root / patch.BASE_RELATIVE).read_bytes() == base
+    assert not (root / ".areal-sglang-patches.lock").exists()
 
 
 @pytest.mark.parametrize("model_type", patch.MODEL_TYPES)

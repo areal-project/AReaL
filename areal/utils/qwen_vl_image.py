@@ -2,8 +2,8 @@
 
 """Follow SGLang's CPU/PIL Qwen image pipeline without changing wire images.
 
-``AREAL_VLM_ALIGN_SGLANG`` defaults to true. Set it to false to use the
-original HF image preprocessing in the OpenAI proxy. This does not change
+``AREAL_VLM_ALIGN_SGLANG`` defaults to false. Set it to true to align the
+OpenAI proxy with the supported SGLang Qwen VLM processor. This does not change
 SGLang's image settings or disable the HF processor's own resizing.
 """
 
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 def sglang_image_alignment_enabled() -> bool:
     """Read the AReaL image-alignment switch without changing server settings."""
-    value = os.environ.get("AREAL_VLM_ALIGN_SGLANG", "true").strip().lower()
+    value = os.environ.get("AREAL_VLM_ALIGN_SGLANG", "false").strip().lower()
     if value not in ("true", "false", "1", "0", "yes", "no", "y", "n"):
         raise ValueError(
             "Invalid AREAL_VLM_ALIGN_SGLANG boolean value; use true or false"
