@@ -4,6 +4,7 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+from megatron.core.packed_seq_params import PackedSeqParams
 
 from areal.engine.megatron_utils.qwen3_vl_token_mask import install_qwen3_vl_token_mask
 
@@ -84,6 +85,21 @@ def _inputs():
     )
 
 
+def _packed_seq_params() -> PackedSeqParams:
+    """Match the THD metadata for ten valid tokens and two padding tokens."""
+    cu_seqlens = torch.tensor([0, 10], dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor([0, 12], dtype=torch.int32)
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=12,
+        max_seqlen_kv=12,
+    )
+
+
 @pytest.mark.parametrize(
     "cp_size,cp_rank,packed",
     [
@@ -106,7 +122,7 @@ def test_native_forward_generated_specials_use_typed_scatter_and_rope(
     data = _inputs()
     ids_before = data["input_ids"].clone()
     if packed:
-        data["packed_seq_params"] = SimpleNamespace()
+        data["packed_seq_params"] = _packed_seq_params()
     model(**data)
     torch.testing.assert_close(
         model.language_model.embedding.ids, ids_before, rtol=0, atol=0
@@ -120,7 +136,7 @@ def test_native_forward_generated_specials_use_typed_scatter_and_rope(
     clean = _inputs()
     clean["input_ids"][0, [0, 5, 9]] = 7
     if packed:
-        clean["packed_seq_params"] = SimpleNamespace()
+        clean["packed_seq_params"] = _packed_seq_params()
     reference = _model(monkeypatch, cp_size, cp_rank)
     install_qwen3_vl_token_mask([reference])
     reference(**clean)
@@ -161,7 +177,7 @@ def test_native_forward_non_embedding_pipeline_stage_uses_typed_rope(monkeypatch
     model = _model(monkeypatch, cp_size=2, cp_rank=1, pre_process=False)
     install_qwen3_vl_token_mask([model])
     data = _inputs()
-    data["packed_seq_params"] = SimpleNamespace()
+    data["packed_seq_params"] = _packed_seq_params()
     model(**data)
     assert model.language_model.inputs["position_ids"].shape == (3, 1, 6)
     assert model.language_model.inputs["input_ids"].shape == (1, 6)
@@ -182,7 +198,7 @@ def test_native_forward_without_visual_grid_has_no_deepstack_mask(
     data["pixel_values_videos"] = None
     data["video_grid_thw"] = None
     if packed:
-        data["packed_seq_params"] = SimpleNamespace()
+        data["packed_seq_params"] = _packed_seq_params()
 
     model(**data)
 
@@ -196,7 +212,7 @@ def test_native_forward_single_visual_modality_preserves_mask(monkeypatch, modal
     model = _model(monkeypatch, cp_size=2)
     install_qwen3_vl_token_mask([model])
     data = _inputs()
-    data["packed_seq_params"] = SimpleNamespace()
+    data["packed_seq_params"] = _packed_seq_params()
     if modality == "image":
         data["pixel_values_videos"] = None
         data["video_grid_thw"] = None
