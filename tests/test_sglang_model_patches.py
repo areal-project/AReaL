@@ -12,6 +12,9 @@ from areal.engine import (
     _sglang_source_patch as installer,
 )
 from areal.engine import (
+    sglang_gdn_decode_padding as gdn,
+)
+from areal.engine import (
     sglang_mm_executor as executor,
 )
 from areal.engine import (
@@ -30,6 +33,12 @@ def runtime(tmp_path, monkeypatch):
     """Small compilable call sites, with the real transforms and source guards."""
     root = tmp_path / "sglang"
     sources = {
+        gdn: (
+            "class Kernel:\n"
+            "    def decode(self):\n"
+            "        if self.use_state_pool:\n"
+            "            pass\n" + gdn.PINNED_OLD
+        ).encode(),
         executor: ("class Runner:\n    def run(self):\n" + executor.OLD).encode(),
         qsa: ("def gather():\n    if True:\n" + qsa.OLD).encode(),
         qwen: (
@@ -48,7 +57,10 @@ def runtime(tmp_path, monkeypatch):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source)
         target.chmod(0o640)
-        patched = source.replace(patch.OLD.encode(), patch.NEW.encode())
+        old, new = (
+            (gdn.PINNED_OLD, gdn.PINNED_NEW) if patch is gdn else (patch.OLD, patch.NEW)
+        )
+        patched = source.replace(old.encode(), new.encode())
         if patch is qwen:
             patched = patched.replace(
                 qwen.RESIZE_OLD.encode(), qwen.RESIZE_NEW.encode()
@@ -56,12 +68,26 @@ def runtime(tmp_path, monkeypatch):
             patched = patched.replace(
                 qwen.DEVICE_OLD.encode(), qwen.DEVICE_NEW.encode()
             )
-        monkeypatch.setattr(
-            patch, "EXPECTED_SHA256", hashlib.sha256(source).hexdigest()
-        )
-        monkeypatch.setattr(
-            patch, "PATCHED_SHA256", hashlib.sha256(patched).hexdigest()
-        )
+        if patch is gdn:
+            monkeypatch.setattr(
+                gdn,
+                "_PATCHES",
+                {
+                    hashlib.sha256(source).hexdigest(): (
+                        old,
+                        new,
+                        hashlib.sha256(patched).hexdigest(),
+                    )
+                },
+            )
+        else:
+            monkeypatch.setattr(
+                patch, "EXPECTED_SHA256", hashlib.sha256(source).hexdigest()
+            )
+            monkeypatch.setattr(
+                patch, "PATCHED_SHA256", hashlib.sha256(patched).hexdigest()
+            )
+    monkeypatch.setattr(gdn, "version", lambda _: "0.6.17")
     monkeypatch.setattr(startup, "installed_sglang_root", lambda: root)
     model = tmp_path / "arbitrary-model-name"
     model.mkdir()
@@ -92,7 +118,7 @@ def test_flash_next_startup_patches_all_sources_and_repeated_start_is_write_free
     assert all(target.stat().st_mtime_ns == mtime for target, mtime in mtimes.items())
 
 
-@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_vl", "llama", None])
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen3_vl_moe", "llama", None])
 def test_other_model_types_skip_sglang_even_with_flash_next_directory_name(
     tmp_path, monkeypatch, model_type
 ):
@@ -104,6 +130,61 @@ def test_other_model_types_skip_sglang_even_with_flash_next_directory_name(
     )
 
     startup.apply_model_patches(["--model", str(model)])
+
+
+@pytest.mark.parametrize("model_type", sorted(startup._GDN_MODEL_TYPES - {"qwen4_exp"}))
+def test_gdn_models_patch_only_decode_and_repeated_start_is_write_free(
+    runtime, monkeypatch, model_type
+):
+    root, model, sources = runtime
+    (model / "config.json").write_text(json.dumps({"model_type": model_type}))
+
+    startup.apply_model_patches(["--model-path", str(model)])
+
+    target = root / gdn.TARGET_RELATIVE
+    assert target.read_bytes() == gdn.patched_source(sources[gdn])
+    for patch, source in sources.items():
+        if patch is not gdn:
+            assert (root / patch.TARGET_RELATIVE).read_bytes() == source
+    modified = target.stat().st_mtime_ns
+    (root / ".areal-sglang-patches.lock").unlink()
+    monkeypatch.setattr(
+        installer, "_atomic_write", lambda *args: pytest.fail("rewrite")
+    )
+
+    startup.apply_model_patches(["--model-path", str(model)])
+
+    assert target.stat().st_mtime_ns == modified
+    assert not (root / ".areal-sglang-patches.lock").exists()
+
+
+def test_explicit_triton_decode_does_not_require_flashinfer_or_source_access(
+    runtime, monkeypatch
+):
+    _, model, _ = runtime
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe"}))
+    monkeypatch.setattr(gdn, "version", lambda _: pytest.fail("FlashInfer accessed"))
+    monkeypatch.setattr(
+        startup, "installed_sglang_root", lambda: pytest.fail("SGLang accessed")
+    )
+
+    startup.apply_model_patches(
+        ["--model-path", str(model), "--linear-attn-decode-backend", "triton"]
+    )
+
+
+def test_old_flashinfer_stops_startup_before_any_source_write(runtime, monkeypatch):
+    root, model, sources = runtime
+    monkeypatch.setattr(gdn, "version", lambda _: "0.6.16")
+
+    with pytest.raises(RuntimeError, match="FlashInfer >= 0.6.17"):
+        startup.apply_model_patches(["--model-path", str(model)])
+
+    assert all(
+        (root / patch.TARGET_RELATIVE).read_bytes() == source
+        for patch, source in sources.items()
+    )
+    assert not (root / ".areal-sglang-patches.lock").exists()
 
 
 def test_hub_model_detection_reads_raw_config_with_selected_revision(
@@ -128,9 +209,12 @@ def test_hub_model_detection_reads_raw_config_with_selected_revision(
         )
 
 
-def test_unknown_source_rejects_entire_profile_without_partial_modification(runtime):
+@pytest.mark.parametrize("invalid_patch", [qwen, gdn])
+def test_unknown_source_rejects_entire_profile_without_partial_modification(
+    runtime, invalid_patch
+):
     root, model, sources = runtime
-    target = root / qwen.TARGET_RELATIVE
+    target = root / invalid_patch.TARGET_RELATIVE
     target.write_bytes(b"# unsupported processor\n")
     before = {
         root / patch.TARGET_RELATIVE: (root / patch.TARGET_RELATIVE).read_bytes()
