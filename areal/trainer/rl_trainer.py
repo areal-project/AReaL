@@ -1336,7 +1336,7 @@ class PPOTrainer:
                 global_step=global_step, max_steps=max_steps
             ):
                 self.rollout.resume()
-            else:
+            elif self.rollout is not None:
                 logger.info(
                     "Skipping rollout resume after final training step "
                     "(global_step=%s)",
