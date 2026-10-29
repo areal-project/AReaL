@@ -261,6 +261,24 @@ def test_ppo_trainer_orders_initial_eval_around_recovery(monkeypatch, recovered:
         }
 
 
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_ppo_trainer_only_passes_token_age_limit_when_enabled(monkeypatch, enabled):
+    _disable_timing_contexts(monkeypatch, rl_trainer)
+    trainer = _build_ppo_trainer([])
+    assert trainer.config.rollout.mask_stale_tokens is False
+    if enabled is not None:
+        trainer.config.rollout.mask_stale_tokens = enabled
+    trainer.config.rollout.max_head_offpolicyness = 1
+    trainer.actor.ppo_update = Mock(side_effect=_StopAfterFirstUpdate)
+
+    with pytest.raises(_StopAfterFirstUpdate):
+        trainer.train(workflow=object())
+
+    trainer.actor.ppo_update.assert_called_once_with(
+        [{}], **({"max_head_offpolicyness": 1} if enabled else {})
+    )
+
+
 @pytest.mark.parametrize("role", ["ref", "critic", "teacher", None])
 @pytest.mark.parametrize(
     ("version", "mode"), [("v1", "awex"), ("v1", "disk"), ("v2", "awex")]

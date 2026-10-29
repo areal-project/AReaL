@@ -3114,6 +3114,14 @@ class InferenceEngineConfig:
             "the request will not be accepted.",
         },
     )
+    mask_stale_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": "Mask actor loss targets whose token policy-version age exceeds "
+            "max_head_offpolicyness. Disabled by default to preserve existing "
+            "training behavior; does not reject rollouts or change scheduling."
+        },
+    )
     enable_rollout_tracing: bool = field(
         default=False,
         metadata={

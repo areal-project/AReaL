@@ -80,7 +80,8 @@ def test_expired_tokens_have_zero_gradient_without_dropping_trajectory(
     assert torch.isfinite(loss)
 
 
-def test_actor_masks_before_packing_and_logs_both_version_scopes():
+@pytest.mark.parametrize("enabled", [False, True])
+def test_actor_version_mask_is_opt_in_and_applied_before_packing(enabled):
     engine = MagicMock()
     engine.get_version.return_value = 49
     engine.train_batch.return_value = {}
@@ -107,12 +108,17 @@ def test_actor_masks_before_packing_and_logs_both_version_scopes():
             return_value=[data],
         ),
     ):
-        actor._ppo_update(data, max_head_offpolicyness=1)
+        actor._ppo_update(data, **({"max_head_offpolicyness": 1} if enabled else {}))
     assert engine.train_batch.call_count == 1
-    assert data["policy_version_mask"].tolist() == [[False, True, True, False]]
     assert data["input_token_loss_mask"].tolist() == [[False, True, True, True]]
     metrics = tracker.export()
     assert metrics["update/version_stats/sample_staleness_theta_max"] == 5
+    if not enabled:
+        assert "policy_version_mask" not in data
+        assert "update/version_filtered_fraction" not in metrics
+        assert data["loss_mask"].tolist() == [[True, True, True, False]]
+        return
+    assert data["policy_version_mask"].tolist() == [[False, True, True, False]]
     assert (
         metrics["update/version_filtered/version_stats/sample_staleness_theta_max"] == 1
     )
