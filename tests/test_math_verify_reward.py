@@ -1,6 +1,13 @@
 from areal.reward import geometry3k_reward_fn, get_math_verify_worker, gsm8k_reward_fn
 
 
+def test_math_agent_accepts_interval_for_gold_inequality():
+    """An inequality gold accepts its interval answer, but not vice versa."""
+    from areal.workflow.openai.math_agent import math_reward_fn
+
+    assert math_reward_fn(completions=r"$(0,1)$", answer=r"$0 < x < 1$") == 1.0
+
+
 class TestGSM8KRewardFn:
     """Test GSM8K reward function with math-verify."""
 

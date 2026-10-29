@@ -21,7 +21,7 @@ from areal.api import AsyncRewardWrapper
 def math_reward_fn(completions: str, answer: str) -> float:
     ans = parse(completions)
     gold = parse(answer)
-    return float(verify(ans, gold))
+    return float(verify(gold, ans))
 
 
 class MathAgent:

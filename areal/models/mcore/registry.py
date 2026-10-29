@@ -519,14 +519,10 @@ def make_mcore_model(
                     "head requires fused_weight_gradient_mlp_cuda."
                 )
 
-        # Keep these four flags aligned with mbridge base defaults.
+        # Honor dispatcher selection just as the mbridge path does.
         provider.variable_seq_lengths = True
-        logger.warning(
-            "Ignoring mcore_config.moe_token_dispatcher_type=%s for bridge_type='megatron-bridge'; "
-            "using 'alltoall' and variable_seq_lengths=True.",
-            mcore_config.moe_token_dispatcher_type,
-        )
-        provider.moe_token_dispatcher_type = "alltoall"
+        provider.moe_token_dispatcher_type = mcore_config.moe_token_dispatcher_type
+        provider.moe_enable_deepep = mcore_config.moe_enable_deepep
         provider.batch_p2p_comm = False
         provider.overlap_p2p_comm = (
             vpp_size > 1 and provider.pipeline_model_parallel_size > 1
@@ -543,6 +539,7 @@ def make_mcore_model(
         # Aligning tf config settings with provider for consistency.
         tf_config.variable_seq_lengths = provider.variable_seq_lengths
         tf_config.moe_token_dispatcher_type = provider.moe_token_dispatcher_type
+        tf_config.moe_enable_deepep = provider.moe_enable_deepep
         tf_config.batch_p2p_comm = provider.batch_p2p_comm
         tf_config.overlap_p2p_comm = provider.overlap_p2p_comm
         if mcore_config.enable_router_replay:

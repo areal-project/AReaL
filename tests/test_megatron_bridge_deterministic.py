@@ -73,13 +73,17 @@ def _run_until_provider_finalize(
     *,
     deterministic: bool,
     model_type: str = "qwen3",
-) -> None:
+    dispatcher: str = "alltoall",
+    deepep: bool = False,
+) -> SimpleNamespace:
     pytest.importorskip("mbridge")
     pytest.importorskip("megatron.core")
     from areal.models.mcore.registry import make_mcore_model
 
     tf_config = SimpleNamespace(params_dtype=None)
     mcore_config = _make_mcore_config(deterministic=deterministic)
+    mcore_config.moe_token_dispatcher_type = dispatcher
+    mcore_config.moe_enable_deepep = deepep
 
     with (
         mock.patch.multiple(
@@ -101,6 +105,21 @@ def _run_until_provider_finalize(
             bridge=_FakeBridge(provider),
             bridge_type="megatron-bridge",
         )
+    return tf_config
+
+
+@pytest.mark.parametrize("dispatcher,deepep", [("alltoall", False), ("flex", True)])
+def test_megatron_bridge_honors_dispatcher_config(dispatcher, deepep):
+    """An explicit DeepEP selection must not silently fall back to all-to-all."""
+    provider = _make_provider(attention_backend=object())
+
+    tf_config = _run_until_provider_finalize(
+        provider, deterministic=False, dispatcher=dispatcher, deepep=deepep
+    )
+
+    for config in (provider, tf_config):
+        assert config.moe_token_dispatcher_type == dispatcher
+        assert config.moe_enable_deepep is deepep
 
 
 def test_megatron_bridge_provider_applies_determinism_before_finalize():
