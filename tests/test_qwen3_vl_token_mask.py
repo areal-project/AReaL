@@ -48,6 +48,10 @@ def _model(monkeypatch, cp_size=1, cp_rank=0, pre_process=True):
     native = pytest.importorskip(
         "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model"
     )
+    # Exercise native forward with CPU-only CP indices for these mask tests.
+    monkeypatch.setattr(
+        native, "get_packed_seq_cp_partition_indices", _packed_cp_indices, raising=False
+    )
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda *args: None)
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda *args: None)
     model = torch.nn.Module()
@@ -83,6 +87,34 @@ def _inputs():
         image_grid_thw=torch.tensor([[1, 2, 4]]),
         video_grid_thw=torch.tensor([[1, 2, 2]]),
     )
+
+
+def _packed_cp_indices(
+    packed_seq_params: PackedSeqParams,
+    *,
+    total_tokens: int,
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+    cp_group: _Group,
+) -> torch.Tensor:
+    """Select zigzag CP chunks without a distributed group or CUDA kernel."""
+    boundaries = packed_seq_params.cu_seqlens_q_padded.tolist()
+    assert boundaries[-1] == total_tokens
+    assert cp_group.size() == cp_size and cp_group.rank() == cp_rank
+    chunks = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        assert (end - start) % (2 * cp_size) == 0
+        chunk_size = (end - start) // (2 * cp_size)
+        for chunk in (cp_rank, 2 * cp_size - 1 - cp_rank):
+            chunks.append(
+                torch.arange(
+                    start + chunk * chunk_size,
+                    start + (chunk + 1) * chunk_size,
+                    device=device,
+                )
+            )
+    return torch.cat(chunks)
 
 
 def _packed_seq_params() -> PackedSeqParams:
