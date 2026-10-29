@@ -23,6 +23,23 @@ from areal.workflow.rlvr import RLVRWorkflow
 logger = logging.getLogger("VisionRLVRWorkflow")
 
 
+def _infer_mm_token_type_ids(processor: Any, input_ids: torch.Tensor):
+    """Build modality IDs (0 text, 1 image, 2 video) from placeholder tokens.
+
+    Matches what Qwen-VL processors return from transformers 5.3 onward, for
+    older processors that do not return ``mm_token_type_ids``.
+    """
+    image_token_id = getattr(processor, "image_token_id", None)
+    if image_token_id is None:
+        return None
+    token_types = torch.zeros_like(input_ids)
+    token_types[input_ids == image_token_id] = 1
+    video_token_id = getattr(processor, "video_token_id", None)
+    if video_token_id is not None:
+        token_types[input_ids == video_token_id] = 2
+    return token_types
+
+
 class VisionRLVRWorkflow(RLVRWorkflow):
     def __init__(
         self,
@@ -135,7 +152,12 @@ class VisionRLVRWorkflow(RLVRWorkflow):
             processed_input = dict(cached_input)
 
         input_ids: list[int] = processed_input["input_ids"].tolist()[0]
-        mm_token_type_ids: list[int] = processed_input["mm_token_type_ids"].tolist()[0]
+        token_types = processed_input.get("mm_token_type_ids")
+        if token_types is None:
+            token_types = _infer_mm_token_type_ids(
+                self.processor, processed_input["input_ids"]
+            )
+        mm_token_type_ids = token_types.tolist()[0] if token_types is not None else None
 
         byte_images = image2base64(data["images"])
         req = ModelRequest(
@@ -157,7 +179,6 @@ class VisionRLVRWorkflow(RLVRWorkflow):
 
         # Build result tensor dict with batch dim 1
         seq = resp.input_tokens + resp.output_tokens
-        mm_token_type_ids = mm_token_type_ids + [0] * resp.output_len
         logprobs = [0.0] * resp.input_len + resp.output_logprobs
         loss_mask = [0] * resp.input_len + [1] * resp.output_len
         versions = [-1] * resp.input_len + resp.output_versions
@@ -172,11 +193,8 @@ class VisionRLVRWorkflow(RLVRWorkflow):
         if "image_grid_thw" in processed_input:
             multi_modal_input[0]["image_grid_thw"] = processed_input["image_grid_thw"]
 
-        return {
+        result = {
             "input_ids": torch.tensor(seq, dtype=torch.long).unsqueeze(0),
-            "mm_token_type_ids": torch.tensor(
-                mm_token_type_ids, dtype=torch.long
-            ).unsqueeze(0),
             "loss_mask": torch.tensor(loss_mask, dtype=torch.int32).unsqueeze(0),
             "logprobs": torch.tensor(logprobs, dtype=torch.float32).unsqueeze(0),
             "multi_modal_input": multi_modal_input,
@@ -188,3 +206,8 @@ class VisionRLVRWorkflow(RLVRWorkflow):
                 [resp.stop_reason == "length"], dtype=torch.bool
             ),
         }
+        if mm_token_type_ids is not None:
+            result["mm_token_type_ids"] = torch.tensor(
+                mm_token_type_ids + [0] * resp.output_len, dtype=torch.long
+            ).unsqueeze(0)
+        return result
