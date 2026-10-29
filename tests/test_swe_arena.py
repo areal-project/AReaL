@@ -42,6 +42,54 @@ def _reset_stats() -> None:
     stats_tracker.export_all(reset=True)
 
 
+@pytest.mark.parametrize("dataset_source", ["arena", "jsonl"])
+def test_training_entry_isolates_arena_failures_only_during_training(
+    monkeypatch, dataset_source
+):
+    """Wire sample rejection for Arena training without weakening evaluation."""
+    from examples.swe import train_swe_rl
+    from examples.swe.utils import SWEPPOConfig
+
+    import areal
+
+    config = SWEPPOConfig()
+    config.scheduler.type = "slurm"
+    config.econfig.dataset_source = dataset_source
+    config.train_dataset.path = "train.jsonl"
+    config.valid_dataset = SimpleNamespace(path="valid.jsonl")
+    monkeypatch.setattr(train_swe_rl, "load_expr_config", lambda *_: (config, None))
+    monkeypatch.setattr(
+        train_swe_rl, "get_arena_mixture_dataset", lambda *_, **__: ([], [])
+    )
+    monkeypatch.setattr(train_swe_rl, "get_swe_dataset", lambda **_: [])
+    captured = {}
+
+    class CaptureTrainer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def train(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(areal, "PPOTrainer", CaptureTrainer)
+    train_swe_rl.main([])
+
+    if dataset_source == "arena":
+        assert captured["workflow_kwargs"]["reject_terminal_task_failures"] is True
+        assert (
+            captured["eval_workflow_kwargs"]["reject_terminal_task_failures"] is False
+        )
+    else:
+        assert "reject_terminal_task_failures" not in captured["workflow_kwargs"]
+        assert "reject_terminal_task_failures" not in captured["eval_workflow_kwargs"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "artifact, method",

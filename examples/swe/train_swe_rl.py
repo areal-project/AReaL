@@ -386,6 +386,9 @@ def main(args):
         workflow_kwargs["experiment_name"] = (
             f"{config.experiment_name}-{config.trial_name}"
         )
+        # Reject terminal task failures per sample so healthy group siblings
+        # can still satisfy actor.min_usable_group_size.
+        workflow_kwargs["reject_terminal_task_failures"] = True
 
     # Eval workflow with lower temperature for deterministic evaluation
     eval_workflow_kwargs = workflow_kwargs.copy()
@@ -393,6 +396,8 @@ def main(args):
         temperature=0.0,
         max_completion_tokens=config.gconfig.max_new_tokens,
     )
+    if econfig.dataset_source == "arena":
+        eval_workflow_kwargs["reject_terminal_task_failures"] = False
 
     with PPOTrainer(
         config,
