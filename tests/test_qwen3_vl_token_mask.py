@@ -165,3 +165,125 @@ def test_native_forward_non_embedding_pipeline_stage_uses_typed_rope(monkeypatch
     model(**data)
     assert model.language_model.inputs["position_ids"].shape == (3, 1, 6)
     assert model.language_model.inputs["input_ids"].shape == (1, 6)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("empty_grid", [False, True])
+def test_native_forward_without_visual_grid_has_no_deepstack_mask(
+    monkeypatch, packed, empty_grid
+):
+    """Text-only CP microbatches must not pass a mask without visual features."""
+    model = _model(monkeypatch, cp_size=2)
+    install_qwen3_vl_token_mask([model])
+    data = _inputs()
+    data["mm_token_type_ids"].zero_()
+    data["pixel_values"] = torch.empty(0, 1) if empty_grid else None
+    data["image_grid_thw"] = torch.empty(0, 3, dtype=torch.long) if empty_grid else None
+    data["pixel_values_videos"] = None
+    data["video_grid_thw"] = None
+    if packed:
+        data["packed_seq_params"] = SimpleNamespace()
+
+    model(**data)
+
+    assert model.language_model.inputs["visual_pos_masks"] is None
+    assert model.language_model.inputs["deepstack_visual_embeds"] is None
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_native_forward_single_visual_modality_preserves_mask(monkeypatch, modality):
+    """A real image or video still supplies its CP-local visual mask."""
+    model = _model(monkeypatch, cp_size=2)
+    install_qwen3_vl_token_mask([model])
+    data = _inputs()
+    data["packed_seq_params"] = SimpleNamespace()
+    if modality == "image":
+        data["pixel_values_videos"] = None
+        data["video_grid_thw"] = None
+        data["mm_token_type_ids"][0, 7] = 0
+    else:
+        data["pixel_values"] = None
+        data["image_grid_thw"] = None
+        data["mm_token_type_ids"][0, 2:4] = 0
+
+    model(**data)
+
+    assert model.language_model.inputs["visual_pos_masks"] is not None
+    assert model.language_model.inputs["deepstack_visual_embeds"] is not None
+
+
+def reorganize_inputs(**kwargs):
+    """Model the native no-pixels return, which retains a supplied mask."""
+    if kwargs["pixel_values"] is None:
+        return None, kwargs["video_grid_thw"], kwargs["video_input_mask"]
+    return kwargs["pixel_values"], kwargs["image_grid_thw"], kwargs["image_input_mask"]
+
+
+def get_rope_index(input_ids):
+    return input_ids
+
+
+def preprocess_packed_seqs(ids, *args, **kwargs):
+    return ids, None
+
+
+def _native_visual_contract_forward(
+    self,
+    input_ids,
+    mm_token_type_ids,
+    attention_mask,
+    packed_seq_params,
+    pixel_values,
+    pixel_values_videos,
+    image_grid_thw,
+    video_grid_thw,
+):
+    inputs = dict(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        pixel_values_videos=pixel_values_videos,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        image_input_mask=None,
+        video_input_mask=None,
+    )
+    _, grid, mask = reorganize_inputs(**inputs)
+    deepstack = [] if grid is not None and grid.shape[0] > 0 else None
+    _, _, packed_mask = reorganize_inputs(**{**inputs, "input_ids": input_ids.clone()})
+    if packed_mask is not None and deepstack is None:
+        raise TypeError("visual mask without deepstack features")
+    return mask, packed_mask
+
+
+@pytest.mark.parametrize("grid_size", [None, 0, 1])
+def test_token_mask_wrapper_matches_native_visual_feature_gate(grid_size):
+    """Packed text and empty grids must not invent a deepstack mask."""
+    model = torch.nn.Module()
+    model.forward = MethodType(_native_visual_contract_forward, model)
+    model.image_token_id = 100
+    model.video_token_id = 101
+    model.vision_start_token_id = 102
+    model.pg_collection = SimpleNamespace()
+    install_qwen3_vl_token_mask([model])
+    ids = torch.tensor([[100, 8, 8, 8]])
+    types = torch.tensor([[int(grid_size == 1), 0, 0, 0]])
+    grid = None if grid_size is None else torch.zeros(grid_size, 3, dtype=torch.long)
+    pixels = None if grid_size is None else torch.zeros(grid_size, 1)
+
+    mask, packed_mask = model(
+        input_ids=ids,
+        mm_token_type_ids=types,
+        attention_mask=torch.ones_like(ids, dtype=torch.bool),
+        packed_seq_params=SimpleNamespace(),
+        pixel_values=pixels,
+        pixel_values_videos=None,
+        image_grid_thw=grid,
+        video_grid_thw=None,
+    )
+
+    if grid_size == 1:
+        assert mask is not None
+        assert packed_mask is not None
+    else:
+        assert mask is None
+        assert packed_mask is None
