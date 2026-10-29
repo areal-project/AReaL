@@ -67,7 +67,10 @@ from areal.experimental.openai.tool_call_parser import (
     process_tool_calls,
     split_reasoning,
 )
-from areal.experimental.openai.types import InteractionWithTokenLogpReward
+from areal.experimental.openai.types import (
+    InteractionWithTokenLogpReward,
+    ensure_parent_token_prefix,
+)
 from areal.infra.processor_cache import ProcessorCallCache
 from areal.utils import logging
 from areal.utils.hf_utils import apply_chat_template
@@ -763,6 +766,7 @@ def _concat_prompt_token_ids_with_parent(
     prompt IDs while preserving the existing parent-token concatenation rules.
     """
     parent_tokens: list[int] = []
+    expected_parent_tokens: list[int] | None = None
     all_message_list: list[dict] = []
     eos_token_id = tokenizer.eos_token_id
 
@@ -778,6 +782,9 @@ def _concat_prompt_token_ids_with_parent(
         parent_tokens = (
             parent.model_response.input_tokens
             + parent.model_response.output_tokens_without_stop  # without stop tokens
+        )
+        expected_parent_tokens = (
+            parent.model_response.input_tokens + parent.model_response.output_tokens
         )
         all_message_list += parent.messages if parent.messages is not None else []
         all_message_list += (
@@ -823,6 +830,8 @@ def _concat_prompt_token_ids_with_parent(
         child_tokens_truncate_idx = -1
 
     prompt_token_ids = parent_tokens + all_tokens[child_tokens_truncate_idx + 1 :]
+    if expected_parent_tokens is not None:
+        ensure_parent_token_prefix(prompt_token_ids, expected_parent_tokens)
     return prompt_token_ids, child_tokens_truncate_idx, len(parent_tokens)
 
 
@@ -1206,19 +1215,24 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         if has_images:
             _, concat_messages, _ = _extract_images_from_messages(concat_messages)
         concat_messages = _parse_tool_call_arguments(concat_messages)
-        prepared_prompt = await _prepare_prompt(
-            tokenizer=self.tokenizer,
-            processor=self.processor,
-            tokenizer_messages=tokenizer_messages,
-            concat_messages=concat_messages,
-            image_data=image_data,
-            parent=interaction.parent if interaction is not None else None,
-            chat_template_type=self.chat_template_type,
-            tools=tools_list,
-            extra_body=extra_body,
-            require_multimodal_processor=self.require_multimodal_processor,
-            processor_cache=processor_cache,
-        )
+        try:
+            prepared_prompt = await _prepare_prompt(
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                tokenizer_messages=tokenizer_messages,
+                concat_messages=concat_messages,
+                image_data=image_data,
+                parent=interaction.parent if interaction is not None else None,
+                chat_template_type=self.chat_template_type,
+                tools=tools_list,
+                extra_body=extra_body,
+                require_multimodal_processor=self.require_multimodal_processor,
+                processor_cache=processor_cache,
+            )
+        except Exception:
+            if self.chat_template_type == "concat" and cache is not None:
+                cache.pop(completion_id, None)
+            raise
         prompt_token_ids = prepared_prompt.input_ids
         if interaction is not None and self.processor is not None:
             interaction.prompt_token_ids = list(prompt_token_ids)
@@ -1731,19 +1745,24 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         if has_images:
             _, concat_messages, _ = _extract_images_from_messages(concat_messages)
         concat_messages = _parse_tool_call_arguments(concat_messages)
-        prepared_prompt = await _prepare_prompt(
-            tokenizer=self.tokenizer,
-            processor=self.processor,
-            tokenizer_messages=tokenizer_messages,
-            concat_messages=concat_messages,
-            image_data=image_data,
-            parent=interaction.parent,
-            chat_template_type=self.chat_template_type,
-            tools=tools_list,
-            extra_body=extra_body,
-            require_multimodal_processor=self.require_multimodal_processor,
-            processor_cache=processor_cache,
-        )
+        try:
+            prepared_prompt = await _prepare_prompt(
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                tokenizer_messages=tokenizer_messages,
+                concat_messages=concat_messages,
+                image_data=image_data,
+                parent=interaction.parent,
+                chat_template_type=self.chat_template_type,
+                tools=tools_list,
+                extra_body=extra_body,
+                require_multimodal_processor=self.require_multimodal_processor,
+                processor_cache=processor_cache,
+            )
+        except Exception:
+            if self.chat_template_type == "concat" and cache is not None:
+                cache.pop(resp_id, None)
+            raise
         prompt_token_ids = prepared_prompt.input_ids
         if self.processor is not None:
             interaction.prompt_token_ids = list(prompt_token_ids)
