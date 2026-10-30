@@ -1159,7 +1159,15 @@ class GatewayTrainController:
             f"meta.version must be a positive integer, got {meta.version}"
         )
         result = self._weight_update_ctrl.update_weights(version=meta.version)
-        self.rollout.continue_generation()
+        # Publish the version before resuming generation. Requests unblocked by
+        # continue_generation() are served by the new weights, so they must be
+        # stamped with the new version; otherwise every segment resumed during
+        # the version broadcast is recorded as pre-update policy and downstream
+        # importance ratios pick the wrong behavior policy for it.
+        try:
+            self.rollout.set_version(meta.version)
+        finally:
+            self.rollout.continue_generation()
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",
             meta.version,
