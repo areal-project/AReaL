@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import math
 import weakref
 from typing import NamedTuple
@@ -8,6 +9,25 @@ import torch
 import torch.distributed as dist
 from megatron.core import tensor_parallel
 from megatron.core.tensor_parallel import layers as mcore_layers
+
+_MCORE_LINEAR_HAS_GTP_REMAT = (
+    "gtp_remat_size"
+    in inspect.signature(
+        mcore_layers.LinearWithGradAccumulationAndAsyncCommunication.forward
+    ).parameters
+)
+
+
+def _mcore_linear_backward(ctx, grad_output: torch.Tensor) -> tuple:
+    gradients = mcore_layers.LinearWithGradAccumulationAndAsyncCommunication.backward(
+        ctx, grad_output
+    )
+    # Older MCore omits the non-tensor gtp_remat_size input used by our forward.
+    if len(gradients) == 9:
+        return (*gradients, None)
+    if len(gradients) != 10:
+        raise RuntimeError(f"Unsupported MCore linear backward arity: {len(gradients)}")
+    return gradients
 
 
 def _matches_storage(
@@ -78,6 +98,10 @@ def _prepare_linear_forward(
     tp_group: torch.distributed.ProcessGroup | None,
     gtp_remat_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if gtp_remat_size > 1 and not _MCORE_LINEAR_HAS_GTP_REMAT:
+        raise NotImplementedError(
+            "GTP weight rematerialization requires MCore linear backward support"
+        )
     if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
         main_grad = weight.main_grad
     else:
@@ -198,6 +222,10 @@ class _LinearWithNativeOutput(
             output = output + bias
         return output
 
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        return _mcore_linear_backward(ctx, grad_output)
+
 
 class _LinearWithFrozenNativeOutput(mcore_layers.LinearWithFrozenWeight):
     """AReaL TP linear that skips wgrad for a frozen weight."""
@@ -296,9 +324,7 @@ class _LinearWithFp32Output(
             ).view(ctx.output_shape)
         else:
             grad_output = grad_output.view(ctx.output_shape).to(dtype=weight.dtype)
-        return mcore_layers.LinearWithGradAccumulationAndAsyncCommunication.backward(
-            ctx, grad_output
-        )
+        return _mcore_linear_backward(ctx, grad_output)
 
 
 class _LinearWithFrozenFp32Output(mcore_layers.LinearWithFrozenWeight):

@@ -49,6 +49,60 @@ def _make_uninitialized_head() -> mcore_layers.ColumnParallelLinear:
     return head
 
 
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for direct FP32 mm")
+@pytest.mark.parametrize("mcore_gradient_count", [9, 10])
+@pytest.mark.parametrize("fp32_output", [False, True])
+def test_lm_head_backward_mcore_arity_preserves_tensor_gradients(
+    mcore_gradient_count: int,
+    fp32_output: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_backward = (
+        mcore_layers.LinearWithGradAccumulationAndAsyncCommunication.backward
+    )
+
+    def versioned_backward(ctx, grad_output):
+        gradients = original_backward(ctx, grad_output)
+        return (*gradients[:9], *((None,) if mcore_gradient_count == 10 else ()))
+
+    monkeypatch.setattr(
+        mcore_layers.LinearWithGradAccumulationAndAsyncCommunication,
+        "backward",
+        staticmethod(versioned_backward),
+    )
+    torch.manual_seed(42)
+    input_ = torch.randn(5, 2, 16, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    weight = torch.randn(32, 16, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    bias = torch.randn(32, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    output = lm_head_module.linear_with_areal_output(
+        input_, weight, bias, False, False, False, fp32_output=fp32_output
+    )
+    grad_output = torch.randn_like(output)
+    output.backward(grad_output)
+    cast_grad = grad_output.to(input_.dtype)
+    torch.testing.assert_close(input_.grad, cast_grad.matmul(weight.detach()))
+    torch.testing.assert_close(
+        weight.grad,
+        cast_grad.reshape(-1, 32).t().matmul(input_.detach().reshape(-1, 16)),
+    )
+    torch.testing.assert_close(bias.grad, cast_grad.reshape(-1, 32).sum(dim=0))
+
+
+def test_lm_head_old_mcore_rejects_gtp_rematerialization(monkeypatch):
+    monkeypatch.setattr(lm_head_module, "_MCORE_LINEAR_HAS_GTP_REMAT", False)
+    with pytest.raises(NotImplementedError, match="requires MCore linear backward"):
+        lm_head_module.linear_with_areal_output(
+            torch.randn(2, 1, 4),
+            torch.randn(8, 4, requires_grad=True),
+            None,
+            False,
+            False,
+            False,
+            gtp_remat_size=2,
+            fp32_output=False,
+        )
+
+
 def test_areal_lm_head_config_defaults_and_fp32_help():
     config = MegatronEngineConfig()
     config_fields = {field.name: field for field in fields(MegatronEngineConfig)}
