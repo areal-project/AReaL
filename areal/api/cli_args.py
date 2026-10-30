@@ -4324,6 +4324,62 @@ class MOPDConfig:
 
 
 @dataclass
+class TrajectoryDebugConfig:
+    """Optional single-controller RL batch capture and offline replay.
+
+    Replay requires a directory produced by dump mode with the same controller
+    version, model, training topology, and scope. Files contain training inputs,
+    not model, optimizer, or RNG checkpoints.
+    """
+
+    mode: str = field(
+        default="off",
+        metadata={
+            "help": "Capture training batches or replay them without inference services.",
+            "choices": ["off", "dump", "replay"],
+        },
+    )
+    path: str | None = field(
+        default=None,
+        metadata={
+            "help": "Snapshot directory. Required for replay; dump defaults to "
+            "<cluster.fileroot>/<experiment_name>/<trial_name>/debug_trajectories."
+        },
+    )
+    scope: str = field(
+        default="rollout",
+        metadata={
+            "help": "Capture after rollout collection, or after auxiliary/prox-logp "
+            "scoring (full). Replay must use the captured scope.",
+            "choices": ["rollout", "full"],
+        },
+    )
+    steps: list[int] | None = field(
+        default=None,
+        metadata={
+            "help": "Nonnegative global steps to capture. None captures every step. "
+            "Replay reads original global step numbers without cycling."
+        },
+    )
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("off", "dump", "replay"):
+            raise ValueError("trajectory_debug.mode must be off, dump, or replay")
+        if self.scope not in ("rollout", "full"):
+            raise ValueError("trajectory_debug.scope must be rollout or full")
+        if self.path is not None and not self.path.strip():
+            raise ValueError("trajectory_debug.path must not be empty")
+        if self.mode == "replay" and self.path is None:
+            raise ValueError("trajectory_debug.path is required for replay")
+        if self.steps is not None and any(
+            type(s) is not int or s < 0 for s in self.steps
+        ):
+            raise ValueError("trajectory_debug.steps must contain nonnegative integers")
+        if self.mode == "replay" and self.steps is not None:
+            raise ValueError("trajectory_debug.steps selects dump steps only")
+
+
+@dataclass
 class PPOConfig(BaseExperimentConfig):
     """Configuration for Proximal Policy Optimization (PPO) reinforcement learning experiments."""
 
@@ -4362,6 +4418,10 @@ class PPOConfig(BaseExperimentConfig):
             "stops when (accepted + rejected) >= batch_size, returning only accepted results. "
             "This results in variable-sized batches of valid data."
         },
+    )
+    trajectory_debug: TrajectoryDebugConfig = field(
+        default_factory=TrajectoryDebugConfig,
+        metadata={"help": "Optional single-controller SGLang RL batch dump/replay."},
     )
 
     def __post_init__(self):

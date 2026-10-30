@@ -1,5 +1,19 @@
 # 调试指南
 
+## 无推理服务的 RL 批次回放
+
+single-controller SGLang RL 可用 `trajectory_debug.mode=dump` 将实际训练批次保存为 CPU 张量，用
+`trajectory_debug.mode=replay` 离线回放。回放不启动 rollout、评测、proxy 或权重传输服务。v1/v2 训练控制器共用此可选路径，默认
+`off` 保持原行为。
+
+`trajectory_debug.scope=rollout` 回放时重算辅助评分与 prox logp；`full` 复用在 advantage
+计算前保存的评分。回放需匹配模型、控制器版本、训练拓扑、batch size 和 scope， 并设置
+`valid_dataset=null`。缺失步骤明确报错，不循环最后一批。批次快照不是模型、优化器 或 RNG checkpoint，只用于固定数据调试。
+
+用法、GPU 脚本、限制及验证协议见
+[trajectory replay 示例](https://github.com/areal-project/AReaL/tree/main/examples/trajectory_replay)。
+保存增加 CPU 内存和磁盘 IO；离线回放陈旧响应不能用来衡量在线 RL 吞吐或代替新的 on-policy 采样。
+
 本指南涵盖 AReaL 训练应用的调试，包括：
 
 - 使用持久化推理服务器调试您的 Agent Workflow（即 rollout）

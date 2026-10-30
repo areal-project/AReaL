@@ -6,6 +6,25 @@ This guide covers debugging AReaL training applications, including:
 - Comparing rollout results between Transformers and inference engines
 - Diagnosing training hangs and deadlocks with `py-spy`
 
+## Replaying an RL training batch without inference
+
+For single-controller SGLang RL, `trajectory_debug.mode=dump` captures the actual
+training batch as CPU tensors. `trajectory_debug.mode=replay` reads those batches
+without starting rollout, evaluation, proxy, or weight-transfer services. Both v1 and v2
+training controllers use the same optional path; the default is `off`.
+
+Use `trajectory_debug.scope=rollout` to recompute auxiliary scores and prox logp, or
+`full` to reuse scores captured immediately before advantage computation. Replay
+requires the same model, controller version, training topology, batch size and scope,
+and `valid_dataset=null`. Missing steps fail explicitly. A batch snapshot is separate
+from model/optimizer/RNG checkpoints and is intended for debugging with fixed data.
+
+See the
+[trajectory replay example](https://github.com/areal-project/AReaL/tree/main/examples/trajectory_replay)
+for the driver, configuration overrides, GPU scripts, limitations and validation
+protocol. Capture adds explicit CPU memory and disk I/O costs; replaying old responses
+does not measure online RL throughput or reproduce fresh on-policy sampling.
+
 ## Debugging agent workflows with a Persistent Inference Server
 
 In AReaL, any class with the method signature
