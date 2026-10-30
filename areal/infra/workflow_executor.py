@@ -33,6 +33,8 @@ from .staleness_manager import StalenessManager
 from areal.utils.rollout_metrics import ConsumedMetrics, Metrics, capture_metrics
 from areal.infra import workflow_context
 from .workflow_context import WorkflowContext
+from areal.v2.inference_service.router.client import backend_session
+from areal.v2.inference_service.router.backend import RoutingError
 from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
     concat_string_interactions,
@@ -358,6 +360,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         terminal_error_fn: Callable[[TResult], Exception | None] | None = None,
         deterministic_order: bool = False,
         consume_result: Callable[[TResult | None], TResult | None] | None = None,
+        health_check: Callable[[], None] | None = None,
     ):
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
@@ -369,6 +372,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self.enable_tracing = enable_tracing
         self.terminal_error_fn = terminal_error_fn
         self.deterministic_order = deterministic_order
+        self.health_check = health_check
         self.logger: Logger
 
         # Unbounded deques for producer/consumer pattern
@@ -656,6 +660,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         with self._result_cv:
             while True:
                 terminal_error = self._pop_terminal_error_locked()
+                if self.health_check is not None:
+                    self.health_check()
                 if terminal_error is not None:
                     raise terminal_error
                 if len(self._pending_results) >= count:
@@ -672,7 +678,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                         )
                     return []
 
-                self._result_cv.wait(timeout=remaining)
+                self._result_cv.wait(
+                    timeout=min(remaining, 1.0) if self.health_check else remaining
+                )
 
             drained: list[TimedResult[TResult]] = list(self._pending_results.values())
             self._pending_results.clear()
@@ -715,6 +723,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     terminal_error = self._pop_terminal_error_locked(task_id)
                     if terminal_error is not None:
                         raise terminal_error
+                if self.health_check is not None:
+                    self.health_check()
                 if task_id in self._pending_results:
                     break
                 self._check_thread_exception()
@@ -726,7 +736,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                         raise TimeoutError(f"Timed out waiting for task {task_id}.")
                     return None
 
-                self._result_cv.wait(timeout=remaining)
+                self._result_cv.wait(
+                    timeout=min(remaining, 1.0) if self.health_check else remaining
+                )
 
             found_result = self._pending_results.pop(task_id)
             self._active_task_ids.remove(task_id)
@@ -1349,9 +1361,10 @@ class WorkflowExecutor:
             try:
                 workflow_data = pending_task.data
                 if workflow_data is not None:
-                    traj = await pending_task.workflow.arun_episode(
-                        self.inference_engine, workflow_data
-                    )
+                    async with backend_session(self.inference_engine):
+                        traj = await pending_task.workflow.arun_episode(
+                            self.inference_engine, workflow_data
+                        )
 
                 # Trajectory format checking
                 if self.config.check_trajectory_format and traj is not None:
@@ -1474,7 +1487,7 @@ class WorkflowExecutor:
                 await self._clear_rejected_trajectory(traj)
                 return None
 
-            except WorkflowContractError as exc:
+            except (WorkflowContractError, RoutingError) as exc:
                 manager.on_rollout_rejected()
                 stats_tracker.get("rollout").scalar(rejected=1)
                 trace_session_event(

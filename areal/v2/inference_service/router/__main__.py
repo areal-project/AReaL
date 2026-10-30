@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 
 def main():
@@ -13,7 +14,7 @@ def main():
     parser.add_argument("--port", type=int, default=8081, help="Bind port")
     parser.add_argument(
         "--admin-api-key",
-        default="areal-admin-key",
+        default=os.environ.get("AREAL_ROUTER_ADMIN_API_KEY", "areal-admin-key"),
         help="Admin API key for privileged operations",
     )
     parser.add_argument(
@@ -27,6 +28,12 @@ def main():
         type=float,
         default=2.0,
         help="Timeout (seconds) per worker health check",
+    )
+    parser.add_argument(
+        "--backend-health-timeout",
+        type=float,
+        default=10.0,
+        help="Timeout (seconds) per inference backend health check",
     )
     parser.add_argument(
         "--routing-strategy",
@@ -58,6 +65,7 @@ def main():
         admin_api_key=args.admin_api_key,
         poll_interval=args.poll_interval,
         worker_health_timeout=args.worker_health_timeout,
+        backend_health_timeout=args.backend_health_timeout,
         routing_strategy=args.routing_strategy,
         log_level=args.log_level,
     )

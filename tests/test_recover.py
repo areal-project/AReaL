@@ -678,7 +678,7 @@ class TestAwexRecoverRestore:
         inference.resume.assert_not_called()
 
     @pytest.mark.parametrize("transport", ["awex", "disk"])
-    def test_load_separated_update_failure_retains_resume(
+    def test_load_separated_update_failure_keeps_admission_paused(
         self, tmp_path, monkeypatch, transport
     ):
         handler, actor, inference, dependencies, events, _ = self.prepare(
@@ -693,7 +693,7 @@ class TestAwexRecoverRestore:
                 weight_update_meta=WeightUpdateMeta(type=transport),
                 colocated_rollout=False,
             )
-        inference.resume.assert_called_once_with()
+        inference.resume.assert_not_called()
         events.offload.assert_not_called()
         inference.onload.assert_not_called()
 
@@ -817,10 +817,7 @@ def test_recover_awex_restores_generation_only_after_success(
             handler.load(engine, *dependencies, **kwargs)
         rollout.onload.assert_not_called()
         rollout.continue_generation.assert_not_awaited()
-        if not colocated and failure == "update":
-            rollout.resume.assert_called_once()
-        else:
-            rollout.resume.assert_not_called()
+        rollout.resume.assert_not_called()
         return
     handler.load(engine, *dependencies, **kwargs)
     if not colocated:
