@@ -14,26 +14,50 @@ import httpx
 
 SYSTEM = """You control a fixed-size training Actor group. Inference stays resident.
 Choose one action from the tools using the supplied current observation. Minimize
-idle training GPU occupancy while making progress on eligible trajectories. Start
-when a complete batch is ready and Actor is stopped. Consider release after an idle
-event with no complete batch. Consider the observed checkpoint/startup overhead and
-in-flight work: release is not required if it is unlikely to be useful. If waiting
-is preferable, set a bounded wake delay.
-You cannot predict future requests: no future arrival schedule is supplied.
+idle training GPU occupancy while making progress on eligible trajectories.
+You are called when collection starts, immediately after a completed update with
+no next batch, after release, on coalesced progress changes or your wake timer.
+Start when a complete batch is ready and Actor is stopped. You may also start
+BEFORE a batch is complete to overlap restoration with remaining SWE work.
+Use workload.batch_remaining_seconds and lifecycle_costs when available. The
+program estimates start_within_seconds = ETA low - startup - restore margin.
+When Actor is stopped and this is at most 5 seconds, start now. Otherwise wait
+no longer than that estimate (maximum 300 seconds) before checking fresh progress.
+Once prestarted, Actor stays resident until an update.
+When Actor is online with no batch, consider saving and releasing immediately
+only if the expected remaining collection time can cover checkpoint, release,
+startup and margin with a useful free window. There is no fixed idle threshold.
+ETA is an empirical hint, not a guarantee. Missing/overdue history is unknown,
+not zero; with unknown ETA prefer starting a stopped Actor or retaining an online
+one to avoid blocking training. Lifecycle configured priors are estimates, not
+current-run measurements. Graded samples still need cleanup and native export.
+Use wait_for_event with a bounded 5-300 second delay; the coordinator handles
+timers and significant progress changes. No future arrival schedule is supplied.
 The runtime enforces completed updates, publication and full checkpointing before
 release. Return a short operational reason, not a chain of thought. Use exactly one
 tool call at a time; querying status is optional. Never invent successful execution.
+Use only allowed_actions from the current observation. On action_rejected, the
+proposal was NOT executed; correct it using the fresh status and rejection_reason.
 """
 
 
-def tools() -> list[dict[str, Any]]:
+def tools(allowed_actions: list[str] | None = None) -> list[dict[str, Any]]:
     result = []
     for name, description in (
         ("get_status", "Read the current coordinator observation."),
-        ("start_actor", "Start or restore the fixed training worker group."),
+        (
+            "start_actor",
+            "Start or restore the stopped training group, including before a batch is ready.",
+        ),
         ("stop_actor", "Save complete state and release idle training workers."),
         ("wait_for_event", "Wait for a changed event or a bounded timeout."),
     ):
+        if (
+            allowed_actions is not None
+            and name != "get_status"
+            and name not in allowed_actions
+        ):
+            continue
         properties = {} if name == "get_status" else {"reason": {"type": "string"}}
         required = [] if name == "get_status" else ["reason"]
         if name == "wait_for_event":
@@ -103,7 +127,7 @@ class ControlLLM:
                 json={
                     "model": self.model,
                     "messages": messages,
-                    "tools": tools(),
+                    "tools": tools(observation.get("allowed_actions")),
                     "tool_choice": "required",
                     "parallel_tool_calls": False,
                 },
@@ -119,6 +143,8 @@ class ControlLLM:
             arguments = json.loads(call["function"]["arguments"])
             if action != "get_status":
                 return {**arguments, "action": action, "model": self.model}
+            if self.observe is not None:
+                observation = {**observation, **self.observe()}
             messages.extend(
                 [
                     {
@@ -129,9 +155,7 @@ class ControlLLM:
                     {
                         "role": "tool",
                         "tool_call_id": call["id"],
-                        "content": json.dumps(
-                            observation if self.observe is None else self.observe()
-                        ),
+                        "content": json.dumps(observation),
                     },
                 ]
             )

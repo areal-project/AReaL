@@ -8,6 +8,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import signal
 import sys
@@ -153,6 +154,20 @@ def prepare(args):
             "images_sha256": images_sha256,
             "gpu_acceptance": "not_run",
             "release_is_guaranteed": False,
+            "agent_timing": {
+                "triggers": "collection/update/release/progress/timer/batch_ready",
+                "startup_estimate_seconds": getattr(
+                    args, "startup_estimate_seconds", 90
+                ),
+                "checkpoint_estimate_seconds": getattr(
+                    args, "checkpoint_estimate_seconds", 40
+                ),
+                "release_estimate_seconds": getattr(
+                    args, "release_estimate_seconds", 15
+                ),
+                "restore_margin_seconds": getattr(args, "restore_margin_seconds", 15),
+                "progress_debounce_seconds": 5,
+            },
         },
     )
     return config, output, dataset
@@ -223,6 +238,9 @@ def summarize(output: Path, manager, expected_steps: int):
         ),
         "idle_metric_note": "Idle clock includes LLM/checkpoint work; use ready-count observations to measure missing-batch intervals.",
         "completed_workflow_episodes": len(episodes),
+        "completed_workflow_grading_exception_zeros": sum(
+            e.get("grading_kind") == "exception_zero" for e in episodes
+        ),
         "tool_calls": sum(e["tool_calls"] for e in episodes),
         "average_turns": sum(e["turns"] for e in episodes) / max(1, len(episodes)),
         "restore_tensor_equality": "native DCP restore; not independently tensor-compared",
@@ -283,13 +301,32 @@ def main():
     parser.add_argument(
         "--export-style", choices=("individual", "concat"), default="concat"
     )
-    parser.add_argument("--idle-seconds", type=float, default=40)
+    parser.add_argument(
+        "--idle-seconds",
+        type=float,
+        default=40,
+        help="Threshold for policy=idle; agent decisions do not wait for it",
+    )
+    parser.add_argument("--startup-estimate-seconds", type=float, default=90)
+    parser.add_argument("--checkpoint-estimate-seconds", type=float, default=40)
+    parser.add_argument("--release-estimate-seconds", type=float, default=15)
+    parser.add_argument("--restore-margin-seconds", type=float, default=15)
     parser.add_argument("--max-turns", type=int, default=24)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--checkpoint-gib", type=int, default=64)
     parser.add_argument("--timeout", type=float, default=3600)
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
+    if any(
+        not math.isfinite(value) or value < 0
+        for value in (
+            args.startup_estimate_seconds,
+            args.checkpoint_estimate_seconds,
+            args.release_estimate_seconds,
+            args.restore_margin_seconds,
+        )
+    ):
+        parser.error("Lifecycle estimates and margin must be finite and nonnegative")
     if min(args.max_turns, args.max_tokens, args.concurrency, args.timeout) <= 0:
         parser.error("turns, tokens, concurrency and timeout must be positive")
     if args.max_tokens + 1024 >= args.context_tokens:
@@ -309,6 +346,7 @@ def main():
 
     from .agent import ControlLLM
     from .plot import plot_run
+    from .swe.progress import SWEProgress
     from .telemetry import GPUMonitor
 
     config, output, dataset = prepare(args)
@@ -317,8 +355,17 @@ def main():
     from areal import PPOTrainer
 
     llm = ControlLLM() if args.policy == "agent" else None
+    progress = SWEProgress(
+        output,
+        startup_seconds=args.startup_estimate_seconds,
+        checkpoint_seconds=args.checkpoint_estimate_seconds,
+        release_seconds=args.release_estimate_seconds,
+        margin_seconds=args.restore_margin_seconds,
+    )
     policy = LifecyclePolicy(
-        mode=args.policy, decide=None if llm is None else llm.decide
+        mode=args.policy,
+        decide=None if llm is None else llm.decide,
+        observe=progress if llm is not None else None,
     )
 
     def stop(signum, frame):
@@ -335,7 +382,7 @@ def main():
         trainer = PPOTrainer(config, train_dataset=dataset, elastic_policy=policy)
         manager = trainer._on_demand
         if llm is not None:
-            llm.observe = manager.get_status
+            llm.observe = policy.observation
         start = time.monotonic()
 
         def observe():
@@ -347,7 +394,7 @@ def main():
                                 {
                                     "wall_time": time.time(),
                                     "monotonic": time.monotonic(),
-                                    **manager.get_status(),
+                                    **policy.observation(),
                                 }
                             )
                             + "\n"

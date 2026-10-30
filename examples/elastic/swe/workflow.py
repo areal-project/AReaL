@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from .grading import (
     validate_grading,
     verify_candidate_syntax_failure,
 )
+from .progress import EpisodeProgress
 from .sandbox import SandboxProcess, load_runtime
 
 
@@ -100,6 +102,13 @@ class SWEAgent:
         await asyncio.to_thread(directory.mkdir, parents=True)
         diagnostics = await asyncio.to_thread((directory / "sandbox.log").open, "w")
         env = SandboxProcess(self.runtime, directory, diagnostics)
+        context = workflow_context.get()
+        progress = EpisodeProgress(
+            directory,
+            task_id=data["instance_id"],
+            group_id=context.task_id,
+            sample_idx=context.sample_idx,
+        )
         report = {
             "task_id": data["instance_id"],
             "native_task_id": workflow_context.get().task_id,
@@ -108,10 +117,13 @@ class SWEAgent:
             "tool_calls": 0,
             "llm_seconds": 0.0,
             "tool_seconds": 0.0,
+            "grading_error_policy": "zero",
         }
         messages = []
+        grading_started = None
         try:
             async with asyncio.timeout(self.episode_timeout):
+                await progress.mark("initializing")
                 before = time.monotonic()
                 await env.start(data)
                 report["init_seconds"] = time.monotonic() - before
@@ -147,6 +159,7 @@ class SWEAgent:
                         report["exit_reason"] = "context_budget"
                         break
                     before = time.monotonic()
+                    await progress.mark("rollout", phase="generation", turn=turn)
                     response = await client.chat.completions.create(
                         model="default",
                         messages=messages,
@@ -195,6 +208,7 @@ class SWEAgent:
                             if call.function.name == "task_done":
                                 done, result = True, {"submitted": True}
                             else:
+                                await progress.mark("rollout", phase="tool", turn=turn)
                                 result = await getattr(env, call.function.name)(
                                     **arguments
                                 )
@@ -218,20 +232,25 @@ class SWEAgent:
                         break
                 if not report["turns"]:
                     raise RuntimeError("SWE prompt does not fit the configured context")
-                before = time.monotonic()
+                grading_started = time.monotonic()
+                await progress.mark("grading", turn=report["turns"])
+                report["grading_stage"] = "extract_patch"
                 final = await env.submit_final_solution()
                 if final["returncode"]:
+                    report["patch_extraction_error_output"] = final["output"]
                     raise RuntimeError("Could not extract candidate patch")
                 patch = final["output"]
                 report.update(
                     patch=patch,
                     patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
                 )
+                report["grading_stage"] = "compile_snapshot"
                 before_compile = await compile_snapshot(env, patch)
+                report["grading_stage"] = "evaluate"
                 reward, output = await grade_live_candidate(env, patch)
-                # Preserve evidence even if validation rejects an incomplete
-                # grading result. Only validated rewards enter training.
+                # Keep the original result even when validation falls back to zero.
                 report.update(raw_reward=reward, grading_output=output)
+                report["grading_stage"] = "validate"
                 candidate_failure = await verify_candidate_syntax_failure(
                     env, patch, reward, output, before_compile
                 )
@@ -241,22 +260,39 @@ class SWEAgent:
                 report.update(
                     reward=float(reward),
                     grading_kind=kind,
-                    reward_seconds=time.monotonic() - before,
+                    reward_seconds=time.monotonic() - grading_started,
                     candidate_syntax_failure=candidate_failure,
                     status="graded",
                 )
         except BaseException as error:
-            report.update(
-                status="cancelled"
-                if isinstance(error, asyncio.CancelledError)
-                else "failed",
-                error=f"{type(error).__name__}: {error}",
-            )
-            raise
+            if grading_started is not None and isinstance(error, Exception):
+                # Demo policy: completed trajectories survive grading failures.
+                # The outer timeout becomes TimeoutError here; explicit task
+                # cancellation remains a BaseException and must still propagate.
+                report.update(
+                    reward=0.0,
+                    grading_kind="exception_zero",
+                    grading_error_type=type(error).__name__,
+                    grading_error=str(error),
+                    grading_error_traceback=traceback.format_exc(),
+                    reward_seconds=time.monotonic() - grading_started,
+                    status="graded",
+                )
+            else:
+                report.update(
+                    status="cancelled"
+                    if isinstance(error, asyncio.CancelledError)
+                    else "failed",
+                    error=f"{type(error).__name__}: {error}",
+                )
+                raise
         finally:
             before = time.monotonic()
             try:
-                await env.close()
+                try:
+                    await progress.mark("cleanup", turn=report["turns"])
+                finally:
+                    await env.close()
                 report["cleanup_verified"] = True
             except BaseException as error:
                 if isinstance(error, asyncio.CancelledError) and env.cleanup_verified:
@@ -276,10 +312,13 @@ class SWEAgent:
                     instance_id=env.instance_id,
                     calls=env.calls,
                     messages=messages,
+                    progress_error=progress.error,
                 )
                 await asyncio.to_thread(diagnostics.close)
                 async with aiofiles.open(directory / "report.json", "w") as stream:
                     await stream.write(json.dumps(report, indent=2))
+                if report["status"] in ("failed", "cancelled"):
+                    await progress.mark(report["status"], turn=report["turns"])
         report["status"] = "completed"
         record = {
             k: v
@@ -289,4 +328,5 @@ class SWEAgent:
         record["report"] = str(directory / "report.json")
         async with aiofiles.open(self.log_path, "a") as stream:
             await stream.write(json.dumps(record) + "\n")
+        await progress.mark("completed", turn=report["turns"])
         return report["reward"]

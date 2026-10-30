@@ -1,0 +1,50 @@
+[
+  {
+    "task": "Project-MONAI__MONAI-5486",
+    "image": "xingyaoww/sweb.eval.x86_64.project-monai_s_monai-5486:latest",
+    "bytes": 6083323402,
+    "digest": "sha256:ff7880c376b2b129c49d50244863ce12d8c9eb619ac51be8f366694130048f22"
+  },
+  {
+    "task": "dask__dask-10159",
+    "image": "xingyaoww/sweb.eval.x86_64.dask_s_dask-10159:latest",
+    "bytes": 2707289195,
+    "digest": "sha256:8a2ccf0add82ea960d2b4e5f122ce8521145c5dd18bbb876580f26d4336f0151"
+  },
+  {
+    "task": "dask__dask-7305",
+    "image": "xingyaoww/sweb.eval.x86_64.dask_s_dask-7305:latest",
+    "bytes": 1805900309,
+    "digest": "sha256:21fd7dd8a9a1511a02fa5c99403449c75547e2e110afee679b6c9c1569290b73"
+  },
+  {
+    "task": "iterative__dvc-1700",
+    "image": "xingyaoww/sweb.eval.x86_64.iterative_s_dvc-1700:latest",
+    "bytes": 1150839798,
+    "digest": "sha256:0c118e87a43e1877c672db1506c34f1b1229b30c9959093d7b814d31da351c04"
+  },
+  {
+    "task": "pandas-dev__pandas-53975",
+    "image": "xingyaoww/sweb.eval.x86_64.pandas-dev_s_pandas-53975:latest",
+    "bytes": 2908442728,
+    "digest": "sha256:b45817ed11542705d541028f48e9ce8026e783feb14440454141fc6d8129df21"
+  },
+  {
+    "task": "pandas-dev__pandas-56016",
+    "image": "xingyaoww/sweb.eval.x86_64.pandas-dev_s_pandas-56016:latest",
+    "bytes": 2863852507,
+    "digest": "sha256:c7c47c2a8aac52abb21973c7e3db63d67d5ba714da9fbcbaf11ee41aef5b05cb"
+  },
+  {
+    "task": "pandas-dev__pandas-57232",
+    "image": "xingyaoww/sweb.eval.x86_64.pandas-dev_s_pandas-57232:latest",
+    "bytes": 3203018814,
+    "digest": "sha256:80c274a5e433885099dbdc42f2a2e58234e79ebfbb863e037cb2890e5c055d72"
+  },
+  {
+    "task": "python__mypy-15006",
+    "image": "xingyaoww/sweb.eval.x86_64.python_s_mypy-15006:latest",
+    "bytes": 1057439728,
+    "digest": "sha256:85f52ba04cf5502fc60fd04c864645c899397f874fd1400a3d8f4f6d1805dc68"
+  }
+]

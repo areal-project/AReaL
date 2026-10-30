@@ -152,7 +152,8 @@ class OnDemandActor:
     """Keep the consumer fence, serving service and data progress across GPU generations.
 
     The caller executes the ordinary native PPO operations between next_batch()
-    and finish_update(). Recovery replays lost updates through the same PPO path.
+    and finish_update(). Only planned GPU worker restarts are supported; the CPU
+    coordinator and native inline producer remain alive throughout the run.
     """
 
     def __init__(
@@ -178,9 +179,6 @@ class OnDemandActor:
             freq_epoch=config.recover.freq_epochs,
             freq_step=config.recover.freq_steps,
             freq_sec=config.recover.freq_secs,
-        )
-        self._initial_checkpoint_frequency = deepcopy(
-            self.checkpoint_frequency.state_dict()
         )
         self.root = Path(self.options.state_root)
         if self.root.exists() and any(self.root.iterdir()):
@@ -250,22 +248,10 @@ class OnDemandActor:
         self._closed = False
         self.cancelled = threading.Event()
         self._capture_cpu: Callable[[], dict[str, Any]] = lambda: {}
-        self._restore_cpu: Callable[[dict[str, Any]], None] = lambda state: None
         self.consumer = self.inbox.queue.consumer(self._read_latest)
         try:
-            self.inbox.set_admission_open(False)
-            self.applied_version = (
-                self.latest_manifest["global_step"] if self.latest_manifest else 0
-            )
-            self._restore_data_progress()
-            previous = self.root / "state.json"
-            if previous.exists():
-                journal = json.loads(previous.read_text())
-                self.generation = journal["generation"]
-                if journal.get("owner"):
-                    raise RuntimeError(
-                        "Previous coordinator left an unconfirmed Actor generation; preserve its journal for cleanup"
-                    )
+            self.applied_version = 0
+            self.data_progress = {"task_groups": 0, "samples": 0, "effective_tokens": 0}
             self.gpu_uuids = resolve_gpu_uuids(list(self.options.actor_devices))
             rollout_gpus = resolve_gpu_uuids(list(self.options.rollout_devices))
             present = gpu_processes()
@@ -276,23 +262,9 @@ class OnDemandActor:
             self.consumer.close()
             raise
 
-    def _restore_data_progress(self) -> None:
-        """Recover logical counts independently of optional measurement history."""
-        progress = (
-            None
-            if self.latest_manifest is None
-            else self.latest_manifest.get("data_progress")
-        )
-        if progress is None:
-            from areal.infra.rpc.serialization import deserialize_value
-
-            progress = {"task_groups": 0, "samples": 0, "effective_tokens": 0}
-            for payload in self.consumer.applied_payloads():
-                progress["task_groups"] += len(payload["episode_ids"])
-                for value in payload["trajectories"]:
-                    trajectory = deserialize_value(value)
-                    progress["samples"] += trajectory["input_ids"].shape[0]
-                    progress["effective_tokens"] += int(trajectory["loss_mask"].sum())
+    def _validate_data_progress(self) -> None:
+        """Check the resident coordinator's logical counts before saving them."""
+        progress = self.data_progress
         if (
             not isinstance(progress, dict)
             or any(
@@ -309,8 +281,6 @@ class OnDemandActor:
             raise ValueError(
                 "Logical data progress disagrees with the checkpoint/queue cursor"
             )
-        self.data_progress = dict(progress)
-        self._active_data_progress = None
 
     @property
     def published_version(self) -> int:
@@ -370,42 +340,17 @@ class OnDemandActor:
         capture_cpu: Callable[[], dict[str, Any]],
         restore_cpu: Callable[[dict[str, Any]], None],
     ) -> None:
+        # restore_cpu remains a compatibility argument. The coordinator never
+        # restarts in inline mode; its state is saved for checkpoint auditing.
         self.rollout, self.weight_meta = rollout, weight_meta
-        self._capture_cpu, self._restore_cpu = capture_cpu, restore_cpu
-        if self.latest_path is not None:
-            restore_cpu(json.loads((self.latest_path / "coordinator.json").read_text()))
-            self._restore_checkpoint_frequency()
-        self._initial_cpu_state = deepcopy(capture_cpu())
+        self._capture_cpu = capture_cpu
         rollout._ensure_initialized()
         versions = rollout.serving_versions()
-        rolled_back = self.inbox.status()["published_version"] > self.applied_version
-        if rolled_back:
-            rollout.pause_generation()
-            self.inbox.rollback(self.consumer)
         if not versions or any(version != self.applied_version for version in versions):
-            if self.latest_path is None and not rolled_back:
-                raise RuntimeError(
-                    "Initial serving weights do not match the immutable base version"
-                )
-            self.ensure_actor()
-            self._publish()
-            rollout.continue_generation()
-        elif self.inbox.status()["published_version"] != self.applied_version:
-            self.inbox.confirm_publication(self.applied_version, consumer=self.consumer)
-        if rolled_back:
-            rollout.continue_generation()
+            raise RuntimeError(
+                "Initial serving weights do not match the immutable base version"
+            )
         self.policy_adapter.bind(self)
-        self.inbox.set_admission_open(True)
-
-    def _restore_checkpoint_frequency(self) -> None:
-        path = (
-            self.latest_path / "checkpoint-schedule.json" if self.latest_path else None
-        )
-        self.checkpoint_frequency.load_state_dict(
-            json.loads(path.read_text())
-            if path is not None and path.exists()
-            else deepcopy(self._initial_checkpoint_frequency)
-        )
 
     def _assert_pool_free(self) -> None:
         present = gpu_processes()
@@ -500,6 +445,8 @@ class OnDemandActor:
         """Start/restore the fixed worker group at the coordinator boundary."""
         if self.active is not None or self._publication_uncertain:
             raise RuntimeError("Actor start requires an idle, published boundary")
+        if self.published_version != self.applied_version:
+            raise RuntimeError("Actor start requires confirmed publication")
         self.ensure_actor()
         return self.get_status()
 
@@ -608,7 +555,11 @@ class OnDemandActor:
                 head_window=self.inbox.max_staleness,
             )
             return trajectories
-        self.maybe_suspend()
+        if self.actor is None and self.policy_adapter.mode == "agent":
+            if self.policy_adapter.decide(None) == "start":
+                self.start_actor()
+        else:
+            self.maybe_suspend()
         return None
 
     @_serialized
@@ -659,6 +610,7 @@ class OnDemandActor:
             or self.inbox.status()["published_version"] != self.applied_version
         ):
             raise RuntimeError("Checkpoint requires applied, fully published weights")
+        self._validate_data_progress()
         started = time.monotonic()
 
         def write(path: Path) -> None:
@@ -853,42 +805,10 @@ class OnDemandActor:
 
     @_serialized
     def recover_uncertain(self, error: Exception) -> None:
-        """Roll back a failed generation to its latest full checkpoint and replay data."""
-        try:
-            self.inbox.set_admission_open(False)
-        except Exception:
-            logger.error("Cannot persist the recovery admission fence", exc_info=True)
-        self._cleanup_event("RECOVERING", error=str(error))
-        self.rollout.pause()
-        # The inference scheduler may be waiting in the failed AWEX collective
-        # too. Fence local submission, then require inference teardown to finish
-        # after the failed training generation is proved stopped.
-        self._release(training_uncertain=True)
-        self.rollout.pause_generation()
-        manifest = self._read_latest()
-        self.consumer.restore_checkpoint(manifest)
-        self.inbox.rollback(self.consumer)
-        self.applied_version = manifest["global_step"] if manifest else 0
-        self._restore_data_progress()
-        self.active = None
-        self._update_applied = False
-        self._checkpoint_dirty = False
-        self._restore_checkpoint_frequency()
-        if self.latest_path is not None:
-            self._restore_cpu(
-                json.loads((self.latest_path / "coordinator.json").read_text())
-            )
-        else:
-            self._restore_cpu(deepcopy(self._initial_cpu_state))
-        # Failed transfers may have overwritten only some inference tensors
-        # without advancing any version label. A matching label is not proof
-        # that serving weights equal the checkpoint. Restore every tensor and
-        # require publication acknowledgment before reopening generation.
-        self.ensure_actor()
-        self._publish()
-        self.rollout.continue_generation()
-        self.rollout.resume()
-        self.inbox.set_admission_open(True)
+        """Compatibility entry point: inline mode cannot replay uncertain updates."""
+        raise RuntimeError(
+            "Inline demo supports planned Actor restarts, not coordinator recovery"
+        ) from error
 
     @_serialized
     def close(self) -> None:
@@ -897,10 +817,6 @@ class OnDemandActor:
         errors = []
         try:
             self.inbox.close()
-        except Exception as error:
-            errors.append(error)
-        try:
-            self.inbox.set_admission_open(False)
         except Exception as error:
             errors.append(error)
         try:

@@ -115,6 +115,8 @@ def plot_run(root: Path) -> Path:
     axes[2].set_ylabel("Training version")
     axes[2].set_xlabel("Elapsed seconds")
     for row in decisions:
+        if row.get("outcome", "accepted") != "accepted":
+            continue
         action = row["decision"]["action"]
         x = row["monotonic"] - start
         axes[1].axvline(x, color="#6b7280", alpha=0.35, linestyle="--")

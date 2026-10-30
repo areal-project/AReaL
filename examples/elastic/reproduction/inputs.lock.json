@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "model": {
+    "repo": "Qwen/Qwen3-4B-Instruct-2507",
+    "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+    "sha256": {
+      "config.json": "5beea1a4a34c62782bfb2f911c606741a3bab8f92d80a118fa053c28af12e8ba",
+      "model-00001-of-00003.safetensors": "75311d91bb08cf0b882913da464a1e722a31fb44db35208663487efb7a3d8ed6",
+      "model-00002-of-00003.safetensors": "0b48adbb1f60e901153d91907ba11ce63bd4b8b584482e730f48808d055dfba1",
+      "model-00003-of-00003.safetensors": "7dd39ccca5e4de123c74c14af44c9bf2eb75df33b4614382af0134528e060d5d",
+      "model.safetensors.index.json": "d6c42883a895dfef5b0080ed2116a1bcd764f558406b98923d675978a1abf29c",
+      "merges.txt": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+      "generation_config.json": "835fffe355c9438e7a25be099b3fccaa98350b83451f9fd2d99512e74f1ade48",
+      "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+      "tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+      "tokenizer_config.json": "a62ff0a2472a0fa1b8eaabcb57c59b58afa42a22831dc141400b6e0cf2b65ce3"
+    }
+  },
+  "dataset": {
+    "dataset": "SWE-Gym/SWE-Gym",
+    "split": "train",
+    "revision": "bb94ed9e39bbeb96a7fcbfb533b80f25a7fd59cb",
+    "parquet_sha256": "60569cea74bb281f7a5579467436a2bc1932c6e0c5f2f7fa0d084392abd9ad97",
+    "harness": "SWE-Gym/SWE-Bench-Fork",
+    "harness_revision": "242429c188fcfd06aad13fce9a54d450470bf0ac",
+    "population": 2438,
+    "selection": "seeded uniform sample of instance_id-sorted training split; no reward or latency filter",
+    "seed": 1,
+    "count": 8,
+    "repeats": 2,
+    "tasks_sha256": "7f0a60dc051c3d134311f85fb13f24beb1ec8f67783050be563686faee077dae",
+    "row_order": [
+      "iterative__dvc-1700",
+      "pandas-dev__pandas-57232",
+      "dask__dask-10159",
+      "pandas-dev__pandas-56016",
+      "python__mypy-15006",
+      "Project-MONAI__MONAI-5486",
+      "pandas-dev__pandas-53975",
+      "dask__dask-7305",
+      "dask__dask-7305",
+      "pandas-dev__pandas-57232",
+      "pandas-dev__pandas-53975",
+      "Project-MONAI__MONAI-5486",
+      "dask__dask-10159",
+      "iterative__dvc-1700",
+      "pandas-dev__pandas-56016",
+      "python__mypy-15006"
+    ],
+    "images_sha256": "0e129d64cced6fdf16b12fdd178c4e8de38eacab2c2af2e159520a2ff9355e07"
+  },
+  "training_image": "ghcr.io/areal-project/areal-runtime@sha256:751c93268976c2157d27e125e6b5599f29ed14a148f90d71b18c27892d0bb226",
+  "control_model": "stepfun/step-3.7-flash",
+  "recipe": {
+    "steps": 8,
+    "concurrency": 2,
+    "export-style": "concat",
+    "context-tokens": 16384,
+    "max-tokens": 4096,
+    "max-turns": 24,
+    "checkpoint-gib": 52,
+    "timeout": 7200,
+    "startup-estimate-seconds": 90,
+    "checkpoint-estimate-seconds": 40,
+    "release-estimate-seconds": 15,
+    "restore-margin-seconds": 15
+  },
+  "required_free_gib": {
+    "resident": 58,
+    "agent": 114
+  },
+  "config_sha256": "0bfbb610ab102e29e2c28e003453b374f2112aa290c682a358ea7d20cee2a1b0",
+  "sdk": {
+    "aenv-src": {
+      "repository": "inclusionAI/AEnvironment",
+      "revision": "667f743428d358f4fb84857835d447cd1d9b31ba",
+      "tree_truncated": false,
+      "compared_python_files": 67,
+      "matching_files": 67,
+      "different_files": [],
+      "not_in_public_revision": []
+    },
+    "swe-src": {
+      "repository": "areal-project/AReaL-SWEAgent",
+      "revision": "f144900d5e0a019bf5381b624c442b49999ffa4d",
+      "tree_truncated": false,
+      "compared_python_files": 22,
+      "matching_files": 22,
+      "different_files": [],
+      "not_in_public_revision": []
+    }
+  }
+}

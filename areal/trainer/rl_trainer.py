@@ -764,39 +764,22 @@ class PPOTrainer:
                 self.actor = self._on_demand.actor
 
         global_step = start_step
-        failures = 0
         while global_step < max_steps:
             if (
                 config.total_train_steps is not None
                 and global_step >= config.total_train_steps
             ):
                 break
-            try:
-                self._train_step(
-                    global_step=global_step,
-                    steps_per_epoch=steps_per_epoch,
-                    workflow=workflow,
-                    workflow_kwargs=workflow_kwargs,
-                    dynamic_filter_fn=dynamic_filter_fn,
-                    eval_workflow=eval_workflow,
-                    eval_workflow_kwargs=eval_workflow_kwargs,
-                )
-            except Exception as error:
-                if (
-                    self._on_demand is None
-                    or failures >= config.actor_lifecycle.max_recovery_attempts
-                ):
-                    raise
-                failures += 1
-                logger.exception(
-                    "Recovering uncertain native PPO update %d", global_step
-                )
-                self._on_demand.recover_uncertain(error)
-                self.actor = self._on_demand.actor
-                global_step = self._on_demand.applied_version
-                continue
+            self._train_step(
+                global_step=global_step,
+                steps_per_epoch=steps_per_epoch,
+                workflow=workflow,
+                workflow_kwargs=workflow_kwargs,
+                dynamic_filter_fn=dynamic_filter_fn,
+                eval_workflow=eval_workflow,
+                eval_workflow_kwargs=eval_workflow_kwargs,
+            )
             global_step += 1
-            failures = 0
 
     def _train_step(
         self,

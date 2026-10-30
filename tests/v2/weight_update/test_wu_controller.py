@@ -442,7 +442,10 @@ class TestGatewayTransactions:
             await _post_json(session, "http://rank/awex/report_weight_meta", 1)
         session.post.assert_called_once()
 
-    def test_metadata_failure_waits_for_peers_and_cleans_both_sides(self, monkeypatch):
+    @pytest.mark.parametrize("colocate", [False, True])
+    def test_metadata_failure_waits_for_peers_and_cleans_both_sides(
+        self, monkeypatch, colocate
+    ):
         import asyncio
         from unittest.mock import AsyncMock
 
@@ -472,7 +475,9 @@ class TestGatewayTransactions:
         monkeypatch.setattr(gateway, "_post_json", metadata)
         monkeypatch.setattr(gateway, "_post", cleanup)
         response = TestClient(app).post(
-            "/connect", json=self.body(), headers={"Authorization": "Bearer test-key"}
+            "/connect",
+            json={**self.body(), "colocate": colocate},
+            headers={"Authorization": "Bearer test-key"},
         )
         assert response.status_code == 503
         assert seen.count("http://train/awex/report_weight_meta") == 1

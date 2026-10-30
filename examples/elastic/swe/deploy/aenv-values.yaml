@@ -1,0 +1,140 @@
+# Overrides for the pinned AEnvironment chart. CPU-only development deployment.
+global:
+  sandboxNamespace: aenv-sandbox
+
+api-service-k8s:
+  enabled: false
+
+controller:
+  image: autopilot-aenv-controller:0.1.0
+  command: ["/usr/bin/service"]
+  service:
+    type: ClusterIP
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+      ephemeral-storage: "256Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+      ephemeral-storage: "2Gi"
+  podTemplates:
+    dualContainer: |
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: placeholder
+        namespace: {{ .Values.sandboxNamespace }}
+        labels:
+          app.kubernetes.io/name: aenv-sandbox
+          template-type: dualContainer
+      spec:
+        automountServiceAccountToken: false
+        containers:
+          - name: main
+            image: autopilot-swe-shell:0.1.0
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "32Mi"
+                ephemeral-storage: "64Mi"
+              limits:
+                cpu: "500m"
+                memory: "256Mi"
+                ephemeral-storage: "256Mi"
+            volumeMounts:
+              - name: shared-data
+                mountPath: /shared
+          - name: second
+            # AEnvironment replaces this with imagePrefix:datasource.
+            image: autopilot-swe-tasks:placeholder
+            imagePullPolicy: IfNotPresent
+            command: ["/bin/bash", "-ec"]
+            args:
+              - |
+                for attempt in $(seq 1 300); do
+                  if [ -x /shared/persistent-bash ]; then
+                    exec /shared/persistent-bash
+                  fi
+                  sleep 1
+                done
+                echo "Timed out waiting for the shell server" >&2
+                exit 1
+            env:
+              - name: PORT
+                value: "8081"
+              - name: SWE_EVAL_ROOT
+                value: /shared/swe_eval
+              - name: SWE_GRADER_PYTHON
+                value: /opt/miniconda3/bin/python
+            resources:
+              requests:
+                cpu: "1"
+                memory: "2Gi"
+                ephemeral-storage: "1Gi"
+              limits:
+                cpu: "4"
+                memory: "8Gi"
+                ephemeral-storage: "8Gi"
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: 8081
+              initialDelaySeconds: 1
+              periodSeconds: 2
+            volumeMounts:
+              - name: shared-data
+                mountPath: /shared
+        volumes:
+          - name: shared-data
+            emptyDir:
+              sizeLimit: "64Mi"
+        restartPolicy: Never
+
+redis:
+  image: redis:alpine
+  service:
+    type: ClusterIP
+  # An isolated development cluster; environment registrations can be recreated.
+  persistence:
+    enabled: false
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+      ephemeral-storage: "128Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+      ephemeral-storage: "1Gi"
+
+envhub:
+  image: autopilot-aenv-envhub:0.1.0
+  service:
+    type: ClusterIP
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+      ephemeral-storage: "128Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+      ephemeral-storage: "1Gi"
+
+api-service:
+  image: autopilot-aenv-api-service:0.1.0
+  scheduleType: k8s
+  service:
+    type: ClusterIP
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+      ephemeral-storage: "128Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+      ephemeral-storage: "1Gi"

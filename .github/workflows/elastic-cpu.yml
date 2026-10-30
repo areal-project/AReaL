@@ -10,6 +10,7 @@ on:
       - 'areal/v2/**'
       - 'examples/elastic/**'
       - 'tests/test_elastic*.py'
+      - 'tests/elastic_tools/**'
       - '.github/workflows/elastic-cpu.yml'
 permissions:
   contents: read
@@ -33,6 +34,7 @@ jobs:
         run: |
           python -m pytest -q tests/test_elastic_runtime.py tests/test_elastic_checkpoint.py \
             tests/test_elastic_runtime_state.py tests/test_elastic_demo.py tests/test_elastic_swe.py \
-            tests/test_elastic_inline.py tests/test_elastic_profile.py tests/test_staleness_manager.py
+            tests/test_elastic_inline.py tests/test_elastic_progress.py \
+            tests/test_elastic_reproduce.py tests/test_staleness_manager.py
           python -m pytest -q tests/v2/weight_update/test_wu_controller.py \
             -k 'full_lifecycle or successful_connect_and_disconnect or sglang_teardown_ack_waits or disconnect_waits_for_running_update'

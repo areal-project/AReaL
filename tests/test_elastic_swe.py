@@ -77,11 +77,24 @@ def test_multitask_dataset_preserves_provenance_and_removes_gold(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("cleanup_fails", "incomplete_grading"),
-    [(False, False), (True, False), (False, True)],
+    ("cleanup_fails", "grading_case"),
+    [
+        (False, "zero"),
+        (False, "one"),
+        (False, "telemetry_error"),
+        (False, "incomplete_import"),
+        (False, "incomplete_segfault"),
+        (False, "sdk_error"),
+        (False, "deadline"),
+        (False, "cancelled"),
+        (False, "patch_error"),
+        (False, "tool_error"),
+        (True, "zero"),
+        (True, "incomplete_import"),
+    ],
 )
 async def test_native_swe_tools_grade_live_worktree_then_confirm_cleanup(
-    tmp_path, monkeypatch, cleanup_fails, incomplete_grading
+    tmp_path, monkeypatch, cleanup_fails, grading_case
 ):
     calls = []
 
@@ -101,10 +114,14 @@ async def test_native_swe_tools_grade_live_worktree_then_confirm_cleanup(
         async def execute_bash(self, command):
             assert command == "pytest tests/test_bug.py"
             calls.append("tool")
+            if grading_case == "tool_error":
+                raise RuntimeError("Tool transport failed before grading")
             return {"returncode": 0, "output": "1 passed"}
 
         async def submit_final_solution(self):
             calls.append("patch")
+            if grading_case == "patch_error":
+                return {"returncode": 1, "output": "git diff failed"}
             return {"returncode": 0, "output": ""}
 
         async def request(self, method, **kwargs):
@@ -113,8 +130,21 @@ async def test_native_swe_tools_grade_live_worktree_then_confirm_cleanup(
                 "return_output": True,
             }
             calls.append("grade")
-            if incomplete_grading:
-                return 0.0, "Evaluation omitted reference tests: test_bug"
+            if grading_case.startswith("incomplete_"):
+                error = (
+                    "AttributeError: 'list' object has no attribute 'items'"
+                    if grading_case == "incomplete_import"
+                    else "Fatal Python error: Segmentation fault"
+                )
+                return 0.0, error + "\nEvaluation omitted reference tests: test_bug"
+            if grading_case == "sdk_error":
+                raise RuntimeError("Sandbox RPC response stream closed")
+            if grading_case == "deadline":
+                await asyncio.Event().wait()
+            if grading_case == "cancelled":
+                raise asyncio.CancelledError()
+            if grading_case in ("one", "telemetry_error"):
+                return 1.0, "AUTOPILOT_SWE_RESOLVED=true"
             return 0.0, "AUTOPILOT_SWE_RESOLVED=false"
 
         async def close(self):
@@ -166,7 +196,17 @@ async def test_native_swe_tools_grade_live_worktree_then_confirm_cleanup(
 
     monkeypatch.setattr("examples.elastic.swe.workflow.SandboxProcess", Sandbox)
     monkeypatch.setattr("examples.elastic.swe.workflow.load_runtime", lambda _: {})
+    if grading_case == "telemetry_error":
+
+        async def progress_disk_error(*args):
+            raise OSError("progress snapshot unavailable")
+
+        monkeypatch.setattr(
+            "examples.elastic.swe.progress.aiofiles.os.replace", progress_disk_error
+        )
     agent = SWEAgent(log_path=str(tmp_path / "episodes.jsonl"), runtime_config="test")
+    if grading_case == "deadline":
+        agent.episode_timeout = 0.5
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
         run = agent.run(
             {"instance_id": "test-task", "problem_statement": "Fix the bug."},
@@ -178,23 +218,60 @@ async def test_native_swe_tools_grade_live_worktree_then_confirm_cleanup(
             with pytest.raises(RuntimeError, match="owned pod remains"):
                 await run
             assert not (tmp_path / "episodes.jsonl").exists()
-        elif incomplete_grading:
-            with pytest.raises(RuntimeError, match="unambiguous completed grading"):
+        elif grading_case == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
                 await run
             assert not (tmp_path / "episodes.jsonl").exists()
+        elif grading_case == "tool_error":
+            with pytest.raises(RuntimeError, match="before grading"):
+                await run
+            assert not (tmp_path / "episodes.jsonl").exists()
+        else:
+            assert await run == (
+                1.0 if grading_case in ("one", "telemetry_error") else 0.0
+            )
+            record = json.loads((tmp_path / "episodes.jsonl").read_text())
             report = json.loads(
                 next(tmp_path.glob("swe-episodes/*/report.json")).read_text()
             )
-            assert report["cleanup_verified"] and report["status"] == "failed"
-            assert report["raw_reward"] == 0.0
-            assert "omitted reference tests" in report["grading_output"]
-            assert "patch" in report and "patch_sha256" in report
-            assert "reward" not in report
-        else:
-            assert await run == 0.0
-            record = json.loads((tmp_path / "episodes.jsonl").read_text())
             assert record["cleanup_verified"] and record["turns"] == 2
-    assert calls == ["start", "tool", "patch", "patch", "grade", "cleanup"]
+            assert report["status"] == "graded" and record["status"] == "completed"
+            if grading_case not in ("zero", "one", "telemetry_error"):
+                assert report["grading_kind"] == "exception_zero"
+                assert record["grading_kind"] == "exception_zero"
+                assert report["grading_error_type"] == (
+                    "TimeoutError" if grading_case == "deadline" else "RuntimeError"
+                )
+                assert report["grading_error_type"] in report["grading_error_traceback"]
+                assert report["grading_stage"] in (
+                    "extract_patch",
+                    "evaluate",
+                    "validate",
+                )
+                if grading_case.startswith("incomplete_"):
+                    assert report["raw_reward"] == 0.0
+                    assert "omitted reference tests" in report["grading_output"]
+                    assert "patch" in report and "patch_sha256" in report
+                if grading_case == "patch_error":
+                    assert report["patch_extraction_error_output"] == "git diff failed"
+            else:
+                assert record["grading_kind"] == "completed_reference_report"
+                assert "grading_error" not in record
+                if grading_case == "telemetry_error":
+                    assert "snapshot unavailable" in report["progress_error"]
+    expected = ["start", "tool"]
+    if grading_case != "tool_error":
+        expected.append("patch")
+        if grading_case != "patch_error":
+            expected += ["patch", "grade"]
+    assert calls == [*expected, "cleanup"]
+    if cleanup_fails or grading_case in ("cancelled", "tool_error"):
+        report = json.loads(
+            next(tmp_path.glob("swe-episodes/*/report.json")).read_text()
+        )
+        assert report["status"] == (
+            "cancelled" if grading_case == "cancelled" else "failed"
+        )
 
 
 def test_swe_grading_rejects_infrastructure_errors_and_incomplete_reports():

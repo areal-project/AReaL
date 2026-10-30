@@ -31,7 +31,6 @@ class InlineBatchSource:
         self._closed = threading.Event()
         self._error = None
         self._published_version = 0
-        self._admission_open = False
         self._lock = threading.RLock()
 
     def start(self, rollout, *, total_batches: int, **prepare_kwargs):
@@ -102,8 +101,7 @@ class InlineBatchSource:
             self._published_version = version
 
     def set_admission_open(self, enabled: bool):
-        # Lifecycle fence only. Native StalenessManager owns actual admission.
-        self._admission_open = enabled
+        """Compatibility no-op; native StalenessManager owns inline admission."""
 
     def rollback(self, consumer):
         raise RuntimeError("Coordinator rollback is not supported by the inline demo")

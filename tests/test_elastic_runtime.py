@@ -221,9 +221,97 @@ def _complete_native_update(manager, version):
     manager.finish_update()
 
 
-@pytest.mark.parametrize("mode", ["resident", "idle"])
+def test_inline_rejects_coordinator_recovery_without_changing_live_state(
+    native_lifecycle,
+):
+    manager = native_lifecycle.manager
+    manager.start_actor()
+    actor, cursor, events = (
+        manager.actor,
+        manager.consumer.cursor,
+        list(native_lifecycle.events),
+    )
+    with pytest.raises(RuntimeError, match="not coordinator recovery"):
+        manager.recover_uncertain(RuntimeError("update failed"))
+    assert manager.actor is actor and manager.consumer.cursor == cursor
+    assert native_lifecycle.events == events
+    with pytest.raises(ValueError, match="fresh state directory"):
+        native_lifecycle.create()
+
+
+@pytest.mark.parametrize("restore_fails", [False, True])
+def test_agent_early_restore_preserves_cursor_and_waits_for_real_batch(
+    native_lifecycle,
+    monkeypatch,
+    restore_fails,
+):
+    """Exercise real CPU queue/checkpoint fences through pre-batch restoration."""
+    from areal.elastic.policy import LifecyclePolicy
+
+    fixture = native_lifecycle
+    fixture.config.recover.mode = "disabled"
+    manager = fixture.manager
+    fixture.config.actor_lifecycle.min_ready_seconds = 0
+    actions, observations = iter(["start_actor", "stop_actor", "start_actor"]), []
+
+    def decide(observation):
+        observations.append(observation)
+        return {"action": next(actions), "reason": "test early lifecycle"}
+
+    manager.policy_adapter.close()
+    manager.policy_adapter = LifecyclePolicy(mode="agent", decide=decide)
+    manager.policy_adapter.bind(manager)
+    before = dict(manager.consumer.cursor)
+    assert manager._poll_batch() is None
+    assert manager.actor is not None and manager.active is None
+    assert manager.consumer.cursor == before
+    assert manager.applied_version == fixture.rollout.version == 0
+    _ready_native_episodes(manager, 0, 0)
+    assert len(manager.next_batch()) == 4
+    manager.actor.updates += 1
+    _complete_native_update(manager, 1)
+    assert manager._poll_batch() is None  # Immediate save/release, no 40s wait.
+    assert manager.actor is None
+    before, progress = dict(manager.consumer.cursor), dict(manager.data_progress)
+    publications = [e for e in fixture.events if e.startswith("publish-")]
+    if restore_fails:
+
+        def broken_load(self, operation, **kwargs):
+            assert operation == "load"
+            raise TimeoutError("checkpoint load interrupted")
+
+        monkeypatch.setattr(type(fixture.actors[0]), "full_checkpoint", broken_load)
+        with pytest.raises(TimeoutError, match="load interrupted"):
+            manager._poll_batch()
+        assert manager.active is None and manager.consumer.cursor == before
+        assert manager.ready_since is None
+        assert manager.data_progress == progress
+        assert manager.applied_version == fixture.rollout.version == 1
+        assert [e for e in fixture.events if e.startswith("publish-")] == publications
+        return
+    assert manager._poll_batch() is None  # Restore with no data ready.
+    assert manager.actor is not None and manager.actor.updates == 1
+    assert manager.active is None and manager.consumer.cursor == before
+    assert manager.data_progress == progress
+    assert manager.applied_version == fixture.rollout.version == 1
+    assert [e for e in fixture.events if e.startswith("publish-")] == publications
+    assert manager._poll_batch() is None  # Prestarted Actor stays until update.
+    _ready_native_episodes(manager, 4, 1)
+    assert len(manager.next_batch()) == 4
+    manager.actor.updates += 1
+    _complete_native_update(manager, 2)
+    assert [o["event"] for o in observations] == [
+        "collection_started",
+        "update_completed",
+        "actor_released",
+    ]
+    assert "load-1" in fixture.events
+
+
+@pytest.mark.parametrize("mode", ["resident", "idle", "native"])
+@pytest.mark.parametrize("failed_step", [False, True])
 def test_resident_starts_with_collection_before_a_batch_exists(
-    native_lifecycle, monkeypatch, mode
+    native_lifecycle, monkeypatch, mode, failed_step
 ):
     """Only the resident policy acquires its initial Actor without ready data."""
     import importlib.util
@@ -258,22 +346,29 @@ def test_resident_starts_with_collection_before_a_batch_exists(
         assert kwargs["global_step"] == 0
         assert (manager.actor is not None) == (mode == "resident")
         order.append("wait-for-batch")
+        if failed_step:
+            raise RuntimeError("update failed")
 
     trainer = SimpleNamespace(
         config=fixture.config,
         recover_info=None,
         train_dataloader=[{}],
-        _on_demand=manager,
+        _on_demand=None if mode == "native" else manager,
         rollout=fixture.rollout,
         _requires_proxy_workflow=lambda workflow: False,
         _train_step=train_step,
     )
-    PPOTrainer.train(trainer, workflow=object(), total_epochs=1)
-    assert order == (
-        ["collection", "actor", "wait-for-batch"]
-        if mode == "resident"
-        else ["collection", "wait-for-batch"]
-    )
+    if failed_step:
+        with pytest.raises(RuntimeError, match="update failed"):
+            PPOTrainer.train(trainer, workflow=object(), total_epochs=1)
+    else:
+        PPOTrainer.train(trainer, workflow=object(), total_epochs=1)
+    expected = {
+        "resident": ["collection", "actor"],
+        "idle": ["collection"],
+        "native": [],
+    }
+    assert order == [*expected[mode], "wait-for-batch"]
 
 
 @pytest.mark.parametrize("native_lifecycle", [4], indirect=True)
@@ -296,14 +391,13 @@ def test_grouped_update_preserves_eight_samples_and_checkpoint_progress(
         }
         assert manager.compatibility["group_size"] == 4
         assert manager.maybe_suspend(now=manager.ready_since + 121)
-        manager.data_progress = {}  # Restore must come from durable checkpoint state.
-        manager._restore_data_progress()
+        assert manager.latest_manifest["data_progress"] == manager.data_progress
         manager.start_actor()
         assert manager.data_progress["samples"] == (version + 1) * 8
         assert manager.actor.updates == version + 1
 
 
-def test_single_sample_multiturn_progress_restores_actual_rows(native_lifecycle):
+def test_single_sample_multiturn_restart_preserves_actual_rows(native_lifecycle):
     from areal.infra.rpc.serialization import serialize_value
 
     manager = native_lifecycle.manager
@@ -320,13 +414,33 @@ def test_single_sample_multiturn_progress_restores_actual_rows(native_lifecycle)
     manager.next_batch()
     manager.actor.updates += 1
     _complete_native_update(manager, 1)
-    manager.data_progress = {}
-    manager._restore_data_progress()
+    manager.stop_actor()
+    assert manager.latest_manifest["data_progress"] == manager.data_progress
+    manager.start_actor()
     assert manager.data_progress == {
         "task_groups": 4,
         "samples": 8,
         "effective_tokens": 16,
     }
+
+
+def test_inconsistent_progress_cannot_replace_checkpoint(native_lifecycle):
+    manager = native_lifecycle.manager
+    _ready_native_episodes(manager, 0, 0)
+    manager.next_batch()
+    manager.actor.updates += 1
+    _complete_native_update(manager, 1)
+    progress = dict(manager.data_progress)
+    checkpoint, cursor = manager.latest_path, manager.consumer.cursor
+    manager.data_progress["task_groups"] += 1
+    try:
+        with pytest.raises(ValueError, match="Logical data progress"):
+            manager.save_checkpoint(reason="test")
+        assert manager.latest_path == checkpoint
+        assert manager.consumer.cursor == cursor
+        assert manager.store.latest(manager.compatibility)[0] == checkpoint
+    finally:
+        manager.data_progress = progress
 
 
 def test_native_lifecycle_three_cycles_restore_cursor_and_actor_state(native_lifecycle):

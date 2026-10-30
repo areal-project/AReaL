@@ -1,0 +1,5 @@
+ARG BASE_IMAGE=busybox:1.37.0
+FROM ${BASE_IMAGE}
+COPY persistent-bash /payload/persistent-bash
+COPY swe_eval/ /payload/swe_eval/
+CMD ["sh", "-ec", "mkdir -p /shared/swe_eval; cp -R /payload/swe_eval/. /shared/swe_eval/; cp /payload/persistent-bash /shared/persistent-bash.tmp; mv /shared/persistent-bash.tmp /shared/persistent-bash; exec sleep infinity"]

@@ -1,0 +1,19 @@
+{
+  "name": "autopilot-swe-bash",
+  "version": "0.1.0",
+  "tags": ["swe", "autopilot", "local"],
+  "status": "Ready",
+  "artifacts": [
+    {
+      "id": "shell",
+      "type": "image",
+      "content": "autopilot-swe-shell:0.1.0"
+    }
+  ],
+  "deployConfig": {
+    "podTemplate": "dualContainer",
+    "imagePrefix": "autopilot-swe-tasks",
+    "cpu": "1",
+    "memory": "256Mi"
+  }
+}

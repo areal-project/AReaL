@@ -138,6 +138,33 @@ async def _gather_all(*operations):
     return results
 
 
+async def _collect_metadata(session, train_urls, inference_urls, timeout_s):
+    """Collect every peer response, then validate and normalize both layouts."""
+    groups = await _gather_all(
+        *[
+            _gather_all(
+                *[
+                    _post_json(session, f"{url}/awex/report_weight_meta", timeout_s)
+                    for url in urls
+                ]
+            )
+            for urls in (train_urls, inference_urls)
+        ]
+    )
+    flattened = []
+    for responses in groups:
+        values = []
+        for response in responses:
+            meta = response.get("result", response.get("meta", response))
+            values.extend(meta if isinstance(meta, list) else [meta])
+        flattened.append(values)
+    _validate_wire_dtypes(*flattened)
+    return (
+        merge_parameter_metadata(flattened[0]),
+        merge_inference_metadata(groups[1]),
+    )
+
+
 async def _discover_parallelism(session, train_urls, inference_urls, timeout_s):
     reports = await _gather_all(
         *[
@@ -437,44 +464,9 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         total_infer_ranks = infer_world_size * num_engines
         total_world_size = total_infer_ranks + train_world_size
 
-        train_meta_resps, infer_meta_resps = await _gather_all(
-            _gather_all(
-                *[
-                    _post_json(
-                        session, f"{url}/awex/report_weight_meta", init_timeout_s
-                    )
-                    for url in train_urls
-                ]
-            ),
-            _gather_all(
-                *[
-                    _post_json(
-                        session, f"{url}/awex/report_weight_meta", init_timeout_s
-                    )
-                    for url in inference_urls
-                ]
-            ),
+        training_params_meta, infer_params_meta = await _collect_metadata(
+            session, train_urls, inference_urls, init_timeout_s
         )
-
-        training_params_meta = []
-        for result in train_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                training_params_meta.extend(meta)
-            else:
-                training_params_meta.append(meta)
-
-        infer_params_meta = []
-        for result in infer_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                infer_params_meta.extend(meta)
-            else:
-                infer_params_meta.append(meta)
-
-        _validate_wire_dtypes(training_params_meta, infer_params_meta)
-        training_params_meta = merge_parameter_metadata(training_params_meta)
-        infer_params_meta = merge_inference_metadata(infer_meta_resps)
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
 
@@ -572,44 +564,9 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         # The total inference world for colocate NCCL groups spans all engines.
         infer_world_size = infer_par["world_size"] * num_engines
 
-        train_meta_resps, infer_meta_resps = await _gather_all(
-            _gather_all(
-                *[
-                    _post_json(
-                        session, f"{url}/awex/report_weight_meta", init_timeout_s
-                    )
-                    for url in train_urls
-                ]
-            ),
-            _gather_all(
-                *[
-                    _post_json(
-                        session, f"{url}/awex/report_weight_meta", init_timeout_s
-                    )
-                    for url in inference_urls
-                ]
-            ),
+        training_params_meta, infer_params_meta = await _collect_metadata(
+            session, train_urls, inference_urls, init_timeout_s
         )
-
-        training_params_meta = []
-        for result in train_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                training_params_meta.extend(meta)
-            else:
-                training_params_meta.append(meta)
-
-        infer_params_meta = []
-        for result in infer_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                infer_params_meta.extend(meta)
-            else:
-                infer_params_meta.append(meta)
-
-        _validate_wire_dtypes(training_params_meta, infer_params_meta)
-        training_params_meta = merge_parameter_metadata(training_params_meta)
-        infer_params_meta = merge_inference_metadata(infer_meta_resps)
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
 

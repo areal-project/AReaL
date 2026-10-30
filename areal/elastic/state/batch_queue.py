@@ -276,37 +276,14 @@ class BatchConsumer:
             ]
 
     def claim(self) -> QueuedBatch | None:
-        self._require_open()
-        if self._active is not None:
-            raise RuntimeError("Previous batch has not completed")
-        with self.queue._transaction() as db:
-            row = db.execute(
-                "SELECT * FROM batches WHERE sequence>? ORDER BY sequence LIMIT 1",
-                (self._current["through_sequence"],),
-            ).fetchone()
-            if row is None:
-                return None
-            if row["status"] != "pending":
-                raise RuntimeError("Queue requires checkpoint recovery")
-            if _digest(row["payload"], row["policy_version"]) != row["digest"]:
-                raise ValueError("Batch payload digest mismatch")
-            db.execute(
-                "UPDATE batches SET status='leased', lease=? WHERE sequence=?",
-                (self._lease, row["sequence"]),
-            )
-            batch = QueuedBatch(
-                row["sequence"],
-                row["batch_id"],
-                json.loads(row["payload"]),
-                row["policy_version"],
-                row["digest"],
-                self._lease,
-            )
-        self._active = batch
-        return batch
+        self._active = self._pending_batch(lease=self._lease)
+        return self._active
 
     def peek(self) -> QueuedBatch | None:
         """Validate the next pending envelope without leasing or advancing it."""
+        return self._pending_batch(lease="")
+
+    def _pending_batch(self, *, lease: str) -> QueuedBatch | None:
         self._require_open()
         if self._active is not None:
             raise RuntimeError("Previous batch has not completed")
@@ -321,13 +298,18 @@ class BatchConsumer:
                 raise RuntimeError("Queue requires checkpoint recovery")
             if _digest(row["payload"], row["policy_version"]) != row["digest"]:
                 raise ValueError("Batch payload digest mismatch")
+            if lease:
+                db.execute(
+                    "UPDATE batches SET status='leased', lease=? WHERE sequence=?",
+                    (lease, row["sequence"]),
+                )
             return QueuedBatch(
                 row["sequence"],
                 row["batch_id"],
                 json.loads(row["payload"]),
                 row["policy_version"],
                 row["digest"],
-                "",
+                lease,
             )
 
     def mark_applied(self, batch: QueuedBatch) -> None:
