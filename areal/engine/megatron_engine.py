@@ -133,6 +133,7 @@ from areal.engine.r3.discovery import (
     discover_native_router_replay,
 )
 from areal.engine.r3.layout import prepare_native_replay_slabs
+from areal.engine.r3.memory import log_routing_memory, routing_memory_snapshot
 from areal.engine.r3.orchestration import (
     clear_router_replay_action,
     clear_router_replay_state,
@@ -140,6 +141,7 @@ from areal.engine.r3.orchestration import (
     set_router_replay_action,
     set_target_indices,
 )
+from areal.engine.r3.packed import PackedRouting
 from areal.engine.r3.transport import localize_r3_tensor
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform, is_npu_available
@@ -464,9 +466,10 @@ class MegatronEngine(TrainEngine):
         self._r3_enabled: bool = self.mcore_config.enable_router_replay
         self._r3_router_groups: dict[int, list[NativeRouterReplayRef]] = {}
         self._r3_local_moe_indices: dict[int, list[int]] = {}
+        self.r3_pipeline_stages: list[dict[str, Any]] = []
         self._r3_moe_config: R3MoEConfig | None = None
         self._r3_num_moe_experts: int | None = None
-        self._r3_pending_routed_experts: torch.Tensor | None = None
+        self._r3_pending_routed_experts: torch.Tensor | PackedRouting | None = None
         self._r3_pending_valid: torch.Tensor | None = None
 
         if self._r3_enabled and self.mcore_config.enable_mtp:
@@ -1599,6 +1602,27 @@ class MegatronEngine(TrainEngine):
                 )
 
         total_local_routers = sum(len(refs) for refs in self._r3_router_groups.values())
+        if self.r3_pipeline_stages:
+            local_layers = sorted(
+                {
+                    layer
+                    for layers in self._r3_local_moe_indices.values()
+                    for layer in layers
+                }
+            )
+            participants = dist.get_process_group_ranks(self.cpu_model_parallel_group)
+            layer_maps: list[Any] = [None] * len(participants)
+            dist.all_gather_object(
+                layer_maps, local_layers, group=self.cpu_model_parallel_group
+            )
+            by_rank = dict(zip(participants, layer_maps, strict=True))
+            for stage in self.r3_pipeline_stages:
+                layers = by_rank[stage["ranks"][0]]
+                if any(by_rank[rank] != layers for rank in stage["ranks"]):
+                    raise r3_error(
+                        "R3 TP/CP replicas disagree on pipeline layer mapping"
+                    )
+                stage["layers"] = tuple(layers)
         self.logger.info(
             "Initialized R3 native RouterReplay refs: vp_stages=%s, local_routers=%s.",
             {
@@ -1703,6 +1727,10 @@ class MegatronEngine(TrainEngine):
 
         routed_experts = localize_r3_tensor(routed_experts)
         routing_valid = localize_r3_tensor(routing_valid)
+        if isinstance(routed_experts, PackedRouting):
+            return self._prepare_packed_r3_forward_context(
+                routed_experts, routing_valid, mb_list
+            )
         if not torch.is_tensor(routed_experts) or not torch.is_tensor(routing_valid):
             raise r3_error(
                 "R3 side-channel values must be torch tensors after localization",
@@ -1798,6 +1826,57 @@ class MegatronEngine(TrainEngine):
                 consumed=offset,
                 routed_batch_size=routed_experts.shape[0],
             )
+        return self._make_r3_forward_context(
+            mb_list, routed_mbs, valid_mbs, routing_valid
+        )
+
+    def _prepare_packed_r3_forward_context(
+        self,
+        routes: PackedRouting,
+        valid: torch.Tensor,
+        mb_list: MicroBatchList,
+    ) -> dict[str, Any]:
+        if valid.shape != torch.Size([len(routes)]):
+            raise r3_error("R3 packed routing batch size mismatch")
+        valid = valid.detach().to(device="cpu", dtype=torch.bool)
+        if self._r3_moe_config is None or self._r3_num_moe_experts is None:
+            raise r3_error("R3 MoE config is not initialized")
+        if routes.values.shape[-1] != self._r3_moe_config.topk or any(
+            i < 0 or i >= self._r3_moe_config.num_moe_layers
+            for i in routes.layer_indices
+        ):
+            raise r3_error("R3 packed routing layer/topk dims do not match MoE config")
+        if routes.values.numel():
+            lo, hi = torch.aminmax(routes.values)
+            if int(lo) < 0 or int(hi) >= self._r3_num_moe_experts:
+                raise r3_error("R3 expert id outside Megatron MoE range")
+        dummy_count = getattr(mb_list, "transport_dummy_count", 0)
+        if dummy_count:
+            routes = routes.append_dummy_rows(dummy_count)
+            valid = torch.cat([valid, torch.zeros(dummy_count, dtype=torch.bool)])
+        if mb_list.forward_indices is not None:
+            if len(mb_list.forward_indices) != len(routes):
+                raise r3_error("R3 forward_indices length does not match packed rows")
+            valid = valid[mb_list.forward_indices]
+            routes = routes.select_rows(mb_list.forward_indices)
+        routed_mbs, valid_mbs = [], []
+        offset = 0
+        for mb in mb_list.mbs:
+            count = len(mb["cu_seqlens"]) - 1
+            routed_mbs.append(routes.select_rows(range(offset, offset + count)))
+            valid_mbs.append(valid[offset : offset + count])
+            offset += count
+        if offset != len(routes):
+            raise r3_error("R3 micro-batches did not consume all packed rows")
+        return self._make_r3_forward_context(mb_list, routed_mbs, valid_mbs, valid)
+
+    def _make_r3_forward_context(
+        self,
+        mb_list: MicroBatchList,
+        routed_mbs: list[torch.Tensor | PackedRouting],
+        valid_mbs: list[torch.Tensor],
+        routing_valid: torch.Tensor,
+    ) -> dict[str, Any]:
         valid_samples = int(routing_valid.sum().item())
         total_samples = int(routing_valid.numel())
         token_padding = (
@@ -1810,11 +1889,15 @@ class MegatronEngine(TrainEngine):
             if mb_list.padded_to_lengths is not None
             else int(sum(mb_list.group_lens))
         )
+        memory = routing_memory_snapshot(routed_mbs)
+        if hasattr(self, "logger"):
+            log_routing_memory(self.logger, memory)
         return {
             "routed_mbs": routed_mbs,
             "valid_mbs": valid_mbs,
             "real_tokens_by_mb": [int(x) for x in mb_list.group_lens],
             "stats": {
+                **memory,
                 "batches_with_side_channel": 1,
                 "logical_microbatches": len(mb_list.mbs),
                 "samples_total": total_samples,
@@ -2950,6 +3033,23 @@ class MegatronEngine(TrainEngine):
                 )
                 if dp_rank == mpu.get_data_parallel_rank():
                     self._cpu_model_parallel_group = cpu_group
+            if self._r3_enabled:
+                own_model_ranks = context_and_model_parallel_ranks[
+                    mpu.get_data_parallel_rank()
+                ]
+                # Every world rank creates every group in identical order.
+                for ranks in rank_generator.get_ranks("tp-cp"):
+                    stage_group = dist.new_group(
+                        ranks, timeout=DIST_GROUP_DEFAULT_TIMEOUT, backend="gloo"
+                    )
+                    if ranks[0] in own_model_ranks:
+                        self.r3_pipeline_stages.append(
+                            {
+                                "ranks": tuple(ranks),
+                                "group": stage_group,
+                                "layers": (),
+                            }
+                        )
 
     def _create_optimizer(self, ft_spec: FinetuneSpec) -> None:
         if self.optimizer_config is None:

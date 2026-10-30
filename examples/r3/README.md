@@ -55,3 +55,34 @@ The examples assume:
 The committed configs are short smoke runs (`total_train_steps=3`,
 `train_dataset.batch_size=8`, `gconfig.n_samples=4`). Override those fields for longer
 comparisons.
+
+## Routing memory
+
+The built-in workflows export routing as a packed CPU tensor
+`routed_experts[sum(sequence_lengths), moe_layers, topk]`, together with
+`r3_cu_seqlens[batch_size + 1]` and `r3_routing_valid[batch_size]`. Expert IDs use
+signed int16 when lossless, including models with 512 experts, and otherwise int32.
+Legacy padded routing inputs remain accepted.
+
+PPO minibatch permutations and engine reordering operate on row metadata instead of
+copying the routing payload. RPC transfers stream only each physical pipeline stage's
+layers, including the union of its virtual pipeline chunks. CP/SP token selection and
+the conversion to native int64 replay indices happen on CPU for the current microbatch
+before upload. Routing is excluded from advantage computation, reference, critic, and
+teacher payloads.
+
+The engine logs host RSS/PSS before replay and exports `r3/cpu_routing_storage_bytes`,
+counting unique replay backing storages rather than counting each microbatch view again.
+This metric excludes model weights and other process allocations; use host PSS and
+container memory measurements for a complete node budget.
+
+For an isolated actor-side memory comparison, run these in separate processes:
+
+```bash
+python tests/torchrun/run_r3_memory_probe.py --format dense
+python tests/torchrun/run_r3_memory_probe.py --format packed
+```
+
+The packed case starts after PP4 distribution. The probe measures routing preparation,
+including retained input trajectories, rather than model training or the source worker's
+transfer peak.

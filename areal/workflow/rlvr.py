@@ -186,7 +186,11 @@ class RLVRWorkflow(RolloutWorkflow):
             ),
         }
         batched = {k: v.unsqueeze(0) for k, v in res.items()}
-        if resp.routed_experts is not None:
+        if (
+            resp.routed_experts is not None
+            or self.r3_num_moe_layers is not None
+            or self.r3_topk is not None
+        ):
             if self.r3_num_moe_layers is None or self.r3_topk is None:
                 raise ValueError(
                     "RLVRWorkflow received routed_experts but R3 MoE shape is not "
@@ -198,6 +202,7 @@ class RLVRWorkflow(RolloutWorkflow):
                     seq_lens=[len(seq)],
                     num_moe_layers=self.r3_num_moe_layers,
                     topk=self.r3_topk,
+                    packed=True,
                 )
             )
         return batched

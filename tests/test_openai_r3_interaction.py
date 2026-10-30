@@ -15,6 +15,11 @@ from areal.experimental.openai.types import (
 )
 
 
+def _routing_rows(data, index=0):
+    offsets = data["r3_cu_seqlens"]
+    return data["routed_experts"][int(offsets[index]) : int(offsets[index + 1])].int()
+
+
 def _response(
     *,
     input_tokens: list[int],
@@ -27,6 +32,54 @@ def _response(
         output_logprobs=[-0.1] * len(output_tokens),
         output_versions=[1] * len(output_tokens),
         routed_experts=routed,
+    )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("serialize", [False, True])
+def test_legacy_cached_leaf_mixes_with_packed_leaf_preserving_history(
+    reverse, serialize
+):
+    def make_interaction(name, valid):
+        interaction = InteractionWithTokenLogpReward(
+            model_response=_response(
+                input_tokens=[1, 2],
+                output_tokens=[3, 4],
+                routed=np.arange(12, dtype=np.int32).reshape(3, 4),
+            ),
+            reward=2.5,
+            r3_num_moe_layers=2,
+            r3_topk=2,
+        )
+        interaction.interaction_id = name
+        interaction.to_tensor_dict()["r3_routing_valid"][0] = valid
+        return interaction
+
+    old = make_interaction("old", False)
+    modern = make_interaction("new", True)
+    old_cache = old._cache.copy()
+    old_cache["routed_experts"] = old_cache["routed_experts"].unsqueeze(0).int()
+    del old_cache["r3_cu_seqlens"]
+    old._cache = old_cache
+    old.model_response = None  # Old serialized caches need no original response.
+    expected_routes = old_cache["routed_experts"].clone()
+    interactions = {"old": old, "new": modern}
+    if serialize:
+        interactions = deserialize_interactions(serialize_interactions(interactions))
+    if reverse:
+        interactions = dict(reversed(list(interactions.items())))
+    group = concat_tensor_interactions(interactions)
+    assert group["r3_routing_valid"].tolist() == [
+        name != "old" for name in interactions
+    ]
+    assert group["rewards"].tolist() == [2.5, 2.5]
+    for row in range(2):
+        torch.testing.assert_close(
+            _routing_rows(group, row), expected_routes[0], rtol=0, atol=0
+        )
+    assert "r3_cu_seqlens" not in old_cache
+    torch.testing.assert_close(
+        old_cache["routed_experts"], expected_routes, rtol=0, atol=0
     )
 
 
@@ -45,11 +98,12 @@ def test_interaction_to_tensor_dict_includes_r3_routing():
 
     tensor_dict = interaction.to_tensor_dict()
 
-    assert tensor_dict["routed_experts"].shape == (1, 4, 2, 2)
+    assert tensor_dict["routed_experts"].shape == (4, 2, 2)
+    assert tensor_dict["routed_experts"].dtype == torch.int16
     assert tensor_dict["r3_routing_valid"].tolist() == [True]
     torch.testing.assert_close(
-        tensor_dict["routed_experts"][0, 3],
-        tensor_dict["routed_experts"][0, 2],
+        _routing_rows(tensor_dict)[3],
+        _routing_rows(tensor_dict)[2],
         rtol=0,
         atol=0,
     )
@@ -82,16 +136,16 @@ def test_concat_interaction_to_tensor_dict_concatenates_parent_routing():
 
     tensor_dict = child.to_tensor_dict()
 
-    routed = tensor_dict["routed_experts"]
-    assert routed.shape == (1, 6, 2, 2)
+    routed = _routing_rows(tensor_dict)
+    assert routed.shape == (6, 2, 2)
     torch.testing.assert_close(
-        routed[0, :2],
-        parent.to_tensor_dict()["routed_experts"][0, :2],
+        routed[:2],
+        _routing_rows(parent.to_tensor_dict())[:2],
         rtol=0,
         atol=0,
     )
     torch.testing.assert_close(
-        routed[0, 2:],
+        routed[2:],
         torch.as_tensor(
             np.stack(
                 [
@@ -140,9 +194,7 @@ def test_concat_three_turns_preserves_historical_routes_and_validity(invalid_tur
                 if expected is None
                 else torch.cat([expected[:-1], current[expected.shape[0] - 1 :]])
             )
-            torch.testing.assert_close(
-                result["routed_experts"][0], expected, rtol=0, atol=0
-            )
+            torch.testing.assert_close(_routing_rows(result), expected, rtol=0, atol=0)
         assert result["r3_routing_valid"].item() == (
             invalid_turn is None or turn < invalid_turn
         )
@@ -177,7 +229,7 @@ def test_proxy_interaction_serialization_preserves_r3_tensor_cache():
     restored = deserialize_interactions(serialized)
 
     tensor_dict = restored["completion-1"].to_tensor_dict()
-    assert tensor_dict["routed_experts"].shape == (1, 4, 2, 2)
+    assert tensor_dict["routed_experts"].shape == (4, 2, 2)
     assert tensor_dict["r3_routing_valid"].tolist() == [True]
 
 
@@ -208,7 +260,7 @@ def test_group_export_mixed_missing_routes_retains_invalid_row(
         r3_num_moe_layers=2,
         r3_topk=2,
     )
-    valid_routes = valid.to_tensor_dict()["routed_experts"].clone()
+    valid_routes = _routing_rows(valid.to_tensor_dict()).clone()
     interactions = {"valid": valid, "missing": missing}
     if missing_first:
         interactions = dict(reversed(list(interactions.items())))
@@ -224,13 +276,13 @@ def test_group_export_mixed_missing_routes_retains_invalid_row(
     assert result["r3_routing_valid"].tolist() == (
         [False, True] if missing_first else [True, False]
     )
-    assert result["routed_experts"].shape == (2, 4, 2, 2)
+    assert result["routed_experts"].shape == (6 if empty_output else 7, 2, 2)
     torch.testing.assert_close(
-        result["routed_experts"][valid_idx], valid_routes[0], rtol=0, atol=0
+        _routing_rows(result, valid_idx), valid_routes, rtol=0, atol=0
     )
     torch.testing.assert_close(
-        result["routed_experts"][missing_idx],
-        torch.zeros_like(result["routed_experts"][missing_idx]),
+        _routing_rows(result, missing_idx),
+        torch.zeros_like(_routing_rows(result, missing_idx)),
         rtol=0,
         atol=0,
     )
@@ -266,14 +318,14 @@ def test_concat_missing_parent_or_child_routes_marks_trajectory_invalid(missing_
 
     result = child.to_tensor_dict()
 
-    assert result["routed_experts"].shape == (1, 6, 2, 2)
+    assert result["routed_experts"].shape == (6, 2, 2)
     assert result["r3_routing_valid"].tolist() == [False]
     expected = torch.zeros((6, 2, 2), dtype=torch.int32)
     if missing_parent:
         expected[2:] = 2
     else:
         expected[:2] = 1
-    torch.testing.assert_close(result["routed_experts"][0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(_routing_rows(result), expected, rtol=0, atol=0)
 
 
 def test_interaction_missing_routes_without_r3_config_preserves_plain_export():
@@ -311,8 +363,8 @@ def test_serialization_configures_r3_for_cached_missing_route_leaf():
 
     assert result["r3_routing_valid"].tolist() == [True, False]
     torch.testing.assert_close(
-        result["routed_experts"][1],
-        torch.zeros_like(result["routed_experts"][1]),
+        _routing_rows(result, 1),
+        torch.zeros_like(_routing_rows(result, 1)),
         rtol=0,
         atol=0,
     )

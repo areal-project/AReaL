@@ -12,6 +12,7 @@ from openai.types.responses.response import Response
 from openai.types.responses.response_input_param import ResponseInputParam
 
 from areal.api import ModelResponse
+from areal.engine.r3.packed import normalize_legacy_routing_cache
 from areal.engine.r3.preprocess import preprocess_routed_experts_batch
 from areal.utils.data import RolloutGroup, concat_padded_tensors, get_batch_size
 
@@ -159,6 +160,7 @@ class InteractionWithTokenLogpReward:
 
     def to_tensor_dict(self) -> dict[str, Any]:
         if self._cache is not None:
+            self._cache = normalize_legacy_routing_cache(self._cache)
             return self._cache
         resp = self.model_response
         assert resp is not None, "Model response is not set."
@@ -231,17 +233,20 @@ class InteractionWithTokenLogpReward:
                     parent_routed = parent_res.get("routed_experts")
                     parent_valid = parent_res.get("r3_routing_valid")
                     if parent_routed is not None and parent_valid is not None:
-                        current_routed = current_r3["routed_experts"].squeeze(0)
+                        current_routed = current_r3["routed_experts"]
+                        if parent_routed.ndim == 4:
+                            # Accept cached trajectories from the legacy wire format.
+                            parent_routed = parent_routed[0]
                         routed_experts = torch.cat(
                             [
                                 # The parent's final sampled token was not
                                 # forwarded there. Use its captured child route
                                 # while preserving earlier historical routes.
-                                parent_routed.squeeze(0)[:-1],
+                                parent_routed[:-1],
                                 current_routed[parent_len - 1 :],
                             ],
                             dim=0,
-                        ).unsqueeze(0)
+                        )
                         r3_routing_valid = (
                             parent_valid.bool() & current_r3["r3_routing_valid"].bool()
                         )
@@ -282,6 +287,7 @@ class InteractionWithTokenLogpReward:
         if routed_experts is not None and r3_routing_valid is not None:
             result["routed_experts"] = routed_experts
             result["r3_routing_valid"] = r3_routing_valid
+            result["r3_cu_seqlens"] = torch.tensor([0, len(seq)], dtype=torch.long)
         if self.mm_token_type_ids is not None or self.multi_modal_input is not None:
             mm_token_type_ids = self.mm_token_type_ids or [0] * resp.input_len
             if len(mm_token_type_ids) != resp.input_len:
@@ -324,6 +330,7 @@ class InteractionWithTokenLogpReward:
             seq_lens=[seq_len],
             num_moe_layers=self.r3_num_moe_layers,
             topk=self.r3_topk,
+            packed=True,
         )
 
 

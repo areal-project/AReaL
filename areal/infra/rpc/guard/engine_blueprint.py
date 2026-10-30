@@ -513,8 +513,18 @@ def call_engine_method():
             (raw_args, raw_kwargs),
             preserve_tensor_aliases=preserve_input_tensor_aliases,
         )
+        if preserve_input_tensor_aliases and getattr(
+            engine, "r3_pipeline_stages", None
+        ):
+            from areal.engine.r3.transport import evict_routing_fetches
+
+            evict_routing_fetches((raw_args, raw_kwargs))
+            # Localized args own the tensors now; the serialized RTensor
+            # objects must not retain the global routing during training.
+            raw_args = raw_kwargs = None
 
         def execute_in_engine_thread():
+            nonlocal args, kwargs
             try:
                 args_bcast = args
                 kwargs_bcast = kwargs
@@ -524,28 +534,44 @@ def call_engine_method():
                 if should_broadcast:
                     logger.debug(f"Broadcasting RPC payload for method: {method_name}")
                     bcast_group, bcast_device = resolve_broadcast_target(
-                        engine, current_platform.current_device(), method_name
+                        engine, None, method_name
                     )
+                    if bcast_device is None:
+                        bcast_device = current_platform.current_device()
                     # Model capability is identical on every rank; inspecting
                     # the local payload would disagree on non-source ranks.
                     preserve_broadcast_aliases = (
                         preserve_input_tensor_aliases
                         and getattr(engine, "is_vision_model", False)
                     )
-                    args_bcast = tensor_container_to(args, bcast_device)
-                    args_bcast = broadcast_tensor_container(
-                        args_bcast,
-                        src_rank=engine.current_data_parallel_head(),
-                        group=bcast_group,
-                        preserve_tensor_aliases=preserve_broadcast_aliases,
-                    )
-                    kwargs_bcast = tensor_container_to(kwargs, bcast_device)
-                    kwargs_bcast = broadcast_tensor_container(
-                        kwargs_bcast,
-                        src_rank=engine.current_data_parallel_head(),
-                        group=bcast_group,
-                        preserve_tensor_aliases=preserve_broadcast_aliases,
-                    )
+                    pipeline_stages = getattr(engine, "r3_pipeline_stages", None)
+                    if pipeline_stages and preserve_input_tensor_aliases:
+                        from areal.engine.r3.broadcast import broadcast_packed_routing
+
+                        args_bcast, kwargs_bcast = broadcast_packed_routing(
+                            (args, kwargs),
+                            src_rank=engine.current_data_parallel_head(),
+                            group=bcast_group,
+                            stages=pipeline_stages,
+                            preserve_tensor_aliases=preserve_broadcast_aliases,
+                            num_experts=engine._r3_num_moe_experts,
+                        )
+                        args = kwargs = None
+                    else:
+                        args_bcast = tensor_container_to(args, bcast_device)
+                        args_bcast = broadcast_tensor_container(
+                            args_bcast,
+                            src_rank=engine.current_data_parallel_head(),
+                            group=bcast_group,
+                            preserve_tensor_aliases=preserve_broadcast_aliases,
+                        )
+                        kwargs_bcast = tensor_container_to(kwargs, bcast_device)
+                        kwargs_bcast = broadcast_tensor_container(
+                            kwargs_bcast,
+                            src_rank=engine.current_data_parallel_head(),
+                            group=bcast_group,
+                            preserve_tensor_aliases=preserve_broadcast_aliases,
+                        )
                     logger.debug("Broadcasting RPC payload done.")
 
                 logger.debug(f"Calling engine '{engine_name}' method: {method_name}")

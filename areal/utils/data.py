@@ -18,6 +18,7 @@ from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api.cli_args import MicroBatchSpec, NormConfig
+from areal.engine.r3.packed import ROUTING_LAYERS_KEY, ROUTING_OFFSETS_KEY
 from areal.infra.platforms import current_platform
 from areal.utils import logging, seqpack
 from areal.utils.math import align
@@ -347,6 +348,23 @@ def concat_padded_tensors(
         if key in multimodal_keys:
             continue
         values = [td[key] for td in tensor_dicts]
+        if ROUTING_OFFSETS_KEY in tensor_dicts[0]:
+            if key == "routed_experts":
+                result[key] = torch.cat(values, dim=0)
+                continue
+            if key == ROUTING_OFFSETS_KEY:
+                offset = 0
+                pieces = [values[0].new_zeros(1)]
+                for value in values:
+                    pieces.append(value[1:] + offset)
+                    offset += int(value[-1])
+                result[key] = torch.cat(pieces)
+                continue
+            if key == ROUTING_LAYERS_KEY:
+                if any(not torch.equal(values[0], value) for value in values[1:]):
+                    raise ValueError("Cannot concatenate different R3 pipeline layers")
+                result[key] = values[0]
+                continue
         if isinstance(values[0], torch.Tensor):
             pv = 0.0 if key == "attention_mask" else pad_value
             result[key] = _pad_cat_dim0(values, pad_value=pv)
@@ -406,7 +424,24 @@ def split_and_unpad_tensor(
         return _unpad_splits(splits, traj_seqlens)
     if isinstance(result, dict):
         split_result = [{} for _ in range(n_trajs)]
+        routing_offsets = result.get(ROUTING_OFFSETS_KEY)
+        if routing_offsets is not None:
+            row = 0
+            for group, output in zip(traj_group_sizes, split_result, strict=True):
+                offsets = routing_offsets[row : row + group + 1]
+                start, end = int(offsets[0]), int(offsets[-1])
+                output["routed_experts"] = result["routed_experts"][start:end]
+                output[ROUTING_OFFSETS_KEY] = offsets - start
+                if ROUTING_LAYERS_KEY in result:
+                    output[ROUTING_LAYERS_KEY] = result[ROUTING_LAYERS_KEY]
+                row += group
         for key, value in result.items():
+            if routing_offsets is not None and key in (
+                "routed_experts",
+                ROUTING_OFFSETS_KEY,
+                ROUTING_LAYERS_KEY,
+            ):
+                continue
             if isinstance(value, torch.Tensor) and value.shape[0] == total:
                 splits = _unpad_splits(
                     list(value.split(traj_group_sizes, dim=0)),
@@ -2583,7 +2618,27 @@ def make_dummy_eval_item(
         group_size = attention_mask.shape[0]
 
     dummy: dict[str, Any] = {}
+    if ROUTING_OFFSETS_KEY in template:
+        routes = template["routed_experts"]
+        device = torch.device("cpu") if isinstance(routes, RTensor) else routes.device
+        dummy["routed_experts"] = torch.zeros(
+            (group_size if active_attention else 0, *routes.shape[1:]),
+            dtype=routes.dtype,
+            device=device,
+        )
+        dummy[ROUTING_OFFSETS_KEY] = (
+            torch.arange(group_size + 1, device=device)
+            if active_attention
+            else torch.zeros(group_size + 1, dtype=torch.long, device=device)
+        )
+        dummy["r3_routing_valid"] = torch.zeros(
+            group_size, dtype=torch.bool, device=device
+        )
+        if ROUTING_LAYERS_KEY in template:
+            dummy[ROUTING_LAYERS_KEY] = template[ROUTING_LAYERS_KEY]
     for key, value in template.items():
+        if key in dummy:
+            continue
         if key in {"attention_mask", "loss_mask"}:
             if isinstance(value, (torch.Tensor, RTensor)):
                 fill_value = int(active_attention and key == "attention_mask")

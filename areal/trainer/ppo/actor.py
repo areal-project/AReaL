@@ -10,10 +10,16 @@ import torch
 from areal.api import TrainEngine
 from areal.api.cli_args import MOPDLossConfig, PPOActorConfig, RejectionSamplingConfig
 from areal.engine.core import stage_batch_for_engine
+from areal.engine.r3.packed import (
+    ROUTING_LAYERS_KEY,
+    ROUTING_OFFSETS_KEY,
+    PackedRouting,
+)
 from areal.engine.r3.transport import (
     clear_engine_r3_side_channel,
     localize_r3_tensor,
     pop_r3_tensors,
+    restore_r3_tensors,
     set_engine_r3_side_channel,
 )
 from areal.infra import TrainController
@@ -267,10 +273,7 @@ class PPOActor:
                 )
                 return logp
         finally:
-            if routed_experts is not None:
-                data["routed_experts"] = routed_experts
-            if routing_valid is not None:
-                data["r3_routing_valid"] = routing_valid
+            restore_r3_tensors(data, routed_experts, routing_valid)
 
     def _log_r3_rollout_train_logp_stats(
         self,
@@ -665,7 +668,9 @@ class PPOActor:
             indices = row_indices[:, 0]
             r3_mbs.append(
                 (
-                    routed_experts[indices.to(routed_experts.device)],
+                    routed_experts.select_rows(indices)
+                    if isinstance(routed_experts, PackedRouting)
+                    else routed_experts[indices.to(routed_experts.device)],
                     routing_valid[indices.to(routing_valid.device)],
                 )
             )
@@ -723,8 +728,21 @@ class PPOActorController(TrainController):
             )
 
         data = args[0]
+        # Neither vision nor actor routing participates in GAE. Preserve the
+        # original remote references instead of fetching/broadcasting them and
+        # returning another copy before the PPO update.
+        held_keys = {
+            "routed_experts",
+            "r3_routing_valid",
+            ROUTING_OFFSETS_KEY,
+            ROUTING_LAYERS_KEY,
+        }
         multi_modal_payloads = [
-            {key: value for key, value in item.items() if is_multi_modal_key(key)}
+            {
+                key: value
+                for key, value in item.items()
+                if is_multi_modal_key(key) or key in held_keys
+            }
             for item in data
         ]
         if not any(multi_modal_payloads):
@@ -736,7 +754,11 @@ class PPOActorController(TrainController):
         # RTensor references on the controller so the grouped image shards do
         # not make an unnecessary worker round trip before ppo_update.
         rpc_data = [
-            {key: value for key, value in item.items() if not is_multi_modal_key(key)}
+            {
+                key: value
+                for key, value in item.items()
+                if not is_multi_modal_key(key) and key not in held_keys
+            }
             for item in data
         ]
         results = self._custom_function_call(

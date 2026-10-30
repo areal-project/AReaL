@@ -1208,9 +1208,21 @@ def awex_run_scheduler_process(*args, **kwargs):
 
     Memory management (pause/resume weights, KV cache, CUDA graphs) is handled
     at runtime by AWEX's release_memory/resume_memory, matching HybridEngine.
-    No init-time memory patching needed.
+    No init-time weight-memory patching is needed.
     """
     import os
+
+    server_args = kwargs.get("server_args", args[0] if args else None)
+    if getattr(server_args, "enable_return_routed_experts", False):
+        from areal.v2.inference_service.sglang.routed_experts_compat import (
+            apply_sglang_routed_experts_token_cache_patch,
+            normalize_routed_experts_server_args,
+        )
+
+        # The AWEX entry bypasses the standard AReaL scheduler entry. Apply
+        # the same token-sized cache fix before constructing the scheduler.
+        normalize_routed_experts_server_args(server_args)
+        apply_sglang_routed_experts_token_cache_patch()
 
     meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
     logger.info(
@@ -1253,6 +1265,11 @@ if __name__ == "__main__":
 
     _load_sglang_plugins_if_available()
     server_args = prepare_server_args(sys.argv[1:])
+    from areal.v2.inference_service.sglang.routed_experts_compat import (
+        normalize_routed_experts_server_args,
+    )
+
+    normalize_routed_experts_server_args(server_args)
     # In AWEX colocated mode the scheduler may not be able to serve requests
     # until the first weight sync (actor holds GPUs / writer version not yet
     # published). SGLang's warmup request would then hang for 600s

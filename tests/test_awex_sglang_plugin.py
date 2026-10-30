@@ -36,6 +36,46 @@ def test_load_sglang_plugins_accepts_runtime_without_registry(monkeypatch):
     assert _load_sglang_plugins_if_available() is False
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("keyword_args", [True, False])
+def test_awex_scheduler_entry_applies_token_cache_fix_before_model_init(
+    monkeypatch, enabled, keyword_args
+):
+    import sys
+
+    import areal.engine.awex.plugins.sglang_plugin as plugin_module
+    from areal.v2.inference_service.sglang import routed_experts_compat as compat
+
+    server_args = SimpleNamespace(
+        enable_return_routed_experts=enabled, disable_piecewise_cuda_graph=False
+    )
+    calls = []
+    monkeypatch.delenv("AWEX_META_SERVER_ADDR", raising=False)
+    monkeypatch.setattr(
+        compat,
+        "apply_sglang_routed_experts_token_cache_patch",
+        lambda: calls.append("patch"),
+    )
+
+    def run(*args, **kwargs):
+        assert calls == (["patch"] if enabled else [])
+        assert server_args.disable_piecewise_cuda_graph is enabled
+        assert (kwargs["server_args"] if keyword_args else args[0]) is server_args
+        return "scheduler-result"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.scheduler",
+        SimpleNamespace(run_scheduler_process=run),
+    )
+    result = (
+        plugin_module.awex_run_scheduler_process(server_args=server_args)
+        if keyword_args
+        else plugin_module.awex_run_scheduler_process(server_args)
+    )
+    assert result == "scheduler-result"
+
+
 def test_event_loop_patch_supports_current_metrics_api():
     class Scheduler:
         def __init__(self):

@@ -11,6 +11,7 @@ from areal.engine.megatron_utils.packed_context_parallel import (
     split_packed_seqs_for_context_parallel,
 )
 from areal.engine.r3.asserts import r3_error
+from areal.engine.r3.packed import PackedRouting
 
 
 @dataclass(frozen=True)
@@ -138,7 +139,7 @@ def _scatter_to_sequence_parallel_region(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def prepare_native_replay_slabs(
-    routed_experts: torch.Tensor,
+    routed_experts: torch.Tensor | PackedRouting,
     routing_valid: torch.Tensor,
     mb_input: Any,
     local_moe_indices: list[int] | tuple[int, ...],
@@ -147,13 +148,21 @@ def prepare_native_replay_slabs(
 ) -> NativeReplaySlabs:
     """Build per-local-router native replay slabs for a Megatron micro-batch.
 
-    ``routed_experts`` is the workflow tensor slice for the current micro-batch
-    with shape ``[B, S, global_moe_layers, topk]``. The output list is ordered to
-    match the local ``TopKRouter`` traversal order on the current PP/VPP stage.
+    ``routed_experts`` is a packed CPU view with row/layer metadata, or a legacy
+    ``[B, S, global_moe_layers, topk]`` tensor. The output list follows the local
+    ``TopKRouter`` traversal order on the current PP/VPP stage.
     """
 
     if not local_moe_indices:
         return NativeReplaySlabs(slabs=[], skip_replay=False)
+    if isinstance(routed_experts, PackedRouting):
+        return _prepare_packed_replay_slabs(
+            routed_experts,
+            routing_valid,
+            mb_input,
+            local_moe_indices,
+            sequence_parallel=sequence_parallel,
+        )
     num_moe_layers = routed_experts.shape[2] if routed_experts.ndim >= 3 else None
     invalid_indices = [
         idx
@@ -214,3 +223,79 @@ def prepare_native_replay_slabs(
                 slab_dtype=str(slab.dtype),
             )
     return NativeReplaySlabs(slabs=slabs, skip_replay=False)
+
+
+def _prepare_packed_replay_slabs(
+    routes: PackedRouting,
+    valid: torch.Tensor,
+    mb_input: Any,
+    layers: list[int] | tuple[int, ...],
+    *,
+    sequence_parallel: bool,
+) -> NativeReplaySlabs:
+    """Gather only this rank's CP/SP tokens, without a full padded routing copy."""
+    from megatron.core import parallel_state as mpu
+
+    if valid.shape != torch.Size([len(routes)]):
+        raise r3_error("R3 routing validity does not match packed rows")
+    if not bool(valid.all()):
+        return NativeReplaySlabs([], True, "invalid_sample")
+    old_cu = mb_input.old_cu_seqlens
+    if old_cu is None:
+        old_cu = mb_input.orig_mb["cu_seqlens"]
+    old = old_cu.tolist()
+    padded = mb_input.padded_mb["cu_seqlens"].tolist()
+    if len(old) != len(routes) + 1 or len(padded) < len(old):
+        raise r3_error("Packed routing rows do not match microbatch cu_seqlens")
+    if not len(routes):
+        return NativeReplaySlabs([], True, "empty_sequence")
+    cp_size = mpu.get_context_parallel_world_size()
+    cp_rank = mpu.get_context_parallel_rank() if cp_size > 1 else 0
+    token_indices = []
+    for segment, (start, end) in enumerate(zip(padded[:-1], padded[1:])):
+        row_index = min(segment, len(routes) - 1)
+        source_row = int(routes.row_indices[row_index])
+        real_len = old[row_index + 1] - old[row_index]
+        if source_row < 0 or real_len == 0:
+            return NativeReplaySlabs([], True, "empty_sequence")
+        source_start, source_end = routes.cu_seqlens[
+            source_row : source_row + 2
+        ].tolist()
+        if source_end - source_start != real_len:
+            raise r3_error(
+                "Packed routing token length does not match microbatch sequence"
+            )
+        size = end - start
+        if size < 0 or (segment < len(routes) and size < real_len):
+            raise r3_error("Invalid R3 padded sequence length")
+        if cp_size > 1:
+            if size % (2 * cp_size):
+                raise r3_error("R3 padded length is not divisible by CP chunks")
+            chunk = size // (2 * cp_size)
+            positions = torch.cat(
+                [
+                    torch.arange(cp_rank * chunk, (cp_rank + 1) * chunk),
+                    torch.arange(size - (cp_rank + 1) * chunk, size - cp_rank * chunk),
+                ]
+            )
+        else:
+            positions = torch.arange(size)
+        if segment >= len(routes):
+            positions.fill_(real_len - 1)
+        token_indices.append(positions.clamp_max(real_len - 1) + source_start)
+    indices = torch.cat(token_indices)
+    if sequence_parallel:
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        if indices.numel() % tp_size:
+            raise r3_error("R3 local token count is not divisible by SP size")
+        if tp_size > 1:
+            indices = indices.chunk(tp_size)[mpu.get_tensor_model_parallel_rank()]
+    try:
+        local_layers = [routes.layer_indices.index(layer) for layer in layers]
+    except ValueError as exc:
+        raise r3_error("R3 local MoE layer is absent from packed routing") from exc
+    slabs = [
+        routes.values[:, layer].index_select(0, indices).long().contiguous()
+        for layer in local_layers
+    ]
+    return NativeReplaySlabs(slabs, False)

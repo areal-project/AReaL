@@ -9,6 +9,7 @@ import pybase64
 import torch
 
 from areal.engine.r3.asserts import r3_error
+from areal.engine.r3.packed import ROUTING_OFFSETS_KEY
 
 
 def decode_sglang_routed_experts(
@@ -130,8 +131,12 @@ def _preprocess_one(
     seq_len: int,
     num_moe_layers: int,
     topk: int,
+    out: np.ndarray | None = None,
 ) -> tuple[np.ndarray, bool]:
-    out = np.zeros((seq_len, num_moe_layers, topk), dtype=np.int32)
+    if out is None:
+        out = np.zeros((seq_len, num_moe_layers, topk), dtype=np.int32)
+    else:
+        out.fill(0)
     if routed_experts is None:
         return out, False
 
@@ -185,6 +190,7 @@ def preprocess_routed_experts_batch(
     topk: int,
     max_seq_len: int | None = None,
     device: torch.device | str | None = None,
+    packed: bool = False,
 ) -> dict[str, torch.Tensor]:
     if len(routed_experts) != len(seq_lens):
         raise r3_error(
@@ -194,6 +200,39 @@ def preprocess_routed_experts_batch(
         )
     if max_seq_len is None:
         max_seq_len = max(seq_lens, default=0)
+
+    if packed:
+        # Keep the legacy padded format available to callers, but workflows
+        # transport actual tokens only. Never allocate B * max(sequence_len).
+        lengths = [int(length) for length in seq_lens]
+        if any(length < 0 or length > max_seq_len for length in lengths):
+            raise r3_error("seq_len exceeds max_seq_len or is negative")
+        offsets = torch.tensor([0, *lengths], dtype=torch.long).cumsum(0)
+        maximum = 0
+        for routing in routed_experts:
+            if routing is not None and routing.size:
+                if np.min(routing) < 0:
+                    raise r3_error("Expert IDs must be nonnegative")
+                maximum = max(maximum, int(np.max(routing)))
+        if maximum > np.iinfo(np.int32).max:
+            raise r3_error("Expert ID exceeds int32 capacity")
+        dtype = np.int16 if maximum <= np.iinfo(np.int16).max else np.int32
+        values = np.empty((sum(lengths), num_moe_layers, topk), dtype=dtype)
+        valid = []
+        for idx, (routing, length) in enumerate(zip(routed_experts, lengths)):
+            _, sample_valid = _preprocess_one(
+                routing,
+                seq_len=length,
+                num_moe_layers=num_moe_layers,
+                topk=topk,
+                out=values[int(offsets[idx]) : int(offsets[idx + 1])],
+            )
+            valid.append(sample_valid)
+        return {
+            "routed_experts": torch.from_numpy(values).to(device=device),
+            ROUTING_OFFSETS_KEY: offsets.to(device=device),
+            "r3_routing_valid": torch.tensor(valid, dtype=torch.bool, device=device),
+        }
 
     batch = np.zeros(
         (len(routed_experts), max_seq_len, num_moe_layers, topk),
