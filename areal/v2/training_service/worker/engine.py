@@ -254,11 +254,60 @@ def create_engine_module(
     _register_compute_route("/forward_batch", "forward_batch")
     _register_compute_route("/eval_batch", "eval_batch")
     _register_engine_route("/create_process_group", "create_process_group")
-    _register_engine_route("/initialize", "initialize")
+
+    @bp.route("/initialize", methods=["POST"])
+    def initialize():
+        args, kwargs = parse_args_kwargs(request.get_json(silent=True) or {})
+        worker_seed = kwargs.pop("worker_seed", None)
+
+        def action():
+            engine = require_engine()
+            if worker_seed is not None:
+                from areal.utils.seeding import set_random_seed
+
+                set_random_seed(
+                    worker_seed, key=f"native-actor-rank-{os.environ.get('RANK', '0')}"
+                )
+            return engine.initialize(*args, **kwargs)
+
+        return run_endpoint(
+            "initialize", lambda: submit_to_engine_thread("initialize", action)
+        )
+
     _register_engine_route("/set_version", "set_version")
     _register_engine_route("/get_version", "get_version", methods=["GET"])
     _register_engine_route("/save", "save")
     _register_engine_route("/load", "load")
+
+    def register_full_checkpoint(operation: str) -> None:
+        from areal.v2.training_service import checkpoint
+
+        function = getattr(checkpoint, f"{operation}_full_checkpoint")
+
+        def handler():
+            args, kwargs = parse_args_kwargs(request.get_json(silent=True) or {})
+            if args:
+                return jsonify(
+                    {"error": "Full checkpoint arguments must be named"}
+                ), 400
+            return run_endpoint(
+                f"checkpoint/{operation}",
+                lambda: submit_to_engine_thread(
+                    f"checkpoint/{operation}",
+                    lambda: function(require_engine(), **kwargs),
+                ),
+            )
+
+        bp.add_url_rule(
+            f"/checkpoint/{operation}",
+            f"full_checkpoint_{operation}",
+            handler,
+            methods=["POST"],
+        )
+
+    for operation in ("inspect", "save", "load"):
+        register_full_checkpoint(operation)
+
     _register_engine_route("/offload", "offload")
     _register_engine_route("/onload", "onload")
     _register_engine_route("/optimizer_zero_grad", "optimizer_zero_grad")

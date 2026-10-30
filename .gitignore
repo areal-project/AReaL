@@ -209,3 +209,7 @@ wandb/
 outputs/
 sympy/
 !/docs/figures/*
+
+# Local elastic demo evidence and private provider configuration
+artifacts/
+openrouter.json

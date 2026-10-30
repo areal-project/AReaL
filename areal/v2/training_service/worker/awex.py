@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from areal.utils import logging
+from areal.v2.weight_update.awex.lifecycle import WeightUpdateLifecycle
 
 if TYPE_CHECKING:
     from flask import Blueprint
@@ -29,6 +30,7 @@ def create_awex_blueprint(
     bp = flask_module.Blueprint("awex", __name__, url_prefix="/awex")
 
     _state: dict[str, Any] = {"adapter": None}
+    lifecycle = WeightUpdateLifecycle()
 
     def _require_adapter():
         if _state["adapter"] is None:
@@ -62,8 +64,11 @@ def create_awex_blueprint(
         data = flask_module.request.get_json(force=True)
 
         def action():
-            adapter = _require_adapter()
-            adapter.init_weight_update_group(**data)
+            fenced = data.pop("fenced", False)
+            if lifecycle.begin(data["pair_name"], fenced=fenced):
+                adapter = _require_adapter()
+                adapter.init_weight_update_group(**data)
+                lifecycle.connected()
 
         return run_endpoint(
             "init_weights_update_group",
@@ -76,6 +81,7 @@ def create_awex_blueprint(
         version = data.get("version", 0)
 
         def action():
+            lifecycle.require(data.get("pair_name"))
             adapter = _require_adapter()
             adapter.execute_weight_update(version)
 
@@ -89,6 +95,7 @@ def create_awex_blueprint(
         data = flask_module.request.get_json(force=True)
 
         def action():
+            lifecycle.require(data.pop("pair_name", None))
             adapter = _require_adapter()
             adapter.batch_isend_irecv(**data)
 
@@ -99,13 +106,15 @@ def create_awex_blueprint(
 
     @bp.route("/teardown", methods=["POST"])
     def teardown():
-        adapter = _state.get("adapter")
-        if adapter is None:
-            return flask_module.jsonify({"status": "success"})
+        data = flask_module.request.get_json(silent=True) or {}
 
         def action():
-            adapter.teardown_weight_update_group()
-            _state["adapter"] = None
+            if lifecycle.begin_teardown(data.get("pair_name")):
+                adapter = _state.get("adapter")
+                if adapter is not None:
+                    adapter.teardown_weight_update_group()
+                _state["adapter"] = None
+                lifecycle.closed()
 
         return run_endpoint(
             "awex_teardown",
@@ -118,8 +127,11 @@ def create_awex_blueprint(
         data = flask_module.request.get_json(force=True)
 
         def action():
-            adapter = _require_adapter()
-            adapter.init_colocate_weight_update(**data)
+            fenced = data.pop("fenced", False)
+            if lifecycle.begin(data["pair_name"], fenced=fenced):
+                adapter = _require_adapter()
+                adapter.init_colocate_weight_update(**data)
+                lifecycle.connected()
 
         return run_endpoint(
             "init_colocate_weight_update",
@@ -133,6 +145,7 @@ def create_awex_blueprint(
         version = data.get("version", 0)
 
         def action():
+            lifecycle.require(data.get("pair_name"))
             adapter = _require_adapter()
             adapter.execute_colocate_weight_update(version)
 
@@ -148,6 +161,7 @@ def create_awex_blueprint(
         tags = data.get("tags")
 
         def action():
+            lifecycle.require(data.get("pair_name"))
             adapter = _require_adapter()
             adapter.release_memory(tags)
 
@@ -163,6 +177,7 @@ def create_awex_blueprint(
         tags = data.get("tags")
 
         def action():
+            lifecycle.require(data.get("pair_name"))
             adapter = _require_adapter()
             adapter.resume_memory(tags)
 

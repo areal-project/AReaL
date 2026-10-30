@@ -14,6 +14,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger("AwexInferenceEndpoints")
 
 
+def _pair_identity(data: dict) -> dict:
+    return {"pair_name": data["pair_name"]} if "pair_name" in data else {}
+
+
 def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
     """Register ``/awex/*`` weight-update endpoints on the SGLang FastAPI app.
 
@@ -55,12 +59,24 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
             logger.error("Failed to init weights update group: %s", e)
             return JSONResponse(status_code=500, content={"error": str(e)})
 
+    @app.post("/awex/teardown")
+    async def teardown(request: Request) -> JSONResponse:
+        try:
+            data = await request.json() if await request.body() else {}
+            rpc_proxy.collective_rpc("awex_teardown", **_pair_identity(data))
+            return JSONResponse(content={"status": "ok"})
+        except Exception as e:
+            logger.error("Failed to tear down weight update group: %s", e)
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
     @app.post("/awex/update_weights")
     async def update_weights(request: Request) -> JSONResponse:
         try:
             data = await request.json()
             version = data.get("version", 0)
-            rpc_proxy.collective_rpc("awex_execute_weight_update", version=version)
+            rpc_proxy.collective_rpc(
+                "awex_execute_weight_update", version=version, **_pair_identity(data)
+            )
             return JSONResponse(content={"status": "ok", "version": version})
         except Exception as e:
             logger.error("Failed to update weights: %s", e)
@@ -111,7 +127,9 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
             data = await request.json()
             version = data.get("version", 0)
             rpc_proxy.collective_rpc(
-                "awex_execute_colocate_weight_update", version=version
+                "awex_execute_colocate_weight_update",
+                version=version,
+                **_pair_identity(data),
             )
             return JSONResponse(content={"status": "ok", "version": version})
         except Exception as e:
@@ -123,7 +141,9 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
         try:
             data = await request.json()
             tags = data.get("tags")
-            rpc_proxy.collective_rpc("awex_release_memory", tags=tags)
+            rpc_proxy.collective_rpc(
+                "awex_release_memory", tags=tags, **_pair_identity(data)
+            )
             return JSONResponse(content={"status": "ok"})
         except Exception as e:
             logger.error("Failed to release memory: %s", e)
@@ -134,7 +154,9 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
         try:
             data = await request.json()
             tags = data.get("tags")
-            rpc_proxy.collective_rpc("awex_resume_memory", tags=tags)
+            rpc_proxy.collective_rpc(
+                "awex_resume_memory", tags=tags, **_pair_identity(data)
+            )
             return JSONResponse(content={"status": "ok"})
         except Exception as e:
             logger.error("Failed to resume memory: %s", e)

@@ -25,6 +25,14 @@ class PairRegistry:
         with self._lock:
             return self._by_name.get(pair_name)
 
+    def finish_connect(self, pair_info: PairInfo) -> None:
+        """Commit only a previously reserved connection after all peers are ready."""
+        with self._lock:
+            current = self._by_name.get(pair_info.pair_name)
+            if current is None or current.state != "connecting":
+                raise RuntimeError("Connection has no matching reservation")
+            self._by_name[pair_info.pair_name] = pair_info
+
     def unregister(self, pair_name: str) -> PairInfo | None:
         with self._lock:
             pair_info = self._by_name.pop(pair_name, None)

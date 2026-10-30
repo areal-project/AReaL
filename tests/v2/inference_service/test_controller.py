@@ -508,6 +508,11 @@ class TestRolloutControllerV2Construction:
 
 
 class TestOnlineCallbackFlow:
+    @pytest.fixture(autouse=True)
+    def _use_loopback_for_callback_server(self, monkeypatch):
+        # These tests exercise local HTTP callbacks, not host route discovery.
+        monkeypatch.setattr("areal.utils.network.gethostip", lambda: "127.0.0.1")
+
     @pytest.mark.asyncio
     async def test_online_callback_without_waiter_buffers_export_request(self):
         cfg = InferenceEngineConfig(
@@ -901,6 +906,78 @@ class TestInferenceServiceWorkflow:
             call(reward=2.0),
             call(reward=3.0),
         ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancel_member", [False, True])
+    async def test_offline_group_cancellation_waits_for_all_member_cleanup(
+        self, cancel_member
+    ):
+        started = asyncio.Event()
+        cancelling = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        member_tasks = []
+        cleaned = set()
+
+        class MockAgent:
+            async def run(self, data, **kwargs):
+                member = int(kwargs["api_key"])
+                member_tasks.append(asyncio.current_task())
+                if len(member_tasks) == 4:
+                    started.set()
+                try:
+                    await started.wait()
+                    if cancel_member and member == 3:
+                        raise asyncio.CancelledError
+                    await asyncio.Event().wait()
+                finally:
+                    if member == 0:
+                        cancelling.set()
+                        # Like sandbox cleanup and report writing, this must
+                        # finish before the runner may close its event loop.
+                        await allow_cleanup.wait()
+                    cleaned.add(member)
+
+        controller = MagicMock()
+        workflow = InferenceServiceWorkflow(
+            controller=controller,
+            agent=MockAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            group_size=4,
+        )
+        workflow._start_session = AsyncMock(
+            return_value=("group", [(f"session-{i}", str(i)) for i in range(4)])
+        )
+        workflow._set_last_reward = AsyncMock()
+        workflow._export_interactions = AsyncMock()
+        with patch(
+            "areal.v2.inference_service.controller.workflow.workflow_context"
+        ) as context:
+            context.get.return_value = MagicMock(task_id=42)
+            context.get_httpx_client = AsyncMock(return_value=MagicMock())
+            group = asyncio.create_task(workflow._run_offline(AsyncMock(), {}))
+            try:
+                await asyncio.wait_for(started.wait(), timeout=1)
+                if not cancel_member:
+                    group.cancel()
+                await asyncio.wait_for(cancelling.wait(), timeout=1)
+                # A second cancellation must not interrupt member cleanup.
+                group.cancel()
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                assert not group.done()
+                assert 0 not in cleaned
+                allow_cleanup.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(group, timeout=1)
+                assert cleaned == {0, 1, 2, 3}
+                workflow._set_last_reward.assert_not_awaited()
+                workflow._export_interactions.assert_not_awaited()
+            finally:
+                allow_cleanup.set()
+                if not group.done():
+                    group.cancel()
+                await asyncio.gather(group, *member_tasks, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_offline_group_serial_flag_preserves_within_group_order(self):

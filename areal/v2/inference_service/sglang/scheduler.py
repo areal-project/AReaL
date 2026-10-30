@@ -13,6 +13,7 @@ import zmq
 from sglang.srt.server_args import PortArgs, ServerArgs
 
 from areal.infra.rpc.serialization import serialize_value
+from areal.v2.weight_update.awex.lifecycle import WeightUpdateLifecycle
 
 RESULT_IPC_ENV = "AREAL_AWEX_RESULT_IPC"
 
@@ -34,6 +35,7 @@ class AwexSchedulerBridge:
     def __init__(self, scheduler: Any) -> None:
         self._scheduler = scheduler
         self._adapter: Any | None = None
+        self._weight_update_lifecycle = WeightUpdateLifecycle()
         self._result_push: zmq.Socket | None = None
 
         result_ipc = os.environ.get(RESULT_IPC_ENV)
@@ -58,6 +60,7 @@ class AwexSchedulerBridge:
             "awex_report_weight_meta",
             "awex_report_parallelism",
             "awex_init_weights_update_group",
+            "awex_teardown",
             "awex_execute_weight_update",
             "awex_batch_isend_irecv",
             "awex_get_parameters",
@@ -103,12 +106,26 @@ class AwexSchedulerBridge:
         self._push_result(self._require_adapter().parallelism_strategy)
 
     def awex_init_weights_update_group(self, **kwargs: Any) -> None:
-        self._require_adapter().init_weight_update_group(**kwargs)
+        fenced = kwargs.pop("fenced", False)
+        if self._weight_update_lifecycle.begin(kwargs["pair_name"], fenced=fenced):
+            self._require_adapter().init_weight_update_group(**kwargs)
+            self._weight_update_lifecycle.connected()
 
-    def awex_execute_weight_update(self, version: int = 0) -> None:
+    def awex_teardown(self, pair_name: str | None = None) -> None:
+        if self._weight_update_lifecycle.begin_teardown(pair_name):
+            if self._adapter is not None:
+                self._adapter.teardown_weight_update_group()
+            self._adapter = None
+            self._weight_update_lifecycle.closed()
+
+    def awex_execute_weight_update(
+        self, version: int = 0, pair_name: str | None = None
+    ) -> None:
+        self._weight_update_lifecycle.require(pair_name)
         self._require_adapter().execute_weight_update(version)
 
     def awex_batch_isend_irecv(self, **kwargs: Any) -> None:
+        self._weight_update_lifecycle.require(kwargs.pop("pair_name", None))
         self._require_adapter().batch_isend_irecv(**kwargs)
 
     def awex_get_parameters(
@@ -122,15 +139,27 @@ class AwexSchedulerBridge:
         self._require_adapter().randomize_parameters()
 
     def awex_init_colocate_weight_update(self, **kwargs: Any) -> None:
-        self._require_adapter().init_colocate_weight_update(**kwargs)
+        fenced = kwargs.pop("fenced", False)
+        if self._weight_update_lifecycle.begin(kwargs["pair_name"], fenced=fenced):
+            self._require_adapter().init_colocate_weight_update(**kwargs)
+            self._weight_update_lifecycle.connected()
 
-    def awex_execute_colocate_weight_update(self, version: int = 0) -> None:
+    def awex_execute_colocate_weight_update(
+        self, version: int = 0, pair_name: str | None = None
+    ) -> None:
+        self._weight_update_lifecycle.require(pair_name)
         self._require_adapter().execute_colocate_weight_update(version)
 
-    def awex_release_memory(self, tags: list[str] | None = None) -> None:
+    def awex_release_memory(
+        self, tags: list[str] | None = None, pair_name: str | None = None
+    ) -> None:
+        self._weight_update_lifecycle.require(pair_name)
         self._require_adapter().release_memory(tags)
 
-    def awex_resume_memory(self, tags: list[str] | None = None) -> None:
+    def awex_resume_memory(
+        self, tags: list[str] | None = None, pair_name: str | None = None
+    ) -> None:
+        self._weight_update_lifecycle.require(pair_name)
         self._require_adapter().resume_memory(tags)
 
 

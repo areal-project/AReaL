@@ -14,6 +14,24 @@ from areal.utils import logging
 logger = logging.getLogger("AwexHTTP")
 
 
+def teardown_weight_update_groups(adapter: Any) -> None:
+    """Attempt both groups, retaining only handles whose cleanup is uncertain."""
+    import torch.distributed as dist
+
+    failures = []
+    for name in ("_weights_update_group", "_weights_update_group_gloo"):
+        group = getattr(adapter, name, None)
+        try:
+            if group is not None and dist.is_initialized():
+                dist.destroy_process_group(group)
+        except Exception as error:
+            failures.append(error)
+        else:
+            setattr(adapter, name, None)
+    if failures:
+        raise ExceptionGroup("Weight update communication cleanup incomplete", failures)
+
+
 def awex_wu_use_group() -> bool:
     """Resolve whether ``batch_send_recv`` should use ``use_group=True``.
 

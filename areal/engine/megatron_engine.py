@@ -444,7 +444,28 @@ class MegatronEngine(TrainEngine):
             100.0 * trainable_params / max(total_params, 1),
         )
 
-    def initialize(self, addr: str | None, ft_spec: FinetuneSpec, *args, **kwargs):
+    def initialize(
+        self,
+        addr: str | None,
+        ft_spec: FinetuneSpec,
+        *args,
+        restore_from_full_checkpoint: bool = False,
+        **kwargs,
+    ):
+        # Internal elastic bootstrap: construct the optimizer normally, then let
+        # full DCP loading replace model, FP32 master parameters and moments.
+        # Cold startup and all ordinary callers continue to load HF weights.
+        if restore_from_full_checkpoint and (
+            self.config.use_lora
+            or self.config.dtype != "bfloat16"
+            or self.mcore_config.fp8_config is not None
+            or self.optimizer_config is None
+            or not self.mcore_config.ddp.use_distributed_optimizer
+            or not self.mcore_config.use_checkpoint_opt_param_scheduler
+        ):
+            raise ValueError(
+                "Deferred weights require full Megatron optimizer/scheduler recovery"
+            )
         try:
             self.seed = get_seed()
         except ValueError:
@@ -540,6 +561,10 @@ class MegatronEngine(TrainEngine):
             self.quantization_config = getattr(
                 self.hf_config, "quantization_config", None
             )
+            if restore_from_full_checkpoint and self.quantization_config:
+                raise ValueError(
+                    "Deferred weight loading currently requires an unquantized model"
+                )
 
             self._check_and_apply_fp8_config()
             self._validate_fp8_consistency()
@@ -585,8 +610,11 @@ class MegatronEngine(TrainEngine):
         if self.config.use_lora:
             self._apply_megatron_bridge_lora()
 
-        with self.device:
-            self._load_model_from_hf(self.config.path)
+        if restore_from_full_checkpoint:
+            self.logger.info("Elastic full restore: deferring HF weight loading to DCP")
+        else:
+            with self.device:
+                self._load_model_from_hf(self.config.path)
 
         # NOTE: Clear high_precision_init_val for FP8 parameters.
         #

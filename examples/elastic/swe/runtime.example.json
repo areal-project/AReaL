@@ -1,0 +1,10 @@
+{
+  "python": "/path/to/sandbox-sdk-venv/bin/python",
+  "pythonpath": "/path/to/AEnvironment/aenv/src:/path/to/AReaL-SWEAgent",
+  "system_url": "http://127.0.0.1",
+  "environment": "autopilot-swe-bash@0.1.0",
+  "transport_timeout": 1900,
+  "kubectl": "/path/to/kubectl",
+  "kubeconfig": "/path/to/private/kubeconfig",
+  "sandbox_namespace": "aenv-sandbox"
+}

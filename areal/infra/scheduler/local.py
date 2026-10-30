@@ -112,8 +112,16 @@ class LocalScheduler(Scheduler):
         nfs_record_root: str = "/tmp/areal/name_resolve",
         etcd3_addr: str = "localhost:2379",
         exp_config: BaseExperimentConfig | None = None,
+        worker_device_control_env_var: str | None = None,
     ):
         self.gpu_devices = gpu_devices or self._detect_gpus()
+        self.worker_device_control_env_var = worker_device_control_env_var
+        if worker_device_control_env_var is not None and (
+            worker_device_control_env_var != "CUDA_VISIBLE_DEVICES" or not gpu_devices
+        ):
+            raise ValueError(
+                "Explicit CUDA workers require a nonempty assigned GPU pool"
+            )
 
         # Resolve experiment/trial names (exp_config overwrites direct params)
         self.experiment_name = experiment_name
@@ -757,6 +765,13 @@ class LocalScheduler(Scheduler):
                 if scheduling.env_vars:
                     env.update(scheduling.env_vars)
 
+                if self.worker_device_control_env_var is not None:
+                    # A CPU coordinator must explicitly expose each worker's
+                    # assigned devices, after all user environment merges.
+                    env[self.worker_device_control_env_var] = ",".join(
+                        map(str, gpu_devices)
+                    )
+
                 log_file = self.log_dir / f"{role}.log"
                 merged_log = self.log_dir / "merged.log"
 
@@ -898,19 +913,23 @@ class LocalScheduler(Scheduler):
 
             self._workers[role] = workers
 
+            if self.exp_config is not None:
+                for worker_rank, worker_info in enumerate(workers):
+                    self._configure_worker(worker_info, worker_rank)
+
             logger.info(
                 f"Successfully created {len(workers)} workers for role '{role}'"
             )
 
         except Exception as e:
-            self._cleanup_workers(workers)
+            try:
+                self._cleanup_workers(workers)
+            finally:
+                if self._workers.get(role) is workers:
+                    del self._workers[role]
             if isinstance(e, SchedulerError):
                 raise
             raise WorkerCreationError(role, "Unexpected error", str(e)) from e
-
-        if self.exp_config is not None:
-            for worker_rank, worker_info in enumerate(workers):
-                self._configure_worker(worker_info, worker_rank)
 
         return worker_ids
 
@@ -1006,7 +1025,21 @@ class LocalScheduler(Scheduler):
             return False
 
     def _configure_worker(self, worker_info: WorkerInfo, worker_rank: int):
+        deadline = time.monotonic() + self.startup_timeout
         while not self._is_worker_ready(worker_info):
+            if (
+                worker_info.process is not None
+                and worker_info.process.poll() is not None
+            ):
+                raise WorkerFailedError(
+                    worker_info.worker.id,
+                    worker_info.process.returncode,
+                    self._read_log_tail(worker_info.log_file),
+                )
+            if time.monotonic() >= deadline:
+                raise WorkerConfigurationError(
+                    worker_info.worker.id, "Worker readiness timed out"
+                )
             time.sleep(0.1)
 
         worker_id = worker_info.worker.id

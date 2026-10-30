@@ -69,6 +69,7 @@ python3 train.py --config path/to/config.yaml actor.lr=1e-4 seed=42
 
 ### Others
 
+- [ActorLifecycle Configuration](section-actor-lifecycle)
 - [Agent Configuration](section-agent)
 - [ArchonEngine Configuration](section-archon-engine)
 - [ArchonFP8 Configuration](section-archon-fp8)
@@ -153,6 +154,7 @@ A dummy place holder of GRPO config for backward compatibility.
 | `eval_gconfig`       | [`GenerationHyperparameters`](section-generation-hyperparameters) \| None | `None`                      | Generation hyperparameters for evaluation. If None, use gconfig.                                                                                                                                                                                                    |
 | `rollout`            | [`InferenceEngineConfig`](section-inference-engine)                       | *InferenceEngineConfig*     | -                                                                                                                                                                                                                                                                   |
 | `actor`              | [`PPOActorConfig`](section-ppo-actor)                                     | *PPOActorConfig*            | -                                                                                                                                                                                                                                                                   |
+| `actor_lifecycle`    | [`ActorLifecycleConfig`](section-actor-lifecycle)                         | *ActorLifecycleConfig*      | -                                                                                                                                                                                                                                                                   |
 | `ref`                | [`PPOActorConfig`](section-ppo-actor) \| None                             | `None`                      | -                                                                                                                                                                                                                                                                   |
 | `critic`             | [`PPOCriticConfig`](section-ppo-critic) \| None                           | `None`                      | -                                                                                                                                                                                                                                                                   |
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`                      | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
@@ -192,6 +194,7 @@ Configuration for Proximal Policy Optimization (PPO) reinforcement learning expe
 | `eval_gconfig`       | [`GenerationHyperparameters`](section-generation-hyperparameters) \| None | `None`                      | Generation hyperparameters for evaluation. If None, use gconfig.                                                                                                                                                                                                    |
 | `rollout`            | [`InferenceEngineConfig`](section-inference-engine)                       | *InferenceEngineConfig*     | -                                                                                                                                                                                                                                                                   |
 | `actor`              | [`PPOActorConfig`](section-ppo-actor)                                     | *PPOActorConfig*            | -                                                                                                                                                                                                                                                                   |
+| `actor_lifecycle`    | [`ActorLifecycleConfig`](section-actor-lifecycle)                         | *ActorLifecycleConfig*      | -                                                                                                                                                                                                                                                                   |
 | `ref`                | [`PPOActorConfig`](section-ppo-actor) \| None                             | `None`                      | -                                                                                                                                                                                                                                                                   |
 | `critic`             | [`PPOCriticConfig`](section-ppo-critic) \| None                           | `None`                      | -                                                                                                                                                                                                                                                                   |
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`                      | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
@@ -897,6 +900,32 @@ Configuration for Weights & Biases experiment tracking.
 | `tags`           | list of string \| None | `None`       | -                                                                                                                          |
 | `config`         | `dict` \| None         | `None`       | -                                                                                                                          |
 | `id_suffix`      | string \| None         | `"train"`    | -                                                                                                                          |
+
+(section-actor-lifecycle)=
+
+## ActorLifecycle Configuration
+
+Opt-in native online Actor lifecycle on explicitly allocated local GPUs.
+
+The state root must be a local filesystem supporting SQLite WAL and flock. GPU pools are
+physical device indices within the task's allocation. The checkpoint estimate reserves
+space before another complete generation is written; it must cover model, optimizer and
+rank sidecars.
+
+| Parameter                     | Type           | Default      | Description                                                                                                                       |
+| ----------------------------- | -------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`                        | string         | `"resident"` | Actor lifecycle; on_demand requires native inline mode. **Choices:** `resident`, `on_demand`                                      |
+| `policy`                      | string         | `"manual"`   | On-demand lifecycle policy: manual tools, event-driven agent, or idle timeout. **Choices:** `manual`, `agent`, `idle`, `resident` |
+| `state_root`                  | string \| None | `None`       | -                                                                                                                                 |
+| `actor_devices`               | `tuple`        | `()`         | -                                                                                                                                 |
+| `rollout_devices`             | `tuple`        | `()`         | -                                                                                                                                 |
+| `idle_timeout`                | float          | `60.0`       | -                                                                                                                                 |
+| `min_ready_seconds`           | float          | `120.0`      | -                                                                                                                                 |
+| `poll_interval`               | float          | `0.2`        | -                                                                                                                                 |
+| `checkpoint_keep`             | integer        | `2`          | -                                                                                                                                 |
+| `checkpoint_estimated_bytes`  | integer        | `0`          | -                                                                                                                                 |
+| `checkpoint_free_space_floor` | integer        | `1073741824` | -                                                                                                                                 |
+| `max_recovery_attempts`       | integer        | `0`          | -                                                                                                                                 |
 
 (section-agent)=
 

@@ -8,7 +8,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -180,9 +179,8 @@ def kill_process_tree(
     skip_pid: int | None = None,
     graceful: bool = True,
 ) -> None:
-    # Remove sigchld handler to avoid spammy logs (only in main thread)
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    # Keep the caller's SIGCHLD handler: uvloop may own unrelated live
+    # subprocesses (e.g. inline SWE tools) while an Actor tree is released.
 
     # Handle None parent_pid - defaults to current process
     if parent_pid is None:

@@ -66,6 +66,8 @@ class PairInfo:
 
     # Colocated mode (training and inference share GPUs)
     colocate: bool = False
+    state: str = "connected"
+    has_published: bool = False
 
     def __post_init__(self):
         if not self.pair_name:

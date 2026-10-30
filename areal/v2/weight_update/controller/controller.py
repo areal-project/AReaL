@@ -26,6 +26,7 @@ class WeightUpdateController:
         self._gateway_url: str = ""
         self._gateway_proc: subprocess.Popen | None = None
         self._pair_name: str | None = None
+        self._pending_pair_name: str | None = None
         self._session: httpx.Client | None = None
 
     @property
@@ -117,7 +118,15 @@ class WeightUpdateController:
         nccl_master_addr: str = "",
         nccl_master_port: int = 0,
     ) -> None:
-        self._pair_name = pair_name
+        if not pair_name or not train_worker_urls or not inference_worker_urls:
+            raise ValueError("Pair name and both worker lists are required")
+        if mode not in ("awex", "disk"):
+            raise ValueError("Unknown weight update mode")
+        if self._pair_name is not None and self._pair_name != pair_name:
+            raise RuntimeError("Disconnect the current pair before connecting another")
+        if self._pending_pair_name is not None and self._pending_pair_name != pair_name:
+            raise RuntimeError("Previous connection outcome requires cleanup")
+        self._pending_pair_name = pair_name
         payload: dict[str, Any] = {
             "pair_name": pair_name,
             "train_worker_urls": train_worker_urls,
@@ -137,6 +146,8 @@ class WeightUpdateController:
             timeout=self.config.request_timeout,
         )
         resp.raise_for_status()
+        self._pair_name = pair_name
+        self._pending_pair_name = None
         logger.info(
             "Connected pair '%s' (mode=%s, colocate=%s, use_lora=%s)",
             pair_name,
@@ -162,19 +173,22 @@ class WeightUpdateController:
             error=data.get("error"),
         )
 
-    def disconnect(self) -> None:
-        if self._pair_name is None:
+    def disconnect(self, *, training_stopped: bool = False) -> None:
+        pair_name = self._pair_name or self._pending_pair_name
+        if pair_name is None:
             return
-        try:
-            resp = self._http.post(
-                f"{self._gateway_url}/disconnect",
-                json={"pair_name": self._pair_name},
-                timeout=self.config.request_timeout,
-            )
-            resp.raise_for_status()
-            logger.info("Disconnected pair '%s'", self._pair_name)
-        finally:
-            self._pair_name = None
+        payload: dict[str, Any] = {"pair_name": pair_name}
+        if training_stopped:
+            payload["training_stopped"] = True
+        resp = self._http.post(
+            f"{self._gateway_url}/disconnect",
+            json=payload,
+            timeout=self.config.request_timeout,
+        )
+        resp.raise_for_status()
+        logger.info("Disconnected pair '%s'", self._pair_name)
+        self._pair_name = None
+        self._pending_pair_name = None
 
     def _gateway_get(self, path: str) -> Any:
         resp = self._http.get(
@@ -199,11 +213,7 @@ class WeightUpdateController:
         return resp.json()
 
     def destroy(self) -> None:
-        if self._pair_name is not None:
-            try:
-                self.disconnect()
-            except Exception:
-                logger.warning("Failed to disconnect during destroy", exc_info=True)
+        self.disconnect()
 
         if self._session is not None:
             self._session.close()

@@ -115,6 +115,7 @@ class FrequencyControl:
             if self.frequency_steps is None and self.frequency_seconds is None:
                 return False
             if self.frequency_seconds is not None:
+                interval_seconds = self.__interval_seconds
                 if dist.is_initialized():
                     interval_seconds = torch.tensor(
                         self.__interval_seconds, device=current_platform.device_type

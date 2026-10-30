@@ -34,6 +34,7 @@ from areal.api.cli_args import (
     ValidDatasetConfig,
     vLLMConfig,
 )
+from areal.elastic.policy import validate_policy
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
 from areal.infra import (
     LocalScheduler,
@@ -109,16 +110,26 @@ class PPOTrainer:
         config: PPOConfig,
         train_dataset: Dataset | None = None,
         valid_dataset: Dataset | None = None,
+        *,
+        elastic_policy=None,
     ):
+        validate_policy(elastic_policy)
+        self._elastic_policy = elastic_policy
+        self._on_demand = None
+        self.actor = None
+        self.rollout = None
         try:
             self._init_impl(config, train_dataset, valid_dataset)
-        except Exception:
+        except BaseException:
             logger.error(
                 "PPOTrainer construction failed; tearing down partially "
                 "created workers",
                 exc_info=True,
             )
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                logger.error("Partial trainer cleanup failed", exc_info=True)
             raise
 
     def _init_impl(
@@ -133,13 +144,36 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        self._on_demand_mode = config.actor_lifecycle.mode == "on_demand"
+        if self._elastic_policy is not None and not self._on_demand_mode:
+            raise ValueError("elastic_policy requires actor_lifecycle.mode='on_demand'")
+        if self._on_demand_mode:
+            from areal.elastic.runtime import validate_on_demand
+
+            validate_on_demand(config)
         self._apply_dte_config_envvars()
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
             config.tokenizer_path
         )
         self.scheduler = None
+        self.rollout_scheduler = None
         if is_single_controller():
-            self.scheduler = self._init_scheduler()
+            if self._on_demand_mode:
+                # Construct both before launching any worker: LocalScheduler
+                # clears trial name-resolve entries during construction.
+                self.scheduler = LocalScheduler(
+                    exp_config=config,
+                    gpu_devices=list(config.actor_lifecycle.actor_devices),
+                    worker_device_control_env_var="CUDA_VISIBLE_DEVICES",
+                )
+                self.rollout_scheduler = LocalScheduler(
+                    exp_config=config,
+                    gpu_devices=list(config.actor_lifecycle.rollout_devices),
+                    worker_device_control_env_var="CUDA_VISIBLE_DEVICES",
+                )
+            else:
+                self.scheduler = self._init_scheduler()
+                self.rollout_scheduler = self.scheduler
         self.data_controller: DataController | None = None
         self._train_rdataset: RDataset | None = None
         self._valid_rdataset: RDataset | None = None
@@ -194,7 +228,8 @@ class PPOTrainer:
             )
 
         # Create models: actor, critic, ref — each with its own allocation.
-        self.actor = self._create_train_engine(config.actor, self.actor_alloc)
+        if not self._on_demand_mode:
+            self.actor = self._create_train_engine(config.actor, self.actor_alloc)
         self.critic = None
         if config.critic is not None:
             critic_alloc = ModelAllocation.from_str(
@@ -267,8 +302,10 @@ class PPOTrainer:
             self.train_dataloader = self._create_dataloader(
                 train_dataset,
                 dataset_config=self.config.train_dataset,
-                rank=self.actor.data_parallel_rank,
-                world_size=self.actor.data_parallel_world_size,
+                rank=0 if self._on_demand_mode else self.actor.data_parallel_rank,
+                world_size=1
+                if self._on_demand_mode
+                else self.actor.data_parallel_world_size,
             )
 
         self.valid_dataloader: StatefulDataLoader | None = None
@@ -288,8 +325,10 @@ class PPOTrainer:
             self.valid_dataloader = self._create_dataloader(
                 valid_dataset,
                 dataset_config=self.config.valid_dataset,
-                rank=self.actor.data_parallel_rank,
-                world_size=self.actor.data_parallel_world_size,
+                rank=0 if self._on_demand_mode else self.actor.data_parallel_rank,
+                world_size=1
+                if self._on_demand_mode
+                else self.actor.data_parallel_world_size,
             )
 
         # -- FinetuneSpec -----------------------------------------------------
@@ -311,7 +350,22 @@ class PPOTrainer:
         # Initialize engines first — the scheduler must know about roles
         # before the data controller can colocate with them.
         engine_init_kwargs = {"addr": None, "ft_spec": ft_spec}
-        self.actor.initialize(**engine_init_kwargs, role="actor")
+        if self._on_demand_mode:
+            from areal.elastic.runtime import OnDemandActor
+
+            self._on_demand = OnDemandActor(
+                config,
+                ft_spec,
+                functools.partial(
+                    self._create_train_engine,
+                    alloc=self.actor_alloc,
+                    scheduler=self.scheduler,
+                    create_process_group=False,
+                ),
+                policy_adapter=self._elastic_policy,
+            )
+        else:
+            self.actor.initialize(**engine_init_kwargs, role="actor")
         if self.critic is not None:
             self.critic.initialize(**engine_init_kwargs, role="critic")
         if self.ref is not None:
@@ -360,7 +414,9 @@ class PPOTrainer:
         )
 
         self.eval_rollout = None
-        if not self._online_mode:
+        if not self._online_mode and (
+            not self._on_demand_mode or valid_dataset is not None
+        ):
             self.eval_rollout = self._init_rollout(
                 config.rollout, is_eval=True, lora_path=initial_lora_path
             )
@@ -449,7 +505,8 @@ class PPOTrainer:
                 f"Invalid weight update mode: {self.config.actor.weight_update_mode}"
             )
 
-        self.actor.connect_engine(self.rollout, self.weight_update_meta)
+        if not self._on_demand_mode:
+            self.actor.connect_engine(self.rollout, self.weight_update_meta)
 
         # Set up evaluation (skip in online mode)
         self.evaluator = Evaluator(config.evaluator, ft_spec)
@@ -462,18 +519,28 @@ class PPOTrainer:
         self.stats_logger = StatsLogger(config, ft_spec)
 
         # Set up checkpointing for recover
-        self.recover_info = self.recover_handler.load(
-            self.actor,
-            self.saver,
-            self.evaluator,
-            self.stats_logger,
-            self.train_dataloader,
-            inference_engine=self.rollout,
-            weight_update_meta=self.weight_update_meta,
-            # Recompute placement instead of reusing _should_offload_rollout:
-            # AWEX clears that flag because it drives the handover itself.
-            colocated_rollout=self._is_actor_rollout_colocated(config),
-        )
+        self.recover_info = None
+        if self._on_demand_mode:
+            self._on_demand.bind(
+                self.rollout,
+                self.weight_update_meta,
+                capture_cpu=self._capture_coordinator_state,
+                restore_cpu=self._restore_coordinator_state,
+            )
+            self.actor = self._on_demand.actor
+        else:
+            self.recover_info = self.recover_handler.load(
+                self.actor,
+                self.saver,
+                self.evaluator,
+                self.stats_logger,
+                self.train_dataloader,
+                inference_engine=self.rollout,
+                weight_update_meta=self.weight_update_meta,
+                # Recompute placement instead of reusing _should_offload_rollout:
+                # AWEX clears that flag because it drives the handover itself.
+                colocated_rollout=self._is_actor_rollout_colocated(config),
+            )
 
         # After recovery, sync the staleness manager so its capacity formula
         # stays bounded despite the version jumping from 0 to recovery_version.
@@ -674,28 +741,94 @@ class PPOTrainer:
         elif self._requires_proxy_workflow(workflow):
             self._ensure_proxy_started()
 
-        for global_step in range(start_step, max_steps):
+        if self._on_demand is not None:
+            if workflow is None:
+                raise ValueError("Inline on_demand requires a dataset/workflow")
+            start_step = self._on_demand.applied_version
+            self._on_demand.inbox.start(
+                self.rollout,
+                dataloader=self.train_dataloader,
+                workflow=workflow,
+                workflow_kwargs=workflow_kwargs,
+                should_accept_fn=dynamic_filter_fn,
+                group_size=config.gconfig.n_samples,
+                dynamic_bs=config.dynamic_bs,
+                reward_normalization=config.gconfig.reward_normalization,
+                drop_incomplete_group=config.gconfig.drop_incomplete_group,
+                total_batches=min(max_steps, config.total_train_steps or max_steps),
+            )
+            if self._on_demand.policy_adapter.mode == "resident":
+                # Start alongside the first collection, not after its batch is
+                # ready. Resident baselines must include the initial GPU lease.
+                self._on_demand.start_actor()
+                self.actor = self._on_demand.actor
+
+        global_step = start_step
+        failures = 0
+        while global_step < max_steps:
             if (
                 config.total_train_steps is not None
                 and global_step >= config.total_train_steps
             ):
                 break
-            epoch = global_step // steps_per_epoch
-            step = global_step % steps_per_epoch
+            try:
+                self._train_step(
+                    global_step=global_step,
+                    steps_per_epoch=steps_per_epoch,
+                    workflow=workflow,
+                    workflow_kwargs=workflow_kwargs,
+                    dynamic_filter_fn=dynamic_filter_fn,
+                    eval_workflow=eval_workflow,
+                    eval_workflow_kwargs=eval_workflow_kwargs,
+                )
+            except Exception as error:
+                if (
+                    self._on_demand is None
+                    or failures >= config.actor_lifecycle.max_recovery_attempts
+                ):
+                    raise
+                failures += 1
+                logger.exception(
+                    "Recovering uncertain native PPO update %d", global_step
+                )
+                self._on_demand.recover_uncertain(error)
+                self.actor = self._on_demand.actor
+                global_step = self._on_demand.applied_version
+                continue
+            global_step += 1
+            failures = 0
 
-            if self._should_offload_rollout:
-                self._onload_rollout()
-            with (
-                stats_tracker.record_timing("rollout"),
-                perf_tracer.trace_scope(
-                    "train.rollout",
-                    category=Category.COMPUTE,
-                    args={
-                        "global_step": global_step,
-                        "epoch_step": step,
-                    },
-                ),
-            ):
+    def _train_step(
+        self,
+        *,
+        global_step: int,
+        steps_per_epoch: int,
+        workflow: WorkflowLike | None,
+        workflow_kwargs: dict[str, Any] | None,
+        dynamic_filter_fn: Callable[[dict[str, Any]], bool] | str | None,
+        eval_workflow: WorkflowLike | None,
+        eval_workflow_kwargs: dict[str, Any] | None,
+    ) -> None:
+        """One native PPO update shared by resident and on-demand Actors."""
+        config = self.config
+        epoch, step = divmod(global_step, steps_per_epoch)
+        if self._should_offload_rollout:
+            self._onload_rollout()
+        with (
+            stats_tracker.record_timing("rollout"),
+            perf_tracer.trace_scope(
+                "train.rollout",
+                category=Category.COMPUTE,
+                args={
+                    "global_step": global_step,
+                    "epoch_step": step,
+                },
+            ),
+        ):
+            if self._on_demand is not None:
+                rollout_batch = self._on_demand.next_batch()
+                self.actor = self._on_demand.actor
+            else:
                 rollout_batch = self.actor.prepare_batch(
                     self.train_dataloader,
                     workflow=workflow,
@@ -706,176 +839,184 @@ class PPOTrainer:
                     reward_normalization=config.gconfig.reward_normalization,
                     drop_incomplete_group=config.gconfig.drop_incomplete_group,
                 )
-            if self._should_offload_rollout:
-                self._offload_rollout()
+        if self._should_offload_rollout:
+            self._offload_rollout()
 
-            if self.critic is not None:
-                if self._should_offload_critic:
-                    self._onload_model(self.critic, role="critic")
-                with (
-                    stats_tracker.record_timing("critic_values"),
-                    perf_tracer.trace_scope(
-                        "train.compute_values",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    values = self.critic.compute_values(rollout_batch)
-                    for traj, v in zip(rollout_batch, values):
-                        traj["values"] = v
-                    self.critic.get_device_stats().log("critic values")
-                # Critic stays onloaded — offloaded after ppo_update below
-
-            if self.ref is not None:
-                if self._should_offload_ref:
-                    self._onload_model(self.ref, role="ref")
-                with (
-                    stats_tracker.record_timing("ref_logp"),
-                    perf_tracer.trace_scope(
-                        "train.ref_logp",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    ref_logps = self.ref.compute_logp(rollout_batch)
-                    for traj, logp in zip(rollout_batch, ref_logps):
-                        traj["ref_logp"] = logp
-                    self.ref.get_device_stats().log("ref logp")
-                if self._should_offload_ref:
-                    self._offload_model(self.ref, role="ref")
-
-            if self.teacher is not None:
-                if self._should_offload_teacher:
-                    self._onload_model(self.teacher, role="teacher")
-                with (
-                    stats_tracker.record_timing("teacher_logp"),
-                    perf_tracer.trace_scope(
-                        "train.teacher_logp",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    teacher_logps = self.teacher.compute_logp(rollout_batch)
-                    for traj, logp in zip(rollout_batch, teacher_logps):
-                        traj["teacher_logp"] = logp
-                        traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
-                        traj["distill_loss_weight"] = (
-                            self.config.teacher.distill_loss_weight
-                        )
-                if self._should_offload_teacher:
-                    self._offload_model(self.teacher, role="teacher")
-
-            # In colocate (awex) mode: switch GPU from inference to training.
-            # Release SGLang KV cache + weights to free GPU for actor.
-            if self._is_v1_awex_colocate(self.config):
-                logger.info("[AWEX] colocate: pausing rollout...")
-                self.rollout.pause()
-                logger.info("[AWEX] colocate: pause_generation_sync...")
-                self.rollout.pause_generation_sync()
-                logger.info("[AWEX] colocate: offload kv_cache...")
-                self.rollout.offload(tags=["kv_cache"])
-                logger.info("[AWEX] colocate: offload weights...")
-                self.rollout.offload(tags=["weights"])
-                logger.info("[AWEX] colocate: offload done, onloading actor...")
-                self.actor.onload()
-
-            if self._should_offload_actor:
-                self._onload_model(self.actor, role="actor")
-            if config.actor.should_compute_prox_logp():
-                with (
-                    stats_tracker.record_timing("recompute_logp"),
-                    perf_tracer.trace_scope(
-                        "train.recompute_logp",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    prox_logps = self.actor.compute_logp(rollout_batch)
-                    for traj, logp in zip(rollout_batch, prox_logps):
-                        traj["prox_logp"] = logp
-                    self.actor.get_device_stats().log("recompute logp")
-
+        if self.critic is not None:
+            if self._should_offload_critic:
+                self._onload_model(self.critic, role="critic")
             with (
-                stats_tracker.record_timing("compute_advantage"),
+                stats_tracker.record_timing("critic_values"),
                 perf_tracer.trace_scope(
-                    "train.compute_advantage",
+                    "train.compute_values",
                     category=Category.COMPUTE,
                     args={"global_step": global_step},
                 ),
             ):
-                adv_batch = self.actor.compute_advantages(rollout_batch)
-                self.actor.get_device_stats().log("compute advantages")
+                values = self.critic.compute_values(rollout_batch)
+                for traj, v in zip(rollout_batch, values):
+                    traj["values"] = v
+                self.critic.get_device_stats().log("critic values")
+            # Critic stays onloaded — offloaded after ppo_update below
 
-            # Wait for async checkpoint staging to complete before modifying parameters
-            self.saver.maybe_wait_for_staging()
-
-            if (
-                config.memory_profiler is not None
-                and global_step in config.memory_profiler.profile_steps
-            ):
-                self.actor.start_memory_profile(config.memory_profiler.max_entries)
-
+        if self.ref is not None:
+            if self._should_offload_ref:
+                self._onload_model(self.ref, role="ref")
             with (
-                stats_tracker.record_timing("train_step"),
+                stats_tracker.record_timing("ref_logp"),
                 perf_tracer.trace_scope(
-                    "train.ppo_update",
+                    "train.ref_logp",
                     category=Category.COMPUTE,
                     args={"global_step": global_step},
                 ),
             ):
-                self.actor.ppo_update(adv_batch)
-                self.actor.step_lr_scheduler()
-                self.actor.get_device_stats().log("ppo update")
+                ref_logps = self.ref.compute_logp(rollout_batch)
+                for traj, logp in zip(rollout_batch, ref_logps):
+                    traj["ref_logp"] = logp
+                self.ref.get_device_stats().log("ref logp")
+            if self._should_offload_ref:
+                self._offload_model(self.ref, role="ref")
 
-            if (
-                config.memory_profiler is not None
-                and global_step in config.memory_profiler.profile_steps
+        if self.teacher is not None:
+            if self._should_offload_teacher:
+                self._onload_model(self.teacher, role="teacher")
+            with (
+                stats_tracker.record_timing("teacher_logp"),
+                perf_tracer.trace_scope(
+                    "train.teacher_logp",
+                    category=Category.COMPUTE,
+                    args={"global_step": global_step},
+                ),
             ):
-                log_dir = StatsLogger.get_log_path(config.stats_logger)
-                snapshot_dir = os.path.join(
-                    log_dir, "memory_snapshots", f"step_{global_step}"
-                )
-                os.makedirs(snapshot_dir, exist_ok=True)
-                self.actor.stop_memory_profile(snapshot_dir)
-                logger.info(f"Memory snapshots saved to {snapshot_dir}")
+                teacher_logps = self.teacher.compute_logp(rollout_batch)
+                for traj, logp in zip(rollout_batch, teacher_logps):
+                    traj["teacher_logp"] = logp
+                    traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
+                    traj["distill_loss_weight"] = (
+                        self.config.teacher.distill_loss_weight
+                    )
+            if self._should_offload_teacher:
+                self._offload_model(self.teacher, role="teacher")
 
-            if self.critic is not None:
-                with (
-                    stats_tracker.record_timing("critic_train_step"),
-                    perf_tracer.trace_scope(
-                        "train.critic_ppo_update",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    self.critic.ppo_update(adv_batch)
-                    self.critic.step_lr_scheduler()
-                    self.critic.get_device_stats().log("ppo critic update")
-                if self._should_offload_critic:
-                    self._offload_model(self.critic, role="critic")
+        # In colocate (awex) mode: switch GPU from inference to training.
+        # Release SGLang KV cache + weights to free GPU for actor.
+        if self._is_v1_awex_colocate(self.config):
+            logger.info("[AWEX] colocate: pausing rollout...")
+            self.rollout.pause()
+            logger.info("[AWEX] colocate: pause_generation_sync...")
+            self.rollout.pause_generation_sync()
+            logger.info("[AWEX] colocate: offload kv_cache...")
+            self.rollout.offload(tags=["kv_cache"])
+            logger.info("[AWEX] colocate: offload weights...")
+            self.rollout.offload(tags=["weights"])
+            logger.info("[AWEX] colocate: offload done, onloading actor...")
+            self.actor.onload()
 
-            # Save BEFORE update_weights. In AWEX colocate mode the
-            # transfer ends with actor weights offloaded, so saving afterwards
-            # would resume weights onto a card already crowded by the
-            # fully-resumed rollout plus transfer staging leftovers and the HF
-            # saver's TP coalesced all-gather transient can OOM. Here the
-            # actor weights are still onloaded from ppo_update (no resume
-            # needed) and MegatronEngine.save() drops the dead fp32 grad
-            # buffers to fund the transient. Weights are identical on both
-            # sides of the transfer, so the checkpoint content is unchanged.
-            if self._is_v1_awex_colocate(config):
-                self._save_training_state(
-                    epoch=epoch,
-                    epoch_step=step,
-                    global_step=global_step,
-                )
+        if self._should_offload_actor:
+            self._onload_model(self.actor, role="actor")
+        if config.actor.should_compute_prox_logp():
+            with (
+                stats_tracker.record_timing("recompute_logp"),
+                perf_tracer.trace_scope(
+                    "train.recompute_logp",
+                    category=Category.COMPUTE,
+                    args={"global_step": global_step},
+                ),
+            ):
+                prox_logps = self.actor.compute_logp(rollout_batch)
+                for traj, logp in zip(rollout_batch, prox_logps):
+                    traj["prox_logp"] = logp
+                self.actor.get_device_stats().log("recompute logp")
 
-            # pause inference for updating weights, save, and evaluation
+        with (
+            stats_tracker.record_timing("compute_advantage"),
+            perf_tracer.trace_scope(
+                "train.compute_advantage",
+                category=Category.COMPUTE,
+                args={"global_step": global_step},
+            ),
+        ):
+            adv_batch = self.actor.compute_advantages(rollout_batch)
+            self.actor.get_device_stats().log("compute advantages")
+
+        # Wait for async checkpoint staging to complete before modifying parameters
+        self.saver.maybe_wait_for_staging()
+
+        if (
+            config.memory_profiler is not None
+            and global_step in config.memory_profiler.profile_steps
+        ):
+            self.actor.start_memory_profile(config.memory_profiler.max_entries)
+
+        with (
+            stats_tracker.record_timing("train_step"),
+            perf_tracer.trace_scope(
+                "train.ppo_update",
+                category=Category.COMPUTE,
+                args={"global_step": global_step},
+            ),
+        ):
+            self.actor.ppo_update(adv_batch)
+            self.actor.step_lr_scheduler()
+            self.actor.get_device_stats().log("ppo update")
+
+        if (
+            config.memory_profiler is not None
+            and global_step in config.memory_profiler.profile_steps
+        ):
+            log_dir = StatsLogger.get_log_path(config.stats_logger)
+            snapshot_dir = os.path.join(
+                log_dir, "memory_snapshots", f"step_{global_step}"
+            )
+            os.makedirs(snapshot_dir, exist_ok=True)
+            self.actor.stop_memory_profile(snapshot_dir)
+            logger.info(f"Memory snapshots saved to {snapshot_dir}")
+
+        if self.critic is not None:
+            with (
+                stats_tracker.record_timing("critic_train_step"),
+                perf_tracer.trace_scope(
+                    "train.critic_ppo_update",
+                    category=Category.COMPUTE,
+                    args={"global_step": global_step},
+                ),
+            ):
+                self.critic.ppo_update(adv_batch)
+                self.critic.step_lr_scheduler()
+                self.critic.get_device_stats().log("ppo critic update")
+            if self._should_offload_critic:
+                self._offload_model(self.critic, role="critic")
+
+        # Save BEFORE update_weights. In AWEX colocate mode the
+        # transfer ends with actor weights offloaded, so saving afterwards
+        # would resume weights onto a card already crowded by the
+        # fully-resumed rollout plus transfer staging leftovers and the HF
+        # saver's TP coalesced all-gather transient can OOM. Here the
+        # actor weights are still onloaded from ppo_update (no resume
+        # needed) and MegatronEngine.save() drops the dead fp32 grad
+        # buffers to fund the transient. Weights are identical on both
+        # sides of the transfer, so the checkpoint content is unchanged.
+        if self._is_v1_awex_colocate(config):
+            self._save_training_state(
+                epoch=epoch,
+                epoch_step=step,
+                global_step=global_step,
+            )
+
+        # On-demand rollout continues through computation and checkpointing;
+        # the native v2 update_weights() owns its short publication pause.
+        if self._on_demand is None:
             self.rollout.pause()
 
-            # Actor already onloaded; engine-internal _offload_aware_context
-            # calls in update_weights/save are no-ops.
+        # Actor already onloaded; engine-internal _offload_aware_context
+        # calls in update_weights/save are no-ops.
 
+        if self._on_demand is not None:
+            self._on_demand.publish_update(global_step + 1)
+            self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
+            self.saver.maybe_wait_for_staging()
+            self._on_demand.maybe_checkpoint(epoch_step=step)
+        else:
             with (
                 stats_tracker.record_timing("update_weights"),
                 perf_tracer.trace_scope(
@@ -903,67 +1044,69 @@ class PPOTrainer:
                     global_step=global_step,
                 )
 
-            # Offload actor before eval
-            if self._should_offload_actor:
-                self._offload_model(self.actor, role="actor")
+        # Offload actor before eval
+        if self._should_offload_actor:
+            self._offload_model(self.actor, role="actor")
 
-            if self._should_offload_rollout:
-                self._onload_rollout(is_eval=True)
-            with (
-                stats_tracker.record_timing("eval"),
-                perf_tracer.trace_scope(
-                    "train.eval",
-                    category=Category.COMPUTE,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._evaluate(
-                    eval_workflow=eval_workflow,
-                    eval_workflow_kwargs=eval_workflow_kwargs,
-                    epoch=epoch,
-                    epoch_step=step,
-                    global_step=global_step,
-                )
-            if self._should_offload_rollout:
-                self._offload_rollout(is_eval=True)
+        if self._should_offload_rollout:
+            self._onload_rollout(is_eval=True)
+        with (
+            stats_tracker.record_timing("eval"),
+            perf_tracer.trace_scope(
+                "train.eval",
+                category=Category.COMPUTE,
+                args={"global_step": global_step},
+            ),
+        ):
+            self._evaluate(
+                eval_workflow=eval_workflow,
+                eval_workflow_kwargs=eval_workflow_kwargs,
+                epoch=epoch,
+                epoch_step=step,
+                global_step=global_step,
+            )
+        if self._should_offload_rollout:
+            self._offload_rollout(is_eval=True)
 
-            with (
-                stats_tracker.record_timing("clear_batches"),
-                perf_tracer.trace_scope(
-                    "train.clear_batches",
-                    category=Category.INSTR,
-                    args={"global_step": global_step},
-                ),
-            ):
-                # Each role runs in its own Python process with a
-                # process-local ``_fetch_buffer``; one HTTP DELETE to the
-                # storage owner clears ``_storage`` but not per-consumer
-                # caches. Fan out ``clear_batches`` to every role that
-                # localized the batch — see areal-project/AReaL#1209.
-                # SPMD mode never populates ``_fetch_buffer`` (no RTensor
-                # round-trip), so the fan-out is single-controller only.
-                if is_single_controller():
-                    self.actor.clear_batches(rollout_batch, adv_batch)
-                    if self.critic is not None:
-                        self.critic.clear_batches(rollout_batch, adv_batch)
-                    if self.ref is not None:
-                        self.ref.clear_batches(rollout_batch)
-                    if self.data_controller is not None:
-                        self.data_controller.clear_batches()
-
-            with perf_tracer.trace_scope(
-                "train.log_stats",
+        with (
+            stats_tracker.record_timing("clear_batches"),
+            perf_tracer.trace_scope(
+                "train.clear_batches",
                 category=Category.INSTR,
                 args={"global_step": global_step},
-            ):
-                self._export_and_commit_stats(
-                    epoch=epoch, epoch_step=step, global_step=global_step
-                )
+            ),
+        ):
+            # Each role runs in its own Python process with a
+            # process-local ``_fetch_buffer``; one HTTP DELETE to the
+            # storage owner clears ``_storage`` but not per-consumer
+            # caches. Fan out ``clear_batches`` to every role that
+            # localized the batch — see areal-project/AReaL#1209.
+            # SPMD mode never populates ``_fetch_buffer`` (no RTensor
+            # round-trip), so the fan-out is single-controller only.
+            if is_single_controller():
+                self.actor.clear_batches(rollout_batch, adv_batch)
+                if self.critic is not None:
+                    self.critic.clear_batches(rollout_batch, adv_batch)
+                if self.ref is not None:
+                    self.ref.clear_batches(rollout_batch)
+                if self.data_controller is not None:
+                    self.data_controller.clear_batches()
 
-            # Resume rollout
+        with perf_tracer.trace_scope(
+            "train.log_stats",
+            category=Category.INSTR,
+            args={"global_step": global_step},
+        ):
+            self._export_and_commit_stats(
+                epoch=epoch, epoch_step=step, global_step=global_step
+            )
+
+        if self._on_demand is None:
             self.rollout.resume()
 
-            self._save_perf_tracer(step=global_step)
+        self._save_perf_tracer(step=global_step)
+        if self._on_demand is not None:
+            self._on_demand.finish_update()
 
     def _save_training_state(
         self,
@@ -996,26 +1139,59 @@ class PPOTrainer:
                 global_step=global_step,
             )
 
+    def _capture_coordinator_state(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name).state_dict()
+            for name in (
+                ("saver", "evaluator", "stats_logger")
+                if self._on_demand_mode
+                else ("saver", "evaluator", "stats_logger", "train_dataloader")
+            )
+        }
+
+    def _restore_coordinator_state(self, state: dict[str, Any]) -> None:
+        for name in ("saver", "evaluator", "stats_logger", "train_dataloader"):
+            getattr(self, name).load_state_dict(state[name])
+
     def close(self):
-        self.saver.finalize()
-        if hasattr(self, "_train_rdataset") and self._train_rdataset is not None:
-            self._train_rdataset.close()
-        if hasattr(self, "_valid_rdataset") and self._valid_rdataset is not None:
-            self._valid_rdataset.close()
-        if hasattr(self, "data_controller") and self.data_controller is not None:
-            self.data_controller.destroy()
-        self.stats_logger.close()
-        if self.eval_rollout is not None:
-            self.eval_rollout.destroy()
-        self.rollout.destroy()
-        if self.teacher is not None:
-            self.teacher.destroy()
-        if self.ref is not None:
-            self.ref.destroy()
-        if self.critic is not None:
-            self.critic.destroy()
-        self.actor.destroy()
-        perf_tracer.save(force=True)
+        errors = []
+
+        def finish(resource: str, method: str) -> None:
+            value = getattr(self, resource, None)
+            if value is not None:
+                try:
+                    getattr(value, method)()
+                except Exception as error:
+                    errors.append(error)
+                    logger.error("Failed to close %s", resource, exc_info=True)
+
+        finish("saver", "finalize")
+        for name in ("_train_rdataset", "_valid_rdataset", "stats_logger"):
+            finish(name, "close")
+        finish("data_controller", "destroy")
+        # Keep serving peers alive until Actor's AWEX release is confirmed.
+        if getattr(self, "_on_demand", None) is not None:
+            finish("_on_demand", "close")
+            actor_released = (
+                self._on_demand.actor is None and self._on_demand.owner is None
+            )
+        else:
+            if getattr(getattr(self, "_elastic_policy", None), "owner", None) is None:
+                finish("_elastic_policy", "close")
+            before = len(errors)
+            finish("actor", "destroy")
+            actor_released = len(errors) == before
+        if actor_released:
+            for name in ("eval_rollout", "rollout"):
+                finish(name, "destroy")
+        for name in ("teacher", "ref", "critic"):
+            finish(name, "destroy")
+        try:
+            perf_tracer.save(force=True)
+        except Exception as error:
+            errors.append(error)
+        if errors:
+            raise ExceptionGroup("Trainer cleanup incomplete", errors)
 
     def _config_perf_tracer(self):
         rank = int(os.getenv("RANK", "0"))
@@ -1026,7 +1202,8 @@ class PPOTrainer:
         if not is_single_controller():
             return
 
-        self.actor.config_perf_tracer(self.config.perf_tracer, role="actor")
+        if self.actor is not None:
+            self.actor.config_perf_tracer(self.config.perf_tracer, role="actor")
         if self.critic is not None:
             self.critic.config_perf_tracer(self.config.perf_tracer, role="critic")
         if self.ref is not None:
@@ -1121,7 +1298,12 @@ class PPOTrainer:
                 spec.env_vars["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
 
     def _create_train_engine(
-        self, actor_config: PPOActorConfig, alloc: ModelAllocation
+        self,
+        actor_config: PPOActorConfig,
+        alloc: ModelAllocation,
+        *,
+        scheduler: Scheduler | None = None,
+        create_process_group: bool = True,
     ) -> FSDPPPOActor | MegatronPPOActor | ArchonPPOActor | PPOActorController:
         """Create a training engine (actor or ref) based on the allocation backend."""
         if alloc.backend == "fsdp":
@@ -1141,10 +1323,11 @@ class PPOTrainer:
                 f"Invalid backend: {alloc.backend}, expected fsdp, megatron or archon"
             )
         if is_single_controller():
-            actor = actor_cls.as_controller(actor_config, self.scheduler)
+            actor = actor_cls.as_controller(actor_config, scheduler or self.scheduler)
         else:
             actor = actor_cls(config=actor_config)
-        actor.create_process_group(parallel_strategy=alloc.parallel)
+        if create_process_group:
+            actor.create_process_group(parallel_strategy=alloc.parallel)
         return actor
 
     def _create_critic(
@@ -1249,8 +1432,9 @@ class PPOTrainer:
         # Single-controller mode - no engine instantiation needed
         if config._version == "v2":
             controller = RolloutControllerV2(
-                config=config, scheduler=cast(Scheduler, self.scheduler)
+                config=config, scheduler=cast(Scheduler, self.rollout_scheduler)
             )
+
         else:
             controller = engine_cls.as_controller(config, self.scheduler)
         init_kwargs = dict(
@@ -1261,6 +1445,12 @@ class PPOTrainer:
             assert len(self.rollout.server_infos) > 0
             init_kwargs["server_infos"] = self.rollout.server_infos
             init_kwargs["role"] = "eval-rollout"
+        if self._on_demand_mode:
+            # Retain ownership even if initialization is interrupted.
+            if is_eval:
+                self.eval_rollout = controller
+            else:
+                self.rollout = controller
         controller.initialize(**init_kwargs)
         return controller
 

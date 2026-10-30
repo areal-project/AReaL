@@ -6,6 +6,8 @@ import os
 import socket
 import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
+from functools import wraps
 from typing import Any
 
 import aiohttp  # pyright: ignore[reportMissingImports]
@@ -23,6 +25,10 @@ from areal.v2.weight_update.gateway.config import (
     WeightUpdateResult,
 )
 from areal.v2.weight_update.gateway.kv_store import WeightMetaStore
+from areal.v2.weight_update.gateway.metadata import (
+    merge_inference_metadata,
+    merge_parameter_metadata,
+)
 from areal.v2.weight_update.gateway.pair_registry import PairRegistry
 
 logger = logging.getLogger("WeightUpdateGateway")
@@ -49,6 +55,9 @@ class UpdateWeightsRequest(BaseModel):
 
 class DisconnectRequest(BaseModel):
     pair_name: str
+    # Recovery-only assertion by the authenticated local lifecycle owner, after
+    # all training descendants have exited and their GPU pool is empty.
+    training_stopped: bool = False
 
 
 class KVPutBody(BaseModel):
@@ -97,7 +106,6 @@ async def _get_json(session: aiohttp.ClientSession, url: str, timeout_s: float) 
         return await resp.json()
 
 
-@async_http_retry
 async def _post_json(
     session: aiohttp.ClientSession,
     url: str,
@@ -110,7 +118,6 @@ async def _post_json(
         return await resp.json()
 
 
-@async_http_retry
 async def _post(
     session: aiohttp.ClientSession,
     url: str,
@@ -122,6 +129,38 @@ async def _post(
         resp.raise_for_status()
 
 
+async def _gather_all(*operations):
+    """Observe every sent request before starting rollback or another collective."""
+    results = await asyncio.gather(*operations, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
+
+
+async def _discover_parallelism(session, train_urls, inference_urls, timeout_s):
+    reports = await _gather_all(
+        *[
+            _get_json(session, f"{url}/awex/report_parallelism", timeout_s)
+            for url in train_urls + inference_urls
+        ]
+    )
+    train_reports, infer_reports = (
+        reports[: len(train_urls)],
+        reports[len(train_urls) :],
+    )
+    keys = ("world_size", "tp_size", "pp_size", "dp_size", "ep_size", "cp_size")
+    for group in (train_reports, infer_reports):
+        reference = tuple(group[0].get(key, 1) for key in keys)
+        if any(
+            tuple(report.get(key, 1) for key in keys) != reference for report in group
+        ):
+            raise ValueError("Workers disagree on their parallel layout")
+    if train_reports[0]["world_size"] != len(train_urls):
+        raise ValueError("Training worker list does not cover the complete group")
+    return train_reports[0], infer_reports[0]
+
+
 def _get_own_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -131,40 +170,40 @@ def _get_own_ip() -> str:
         return "127.0.0.1"
 
 
-def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
-    """Merge serialized training ParameterMeta entries by parameter name.
+def _validate_wire_dtypes(
+    training_meta: list[dict], inference_meta: list[dict]
+) -> None:
+    """Reject incompatible P2P buffers before any rank initializes a collective."""
 
-    Each FSDP worker reports metadata for its own local shard only.
-    With ``dp_size > 1`` the same parameter name appears once per worker,
-    each carrying a single shard.  The ``TransferPlanBuilder`` indexes
-    parameters with ``{meta.name: meta}``, so duplicates silently shadow
-    earlier entries.  We merge them here so the builder sees one
-    ``ParameterMeta`` per name with all shards in a single replica.
-    """
-    by_name: dict[str, dict] = {}
-    overflow: list[dict] = []
-    for pm in meta_list:
-        data = pm.get("data", pm) if isinstance(pm, dict) else pm
-        name = data.get("name") if isinstance(data, dict) else None
-        if name is None:
-            logger.warning("Found parameter metadata with no name: %s", pm)
-            overflow.append(pm)
-            continue
+    def data(value: dict) -> dict:
+        return value.get("data", value)
 
-        if name not in by_name:
-            by_name[name] = pm
-        else:
-            existing_data = by_name[name].get("data", by_name[name])
-            existing_data.setdefault("shards", []).extend(data.get("shards", []))
-            ex_replicas = existing_data.get("replicas", [])
-            new_replicas = data.get("replicas", [])
-            if ex_replicas and new_replicas:
-                ex_rep_data = ex_replicas[0].get("data", ex_replicas[0])
-                new_rep_data = new_replicas[0].get("data", new_replicas[0])
-                ex_rep_data.setdefault("shards", []).extend(
-                    new_rep_data.get("shards", [])
+    def dtype(value: dict):
+        result = value.get("dtype")
+        return result.get("value") if isinstance(result, dict) else result
+
+    by_name: dict[str, str] = {}
+    for role, metadata in (("training", training_meta), ("inference", inference_meta)):
+        for parameter in metadata:
+            parameter = data(parameter)
+            name, expected = parameter["name"], dtype(parameter)
+            if expected is None:
+                raise ValueError(f"Missing AWEX wire dtype for {role} parameter {name}")
+            if name in by_name and by_name[name] != expected:
+                raise ValueError(
+                    f"AWEX wire dtype mismatch for {name}: {by_name[name]} != {expected}"
                 )
-    return list(by_name.values()) + overflow
+            by_name[name] = expected
+            shards = list(parameter.get("shards", []))
+            for replica in parameter.get("replicas", []):
+                shards.extend(data(replica).get("shards", []))
+            for shard in shards:
+                actual = dtype(data(shard))
+                if actual != expected:
+                    raise ValueError(
+                        f"AWEX wire dtype mismatch for {role} shard {name}: "
+                        f"{actual} != {expected}"
+                    )
 
 
 def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
@@ -184,6 +223,38 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     app.state.kv_store = kv_store
     app.state.registry = registry
     app.state.config = config
+    app.state.operation_lock = asyncio.Lock()
+    app.state.retired_pairs = set()
+
+    def serialized(operation):
+        @wraps(operation)
+        async def invoke(*args, **kwargs):
+            async with app.state.operation_lock:
+                return await operation(*args, **kwargs)
+
+        return invoke
+
+    async def teardown_pair(
+        pair_info: PairInfo, session, *, training_stopped: bool = False
+    ) -> list[str]:
+        if pair_info.mode != "awex":
+            return []
+        results = await asyncio.gather(
+            *[
+                _post(
+                    session,
+                    f"{url}/awex/teardown",
+                    config.init_timeout_s,
+                    json_data={"pair_name": pair_info.pair_name},
+                )
+                for url in (
+                    ([] if training_stopped else pair_info.train_worker_urls)
+                    + pair_info.inference_worker_urls
+                )
+            ],
+            return_exceptions=True,
+        )
+        return [str(result) for result in results if isinstance(result, BaseException)]
 
     def _auth(request: Request) -> None:
         require_admin_key(request, config.admin_api_key)
@@ -193,7 +264,97 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         return HealthResponse()
 
     @app.post("/connect")
+    @serialized
     async def connect(request: Request, body: ConnectRequest) -> ConnectResponse:
+        _auth(request)
+        if (
+            not body.pair_name
+            or not body.train_worker_urls
+            or not body.inference_worker_urls
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Pair name and both worker lists are required"},
+            )
+        if body.mode not in ("awex", "disk"):
+            return JSONResponse(
+                status_code=400, content={"error": "Unknown weight update mode"}
+            )
+        existing = registry.get_by_name(body.pair_name)
+        if existing is not None:
+            identity = (
+                "train_worker_urls",
+                "inference_worker_urls",
+                "mode",
+                "colocate",
+                "save_path",
+                "use_lora",
+                "lora_name",
+                "lora_keep_versions",
+            )
+            if existing.state == "connected" and all(
+                getattr(existing, key) == getattr(body, key) for key in identity
+            ):
+                return ConnectResponse(pair_name=body.pair_name)
+            return JSONResponse(
+                status_code=409,
+                content={"error": "Pair already exists or requires cleanup"},
+            )
+        if body.pair_name in app.state.retired_pairs:
+            return JSONResponse(
+                status_code=409,
+                content={"error": "Retired pair requires a fresh generation name"},
+            )
+        participants = set(body.train_worker_urls + body.inference_worker_urls)
+        for name in registry.list_pairs():
+            other = registry.get_by_name(name)
+            if participants.intersection(
+                other.train_worker_urls + other.inference_worker_urls
+            ):
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "Worker already belongs to another pair"},
+                )
+        pending = PairInfo(
+            pair_name=body.pair_name,
+            train_worker_urls=body.train_worker_urls,
+            inference_worker_urls=body.inference_worker_urls,
+            mode=body.mode,
+            colocate=body.colocate,
+            state="connecting",
+        )
+        registry.register(pending)
+        try:
+            result = await connect_impl(request, body)
+            if isinstance(result, JSONResponse) and result.status_code >= 400:
+                registry.unregister(body.pair_name)
+                # Validation rejects have not touched workers, but the caller
+                # may have lost this response and still need to disconnect.
+                app.state.retired_pairs.add(body.pair_name)
+            return result
+        except Exception as error:
+            pending.state = "failed"
+            failures = await teardown_pair(pending, request.app.state.http_session)
+            if not failures:
+                kv_store.clear_pair(body.pair_name)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": str(error),
+                    "state": "failed",
+                    "cleanup_failures": failures,
+                },
+            )
+
+    @app.get("/pairs/{pair_name}")
+    async def pair_status(pair_name: str, request: Request):
+        _auth(request)
+        pair = registry.get_by_name(pair_name)
+        if pair is None:
+            return JSONResponse(status_code=404, content={"error": "Pair not found"})
+        return asdict(pair)
+
+    async def connect_impl(request: Request, body: ConnectRequest) -> ConnectResponse:
         _auth(request)
         pair_name = body.pair_name
         train_urls = body.train_worker_urls
@@ -232,7 +393,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 lora_name=body.lora_name,
                 lora_keep_versions=body.lora_keep_versions,
             )
-            registry.register(pair_info)
+            registry.finish_connect(pair_info)
             logger.info(
                 "Connected disk pair '%s' (save_path=%s, use_lora=%s, "
                 "lora_keep_versions=%d)",
@@ -262,17 +423,8 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         session = request.app.state.http_session
         init_timeout_s = config.init_timeout_s
 
-        train_par, infer_par = await asyncio.gather(
-            _get_json(
-                session,
-                f"{train_urls[0]}/awex/report_parallelism",
-                init_timeout_s,
-            ),
-            _get_json(
-                session,
-                f"{inference_urls[0]}/awex/report_parallelism",
-                init_timeout_s,
-            ),
+        train_par, infer_par = await _discover_parallelism(
+            session, train_urls, inference_urls, init_timeout_s
         )
 
         train_world_size = train_par["world_size"]
@@ -285,8 +437,8 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         total_infer_ranks = infer_world_size * num_engines
         total_world_size = total_infer_ranks + train_world_size
 
-        train_meta_resps, infer_meta_resps = await asyncio.gather(
-            asyncio.gather(
+        train_meta_resps, infer_meta_resps = await _gather_all(
+            _gather_all(
                 *[
                     _post_json(
                         session, f"{url}/awex/report_weight_meta", init_timeout_s
@@ -294,7 +446,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     for url in train_urls
                 ]
             ),
-            asyncio.gather(
+            _gather_all(
                 *[
                     _post_json(
                         session, f"{url}/awex/report_weight_meta", init_timeout_s
@@ -311,7 +463,6 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 training_params_meta.extend(meta)
             else:
                 training_params_meta.append(meta)
-        training_params_meta = _merge_training_meta_by_name(training_params_meta)
 
         infer_params_meta = []
         for result in infer_meta_resps:
@@ -321,6 +472,9 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             else:
                 infer_params_meta.append(meta)
 
+        _validate_wire_dtypes(training_params_meta, infer_params_meta)
+        training_params_meta = merge_parameter_metadata(training_params_meta)
+        infer_params_meta = merge_inference_metadata(infer_meta_resps)
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
 
@@ -335,6 +489,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
 
         init_payload_base = {
             "pair_name": pair_name,
+            "fenced": True,
             "master_addr": master_addr,
             "master_port": master_port,
             "world_size": total_world_size,
@@ -351,7 +506,12 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     session,
                     f"{url}/awex/init_weights_update_group",
                     init_timeout_s,
-                    json_data={**init_payload_base, "transfer_rank": i},
+                    json_data={
+                        **init_payload_base,
+                        "transfer_rank": i,
+                        # Leave part of the HTTP budget for abort and error replies.
+                        "transfer_timeout_s": config.update_timeout_s * 0.8,
+                    },
                 )
             )
         for i, url in enumerate(train_urls):
@@ -366,18 +526,18 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     },
                 )
             )
-        await asyncio.gather(*init_tasks)
+        await _gather_all(*init_tasks)
 
         liveness_tasks = [
             _post(
                 session,
                 f"{url}/awex/batch_isend_irecv",
                 init_timeout_s,
-                json_data={"world_size": total_world_size},
+                json_data={"world_size": total_world_size, "pair_name": pair_name},
             )
             for url in inference_urls + train_urls
         ]
-        await asyncio.gather(*liveness_tasks)
+        await _gather_all(*liveness_tasks)
 
         pair_info = PairInfo(
             pair_name=pair_name,
@@ -388,7 +548,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             master_addr=master_addr,
             master_port=master_port,
         )
-        registry.register(pair_info)
+        registry.finish_connect(pair_info)
 
         logger.info("Connected pair '%s'", pair_name)
         return ConnectResponse(pair_name=pair_name)
@@ -402,17 +562,8 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         session = request.app.state.http_session
         init_timeout_s = config.init_timeout_s
 
-        train_par, infer_par = await asyncio.gather(
-            _get_json(
-                session,
-                f"{train_urls[0]}/awex/report_parallelism",
-                init_timeout_s,
-            ),
-            _get_json(
-                session,
-                f"{inference_urls[0]}/awex/report_parallelism",
-                init_timeout_s,
-            ),
+        train_par, infer_par = await _discover_parallelism(
+            session, train_urls, inference_urls, init_timeout_s
         )
 
         train_world_size = train_par["world_size"]
@@ -421,8 +572,8 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         # The total inference world for colocate NCCL groups spans all engines.
         infer_world_size = infer_par["world_size"] * num_engines
 
-        train_meta_resps, infer_meta_resps = await asyncio.gather(
-            asyncio.gather(
+        train_meta_resps, infer_meta_resps = await _gather_all(
+            _gather_all(
                 *[
                     _post_json(
                         session, f"{url}/awex/report_weight_meta", init_timeout_s
@@ -430,7 +581,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     for url in train_urls
                 ]
             ),
-            asyncio.gather(
+            _gather_all(
                 *[
                     _post_json(
                         session, f"{url}/awex/report_weight_meta", init_timeout_s
@@ -447,7 +598,6 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 training_params_meta.extend(meta)
             else:
                 training_params_meta.append(meta)
-        training_params_meta = _merge_training_meta_by_name(training_params_meta)
 
         infer_params_meta = []
         for result in infer_meta_resps:
@@ -457,6 +607,9 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             else:
                 infer_params_meta.append(meta)
 
+        _validate_wire_dtypes(training_params_meta, infer_params_meta)
+        training_params_meta = merge_parameter_metadata(training_params_meta)
+        infer_params_meta = merge_inference_metadata(infer_meta_resps)
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
 
@@ -469,6 +622,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
 
         init_payload_base = {
             "pair_name": pair_name,
+            "fenced": True,
             "kv_store_url": kv_store_url,
             "infer_world_size": infer_world_size,
             "train_world_size": train_world_size,
@@ -499,7 +653,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     },
                 )
             )
-        await asyncio.gather(*init_tasks)
+        await _gather_all(*init_tasks)
 
         pair_info = PairInfo(
             pair_name=pair_name,
@@ -509,7 +663,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             inference_world_size=infer_world_size,
             colocate=True,
         )
-        registry.register(pair_info)
+        registry.finish_connect(pair_info)
 
         logger.info("Connected colocate pair '%s'", pair_name)
         return ConnectResponse(pair_name=pair_name)
@@ -520,37 +674,37 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         session: aiohttp.ClientSession,
         timeout_s: float,
     ) -> None:
-        await asyncio.gather(
+        await _gather_all(
             *[
                 _post(
                     session,
                     f"{url}/awex/release_memory",
                     timeout_s,
-                    json_data={"tags": ["optimizer"]},
+                    json_data={"tags": ["optimizer"], "pair_name": pair_info.pair_name},
                 )
                 for url in pair_info.train_worker_urls
             ]
         )
 
-        await asyncio.gather(
+        await _gather_all(
             *[
                 _post(
                     session,
                     f"{url}/awex/resume_memory",
                     timeout_s,
-                    json_data={"tags": ["weights"]},
+                    json_data={"tags": ["weights"], "pair_name": pair_info.pair_name},
                 )
                 for url in pair_info.inference_worker_urls
             ]
         )
 
-        await asyncio.gather(
+        await _gather_all(
             *[
                 _post(
                     session,
                     f"{url}/awex/execute_colocate_weight_update",
                     timeout_s,
-                    json_data={"version": version},
+                    json_data={"version": version, "pair_name": pair_info.pair_name},
                 )
                 for url in pair_info.train_worker_urls
             ],
@@ -559,31 +713,31 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     session,
                     f"{url}/awex/execute_colocate_weight_update",
                     timeout_s,
-                    json_data={"version": version},
+                    json_data={"version": version, "pair_name": pair_info.pair_name},
                 )
                 for url in pair_info.inference_worker_urls
             ],
         )
 
-        await asyncio.gather(
+        await _gather_all(
             *[
                 _post(
                     session,
                     f"{url}/awex/release_memory",
                     timeout_s,
-                    json_data={"tags": ["weights"]},
+                    json_data={"tags": ["weights"], "pair_name": pair_info.pair_name},
                 )
                 for url in pair_info.train_worker_urls
             ]
         )
 
-        await asyncio.gather(
+        await _gather_all(
             *[
                 _post(
                     session,
                     f"{url}/awex/resume_memory",
                     timeout_s,
-                    json_data={"tags": ["kv_cache"]},
+                    json_data={"tags": ["kv_cache"], "pair_name": pair_info.pair_name},
                 )
                 for url in pair_info.inference_worker_urls
             ]
@@ -605,13 +759,13 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         session: aiohttp.ClientSession,
         timeout_s: float,
     ) -> None:
-        await asyncio.gather(
+        await _gather_all(
             *[
                 _post(
                     session,
                     f"{url}/awex/update_weights",
                     timeout_s,
-                    json_data={"version": version},
+                    json_data={"version": version, "pair_name": pair_info.pair_name},
                 )
                 for url in pair_info.train_worker_urls + pair_info.inference_worker_urls
             ]
@@ -633,7 +787,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             "args": serialize_value([save_meta]),
             "kwargs": serialize_value({}),
         }
-        await asyncio.gather(
+        await _gather_all(
             *[
                 _post_json(session, f"{url}/save", timeout_s, json_data=save_payload)
                 for url in pair_info.train_worker_urls
@@ -642,7 +796,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
 
         if pair_info.use_lora:
             lora_name = get_versioned_lora_name(pair_info.lora_name, version)
-            await asyncio.gather(
+            await _gather_all(
                 *[
                     _post_json(
                         session,
@@ -682,11 +836,11 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                             e,
                         )
 
-                await asyncio.gather(
+                await _gather_all(
                     *[_unload(url) for url in pair_info.inference_worker_urls]
                 )
         else:
-            await asyncio.gather(
+            await _gather_all(
                 *[
                     _post_json(
                         session,
@@ -702,6 +856,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             )
 
     @app.post("/update_weights")
+    @serialized
     async def update_weights(
         request: Request, body: UpdateWeightsRequest
     ) -> WeightUpdateResult:
@@ -718,6 +873,21 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         timeout_s = config.update_timeout_s
         start = time.monotonic()
 
+        if pair_info.state != "connected":
+            return JSONResponse(
+                status_code=409,
+                content={"error": "Pair requires cleanup before updating"},
+            )
+        if body.version < 0 or (
+            pair_info.has_published and body.version < pair_info.last_version
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={"error": "Weight version cannot move backwards"},
+            )
+        if pair_info.has_published and body.version == pair_info.last_version:
+            return WeightUpdateResult(status="ok", version=body.version, duration_ms=0)
+
         try:
             if pair_info.colocate:
                 await _colocate_transfer_weights(
@@ -732,6 +902,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     pair_info, body.version, session, timeout_s
                 )
         except Exception as e:
+            pair_info.state = "failed"
             duration_ms = (time.monotonic() - start) * 1000
             logger.error(
                 "Weight update failed for pair '%s': %s",
@@ -747,6 +918,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
 
         duration_ms = (time.monotonic() - start) * 1000
         pair_info.last_version = body.version
+        pair_info.has_published = True
         logger.info(
             "Weight update completed for pair '%s' v%d (%.1fms)",
             pair_info.pair_name,
@@ -758,6 +930,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         )
 
     @app.post("/disconnect")
+    @serialized
     async def disconnect(
         request: Request, body: DisconnectRequest
     ) -> DisconnectResponse:
@@ -765,13 +938,32 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
 
         pair_info = registry.get_by_name(body.pair_name)
         if pair_info is None:
+            if body.pair_name in app.state.retired_pairs:
+                return DisconnectResponse(pair_name=body.pair_name)
             return JSONResponse(
                 status_code=404,
                 content={"error": f"Pair '{body.pair_name}' not found"},
             )
 
+        pair_info.state = "draining"
+        failures = await teardown_pair(
+            pair_info,
+            getattr(request.app.state, "http_session", None),
+            training_stopped=body.training_stopped,
+        )
+        if failures:
+            pair_info.state = "failed"
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "Weight update teardown incomplete",
+                    "failures": failures,
+                },
+            )
+
         registry.unregister(pair_info.pair_name)
         kv_store.clear_pair(pair_info.pair_name)
+        app.state.retired_pairs.add(pair_info.pair_name)
 
         return DisconnectResponse(pair_name=pair_info.pair_name)
 

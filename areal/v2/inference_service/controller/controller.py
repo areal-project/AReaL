@@ -975,13 +975,22 @@ class RolloutControllerV2:
         """Tear down all services and release resources."""
         if self._destroyed:
             return
-        self._destroyed = True
-
         self._shutdown_requested.set()
         future = self._init_future
-        self._init_future = None
         if future is not None:
             future.cancel()
+            try:
+                future.result(timeout=self.config.setup_timeout)
+            except concurrent.futures.TimeoutError:
+                if not future.done():
+                    raise RuntimeError(
+                        "Inference initialization is still running; release is unconfirmed"
+                    ) from None
+            except BaseException:
+                if not future.done():
+                    raise
+            self._init_future = None
+        self._destroyed = True
 
         self._stop_online_callback_server()
 
@@ -1054,13 +1063,12 @@ class RolloutControllerV2:
 
         self._ensure_initialized()
 
+        if self._gateway_addr:
+            run_async_task(self._async_set_version, version)
+        # Capacity must not advance until every serving proxy confirms the
+        # version. A partial publication is repaired while generation is paused.
         with self._version_lock:
             self._version = version
-
-        if not self._gateway_addr:
-            return
-
-        run_async_task(self._async_set_version, version)
 
     async def _async_set_version(self, version: int) -> None:
         payload = {"version": version}
@@ -1074,15 +1082,47 @@ class RolloutControllerV2:
         failed = [r for r in results if isinstance(r, Exception)]
         for r in failed:
             logger.error("Failed to set version on a worker: %s", r)
-        if failed and len(failed) == len(results):
+        if failed:
             raise RuntimeError(
-                f"set_version({version}) failed on ALL {len(failed)} workers"
+                f"set_version({version}) failed on {len(failed)}/{len(results)} workers"
             )
 
     def get_version(self) -> int:
         """Return the local version (compatible with VersionProvider protocol)."""
         with self._version_lock:
             return self._version
+
+    def serving_versions(self) -> list[int]:
+        """Read every live proxy; a cached controller version is not an ack."""
+        from areal.infra.utils.concurrent import run_async_task
+
+        self._ensure_initialized()
+        if not self._data_proxy_addrs:
+            raise RuntimeError("No serving proxies are registered")
+
+        async def read_all() -> list[int]:
+            client = await self._get_async_client()
+
+            async def read(addr: str) -> int:
+                response = await client.get(f"{addr}/get_version")
+                response.raise_for_status()
+                value = response.json()["version"]
+                if type(value) is not int or value < 0:
+                    raise RuntimeError("Invalid serving weight version")
+                return value
+
+            results = await asyncio.gather(
+                *(read(addr) for addr in self._data_proxy_addrs),
+                return_exceptions=True,
+            )
+            failures = [value for value in results if isinstance(value, BaseException)]
+            if failures:
+                raise RuntimeError(
+                    "Cannot confirm every serving weight version"
+                ) from failures[0]
+            return results
+
+        return run_async_task(read_all)
 
     # -- Capacity ----------------------------------------------------------
 

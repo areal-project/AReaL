@@ -249,14 +249,32 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                     await _run_one(member_index, session_id, session_api_key)
                 )
         else:
-            results = await asyncio.gather(
-                *[
-                    _run_one(member_index, session_id, session_api_key)
-                    for member_index, (session_id, session_api_key) in enumerate(
-                        sessions
-                    )
-                ]
-            )
+            members = [
+                asyncio.create_task(_run_one(member_index, session_id, session_api_key))
+                for member_index, (session_id, session_api_key) in enumerate(sessions)
+            ]
+            group = asyncio.gather(*members)
+            try:
+                results = await asyncio.shield(group)
+            except asyncio.CancelledError:
+                # gather can raise as soon as one member finishes cancellation.
+                # Keep the parent alive until every member has cleaned up its
+                # resources, even if the parent is cancelled again meanwhile.
+                for member in members:
+                    if not member.done() and not member.cancelling():
+                        member.cancel()
+                drained = asyncio.gather(*members, return_exceptions=True)
+                while not drained.done():
+                    try:
+                        await asyncio.shield(drained)
+                    except asyncio.CancelledError:
+                        continue
+                drained.result()
+                # The shield may have detached from the original aggregate.
+                # Retrieve its exception as well, after every member is done.
+                if not group.cancelled():
+                    group.exception()
+                raise
 
         session_ids = [sid for sid, _ in sessions]
         n_failed = sum(result is None for result in results)

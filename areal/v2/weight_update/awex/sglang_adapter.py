@@ -5,7 +5,12 @@ from __future__ import annotations
 import gc
 import math
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import timedelta
+from functools import wraps
 from typing import Any
 
 import httpx
@@ -35,7 +40,9 @@ from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
+    teardown_weight_update_groups,
 )
+from areal.v2.weight_update.awex.deadline import TransferDeadline
 from areal.v2.weight_update.awex.delta_config import (
     DTERuntimeConfig,
     synchronize_wire_dtypes,
@@ -50,6 +57,56 @@ from areal.v2.weight_update.nccl_group import (
 )
 
 logger = logging.getLogger("AwexSGLangAdapter")
+
+
+def _on_transfer_thread(*, start: bool = False, stop: bool = False):
+    """Keep AWEX's NCCL thread-local state outside the model execution thread."""
+
+    def decorate(method):
+        @wraps(method)
+        def call(self, *args, **kwargs):
+            if start and self._transfer_executor is None:
+                self._finish_transfer_deadline()
+                if current_platform.device_type == "cuda":
+                    self._transfer_device = current_platform.current_device()
+                    self._transfer_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="SGLangAWEX"
+                    )
+            executor = self._transfer_executor
+            if executor is None or self._transfer_thread_id == threading.get_ident():
+                return method(self, *args, **kwargs)
+
+            # The serial scheduler RPC waits here. Drain earlier model work;
+            # a new thread inherits neither streams nor inference-mode state.
+            if not stop:
+                current_platform.synchronize()
+
+            def execute():
+                self._transfer_thread_id = threading.get_ident()
+                with torch.cuda.device(self._transfer_device), torch.inference_mode():
+                    result = method(self, *args, **kwargs)
+                    if not stop:
+                        current_platform.synchronize()
+                    return result
+
+            try:
+                return executor.submit(execute).result()
+            finally:
+                if (
+                    stop
+                    and self._transfer_deadline is None
+                    and self._weights_update_group is None
+                    and self._weights_update_group_gloo is None
+                ):
+                    # Discard any Torch/NCCL nesting state left by an aborted
+                    # operation, after its execution and watchdog have exited.
+                    executor.shutdown(wait=True)
+                    self._transfer_executor = None
+                    self._transfer_thread_id = None
+
+        return call
+
+    return decorate
 
 
 class AwexSGLangAdapter(AwexInferenceAdapter):
@@ -74,6 +131,11 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._train_to_infer_device_mapping: dict | None = None
         self._infer_to_train_device_mapping: dict | None = None
         self._dte_config = DTERuntimeConfig.from_env()
+        self._transfer_timeout_s = 120.0
+        self._transfer_deadline: TransferDeadline | None = None
+        self._transfer_executor: ThreadPoolExecutor | None = None
+        self._transfer_thread_id: int | None = None
+        self._transfer_device: int | None = None
 
     def _get_model(self) -> torch.nn.Module:
         return self._scheduler.tp_worker.model_runner.model
@@ -359,6 +421,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         for _, param in self._get_model().named_parameters():
             param.data.normal_()
 
+    @_on_transfer_thread(start=True)
     def init_weight_update_group(
         self,
         pair_name: str,
@@ -370,7 +433,12 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
+        transfer_timeout_s: float = 120.0,
     ) -> None:
+        self._finish_transfer_deadline()
+        if not math.isfinite(transfer_timeout_s) or transfer_timeout_s <= 0:
+            raise ValueError("AWEX transfer timeout must be finite and positive")
+        self._transfer_timeout_s = transfer_timeout_s
         if self._dte_config.enabled:
             validate_dte_world_size(world_size, infer_world_size, train_world_size)
 
@@ -412,6 +480,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             world_size=world_size,
             group_name=f"awex_{pair_name}",
             role="inference",
+            timeout=timedelta(seconds=transfer_timeout_s + 30.0),
         )
         self._weights_update_group_gloo = init_weights_update_group(
             master_address=master_addr,
@@ -421,6 +490,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             group_name=f"awex_{pair_name}_gloo",
             backend="gloo",
             role="inference",
+            timeout=timedelta(seconds=transfer_timeout_s + 30.0),
         )
         if self._dte_config.enabled:
             self._separation_wire_dtypes = synchronize_wire_dtypes(
@@ -437,7 +507,12 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             pair_name,
         )
 
+    @_on_transfer_thread()
     def execute_weight_update(self, version: int) -> None:
+        with self._bound_transfer():
+            self._execute_weight_update(version)
+
+    def _execute_weight_update(self, version: int) -> None:
         if self._dte_config.enabled:
             self._execute_separation_weight_update(version)
             return
@@ -462,11 +537,63 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             use_group=awex_wu_use_group(),
         )
 
+        self._check_transfer_deadline()
+
         for original, contiguous in non_contiguous_pairs:
             original.copy_(contiguous)
 
         current_platform.synchronize()
-        dist.barrier(group=self._weights_update_group_gloo)
+        self._complete_transfer()
+
+    @contextmanager
+    def _bound_transfer(self):
+        self._finish_transfer_deadline()
+        if current_platform.device_type != "cuda":
+            yield
+            return
+        deadline = TransferDeadline(
+            self._weights_update_group, self._transfer_timeout_s
+        )
+        self._transfer_deadline = deadline
+        try:
+            with deadline:
+                yield
+        except Exception:
+            logger.error(
+                "AWEX transfer failed; preserving exception chain", exc_info=True
+            )
+            raise
+        finally:
+            self._finish_transfer_deadline()
+
+    def _finish_transfer_deadline(self) -> None:
+        # Scheduler RPCs are serial: only the execute thread retires its guard.
+        # Joining here is insufficient if this adapter ever becomes concurrent.
+        deadline = self._transfer_deadline
+        if deadline is None:
+            return
+        deadline.wait()
+        if deadline.aborted:
+            if self._weights_update_group is not deadline.group:
+                raise RuntimeError("AWEX group changed before abort completion")
+            # Torch's abort already unregisters this exact group.
+            self._weights_update_group = None
+        self._transfer_deadline = None
+
+    def _check_transfer_deadline(self) -> None:
+        if self._transfer_deadline is not None:
+            self._transfer_deadline.check()
+
+    def _complete_transfer(self) -> None:
+        if self._transfer_deadline is None:
+            dist.barrier(group=self._weights_update_group_gloo)
+            return
+        remaining = self._transfer_deadline.check()
+        # Same barrier protocol as the senders, with a bounded host wait.
+        work = dist.barrier(group=self._weights_update_group_gloo, async_op=True)
+        if work.wait(timeout=timedelta(seconds=remaining)) is False:
+            raise RuntimeError("AWEX completion barrier did not finish")
+        self._transfer_deadline.check()
 
     def _execute_separation_weight_update(self, version: int) -> None:
         """Receive either a sparse AdamW update or its dense fallback."""
@@ -498,11 +625,12 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 blocking=True,
                 use_group=awex_wu_use_group(),
             )
+            self._check_transfer_deadline()
             for original, contiguous in non_contiguous_pairs:
                 original.copy_(contiguous)
 
         current_platform.synchronize()
-        dist.barrier(group=self._weights_update_group_gloo)
+        self._complete_transfer()
 
     def _execute_separation_delta_recv(
         self,
@@ -570,6 +698,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             len(self._separation_wire_dtypes),
         )
 
+    @_on_transfer_thread()
     def batch_isend_irecv(self, **kwargs) -> None:
         if self._weights_update_group_gloo is None:
             raise RuntimeError("Gloo weight update group is not initialized")
@@ -584,13 +713,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             **setup_kwargs,
         )
 
+    @_on_transfer_thread(stop=True)
     def teardown_weight_update_group(self) -> None:
-        if self._weights_update_group is not None and dist.is_initialized():
-            dist.destroy_process_group(self._weights_update_group)
-        if self._weights_update_group_gloo is not None and dist.is_initialized():
-            dist.destroy_process_group(self._weights_update_group_gloo)
-        self._weights_update_group = None
-        self._weights_update_group_gloo = None
+        self._finish_transfer_deadline()
+        teardown_weight_update_groups(self)
         self._transfer_plan = None
         self._transfer_rank = None
         self._world_size = None

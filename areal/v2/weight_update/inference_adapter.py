@@ -42,6 +42,7 @@ class AwexInferenceAdapter(Protocol):
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
+        transfer_timeout_s: float = 120.0,
     ) -> None:
         """Pull peer meta from KV store, build local recv plan, join NCCL group."""
         ...

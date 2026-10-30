@@ -3394,6 +3394,95 @@ class TeacherConfig:
 
 
 @dataclass
+class ActorLifecycleConfig:
+    """Opt-in native online Actor lifecycle on explicitly allocated local GPUs.
+
+    The state root must be a local filesystem supporting SQLite WAL and flock.
+    GPU pools are physical device indices within the task's allocation. The
+    checkpoint estimate reserves space before another complete generation is
+    written; it must cover model, optimizer and rank sidecars.
+    """
+
+    # The pinned OmegaConf rejects Literal annotations in structured configs.
+    mode: str = field(
+        default="resident",
+        metadata={
+            "help": "Actor lifecycle; on_demand requires native inline mode.",
+            "choices": ["resident", "on_demand"],
+        },
+    )
+    policy: str = field(
+        default="manual",
+        metadata={
+            "help": "On-demand lifecycle policy: manual tools, event-driven agent, or idle timeout.",
+            "choices": ["manual", "agent", "idle", "resident"],
+        },
+    )
+    state_root: str | None = None
+    actor_devices: tuple[int, ...] = ()
+    rollout_devices: tuple[int, ...] = ()
+    idle_timeout: float = 60.0
+    min_ready_seconds: float = 120.0
+    poll_interval: float = 0.2
+    checkpoint_keep: int = 2
+    checkpoint_estimated_bytes: int = 0
+    checkpoint_free_space_floor: int = 1 << 30
+    max_recovery_attempts: int = 0
+
+    def __post_init__(self) -> None:
+        import math
+
+        if self.mode not in ("resident", "on_demand"):
+            raise ValueError("actor_lifecycle.mode must be resident or on_demand")
+        if self.policy not in ("manual", "agent", "idle", "resident"):
+            raise ValueError(
+                "actor_lifecycle.policy must be manual, agent, idle or resident"
+            )
+        if (
+            any(
+                not math.isfinite(value) or value < 0
+                for value in (
+                    self.idle_timeout,
+                    self.min_ready_seconds,
+                    self.poll_interval,
+                )
+            )
+            or self.poll_interval == 0
+        ):
+            raise ValueError(
+                "Lifecycle timeouts must be finite and nonnegative; poll_interval must be positive"
+            )
+        if (
+            self.checkpoint_keep < 1
+            or self.checkpoint_free_space_floor < 0
+            or self.max_recovery_attempts < 0
+        ):
+            raise ValueError(
+                "Invalid checkpoint retention, space floor or recovery limit"
+            )
+        if self.mode == "on_demand":
+            if self.state_root is None or not Path(self.state_root).is_absolute():
+                raise ValueError(
+                    "on_demand requires an absolute actor_lifecycle.state_root"
+                )
+            if self.checkpoint_estimated_bytes <= 0:
+                raise ValueError(
+                    "on_demand requires a positive full checkpoint size estimate"
+                )
+            for devices in (self.actor_devices, self.rollout_devices):
+                if (
+                    not devices
+                    or len(devices) != len(set(devices))
+                    or any(type(device) is not int or device < 0 for device in devices)
+                ):
+                    raise ValueError(
+                        "on_demand requires explicit, nonempty, unique GPU pools"
+                    )
+            if set(self.actor_devices).intersection(self.rollout_devices):
+                raise ValueError("Actor and Rollout GPU pools must be disjoint")
+
+
+@dataclass
 class PPOConfig(BaseExperimentConfig):
     """Configuration for Proximal Policy Optimization (PPO) reinforcement learning experiments."""
 
@@ -3408,6 +3497,7 @@ class PPOConfig(BaseExperimentConfig):
     )
     rollout: InferenceEngineConfig = field(default_factory=InferenceEngineConfig)
     actor: PPOActorConfig = field(default_factory=PPOActorConfig)
+    actor_lifecycle: ActorLifecycleConfig = field(default_factory=ActorLifecycleConfig)
     ref: PPOActorConfig | None = field(default=None)
     critic: PPOCriticConfig | None = field(default=None)
     teacher: TeacherConfig | None = field(

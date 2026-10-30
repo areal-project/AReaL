@@ -347,6 +347,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
     def _check_thread_exception(self):
         """Check if any background thread has failed and raise if so."""
+        if self._shutdown_event.is_set():
+            raise RuntimeError("Workflow dispatcher is shutting down")
         with self._thread_exception_lock:
             if self._thread_exception is not None:
                 raise RuntimeError(
@@ -414,6 +416,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     continue
 
             except Exception as e:
+                if self._shutdown_event.is_set():
+                    break
                 self.logger.error("Producer thread failed", exc_info=True)
                 self._set_thread_exception(e)
                 with self._result_cv:
@@ -453,6 +457,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     self._input_cv.notify()
 
             except Exception as e:
+                if self._shutdown_event.is_set():
+                    break
                 self.logger.error("Consumer thread failed", exc_info=True)
                 self._set_thread_exception(e)
                 with self._result_cv:
@@ -488,12 +494,16 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self._fetch_thread = threading.Thread(target=self._fetch_loop, daemon=True)
         self._fetch_thread.start()
 
-    def destroy(self):
+    def request_shutdown(self):
+        """Wake blocking batch consumers before joining their owning thread."""
         self._shutdown_event.set()
         with self._input_cv:
             self._input_cv.notify()
         with self._result_cv:
             self._result_cv.notify_all()
+
+    def destroy(self):
+        self.request_shutdown()
 
         if self._commit_thread and self._commit_thread.is_alive():
             self._commit_thread.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS)
@@ -702,6 +712,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         results = []
 
         while True:
+            self._check_thread_exception()
             # Submit tasks to maintain overlap
             with self._input_cv:
                 pending_inputs = len(self._pending_inputs)

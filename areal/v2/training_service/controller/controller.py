@@ -8,6 +8,8 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Callable
+from functools import wraps
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -26,6 +28,15 @@ if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler, Worker
 
 logger = logging.getLogger("GatewayTrainController")
+
+
+def _exclusive_engine_operation(method: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(method)
+    def execute(self: GatewayTrainController, *args: Any, **kwargs: Any) -> Any:
+        with self._engine_operation_lock:
+            return method(self, *args, **kwargs)
+
+    return execute
 
 
 class GatewayTrainController:
@@ -56,6 +67,8 @@ class GatewayTrainController:
         self._own_process_group = False
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
+        self._weight_update_identity: tuple[Any, ...] | None = None
+        self._engine_operation_lock = threading.RLock()
 
         # Version management
         self._version_lock = Lock()
@@ -70,6 +83,7 @@ class GatewayTrainController:
         self._init_lock = threading.Lock()
         self._workers_ready = threading.Event()
         self._shutdown_requested = threading.Event()
+        self._full_restore_pending = False
 
     # -- Initialize --------------------------------------------------------
 
@@ -79,6 +93,7 @@ class GatewayTrainController:
         ft_spec: FinetuneSpec | None = None,
         *,
         wait: bool = False,
+        restore_from_full_checkpoint: bool = False,
         **kwargs: Any,
     ) -> concurrent.futures.Future | None:
         if self._init_future is not None:
@@ -86,6 +101,11 @@ class GatewayTrainController:
                 "initialize() called while a previous initialization is in progress"
             )
 
+        if restore_from_full_checkpoint:
+            if self.train_alloc.backend != "megatron":
+                raise ValueError("Deferred weight initialization requires Megatron")
+            kwargs["restore_from_full_checkpoint"] = True
+        self._full_restore_pending = restore_from_full_checkpoint
         self._role = role
 
         self._workers_ready.clear()
@@ -310,6 +330,16 @@ class GatewayTrainController:
                         kwargs={
                             "addr": kwargs.get("addr"),
                             "ft_spec": ft_spec,
+                            **(
+                                {"worker_seed": kwargs["worker_seed"]}
+                                if "worker_seed" in kwargs
+                                else {}
+                            ),
+                            **(
+                                {"restore_from_full_checkpoint": True}
+                                if kwargs.get("restore_from_full_checkpoint", False)
+                                else {}
+                            ),
                         },
                         timeout=self.config.setup_timeout,
                     )
@@ -582,7 +612,7 @@ class GatewayTrainController:
         return host, port
 
     def _kill_forked_service(
-        self, guard_addr: str, role: str, worker_index: int
+        self, guard_addr: str, role: str, worker_index: int, *, strict: bool = False
     ) -> None:
         import requests
 
@@ -595,13 +625,24 @@ class GatewayTrainController:
             if resp.status_code == 200:
                 logger.info("Killed forked service %s/%d", role, worker_index)
             else:
+                if strict:
+                    raise RuntimeError(
+                        f"Unconfirmed forked service exit: {role}/{worker_index} "
+                        f"(HTTP {resp.status_code})"
+                    )
                 logger.warning(
                     "Failed to kill %s/%d: %s", role, worker_index, resp.text
                 )
         except Exception as exc:
+            if strict:
+                raise
             logger.error("Error killing %s/%d: %s", role, worker_index, exc)
 
     # -- Health checks -----------------------------------------------------
+
+    def _require_restored_weights(self) -> None:
+        if self._full_restore_pending:
+            raise RuntimeError("Actor requires a successful full checkpoint restore")
 
     def _wait_for_service(
         self, url: str, name: str, timeout: float | None = None
@@ -640,16 +681,20 @@ class GatewayTrainController:
 
     # -- Gateway HTTP helpers (duck-type TrainController interface) ---------
 
-    def _gateway_post(self, path: str, payload: Any = None) -> Any:
+    @_exclusive_engine_operation
+    def _gateway_post(
+        self, path: str, payload: Any = None, *, timeout: float | None = None
+    ) -> Any:
         import requests
 
         self._ensure_initialized()
+        self._require_restored_weights()
         url = f"{self._gateway_addr}{path}"
         resp = requests.post(
             url,
             json=payload,
             headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=self.config.request_timeout,
+            timeout=self.config.request_timeout if timeout is None else timeout,
         )
         if resp.status_code >= 400:
             raise RuntimeError(
@@ -657,10 +702,12 @@ class GatewayTrainController:
             )
         return resp.json()
 
+    @_exclusive_engine_operation
     def _gateway_get(self, path: str) -> Any:
         import requests
 
         self._ensure_initialized()
+        self._require_restored_weights()
         url = f"{self._gateway_addr}{path}"
         resp = requests.get(
             url,
@@ -773,11 +820,9 @@ class GatewayTrainController:
         self._gateway_post("/eval")
         return self
 
+    @_exclusive_engine_operation
     def set_version(self, version: int) -> None:
         from areal.infra.rpc.serialization import serialize_value
-
-        with self._version_lock:
-            self._version = version
 
         self._gateway_post(
             "/set_version",
@@ -786,6 +831,8 @@ class GatewayTrainController:
                 "kwargs": serialize_value({}),
             },
         )
+        with self._version_lock:
+            self._version = version
 
     def get_version(self) -> int:
         with self._version_lock:
@@ -812,6 +859,87 @@ class GatewayTrainController:
                 "kwargs": serialize_value({}),
             },
         )
+
+    @_exclusive_engine_operation
+    def full_checkpoint(
+        self,
+        operation: str,
+        *,
+        path: str,
+        backend: str,
+        identity_sha256: str,
+        version: int,
+    ) -> list[dict[str, Any]]:
+        """Preflight all ranks before a native collective save/load, with no retries."""
+        self._ensure_initialized()
+        if operation not in ("save", "load"):
+            raise ValueError("Full checkpoint operation must be save or load")
+        if operation == "save":
+            self._require_restored_weights()
+        kwargs = {
+            "path": path,
+            "backend": backend,
+            "identity_sha256": identity_sha256,
+            "version": version,
+        }
+
+        async def all_ranks(
+            endpoint: str, parameters: dict[str, Any]
+        ) -> list[dict[str, Any]]:
+            results = await asyncio.gather(
+                *[
+                    self._call_worker_engine_endpoint(
+                        worker,
+                        endpoint,
+                        kwargs=parameters,
+                        timeout=self.config.setup_timeout,
+                    )
+                    for worker in self._worker_addrs
+                ],
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            reports = results
+            if len(reports) != self.train_alloc.parallel.world_size or sorted(
+                report["rank"] for report in reports
+            ) != list(range(self.train_alloc.parallel.world_size)):
+                raise ValueError("Full checkpoint rank reports are incomplete")
+            for report in reports:
+                if (
+                    report["world_size"],
+                    report["policy_version"],
+                    report["backend"],
+                    report["identity_sha256"],
+                ) != (
+                    self.train_alloc.parallel.world_size,
+                    version,
+                    backend,
+                    identity_sha256,
+                ):
+                    raise ValueError("Full checkpoint worker identity mismatch")
+            return reports
+
+        async def execute() -> list[dict[str, Any]]:
+            inspected = await all_ranks(
+                "/checkpoint/inspect", {**kwargs, "loading": operation == "load"}
+            )
+            completed = await all_ranks(f"/checkpoint/{operation}", kwargs)
+            if {r["rank"]: r["state_sha256"] for r in inspected} != {
+                r["rank"]: r["state_sha256"] for r in completed
+            }:
+                raise ValueError(
+                    "Checkpoint runtime changed between preflight and completion"
+                )
+            return completed
+
+        reports = run_async_task(execute)
+        if operation == "load":
+            with self._version_lock:
+                self._version = version
+            self._full_restore_pending = False
+        return reports
 
     def offload(self) -> None:
         self._gateway_post("/offload")
@@ -869,7 +997,11 @@ class GatewayTrainController:
             "args": serialize_value([]),
             "kwargs": serialize_value({"step": step, "force": force}),
         }
-        self._gateway_post("/save_perf_tracer", payload)
+        # Optional trace persistence must not block failed-generation cleanup
+        # for the full training RPC timeout. A timeout does not cancel the RPC.
+        self._gateway_post(
+            "/save_perf_tracer", payload, timeout=min(5.0, self.config.request_timeout)
+        )
 
     def clear_batches(self, *targets: Any) -> None:
         from areal.infra.rpc.rtensor import RTensor, flatten_shard_ids
@@ -932,8 +1064,10 @@ class GatewayTrainController:
 
     # -- RL parity methods (connect_engine / update_weights / batch) --------
 
+    @_exclusive_engine_operation
     def connect_engine(self, rollout: Any, meta: Any) -> None:
         self._ensure_initialized()
+        self._require_restored_weights()
         import requests
 
         from areal.v2.inference_service.controller.controller import (
@@ -953,14 +1087,34 @@ class GatewayTrainController:
                 f"Ensure _version='v2' is set on InferenceEngineConfig."
             )
 
-        self.rollout = rollout
-
         if meta.type not in ("awex", "disk"):
             raise ValueError(
                 f"GatewayTrainController supports 'awex' or 'disk' weight "
                 f"updates, got '{meta.type}'"
             )
 
+        inference_urls: list[str] = rollout.inference_worker_urls
+        identity = (
+            tuple(self._worker_addrs),
+            tuple(inference_urls),
+            meta.type,
+            meta.path if meta.type == "disk" else None,
+            meta.use_lora,
+            meta.lora_name,
+            meta.lora_keep_versions,
+        )
+        if self._weight_update_ctrl is not None:
+            if self._weight_update_identity == identity:
+                self.rollout = rollout
+                return
+            # Preserve the old handle until both peers confirm cleanup. A
+            # partially initialized pair must also pass through disconnect.
+            self._weight_update_ctrl.disconnect()
+            self._weight_update_ctrl.destroy()
+            self._weight_update_ctrl = None
+            self._weight_update_identity = None
+
+        self.rollout = rollout
         ctrl = WeightUpdateController(
             WeightUpdateControllerConfig(
                 # Bind gateway to this node's outbound IP so cross-host
@@ -971,10 +1125,10 @@ class GatewayTrainController:
                 log_level=self.config.log_level,
             )
         )
+        self._weight_update_ctrl = ctrl
         ctrl.initialize()
 
-        inference_urls: list[str] = rollout.inference_worker_urls
-        pair_name = f"{self._role}-rollout"
+        pair_name = f"{self._role}-rollout-{uuid4().hex}"
 
         if meta.type == "awex":
             # NCCL rendezvous master must live on the rank-0 process's node.
@@ -1007,7 +1161,7 @@ class GatewayTrainController:
                 lora_name=meta.lora_name,
                 lora_keep_versions=meta.lora_keep_versions,
             )
-        self._weight_update_ctrl = ctrl
+        self._weight_update_identity = identity
         logger.info(
             "WeightUpdateController connected (pair=%s, train=%d, inf=%d)",
             pair_name,
@@ -1015,17 +1169,24 @@ class GatewayTrainController:
             len(inference_urls),
         )
 
-    def update_weights(self, meta: Any) -> None:
+    @_exclusive_engine_operation
+    def update_weights(self, meta: Any, *, resume_generation: bool = True) -> None:
         if self._weight_update_ctrl is None or self.rollout is None:
             raise RuntimeError(
                 "connect_engine() must be called before update_weights()"
             )
         self.rollout.pause_generation()
-        assert meta.version is not None and meta.version > 0, (
-            f"meta.version must be a positive integer, got {meta.version}"
+        assert type(meta.version) is int and meta.version >= 0, (
+            f"meta.version must be a nonnegative integer, got {meta.version}"
         )
         result = self._weight_update_ctrl.update_weights(version=meta.version)
-        self.rollout.continue_generation()
+        if result.status != "ok" or result.version != meta.version:
+            raise RuntimeError(
+                f"Weight publication v{meta.version} was not confirmed: {result}"
+            )
+        self.rollout.set_version(meta.version)
+        if resume_generation:
+            self.rollout.continue_generation()
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",
             meta.version,
@@ -1100,7 +1261,7 @@ class GatewayTrainController:
 
     # -- Destroy -----------------------------------------------------------
 
-    def _graceful_shutdown_workers(self) -> None:
+    def _graceful_shutdown_workers(self, *, strict: bool = False) -> None:
         """Destroy engines on all training workers before killing processes.
 
         ``dist.destroy_process_group()`` is a local operation
@@ -1118,13 +1279,20 @@ class GatewayTrainController:
                 tasks = []
                 for addr in self._worker_addrs:
                     tasks.append(_shutdown_one(session, addr))
-                await asyncio.gather(*tasks, return_exceptions=True)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                errors = [result for result in results if isinstance(result, Exception)]
+                if strict and errors:
+                    raise ExceptionGroup(
+                        "Training engine shutdown is unconfirmed", errors
+                    )
 
         async def _shutdown_one(session: aiohttp.ClientSession, addr: str) -> None:
+            errors = []
             try:
                 async with session.post(f"{addr}/awex/teardown") as resp:
                     resp.raise_for_status()
             except Exception as e:
+                errors.append(e)
                 logger.warning(
                     "Graceful shutdown: failed to call /awex/teardown on %s: %s",
                     addr,
@@ -1134,16 +1302,30 @@ class GatewayTrainController:
                 async with session.post(f"{addr}/destroy_engine", json={}) as resp:
                     resp.raise_for_status()
             except Exception as e:
+                errors.append(e)
                 logger.warning(
                     "Graceful shutdown: failed to call /destroy_engine on %s: %s",
                     addr,
                     e,
                 )
+            if strict and errors:
+                raise ExceptionGroup(f"Unconfirmed shutdown on {addr}", errors)
 
         run_async_task(_shutdown_all)
         logger.info("All training worker engines destroyed gracefully")
 
-    def _cleanup_runtime_state(self) -> None:
+    def _cleanup_runtime_state(
+        self, *, training_stopped: bool = False, parallel_child_cleanup: bool = False
+    ) -> None:
+        if self._weight_update_ctrl is not None:
+            # A live inference generation must release its old communicator
+            # before the training peers disappear. Propagate uncertainty so
+            # callers cannot treat an unconfirmed release as reusable GPUs.
+            self._weight_update_ctrl.disconnect()
+            self._weight_update_ctrl.destroy()
+            self._weight_update_ctrl = None
+            self._weight_update_identity = None
+
         if self._router_addr and self._model_addr:
             try:
                 import requests
@@ -1157,9 +1339,35 @@ class GatewayTrainController:
             except Exception:
                 logger.error("Failed to unregister model: %s", traceback.format_exc())
 
-        self._graceful_shutdown_workers()
+        if not training_stopped:
+            if parallel_child_cleanup:
+                self._graceful_shutdown_workers(strict=True)
+            else:
+                self._graceful_shutdown_workers()
+
+        if parallel_child_cleanup and not training_stopped and self._forked_services:
+            # Elastic only: collectives have already been shut down above. Keep
+            # guards/ownership until every independent child exit is confirmed.
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(32, len(self._forked_services)),
+                thread_name_prefix="actor_teardown",
+            ) as pool:
+                futures = [
+                    pool.submit(self._kill_forked_service, *service, strict=True)
+                    for service in reversed(self._forked_services)
+                ]
+                errors = []
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as error:
+                        errors.append(error)
+            if errors:
+                raise ExceptionGroup("Actor child release is unconfirmed", errors)
 
         for guard_addr, role, worker_index in reversed(self._forked_services):
+            if training_stopped or parallel_child_cleanup:
+                continue
             try:
                 self._kill_forked_service(guard_addr, role, worker_index)
             except Exception:
@@ -1204,14 +1412,53 @@ class GatewayTrainController:
                 logger.error(
                     "Failed to destroy process group: %s", traceback.format_exc()
                 )
-            finally:
-                self._own_process_group = False
+                if dist.is_initialized():
+                    raise
+            if dist.is_initialized():
+                raise RuntimeError("Coordinator process group release is unconfirmed")
+            self._own_process_group = False
 
-    def destroy(self) -> None:
+    @_exclusive_engine_operation
+    def destroy(
+        self, *, training_stopped: bool = False, parallel_child_cleanup: bool = False
+    ) -> None:
+        self.quiesce_initialization()
+        if training_stopped:
+            self.disconnect_stopped_training()
+        self._cleanup_runtime_state(
+            training_stopped=training_stopped,
+            parallel_child_cleanup=parallel_child_cleanup,
+        )
+
+    @_exclusive_engine_operation
+    def disconnect_stopped_training(self) -> None:
+        """Recovery only: caller must prove all owned training processes exited.
+
+        The surviving inference peers must still acknowledge communicator
+        teardown. A timeout or a failed worker RPC is never sufficient proof.
+        """
+        if self._weight_update_ctrl is not None:
+            self._weight_update_ctrl.disconnect(training_stopped=True)
+            self._weight_update_ctrl.destroy()
+            self._weight_update_ctrl = None
+            self._weight_update_identity = None
+
+    def quiesce_initialization(self, timeout: float | None = None) -> None:
+        """Wait for a running launch to stop before deleting its resources."""
         self._shutdown_requested.set()
         future = self._init_future
-        self._init_future = None
         if future is not None:
             future.cancel()
-
-        self._cleanup_runtime_state()
+            try:
+                future.result(timeout=timeout or self.config.setup_timeout)
+            except concurrent.futures.TimeoutError:
+                # A completed launch may itself have raised TimeoutError.
+                # Only a still-running creator prevents final cleanup.
+                if not future.done():
+                    raise RuntimeError(
+                        "Training initialization is still running; release is unconfirmed"
+                    ) from None
+            except BaseException:
+                if not future.done():
+                    raise
+            self._init_future = None

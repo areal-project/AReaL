@@ -2,6 +2,7 @@
 """NCCL process group initialization utilities for weight updates."""
 
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -92,6 +93,7 @@ def init_weights_update_group(
     group_name,
     backend="nccl",
     role="",
+    timeout: timedelta | None = None,
 ):
     """Initialize the Torch process group for model parameter updates."""
     assert torch.distributed.is_initialized(), (
@@ -128,6 +130,7 @@ def init_weights_update_group(
             rank=rank,
             group_name=group_name,
             pg_options=options,
+            timeout=timeout,
         )
         logger.info(f"Initialized custom process group: {group}")
         return group
