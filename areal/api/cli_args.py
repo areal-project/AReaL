@@ -278,6 +278,12 @@ class GenerationHyperparameters:
             )
         },
     )
+    score_centering_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "SGLang sampler head width for score centering; 0 disables collection. Requires temperature=1 and untruncated sampling."
+        },
+    )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
 
     def new(self, **kwargs):
@@ -316,6 +322,7 @@ class GenerationHyperparameters:
         )
 
     _OPENAI_UNSUPPORTED_ARGS: ClassVar[set[str]] = {
+        "score_centering_top_k",
         "min_new_tokens",  # Not supported by OpenAI
         "greedy",  # Not directly supported by OpenAI
         "top_k",  # Not supported by OpenAI
@@ -339,6 +346,10 @@ class GenerationHyperparameters:
         self, exclude_args: list[str] | None = None, api_format: str = "completions"
     ) -> dict[str, Any]:
         """Convert the generation hyperparameters to a dictionary of arguments for OpenAI client."""
+        if self.score_centering_top_k:
+            raise ValueError(
+                "Score centering requires the native SGLang RLVR workflow, not OpenAI clients."
+            )
         final_exclude_args = set(exclude_args) if exclude_args is not None else set()
         final_exclude_args.update(self._OPENAI_UNSUPPORTED_ARGS)
         # TODO: move the excluded args into extra body, so they can be passed through the client request
@@ -2198,6 +2209,13 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={"help": "Maximum number of new tokens to generate"},
     )
 
+    use_score_centering: bool = field(
+        default=False,
+        metadata={
+            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Initial support: SGLang, FSDP, temperature=1, no sampling truncation."
+        },
+    )
+
     def _uses_group_statistics(self) -> bool:
         for normalization in (self.reward_norm, self.adv_norm):
             if normalization is None:
@@ -2401,6 +2419,28 @@ class PPOActorConfig(TrainEngineConfig):
                 )
 
         super().__post_init__()
+        if self.use_score_centering:
+            if (
+                not self.backend.startswith("fsdp:")
+                or self.enable_tree_training
+                or self.is_critic
+            ):
+                raise ValueError("Score centering requires an ordinary FSDP actor.")
+            if self.temperature != 1.0 or self.recompute_logprob:
+                raise ValueError(
+                    "Score centering requires temperature=1 and recompute_logprob=False to preserve sampler probabilities."
+                )
+            if (
+                self.use_sapo_loss
+                or self.use_cispo_loss
+                or self.use_decoupled_loss
+                or self.rejection_sampling is not None
+                or self.m2_threshold is not None
+                or self.importance_sampling_level != "token"
+            ):
+                raise ValueError(
+                    "Score centering selects unweighted token-wise REINFORCE; other policy surrogates and rejection rules are unsupported."
+                )
 
 
 @dataclass

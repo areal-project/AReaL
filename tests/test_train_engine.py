@@ -181,7 +181,9 @@ def test_eval_batch(engine, mock_input):
         loss_weight_fn=lambda x: x["cu_seqlens"][-1],
     )
     assert isinstance(eval_result, torch.Tensor), "Evaluation should return a tensor"
-    assert eval_result.is_cuda, "Evaluation tensor should be on CUDA device"
+    assert eval_result.device.type == current_platform.device_type, (
+        f"Evaluation tensor should be on {current_platform.device_type} device"
+    )
     assert eval_result is not None, "Evaluation should return a loss value"
     print(f"✓ Evaluation successful, loss: {eval_result.item()}")
 

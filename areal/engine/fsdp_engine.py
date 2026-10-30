@@ -353,6 +353,11 @@ class FSDPEngine(TrainEngine):
 
         parallel_strategy = self._make_parallel_strategy(parallel_strategy)
 
+        if getattr(self.config, "use_score_centering", False) and (
+            parallel_strategy.tensor_parallel_size != 1
+            or parallel_strategy.context_parallel_size != 1
+        ):
+            raise ValueError("Score centering currently requires TP=SP=1.")
         self.parallel_helper = ParallelHelper.from_parallel_strategy(parallel_strategy)
 
         self.logger.info(
@@ -2173,6 +2178,8 @@ class FSDPEngine(TrainEngine):
         inputs.pop("turn_ids", None)
         inputs.pop("is_truncated", None)
         inputs.pop("_pg_token_weights", None)
+        inputs.pop("sampler_head_ids", None)
+        inputs.pop("sampler_head_logprobs", None)
 
         ctx = FSDPTrainContext(
             model_inputs=inputs,
@@ -2294,7 +2301,39 @@ class FSDPEngine(TrainEngine):
                 "Tree training with critic model is not supported yet."
             )
         if not self.config.is_critic:
-            if self.enable_tree_training:
+            sc_correction = None
+            if getattr(self.config, "use_score_centering", False):
+                if (
+                    self.enable_tree_training
+                    or self.parallel_helper.sp_size != 1
+                    or self.parallel_helper.tp_size != 1
+                ):
+                    raise ValueError(
+                        "Score centering currently requires ordinary FSDP sequences with TP=SP=1."
+                    )
+                from areal.utils.score_centering import score_centering_logprobs
+
+                n = logits.shape[0] - ctx.pad_length
+                labels = torch.roll(
+                    ctx.model_inputs["input_ids"], shifts=-1, dims=-1
+                ).reshape(-1)[:n]
+                ids = ctx.mb_input["sampler_head_ids"]
+                q = ctx.mb_input["sampler_head_logprobs"]
+                if ids.ndim != 2 or ids.shape[0] != n or ids.shape != q.shape:
+                    raise ValueError(
+                        "Packed sampler heads must have shape [real_tokens, K]."
+                    )
+                logprobs, entropy, sc_correction = score_centering_logprobs(
+                    logits[:n],
+                    labels,
+                    ids,
+                    q,
+                    chunk_size=self.config.logprobs_chunk_size,
+                )
+                vocab_min_logits, vocab_max_logits = self._get_vocab_min_max_logits(
+                    logits[:n], 0
+                )
+            elif self.enable_tree_training:
                 # Handle dummy trie (empty tree for DP synchronization)
                 # When trie has no sequences, return zero loss with grad connection
                 if ctx.trie_node is None or not ctx.trie_node.all_sequence_ids:
@@ -2337,6 +2376,11 @@ class FSDPEngine(TrainEngine):
                 ctx.mb_input,
                 vocab_min_logits=vocab_min_logits,
                 vocab_max_logits=vocab_max_logits,
+                **(
+                    {"sc_correction": sc_correction}
+                    if sc_correction is not None
+                    else {}
+                ),
             )
         else:
             values = self._compute_values(logits.squeeze(-1), ctx.ulysses_pad_size)

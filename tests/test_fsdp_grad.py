@@ -13,9 +13,11 @@ from areal.engine.fsdp_utils.grad import (
     get_main_grads_for_grad_norm,
     to_local_if_dtensor,
 )
+from areal.infra.platforms import current_platform
 
-# Check if CUDA is available
-CUDA_AVAILABLE = torch.cuda.is_available()
+# Check if an accelerator (CUDA, XPU, NPU, ...) is available
+ACCELERATOR_DEVICE = current_platform.device_type
+ACCELERATOR_AVAILABLE = ACCELERATOR_DEVICE != "cpu"
 
 
 class SimpleModel(nn.Module):
@@ -147,12 +149,12 @@ class TestGetGradNormFp32:
             f"norm_type={norm_type}: {result} != {expected}"
         )
 
-    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    @pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="Accelerator not available")
     @pytest.mark.parametrize("norm_type", [1.0, 2.0, 3.0, float("inf")])
     def test_norm_types_gpu_no_offload(self, mock_process_groups, norm_type):
         """Test different norm types with GPU tensors (offload_params=False)."""
         dp_group, mp_group = mock_process_groups
-        grads = [torch.randn(4, 4, device="cuda") for _ in range(3)]
+        grads = [torch.randn(4, 4, device=ACCELERATOR_DEVICE) for _ in range(3)]
 
         with patch("torch.distributed.all_reduce"):
             result = get_grad_norm_fp32(
@@ -170,7 +172,7 @@ class TestGetGradNormFp32:
             f"norm_type={norm_type}: {result} != {expected}"
         )
 
-    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    @pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="Accelerator not available")
     def test_offload_vs_non_offload_consistency_l2(self, mock_process_groups):
         """Test that offload and non-offload paths produce consistent L2 norm results."""
         dp_group, mp_group = mock_process_groups
@@ -178,7 +180,7 @@ class TestGetGradNormFp32:
         # Use same random seed to create identical gradients
         torch.manual_seed(42)
         grads_cpu = [torch.randn(4, 4, device="cpu") for _ in range(3)]
-        grads_gpu = [g.clone().cuda() for g in grads_cpu]
+        grads_gpu = [g.clone().to(ACCELERATOR_DEVICE) for g in grads_cpu]
 
         with patch("torch.distributed.all_reduce"):
             result_offload = get_grad_norm_fp32(
@@ -190,14 +192,14 @@ class TestGetGradNormFp32:
 
         assert abs(result_offload - result_no_offload) < 1e-4
 
-    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    @pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="Accelerator not available")
     def test_offload_vs_non_offload_consistency_inf(self, mock_process_groups):
         """Test that offload and non-offload paths produce consistent inf norm results."""
         dp_group, mp_group = mock_process_groups
 
         torch.manual_seed(42)
         grads_cpu = [torch.randn(4, 4, device="cpu") for _ in range(3)]
-        grads_gpu = [g.clone().cuda() for g in grads_cpu]
+        grads_gpu = [g.clone().to(ACCELERATOR_DEVICE) for g in grads_cpu]
 
         with patch("torch.distributed.all_reduce"):
             result_offload = get_grad_norm_fp32(
@@ -292,10 +294,10 @@ class TestClipGradByTotalNormFp32:
         new_norm = compute_expected_grad_norm(list(model.parameters()), norm_type=2.0)
         assert new_norm < original_norm
 
-    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    @pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="Accelerator not available")
     def test_clipping_reduces_grad_magnitude_gpu(self):
         """Test that clipping reduces gradient magnitude when norm exceeds max (GPU)."""
-        model = create_model_with_grads(device="cuda", grad_scale=10.0)
+        model = create_model_with_grads(device=ACCELERATOR_DEVICE, grad_scale=10.0)
 
         original_norm = compute_expected_grad_norm(
             list(model.parameters()), norm_type=2.0
@@ -338,10 +340,10 @@ class TestClipGradByTotalNormFp32:
                 expected = original_grads[name] * expected_scale
                 assert torch.allclose(param.grad, expected, atol=1e-6)
 
-    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    @pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="Accelerator not available")
     def test_clip_coefficient_applied_correctly_gpu(self):
         """Test that the clip coefficient is applied correctly (GPU)."""
-        model = create_model_with_grads(device="cuda", grad_scale=1.0)
+        model = create_model_with_grads(device=ACCELERATOR_DEVICE, grad_scale=1.0)
         original_grads = {
             name: param.grad.clone()
             for name, param in model.named_parameters()
@@ -382,17 +384,17 @@ class TestClipGradByTotalNormFp32:
             offload_params=True,
         )
 
-    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    @pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="Accelerator not available")
     def test_offload_vs_non_offload_clipping_consistency(self):
         """Test that CPU and GPU paths produce same clipping results."""
         torch.manual_seed(42)
 
         # Create model on CPU first, then copy to GPU to ensure identical grads
         model_cpu = create_model_with_grads(device="cpu", grad_scale=5.0)
-        model_gpu = copy.deepcopy(model_cpu).cuda()
+        model_gpu = copy.deepcopy(model_cpu).to(ACCELERATOR_DEVICE)
         for p_cpu, p_gpu in zip(model_cpu.parameters(), model_gpu.parameters()):
             if p_cpu.grad is not None:
-                p_gpu.grad = p_cpu.grad.clone().cuda()
+                p_gpu.grad = p_cpu.grad.clone().to(ACCELERATOR_DEVICE)
 
         total_norm = 10.0
         max_norm = 1.0
@@ -454,10 +456,10 @@ class TestIntegration:
             expected_ratio = max_norm / (total_norm + 1e-6)
             assert abs(new_norm - total_norm * expected_ratio) < 1e-4
 
-    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    @pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="Accelerator not available")
     def test_compute_and_clip_workflow_gpu(self):
         """Test the complete workflow of computing norm and clipping (GPU)."""
-        model = create_model_with_grads(device="cuda", grad_scale=5.0)
+        model = create_model_with_grads(device=ACCELERATOR_DEVICE, grad_scale=5.0)
         params = list(model.parameters())
         grads = [p.grad for p in params if p.grad is not None]
 
@@ -485,16 +487,16 @@ class TestIntegration:
             expected_ratio = max_norm / (total_norm + 1e-6)
             assert abs(new_norm - total_norm * expected_ratio) < 1e-4
 
-    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    @pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="Accelerator not available")
     def test_cpu_gpu_consistency_end_to_end(self):
         """Test that CPU and GPU paths produce consistent results end-to-end."""
         torch.manual_seed(42)
         # Create model on CPU first, then copy to GPU to ensure identical grads
         model_cpu = create_model_with_grads(device="cpu", grad_scale=5.0)
-        model_gpu = copy.deepcopy(model_cpu).cuda()
+        model_gpu = copy.deepcopy(model_cpu).to(ACCELERATOR_DEVICE)
         for p_cpu, p_gpu in zip(model_cpu.parameters(), model_gpu.parameters()):
             if p_cpu.grad is not None:
-                p_gpu.grad = p_cpu.grad.clone().cuda()
+                p_gpu.grad = p_cpu.grad.clone().to(ACCELERATOR_DEVICE)
 
         dp_group = MagicMock()
         mp_group = MagicMock()

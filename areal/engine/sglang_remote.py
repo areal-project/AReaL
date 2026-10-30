@@ -150,6 +150,12 @@ class SGLangBackend:
             "stream": False,
         }
 
+        if gconfig.score_centering_top_k:
+            from areal.utils.score_centering import validate_sampling
+
+            validate_sampling(gconfig)
+            payload["top_logprobs_num"] = gconfig.score_centering_top_k
+
         # Add return_routed_experts to payload if set
         if req.metadata.get("return_routed_experts", False):
             payload["return_routed_experts"] = True
@@ -201,7 +207,12 @@ class SGLangBackend:
         output_tokens = [x[1] for x in meta_info["output_token_logprobs"]]
         output_logprobs = [x[0] for x in meta_info["output_token_logprobs"]]
 
+        from areal.utils.score_centering import parse_sampler_heads
+
+        head_ids, head_logprobs = parse_sampler_heads(meta_info, output_tokens)
         return HttpGenerationResult(
+            sampler_head_ids=head_ids,
+            sampler_head_logprobs=head_logprobs,
             output_tokens=output_tokens,
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,

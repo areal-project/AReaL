@@ -14,9 +14,6 @@ from openai.types.responses.response_input_param import ResponseInputParam
 from areal.api import ModelResponse
 from areal.engine.r3.preprocess import preprocess_routed_experts_batch
 from areal.utils.data import RolloutGroup, concat_padded_tensors, get_batch_size
-from areal.utils import logging
-
-logger = logging.getLogger("TokenLogpReward")
 
 
 class ApiType(str, Enum):
@@ -197,6 +194,13 @@ class InteractionWithTokenLogpReward:
             parent_versions = parent_res["versions"].squeeze(0).tolist()
             parent_turn_ids = parent_res["turn_ids"].squeeze(0).tolist()
             parent_len = len(parent_logprobs)
+            parent_tokens = parent_res["input_ids"].squeeze(0).tolist()
+            if resp.input_tokens[:parent_len] != parent_tokens:
+                raise ValueError(
+                    "Concat child prompt does not preserve the parent's sampled "
+                    "token prefix. Inheriting its logprobs would train different "
+                    "actions from those sampled during rollout."
+                )
             assert (
                 parent_len
                 == len(parent_loss_mask)
@@ -207,7 +211,7 @@ class InteractionWithTokenLogpReward:
             own_turn_id = max(valid_parent_turn_ids) + 1 if valid_parent_turn_ids else 0
             parent_token_rewards_tensor = parent_res.get("token_rewards")
             current_r3 = self._r3_tensor_dict(seq_len=len(seq))
-            if resp.input_len > parent_len:
+            if resp.input_len >= parent_len:
                 logprobs = (
                     parent_logprobs
                     + [0.0] * (resp.input_len - parent_len)
@@ -249,28 +253,6 @@ class InteractionWithTokenLogpReward:
                     + [-1] * (resp.input_len - parent_len)
                     + [own_turn_id] * resp.output_len
                 )
-            else:
-                # FIXME: Find out why this happens occasionally
-                api_type = self.api_type
-                input_name = self.input_name_for_logging
-                logger.warning(
-                    f"The input length of the child {api_type} ({resp.input_len}) is less than or "
-                    f"equal to the length of the parent {api_type} {parent_len}. "
-                    f"This should not happen if the {input_name}s are constructed properly. "
-                    f"Ignoring the parent {api_type} by masking them out. \n"
-                    f"Parent input token ids: {self.parent.model_response.input_tokens}\n"
-                    f"Parent output token ids: {self.parent.model_response.output_tokens}\n"
-                    f"Child input token ids: {resp.input_tokens}\n"
-                    f"Parent input {input_name}: {self.parent_data}\n"
-                    f"Child input {input_name}: {self.current_data}",
-                )
-                logprobs = [0.0] * resp.input_len + resp.output_logprobs
-                loss_mask = [0] * resp.input_len + [1] * resp.output_len
-                versions = [-1] * resp.input_len + resp.output_versions
-                if current_r3 is not None:
-                    routed_experts = current_r3["routed_experts"]
-                    r3_routing_valid = torch.zeros(1, dtype=torch.bool)
-                turn_ids = [-1] * resp.input_len + [0] * resp.output_len
         else:
             logprobs = [0.0] * resp.input_len + resp.output_logprobs
             loss_mask = [0] * resp.input_len + [1] * resp.output_len
@@ -314,7 +296,7 @@ class InteractionWithTokenLogpReward:
             result["multi_modal_input"] = [self.multi_modal_input or {}]
         if self.token_rewards is not None or parent_token_rewards_tensor is not None:
             token_rewards = torch.zeros(len(seq), dtype=torch.float32, device="cpu")
-            if parent_token_rewards_tensor is not None and resp.input_len > parent_len:
+            if parent_token_rewards_tensor is not None and resp.input_len >= parent_len:
                 token_rewards[:parent_len] = parent_token_rewards_tensor.squeeze(0)
             if self.token_rewards is not None:
                 token_rewards[resp.input_len :] = self.token_rewards.detach()
