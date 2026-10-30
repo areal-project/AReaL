@@ -61,6 +61,8 @@ class VLLMBackend:
     ) -> HttpRequest:
         """Build vLLM generation request."""
         gconfig = req.gconfig
+        if gconfig.score_centering_top_k:
+            raise ValueError("Score-centering sampler heads currently require SGLang.")
         stop_token_ids = gconfig.stop_token_ids
 
         # NOTE: vLLM uses flat payload structure, not nested sampling_params

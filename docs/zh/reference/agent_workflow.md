@@ -30,6 +30,38 @@
 1. **构建对话树**用于多轮奖励传播
 1. **导出训练就绪的张量**并正确归因奖励
 
+### SGLang 图片预处理
+
+对于支持的 Qwen VLM，OpenAI proxy 默认在准备训练输入时对齐 SGLang 的图片缩放规则。该行为覆盖 Chat
+Completions、Responses、缓存 prompt 和 concat 历史。 发送给 SGLang 的仍是原始图片字节，不会重新编码。
+
+在 proxy/rollout worker 的环境中设置 `AREAL_VLM_ALIGN_SGLANG=false`，可恢复原来的 Hugging Face
+图片预处理流程。默认值为 `true`，也支持 `1` 和 `0`。这个开关不会修改 SGLang 的配置， 也不会关闭 HF Processor
+自身的缩放。关闭对齐后，训练和推理使用的图片输入可能不同。
+
+`SGLANG_VLM_QWEN_LIMIT_PIXEL` 独立控制 SGLang 的像素压缩：默认的 `true` 将符合条件的最大像素预算缩小 16 倍， `false`
+则保留完整预算。开启 proxy 对齐时，这两种设置都会按 SGLang 的实际值处理。proxy 和 SGLang 必须使用相同的
+`SGLANG_VLM_QWEN_LIMIT_PIXEL` 和 `SGLANG_RESIZE_RESAMPLE` 设置。对齐开关不另设像素预算或 JPEG 质量参数。 请在启动
+worker 前设置这些环境变量，无需修改 YAML。
+
+SGLang 服务端的 AReaL Qwen3-VL/Qwen3.5 处理器是独立的显式选项。如需经过验证的 CPU/PIL 服务端路径，或采样文本中可能包含字面视觉
+token、需要保留真实图片的位置，请在 SGLang 服务端环境中设置
+`SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=areal.engine.sglang_processors`。未设置时，该
+Qwen3-VL/Qwen3.5 集成不会修改 SGLang 源码，也不会覆盖已有的第三方处理器。该服务端设置独立于控制 proxy 图片预处理的
+`AREAL_VLM_ALIGN_SGLANG`。
+
+服务端集成基于 Qwen 示例使用的 SGLang `0.5.18.dev10+g85b539146` 运行环境验证。显式启用后， AReaL 会先校验
+`srt/multimodal/processors/qwen_vl.py` 和 `base_processor.py` 的 SHA-256；
+遇到未知源码会拒绝启动。首次安装补丁需要可写的 SGLang 包。对于只读运行环境，先将 `MODEL_PATH` 指向含有 `config.json` 的 Qwen3-VL
+或 Qwen3.5 模型，再在可写的镜像构建阶段使用相同版本的 AReaL 和 SGLang 运行：
+
+```bash
+export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=areal.engine.sglang_processors
+python -c 'import os; from areal.engine.sglang_model_patches import apply_model_patches; apply_model_patches(["--model-path", os.environ["MODEL_PATH"]])'
+```
+
+将处理后的 SGLang 包打入只读镜像；启动时会校验两个文件，不会再次写入。同时需确保 SGLang 的 tokenizer worker 能导入 AReaL 处理器包。
+
 ## 与 RolloutWorkflow 的关系
 
 代理工作流不是单独的抽象——它们通过 `OpenAIProxyWorkflow` 自动包装为 `RolloutWorkflow`：

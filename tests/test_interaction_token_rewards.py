@@ -183,15 +183,36 @@ def test_concat_with_one_rewarded_turn_zero_fills_other_spans(
     )
 
 
-def test_concat_with_short_child_prompt_masks_parent_rewards():
-    """The invalid-prefix fallback must not copy rewards from its parent."""
+@pytest.mark.parametrize("child_prompt", [[1, 2], [1, 2, 9], [1, 9, 3, 4]])
+def test_concat_with_invalid_child_prefix_rejects_logprob_inheritance(child_prompt):
+    """A shorter or changed prefix cannot inherit the parent's action metadata."""
     parent = _interaction("parent", [1, 2], [3])
     parent.token_rewards = torch.tensor([0.5])
-    leaf = _interaction("leaf", [1, 2], [4], parent=parent)
+    leaf = _interaction("leaf", child_prompt, [4], parent=parent)
 
+    with pytest.raises(ValueError, match="does not preserve.*sampled token prefix"):
+        leaf.to_tensor_dict()
+
+
+def test_concat_with_equal_length_prompt_preserves_parent_metadata_and_rewards():
+    """Continuation with no added context must retain the complete parent span."""
+    parent = _interaction("parent", [1, 2], [3, 4])
+    parent.model_response.output_logprobs = [-0.25, -0.5]
+    parent.model_response.output_versions = [5, 6]
+    parent.token_rewards = torch.tensor([0.5, -0.25])
+    leaf = _interaction("leaf", [1, 2, 3, 4], [5], parent=parent)
+    leaf.token_rewards = torch.tensor([0.75])
+
+    actual = leaf.to_tensor_dict()
+
+    for key in ("input_ids", "loss_mask", "logprobs", "versions", "turn_ids"):
+        torch.testing.assert_close(
+            actual[key][:, :4], parent.to_tensor_dict()[key], rtol=0.0, atol=0.0
+        )
+    assert actual["turn_ids"].tolist() == [[-1, -1, 0, 0, 1]]
     torch.testing.assert_close(
-        leaf.to_tensor_dict()["token_rewards"],
-        torch.zeros((1, 3), dtype=torch.float32),
+        actual["token_rewards"],
+        torch.tensor([[0.0, 0.0, 0.5, -0.25, 0.75]]),
         rtol=0.0,
         atol=0.0,
     )

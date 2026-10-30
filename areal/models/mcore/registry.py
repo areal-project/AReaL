@@ -20,6 +20,7 @@ from transformers import AutoConfig, PretrainedConfig
 from areal.api.cli_args import MegatronEngineConfig
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.mtp_only import freeze_non_mtp_parameters
+from areal.engine.megatron_utils.qwen3_vl_token_mask import install_qwen3_vl_token_mask
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
@@ -575,6 +576,14 @@ def make_mcore_model(
             set_deterministic_algorithms(provider, prebuild=True)
 
         provider.finalize()
+
+        if getattr(hf_config, "model_type", None) in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        ):
+            provider.register_pre_wrap_hook(install_qwen3_vl_token_mask)
 
         if mcore_config.mtp_only:
             if getattr(provider, "moe_router_enable_expert_bias", False):
