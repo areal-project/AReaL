@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from areal.trainer.ppo.advantage_algorithms import TemporalInputs, token_gae, turn_gae
+from areal.trainer.ppo.gae import compute_gae_lambda
 
 
 def _inputs() -> TemporalInputs:
@@ -82,3 +83,52 @@ def test_turn_gae_missing_turn_ids_rejected():
     """Turn estimation requires explicit rollout structure."""
     with pytest.raises(ValueError, match="requires rollout data.*turn_ids"):
         turn_gae(replace(_inputs(), turn_ids=None))
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.1])
+def test_static_gae_lambda_must_be_in_unit_interval(value):
+    with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
+        compute_gae_lambda(
+            value,
+            torch.ones(2, 3),
+            None,
+            timestep_unit="token",
+        )
+
+
+@pytest.mark.parametrize("value", [0.0, 1.0])
+def test_static_gae_lambda_accepts_unit_interval_endpoints(value):
+    assert (
+        compute_gae_lambda(
+            value,
+            torch.ones(2, 3),
+            None,
+            timestep_unit="token",
+        )
+        == value
+    )
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.1])
+def test_dynamic_gae_lambda_must_be_in_unit_interval(value):
+    def invalid_lambda(_context):
+        return torch.full((2,), value)
+
+    with pytest.raises(RuntimeError, match=r"values must be in \[0, 1\]"):
+        compute_gae_lambda(
+            invalid_lambda,
+            torch.ones(2, 3),
+            None,
+            timestep_unit="token",
+        )
+
+
+@pytest.mark.parametrize("value", [0.0, 1.0])
+def test_dynamic_gae_lambda_accepts_unit_interval_endpoints(value):
+    result = compute_gae_lambda(
+        lambda _context: torch.full((2,), value),
+        torch.ones(2, 3),
+        None,
+        timestep_unit="token",
+    )
+    torch.testing.assert_close(result, torch.full((2,), value))
