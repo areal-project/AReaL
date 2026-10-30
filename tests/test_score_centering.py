@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from areal.api.cli_args import GenerationHyperparameters, MicroBatchSpec, PPOActorConfig
+from areal.api.cli_args import (
+    GenerationHyperparameters,
+    MicroBatchSpec,
+    PPOActorConfig,
+    RejectionSamplingConfig,
+)
 from areal.api.io_struct import ModelRequest, ModelResponse
 from areal.engine.sglang_remote import SGLangBackend
 from areal.utils.data import (
@@ -43,7 +48,7 @@ def test_selected_backward_matches_dense_rounding_with_peaked_logits(device, dty
     torch.testing.assert_close(logits.grad, oracle.grad, rtol=0, atol=0)
 
 
-def reference(logits, labels, ids, q):
+def reference(logits, labels, ids, q, tis_cap=None):
     lp = logits.log_softmax(-1)
     phead = lp.gather(-1, ids)
     with torch.no_grad():
@@ -56,6 +61,12 @@ def reference(logits, labels, ids, q):
                 :, None
             ]
         )
+        if tis_cap is not None:
+            rho = (1 - sampler.sum(-1)).clamp_min(0) / (1 - p.sum(-1)).clamp_min(1e-6)
+            coefficient = (
+                torch.minimum(p, tis_cap * sampler)
+                - (rho * tis_cap).clamp_max(1)[:, None] * p
+            )
     return lp.gather(-1, labels[:, None]).squeeze(-1), (phead * coefficient).sum(-1)
 
 
@@ -365,7 +376,8 @@ async def test_interrupted_generation_accumulates_heads_and_versions(monkeypatch
 
 
 @pytest.mark.parametrize("width", [1, 12])
-def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width):
+@pytest.mark.parametrize("tis_cap", [None, 2.0])
+def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width, tis_cap):
     """Exercise real actor alignment and FSDP loss hooks without mocking DTensor."""
     from functools import partial
 
@@ -376,6 +388,9 @@ def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width):
     config = PPOActorConfig(
         backend="fsdp:d1",
         use_score_centering=True,
+        rejection_sampling=RejectionSamplingConfig(action="clamp", upper=tis_cap)
+        if tis_cap is not None
+        else None,
         recompute_logprob=False,
         kl_ctl=0,
         mb_spec=MicroBatchSpec(n_mbs=2),
@@ -416,6 +431,7 @@ def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width):
     engine.config = config
     engine.enable_tree_training = False
     engine.parallel_helper = SimpleNamespace(tp_size=1, sp_size=1)
+    engine.model_config = SimpleNamespace(vocab_size=17)
     for item in mbs:
         inputs, ctx = engine._prepare_mb_inputs(item)
         assert "sampler_head_ids" not in inputs
@@ -428,10 +444,16 @@ def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width):
             labels,
             ctx.mb_input["sampler_head_ids"],
             ctx.mb_input["sampler_head_logprobs"],
+            tis_cap=tis_cap,
         )
         mask = ctx.mb_input["loss_mask"].bool()
+        weight = (
+            1.0
+            if tis_cap is None
+            else (lp.detach() - ctx.mb_input["logprobs"]).exp().clamp_max(tis_cap)
+        )
         expected = (
-            torch.where(mask, ctx.mb_input["advantages"] * (c - lp), 0).sum()
+            torch.where(mask, ctx.mb_input["advantages"] * (c - weight * lp), 0).sum()
             / mask.sum()
         )
         loss = engine._compute_logprobs_and_loss(
@@ -443,6 +465,11 @@ def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width):
                 eps_clip_higher=None,
                 c_clip=None,
                 use_score_centering=True,
+                rejection_sampling=RejectionSamplingConfig(
+                    action="clamp", upper=tis_cap
+                )
+                if tis_cap is not None
+                else None,
             ),
             lambda data: data["loss_mask"].count_nonzero(),
             mask.sum(),

@@ -66,6 +66,7 @@ from areal.utils.functional.loss_aggregation import (
     TokenMean,
 )
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.score_centering import resolve_score_centering_tis_cap
 from areal.utils.stats_tracker import ReduceType
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -173,6 +174,9 @@ class PPOActor:
             logger.info(
                 "Mode: REINFORCE with score centering (sampler behavior probabilities)"
             )
+            tis_cap = resolve_score_centering_tis_cap(config.rejection_sampling)
+            if tis_cap is not None:
+                logger.info(f"  TIS weighted-score centering, cap={tis_cap}")
         elif not config.use_decoupled_loss:
             logger.info("Mode: Standard PPO (on-policy)")
             if config.recompute_logprob:
@@ -1004,18 +1008,30 @@ def grpo_loss_fn(
     # Score centering uses the explicit REINFORCE surrogate, not clipped PPO.
     if use_score_centering:
         if sc_correction is None:
-            raise ValueError(
-                "Score centering requires the FSDP score-centering logprob path."
-            )
+            raise ValueError("Score centering requires a score-centering logprob path.")
         if input_data.get("teacher_logp") is not None:
             raise ValueError("Score centering with distillation is not supported.")
-        token_loss = advantages.detach() * (sc_correction - logprobs)
+        tis_cap = resolve_score_centering_tis_cap(rejection_sampling)
+        if tis_cap is None:
+            sc_weight = torch.ones_like(logprobs)
+            sc_clipped = torch.zeros_like(loss_mask)
+        else:
+            from areal.utils.score_centering import score_centering_tis_weights
+
+            # Original sampler logprobs, never the proximal policy. The correction
+            # already centers weighted scores; do not multiply it by sc_weight.
+            behavior_logp = torch.where(loss_mask.bool(), old_logp, logprobs.detach())
+            sc_weight = score_centering_tis_weights(logprobs, behavior_logp, tis_cap)
+            sc_clipped = (
+                logprobs.detach() - behavior_logp > math.log(tis_cap)
+            ) & loss_mask.bool()
+        token_loss = advantages.detach() * (sc_correction - sc_weight * logprobs)
         loss = pg_reduction.aggregate(token_loss, loss_mask)
         stat = dict(
             loss=token_loss.detach(),
-            importance_weight=torch.ones_like(logprobs),
+            importance_weight=sc_weight,
             approx_kl=old_logp - logprobs.detach(),
-            clip_mask=torch.zeros_like(loss_mask),
+            clip_mask=sc_clipped,
             dual_clip_mask=torch.zeros_like(loss_mask),
         )
     elif use_cispo_loss:

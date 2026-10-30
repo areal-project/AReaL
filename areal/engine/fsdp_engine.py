@@ -353,11 +353,12 @@ class FSDPEngine(TrainEngine):
 
         parallel_strategy = self._make_parallel_strategy(parallel_strategy)
 
-        if getattr(self.config, "use_score_centering", False) and (
-            parallel_strategy.tensor_parallel_size != 1
-            or parallel_strategy.context_parallel_size != 1
+        if (
+            getattr(self.config, "use_score_centering", False)
+            and parallel_strategy.tensor_parallel_size > 1
+            and self.model_config.vocab_size % parallel_strategy.tensor_parallel_size
         ):
-            raise ValueError("Score centering currently requires TP=SP=1.")
+            raise ValueError("FSDP score centering requires equal vocabulary shards.")
         self.parallel_helper = ParallelHelper.from_parallel_strategy(parallel_strategy)
 
         self.logger.info(
@@ -2303,36 +2304,62 @@ class FSDPEngine(TrainEngine):
         if not self.config.is_critic:
             sc_correction = None
             if getattr(self.config, "use_score_centering", False):
-                if (
-                    self.enable_tree_training
-                    or self.parallel_helper.sp_size != 1
-                    or self.parallel_helper.tp_size != 1
-                ):
+                if self.enable_tree_training:
                     raise ValueError(
-                        "Score centering currently requires ordinary FSDP sequences with TP=SP=1."
+                        "Score centering requires ordinary FSDP sequences."
                     )
-                from areal.utils.score_centering import score_centering_logprobs
+                from areal.utils.score_centering import (
+                    resolve_score_centering_tis_cap,
+                    score_centering_logprobs,
+                )
 
-                n = logits.shape[0] - ctx.pad_length
-                labels = torch.roll(
-                    ctx.model_inputs["input_ids"], shifts=-1, dims=-1
-                ).reshape(-1)[:n]
                 ids = ctx.mb_input["sampler_head_ids"]
                 q = ctx.mb_input["sampler_head_logprobs"]
+                n = ctx.mb_input["input_ids"].numel()
                 if ids.ndim != 2 or ids.shape[0] != n or ids.shape != q.shape:
                     raise ValueError(
                         "Packed sampler heads must have shape [real_tokens, K]."
                     )
+                padding = ctx.pad_length + ctx.ulysses_pad_size
+                ids = torch.cat([ids, ids.new_zeros((padding, ids.shape[1]))])
+                q = torch.cat([q, q.new_full((padding, q.shape[1]), float("-inf"))])
+                if self.parallel_helper.sp_size > 1:
+                    rank = dist.get_rank(self.sp_group)
+                    ids = ids.chunk(self.parallel_helper.sp_size, dim=0)[rank]
+                    q = q.chunk(self.parallel_helper.sp_size, dim=0)[rank]
+                labels = ctx.model_inputs.get("rolled_input_ids")
+                if labels is None:
+                    labels = torch.roll(
+                        ctx.model_inputs["input_ids"], shifts=-1, dims=-1
+                    )
                 logprobs, entropy, sc_correction = score_centering_logprobs(
-                    logits[:n],
-                    labels,
+                    logits,
+                    labels.reshape(-1),
                     ids,
                     q,
                     chunk_size=self.config.logprobs_chunk_size,
+                    tis_cap=resolve_score_centering_tis_cap(
+                        getattr(self.config, "rejection_sampling", None)
+                    ),
+                    tp_group=self.parallel_helper.tp_group
+                    if self.parallel_helper.tp_size > 1
+                    else None,
+                    vocab_size=self.model_config.vocab_size
+                    if self.parallel_helper.tp_size > 1
+                    else None,
+                )
+                if self.parallel_helper.sp_size > 1:
+                    logprobs = self._sp_all_gather(logprobs)
+                    entropy = self._sp_all_gather(entropy)
+                    sc_correction = self._sp_all_gather(sc_correction)
+                logprobs, entropy, sc_correction = (
+                    value[:n] for value in (logprobs, entropy, sc_correction)
                 )
                 vocab_min_logits, vocab_max_logits = self._get_vocab_min_max_logits(
-                    logits[:n], 0
+                    logits, ctx.ulysses_pad_size
                 )
+                vocab_min_logits = vocab_min_logits[:n]
+                vocab_max_logits = vocab_max_logits[:n]
             elif self.enable_tree_training:
                 # Handle dummy trie (empty tree for DP synchronization)
                 # When trie has no sequences, return zero loss with grad connection
