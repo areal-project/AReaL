@@ -716,6 +716,19 @@ class RemoteSGLangEngine(InferenceEngine):
         return self._engine.destroy()
 
     @property
+    def route_client(self):
+        return self._engine.route_client
+
+    def configure_backend_routing(self, **kwargs) -> None:
+        self._engine.configure_backend_routing(**kwargs)
+
+    def set_sender_state(self, paused: bool, control_seq: int) -> None:
+        self._engine.set_sender_state(paused, control_seq)
+
+    async def close_backend_session(self, session_id: str) -> None:
+        await self._engine.close_backend_session(session_id)
+
+    @property
     def initialized(self) -> bool:
         return self._engine.initialized
 

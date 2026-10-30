@@ -16,12 +16,24 @@ from __future__ import annotations
 import asyncio
 import hmac
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+from starlette.responses import JSONResponse
 
 from areal.utils import logging
+from areal.v2.inference_service.router.backend import (
+    Acquire,
+    BackendRegistry,
+    CloseSession,
+    LeaseResponse,
+    RegisterBackends,
+    Release,
+    RoutingError,
+    SetPoolState,
+)
 from areal.v2.inference_service.router.config import RouterConfig
 from areal.v2.inference_service.router.state import (
     GroupRegistry,
@@ -73,10 +85,14 @@ class UnregisterWorkerRequest(BaseModel):
 
 
 class RouteRequest(BaseModel):
+    target: Literal["data_proxy", "backend"] = "data_proxy"
     api_key: str | None = None
     path: str | None = None
     session_id: str | None = None
     model: str | None = None
+    run_id: str | None = None
+    pool_id: str | None = None
+    request_id: str | None = None
 
 
 class SessionEntry(BaseModel):
@@ -185,6 +201,7 @@ def create_app(config: RouterConfig) -> FastAPI:
     session_registry = SessionRegistry()
     model_registry = ModelRegistry()
     group_registry = GroupRegistry()
+    backend_registry = BackendRegistry()
     strategy = get_strategy(config.routing_strategy)
 
     async def _poll_workers() -> None:
@@ -204,6 +221,32 @@ def create_app(config: RouterConfig) -> FastAPI:
             await asyncio.gather(*[_check(w) for w in workers])
             await asyncio.sleep(config.poll_interval)
 
+    async def _poll_backends() -> None:
+        """Poll inference backends independently of DataProxy responsiveness."""
+        while True:
+
+            async def _check_backend(target):
+                pool_id, run_id, backend_id, address, control_seq = target
+                try:
+                    response = await app.state.http_client.get(
+                        f"{address.rstrip('/')}/health",
+                        timeout=config.backend_health_timeout,
+                    )
+                    healthy = response.status_code == 200
+                except httpx.HTTPError:
+                    healthy = False
+                await backend_registry.update_health(
+                    pool_id, run_id, backend_id, healthy, control_seq=control_seq
+                )
+
+            await asyncio.gather(
+                *[
+                    _check_backend(target)
+                    for target in await backend_registry.health_targets()
+                ]
+            )
+            await asyncio.sleep(config.poll_interval)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info(
@@ -212,7 +255,10 @@ def create_app(config: RouterConfig) -> FastAPI:
             config.poll_interval,
         )
         app.state.http_client = httpx.AsyncClient(timeout=config.worker_health_timeout)
-        poll_task = asyncio.create_task(_poll_workers())
+        poll_tasks = [
+            asyncio.create_task(_poll_workers()),
+            asyncio.create_task(_poll_backends()),
+        ]
         app.state.worker_registry = worker_registry
         app.state.session_registry = session_registry
         app.state.model_registry = model_registry
@@ -221,11 +267,9 @@ def create_app(config: RouterConfig) -> FastAPI:
         try:
             yield
         finally:
-            poll_task.cancel()
-            try:
-                await poll_task
-            except asyncio.CancelledError:
-                pass
+            for task in poll_tasks:
+                task.cancel()
+            await asyncio.gather(*poll_tasks, return_exceptions=True)
             await app.state.http_client.aclose()
             logger.info("Router shutting down")
 
@@ -237,6 +281,41 @@ def create_app(config: RouterConfig) -> FastAPI:
     app.state.model_registry = model_registry
     app.state.group_registry = group_registry
     app.state.strategy = strategy
+    app.state.backend_registry = backend_registry
+
+    @app.exception_handler(RoutingError)
+    async def routing_error_handler(request: Request, exc: RoutingError):
+        status = 503 if exc.code in ("PAUSED", "UNAVAILABLE", "FAILED") else 409
+        return JSONResponse(status_code=status, content={"detail": {"code": exc.code}})
+
+    @app.post("/routing/backends/register", response_model=StatusResponse)
+    async def register_backends(body: RegisterBackends, request: Request):
+        _require_admin_key(request, config.admin_api_key)
+        await backend_registry.register(body)
+        return StatusResponse(status="ok")
+
+    @app.post("/routing/release", response_model=StatusResponse)
+    async def release_backend(body: Release, request: Request):
+        _require_admin_key(request, config.admin_api_key)
+        await backend_registry.release(body)
+        return StatusResponse(status="ok")
+
+    @app.post("/routing/close_session", response_model=StatusResponse)
+    async def close_backend_session(body: CloseSession, request: Request):
+        _require_admin_key(request, config.admin_api_key)
+        await backend_registry.close_session(body)
+        return StatusResponse(status="ok")
+
+    @app.post("/routing/pools/{pool_id}/state", response_model=StatusResponse)
+    async def set_pool_state(pool_id: str, body: SetPoolState, request: Request):
+        _require_admin_key(request, config.admin_api_key)
+        await backend_registry.set_state(pool_id, body)
+        return StatusResponse(status="ok")
+
+    @app.get("/routing/pools/{pool_id}/state")
+    async def get_pool_state(pool_id: str, run_id: str, request: Request):
+        _require_admin_key(request, config.admin_api_key)
+        return await backend_registry.snapshot(pool_id, run_id)
 
     # =========================================================================
     # Health
@@ -300,9 +379,27 @@ def create_app(config: RouterConfig) -> FastAPI:
     # Routing (admin key required)
     # =========================================================================
 
-    @app.post("/route", response_model=RouteResponse)
+    @app.post("/route", response_model=RouteResponse | LeaseResponse)
     async def route(body: RouteRequest, request: Request):
         _require_admin_key(request, config.admin_api_key)
+
+        if body.target == "backend":
+            if (
+                not all((body.run_id, body.pool_id, body.request_id))
+                or body.session_id == ""
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Backend routing requires nonempty run_id, pool_id and request_id",
+                )
+            return await backend_registry.acquire(
+                Acquire(
+                    run_id=body.run_id,
+                    pool_id=body.pool_id,
+                    request_id=body.request_id,
+                    session_id=body.session_id,
+                )
+            )
 
         # Step A: resolve model → candidate worker addrs
         model_addrs: list[str] | None = None

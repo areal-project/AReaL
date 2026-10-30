@@ -57,6 +57,7 @@ LOGGER_COLORS_EXACT = {
     # Controllers - white
     "TrainController": "white",
     "RolloutController": "white",
+    "BackendRouter": "white",
     "WorkflowExecutor": "white",
     "AgentCli": "white",
     # Stats/Perf - green

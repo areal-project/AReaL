@@ -44,6 +44,8 @@ from areal.utils.dynamic_import import import_from_string
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, gethostip
+from areal.v2.inference_service.router.backend import RoutingError
+from areal.v2.inference_service.router.client import backend_session
 
 from .server import (
     ANTHROPIC_MESSAGES_PATHNAME,
@@ -557,7 +559,7 @@ def grant_capacity():
 # =============================================================================
 
 
-def _cleanup_stale_sessions():
+def _cleanup_stale_sessions() -> list[str]:
     """Remove stale sessions and orphaned API key mappings.
 
     Called periodically (at most once per minute) during start_session to clean up
@@ -574,7 +576,7 @@ def _cleanup_stale_sessions():
     # Only run cleanup at most once per minute
     current_time = time.time()
     if current_time - _last_cleanup_time < 60:
-        return
+        return []
 
     _last_cleanup_time = current_time
 
@@ -583,11 +585,17 @@ def _cleanup_stale_sessions():
         if session_data.is_stale(timeout_seconds=_session_timeout_seconds):
             stale_sessions.append(session_id)
 
+    closed_backend_sessions = []
     for session_id in stale_sessions:
         logger.warning(f"Removing stale session: {session_id}")
         session_data = _session_cache.pop(session_id, None)
         _session_invalid_tool_errors.pop(session_id, None)
         if session_data is not None:
+            if getattr(_engine, "route_client", None) is not None:
+                _engine.route_client.close_local_session(
+                    session_data.backend_session_id
+                )
+                closed_backend_sessions.append(session_data.backend_session_id)
             cache_group_id = session_data.take_processor_cache_group_id()
             if cache_group_id is not None:
                 _processor_cache_registry.release(cache_group_id)
@@ -609,10 +617,11 @@ def _cleanup_stale_sessions():
         _remove_api_keys_for_session(sid)
     if orphaned_sids:
         logger.info(f"Cleaned up {len(orphaned_sids)} orphaned API key mappings")
+    return closed_backend_sessions
 
 
 @app.post(f"/{RL_START_SESSION_PATHNAME}", dependencies=[Depends(_require_admin_key)])
-def start_session(request: StartSessionRequest) -> StartSessionResponse:
+async def start_session(request: StartSessionRequest) -> StartSessionResponse:
     """Start a new RL session and allocate a unique session API key.
 
     If ``request.api_key`` is provided, reuse that key instead of generating
@@ -634,8 +643,11 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
 
     with _lock:
         # Periodically cleanup stale sessions
-        _cleanup_stale_sessions()
+        closed_backend_sessions = _cleanup_stale_sessions()
+    for backend_id in closed_backend_sessions:
+        await _engine.close_backend_session(backend_id)
 
+    with _lock:
         if _capacity <= 0:
             raise HTTPException(
                 status_code=429,
@@ -699,7 +711,7 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
 
 
 @app.post(f"/{RL_END_SESSION_PATHNAME}")
-def end_session(session_id: str = Depends(_require_session_key)):
+async def end_session(session_id: str = Depends(_require_session_key)):
     """End an RL session.
 
     Returns the number of recorded interactions so callers (e.g. the proxy
@@ -715,6 +727,8 @@ def end_session(session_id: str = Depends(_require_session_key)):
         interaction_count = len(session.completions)
         invalid_tool_json_message = _session_invalid_tool_errors.get(session_id, "")
 
+    if getattr(_engine, "route_client", None) is not None:
+        await _engine.close_backend_session(session.backend_session_id)
     # finish() outside lock to avoid holding lock during potential I/O
     session.finish()
     cache_group_id = session.take_processor_cache_group_id()
@@ -1118,7 +1132,15 @@ async def _call_client_create(
         }
         if supports_processor_cache:
             client_kwargs["processor_cache"] = session_data.processor_cache
-        return await create_fn(**client_kwargs)
+        async with backend_session(
+            _engine, session_data.backend_session_id, close=False
+        ):
+            return await create_fn(**client_kwargs)
+    except RoutingError as e:
+        session_data.mark_system_error(str(e))
+        # 409 is intentionally not an SDK-transparent retry status. A metadata
+        # lease cannot make an uncertain generation safe to replay.
+        raise HTTPException(status_code=409, detail={"code": e.code}) from e
     except InvalidToolCallError as exc:
         # A streaming response has already sent HTTP 200 by the time the model
         # output can be validated. Poison the session so an SDK retry receives
