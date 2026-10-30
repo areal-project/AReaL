@@ -429,12 +429,21 @@ class PPOActor:
 
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
-    def ppo_update(self, data: list[dict[str, Any]]) -> None:
+    def ppo_update(
+        self,
+        data: list[dict[str, Any]],
+        *,
+        max_head_offpolicyness: int | None = None,
+    ) -> None:
         batched, meta = concat_batch(data)
-        self._ppo_update(batched, meta)
+        self._ppo_update(batched, meta, max_head_offpolicyness=max_head_offpolicyness)
 
     def _ppo_update(
-        self, data: dict[str, Any], meta: TrajBatchMeta | None = None
+        self,
+        data: dict[str, Any],
+        meta: TrajBatchMeta | None = None,
+        *,
+        max_head_offpolicyness: int | None = None,
     ) -> None:
         if self.config.loss_aggregation != "token_mean" and (
             data.get("teacher_logp") is not None
@@ -572,6 +581,27 @@ class PPOActor:
                 denominator="agent",
             )
         ########## Logging code ends ##########
+
+        if max_head_offpolicyness is not None:
+            version_mask, aligned_versions = _policy_version_loss_mask(
+                data.get("versions"),
+                loss_mask,
+                self.engine.get_version(),
+                max_head_offpolicyness,
+            )
+            # Keep original masks for reduction denominators and input-token
+            # provenance. This extra numerator mask travels through packing/CP.
+            data["policy_version_mask"] = version_mask
+            with stats_tracker.scope("update"):
+                stats_tracker.stat_compact(
+                    loss_mask.bool(),
+                    ReduceType.AVG,
+                    version_filtered_fraction=(~version_mask).float(),
+                )
+                with stats_tracker.scope("version_filtered"):
+                    _log_version_staleness_stats(
+                        aligned_versions, self.engine.get_version(), version_mask
+                    )
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
@@ -913,6 +943,8 @@ def grpo_loss_fn(
         TokenMean(denominator_mask) if loss_step is None else loss_step.bind(input_data)
     )
     loss_mask = denominator_mask
+    if "policy_version_mask" in input_data:
+        loss_mask = loss_mask & input_data["policy_version_mask"].bool()
     if mopd_loss_config is not None and mopd_loss_config.rl_coefficient == 0:
         teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
         teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")
@@ -923,7 +955,7 @@ def grpo_loss_fn(
             raise RuntimeError(
                 "MOPD targets require immutable rollout behavior log-probabilities"
             )
-        normalization_mask = loss_mask
+        normalization_mask = denominator_mask
         prox_logp_gt = input_data.get("prox_logp")
         if m2_threshold is not None or rejection_sampling is not None:
             prox_logp = _resolve_proximal_logp(
@@ -1717,6 +1749,40 @@ def _log_proximal_approximation_stats(
                 kl_div_dual=kl_div_estimator_dual,
                 denominator="n_valid_tokens",
             )
+
+
+def _policy_version_loss_mask(
+    versions: torch.Tensor | None,
+    loss_mask: torch.Tensor,
+    current_version: int,
+    max_head_offpolicyness: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask expired targets without removing tokens from the model context.
+
+    Versions retain input-token positions; the advantage-preprocessed loss mask
+    already addresses next-token predictions. Align before packing or CP splits.
+    Negative versions on supervised positions are invalid and are masked too.
+    """
+    if max_head_offpolicyness < 0:
+        raise ValueError("max_head_offpolicyness must be nonnegative")
+    if versions is None or versions.shape != loss_mask.shape:
+        raise ValueError("Training version masking requires shape-matched versions")
+    if versions.dtype not in (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    ):
+        raise ValueError("Training versions must have an integer dtype")
+    aligned_versions = torch.roll(versions.to(torch.int64), shifts=-1, dims=-1)
+    aligned_versions[..., -1] = -1
+    keep = (
+        loss_mask.bool()
+        & (aligned_versions >= 0)
+        & (current_version - aligned_versions <= max_head_offpolicyness)
+    )
+    return keep, aligned_versions
 
 
 def _log_version_staleness_stats(

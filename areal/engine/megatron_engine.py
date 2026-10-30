@@ -2120,6 +2120,11 @@ class MegatronEngine(TrainEngine):
                         "multimodal, padding, and sequence-boundary positions are "
                         "not used as MTP supervision."
                     )
+                if "policy_version_mask" in mb_input.padded_mb:
+                    mtp_loss_mask = (
+                        mtp_loss_mask.bool()
+                        & mb_input.padded_mb["policy_version_mask"].bool()
+                    )
                 input_ids = mb_input.padded_mb["input_ids"]
                 if mtp_loss_mask.shape != input_ids.shape:
                     raise ValueError(

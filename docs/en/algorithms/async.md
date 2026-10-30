@@ -35,6 +35,20 @@ rollout:
   max_head_offpolicyness: 4  # Allow up to 4 version steps behind
 ```
 
+`mask_stale_tokens` defaults to `false`, preserving the existing training loss.
+To also filter individual actor loss targets by token policy-version age, enable it
+explicitly:
+
+```yaml
+rollout:
+  max_head_offpolicyness: 4
+  mask_stale_tokens: true
+```
+
+Tokens older than the limit are excluded from actor loss (including MTP). Rollouts
+continue normally; context, rewards, PRM scores, advantage computation, and the
+original loss normalization denominator are preserved.
+
 **Configuration tips:**
 
 - Set to `0` for synchronous RL (useful for debugging or baseline comparisons)
