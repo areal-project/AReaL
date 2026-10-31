@@ -39,7 +39,7 @@ from areal.experimental.openai.types import (
     concat_tensor_interactions,
 )
 from areal.utils import logging, perf_tracer, stats_tracker
-from areal.infra.utils.concurrent import get_executor
+from areal.infra.utils.concurrent import get_executor, run_async_task
 from areal.utils.data import RolloutGroup, cycle_dataloader
 from areal.utils.perf_tracer import trace_perf, trace_session_event
 from logging import Logger
@@ -358,12 +358,14 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         terminal_error_fn: Callable[[TResult], Exception | None] | None = None,
         deterministic_order: bool = False,
         consume_result: Callable[[TResult | None], TResult | None] | None = None,
+        discard_result: Callable[[TResult | None], None] | None = None,
     ):
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
             enable_tracing=enable_tracing,
         )
         self.consume_result = consume_result or (lambda result: result)
+        self.discard_result = discard_result or (lambda result: None)
         self.task_factory = task_factory
         self.staleness_manager = staleness_manager
         self.enable_tracing = enable_tracing
@@ -375,6 +377,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self._pending_inputs: deque[TInput] = deque()
         self._pending_results: dict[int, TimedResult[TResult]] = {}
         self._active_task_ids: set[int] = set()
+        # Tasks whose result nobody will fetch (e.g. the controller timed out).
+        self._abandoned_task_ids: set[int] = set()
 
         # Condition variables for coordination
         self._input_lock = threading.Lock()
@@ -422,6 +426,49 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
     def cancel_callback(self, task_id: int):
         """Remove a registered callback for a task (e.g., on timeout)."""
         self._task_callbacks.pop(task_id, None)
+
+    def abandon_task(self, task_id: int) -> bool:
+        """Stop retaining a task result that nobody will fetch.
+
+        Called by the remote caller when it gives up on a task (for example
+        when the rollout controller times out). Without this the worker keeps
+        the whole trajectory in ``_pending_results`` until the process exits,
+        because the only consumer (``get_rollout_result``) never runs again.
+
+        Returns whether the dispatcher still knew about the task.
+        """
+        with self._result_cv:
+            known = (
+                task_id in self._active_task_ids
+                or task_id in self._pending_results
+                or task_id in self._task_callbacks
+            )
+            if not known:
+                return False
+            self._task_callbacks.pop(task_id, None)
+            self._abandoned_task_ids.add(task_id)
+            self._result_cv.notify_all()
+            return True
+
+    def _pop_pending_abandoned_locked(self) -> list[TimedResult[TResult]]:
+        """Drop results that were abandoned while they were already pending."""
+        pending = [
+            task_id
+            for task_id in self._abandoned_task_ids
+            if task_id in self._pending_results
+        ]
+        discarded = []
+        for task_id in pending:
+            self._abandoned_task_ids.discard(task_id)
+            self._active_task_ids.discard(task_id)
+            discarded.append(self._pending_results.pop(task_id))
+        return discarded
+
+    def _discard_result(self, result: TResult | None) -> None:
+        try:
+            self.discard_result(result)
+        except Exception:
+            self.logger.exception("Failed to discard an abandoned rollout result")
 
     def _send_callback(self, addr: str, task_id: int, result: TResult):
         """Send task result to callback address (fire-and-forget)."""
@@ -492,16 +539,25 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                         count=count, timeout=0.05, with_timing=True
                     )
                 except TimeoutError:
-                    continue
+                    results = []
 
                 with self._result_cv:
+                    discarded = self._pop_pending_abandoned_locked()
                     for result in results:
-                        self._pending_results[result.task_id] = result
                         # Trigger callback if registered
                         cb_addr = self._task_callbacks.pop(result.task_id, None)
+                        if result.task_id in self._abandoned_task_ids:
+                            self._abandoned_task_ids.discard(result.task_id)
+                            self._active_task_ids.discard(result.task_id)
+                            discarded.append(result)
+                            continue
+                        self._pending_results[result.task_id] = result
                         if cb_addr:
                             self._send_callback(cb_addr, result.task_id, result.data)
                     self._result_cv.notify_all()
+
+                for result in discarded:
+                    self._discard_result(result.data)
 
                 # Newly available capacity after result processing should wake producers
                 with self._input_cv:
@@ -1230,6 +1286,10 @@ class WorkflowExecutor:
                 result
                 if isinstance(result, WorkflowContractFailure)
                 else self.consumed_metrics.consume(result)
+            ),
+            discard_result=lambda result: run_async_task(
+                self._clear_rejected_trajectory,
+                getattr(result, "trajectory", None),
             ),
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
