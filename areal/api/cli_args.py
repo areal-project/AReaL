@@ -924,6 +924,30 @@ class FP8EngineConfig:
         },
     )
 
+    def apply_to(self, transformer_config: Any) -> None:
+        """Apply the same precision settings to MCore and Bridge providers."""
+        unprefixed = {
+            "tp_only_amax_red",
+            "first_last_layers_bf16",
+            "num_layers_at_start_in_bf16",
+            "num_layers_at_end_in_bf16",
+        }
+        for option in fields(self):
+            if option.name == "direct_convert":
+                # AReaL's export policy, not a TransformerEngine option.
+                continue
+            target = (
+                "fp8"
+                if option.name == "mode"
+                else option.name
+                if option.name in unprefixed
+                else f"fp8_{option.name}"
+            )
+            if hasattr(transformer_config, target):
+                setattr(transformer_config, target, getattr(self, option.name))
+            else:
+                logger.warning("Unknown FP8 field in TransformerConfig: %s", target)
+
 
 @dataclass
 class CPUStagedOffloadConfig:
