@@ -672,6 +672,42 @@ def pad_and_stack_tensors_along_first_dim(tensor_list: list[torch.Tensor]):
     return torch.stack(padded_tensors, dim=0)
 
 
+def _remember_cu_seqlens_host(
+    cu: torch.Tensor | None,
+    host: list[int] | None = None,
+) -> None:
+    """Cache a host-side copy of ``cu_seqlens`` for MindSpeed GDN kernels."""
+    if cu is None or not torch.is_tensor(cu):
+        return
+    try:
+        from areal.engine.megatron_utils.mindspeed_gdn_patch import remember_cu_seqlens
+    except ImportError:
+        return
+    remember_cu_seqlens(cu, host=host)
+
+
+def _move_tensor_container_remembering_cu_seqlens(container, *args, **kwargs):
+    """``tensor_container_to`` that re-registers ``cu_seqlens`` after ``.to()``."""
+    if not isinstance(container, dict):
+        return tensor_container_to(container, *args, **kwargs)
+    cu = container.get("cu_seqlens")
+    if not torch.is_tensor(cu):
+        return tensor_container_to(container, *args, **kwargs)
+    try:
+        from areal.engine.megatron_utils.mindspeed_gdn_patch import (
+            cu_seqlens_host_list,
+            remember_cu_seqlens,
+        )
+    except ImportError:
+        return tensor_container_to(container, *args, **kwargs)
+    host = cu_seqlens_host_list(cu)
+    moved = tensor_container_to(container, *args, **kwargs)
+    moved_cu = moved.get("cu_seqlens") if isinstance(moved, dict) else None
+    if torch.is_tensor(moved_cu):
+        remember_cu_seqlens(moved_cu, host=host)
+    return moved
+
+
 def tensor_container_to(
     d: dict[str, Any] | torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
     *args,
@@ -779,12 +815,16 @@ class MicroBatchList:
             )
 
     def to(self, *args, **kwargs):
-        mbs = [tensor_container_to(mb, *args, **kwargs) for mb in self.mbs]
-        data = tensor_container_to(self.data, *args, **kwargs)
+        mbs = [
+            _move_tensor_container_remembering_cu_seqlens(mb, *args, **kwargs)
+            for mb in self.mbs
+        ]
+        data = _move_tensor_container_remembering_cu_seqlens(self.data, *args, **kwargs)
         padded_mbs = None
         if self.padded_mbs is not None:
             padded_mbs = [
-                tensor_container_to(mb, *args, **kwargs) for mb in self.padded_mbs
+                _move_tensor_container_remembering_cu_seqlens(mb, *args, **kwargs)
+                for mb in self.padded_mbs
             ]
         old_cu_seqlens_list = None
         if self.old_cu_seqlens_list is not None:
@@ -1052,6 +1092,7 @@ def pad_packed_tensor_dict(
             f"pad_to_length {pad_to_length} is smaller than total length {total_length}."
         )
     elif pad_length == 0:
+        _remember_cu_seqlens_host(data["cu_seqlens"])
         return (
             data,
             pad_length,
@@ -1087,6 +1128,7 @@ def pad_packed_tensor_dict(
             padded_data[key] = padded_tensor
         else:
             padded_data[key] = value
+    _remember_cu_seqlens_host(padded_data["cu_seqlens"])
     return (
         padded_data,
         pad_length,
