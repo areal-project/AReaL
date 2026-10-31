@@ -2638,6 +2638,12 @@ class SGLangConfig:
     cuda_graph_max_bs: int | None = None
     cuda_graph_bs: list[int] | None = None
     torchao_config: str = ""
+    fp8_gemm_runner_backend: str | None = field(
+        default=None,
+        metadata={
+            "help": "SGLang FP8 GEMM backend. Qwen3.5 AWEX block-FP8 requires 'triton' for writable FP32 scale grids."
+        },
+    )
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -2749,6 +2755,11 @@ class SGLangConfig:
 
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
+        args = dict(args)
+        # SGLang's CLI spelling differs from its ServerArgs field name.
+        backend = args.pop("fp8_gemm_runner_backend", None)
+        if backend is not None:
+            args["fp8_gemm_backend"] = backend
         return get_py_cmd("areal.v2.inference_service.sglang.launch_server", args)
 
     @staticmethod
@@ -2778,6 +2789,8 @@ class SGLangConfig:
             )
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
+        if sglang_config.fp8_gemm_runner_backend is None:
+            args.pop("fp8_gemm_runner_backend")
         if sglang_config.enable_multithread_load:
             model_loader_extra_config = dict(
                 enable_multithread_load=sglang_config.enable_multithread_load,
