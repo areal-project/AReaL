@@ -1,0 +1,341 @@
+{
+  "description": "Batch48 inline example with causal workload/CV search gating; initial fixed baseline and all 44 feasible layouts",
+  "gpu_budget": 16,
+  "initial_layout": {
+    "actor_dp": 2,
+    "actor_tp": 4,
+    "rollout_replicas": 4,
+    "rollout_tp": 2
+  },
+  "candidates": [
+    {
+      "actor_dp": 1,
+      "actor_tp": 1,
+      "rollout_replicas": 15,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 2,
+      "actor_tp": 1,
+      "rollout_replicas": 14,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 2,
+      "actor_tp": 1,
+      "rollout_replicas": 7,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 1,
+      "actor_tp": 2,
+      "rollout_replicas": 14,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 1,
+      "actor_tp": 2,
+      "rollout_replicas": 7,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 3,
+      "actor_tp": 1,
+      "rollout_replicas": 13,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 4,
+      "actor_tp": 1,
+      "rollout_replicas": 12,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 4,
+      "actor_tp": 1,
+      "rollout_replicas": 6,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 4,
+      "actor_tp": 1,
+      "rollout_replicas": 3,
+      "rollout_tp": 4
+    },
+    {
+      "actor_dp": 2,
+      "actor_tp": 2,
+      "rollout_replicas": 12,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 2,
+      "actor_tp": 2,
+      "rollout_replicas": 6,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 2,
+      "actor_tp": 2,
+      "rollout_replicas": 3,
+      "rollout_tp": 4
+    },
+    {
+      "actor_dp": 1,
+      "actor_tp": 4,
+      "rollout_replicas": 12,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 1,
+      "actor_tp": 4,
+      "rollout_replicas": 6,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 1,
+      "actor_tp": 4,
+      "rollout_replicas": 3,
+      "rollout_tp": 4
+    },
+    {
+      "actor_dp": 6,
+      "actor_tp": 1,
+      "rollout_replicas": 10,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 6,
+      "actor_tp": 1,
+      "rollout_replicas": 5,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 3,
+      "actor_tp": 2,
+      "rollout_replicas": 10,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 3,
+      "actor_tp": 2,
+      "rollout_replicas": 5,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 8,
+      "actor_tp": 1,
+      "rollout_replicas": 8,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 8,
+      "actor_tp": 1,
+      "rollout_replicas": 4,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 8,
+      "actor_tp": 1,
+      "rollout_replicas": 2,
+      "rollout_tp": 4
+    },
+    {
+      "actor_dp": 8,
+      "actor_tp": 1,
+      "rollout_replicas": 1,
+      "rollout_tp": 8
+    },
+    {
+      "actor_dp": 4,
+      "actor_tp": 2,
+      "rollout_replicas": 8,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 4,
+      "actor_tp": 2,
+      "rollout_replicas": 4,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 4,
+      "actor_tp": 2,
+      "rollout_replicas": 2,
+      "rollout_tp": 4
+    },
+    {
+      "actor_dp": 4,
+      "actor_tp": 2,
+      "rollout_replicas": 1,
+      "rollout_tp": 8
+    },
+    {
+      "actor_dp": 2,
+      "actor_tp": 4,
+      "rollout_replicas": 8,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 2,
+      "actor_tp": 4,
+      "rollout_replicas": 4,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 2,
+      "actor_tp": 4,
+      "rollout_replicas": 2,
+      "rollout_tp": 4
+    },
+    {
+      "actor_dp": 2,
+      "actor_tp": 4,
+      "rollout_replicas": 1,
+      "rollout_tp": 8
+    },
+    {
+      "actor_dp": 1,
+      "actor_tp": 8,
+      "rollout_replicas": 8,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 1,
+      "actor_tp": 8,
+      "rollout_replicas": 4,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 1,
+      "actor_tp": 8,
+      "rollout_replicas": 2,
+      "rollout_tp": 4
+    },
+    {
+      "actor_dp": 1,
+      "actor_tp": 8,
+      "rollout_replicas": 1,
+      "rollout_tp": 8
+    },
+    {
+      "actor_dp": 12,
+      "actor_tp": 1,
+      "rollout_replicas": 4,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 12,
+      "actor_tp": 1,
+      "rollout_replicas": 2,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 12,
+      "actor_tp": 1,
+      "rollout_replicas": 1,
+      "rollout_tp": 4
+    },
+    {
+      "actor_dp": 6,
+      "actor_tp": 2,
+      "rollout_replicas": 4,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 6,
+      "actor_tp": 2,
+      "rollout_replicas": 2,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 6,
+      "actor_tp": 2,
+      "rollout_replicas": 1,
+      "rollout_tp": 4
+    },
+    {
+      "actor_dp": 3,
+      "actor_tp": 4,
+      "rollout_replicas": 4,
+      "rollout_tp": 1
+    },
+    {
+      "actor_dp": 3,
+      "actor_tp": 4,
+      "rollout_replicas": 2,
+      "rollout_tp": 2
+    },
+    {
+      "actor_dp": 3,
+      "actor_tp": 4,
+      "rollout_replicas": 1,
+      "rollout_tp": 4
+    }
+  ],
+  "run": {
+    "batch_size": 48,
+    "staleness": 2,
+    "client_concurrency": 64,
+    "tool_capacities": [
+      [
+        "python",
+        32
+      ],
+      [
+        "terminal",
+        32
+      ]
+    ],
+    "max_new_tokens": 32768,
+    "max_context_tokens": 65536,
+    "max_events": 32000000,
+    "max_simulated_seconds": 40000,
+    "actor_lifecycle_enabled": false,
+    "actor_lifecycle_history_seconds": 120,
+    "actor_lifecycle_margin_seconds": 5,
+    "actor_stopped_rollout_reconfig": false
+  },
+  "handoff": {
+    "node_gpus": [
+      8,
+      8
+    ],
+    "actor_startup_seconds": 30,
+    "rollout_startup_seconds": 30,
+    "actor_warmup_seconds": 5,
+    "rollout_warmup_seconds": 5,
+    "actor_state_bytes": 56314553344,
+    "weight_bytes": 8044936192,
+    "effective_bandwidth_GBps": 50,
+    "actor_sync_setup_seconds": 1,
+    "rollout_sync_setup_seconds": 0.1,
+    "provenance": "ILLUSTRATIVE ASSUMPTIONS: hard 2x8 pool; stop-before-start; startup30s/warmup5s; 14bytes/parameter Actor state; serialized50GBps save/load. Native reconfiguration not measured."
+  },
+  "forecast": {
+    "seed": 20261029,
+    "max_new_tokens": 32768,
+    "unseen_tool_residual_seconds": 5
+  },
+  "policy": {
+    "every_updates": 2,
+    "lookahead_batches": 16,
+    "minimum_completed_episodes": 96,
+    "minimum_relative_improvement": 0.03,
+    "max_evaluations": 64,
+    "decision_delay_seconds": 1,
+    "workload_trigger_enabled": true,
+    "feature_window_updates": 2,
+    "workload_change_ratio": 0.3,
+    "workload_change_checks": 2,
+    "max_search_interval_updates": 16,
+    "forecast_seed_by_update": true
+  },
+  "tool_seconds_per_unit": {
+    "synthetic-python-work-v1": 1,
+    "synthetic-terminal-work-v1": 1
+  },
+  "model_assumptions": {
+    "inter_node_dp_GBps": 50
+  }
+}

@@ -1,5 +1,7 @@
 # Elastic training with AReaL v2.1.0
 
+[Inline重配置模拟](INLINE_RECONFIGURATION.md)：固定GPU全程硬上限下主动供给训练任务，以相同训练工作量比较固定／动态配置。[共用模拟模块](../../../areal/elastic/simulation/README.md)独立于AutoPilot修订流程。
+
 The execution entry is native `PPOTrainer`. With `actor_lifecycle.mode=on_demand`,
 Rollout and CPU data services survive Actor worker release and restart. PPO computation,
 checkpointing and publication stay in the native trainer. Current verification and GPU
@@ -40,9 +42,6 @@ On-demand always selects an Elastic policy. The default `actor_lifecycle.policy=
 currently uses `IdleTimeoutPolicy`; the runtime has no separate idle-timeout rule. Full
 model-based Basic remains a later integration. `actor_lifecycle.policy=reference` is
 reserved and fails explicitly before services start until Reference scheduling exists.
-
-CPU条件模拟位于
-[areal/elastic/simulation](../../../areal/elastic/simulation/README.md)，独立于AutoPilot修订流程。
 
 ## Code map
 

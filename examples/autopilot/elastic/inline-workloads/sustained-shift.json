@@ -1,0 +1,91 @@
+{
+  "schema_version": "synthetic-inline-workload-v1",
+  "seed": 20261029,
+  "count": 7680,
+  "composition": [
+    {
+      "until_task": 2560,
+      "weights": {
+        "long_decode": 1
+      }
+    },
+    {
+      "until_task": 5120,
+      "weights": {
+        "multiturn_prefill": 1
+      }
+    },
+    {
+      "until_task": 7680,
+      "weights": {
+        "long_decode": 1
+      }
+    }
+  ],
+  "families": [
+    {
+      "max_turns": 1,
+      "mean_turns": 1,
+      "message_overhead_tokens": 16,
+      "name": "long_decode",
+      "output": {
+        "maximum": 16384,
+        "median": 8192,
+        "minimum": 4096.0,
+        "sigma": 0.3
+      },
+      "prompt": {
+        "maximum": 1024,
+        "median": 512,
+        "minimum": 256.0,
+        "sigma": 0.3
+      },
+      "tool_output": {
+        "maximum": 256,
+        "median": 128,
+        "minimum": 64.0,
+        "sigma": 0.3
+      },
+      "tool_reference": "synthetic-python-work-v1",
+      "tool_type": "python",
+      "tool_work": {
+        "maximum": 0.1,
+        "median": 0.05,
+        "minimum": 0.025,
+        "sigma": 0.5
+      }
+    },
+    {
+      "max_turns": 4,
+      "mean_turns": 4,
+      "message_overhead_tokens": 16,
+      "name": "multiturn_prefill",
+      "output": {
+        "maximum": 64,
+        "median": 32,
+        "minimum": 16.0,
+        "sigma": 0.3
+      },
+      "prompt": {
+        "maximum": 16384,
+        "median": 8192,
+        "minimum": 4096.0,
+        "sigma": 0.3
+      },
+      "tool_output": {
+        "maximum": 4096,
+        "median": 2048,
+        "minimum": 1024.0,
+        "sigma": 0.3
+      },
+      "tool_reference": "synthetic-python-work-v1",
+      "tool_type": "python",
+      "tool_work": {
+        "maximum": 0.1,
+        "median": 0.05,
+        "minimum": 0.025,
+        "sigma": 0.5
+      }
+    }
+  ]
+}

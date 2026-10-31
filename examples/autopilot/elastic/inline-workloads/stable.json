@@ -1,0 +1,79 @@
+{
+  "schema_version": "synthetic-inline-workload-v1",
+  "seed": 20261029,
+  "count": 640,
+  "composition": [
+    {
+      "until_task": 640,
+      "weights": {
+        "prefill": 1
+      }
+    }
+  ],
+  "families": [
+    {
+      "max_turns": 1,
+      "mean_turns": 1,
+      "message_overhead_tokens": 16,
+      "name": "short",
+      "output": {
+        "maximum": 512,
+        "median": 128,
+        "minimum": 32,
+        "sigma": 0.5
+      },
+      "prompt": {
+        "maximum": 4096,
+        "median": 512,
+        "minimum": 128,
+        "sigma": 0.4
+      },
+      "tool_output": {
+        "maximum": 1024,
+        "median": 256,
+        "minimum": 64,
+        "sigma": 0.6
+      },
+      "tool_reference": "synthetic-python-work-v1",
+      "tool_type": "python",
+      "tool_work": {
+        "maximum": 120,
+        "median": 0.2,
+        "minimum": 0.01,
+        "sigma": 1.0
+      }
+    },
+    {
+      "max_turns": 1,
+      "mean_turns": 1,
+      "message_overhead_tokens": 16,
+      "name": "prefill",
+      "output": {
+        "maximum": 128,
+        "median": 64,
+        "minimum": 32.0,
+        "sigma": 0.3
+      },
+      "prompt": {
+        "maximum": 16384,
+        "median": 8192,
+        "minimum": 4096.0,
+        "sigma": 0.3
+      },
+      "tool_output": {
+        "maximum": 256,
+        "median": 128,
+        "minimum": 64.0,
+        "sigma": 0.3
+      },
+      "tool_reference": "synthetic-python-work-v1",
+      "tool_type": "python",
+      "tool_work": {
+        "maximum": 0.1,
+        "median": 0.05,
+        "minimum": 0.025,
+        "sigma": 0.5
+      }
+    }
+  ]
+}

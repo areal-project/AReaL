@@ -1,24 +1,28 @@
-# AutoPilot 进度
+# AutoPilot Inline 进度
 
-更新：2026-10-31（香港时间）。开发分支`lws/feat/elastic-reconfig`，远端`origin`为`areal-project/AReaL`。
-[双机交接](examples/autopilot/DEVELOPMENT.md)／[架构](areal/elastic/README.md)／[策略版本](areal/elastic/policy/basic/VERSIONS.md)。
+更新：2026-10-31（香港时间）。当前分支`lws/feat/elastic-reconfig-inline`；共用重构基点`3c0e97a5`，后续online开发回到`lws/feat/elastic-reconfig`。
+[运行与约束](examples/autopilot/elastic/INLINE_RECONFIGURATION.md)／[结果](examples/autopilot/elastic/RESULTS_INLINE.md)／[双机交接](examples/autopilot/DEVELOPMENT.md)。
 
-## 当前状态
+## 当前实现与已验证结果
 
-- 后续优先推进online。共用simulation已从AutoPilot
-  domain移入`areal/elastic/simulation/`，抽取事件内核与候选评估，拆分观测和online预测；online策略规则保持不变，115项online正常CPU检查通过。
-- inline模拟、CV触发、示例及双周会结果单独保存到`lws/feat/elastic-reconfig-inline`；当前分支保留共用重构，避免混入inline专用策略与任务池。
-- 共享集成分支本地及远端均在`7bab3a80`；重配置与Arena独立推进。旧分支已清理，个人GitHub仓库保留。完整实验trace、日志和校准位于仓库父目录`artifacts/`，不随Git同步。
+- Inline任务池主动补充Rollout；固定全局batch48、staleness2，Actor
+  DP×TP与Rollout副本×TP联合选择，全程16卡硬上限（含交接）。候选比较相同后续工作量的完成时间，计入搜索、复核和交接成本；预测仅使用已知元数据与已完成历史。
+- CV触发分离轻量检查和全候选搜索；稳定负载跳过全搜，变化须持续达到阈值，保留低频刷新。32-update配对CPU66.92→11.15秒（6倍），训练记录一致。[证据](../artifacts/elastic-inline-cv-20261029/README.md)。
+- 双周会主展示均为seed20261029，9,216题／192更新；下表为组件校准的CPU条件模拟，GPU原生交接与训练质量尚未验证。
 
-## 已验证
+| Trace                        | 初态固定→动态       | 缩时   | 交接／峰值GPU |
+| ---------------------------- | ------------------- | ------ | ------------- |
+| 长度变化→多轮长输入→16K／4K  | 14,749.6→11,847.1秒 | 19.68% | 2次／16卡     |
+| 24K短输出→16K／4K→多轮长输入 | 19,657.2→14,770.5秒 | 24.86% | 3次／16卡     |
 
-- Online
-  v3统一32格条件模拟完成并审计：19/32满足TTFT5秒＋最大TBT100毫秒／80%目标；同轨迹按平均TPOT50毫秒后处理32/32达标，TPOT尚未接入决策。[配置与结果](examples/autopilot/elastic/RESULTS_V3.md)。
-- v3.1发布等待、Actor保存／释放／恢复、停止时仅调Rollout及分侧120秒历史等待已有正常CPU验证；冻结4B／H20组件与发布校准保留。[版本](areal/elastic/policy/basic/VERSIONS.md)。
-- 真实4B＋Hermes/DAPO固定布局16题／4更新通过，32次推理、5次工具、消费／发布／checkpoint及退出审计通过。[证据](../artifacts/h20-training-trace-20261025-f28c1811/smoke-001/audit.json)。
+- Trace
+  B各阶段配置为12×1／1×4→8×1／2×4→6×2／1×4，详细交接及阶段耗时见[证据](../artifacts/elastic-inline-context-shift-20261029/README.md)。Trace
+  A另有第二seed19.75%的历史复核，双周会不展示。
+- Batch48筛查覆盖9类×2seed×44布局，722组完成、70组显存拒绝；仅作候选空间诊断。[筛查](../artifacts/elastic-inline-batch48-screen-20261029/README.md)。
+- 共用重构已通过115项online正常CPU检查及完整pre-commit；本分支16项inline正常CPU检查通过，原46份Python／JSON改动的语义完整保留；8种online负载共7,150题生成结果与修改前一致。完整trace、日志与校准保留仓库父目录`artifacts/`，不随Git同步。
 
-## 下一步与约束
+## 后续与边界
 
-- 待用户整理proposal后确定online修订对象与评估任务；原生DP／副本切换GPU验收、TP切换与训练质量仍待完成，条件模拟不能代替原生验收。
-- 当前SLO仍由最大TBT驱动；启动、跨节点链路与未见混合形状为条件模型。外层revision尚未验证对新闭环的额外收益。
-- H20监控及自动开跑继续暂停，等待用户明确恢复；公司端Arena真实模型连通与训练验收独立推进。[采集计划](examples/task_workflows/TRAIN_TRACE_PLAN.md)。
+- 本分支保留inline实现与双周会结果；后续优先在`lws/feat/elastic-reconfig`推进online，待用户proposal确定修订对象与评估任务。
+- 新inline闭环尚未接入外层revision并验证额外收益；原生DP／副本切换GPU验收、TP切换及训练质量待完成。
+- H20监控及自动开跑继续暂停；Arena真实模型连通和训练验收独立推进。双周会已结束，幻灯片v1已撤下。

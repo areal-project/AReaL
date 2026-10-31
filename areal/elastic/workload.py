@@ -206,11 +206,11 @@ def arrival_times(spec: WorkloadSpec) -> tuple[float, ...]:
     return tuple(times)
 
 
-def generate(spec: WorkloadSpec) -> tuple[dict, ...]:
+def _generate_at(spec: WorkloadSpec, indexed_times) -> tuple[dict, ...]:
     families = {f.name: f for f in spec.families}
     names, weights = zip(*spec.composition[0].weights, strict=True)
     episodes = []
-    for index, at in enumerate(arrival_times(spec)):
+    for index, at in indexed_times:
         episode_id = f"episode-{index:08d}"
         name = _rng(spec.seed, episode_id, "family").choices(names, weights, k=1)[0]
         family = families[name]
@@ -268,6 +268,80 @@ def generate(spec: WorkloadSpec) -> tuple[dict, ...]:
             }
         )
     return tuple(episodes)
+
+
+def generate(spec: WorkloadSpec) -> tuple[dict, ...]:
+    return _generate_at(spec, enumerate(arrival_times(spec)))
+
+
+@dataclass(frozen=True)
+class TaskCountPhase:
+    until_task: int
+    weights: tuple[tuple[str, float], ...]
+
+
+@dataclass(frozen=True)
+class TaskCountSpec:
+    seed: int
+    count: int
+    composition: tuple[TaskCountPhase, ...]
+    families: tuple[TaskFamily, ...]
+
+    def __post_init__(self):
+        if type(self.count) is not int or self.count < 1 or not self.composition:
+            raise ValueError(
+                "A finite positive task count and composition are required"
+            )
+        start = 0
+        for phase in self.composition:
+            if (
+                type(phase.until_task) is not int
+                or not start < phase.until_task <= self.count
+            ):
+                raise ValueError("Task phases must partition [0, count)")
+            WorkloadSpec(
+                self.seed,
+                1.0,
+                (ArrivalPhase(1.0, 0.0),),
+                (CompositionPhase(1.0, phase.weights),),
+                self.families,
+            )
+            start = phase.until_task
+        if start != self.count:
+            raise ValueError("Task phases must end at the declared count")
+
+    @classmethod
+    def decode(cls, raw):
+        if raw["schema_version"] != "synthetic-inline-workload-v1":
+            raise ValueError("Unknown task-count workload schema")
+        return cls(
+            raw["seed"],
+            raw["count"],
+            tuple(
+                TaskCountPhase(p["until_task"], tuple(sorted(p["weights"].items())))
+                for p in raw["composition"]
+            ),
+            tuple(TaskFamily.decode(f) for f in raw["families"]),
+        )
+
+
+def generate_count(spec: TaskCountSpec) -> tuple[dict, ...]:
+    """Generate identical ordered tasks independently of submission or execution time."""
+    result = []
+    start = 0
+    for phase in spec.composition:
+        phase_spec = WorkloadSpec(
+            spec.seed,
+            1.0,
+            (ArrivalPhase(1.0, 0.0),),
+            (CompositionPhase(1.0, phase.weights),),
+            spec.families,
+        )
+        result.extend(
+            _generate_at(phase_spec, ((i, 0.0) for i in range(start, phase.until_task)))
+        )
+        start = phase.until_task
+    return tuple(result)
 
 
 def write_workload(

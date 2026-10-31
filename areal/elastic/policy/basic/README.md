@@ -7,19 +7,20 @@
 原生 `on_demand` 通过 `policy/adapter.py::PolicyAdapter` 统一装配和调用策略，默认使用
 `IdleTimeoutPolicy`。默认空闲 60s 后请求释放， 支持零超时；最短驻留、发布、保存与进程清理由 Runtime 约束。完整 Basic 尚未成为默认策略。
 
-| 文件                                            | 职责                                              |
-| ----------------------------------------------- | ------------------------------------------------- |
-| `policy.py`                                     | 固定超时基线、模型生命周期决策和离线联合规划入口  |
-| `optimizer.py`                                  | 有限视野搜索、成本／时间约束、切换门槛与查询预算  |
-| `simulator.py`                                  | 阶段组合、负载预测、驻留 GPU 成本及联合模拟       |
-| `actor_cost.py`                                 | Actor 模型到阶段预测／生命周期策略的适配          |
-| `joint.py`、`serial_planning.py`                | 联合配置协议与离线严格串行模型／决策              |
-| `serving.py`                                    | 请求级 TTFT／TBT 统计与联合达标率约束             |
-| `online.py`、`history.py`、`online_forecast.py` | 仅SLO压力／宽裕触发、负载阶段、历史回放与在线搜索 |
-| `observations.py`、`forecast_workload.py`       | 共用布局／观测／预测输入与历史episode后续估计     |
-| `profile.py`                                    | 实测 workflow 装配与固定布局模拟边界              |
-| `serialization.py`                              | 公共规划输入的 JSON 解码                          |
-| `cost_model/`                                   | Actor、Rollout 与转换成本模型、校准和基础数据     |
+| 文件                                                   | 职责                                                   |
+| ------------------------------------------------------ | ------------------------------------------------------ |
+| `policy.py`                                            | 固定超时基线、模型生命周期决策和离线联合规划入口       |
+| `optimizer.py`                                         | 有限视野搜索、成本／时间约束、切换门槛与查询预算       |
+| `simulator.py`                                         | 阶段组合、负载预测、驻留 GPU 成本及联合模拟            |
+| `actor_cost.py`                                        | Actor 模型到阶段预测／生命周期策略的适配               |
+| `joint.py`、`serial_planning.py`                       | 联合配置协议与离线严格串行模型／决策                   |
+| `serving.py`                                           | 请求级 TTFT／TBT 统计与联合达标率约束                  |
+| `online.py`、`history.py`、`online_forecast.py`        | 仅SLO压力／宽裕触发、负载阶段、历史回放与在线搜索      |
+| `observations.py`、`forecast_workload.py`              | 共用布局／观测／预测输入与历史episode后续估计          |
+| `inline.py`、`inline_forecast.py`、`inline_trigger.py` | 轻量统计／CV触发、同工作量完成时间比较及任务池历史预测 |
+| `profile.py`                                           | 实测 workflow 装配与固定布局模拟边界                   |
+| `serialization.py`                                     | 公共规划输入的 JSON 解码                               |
+| `cost_model/`                                          | Actor、Rollout 与转换成本模型、校准和基础数据          |
 
 `BasicPolicy.decide()` 处理生命周期，`JointPolicy.plan()` 返回离线联合计划；Basic 独立于 Reference。
 运行历史统一来自默认 Monitor，超时基线也会积累数据；启用采集不自动切换模型搜索。 模型比较固定样本量和训练语义，缺少测量或状态时明确拒绝预测；配置转换需显式声明兼容。
@@ -37,6 +38,10 @@ CPU持续事件环境和冻结模型适配位于 `areal/elastic/simulation/onlin
 不合格者也不能进入压力回退。`actor_memory_scope="evaluation"`可仅对原候选评估所用batch加余量，不额外扫旧历史；默认`all_completed`。
 省略余量或设0关闭筛选，原物理显存模型及训练微批保持不变。
 [运行与假设](../../../../examples/autopilot/elastic/ONLINE_RECONFIGURATION.md)。
+
+`InlinePolicy`每K次完整update发布后检查；候选包含current，比较相同后续M个batch及发布的完成时间，达到收益门槛才切换。预测只使用已知任务元数据与已完成历史。全程硬预算、先停后起及搜索／复核时序由独立模拟环境执行。[Inline运行](../../../../examples/autopilot/elastic/INLINE_RECONFIGURATION.md)。
+
+`workload_trigger_enabled`可将检查与全搜分开：只统计最近已发布batch中的初始输入、总输出、累计训练token、最大上下文的均值／P90／CV，以及轮数和多轮比例。连续变化达到阈值才全搜，另有低频兜底；稳定检查不构造完整候选快照。旧配置默认保留周期全搜，新batch48示例显式开启。`forecast_seed_by_update`让同一update的搜索与复核使用相同采样索引，避免调用次数改变预测样本。
 
 [成本模型](cost_model/README.md)／[原生执行接口](../../../../examples/autopilot/elastic/README.md)。
 离线 CLI、R10 专用回放辅助模块与原详细说明见
