@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from areal.api.cli_args import SGLangConfig
 from areal.engine.awex.qwen3_5_fp8 import Qwen35FP8Policy
 
 
@@ -55,6 +56,21 @@ def test_fused_projection_partial_ignore_is_rejected():
 def test_unsupported_scale_contract_is_rejected(override):
     with pytest.raises(ValueError, match="unpacked FP32 scales"):
         Qwen35FP8Policy(Qwen35FP8Policy.checkpoint_config() | override)
+
+
+def test_sglang_fp8_backend_uses_upstream_cli_spelling(monkeypatch):
+    monkeypatch.setattr(
+        "areal.api.cli_args.pkg_version.is_version_greater_or_equal", lambda *args: True
+    )
+    defaults = SGLangConfig.build_args(SGLangConfig(), tp_size=1, base_gpu_id=0)
+    assert "fp8_gemm_runner_backend" not in defaults
+    args = SGLangConfig.build_args(
+        SGLangConfig(fp8_gemm_runner_backend="triton"), tp_size=1, base_gpu_id=0
+    )
+    command = SGLangConfig.build_cmd_from_args(args)
+    assert command[command.index("--fp8-gemm-backend") + 1] == "triton"
+    assert "--fp8-gemm-runner-backend" not in command
+    assert args["fp8_gemm_runner_backend"] == "triton"
 
 
 def test_pipeline_parallelism_rejects_layer_specific_projection_exclusions(policy):
