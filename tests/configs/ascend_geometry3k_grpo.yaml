@@ -110,6 +110,7 @@ actor:
     std_level: group
     group_size: ${gconfig.n_samples}
   adv_norm: null
+  weight_update_mode: awex
   megatron:
     bridge_type: megatron-bridge
     use_bridge_for_update_weights: true
@@ -147,6 +148,13 @@ ref:
     target: actor
   scheduling_spec: ${actor.scheduling_spec}
 
+awex:
+  device_backend: npu
+  use_mindspeed: true
+  meta_server_addr: auto
+  comm_backend: hccl
+  weights_exchange_ipc_backend: npu
+
 vllm:
   model: ${actor.path}
   seed: ${seed}
@@ -161,15 +169,12 @@ vllm:
   no_enable_prefix_caching: false
   compilation_config:
     cudagraph_capture_sizes:
-      - 1
-      - 2
       - 4
       - 8
       - 16
     cudagraph_mode: FULL_DECODE_ONLY
   additional_config:
     enable_cpu_binding: true
-  gdn_prefill_backend: triton
   speculative_config:
     method: mtp
     num_speculative_tokens: 3
