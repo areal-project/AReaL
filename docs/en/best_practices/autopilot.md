@@ -1,8 +1,8 @@
 # AReaL Autopilot (Offline Analysis)
 
 The offline Autopilot analyzer turns existing AReaL training configuration and
-PerfTracer output into a measured phase summary and a short list of next diagnostics.
-It can also include compatible results from `areal.tools.benchmark_fsdp` as tuning
+PerfTracer output into a measured phase summary and a short list of next diagnostics. It
+can also include compatible results from `areal.tools.benchmark_fsdp` as tuning
 candidates.
 
 The analyzer is read-only: it does not change configuration, start a training job, or
@@ -11,19 +11,25 @@ GPU, communication, storage, or scheduler root cause.
 
 ## Collect and analyze
 
-Enable `perf_tracer.enabled` in the training config, then run the experiment. PerfTracer
-writes one `traces-r{rank}.jsonl` file per participating rank. Pass the run's YAML config
-and all trace files to the analyzer:
+Enable `perf_tracer.enabled` in the training config, then run the experiment. AReaL
+saves the composed and resolved run configuration as `config.yaml` under the run's
+`stats_logger` directory. Use that saved snapshot, rather than the original Hydra source
+file, so inherited defaults and interpolations match the actual run. PerfTracer writes
+one `traces-r{rank}.jsonl` file per participating rank. Pass the snapshot and all trace
+files to the analyzer:
 
 ```bash
 python -m areal.tools.autopilot \
-  --config examples/math/gsm8k_grpo.yaml \
+  --config /path/to/stats_logger/config.yaml \
   --traces /path/to/perf_tracer/traces-r*.jsonl \
   --output-dir /path/to/autopilot-report
 ```
 
 The output directory must not already exist. It contains `report.json` for downstream
 processing and `report.md` for review.
+
+The analyzer rejects a source file that still contains Hydra `defaults` or `${...}`
+interpolations. Run the training entrypoint first and use its resolved `config.yaml`.
 
 ## Include FSDP measurements
 
@@ -33,7 +39,7 @@ path matches the benchmark model:
 
 ```bash
 python -m areal.tools.autopilot \
-  --config examples/math/gsm8k_grpo.yaml \
+  --config /path/to/stats_logger/config.yaml \
   --traces /path/to/perf_tracer/traces-r*.jsonl \
   --benchmark-report /path/to/fsdp-benchmark/report.json \
   --output-dir /path/to/autopilot-report
@@ -51,7 +57,11 @@ the slowest rank within a role is used. Sequential operations are combined withi
 role, then the slowest role is used for the phase. This avoids adding parallel rank or
 role times together. Phase shares are calculated only from recognized phases present in
 the input traces. The report lists known spans that were not observed overall and by
-role, so missing instrumentation for a role is visible.
+role times together. Spans without a valid `global_step` are retained as per-worker
+totals, but excluded from step statistics and phase shares because they cannot be safely
+assigned to a training step. Phase shares are calculated only from recognized,
+step-assigned phases present in the input traces. The report lists known spans that were
+not observed overall and by role, so missing instrumentation for a role is visible.
 
 Each recommendation links to the observed span that triggered it and suggests the next
 measurement to collect. The report lists missing instrumentation so an absent phase is

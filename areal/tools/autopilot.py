@@ -97,8 +97,12 @@ def analyze_traces(trace_paths: Sequence[Path]) -> dict[str, Any]:
         lambda: defaultdict(lambda: defaultdict(float))
     )
     observed_span_roles: dict[str, set[str]] = defaultdict(set)
+    unassigned_spans: dict[str, dict[tuple[str, str], list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     files: set[Path] = set()
     observed_spans: set[str] = set()
+    observed_workers: set[tuple[str, str]] = set()
     event_count = 0
 
     for raw_path in trace_paths:
@@ -114,25 +118,25 @@ def analyze_traces(trace_paths: Sequence[Path]) -> dict[str, Any]:
                 event.get("ph") != "X"
                 or not isinstance(name, str)
                 or name not in _SPAN_TO_PHASE
-                or not isinstance(args, dict)
             ):
                 continue
-            step = args.get("global_step")
             duration = event.get("dur")
             if (
-                isinstance(step, bool)
-                or not isinstance(step, int)
-                or step < 0
-                or isinstance(duration, bool)
+                isinstance(duration, bool)
                 or not isinstance(duration, int | float)
                 or not math.isfinite(duration)
                 or duration <= 0
             ):
                 continue
             role_rank = _worker(event, path)
-            step_spans[step][name][role_rank] += float(duration)
+            observed_workers.add(role_rank)
             observed_span_roles[name].add(role_rank[0])
             observed_spans.add(name)
+            step = args.get("global_step") if isinstance(args, dict) else None
+            if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+                unassigned_spans[name][role_rank].append(float(duration))
+                continue
+            step_spans[step][name][role_rank] += float(duration)
 
     if not step_spans:
         raise ValueError("No valid train.* phase spans with global_step were found")
@@ -204,9 +208,7 @@ def analyze_traces(trace_paths: Sequence[Path]) -> dict[str, Any]:
             role: len(
                 {
                     worker
-                    for spans in step_spans.values()
-                    for by_worker in spans.values()
-                    for worker in by_worker
+                    for worker in observed_workers
                     if worker[0] == role and worker[1].isdigit()
                 }
             )
@@ -224,12 +226,29 @@ def analyze_traces(trace_paths: Sequence[Path]) -> dict[str, Any]:
             )
             for role in sorted(set().union(*observed_span_roles.values()))
         },
+        "unassigned_spans": {
+            span: {
+                "phase": _SPAN_TO_PHASE[span],
+                "workers": [
+                    {
+                        "role": role,
+                        "rank": rank,
+                        "event_count": len(durations),
+                        "total_seconds": sum(durations) / 1_000_000,
+                    }
+                    for (role, rank), durations in sorted(by_worker.items())
+                ],
+            }
+            for span, by_worker in sorted(unassigned_spans.items())
+        },
         "spans": spans_report,
         "phases": phases_report,
     }
 
 
 def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
+    from areal.api.cli_args import MicroBatchSpec
+
     sections = {
         name: config.get(name) or {} for name in ("actor", "cluster", "rollout")
     }
@@ -242,9 +261,13 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
     microbatch = actor.get("mb_spec") or {}
     if not isinstance(microbatch, dict):
         raise ValueError("Expected 'actor.mb_spec' configuration to be a mapping")
-    optimizer = actor.get("optimizer") or {}
-    if not isinstance(optimizer, dict):
+    optimizer = actor.get("optimizer")
+    if optimizer is not None and not isinstance(optimizer, dict):
         raise ValueError("Expected 'actor.optimizer' configuration to be a mapping")
+    fsdp = actor.get("fsdp") or {}
+    if not isinstance(fsdp, dict):
+        raise ValueError("Expected 'actor.fsdp' configuration to be a mapping")
+    microbatch_defaults = MicroBatchSpec()
     backend = actor.get("backend") or config.get("allocation_mode")
     if not actor.get("backend") and isinstance(backend, str) and "+" in backend:
         try:
@@ -263,18 +286,34 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
             "n_gpus_per_node": cluster.get("n_gpus_per_node"),
         },
         "microbatch": {
-            "n_mbs": microbatch.get("n_mbs"),
+            "n_mbs": microbatch.get("n_mbs", microbatch_defaults.n_mbs),
             "max_tokens_per_mb": microbatch.get("max_tokens_per_mb"),
-            "packing_algorithm": microbatch.get("packing_algorithm"),
+            "packing_algorithm": microbatch.get(
+                "packing_algorithm", microbatch_defaults.packing_algorithm
+            ),
+            "granularity": microbatch.get(
+                "granularity", microbatch_defaults.granularity
+            ),
+            "n_mbs_divisor": microbatch.get(
+                "n_mbs_divisor", microbatch_defaults.n_mbs_divisor
+            ),
         },
         "gradient_checkpointing": actor.get("gradient_checkpointing", False),
         "dtype": actor.get("dtype", "bfloat16"),
         "attn_impl": actor.get("attn_impl", "flash_attention_2"),
         "optimizer_dtype": actor.get("optimizer_dtype", "float32"),
-        "optimizer_type": optimizer.get("type", "adam"),
+        "optimizer_type": optimizer.get("type", "adam")
+        if optimizer is not None
+        else None,
+        "grad_reduce_dtype": actor.get("grad_reduce_dtype", "float32"),
         "disable_dropout": actor.get("disable_dropout", False),
         "offload": actor.get("offload", False),
+        "fsdp_offload_params": fsdp.get("offload_params", False),
+        "fsdp_per_layer_optim_step": fsdp.get("per_layer_optim_step", False),
         "use_lora": actor.get("use_lora", False),
+        "use_kernels": actor.get("use_kernels", False),
+        "pad_to_maximum": actor.get("pad_to_maximum", False),
+        "init_from_scratch": actor.get("init_from_scratch", False),
         "max_concurrent_rollouts": rollout.get("max_concurrent_rollouts"),
         "queue_size": rollout.get("queue_size"),
     }
@@ -292,6 +331,12 @@ def _benchmark_candidates(
     if not isinstance(report, dict) or not isinstance(report.get("plan"), dict):
         raise ValueError(f"Benchmark report {report_path} has no plan object")
     plan = report["plan"]
+    if report.get("fatal_error"):
+        return {
+            "status": "incomplete_sweep",
+            "reasons": [f"benchmark sweep stopped: {report['fatal_error']}"],
+            "candidates": [],
+        }
     backend = config.get("backend")
     reasons = []
     if not isinstance(backend, str) or not backend.startswith("fsdp:"):
@@ -338,17 +383,29 @@ def _benchmark_candidates(
             ("attn_impl", "flash_attention_2"),
             ("optimizer_dtype", "float32"),
             ("optimizer_type", "adam"),
+            ("grad_reduce_dtype", "float32"),
+            ("use_kernels", False),
+            ("pad_to_maximum", False),
+            ("init_from_scratch", plan.get("init_from_scratch", False)),
         ):
             if config.get(key) != benchmark_value:
                 reasons.append(
                     f"training config {key}={config.get(key)!r} differs from benchmark {benchmark_value!r}"
                 )
-        if config.get("offload"):
+        if config.get("offload") or config.get("fsdp_offload_params"):
             reasons.append("FSDP benchmark does not measure CPU offload")
+        if config.get("fsdp_per_layer_optim_step"):
+            reasons.append("FSDP benchmark does not measure per-layer optimizer steps")
         if config.get("use_lora"):
             reasons.append("FSDP benchmark does not measure LoRA training")
-        if config["microbatch"].get("n_mbs", 1) != 1:
-            reasons.append("FSDP benchmark uses n_mbs=1")
+        for key, value in (
+            ("n_mbs", 1),
+            ("granularity", 1),
+            ("n_mbs_divisor", 1),
+            ("packing_algorithm", "ffd"),
+        ):
+            if config["microbatch"].get(key) != value:
+                reasons.append(f"FSDP benchmark uses {key}={value}")
         if not config.get("disable_dropout"):
             reasons.append("FSDP benchmark disables dropout")
     except (TypeError, ValueError, AllocationValidationError) as exc:
@@ -360,7 +417,7 @@ def _benchmark_candidates(
     if not isinstance(trials, list):
         raise ValueError(f"Benchmark report {report_path} has invalid trials")
     candidates = []
-    for trial in trials:
+    for index, trial in enumerate(trials):
         if not isinstance(trial, dict) or trial.get("status") != "ok":
             continue
         speed = trial.get("loss_tokens_per_second")
@@ -369,19 +426,90 @@ def _benchmark_candidates(
             isinstance(speed, bool)
             or not isinstance(speed, int | float)
             or not math.isfinite(speed)
+            or speed <= 0
             or not isinstance(latency, dict)
             or isinstance(latency.get("mean"), bool)
             or not isinstance(latency.get("mean"), int | float)
             or not math.isfinite(latency["mean"])
+            or latency["mean"] <= 0
         ):
-            continue
-        ranks = trial.get("ranks") or [{}]
-        if not isinstance(ranks, list):
-            continue
-        rank = ranks[0] if ranks and isinstance(ranks[0], dict) else {}
+            raise ValueError(
+                f"Benchmark trial {index} has invalid throughput or latency"
+            )
+        tokens = trial.get("max_tokens_per_mb")
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
+            raise ValueError(f"Benchmark trial {index} has invalid max_tokens_per_mb")
+        if not isinstance(trial.get("gradient_checkpointing"), bool):
+            raise ValueError(
+                f"Benchmark trial {index} has invalid gradient_checkpointing"
+            )
+        world_size = plan.get("world_size")
+        memory = trial.get("peak_allocated_bytes_per_rank")
+        ranks = trial.get("ranks")
+        if (
+            isinstance(world_size, bool)
+            or not isinstance(world_size, int)
+            or world_size < 1
+            or not isinstance(memory, list)
+            or len(memory) != world_size
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(value)
+                or value < 0
+                for value in memory
+            )
+            or not isinstance(ranks, list)
+            or len(ranks) != world_size
+            or any(not isinstance(rank, dict) for rank in ranks)
+        ):
+            raise ValueError(f"Benchmark trial {index} has invalid per-rank results")
+        if sorted(
+            rank["rank"]
+            for rank in ranks
+            if isinstance(rank.get("rank"), int) and not isinstance(rank["rank"], bool)
+        ) != list(range(world_size)):
+            raise ValueError(
+                f"Benchmark trial {index} has missing or duplicate rank IDs"
+            )
+        for rank in ranks:
+            engine = rank.get("effective_engine_config")
+            if not isinstance(engine, dict) or not isinstance(
+                engine.get("optimizer"), dict
+            ):
+                raise ValueError(
+                    f"Benchmark trial {index} has invalid engine/optimizer metadata"
+                )
+            measured = summarize_config({"actor": engine})
+            for key in (
+                "dtype",
+                "attn_impl",
+                "optimizer_dtype",
+                "optimizer_type",
+                "grad_reduce_dtype",
+                "disable_dropout",
+                "offload",
+                "fsdp_offload_params",
+                "fsdp_per_layer_optim_step",
+                "use_lora",
+                "use_kernels",
+                "pad_to_maximum",
+                "init_from_scratch",
+            ):
+                if measured[key] != config[key]:
+                    raise ValueError(
+                        f"Benchmark trial {index} engine {key} differs from training config"
+                    )
+            if (
+                measured["microbatch"]
+                != {**config["microbatch"], "max_tokens_per_mb": tokens}
+                or measured["gradient_checkpointing"] != trial["gradient_checkpointing"]
+            ):
+                raise ValueError(
+                    f"Benchmark trial {index} engine microbatch settings differ from trial"
+                )
+        rank = ranks[0]
         engine_config = rank.get("effective_engine_config", {})
-        if not isinstance(engine_config, dict):
-            continue
         candidates.append(
             {
                 "max_tokens_per_mb": trial.get("max_tokens_per_mb"),
@@ -426,7 +554,7 @@ def _recommendations(
     trace_analysis: dict[str, Any],
     config: dict[str, Any],
     benchmark: dict[str, Any],
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     phases = trace_analysis["phases"]
     dominant = max(
         phases, key=lambda phase: phases[phase]["share_of_observed_phase_time"]
@@ -445,7 +573,7 @@ def _recommendations(
             "priority": "investigate",
             "finding": (
                 f"{dominant} is the largest observed phase at {share:.1%} of "
-                f"instrumented phase time across {trace_analysis['step_count']} steps."
+                f"step-assigned instrumented phase time across {trace_analysis['step_count']} steps."
             ),
             "action": _PHASE_ACTIONS[dominant],
             "evidence": f"trace_analysis.spans.{dominant_span}",
@@ -457,6 +585,15 @@ def _recommendations(
             "evidence": "PerfTracer train.* complete events with global_step",
         },
     ]
+    if trace_analysis["unassigned_spans"]:
+        recommendations.append(
+            {
+                "priority": "investigate",
+                "finding": "Some observed trainer spans have no valid global_step and are excluded from step statistics and phase shares.",
+                "action": "Review the per-worker unassigned span totals before interpreting the largest step-assigned phase as the overall bottleneck.",
+                "evidence": "trace_analysis.unassigned_spans",
+            }
+        )
     candidates = benchmark.get("candidates", [])
     if candidates:
         candidate = candidates[0]
@@ -527,6 +664,26 @@ def analyze(
     config_data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(config_data, dict):
         raise ValueError(f"Expected a YAML mapping in {config_path}")
+    if "defaults" in config_data:
+        raise ValueError(
+            "Hydra defaults require composition. Pass the resolved config.yaml saved "
+            "in the training run's stats_logger directory."
+        )
+
+    def check_resolved(value: Any) -> None:
+        if isinstance(value, str) and "${" in value:
+            raise ValueError(
+                "Unresolved configuration interpolation. Pass the resolved config.yaml "
+                "saved in the training run's stats_logger directory."
+            )
+        if isinstance(value, dict):
+            for item in value.values():
+                check_resolved(item)
+        elif isinstance(value, list):
+            for item in value:
+                check_resolved(item)
+
+    check_resolved(config_data)
     config = summarize_config(config_data)
     trace_analysis = analyze_traces(trace_paths)
     benchmark = _benchmark_candidates(benchmark_path, config)
@@ -540,6 +697,8 @@ def analyze(
         "recommendations": _recommendations(trace_analysis, config, benchmark),
         "limitations": [
             "Phase duration is evidence of elapsed time, not a root-cause diagnosis.",
+            "Phase sums assume sequential operations within each role; they are not a cross-role critical-path or whole-run wall-clock measurement.",
+            "Observed spans without a valid global_step are reported per worker and excluded from step statistics and phase shares.",
             "Missing spans may be disabled, uninstrumented, or absent from the input files.",
             "FSDP benchmark measurements use synthetic SFT tokens and require validation with the target RL workload.",
             "No config is changed and no training job is launched.",
@@ -592,6 +751,24 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"| `{span}` | {metrics['phase']} | {metrics['steps']} | "
             f"{metrics['mean_seconds']:.4f} | {metrics['p95_seconds']:.4f} |"
         )
+    if traces["unassigned_spans"]:
+        lines.extend(
+            [
+                "",
+                "### Observed Spans Without a Step",
+                "",
+                "These per-worker sums are excluded from step statistics and phase shares. Parallel worker times must not be added together as elapsed time.",
+                "",
+                "| Span | Role | Rank | Events | Total (s) |",
+                "| --- | --- | --- | ---: | ---: |",
+            ]
+        )
+        for span, metrics in traces["unassigned_spans"].items():
+            for worker in metrics["workers"]:
+                lines.append(
+                    f"| `{span}` | {worker['role']} | {worker['rank']} | "
+                    f"{worker['event_count']} | {worker['total_seconds']:.4f} |"
+                )
     lines.extend(["", "Unobserved known spans:", ""])
     lines.extend(f"- `{span}`" for span in traces["missing_spans"])
     if not traces["missing_spans"]:
@@ -660,7 +837,12 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Resolved run YAML; Hydra defaults and unresolved interpolations are rejected",
+    )
     parser.add_argument("--traces", type=Path, nargs="+", required=True)
     parser.add_argument("--benchmark-report", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -679,16 +861,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit(f"input file does not exist: {path}")
     try:
         report = analyze(args.config, args.traces, args.benchmark_report)
+        json_report = (
+            json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+        )
+        markdown_report = render_markdown(report)
+        args.output_dir.mkdir(parents=True)
+        (args.output_dir / "report.json").write_text(json_report, encoding="utf-8")
+        (args.output_dir / "report.md").write_text(markdown_report, encoding="utf-8")
     except (OSError, ValueError, yaml.YAMLError) as exc:
         raise SystemExit(str(exc)) from exc
-    args.output_dir.mkdir(parents=True)
-    (args.output_dir / "report.json").write_text(
-        json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    (args.output_dir / "report.md").write_text(
-        render_markdown(report), encoding="utf-8"
-    )
     return 0
 
 
