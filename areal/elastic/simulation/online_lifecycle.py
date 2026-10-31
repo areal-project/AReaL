@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 
-from areal.elastic.policy.basic.forecast import ActorLifecycleView
+from areal.elastic.policy.basic.observations import ActorLifecycleView
 
 
 class ActorLifecycle:

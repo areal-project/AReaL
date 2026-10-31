@@ -9,7 +9,7 @@ from math import inf
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .forecast import OnlineLayout
+    from .observations import OnlineLayout
     from .online import CandidatePrediction
 
 

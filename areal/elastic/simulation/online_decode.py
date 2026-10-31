@@ -9,12 +9,12 @@ import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from areal.elastic.policy.basic.forecast import ServiceView
+from areal.elastic.policy.basic.observations import ServiceView
 from areal.elastic.policy.reference.cost_model._rollout.scheduling import policy_for
 from areal.elastic.policy.reference.cost_model._rollout.types import ServiceSlice
 
 if TYPE_CHECKING:
-    from .online_simulation import OnlineSimulation
+    from .simulation_core import SimulationCore
 
 
 @dataclass(frozen=True)
@@ -72,7 +72,7 @@ class _Plan:
     run: _Run | None = None
 
 
-def advance_decode(sim: OnlineSimulation, until: float | None) -> None:
+def advance_decode(sim: SimulationCore, until: float | None) -> None:
     """Skip only full decode iterations; keep the next GPU iteration in flight.
 
     All replicas share the earliest structural boundary. Independent decode
@@ -84,7 +84,7 @@ def advance_decode(sim: OnlineSimulation, until: float | None) -> None:
         affine is None
         or sim.sink is not None
         or sim.publication != "idle"
-        or sim._forecast_slo_guard is not None
+        or sim.prediction_guard_active()
     ):
         return
     boundary = min(

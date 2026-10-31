@@ -41,6 +41,9 @@ currently uses `IdleTimeoutPolicy`; the runtime has no separate idle-timeout rul
 model-based Basic remains a later integration. `actor_lifecycle.policy=reference` is
 reserved and fails explicitly before services start until Reference scheduling exists.
 
+CPU条件模拟位于
+[areal/elastic/simulation](../../../areal/elastic/simulation/README.md)，独立于AutoPilot修订流程。
+
 ## Code map
 
 | Responsibility                                                       | Current module                                            |

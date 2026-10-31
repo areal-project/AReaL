@@ -7,11 +7,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING
 
-from areal.elastic.policy.basic.forecast import RequestView
+from areal.elastic.policy.basic.observations import RequestView
 
 if TYPE_CHECKING:
     from .online_decode import _Plan
-    from .online_simulation import _Request
+    from .simulation_core import _Request
 
 
 _REQUEST_FIELDS = tuple(f.name for f in fields(RequestView))

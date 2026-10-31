@@ -299,6 +299,7 @@ areal/trainer/rl_trainer.py             # 唯一 PPO 执行与每轮工作顺序
 areal/elastic/runtime.py               # Actor 生命周期、发布、保存与恢复
 areal/elastic/{state,control,monitor}/   # 持久状态、控制事务与运行观测／实测
 areal/v2/training_service/{checkpoint,runtime_state}.py # 原生状态读写与各 rank LR／RNG
+areal/elastic/simulation/               # 共用事件内核与online条件模拟
 areal/elastic/policy/basic/             # Basic 模型／simulator／optimizer
 areal/elastic/policy/reference/         # 独立 Expert 对照
 areal/autopilot/revision/               # 通用 proposal／评测编排／接受／store

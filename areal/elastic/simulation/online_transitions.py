@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exclusive TP-local leases and explicit make-before-break timing inputs."""
+"""TP-local GPU leases and explicit startup, state and link timing inputs."""
 
 from __future__ import annotations
 

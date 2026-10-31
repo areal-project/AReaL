@@ -12,7 +12,6 @@ from tests.test_elastic_policy import (
     _FixedRollout,
 )
 
-from areal.autopilot.domains.elastic.serving_observer import ServingObserver
 from areal.elastic.contracts import BatchWorkload, TrainingConfig, WorkloadStats
 from areal.elastic.policy.basic import (
     JointConfig,
@@ -33,6 +32,7 @@ from areal.elastic.policy.reference import (
     Request,
     Scenario,
 )
+from areal.elastic.simulation.serving_observer import ServingObserver
 
 
 def test_joint_search_filters_slo_before_comparing_gpu_cost():

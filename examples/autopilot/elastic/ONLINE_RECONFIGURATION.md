@@ -112,19 +112,19 @@ batch保持原值：交接层在安全边界接最新权重／优化器／游标
 
 ## 实现与运行
 
-| 文件                                                    | 职责                                               |
-| ------------------------------------------------------- | -------------------------------------------------- |
-| `areal/elastic/policy/basic/history.py`                 | 阶段特征、固定窗口、确定性回放                     |
-| `areal/elastic/policy/basic/online.py`                  | 触发、80%目标与按触发类型筛选                      |
-| `areal/elastic/policy/basic/search.py`                  | 固定窗口评分选择、候选优先级与成本下界             |
-| `areal/autopilot/domains/elastic/online_control.py`     | 实测CPU决策事件、最新状态复核与应用时刻            |
-| `areal/autopilot/domains/elastic/online_simulation.py`  | 持续主环境、状态恢复、候选联合模拟及窗口／尾部计费 |
-| `areal/autopilot/domains/elastic/online_models.py`      | 冻结4B／H20组件、显存及发布模型                    |
-| `areal/autopilot/domains/elastic/online_decode.py`      | 固定batch的线性Decode区间推进                      |
-| `areal/autopilot/domains/elastic/online_state.py`       | 副本索引／计划失效及内部可变请求状态               |
-| `areal/autopilot/domains/elastic/online_parallel.py`    | 独立候选的CPU进程池与按原索引汇总                  |
-| `areal/autopilot/domains/elastic/online_inputs.py`      | 不可变负载／恢复模板与候选私有状态分离             |
-| `areal/autopilot/domains/elastic/online_transitions.py` | 节点GPU租约、链路及交接假设                        |
+| 文件                                             | 职责                                               |
+| ------------------------------------------------ | -------------------------------------------------- |
+| `areal/elastic/policy/basic/history.py`          | 阶段特征、固定窗口、确定性回放                     |
+| `areal/elastic/policy/basic/online.py`           | 触发、80%目标与按触发类型筛选                      |
+| `areal/elastic/policy/basic/search.py`           | 固定窗口评分选择、候选优先级与成本下界             |
+| `areal/elastic/simulation/online_control.py`     | 实测CPU决策事件、最新状态复核与应用时刻            |
+| `areal/elastic/simulation/online_simulation.py`  | 持续主环境、状态恢复、候选联合模拟及窗口／尾部计费 |
+| `areal/elastic/simulation/online_models.py`      | 冻结4B／H20组件、显存及发布模型                    |
+| `areal/elastic/simulation/online_decode.py`      | 固定batch的线性Decode区间推进                      |
+| `areal/elastic/simulation/online_state.py`       | 副本索引／计划失效及内部可变请求状态               |
+| `areal/elastic/simulation/online_parallel.py`    | 独立候选的CPU进程池与按原索引汇总                  |
+| `areal/elastic/simulation/online_inputs.py`      | 不可变负载／恢复模板与候选私有状态分离             |
+| `areal/elastic/simulation/online_transitions.py` | 节点GPU租约、链路及交接假设                        |
 
 候选模拟默认合并稳定的纯Decode区间，按冻结线性fit累计长度、时间及最大TBT；请求完成、prefill、工具、发布、交接、检查或窗口边界前停止，保留跨边界的在途GPU步。`OnlineForecastModel(..., coalesce_decode=False)`可对照逐token模式。带逐batch日志、未声明线性能力的模型及旧SLO提前剪枝模式仍逐token执行；闭式求和与逐步浮点累加存在微小数值差异。[对照与速度](../../../../artifacts/elastic-decode-coalescing-20261025/README.md)。
 

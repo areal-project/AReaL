@@ -25,8 +25,8 @@ class ChunkResult:
 
 def evaluate_chunk(job):
     started = time.process_time()
+    from .online_candidates import OnlineForecastModel
     from .online_models import CalibratedOnlineModels
-    from .online_simulation import OnlineForecastModel
 
     global _models, _identity, _search
     payload, indexed = job

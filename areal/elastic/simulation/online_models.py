@@ -14,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from areal.elastic.contracts import WorkloadStats
-from areal.elastic.policy.basic.forecast import OnlineLayout, Turn
+from areal.elastic.policy.basic.observations import OnlineLayout, Turn
 from areal.elastic.policy.reference import ParallelLayout
 from areal.elastic.policy.reference.core import fingerprint, nonnegative
 from areal.elastic.policy.reference.cost_model._actor.components import (

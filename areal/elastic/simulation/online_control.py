@@ -50,7 +50,7 @@ class OnlineControl:
         )
 
     def model(self, delay):
-        from .online_simulation import OnlineForecastModel
+        from .online_candidates import OnlineForecastModel
 
         sim = self.sim
         return OnlineForecastModel(

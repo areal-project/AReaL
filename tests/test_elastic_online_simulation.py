@@ -6,28 +6,14 @@ from dataclasses import asdict, replace
 
 import pytest
 
-from areal.autopilot.domains.elastic.online_control import OnlineControl, _Search
-from areal.autopilot.domains.elastic.online_decode import _Run
-from areal.autopilot.domains.elastic.online_simulation import (
-    OnlineForecastModel,
-    OnlineRunConfig,
-    OnlineSimulation,
-)
-from areal.autopilot.domains.elastic.online_transitions import (
-    ActorMemoryRejected,
-    GPUAllocator,
-    HandoffConfig,
-)
-from areal.elastic.policy.basic.forecast import (
+from areal.elastic.policy.basic.history import HistoricalReplay, HistoryReplayConfig
+from areal.elastic.policy.basic.observations import (
     ActorWaitView,
     EpisodeSample,
     Forecast,
-    ForecastConfig,
-    HistoricalForecaster,
     OnlineLayout,
     Turn,
 )
-from areal.elastic.policy.basic.history import HistoricalReplay, HistoryReplayConfig
 from areal.elastic.policy.basic.online import (
     ActorSupply,
     CandidatePrediction,
@@ -36,10 +22,23 @@ from areal.elastic.policy.basic.online import (
     OnlinePolicyConfig,
     rolling_slo,
 )
+from areal.elastic.policy.basic.online_forecast import (
+    ForecastConfig,
+    HistoricalForecaster,
+)
 from areal.elastic.policy.basic.search import SearchBound, select_prediction
 from areal.elastic.policy.basic.serving import ServingSLO
 from areal.elastic.policy.reference.core import fingerprint
 from areal.elastic.policy.reference.cost_model.rollout import RolloutConfig
+from areal.elastic.simulation.online_candidates import OnlineForecastModel
+from areal.elastic.simulation.online_control import OnlineControl, _Search
+from areal.elastic.simulation.online_decode import _Run
+from areal.elastic.simulation.online_simulation import OnlineRunConfig, OnlineSimulation
+from areal.elastic.simulation.online_transitions import (
+    ActorMemoryRejected,
+    GPUAllocator,
+    HandoffConfig,
+)
 
 
 class _KnownCosts:
@@ -1595,7 +1594,7 @@ def test_memory_reserve_uses_completed_history_beyond_the_serving_window():
 
 def test_evaluation_reserve_checks_target_calls_without_changing_physical_model():
     """Ordinary evaluated shapes apply headroom to the target Actor only."""
-    from areal.autopilot.domains.elastic.online_memory import EvaluationMemoryModels
+    from areal.elastic.simulation.online_memory import EvaluationMemoryModels
 
     physical = _HeadroomCosts()
     target = OnlineLayout(2, 1, 2, 1)

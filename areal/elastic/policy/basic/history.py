@@ -9,14 +9,8 @@ from dataclasses import dataclass, replace
 from statistics import fmean
 
 from .cost_model.rollout import nonnegative, positive_int
-from .forecast import (
-    EpisodeSample,
-    Forecast,
-    ForecastConfig,
-    HistoricalForecaster,
-    OnlineObservation,
-    ReplayWindow,
-)
+from .observations import EpisodeSample, Forecast, OnlineObservation, ReplayWindow
+from .online_forecast import ForecastConfig, HistoricalForecaster
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,8 @@
 # Elastic revision adapter
 
+弹性训练的CPU执行环境与候选模拟已移至
+[areal/elastic/simulation](../../../elastic/simulation/README.md)，供重配置策略独立使用。本目录负责领域评测、代码修订接入和接受后的部署适配；`online.py`仍是原生修订流程的host桥接。
+
 `RevisionLoop` proposes one Python component module, evaluates it, and either atomically
 activates it or gives aggregate feedback to the agent for another bounded attempt. Each
 store targets **simulator or optimizer**; the other component stays fixed.

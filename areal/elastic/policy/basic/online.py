@@ -10,14 +10,9 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from .cost_model.rollout import nonnegative, positive_int
-from .forecast import (
-    Forecast,
-    HistoricalForecaster,
-    OnlineLayout,
-    OnlineObservation,
-    ReplayWindow,
-)
 from .history import HistoricalReplay, WorkloadFeatures
+from .observations import Forecast, OnlineLayout, OnlineObservation, ReplayWindow
+from .online_forecast import HistoricalForecaster
 from .search import meets_target, select_prediction
 from .serving import ServingSLO
 

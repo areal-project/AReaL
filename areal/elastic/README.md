@@ -29,6 +29,7 @@ elastic/
     collector.py              默认 ElasticMonitor：观测、采集、历史与测量恢复
     history.py                有界历史、去重与回退
     trace.py                  已有日志／trace 解析
+  simulation/                 共用事件内核、online供给、候选分支与交接
   policy/
     adapter.py                默认超时与实测 Basic 的统一装配／决策入口
     basic/                    Basic cost model、simulator、optimizer 与 policy
@@ -86,3 +87,6 @@ I/O／数据格式故障会清空可用测量窗口、回到 Basic 超时策略�
 AutoPilot 的通用修订机制位于 [revision](../autopilot/revision/README.md)， Elastic evaluator、候选
 worker、bundle 验证和原生策略桥接位于 [domains/elastic](../autopilot/domains/elastic/README.md)。接受
 bundle 不能仅修改路径后继续视为有效；训练 checkpoint 另按恢复兼容性校验，Expert 校准须另做兼容审计。
+
+CPU条件模拟独立位于 [simulation](simulation/README.md)，由策略注入预测模型；事件推进和状态恢复由共用内核负责。布局、工作量与观测契约位于
+`policy/basic/observations.py`，online历史预测位于 `online_forecast.py`。

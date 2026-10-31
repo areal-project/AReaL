@@ -1,19 +1,27 @@
 # Elastic 双机开发交接
 
-共同仓库：`git@github.com:areal-project/AReaL.git`；集成分支：`lws/feat/elastic`。 迁移起点为
-`86323615a3a62fc22c7371b1ceaba526ec1ada93`，保留 v2.1.0 基线与原提交历史。 本次完整保留
-elastic、AutoPilot、Trainer／v2 接入、任务工作流、trace、测试和配置。 旧
-`lws/feat/autopilot`、`lws/feat/autopilot-reconfiguration` 均保留在 `0947bfc8`。
+共同仓库：`git@github.com:areal-project/AReaL.git`；集成分支：`lws/feat/elastic`。
+
+| 分支                               | 职责                             |
+| ---------------------------------- | -------------------------------- |
+| `lws/feat/elastic`                 | 共同集成                         |
+| `lws/feat/elastic-reconfig`        | online重配置与共用simulation开发 |
+| `lws/feat/elastic-reconfig-inline` | inline模拟、CV触发与双周会结果   |
+| `lws/feat/elastic-envarena`        | 公司Arena环境与任务工作流适配    |
+| `feat/elastic-demo`                | 基于v2.1.0的独立SWE inline演示   |
+| `feat/rl-perf-trace-profile`       | 基于较新上游的训练性能采集       |
+
+旧Elastic／Expert的37个提交已压缩为`55eb9118`，与原`9a9cbfc6`源码树一致；本地及fork远端的旧backup／Expert分支已清理。
+本地已移除`fork`远端及旧分支`feature/autopilot-elastic`，仅使用`origin`；个人GitHub仓库保留。inline工作保存到独立分支，日常开发回到重配置分支。
+当前分支状态见[进度](../../PROGRESS.md)及其分支清单；实验原始数据和验证归档继续保留。
 
 ## 公司电脑接入
 
 在公司端现有 checkout 中先执行 `git status --short`、`git remote -v`。
-本机尚未提交的工作先保存到独立工作分支；未推送的提交继续保留在原分支。 `origin` 应指向共同仓库。若它当前指向个人 fork，且尚无同名 `fork`
-remote，可执行：
+本机尚未提交的工作先保存到独立工作分支；未推送的提交继续保留在原分支。`origin`应指向共同仓库。若它当前指向个人fork，可执行：
 
 ```bash
-git remote rename origin fork
-git remote add origin git@github.com:areal-project/AReaL.git
+git remote set-url origin git@github.com:areal-project/AReaL.git
 ```
 
 首次建立本地集成分支：
@@ -24,7 +32,9 @@ git switch --track -c lws/feat/elastic origin/lws/feat/elastic
 ```
 
 若本地分支已存在，改用 `git switch lws/feat/elastic`，核对其跟踪关系后执行 `git pull --ff-only`。
-本地与公司端均使用此分支；个人 fork 可继续作为备份 remote。
+两台机器均通过`origin`同步；并行任务使用各自任务分支。
+
+共享分支已清除误推的修复／撤回两个提交，远端回到`7bab3a80`，源码不变。公司端若仍停在`c382abe0`，需先保存待保留工作，再对齐`origin/lws/feat/elastic`；普通pull不会主动回退本地分支。
 
 新目录可直接克隆：
 

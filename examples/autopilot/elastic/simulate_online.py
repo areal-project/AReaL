@@ -23,12 +23,7 @@ def cpu_math_imports():
     root = Path(__file__).resolve().parents[3]
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    for name in (
-        "areal",
-        "areal.autopilot",
-        "areal.autopilot.domains",
-        "areal.autopilot.domains.elastic",
-    ):
+    for name in ("areal",):
         if name not in sys.modules:
             package = types.ModuleType(name)
             package.__path__ = [str(root.joinpath(*name.split(".")))]
@@ -37,7 +32,7 @@ def cpu_math_imports():
 
 
 def load_workload(path, tool_seconds_per_unit):
-    from areal.elastic.policy.basic.forecast import EpisodeSample, Turn
+    from areal.elastic.policy.basic.observations import EpisodeSample, Turn
 
     result = []
     for line in Path(path).read_text().splitlines():
@@ -94,7 +89,7 @@ def load_workload(path, tool_seconds_per_unit):
 
 
 def candidates(batch_size, *, steady_gpu_budget=16, role_gpu_limit=8):
-    from areal.elastic.policy.basic.forecast import OnlineLayout
+    from areal.elastic.policy.basic.observations import OnlineLayout
 
     if not 2 <= steady_gpu_budget <= 16 or not 1 <= role_gpu_limit <= 16:
         raise ValueError("Search requires a2–16GPU steady budget and1–16GPU role limit")
@@ -138,20 +133,20 @@ def main():
         cpu_math_imports as initialize_worker,
     )
 
-    from areal.autopilot.domains.elastic.online_models import CalibratedOnlineModels
-    from areal.autopilot.domains.elastic.online_simulation import (
+    from areal.elastic.policy.basic.history import HistoricalReplay, HistoryReplayConfig
+    from areal.elastic.policy.basic.observations import OnlineLayout
+    from areal.elastic.policy.basic.online import OnlinePolicy, OnlinePolicyConfig
+    from areal.elastic.policy.basic.online_forecast import (
+        ForecastConfig,
+        HistoricalForecaster,
+    )
+    from areal.elastic.policy.basic.serving import ServingSLO
+    from areal.elastic.simulation.online_models import CalibratedOnlineModels
+    from areal.elastic.simulation.online_simulation import (
         OnlineRunConfig,
         OnlineSimulation,
     )
-    from areal.autopilot.domains.elastic.online_transitions import HandoffConfig
-    from areal.elastic.policy.basic.forecast import (
-        ForecastConfig,
-        HistoricalForecaster,
-        OnlineLayout,
-    )
-    from areal.elastic.policy.basic.history import HistoricalReplay, HistoryReplayConfig
-    from areal.elastic.policy.basic.online import OnlinePolicy, OnlinePolicyConfig
-    from areal.elastic.policy.basic.serving import ServingSLO
+    from areal.elastic.simulation.online_transitions import HandoffConfig
 
     raw = json.loads(args.config.read_text())
     run_raw = dict(raw["run"])
@@ -195,20 +190,25 @@ def main():
     sources = [Path(__file__)] + [
         repo / p
         for p in (
-            "areal/elastic/policy/basic/forecast.py",
+            "areal/elastic/policy/basic/online_forecast.py",
+            "areal/elastic/policy/basic/observations.py",
+            "areal/elastic/policy/basic/forecast_workload.py",
             "areal/elastic/policy/basic/history.py",
             "areal/elastic/policy/basic/online.py",
             "areal/elastic/policy/basic/search.py",
             "areal/elastic/policy/basic/serving.py",
-            "areal/autopilot/domains/elastic/online_models.py",
-            "areal/autopilot/domains/elastic/online_decode.py",
-            "areal/autopilot/domains/elastic/online_inputs.py",
-            "areal/autopilot/domains/elastic/online_control.py",
-            "areal/autopilot/domains/elastic/online_lifecycle.py",
-            "areal/autopilot/domains/elastic/online_state.py",
-            "areal/autopilot/domains/elastic/online_parallel.py",
-            "areal/autopilot/domains/elastic/online_simulation.py",
-            "areal/autopilot/domains/elastic/online_transitions.py",
+            "areal/elastic/simulation/online_models.py",
+            "areal/elastic/simulation/online_decode.py",
+            "areal/elastic/simulation/online_inputs.py",
+            "areal/elastic/simulation/online_control.py",
+            "areal/elastic/simulation/online_lifecycle.py",
+            "areal/elastic/simulation/online_state.py",
+            "areal/elastic/simulation/online_parallel.py",
+            "areal/elastic/simulation/online_simulation.py",
+            "areal/elastic/simulation/simulation_core.py",
+            "areal/elastic/simulation/online_candidates.py",
+            "areal/elastic/simulation/online_memory.py",
+            "areal/elastic/simulation/online_transitions.py",
         )
     ]
     identity = dict(
