@@ -2,7 +2,11 @@ import asyncio
 from types import SimpleNamespace
 from unittest import mock
 
-from areal.api.io_struct import GenerationHyperparameters, ModelRequest
+from areal.api.io_struct import (
+    GenerationHyperparameters,
+    HttpGenerationResult,
+    ModelRequest,
+)
 from areal.infra.remote_inf_engine import RemoteInfEngine
 
 
@@ -36,7 +40,7 @@ def _build_engine(versions_seen):
     def _parse_generation_response(_response):
         # The weight update lands while the request is in flight.
         engine._version = 11
-        return SimpleNamespace(
+        return HttpGenerationResult(
             output_tokens=[1, 2, 3],
             output_logprobs=[0.0, 0.0, 0.0],
             stop_reason="stop",

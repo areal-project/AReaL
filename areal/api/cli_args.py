@@ -196,6 +196,13 @@ class GenerationHyperparameters:
         default=1.0,
         metadata={"help": "Sampling temperature. Higher values increase diversity."},
     )
+    # Score Centering: number of top-k logprobs to request from sampler
+    sc_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "Number of top-k logprobs to request for Score Centering. 0 = disabled."
+        },
+    )
     stop_token_ids: list[int] = field(
         default_factory=list,
         metadata={"help": "Stop generation when encountering these token IDs."},
@@ -1760,6 +1767,69 @@ class PPOActorConfig(TrainEngineConfig):
             "Unused by other loss aggregation modes.",
         },
     )
+    # Score Centering (arXiv:2609.20807) — additive drift correction
+    use_score_centering: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable Score Centering (SC) additive drift correction. "
+            "When True, requires sampler top-k logprobs in input_data."
+        },
+    )
+    sc_top_k: int = field(
+        default=128,
+        metadata={
+            "help": "Top-k for Score Centering (number of sampler tokens to capture)."
+        },
+    )
+    sc_mode: str = field(
+        default="none",
+        metadata={
+            "help": "SC + IS combination mode: 'none' (pure SC), 'tis' (truncated IS), 'mis' (mixture IS / IcePop band-masked importance sampling).",
+            "choices": ["none", "tis", "mis"],
+        },
+    )
+    sc_clip_low: float = field(
+        default=0.5,
+        metadata={
+            "help": "Lower bound for SC IS ratio clipping. Default 0.5 "
+            "matches the IcePop paper. When sc_mode='none' (pure SC), "
+            "this value is unused."
+        },
+    )
+    sc_clip_high: float = field(
+        default=float("inf"),
+        metadata={
+            "help": "Upper bound for SC IS ratio clipping. Default inf "
+            "(no upper clip). Set to a finite value (e.g. 5.0) when "
+            "using sc_mode='tis' or 'mis'."
+        },
+    )
+    sc_reinforce_baseline: bool = field(
+        default=False,
+        metadata={
+            "help": "When True, use pure REINFORCE (-A·log p(a)) as the "
+            "baseline loss for SC-off comparisons, instead of PPO clipped "
+            "surrogate. This enables a fair A1 ablation: SC-on and SC-off "
+            "both use REINFORCE (no PPO ratio), so the only difference is "
+            "the SC correction term. Only takes effect when "
+            "use_score_centering=False (SC-off)."
+        },
+    )
+    sc_loss_mode: str = field(
+        default="reinforce",
+        metadata={
+            "help": "Loss integration mode for Score Centering: "
+            "'reinforce' (Plan A, default) — replace PPO with REINFORCE+SC; "
+            "'ppo_additive' (Plan B) — keep PPO clipped surrogate and add "
+            "SC correction as an additive term. Plan A is for paper "
+            "reproduction / strong-TIM scenarios; Plan B is for production "
+            "stability with recompute_logprob=true + async RL, where PPO "
+            "clip controls θ_now/θ_sync staleness variance orthogonally to "
+            "SC's θ_now/θ_rollout drift correction.",
+            "choices": ["reinforce", "ppo_additive"],
+        },
+    )
+
     # Logging Agent Trajectories
     log_agent_stats: bool = field(
         default=False,
@@ -1877,6 +1947,97 @@ class PPOActorConfig(TrainEngineConfig):
                     "SAPO is not compatible with `use_decoupled_loss=True`. "
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
                 )
+            if self.sc_reinforce_baseline:
+                raise ValueError(
+                    "sc_reinforce_baseline=True is not compatible with "
+                    "use_sapo_loss=True. SAPO and REINFORCE baseline are "
+                    "mutually exclusive main losses. Set sc_reinforce_baseline=False "
+                    "or use_sapo_loss=False."
+                )
+
+        # Validate Score Centering configuration.
+        # sc_loss_mode is validated unconditionally (cheap, and the field
+        # has a valid default so it should always pass for non-SC users).
+        if self.sc_loss_mode not in ("reinforce", "ppo_additive"):
+            raise ValueError(
+                f"sc_loss_mode must be 'reinforce' or 'ppo_additive'; "
+                f"got {self.sc_loss_mode!r}."
+            )
+        # All other SC fields (sc_mode, sc_clip_*) are only validated when SC
+        # is enabled, so SC-off users with stale/unset SC config don't hit
+        # confusing errors.
+        if self.use_score_centering:
+            if self.sc_mode not in ("none", "tis", "mis"):
+                raise ValueError(
+                    f"sc_mode must be 'none', 'tis', or 'mis'; got {self.sc_mode!r}."
+                )
+            if self.sc_clip_low >= self.sc_clip_high:
+                raise ValueError(
+                    "sc_clip_low must be strictly less than sc_clip_high; "
+                    f"got {self.sc_clip_low} >= {self.sc_clip_high}."
+                )
+            # tis mode requires finite sc_clip_low and sc_clip_high (two-sided
+            # clamp; infinite bounds make clamp a no-op on that side).
+            if self.sc_mode == "tis":
+                if not (
+                    math.isfinite(self.sc_clip_low) and math.isfinite(self.sc_clip_high)
+                ):
+                    raise ValueError(
+                        "sc_mode='tis' requires finite sc_clip_low and "
+                        f"sc_clip_high (got low={self.sc_clip_low}, "
+                        f"high={self.sc_clip_high}); use 'none' for pure SC."
+                    )
+            # mis mode requires finite sc_clip_low and sc_clip_high, and low >= 0.
+            if self.sc_mode == "mis":
+                if not (
+                    math.isfinite(self.sc_clip_low) and math.isfinite(self.sc_clip_high)
+                ):
+                    raise ValueError(
+                        "sc_mode='mis' requires finite sc_clip_low and sc_clip_high "
+                        f"(got low={self.sc_clip_low}, high={self.sc_clip_high})."
+                    )
+                if self.sc_clip_low < 0:
+                    raise ValueError(
+                        f"sc_mode='mis' requires sc_clip_low >= 0 (got {self.sc_clip_low})."
+                    )
+                if self.sc_clip_high <= 0:
+                    raise ValueError(
+                        f"sc_mode='mis' requires sc_clip_high > 0 (got {self.sc_clip_high})."
+                    )
+
+        # SC + unsupported combinations fail fast.
+        if self.use_score_centering:
+            if self.enable_tree_training:
+                raise NotImplementedError(
+                    "Score Centering is not supported with tree training "
+                    "(enable_tree_training=True). Tree training uses flex attention "
+                    "with a different sequence layout that breaks top-k alignment."
+                )
+            # sc_reinforce_baseline is only meaningful when SC is off (it
+            # switches the SC-off baseline from PPO to REINFORCE). When SC is
+            # on, the loss is always REINFORCE+SC and sc_reinforce_baseline is
+            # silently ignored — fail fast to avoid confusion.
+            if self.sc_reinforce_baseline:
+                raise ValueError(
+                    "sc_reinforce_baseline=True is only valid when "
+                    "use_score_centering=False. When SC is on, the loss is already "
+                    "REINFORCE+SC (no PPO ratio), so the baseline flag is meaningless. "
+                    "Set sc_reinforce_baseline=False or use_score_centering=False."
+                )
+            # recompute_logprob=True means the engine computes old_logp from
+            # the trainer's own forward pass, so TIM (train-inference mismatch)
+            # is effectively 0 — the drift SC is designed to correct does not
+            # exist.  Since the SC correction is advantage-weighted, the
+            # spurious gradient is advantage-gated (≈0 for GRPO), so we warn
+            # rather than hard-reject to avoid blocking on-policy SC experiments.
+            if self.recompute_logprob:
+                logger.warning(
+                    "use_score_centering=True with recompute_logprob=True: "
+                    "TIM is 0 (old_logp from trainer forward), so SC correction "
+                    "targets a non-existent drift. The gradient is "
+                    "advantage-gated, but consider recompute_logprob=False for "
+                    "meaningful drift correction."
+                )
 
         super().__post_init__()
 
@@ -1937,6 +2098,9 @@ class vLLMConfig:
     # original
     max_num_batched_tokens: int = 2048
     max_num_seqs: int = 256
+    # Score Centering: vLLM caps logprobs at max_logprobs (default 20).
+    # Auto-raised from gconfig.sc_top_k in PPOConfig.__post_init__.
+    max_logprobs: int = 20
     # kv_cache_type: str = "auto"
     block_size: int = 16
     cpu_offload_gb: float = 0
@@ -2576,6 +2740,14 @@ class InferenceEngineConfig:
             "requests select the adapter by this name (plus the weight version). "
             "Usually left empty and auto-filled from gconfig.lora_name by "
             "PPOConfig.__post_init__ so load and request sides stay in sync."
+        },
+    )
+    sc_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "Score Centering: number of top-k logprobs to request from "
+            "the vLLM sampler. Auto-filled from gconfig.sc_top_k by "
+            "PPOConfig.__post_init__. 0 = disabled (no top-k logprobs)."
         },
     )
     agent: AgentConfig = field(
@@ -3576,6 +3748,61 @@ class PPOConfig(BaseExperimentConfig):
         # the engine config. Single source of truth: gconfig.lora_name.
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
+        # Score Centering: actor.sc_top_k is a convenience fallback for the
+        # request side's single source of truth, gconfig.sc_top_k.
+        if self.actor.use_score_centering and self.gconfig.sc_top_k <= 0:
+            if self.actor.sc_top_k > 0:
+                self.gconfig.sc_top_k = self.actor.sc_top_k
+            else:
+                logger.warning(
+                    "actor.use_score_centering=True but both actor.sc_top_k and "
+                    "generation.sc_top_k are 0; no sampler top-k logprobs will be "
+                    "requested and Score Centering will be skipped."
+                )
+        # Propagate sc_top_k to the rollout engine so the OpenAI-proxy generation
+        # path requests the same top-k logprobs the trainer expects for SC.
+        # The request side (ArealOpenAI) cannot read gconfig.sc_top_k, so it must
+        # come from the engine config. Single source of truth: gconfig.sc_top_k.
+        if self.gconfig.sc_top_k > 0 and not self.rollout.sc_top_k:
+            self.rollout.sc_top_k = self.gconfig.sc_top_k
+        # Propagate sc_top_k to vLLM's max_logprobs so the engine accepts
+        # logprobs=sc_top_k (vLLM default cap is 20). Only raises, never lowers.
+        if self.gconfig.sc_top_k > 0:
+            vllm_cfg = getattr(self, "vllm", None)
+            if vllm_cfg is not None and vllm_cfg.max_logprobs < self.gconfig.sc_top_k:
+                vllm_cfg.max_logprobs = self.gconfig.sc_top_k
+
+        # Score Centering sampling prerequisites — SC requires stochastic
+        # sampling so the sampler top-k head is a meaningful distribution.
+        if self.actor.use_score_centering:
+            if self.gconfig.greedy:
+                raise ValueError(
+                    "use_score_centering=True requires stochastic sampling; "
+                    "set generation.greedy=False."
+                )
+            if self.gconfig.temperature <= 0:
+                raise ValueError(
+                    "use_score_centering=True requires temperature > 0; "
+                    f"got {self.gconfig.temperature}."
+                )
+            if not (0 < self.gconfig.top_p <= 1.0):
+                raise ValueError(
+                    "use_score_centering=True requires 0 < top_p <= 1.0; "
+                    f"got {self.gconfig.top_p}."
+                )
+            # top_k: vLLM semantics — <=0 or >= vocab means unbounded.
+            # If bounded, it must be >= sc_top_k so the top-k head is complete.
+            if 0 < self.gconfig.top_k < self.gconfig.sc_top_k:
+                raise ValueError(
+                    f"use_score_centering=True requires top_k >= sc_top_k "
+                    f"({self.gconfig.sc_top_k}) when top_k is bounded; "
+                    f"got top_k={self.gconfig.top_k}. Set top_k<=0 for unbounded."
+                )
+            if self.gconfig.frequency_penalty != 0.0:
+                raise ValueError(
+                    "use_score_centering=True requires no frequency_penalty; "
+                    "set frequency_penalty=0.0."
+                )
         super().__post_init__()
 
 

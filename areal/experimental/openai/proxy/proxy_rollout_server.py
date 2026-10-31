@@ -306,6 +306,7 @@ def _setup_openai_client():
         tool_call_parser=agent_cfg.tool_call_parser,
         reasoning_parser=agent_cfg.reasoning_parser,
         engine_max_tokens=agent_cfg.engine_max_tokens,
+        sc_top_k=getattr(config, "sc_top_k", 0),
         chat_template_type=agent_cfg.chat_template_type,
         chat_template_kwargs=chat_template_kwargs,
         lora_name=config.lora_name,
