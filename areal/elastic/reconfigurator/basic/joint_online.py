@@ -20,8 +20,7 @@ from typing import Protocol
 
 from areal.elastic.contracts import RequestView, ToolView
 from areal.elastic.layout import ExecutionLayout, ReconfigurationPlanner
-from areal.elastic.simulation.online_state import RequestState
-from areal.elastic.simulation.online_transitions import GPUAllocator
+from areal.elastic.simulation_primitives import GPUAllocator, RequestState
 
 from .core import fingerprint
 from .cost_model._rollout.types import ServiceSlice

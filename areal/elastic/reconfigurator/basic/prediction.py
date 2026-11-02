@@ -10,6 +10,7 @@ from dataclasses import replace
 from areal.elastic.contracts import (
     CandidatePrediction,
     Forecast,
+    HandoffConfig,
     OnlineLayout,
     OnlineObservation,
 )
@@ -20,10 +21,7 @@ from areal.elastic.reconfigurator.basic.optimizer import (
     SearchBound,
 )
 from areal.elastic.serving import ServingSLO, request_slo_status, rolling_slo
-from areal.elastic.simulation.online_inputs import ForecastInputs
-from areal.elastic.simulation.online_transitions import (
-    HandoffConfig,
-)
+from areal.elastic.simulation_primitives import ReplayInputs
 
 from .optimizer import OnlineOptimizer
 from .simulator import JointSimulator
@@ -54,7 +52,7 @@ class OnlineForecastModel:
         self._view = None
         self._forecasts = None
         self._work_ids = ()
-        self._prepared: dict[int, ForecastInputs] = {}
+        self._prepared: dict[int, ReplayInputs] = {}
         self.input_preparations = 0
         self.execution_stats = {"mode": "serial"}
 
@@ -161,7 +159,7 @@ class OnlineForecastModel:
             try:
                 prepared = self._prepared.get(index)
                 if prepared is None:
-                    prepared = ForecastInputs.prepare(
+                    prepared = ReplayInputs.prepare(
                         view,
                         forecast,
                         self.config.max_new_tokens,

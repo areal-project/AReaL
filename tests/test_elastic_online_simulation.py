@@ -7,11 +7,13 @@ from dataclasses import asdict, replace
 import pytest
 
 from areal.elastic.contracts import (
+    ActorMemoryRejected,
     ActorSupply,
     ActorWaitView,
     CandidatePrediction,
     EpisodeSample,
     Forecast,
+    HandoffConfig,
     OnlineDecision,
     OnlineLayout,
     Turn,
@@ -37,13 +39,8 @@ from areal.elastic.reconfigurator.reference.reconfigurator import (
     _Search,
 )
 from areal.elastic.serving import ServingSLO, rolling_slo
-from areal.elastic.simulation.online_decode import _Run
-from areal.elastic.simulation.online_simulation import OnlineRunConfig, OnlineSimulation
-from areal.elastic.simulation.online_transitions import (
-    ActorMemoryRejected,
-    GPUAllocator,
-    HandoffConfig,
-)
+from areal.elastic.simulation.simulation import OnlineRunConfig, OnlineSimulation
+from areal.elastic.simulation_primitives import GPUAllocator, _Run
 
 
 class _KnownCosts:

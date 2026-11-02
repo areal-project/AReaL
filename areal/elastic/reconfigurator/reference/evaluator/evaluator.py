@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import cached_property
 
 from areal.elastic.contracts import (
+    ActorMemoryRejected,
     ActorMemorySafety,
     ActorSupply,
     ActorView,
@@ -21,6 +22,7 @@ from areal.elastic.contracts import (
     EpisodeSample,
     EpisodeView,
     Forecast,
+    HandoffConfig,
     OnlineLayout,
     OnlineObservation,
     RequestView,
@@ -45,13 +47,13 @@ from areal.elastic.reconfigurator.reference.optimizer import (
     candidate_order,
 )
 from areal.elastic.serving import ServingSLO, request_slo_status, rolling_slo
-from areal.elastic.simulation.online_inputs import ForecastInputs, WorkInputs
-from areal.elastic.simulation.online_state import ReplicaState, RequestState
-from areal.elastic.simulation.online_transitions import (
-    ActorMemoryRejected,
+from areal.elastic.simulation_primitives import (
     GPUAllocator,
-    HandoffConfig,
+    ReplayInputs,
+    ReplicaState,
+    RequestState,
     SerializedLink,
+    WorkInputs,
 )
 
 
@@ -246,7 +248,7 @@ class Evaluator:
         self._view = None
         self._forecasts = None
         self._work_ids = ()
-        self._prepared: dict[int, ForecastInputs] = {}
+        self._prepared: dict[int, ReplayInputs] = {}
         self.input_preparations = 0
         self.execution_stats = {"mode": "serial"}
 
@@ -560,7 +562,7 @@ class Evaluator:
             try:
                 prepared = self._prepared.get(index)
                 if prepared is None:
-                    prepared = ForecastInputs.prepare(
+                    prepared = ReplayInputs.prepare(
                         view,
                         forecast,
                         self.config.max_new_tokens,
@@ -885,7 +887,7 @@ class Evaluator:
                     (self.evaluate(view, forecasts, c, bound=bound) for _, c in indexed)
                 ),
             )
-        from areal.elastic.simulation.online_parallel import evaluate_chunk
+        from areal.elastic.reconfigurator.parallel import evaluate_chunk
 
         payload = (
             "reference",
@@ -1079,14 +1081,14 @@ class Evaluator:
         slo=None,
         *,
         coalesce_decode: bool = False,
-        _prepared: ForecastInputs | None = None,
+        _prepared: ReplayInputs | None = None,
         **simulation_options,
     ):
         if view.busy:
             raise ValueError(
                 "Forecast branching waits for a stable deployment/publication boundary"
             )
-        prepared = _prepared or ForecastInputs.prepare(
+        prepared = _prepared or ReplayInputs.prepare(
             view, forecast, config.max_new_tokens, config.max_context_tokens
         )
         if prepared.view is not view or prepared.forecast is not forecast:
@@ -1353,7 +1355,7 @@ class Evaluator:
                     )
                     break
                 if self.coalesce_decode:
-                    from areal.elastic.simulation.online_decode import advance_decode
+                    from areal.elastic.simulation_primitives import advance_decode
 
                     advance_decode(self, until)
                 when = self.heap[0][0]

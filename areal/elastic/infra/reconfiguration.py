@@ -11,7 +11,6 @@ import os
 import re
 import time
 import uuid
-from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
@@ -447,24 +446,20 @@ class ReconfigurationExecutor:
         plan = self.owner.plan_reconfiguration(target)
         self.owner.last_reconfiguration_plan = plan
         if plan.steps:
-            with self.owner._reconfiguration_phase("checkpoint"):
-                self.owner.save_checkpoint(reason="resource-reconfigure")
+            self.owner.save_checkpoint(reason="resource-reconfigure")
             if self.owner.checkpoint_version != self.owner.applied_version:
                 raise RuntimeError("Reconfiguration source checkpoint is not current")
-        with self.owner._reconfiguration_phase("application_and_commit"):
-            receipt = application.apply(request, plan=plan)
+        receipt = application.apply(request, plan=plan)
         if not self.owner.control_snapshot().boundary_ready:
             raise RuntimeError("Reconfiguration left an incomplete boundary")
         if receipt["status"] == "unchanged":
             return receipt
-        with self.owner._reconfiguration_phase("generation_resume"):
-            self.owner.rollout.continue_generation()
-        with self.owner._reconfiguration_phase("admission_open"):
-            self.owner.set_admission_open(True)
-            if self.owner.managed_rollout:
-                self.owner.rollout.open_model_calls()
-            else:
-                self.owner.rollout.resume()
+        self.owner.rollout.continue_generation()
+        self.owner.set_admission_open(True)
+        if self.owner.managed_rollout:
+            self.owner.rollout.open_model_calls()
+        else:
+            self.owner.rollout.resume()
         return receipt
 
     def execute(self, plan: ReconfigurationPlan) -> None:
@@ -488,30 +483,24 @@ class ReconfigurationExecutor:
         )
         for step in plan.steps:
             if step == "drain_model_calls":
-                with self.owner._reconfiguration_phase("drain"):
-                    self.owner.rollout.drain_model_calls()
+                self.owner.rollout.drain_model_calls()
             elif step == "close_admission":
                 self.owner.set_admission_open(False)
             elif step == "release_actor":
-                with self.owner._reconfiguration_phase("actor_release"):
-                    self.owner._release()
-                    if self.owner.reconfigurator_adapter is not None:
-                        self.owner.reconfigurator_adapter.role_released("actor")
+                self.owner._release()
+                if self.owner.reconfigurator_adapter is not None:
+                    self.owner.reconfigurator_adapter.role_released("actor")
             elif step == "disconnect_weights":
-                with self.owner._reconfiguration_phase("awex_disconnect"):
-                    self.owner.actor.disconnect_engine()
+                self.owner.actor.disconnect_engine()
             elif step == "stop_rollout":
-                with self.owner._reconfiguration_phase("rollout_stop"):
-                    self.owner.rollout.stop_inference_replicas()
-                    if self.owner.reconfigurator_adapter is not None:
-                        self.owner.reconfigurator_adapter.role_released("rollout")
+                self.owner.rollout.stop_inference_replicas()
+                if self.owner.reconfigurator_adapter is not None:
+                    self.owner.reconfigurator_adapter.role_released("rollout")
             elif step == "set_layout":
-                with self.owner._reconfiguration_phase("placement"):
-                    self.owner._set_execution_layout(plan.target)
+                self.owner._set_execution_layout(plan.target)
             elif step == "rebuild_rollout":
                 self.owner.rollout.rebuild_inference_replicas(
-                    plan.target.rollout_devices,
-                    timing=self.owner._reconfiguration_phase,
+                    plan.target.rollout_devices
                 )
             elif step == "rebind_runtime":
                 if self.owner.reconfigurator_adapter is not None:
@@ -519,15 +508,13 @@ class ReconfigurationExecutor:
             elif step == "restore_actor":
                 self.owner.ensure_actor(connect_weights=False)
             elif step == "connect_weights":
-                with self.owner._reconfiguration_phase("awex_connect"):
-                    self.owner.actor.connect_engine(
-                        self.owner.rollout, self.owner.weight_meta
-                    )
+                self.owner.actor.connect_engine(
+                    self.owner.rollout, self.owner.weight_meta
+                )
             elif step == "pause_rollout":
                 self.owner.rollout.pause()
             elif step == "publish_weights":
-                with self.owner._reconfiguration_phase("publish"):
-                    self.owner._publish()
+                self.owner._publish()
             else:
                 raise ValueError(f"Unknown transition step: {step}")
         self.owner._reconfiguration_incomplete = False
@@ -826,6 +813,3 @@ class TrainerReconfiguration:
                 **details,
             },
         )
-
-    def _reconfiguration_phase(self, name):
-        return nullcontext()

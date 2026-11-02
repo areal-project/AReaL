@@ -7,10 +7,12 @@ from dataclasses import asdict, replace
 import pytest
 
 from areal.elastic.contracts import (
+    ActorMemoryRejected,
     ActorWaitView,
     CandidatePrediction,
     EpisodeSample,
     Forecast,
+    HandoffConfig,
     OnlineLayout,
     Turn,
 )
@@ -31,13 +33,8 @@ from areal.elastic.reconfigurator.basic.reconfigurator import (
     OnlineReconfiguratorConfig,
 )
 from areal.elastic.serving import ServingSLO, rolling_slo
-from areal.elastic.simulation.online_decode import _Run
-from areal.elastic.simulation.online_simulation import OnlineRunConfig, OnlineSimulation
-from areal.elastic.simulation.online_transitions import (
-    ActorMemoryRejected,
-    GPUAllocator,
-    HandoffConfig,
-)
+from areal.elastic.simulation.simulation import OnlineRunConfig, OnlineSimulation
+from areal.elastic.simulation_primitives import GPUAllocator, _Run
 
 
 class _KnownCosts:
@@ -1853,7 +1850,14 @@ def test_shared_factory_runs_selected_complete_version(implementation):
     assert strategy.implementation == implementation
     assert type(strategy.optimizer).__module__.endswith(implementation + ".optimizer")
     assert result["status"] == "complete" and result["completed_updates"] == 3
-    assert any(d["target"] != asdict(INITIAL) for d in sim.decisions)
+    assert sim.control.stats["verifications"] > 0
+    # A proposal may be retained after the shared latest-state verification.
+    assert any(
+        d.get("proposed_target") != asdict(INITIAL)
+        and d.get("application_status") in {"applied", "retained"}
+        for d in sim.decisions
+        if "proposed_target" in d
+    )
 
 
 def test_initial_and_reference_selection_preserve_their_capacity_rules():

@@ -13,11 +13,10 @@ if TYPE_CHECKING:
     )
 
 import math
-import threading
-from collections import deque
-from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Protocol
+
+from areal.elastic.layout import ExecutionLayout
 
 
 def nonnegative(name: str, value: float, *, positive: bool = False) -> None:
@@ -35,9 +34,6 @@ def nonnegative(name: str, value: float, *, positive: bool = False) -> None:
 def positive_int(name: str, value: int) -> None:
     if type(value) is not int or value < 1:
         raise ValueError(f"{name} must be a positive integer")
-
-
-Decision = Literal["train", "keep", "release"]
 
 
 @dataclass(frozen=True, order=True)
@@ -94,52 +90,6 @@ class BatchWorkload:
                 stats.loss_tokens, self.effective_tokens, abs_tol=1
             ):
                 raise ValueError("Actor loss tokens and effective_tokens disagree")
-
-
-@dataclass(frozen=True)
-class ResourceDecision:
-    """Resource ownership and consuming a ready update are separate decisions."""
-
-    action: Literal["keep", "launch", "release", "reconfigure"]
-    config: TrainingConfig | None = None
-    train: bool = False
-    reason: str = ""
-
-    def __post_init__(self) -> None:
-        if self.action not in {"keep", "launch", "release", "reconfigure"}:
-            raise ValueError("Invalid resource action")
-        if self.action in {"launch", "reconfigure"} and self.config is None:
-            raise ValueError("Resource action requires a target configuration")
-        if self.action == "release" and self.config is not None:
-            raise ValueError("Release cannot select a target configuration")
-        if self.action == "release" and self.train:
-            raise ValueError("Cannot release and train in one decision")
-
-
-@dataclass(frozen=True)
-class ElasticObservation:
-    state: str
-    model_version: int
-    serving_version: int | None
-    training_active: bool
-    batch_ready: bool
-    idle_duration: float
-    gate_available: bool
-    pending_publication: bool
-    committed: bool
-    observed_at: float
-    training_config: TrainingConfig | None = None
-    next_batch: BatchWorkload | None = None
-    committed_samples: int = 0
-    committed_tokens: int = 0
-    max_train_gpus: int = 0
-    has_checkpoint: bool = False
-    episode_active: bool = False
-    episode_elapsed: float = 0.0
-    checkpoint_config: TrainingConfig | None = None
-
-
-# Decision preserves the original string-based baseline reconfigurator interface.
 
 
 def _positive_stat(name: str, value: float) -> None:
@@ -349,96 +299,6 @@ class WorkloadStats:
             quotient, extra = divmod(remaining, free)
             result = [low + quotient + (i < extra) for i in range(free)]
         return fixed + result
-
-
-@dataclass(frozen=True)
-class Measurement:
-    phase: str
-    world_size: int
-    seconds: float
-    sequence_tokens: int = 0
-    profile_id: str = ""
-
-    def __post_init__(self) -> None:
-        TrainingConfig(self.world_size, self.profile_id)
-        if not math.isfinite(self.seconds) or self.seconds < 0:
-            raise ValueError("Measurement duration must be finite and nonnegative")
-        if self.sequence_tokens < 0:
-            raise ValueError("Measurement token count must be nonnegative")
-
-
-@dataclass(frozen=True)
-class HistorySnapshot:
-    workloads: tuple[BatchWorkload, ...] = ()
-    measurements: tuple[Measurement, ...] = ()
-
-
-class HistoryWindow:
-    """Bounded completed observations; no future trace or wall-clock oracle."""
-
-    def __init__(self, capacity: int = 32):
-        if type(capacity) is not int or capacity < 1:
-            raise ValueError("History capacity must be positive")
-        self._workloads = deque(maxlen=capacity)
-        self._measurements = deque(maxlen=capacity * 16)
-        self._lock = threading.RLock()
-
-    def add_workload(self, workload: BatchWorkload) -> None:
-        with self._lock:
-            self._workloads.append(workload)
-
-    def add_measurement(self, measurement: Measurement) -> None:
-        with self._lock:
-            self._measurements.append(measurement)
-
-    def snapshot(self) -> HistorySnapshot:
-        with self._lock:
-            return HistorySnapshot(tuple(self._workloads), tuple(self._measurements))
-
-
-@dataclass(frozen=True)
-class ForecastUpdate:
-    workload: BatchWorkload
-    wait_seconds: float
-
-
-@dataclass(frozen=True)
-class PlanStep:
-    config: TrainingConfig
-    release_before: bool = False
-
-
-@dataclass(frozen=True)
-class SimulationResult:
-    feasible: bool
-    seconds: float = 0.0
-    training_gpu_seconds: float = 0.0
-    inference_gpu_seconds: float = 0.0
-    extra_gpu_seconds: float = 0.0
-    samples: int = 0
-    effective_tokens: int = 0
-    reason: str = ""
-    events: tuple[tuple[str, int, float], ...] = ()
-    unmeasured: bool = False
-    profile_events: tuple[tuple[str, str, float], ...] = ()
-
-    @property
-    def total_gpu_seconds(self) -> float:
-        return (
-            self.training_gpu_seconds
-            + self.inference_gpu_seconds
-            + self.extra_gpu_seconds
-        )
-
-
-@dataclass(frozen=True)
-class SearchResult:
-    decision: ResourceDecision
-    prediction: SimulationResult | None
-    evaluated: int
-    rejected: tuple[str, ...] = ()
-    plan: tuple[PlanStep, ...] = ()
-    fallback_allowed: bool = False
 
 
 class Reconfigurator(Protocol):
@@ -795,14 +655,6 @@ class ControlSnapshot:
     checkpoint_version: int = 0
 
 
-class NativeControlPort(Protocol):
-    def control_snapshot(self) -> ControlSnapshot: ...
-    def control_operation(
-        self, *, blocking: bool = False
-    ) -> AbstractContextManager[ControlSnapshot]: ...
-    def fence_admission(self) -> None: ...
-
-
 class SimulationModels(Protocol):
     source_ids: tuple[str, ...]
 
@@ -844,3 +696,111 @@ class SimulationConfig:
             raise ValueError("Explicit staleness and simulation budget are required")
         if not self.tool_capacities or any(n < 1 for _, n in self.tool_capacities):
             raise ValueError("Explicit positive tool pool capacities are required")
+
+
+class ActorMemoryRejected(ValueError):
+    """The declared Actor recipe cannot safely train this completed batch."""
+
+
+@dataclass(frozen=True)
+class NativePlacement:
+    layout: OnlineLayout
+    execution: ExecutionLayout
+
+
+@dataclass(frozen=True)
+class HandoffConfig:
+    node_gpus: tuple[int, ...]
+    actor_startup_seconds: float
+    rollout_startup_seconds: float
+    actor_warmup_seconds: float
+    rollout_warmup_seconds: float
+    actor_state_bytes: int
+    weight_bytes: int
+    effective_bandwidth_GBps: float
+    actor_sync_setup_seconds: float
+    rollout_sync_setup_seconds: float
+    provenance: str
+    mode: str = "hot"
+    native_source: ExecutionLayout | None = None
+    native_devices: tuple[int, ...] = ()
+    native_placements: tuple[NativePlacement, ...] = ()
+    phase_seconds: tuple[tuple[str, float], ...] = ()
+    native_checkpoint_version: int | None = None
+
+    @classmethod
+    def from_dict(cls, raw):
+        values = dict(raw)
+        values["node_gpus"] = tuple(values["node_gpus"])
+        values["native_devices"] = tuple(values.get("native_devices", ()))
+        values["phase_seconds"] = tuple(
+            tuple(x) for x in values.get("phase_seconds", ())
+        )
+        if values.get("native_source") is not None:
+            values["native_source"] = ExecutionLayout.decode(values["native_source"])
+        values["native_placements"] = tuple(
+            NativePlacement(
+                OnlineLayout(**p["layout"]), ExecutionLayout.decode(p["execution"])
+            )
+            for p in values.get("native_placements", ())
+        )
+        return cls(**values)
+
+    def __post_init__(self):
+        if self.mode not in {"hot", "cold"}:
+            raise ValueError("Handoff mode must be hot or cold")
+        if len(dict(self.phase_seconds)) != len(self.phase_seconds):
+            raise ValueError("Native transition timing names must be unique")
+        for name, seconds in self.phase_seconds:
+            nonnegative(name, seconds)
+        if self.native_source is not None:
+            if len(set(self.native_devices)) != len(self.native_devices) or sum(
+                self.node_gpus
+            ) != len(self.native_devices):
+                raise ValueError(
+                    "Native topology must contain exactly the immutable reservation"
+                )
+            for placement in self.native_placements:
+                target = placement.execution
+                if (
+                    placement.layout.actor_tp != 1
+                    or placement.layout.rollout_tp != 1
+                    or target.world_size != placement.layout.actor_dp
+                    or len(target.rollout_devices) != placement.layout.rollout_replicas
+                ):
+                    raise ValueError(
+                        "Native prediction requires matching FSDP DP / SGLang TP1 layouts"
+                    )
+                if not set(target.actor_devices + target.rollout_devices) <= set(
+                    self.native_devices
+                ):
+                    raise ValueError(
+                        "Native candidate exceeds the original reservation"
+                    )
+        if self.native_checkpoint_version is not None and (
+            type(self.native_checkpoint_version) is not int
+            or self.native_checkpoint_version < 0
+        ):
+            raise ValueError("Native checkpoint version must be nonnegative or unknown")
+        if not self.node_gpus or not self.provenance:
+            raise ValueError(
+                "Explicit pool topology and timing provenance are required"
+            )
+        for count in self.node_gpus:
+            positive_int("node_gpus", count)
+            if count > 8:
+                raise ValueError("A modeled node contains at most eight GPUs")
+        for name in (
+            "actor_startup_seconds",
+            "rollout_startup_seconds",
+            "actor_warmup_seconds",
+            "rollout_warmup_seconds",
+            "actor_sync_setup_seconds",
+            "rollout_sync_setup_seconds",
+        ):
+            nonnegative(name, getattr(self, name))
+        for name in ("actor_state_bytes", "weight_bytes"):
+            positive_int(name, getattr(self, name))
+        nonnegative(
+            "effective_bandwidth_GBps", self.effective_bandwidth_GBps, positive=True
+        )

@@ -8,11 +8,13 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from areal.autopilot.domains.elastic.activation import PreparedReconfigurator
+from areal.autopilot.domains.elastic.activation import (
+    ReconfiguratorApplication as ActivationStore,
+)
 from areal.autopilot.revision.contracts import digest, source_digest
 from areal.autopilot.revision.execution import load_source
 from areal.elastic.contracts import OnlineLayout
-from areal.elastic.infra.activation import PreparedReconfigurator
-from areal.elastic.infra.activation import ReconfiguratorApplication as ActivationStore
 from areal.elastic.reconfigurator import build_reconfigurator
 from areal.utils.atomic import atomic_json
 
@@ -178,9 +180,8 @@ class LoadedOnlineBundle:
 
 
 def load_bundle(path):
+    from areal.elastic.contracts import HandoffConfig, SimulationConfig
     from areal.elastic.serving import ServingSLO
-    from areal.elastic.simulation.online_transitions import HandoffConfig
-    from areal.elastic.simulation.simulation_core import SimulationConfig
 
     value = json.loads(Path(path).read_text())
     validate_bundle(value)

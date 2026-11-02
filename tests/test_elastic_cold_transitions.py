@@ -6,12 +6,73 @@ from dataclasses import replace
 
 import pytest
 
-from tests.test_elastic_online_simulation import _KnownCosts, config, handoff
+from tests.test_elastic_online_simulation import (
+    _DecisionClock,
+    _KnownCosts,
+    config,
+    episodes,
+    handoff,
+)
 
 from areal.elastic.contracts import EpisodeSample, OnlineLayout, Turn
 from areal.elastic.layout import ReconfigurationPlanner
+from areal.elastic.reconfigurator import build_reconfigurator
 from areal.elastic.serving import ServingSLO
-from areal.elastic.simulation.online_simulation import OnlineSimulation
+from areal.elastic.simulation.simulation import OnlineSimulation
+
+
+@pytest.mark.parametrize("measured_search_time", [False, True])
+def test_cold_control_observes_rebuilding_rollout_and_finishes_same_work(
+    monkeypatch, measured_search_time
+):
+    """Periodic control continues while old engines have released their GPUs."""
+    initial, target = OnlineLayout(2, 1, 2, 1), OnlineLayout(1, 1, 1, 1)
+    slo = ServingSLO(5, 0.05, 0.8)
+    reconfigurator = build_reconfigurator(
+        "reference",
+        candidates=(initial, target),
+        replay={
+            "history_seconds": 5,
+            "feature_window_seconds": 5,
+            "initial_regime_seconds": 5,
+        },
+        settings={
+            "check_interval_seconds": 2,
+            "slo_window_seconds": 5,
+            "decision_delay_seconds": 0.05,
+            "minimum_completed_requests": 2,
+        },
+        slo=slo,
+    )
+    sim = OnlineSimulation.create(
+        episodes(32),
+        initial,
+        _KnownCosts(),
+        config(),
+        cold_handoff(pool=8),
+        slo,
+        input_closes_at=31,
+        reconfigurator=reconfigurator,
+        measured_search_time=measured_search_time,
+        search_clock=_DecisionClock(0.001),
+    )
+    observe, rebuilding = sim.observe, []
+
+    def observed():
+        view = observe()
+        if sim.rollout_id not in sim.deployments:
+            assert view.busy and not view.services
+            rebuilding.append(view)
+        return view
+
+    monkeypatch.setattr(sim, "observe", observed)
+    result = sim.run()
+    assert sim.control is reconfigurator and rebuilding
+    assert result["status"] == "complete"
+    assert result["completed_episodes"] == result["trained_episodes"] == 32
+    assert result["completed_updates"] == result["published_version"] == 8
+    assert result["peak_gpus"] <= 8
+    assert sim.control.stats["applied"] >= 1
 
 
 class _Seconds(_KnownCosts):
@@ -139,8 +200,8 @@ def test_explicit_hot_keeps_the_existing_overlap_execution():
 
 
 def test_cold_native_plan_rebuilds_actor_when_pool_changes_at_same_dp():
+    from areal.elastic.contracts import NativePlacement
     from areal.elastic.layout import ExecutionLayout
-    from areal.elastic.simulation.online_transitions import NativePlacement
 
     initial = OnlineLayout(1, 1, 1, 1)
     target = OnlineLayout(1, 1, 2, 1)

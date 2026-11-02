@@ -134,14 +134,13 @@ def main():
         cpu_math_imports as initialize_worker,
     )
 
-    from areal.elastic.contracts import OnlineLayout
+    from areal.elastic.contracts import HandoffConfig, OnlineLayout
     from areal.elastic.reconfigurator import build_reconfigurator, component_module
     from areal.elastic.serving import ServingSLO
-    from areal.elastic.simulation.online_simulation import (
+    from areal.elastic.simulation.simulation import (
         OnlineRunConfig,
         OnlineSimulation,
     )
-    from areal.elastic.simulation.online_transitions import HandoffConfig
 
     raw = json.loads(args.config.read_text())
     implementation = args.reconfigurator or raw.get("implementation", "reference")
@@ -198,8 +197,8 @@ def main():
         + [
             repo / "areal/elastic/contracts.py",
             repo / "areal/elastic/serving.py",
-            repo / "areal/elastic/contracts.py",
-            repo / "areal/elastic/contracts.py",
+            repo / "areal/elastic/simulation_primitives.py",
+            repo / "areal/elastic/layout.py",
             repo / "areal/elastic/reconfigurator/__init__.py",
         ]
     )

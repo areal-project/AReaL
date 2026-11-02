@@ -229,3 +229,7 @@ and memory records; Rollout checks token lengths and records request and engine 
 timing. Use `--cases all` for the full case set. Measurement definitions and calibration
 scope are maintained in the workspace
 [calibration guide](../../../docs/implementation/calibration.md).
+
+`examples.profile.trace` parses existing Actor summary metrics, rank microbatch logs and
+Chrome/JSONL CPU spans. It reports per-step phase durations without adding runtime
+instrumentation.

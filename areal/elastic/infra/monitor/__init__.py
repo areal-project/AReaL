@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Native training observations and existing-log parsing."""
+"""Native training observations and Worker instrumentation."""
 
 from areal.elastic.infra.monitor.collector import TrainerMonitor
 

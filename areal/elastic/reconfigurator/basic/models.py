@@ -13,7 +13,12 @@ from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 
-from areal.elastic.contracts import OnlineLayout, Turn, WorkloadStats
+from areal.elastic.contracts import (
+    ActorMemoryRejected,
+    OnlineLayout,
+    Turn,
+    WorkloadStats,
+)
 from areal.elastic.reconfigurator.basic import ParallelLayout
 from areal.elastic.reconfigurator.basic.core import fingerprint, nonnegative
 from areal.elastic.reconfigurator.basic.cost_model._actor.components import (
@@ -25,7 +30,6 @@ from areal.elastic.reconfigurator.basic.cost_model._actor.packing import (
     dispatch_workload,
     ffd,
 )
-from areal.elastic.simulation.online_transitions import ActorMemoryRejected
 
 
 def digest(path: Path):

@@ -119,7 +119,7 @@ class OnlineOptimizer:
         evaluator.prepare_context(view, forecasts)
         if not evaluator._historical:
             return evaluator.evaluate_many(view, forecasts, layouts)
-        from areal.elastic.simulation.online_parallel import evaluate_chunk
+        from areal.elastic.reconfigurator.parallel import evaluate_chunk
 
         actor_scores, rollout_scores = ({}, {})
         turns = tuple(t for e in evaluator._known_batch for t in e)[-16:]
@@ -259,7 +259,7 @@ class OnlineOptimizer:
             return tuple(
                 evaluator.evaluate(view, forecasts, layout) for layout in layouts
             )
-        from areal.elastic.simulation.online_parallel import evaluate_chunk
+        from areal.elastic.reconfigurator.parallel import evaluate_chunk
 
         evaluator.prepare_context(view, forecasts)
         payload = (

@@ -14,14 +14,14 @@ import numpy as np
 import pytest
 
 from examples.profile import cost_model_tools
-
-from areal.elastic.contracts import WorkloadStats
-from areal.elastic.infra.monitor.trace import (
+from examples.profile.trace import (
     actor_trace_times,
     parse_microbatch_log,
     stage_metrics,
     trace_events,
 )
+
+from areal.elastic.contracts import WorkloadStats
 from areal.elastic.reconfigurator import reference as expert
 from areal.elastic.reconfigurator.reference.identity import fingerprint
 

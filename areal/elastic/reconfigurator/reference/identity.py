@@ -30,4 +30,5 @@ def code_revision() -> str:
         digest.update(str(path.relative_to(root)).encode())
         digest.update(path.read_bytes())
     digest.update((root.parents[1] / "contracts.py").read_bytes())
+    digest.update((root.parents[1] / "simulation_primitives.py").read_bytes())
     return digest.hexdigest()

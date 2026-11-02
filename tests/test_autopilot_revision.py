@@ -88,7 +88,7 @@ def test_elastic_planning_and_native_controls_import_without_autopilot():
         sys.meta_path.insert(0, BlockAutoPilot())
         from areal.elastic.reconfigurator import basic as planning, reference
         from areal.elastic import contracts, layout
-        from areal.elastic.infra import adapter, activation, reconfiguration
+        from areal.elastic.infra import adapter, reconfiguration
         from areal.elastic.infra.state import checkpoint_store
         from areal.elastic.infra.monitor import collector
         assert planning.OnlineReconfigurator and reference.OnlineReconfigurator and reference.Catalog

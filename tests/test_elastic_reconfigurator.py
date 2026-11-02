@@ -1,35 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import FrozenInstanceError, dataclass, replace
+from dataclasses import dataclass, replace
 
 import pytest
 
-from areal.elastic.contracts import ElasticObservation
 from areal.elastic.reconfigurator import reference as expert
-
-
-def observation(**changes):
-    return replace(
-        ElasticObservation(
-            state="ACTIVE",
-            model_version=2,
-            serving_version=2,
-            training_active=True,
-            batch_ready=False,
-            idle_duration=5,
-            gate_available=True,
-            pending_publication=False,
-            committed=True,
-            observed_at=10,
-        ),
-        **changes,
-    )
-
-
-def test_reconfigurator_observation_is_immutable():
-    sample = observation()
-    with pytest.raises(FrozenInstanceError):
-        sample.model_version = 3
 
 
 @dataclass(frozen=True)

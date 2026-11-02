@@ -133,10 +133,9 @@ def main():
         else:
             from areal.autopilot.domains.elastic.contracts import decode
             from areal.autopilot.revision.execution import load_source
+            from areal.elastic.contracts import HandoffConfig, SimulationConfig
             from areal.elastic.reconfigurator.reference.evaluator import Evaluator
             from areal.elastic.serving import ServingSLO
-            from areal.elastic.simulation.online_transitions import HandoffConfig
-            from areal.elastic.simulation.simulation_core import SimulationConfig
 
             assembly = profile["assembly"]
             models = load_source(profile["model_source"]).build_model(

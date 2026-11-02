@@ -13,6 +13,7 @@ from areal.elastic.contracts import (
     EpisodeSample,
     EpisodeView,
     Forecast,
+    HandoffConfig,
     OnlineLayout,
     OnlineObservation,
     RequestView,
@@ -25,9 +26,7 @@ from areal.elastic.reconfigurator import build_reconfigurator
 from areal.elastic.reconfigurator.basic.simulator import JointSimulator
 from areal.elastic.reconfigurator.reference.evaluator import Evaluator
 from areal.elastic.serving import ServingSLO
-from areal.elastic.simulation.online_simulation import OnlineSimulation
-from areal.elastic.simulation.online_transitions import HandoffConfig
-from areal.elastic.simulation.simulation_core import SimulationCore
+from areal.elastic.simulation.simulation import OnlineSimulation
 
 
 class Seconds:
@@ -200,7 +199,7 @@ def test_prediction_routes_through_owned_simulator_without_experiment_kernel(
     assert prediction.supported and own_call.call_count == 1
     experiment_call.assert_not_called()
     candidate = window(implementation)
-    assert not isinstance(candidate, (OnlineSimulation, SimulationCore))
+    assert not isinstance(candidate, OnlineSimulation)
 
 
 @pytest.mark.parametrize("implementation", ["basic", "reference"])

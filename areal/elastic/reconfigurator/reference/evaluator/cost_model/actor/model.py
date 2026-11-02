@@ -8,7 +8,12 @@ import math
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
-from areal.elastic.contracts import OnlineLayout, Turn, WorkloadStats
+from areal.elastic.contracts import (
+    ActorMemoryRejected,
+    OnlineLayout,
+    Turn,
+    WorkloadStats,
+)
 from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.fsdp import (
     FSDPHostRates,
     fsdp_work,
@@ -45,7 +50,6 @@ from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts impor
     nonnegative,
 )
 from areal.elastic.reconfigurator.reference.identity import code_revision, fingerprint
-from areal.elastic.simulation.online_transitions import ActorMemoryRejected
 
 from . import backend_for
 

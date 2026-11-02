@@ -7,14 +7,14 @@ from __future__ import annotations
 import dataclasses
 from pathlib import Path
 
+from areal.autopilot.domains.elastic.activation import (
+    ReconfiguratorBoundaryBusy,
+    ReconfiguratorRequest,
+)
 from areal.autopilot.domains.elastic.bundle import ReconfiguratorApplication
 from areal.autopilot.domains.elastic.contracts import deployment_contract
 from areal.autopilot.revision.contracts import digest
 from areal.elastic.contracts import ControlBusy
-from areal.elastic.infra.activation import (
-    ReconfiguratorBoundaryBusy,
-    ReconfiguratorRequest,
-)
 from areal.elastic.infra.adapter import NativeControlEnvironment, ReconfiguratorAdapter
 
 

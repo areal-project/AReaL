@@ -114,7 +114,7 @@ class NativePlacements:
         return tuple(result)
 
     def prediction_handoff(self, handoff):
-        from areal.elastic.simulation.online_transitions import NativePlacement
+        from areal.elastic.contracts import NativePlacement
 
         devices = tuple(self.owner.resource_reservation)
         if len(devices) > 8:
@@ -358,7 +358,7 @@ class ReconfiguratorAdapter:
             )
             self.run_config = SimulationConfig(**values)
         if self.handoff is None and profile.get("handoff"):
-            from areal.elastic.simulation.online_transitions import HandoffConfig
+            from areal.elastic.contracts import HandoffConfig
 
             self.handoff = HandoffConfig.from_dict(
                 {"mode": "cold", **profile["handoff"]}

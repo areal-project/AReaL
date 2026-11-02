@@ -9,7 +9,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from areal.elastic.infra.activation import (
+from areal.autopilot.domains.elastic.activation import (
     ReconfiguratorBoundaryBusy,
     ReconfiguratorRequest,
 )

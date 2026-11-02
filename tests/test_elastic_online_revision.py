@@ -30,10 +30,9 @@ from areal.autopilot.domains.elastic.loaders import (
 )
 from areal.autopilot.revision import CandidateRunner, Proposal, RevisionLoop
 from areal.autopilot.revision.execution import load_source
+from areal.elastic.contracts import HandoffConfig, SimulationConfig
 from areal.elastic.serving import ServingSLO
-from areal.elastic.simulation.online_simulation import OnlineSimulation
-from areal.elastic.simulation.online_transitions import HandoffConfig
-from areal.elastic.simulation.simulation_core import SimulationConfig
+from areal.elastic.simulation.simulation import OnlineSimulation
 
 
 @pytest.fixture

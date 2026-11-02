@@ -14,12 +14,17 @@ from areal.autopilot.domains.elastic.model_evaluator import (
 from areal.autopilot.domains.elastic.model_execution import HistoricalSourceEvaluator
 from areal.autopilot.domains.elastic.optimizer_evaluator import OnlineOptimizerEvaluator
 from areal.autopilot.revision.execution import load_source
-from areal.elastic.contracts import EpisodeSample, Forecast, OnlineLayout, Turn
+from areal.elastic.contracts import (
+    EpisodeSample,
+    Forecast,
+    HandoffConfig,
+    OnlineLayout,
+    SimulationConfig,
+    Turn,
+)
 from areal.elastic.reconfigurator.reference.evaluator import Evaluator
 from areal.elastic.serving import ServingSLO
-from areal.elastic.simulation.online_simulation import OnlineSimulation
-from areal.elastic.simulation.online_transitions import HandoffConfig
-from areal.elastic.simulation.simulation_core import SimulationConfig
+from areal.elastic.simulation.simulation import OnlineSimulation
 
 MODEL_SOURCE = """from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import RolloutConfig
 class Components:

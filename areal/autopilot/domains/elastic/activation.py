@@ -6,13 +6,61 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import re
+import threading
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from areal.elastic.contracts import BatchWorkload, HistoryWindow, Measurement
+from areal.elastic.contracts import BatchWorkload, TrainingConfig
 from areal.utils.atomic import atomic_json
 from areal.utils.atomic import json_digest as digest
+
+
+@dataclass(frozen=True)
+class Measurement:
+    phase: str
+    world_size: int
+    seconds: float
+    sequence_tokens: int = 0
+    profile_id: str = ""
+
+    def __post_init__(self) -> None:
+        TrainingConfig(self.world_size, self.profile_id)
+        if not math.isfinite(self.seconds) or self.seconds < 0:
+            raise ValueError("Measurement duration must be finite and nonnegative")
+        if self.sequence_tokens < 0:
+            raise ValueError("Measurement token count must be nonnegative")
+
+
+@dataclass(frozen=True)
+class HistorySnapshot:
+    workloads: tuple[BatchWorkload, ...] = ()
+    measurements: tuple[Measurement, ...] = ()
+
+
+class HistoryWindow:
+    """Bounded completed observations; no future trace or wall-clock oracle."""
+
+    def __init__(self, capacity: int = 32):
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError("History capacity must be positive")
+        self._workloads = deque(maxlen=capacity)
+        self._measurements = deque(maxlen=capacity * 16)
+        self._lock = threading.RLock()
+
+    def add_workload(self, workload: BatchWorkload) -> None:
+        with self._lock:
+            self._workloads.append(workload)
+
+    def add_measurement(self, measurement: Measurement) -> None:
+        with self._lock:
+            self._measurements.append(measurement)
+
+    def snapshot(self) -> HistorySnapshot:
+        with self._lock:
+            return HistorySnapshot(tuple(self._workloads), tuple(self._measurements))
 
 
 @dataclass(frozen=True)

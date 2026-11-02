@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Read existing summary rows, optional rank logs and Chrome complete spans.
+"""Offline analysis of summary rows, rank logs and Chrome complete spans.
 
 No new training instrumentation. CPU wall spans are not CUDA kernel durations.
 """

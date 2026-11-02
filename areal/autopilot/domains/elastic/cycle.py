@@ -223,10 +223,9 @@ class ReconfiguratorRevisionCycle:
     ):
         from dataclasses import asdict
 
+        from areal.elastic.contracts import HandoffConfig, SimulationConfig
         from areal.elastic.reconfigurator import build_reconfigurator
         from areal.elastic.serving import ServingSLO
-        from areal.elastic.simulation.online_transitions import HandoffConfig
-        from areal.elastic.simulation.simulation_core import SimulationConfig
 
         from .bundle import export_accepted_bundle
         from .contracts import decode
