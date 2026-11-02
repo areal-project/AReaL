@@ -44,3 +44,9 @@ python -m examples.profile.rollout_calibration \
 batch trace记录请求关联、本次query、实际past、attention pairs、阶段和GPU事件时长。
 KV字段是forward入口已分配槽位占用，包含本批分配；不等于请求逻辑上下文总和。
 观测字段缺失保留null，不以客户端墙钟替代GPU时间。混合到达／大batch验证集尚待补充。
+
+## CPU 校准与诊断工具
+
+`examples.profile.cost_model_tools` 提供 `fit_phase_calibration()`、Packing 耗时诊断和 RPC
+观测模型。运行时读取冻结参数，阶段耗时计算位于 Reference 的 Actor／Rollout／发布模型。源码身份仍覆盖完整
+Reference；迁移只建立明确审计的校准副本，不 refit。

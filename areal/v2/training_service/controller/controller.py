@@ -1085,10 +1085,7 @@ class GatewayTrainController:
                 return
             # Preserve the old handle until both peers confirm cleanup. A
             # partially initialized pair must also pass through disconnect.
-            self._weight_update_ctrl.disconnect()
-            self._weight_update_ctrl.destroy()
-            self._weight_update_ctrl = None
-            self._weight_update_identity = None
+            self._disconnect_weight_update()
 
         self.rollout = rollout
         ctrl = WeightUpdateController(
@@ -1280,15 +1277,23 @@ class GatewayTrainController:
         run_async_task(_shutdown_all)
         logger.info("All training worker engines destroyed gracefully")
 
-    def _cleanup_runtime_state(self, *, training_stopped: bool = False) -> None:
+    @_exclusive_engine_operation
+    def disconnect_engine(self) -> None:
+        """Release weight-transfer peers while retaining training workers/state."""
+        self._disconnect_weight_update()
+
+    def _disconnect_weight_update(self, *, training_stopped: bool = False) -> None:
         if self._weight_update_ctrl is not None:
-            # A live inference generation must release its old communicator
-            # before the training peers disappear. Propagate uncertainty so
-            # callers cannot treat an unconfirmed release as reusable GPUs.
-            self._weight_update_ctrl.disconnect()
+            if training_stopped:
+                self._weight_update_ctrl.disconnect(training_stopped=True)
+            else:
+                self._weight_update_ctrl.disconnect()
             self._weight_update_ctrl.destroy()
             self._weight_update_ctrl = None
             self._weight_update_identity = None
+
+    def _cleanup_runtime_state(self, *, training_stopped: bool = False) -> None:
+        self._disconnect_weight_update()
 
         if self._router_addr and self._model_addr:
             try:
@@ -1373,11 +1378,7 @@ class GatewayTrainController:
         The surviving inference peers must still acknowledge communicator
         teardown. A timeout or a failed worker RPC is never sufficient proof.
         """
-        if self._weight_update_ctrl is not None:
-            self._weight_update_ctrl.disconnect(training_stopped=True)
-            self._weight_update_ctrl.destroy()
-            self._weight_update_ctrl = None
-            self._weight_update_identity = None
+        self._disconnect_weight_update(training_stopped=True)
 
     def quiesce_initialization(self, timeout: float | None = None) -> None:
         """Wait for a running launch to stop before deleting its resources."""

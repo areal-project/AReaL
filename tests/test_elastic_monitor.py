@@ -41,13 +41,13 @@ def test_default_monitor_records_causal_inputs_only_after_update_finishes(
     first = monitor.runtime_history.snapshot(1)["updates"][0]
     assert first["workload"]["effective_tokens"] == monitor.completed_tokens == 8
     assert not first["missing_phases"] and first["checkpointed"]
-    assert first["policy_name"] == "IdleTimeoutPolicy"
+    assert first["reconfigurator_name"] == "OnlineReconfigurator"
     _update(manager)
     second = monitor.runtime_history.snapshot(2)["updates"][1]
     assert len(second["history"]["workloads"]) == 1
     assert second["observation"]["committed_tokens"] == 8
     assert second["committed_tokens"] == monitor.completed_tokens == 16
-    assert not (manager.root / "policy-application").exists()
+    assert not (manager.root / "reconfigurator-application").exists()
 
 
 def test_default_monitor_rolls_back_unsaved_history_and_replay_counts_once(
@@ -83,7 +83,8 @@ def test_default_monitor_restart_preserves_history_order_and_ignores_old_pending
     manager = fixture.manager
     for _ in range(2):
         _update(manager)
-        assert manager.maybe_suspend(now=manager.ready_since + 121)
+        manager.save_checkpoint(reason="reconfiguration")
+        manager._release()
     expected = manager.monitor.history.snapshot()
     pending = json.loads(manager.monitor.pending_path.read_text())
     state = json.loads((manager.latest_path / "monitor-state.json").read_text())
@@ -135,7 +136,7 @@ def test_optional_monitor_write_failure_does_not_rollback_or_block_release(
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
-    from areal.elastic.monitor import collector
+    from areal.elastic.infra.monitor import collector
 
     fixture = request.getfixturevalue("native_lifecycle")
     manager = fixture.manager
@@ -161,9 +162,16 @@ def test_optional_monitor_write_failure_does_not_rollback_or_block_release(
         assert manager.active is None and manager.actor.updates == 1
         assert not manager.monitor.metrics_available
         assert manager.monitor.completed_tokens == 8
-        decide = MagicMock(side_effect=AssertionError("measured policy must pause"))
-        patch.setattr(manager.policy_adapter, "policy", SimpleNamespace(decide=decide))
-        assert manager.maybe_suspend(now=manager.ready_since + 121)
+        decide = MagicMock(
+            side_effect=AssertionError("measured reconfigurator must pause")
+        )
+        patch.setattr(
+            manager.reconfigurator_adapter,
+            "reconfigurator",
+            SimpleNamespace(decide=decide),
+        )
+        manager.save_checkpoint(reason="reconfiguration")
+        manager._release()
         decide.assert_not_called()
         assert manager.actor is None
         assert manager.latest_manifest["data_progress"] == {
@@ -237,7 +245,7 @@ def test_critical_checkpoint_failure_still_blocks_release_without_metrics(
             lambda **kwargs: (_ for _ in ()).throw(OSError("full-state save failed")),
         )
         with pytest.raises(OSError, match="full-state save failed"):
-            manager.maybe_suspend(now=manager.ready_since + 121)
+            manager.save_checkpoint(reason="reconfiguration")
     assert manager.actor is actor and manager.owner == owner
     assert manager.applied_version == manager.published_version == 2
     assert manager.checkpoint_version == 1

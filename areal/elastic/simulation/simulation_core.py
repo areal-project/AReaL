@@ -2,21 +2,19 @@
 
 """Shared event execution and state restoration for elastic training.
 
-The private workload oracle stays in the environment. Policies receive immutable
+The private workload oracle stays in the environment. Reconfigurators receive immutable
 observations; candidate branches receive only forecast workloads."""
 
 from __future__ import annotations
 
 import heapq
-import math
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import Executor
 from dataclasses import asdict, dataclass, field, replace
 from functools import cached_property
-from typing import Protocol
 
-from areal.elastic.policy.basic.observations import (
+from areal.elastic.contracts import (
     ActorView,
     ActorWaitView,
     EpisodeSample,
@@ -26,80 +24,26 @@ from areal.elastic.policy.basic.observations import (
     OnlineObservation,
     RequestView,
     ServiceView,
+    SimulationConfig,
+    SimulationModels,
     ToolView,
     Turn,
 )
-from areal.elastic.policy.reference.cost_model._rollout.scheduling import policy_for
-from areal.elastic.policy.reference.cost_model._rollout.types import (
+from areal.elastic.reconfigurator.reference.evaluator.contracts import Request
+from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import (
     ServiceSlice,
 )
-from areal.elastic.policy.reference.cost_model.rollout import RolloutConfig
-from areal.elastic.policy.reference.scenario import Request
-
-from .online_inputs import ForecastInputs, WorkInputs
-from .online_state import ReplicaState, RequestState
-from .online_transitions import (
+from areal.elastic.reconfigurator.reference.evaluator.cost_model.rollout.scheduling import (
+    scheduler_for,
+)
+from areal.elastic.simulation.online_inputs import ForecastInputs, WorkInputs
+from areal.elastic.simulation.online_state import ReplicaState, RequestState
+from areal.elastic.simulation.online_transitions import (
     ActorMemoryRejected,
     GPUAllocator,
     HandoffConfig,
     SerializedLink,
 )
-
-
-class SimulationModels(Protocol):
-    source_ids: tuple[str, ...]
-
-    def rollout_config(self, layout: OnlineLayout) -> RolloutConfig: ...
-    def service(
-        self, layout: OnlineLayout, kv: int, slices: tuple[ServiceSlice, ...]
-    ) -> float: ...
-    def actor(
-        self, layout: OnlineLayout, batch: tuple[tuple[Turn, ...], ...]
-    ) -> tuple[tuple[str, float], ...]: ...
-    def publication(
-        self, layout: OnlineLayout, recipients: tuple[OnlineLayout, ...]
-    ) -> float: ...
-
-
-@dataclass(frozen=True)
-class SimulationConfig:
-    batch_size: int
-    staleness: int
-    client_concurrency: int
-    tool_capacities: tuple[tuple[str, int], ...]
-    max_new_tokens: int
-    max_context_tokens: int
-    max_events: int
-    max_simulated_seconds: float
-    actor_lifecycle_enabled: bool = False
-    actor_lifecycle_history_seconds: float = 120.0
-    actor_lifecycle_margin_seconds: float = 5.0
-    actor_stopped_rollout_reconfig: bool = False
-
-    def __post_init__(self):
-        for name in (
-            "batch_size",
-            "client_concurrency",
-            "max_new_tokens",
-            "max_context_tokens",
-            "max_events",
-        ):
-            value = getattr(self, name)
-            if type(value) is not int or value < 1:
-                raise ValueError(f"Invalid {name}")
-        if self.staleness < 0 or self.max_simulated_seconds <= 0:
-            raise ValueError("Explicit staleness and simulation budget are required")
-        if not self.tool_capacities or any(n < 1 for _, n in self.tool_capacities):
-            raise ValueError("Explicit positive tool pool capacities are required")
-        if (
-            not math.isfinite(self.actor_lifecycle_history_seconds)
-            or self.actor_lifecycle_history_seconds <= 0
-            or not math.isfinite(self.actor_lifecycle_margin_seconds)
-            or self.actor_lifecycle_margin_seconds < 0
-        ):
-            raise ValueError(
-                "Lifecycle needs a positive history and nonnegative margin"
-            )
 
 
 @dataclass(init=False)
@@ -119,7 +63,7 @@ class _Request:
         self.view = (
             RequestState(*values) if values is not None else RequestState.copy(view)
         )
-        self.reservation, self.order = reservation, order
+        self.reservation, self.order = (reservation, order)
 
     @property
     def group_id(self):
@@ -127,7 +71,6 @@ class _Request:
 
     @cached_property
     def request(self):
-        # The scheduler sees a public generation budget, never the actual stop length.
         return Request(
             f"request-{self.view.turn}", self.view.input_tokens, self.reservation
         )
@@ -184,19 +127,23 @@ class SimulationCore:
         slo=None,
         *,
         input_closes_at: float,
-        policy: object | None = None,
+        reconfigurator: object | None = None,
         event_sink: Callable[[dict], None] | None = None,
         start_time: float = 0.0,
         coalesce_decode: bool = False,
         candidate_executor: Executor | None = None,
         _work: WorkInputs | None = None,
-        _lifecycle_view=None,
     ):
         if config.batch_size % initial.actor_dp:
             raise ValueError("Actor DP must divide the episode batch")
         work = _work or WorkInputs.prepare(episodes, input_closes_at, start_time)
         self._truth = work.truth
-        self.models, self.config, self.handoff, self.slo = models, config, handoff, slo
+        self.models, self.config, self.handoff, self.slo = (
+            models,
+            config,
+            handoff,
+            slo,
+        )
         self.now = start_time
         if initial.actor_gpus + initial.rollout_gpus > 16:
             raise ValueError(
@@ -219,7 +166,7 @@ class SimulationCore:
             raise ValueError(
                 "Initial deployment does not fit the explicit resource pool"
             )
-        self.actor_id, self.rollout_id, self.next_deployment = 0, 1, 2
+        self.actor_id, self.rollout_id, self.next_deployment = (0, 1, 2)
         self._last_layout = initial
         self.episodes: dict[str, _Episode] = {}
         self.arrival_order: list[str] = []
@@ -243,7 +190,7 @@ class SimulationCore:
         self.pending_handoff: dict | None = None
         self._handoff_old_costs: dict[str, float] = {}
         self.decision_pending = False
-        self.policy = policy
+        self.reconfigurator = reconfigurator
         self.sink = event_sink
         self.events: list[dict] = []
         self.decisions: list[dict] = []
@@ -253,7 +200,7 @@ class SimulationCore:
         self.sequence = work.sequence
         self.done = False
         self.processed_events = 0
-        self.status, self.reason = "running", ""
+        self.status, self.reason = ("running", "")
         self.training_limit: int | None = None
         self.coalesce_decode = coalesce_decode
         self.candidate_executor = candidate_executor
@@ -263,11 +210,7 @@ class SimulationCore:
         self.local_service_ticks = 0
         self.decode_run_reuses = 0
         self.control = None
-        self.lifecycle = None
-        if config.actor_lifecycle_enabled:
-            from .online_lifecycle import ActorLifecycle
-
-            self.lifecycle = ActorLifecycle(self, _lifecycle_view)
+        self._restoring_actor = None
         self.emit("allocation", leases=dict(self.pool.leases))
 
     @property
@@ -286,14 +229,7 @@ class SimulationCore:
         return self._last_layout
 
     def reconfiguration_allowed(self):
-        return (
-            self.lifecycle is None
-            or self.lifecycle.state == "running"
-            or (
-                self.lifecycle.state == "stopped"
-                and self.config.actor_stopped_rollout_reconfig
-            )
-        )
+        return self._restoring_actor is None
 
     def emit(self, kind: str, **data):
         self.counters[kind] += 1
@@ -306,7 +242,7 @@ class SimulationCore:
             self.events.append(event)
 
     def schedule_at(self, when: float, kind: str, data=None, *, priority: int = 0):
-        if when < self.now - 1e-9:
+        if when < self.now - 1e-09:
             raise ValueError("An event cannot be scheduled in the past")
         self.sequence += 1
         heapq.heappush(
@@ -327,14 +263,14 @@ class SimulationCore:
                 if (
                     until_update is not None
                     and self.provider_version >= until_update
-                    and self.publication == "idle"
+                    and (self.publication == "idle")
                 ):
                     paused = True
                     break
                 if (
                     stop_after_handoff
-                    and not self.pending_handoff
-                    and not self.decision_pending
+                    and (not self.pending_handoff)
+                    and (not self.decision_pending)
                 ):
                     paused = True
                     break
@@ -347,7 +283,7 @@ class SimulationCore:
                     )
                     break
                 if self.coalesce_decode:
-                    from .online_decode import advance_decode
+                    from areal.elastic.simulation.online_decode import advance_decode
 
                     advance_decode(self, until)
                 when = self.heap[0][0]
@@ -371,8 +307,8 @@ class SimulationCore:
                 service_only = (
                     self.coalesce_decode
                     and self.sink is None
-                    and self.pending_handoff is None
-                    and self.publication == "idle"
+                    and (self.pending_handoff is None)
+                    and (self.publication == "idle")
                 )
                 completed = self.counters["request_complete"]
                 while self.heap and self.heap[0][0] == self.now:
@@ -398,13 +334,13 @@ class SimulationCore:
                         else None
                     )
                     self.check_prediction_bounds()
-            if self.status == "running" and not paused:
+            if self.status == "running" and (not paused):
                 self.status, self.reason = (
                     "complete",
                     "Input closed, serving drained and all full batches trained",
                 )
         except (ValueError, ArithmeticError) as exc:
-            self.status, self.reason = "unsupported", str(exc)
+            self.status, self.reason = ("unsupported", str(exc))
         return self.result()
 
     def handle(self, kind: str, data):
@@ -463,14 +399,11 @@ class SimulationCore:
 
     def tick(self, local_services: set[tuple[int, int]] | None = None):
         if local_services is not None:
-            # No admission credit, tool readiness, complete training batch or
-            # deployment boundary changed. Preserve the usual timestamp-wide
-            # event handling before restarting only the completed replicas.
             self.local_service_ticks += 1
             self.service(local_services)
             return
-        if self.publication == "pending" and not any(
-            d.busy for d in self.deployments.values()
+        if self.publication == "pending" and (
+            not any(d.busy for d in self.deployments.values())
         ):
             self.start_publication()
         self.before_work()
@@ -478,24 +411,20 @@ class SimulationCore:
             self.admit()
             self.start_tools()
             self.service()
-            if self.lifecycle is not None:
-                self.lifecycle.tick()
             self.start_actor()
         else:
-            self.start_tools()  # Tool execution remains independent of GPU publication.
+            self.start_tools()
         self.after_work()
         if (
             self.input_closed
             and len(self.episodes) == len(self._truth)
-            and self._completed_episodes == len(self.episodes)
-            and not self.actor_batch
-            and self.publication == "idle"
-            and self.pending_handoff is None
-            and not self.decision_pending
-            and (
-                self.lifecycle is None or self.lifecycle.state in {"running", "stopped"}
-            )
-            and len(self.arrival_order) - self.consumed < self.config.batch_size
+            and (self._completed_episodes == len(self.episodes))
+            and (not self.actor_batch)
+            and (self.publication == "idle")
+            and (self.pending_handoff is None)
+            and (not self.decision_pending)
+            and (self._restoring_actor is None)
+            and (len(self.arrival_order) - self.consumed < self.config.batch_size)
         ):
             if self.control is not None:
                 self.control.cancel()
@@ -511,7 +440,6 @@ class SimulationCore:
         )
 
     def advance(self, when):
-        # Count only intervals with tasks waiting for staleness admission credit.
         if (
             self._admission_cursor < len(self.arrival_order)
             and self.admission_credits() <= 0
@@ -543,23 +471,11 @@ class SimulationCore:
             view = request.view
             if not self.episodes[view.episode_id].admitted:
                 continue
-            need = view.input_tokens + request.reservation - 1
-            candidates = [
-                i
-                for i, group in target.replicas.items()
-                if len(group.rows) < cfg.max_batch_sequences
-                and group.reserved_tokens + need <= cfg.kv_capacity_tokens
-            ]
-            if candidates:
-                replica = min(
-                    candidates,
-                    key=lambda i: (
-                        target.replicas[i].kv_tokens,
-                        len(target.replicas[i].rows),
-                        i,
-                    ),
-                )
-                view.deployment, view.replica = target.identity, replica
+            replica = scheduler_for(cfg.backend).choose_replica(
+                cfg, request, target.replicas
+            )
+            if replica is not None:
+                view.deployment, view.replica = (target.identity, replica)
                 target.replicas[replica].add(request)
                 del self._unassigned[view.request_id]
                 self.emit(
@@ -578,11 +494,7 @@ class SimulationCore:
             for replica in range(cfg.replicas):
                 if (
                     local_services is not None
-                    and (
-                        deployment.identity,
-                        replica,
-                    )
-                    not in local_services
+                    and (deployment.identity, replica) not in local_services
                 ):
                     continue
                 if replica in deployment.busy:
@@ -594,26 +506,30 @@ class SimulationCore:
                 continuation = (
                     self.coalesce_decode
                     and self.sink is None
-                    and not self.prediction_guard_active()
-                    and plan is not None
+                    and (not self.prediction_guard_active())
+                    and (plan is not None)
                     and plan.continuation
-                    and plan.revision == group.revision
-                    and plan.version == deployment.version
-                    and plan.limit > 0
-                    and plan.first_seconds > 0
-                    and group.kv_tokens + len(plan.batch.slices)
-                    <= cfg.kv_capacity_tokens
+                    and (plan.revision == group.revision)
+                    and (plan.version == deployment.version)
+                    and (plan.limit > 0)
+                    and (plan.first_seconds > 0)
+                    and (
+                        group.kv_tokens + len(plan.batch.slices)
+                        <= cfg.kv_capacity_tokens
+                    )
                 )
                 if continuation:
                     duration = plan.first_seconds
                     rows = tuple(
-                        (key, context + 1, query, phase, emits)
-                        for key, context, query, phase, emits in plan.batch.slices
+                        (
+                            (key, context + 1, query, phase, emits)
+                            for key, context, query, phase, emits in plan.batch.slices
+                        )
                     )
                     self.decode_batch_reuses += 1
                 else:
                     group.flush_decode()
-                    slices, _ = policy_for(cfg.backend).batch(
+                    slices, _ = scheduler_for(cfg.backend).batch(
                         cfg, list(group.rows.values())
                     )
                     duration = self.models.service(
@@ -629,12 +545,7 @@ class SimulationCore:
                         )
                         for s in slices
                     )
-                batch = ServiceView(
-                    replica,
-                    self.now,
-                    rows,
-                    deployment.version,
-                )
+                batch = ServiceView(replica, self.now, rows, deployment.version)
                 if continuation:
                     plan.batch = batch
                     plan.continuation = False
@@ -653,16 +564,14 @@ class SimulationCore:
         defer = (
             self.coalesce_decode
             and self.sink is None
-            and not self.prediction_guard_active()
-            and plan is not None
-            and plan.batch is batch
-            and plan.revision == group.revision
-            and plan.version == deployment.version
-            and plan.limit > 1
+            and (not self.prediction_guard_active())
+            and (plan is not None)
+            and (plan.batch is batch)
+            and (plan.revision == group.revision)
+            and (plan.version == deployment.version)
+            and (plan.limit > 1)
         )
         if defer:
-            # The retained ordinary iteration cannot finish any selected
-            # request. Keep it in the same summary across unrelated events.
             group.defer_decode(plan, 1, self.now, self.now, 0.0)
             group.kv_tokens += len(batch.slices)
             self.counters["token_generated"] += len(batch.slices)
@@ -694,12 +603,12 @@ class SimulationCore:
         if (
             self.coalesce_decode
             and self.sink is None
-            and not self.prediction_guard_active()
-            and plan is not None
-            and plan.batch is batch
-            and plan.revision == group.revision
-            and plan.version == deployment.version
-            and plan.limit > 0
+            and (not self.prediction_guard_active())
+            and (plan is not None)
+            and (plan.batch is batch)
+            and (plan.revision == group.revision)
+            and (plan.version == deployment.version)
+            and (plan.limit > 0)
         ):
             plan.first_seconds += plan.increment
             plan.limit -= 1
@@ -742,7 +651,6 @@ class SimulationCore:
             self._tool_episodes[episode.episode_id] = episode
 
     def start_tools(self):
-        # Match original episode-arrival priority, rather than tool-ready FIFO.
         waiting = sorted(
             self._tool_episodes.values(),
             key=lambda e: self._episode_order[e.episode_id],
@@ -751,7 +659,7 @@ class SimulationCore:
             active = sum(
                 e.tool is not None
                 and e.tool.pool == pool
-                and e.tool.started_at is not None
+                and (e.tool.started_at is not None)
                 for e in waiting
             )
             for episode in waiting:
@@ -786,7 +694,7 @@ class SimulationCore:
         self.new_request(episode, self.now)
 
     def start_actor(self):
-        if self.lifecycle is not None and self.lifecycle.state != "running":
+        if self._restoring_actor is not None:
             return
         if (
             self.training_limit is not None
@@ -805,8 +713,30 @@ class SimulationCore:
             self.episodes[e].completed_at is None for e in batch
         ):
             return
+        if self.actor_id not in self.deployments:
+            identity = self.next_deployment
+            if (
+                self.pool.acquire(
+                    str(identity),
+                    "actor",
+                    self.layout.actor_gpus,
+                    tp=self.layout.actor_tp,
+                )
+                is None
+            ):
+                raise ValueError("Initial Actor does not fit the declared GPU pool")
+            self.next_deployment += 1
+            self._restoring_actor = identity
+            self.add_restoring_actor(identity)
+            self.emit("actor_restore_start", deployment=identity)
+            self.schedule_at(
+                self.now + self.handoff.actor_startup_seconds,
+                "process_started",
+                identity,
+            )
+            return
         wait = self.actor_wait
-        if wait and wait.deployment == self.actor_id and wait.batch == batch:
+        if wait and wait.deployment == self.actor_id and (wait.batch == batch):
             self.reject_unrepairable_forecast_wait()
             return
         try:
@@ -844,7 +774,7 @@ class SimulationCore:
                 seconds=seconds,
             )
             self.actor_wait = None
-        self.actor_batch, self.actor_stages = batch, stages
+        self.actor_batch, self.actor_stages = (batch, stages)
         versions = Counter()
         for request in self.requests.values():
             if request.view.episode_id in batch:
@@ -928,8 +858,6 @@ class SimulationCore:
         self.provider_version = version
         self.publication = "idle"
         self.emit("weights_published", version=version, recipients=identities)
-        if self.lifecycle is not None:
-            self.lifecycle.request_check()
         if self.control is not None:
             self.control.publication_complete()
 
@@ -984,7 +912,7 @@ class SimulationCore:
                 self.actor_phase,
                 self.actor_phase_started,
                 self.actor_wait,
-                self.lifecycle.observe() if self.lifecycle is not None else None,
+                self.actor_id in self.deployments,
             ),
             self.consumed,
             self.training_version,
@@ -992,13 +920,15 @@ class SimulationCore:
             self.pending_handoff is not None
             or self.publication != "idle"
             or self.decision_pending
-            or not self.reconfiguration_allowed(),
+            or (not self.reconfiguration_allowed()),
             self.input_closed,
             self.actor_id,
             self.rollout_id,
             tuple(
-                (int(owner), role, devices)
-                for owner, (role, devices) in sorted(self.pool.leases.items())
+                (
+                    (int(owner), role, devices)
+                    for owner, (role, devices) in sorted(self.pool.leases.items())
+                )
             ),
         )
 
@@ -1050,13 +980,6 @@ class SimulationCore:
         )
         if self.control is not None:
             result["control"] = dict(clock="measured", **self.control.stats)
-        if self.lifecycle is not None:
-            result["actor_lifecycle"] = dict(
-                state=self.lifecycle.state,
-                suspends=self.counters["actor_suspended"],
-                resumes=self.counters["actor_resumed"],
-                snapshot=self.lifecycle.snapshot,
-            )
         return result
 
     @classmethod
@@ -1095,15 +1018,9 @@ class SimulationCore:
             start_time=view.now,
             coalesce_decode=coalesce_decode,
             _work=prepared.work,
-            _lifecycle_view=view.actor.lifecycle,
             **simulation_options,
         )
-        stopped = (
-            view.actor.lifecycle is not None and view.actor.lifecycle.state == "stopped"
-        )
-        if stopped:
-            if simulation.lifecycle is None:
-                raise ValueError("Stopped Actor observation requires lifecycle support")
+        if not view.actor.running:
             del simulation.deployments[0]
         owners = {
             view.actor_deployment: (
@@ -1144,14 +1061,14 @@ class SimulationCore:
                     (node, rank) in occupied
                     or node < 0
                     or node >= len(handoff.node_gpus)
-                    or not 0 <= rank < handoff.node_gpus[node]
+                    or (not 0 <= rank < handoff.node_gpus[node])
                 ):
                     raise ValueError(
                         "Invalid or overlapping visible TP-local GPU leases"
                     )
                 occupied.add((node, rank))
-            leases[owner] = role, devices
-        if set(leases) != ({"1"} if stopped else {"0", "1"}):
+            leases[owner] = (role, devices)
+        if set(leases) != ({"0", "1"} if view.actor.running else {"1"}):
             raise ValueError("Forecast requires complete current GPU placement")
         simulation.pool.leases = leases
         simulation.pool.peak_gpus = len(occupied)
@@ -1178,8 +1095,6 @@ class SimulationCore:
             simulation.requests[current.request_id] = _Request(
                 current, reservation, len(simulation.requests), values=values
             )
-        # Rebuild indexes solely from the visible restored state. Completed
-        # history remains available to observe()/training, outside token hot paths.
         simulation._live_requests = {
             key: request
             for key, request in simulation.requests.items()
@@ -1204,7 +1119,6 @@ class SimulationCore:
         simulation._active_episodes = prepared.active
         simulation._completed_episodes = prepared.completed
         simulation._admission_cursor = prepared.admission_cursor
-        # Recompute the remaining known GPU iteration, not its hidden stop lengths.
         for service in view.services:
             group = simulation.deployments[1].replicas[service.replica]
             slices = tuple(ServiceSlice(*s) for s in service.slices)
@@ -1215,8 +1129,6 @@ class SimulationCore:
                 "service_complete",
                 (1, service.replica),
             )
-        # Tools' true end times are not in the view. Their sampled total duration
-        # is conditioned on already elapsed time by HistoricalForecaster.
         for episode in view.episodes:
             if episode.tool is not None and episode.tool.started_at is not None:
                 turn = simulation._truth[episode.episode_id].turns[

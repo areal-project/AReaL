@@ -1,33 +1,21 @@
-# Tau2 计划与公司端交接
+# AutoPilot 计划与历史交接
 
 范围：S031、S029、T0390、S026、S030、S028、S025、S024、S013。当前状态统一维护在
 [PROGRESS.md](../../PROGRESS.md)，Expert 接口与边界见
-[Reference](../../areal/elastic/policy/reference/README.md)。设计长文与历史进度保留在本地归档。
+[Reference](../../areal/elastic/reconfigurator/reference/README.md)。设计长文与历史进度保留在本地归档。
 
-当前在线重配置见[在线模拟](elastic/ONLINE_RECONFIGURATION.md)：历史负载回放、80%目标、候选严格剪枝、重复搜索抑制及CPU搜索／复核延迟通过50项正常检查；165候选快照4worker复用11.3→7.1秒，所选配置一致。新完整单峰守恒通过，但动态SLO51.94%低于固定63.65%，部署选择质量待改；旧95%实验独立保留，真实服务交接仍待验收。
+## 当前实现与方向
 
-共享16卡稳态预算／TP≤8的条件探索已完成68组预定＋6组追加验证，原fit不变，56项正常CPU检查通过。[8类负载对照](../../../artifacts/elastic-workload-regimes-20261025/README.md)中，低负载和大输入资源调整的节省在两种子复现，联合搜索仍有失败；跨节点Actor收益、网络争用和真实引擎交接尚未验收。
+- `basic` 为 JointSimulator 基线 **Basic v1**；`reference` 使用 Evaluator。两者的候选预测与外层实验环境分离。
+- 当前 revision 接入仍在 Reference；后续以 Basic 为起点验证 revision，再补齐粗模型的预测细节。
+- 原生与模拟共用所选 reconfigurator；执行环境显式区分 hot／cold。原生当前支持 cold，不增加推理流采集。
+- Revision 先评估真实历史覆盖范围的模型误差，再固定模型评估 optimizer 的候选质量／查询开销；接受的完整 bundle
+  由模拟和原生共同加载。calibration、validation、final holdout 分开。
+- 固定训练语义、逻辑 batch、采样及 staleness，后续用实测比较完成时间、GPU 成本和训练质量，计入搜索、修订与切换开销。
+- 运行方式见[Online](elastic/ONLINE_RECONFIGURATION.md)，代码修订见[Elastic revision](../../areal/autopilot/domains/elastic/README.md)。当前验收状态以
+  [PROGRESS](../../PROGRESS.md) 为准。
 
-[M2 历史快照](../../../artifacts/repository-archive-20261021/files/examples/autopilot/elastic/milestones/m2/README.md)
-保留旧串行执行器的代码身份与证据。 [架构图](elastic/README.md#policy-and-revision-loops) 区分 policy
-loop、cost-model revision 和 optimizer revision；当前执行入口为原生 PPOTrainer，联合配置模型保留作离线参考。
-
-## 目标与实验约束
-
-- 保留已有等待回收能力，下一阶段研究 rollout／actor 配置的成本优化及 AutoPilot 修订增益。
-- 并行开发 Expert 与 Basic。校准并验证 `expert_designed` cost model／simulator，作为离线实验的固定高质量对照；它不包含
-  optimizer。 Basic 的模型与 optimizer 是被评估、被修订的对象，专家模型在每组实验中冻结。
-- 首轮建议固定各 trial 的训练语义、逻辑 batch、数据复用与模型；配置改变带来的队列、staleness、权重同步和切换开销需一起评估。
-- 报告 GPU-hours、完成时间与 held-out 质量；episode、actor sequence uses、attention／loss tokens 分开计数。
-  质量容差、时间约束和可调配置集合需结合真实运行确认。
-- evaluator 负责评估候选、返回修订反馈和判断接受／拒绝；agent 据此修改 Basic。 模型 evaluator
-  输入该次训练历史中的实际配置、负载与必要初态，以真实执行测量为标签。 首先验证历史已覆盖范围的预测准确性；未见配置的泛化另行验证，不作为当前历史修订的先决条件。
-  校准、反复反馈的验证集与最终保留集分开；公司端最后 200 步继续保留不评分。
-- simulator 实验在相同场景和指标上比较 `basic_v0`、各轮接受的修订版本与固定 expert，观察 Basic 的改善及其与 expert 的差距。
-  expert 是高质量对照，不默认用其输出指导 Basic 拟合或生成修订标签；改善趋势由实验验证。
-- optimizer 在当前冻结模型上搜索；evaluator 在固定预算下以同一模型复核返回的配置，并报告配置成本、求解时间与查询开销。 专家 simulator
-  可提供离线成本参考，评分与修订反馈仍由 evaluator 负责。最终用独立实测验证，计入采样、搜索、修订和切换开销。
-- 对照包括现有固定配置、固定 Planner、普通在线校准，再分别评估模型修订、optimizer 修订及联合修订。
+以下为既有任务接入计划与实验记录；其中旧 Basic／Expert／串行路径名称保留历史语境，不代表当前入口。
 
 ## DAPO 与 SWE 适配计划
 
@@ -202,14 +190,14 @@ dispatch／packing／阶段定义。v1 历史误差不能直接证明 v2 异步�
 
 ## 应用接入
 
-现有验收基线为 Qwen3-0.6B＋FSDP＋SGLang 的执行、policy 应用、历史采集与两类 revision。 下一步先接原生在线入口的按需训练，顺序见下节；原生
-SWE／Tau2 的完整 workflow 适配另行推进。 九条 Tau2 的研究范围和 Expert 独立参考职责不变。
+现有验收基线为 Qwen3-0.6B＋FSDP＋SGLang 的执行、reconfigurator 应用、历史采集与两类 revision。
+下一步先接原生在线入口的按需训练，顺序见下节；原生 SWE／Tau2 的完整 workflow 适配另行推进。 九条 Tau2 的研究范围和 Expert 独立参考职责不变。
 
 执行统一为 `PPOTrainer → OnDemandActor`；删除旧串行训练器、Rollout 包装和小模型 fixture 入口。 共享
 checkpoint、队列、在线 inbox 与进程所有权移入 `areal/elastic/state/`。
 
-- AReaL 的 `PolicyAdapter` 统一接默认超时／实测 Basic；AutoPilot 的 `RevisionAdapter` 接修订和独立验收后的
-  bundle；默认 Monitor 统一提供观测、历史和测量恢复，旧串行 bundle 拒绝部署到原生 scope。
+- AReaL 的 `ReconfiguratorAdapter` 统一接默认超时／实测 Basic；AutoPilot 的 `RevisionAdapter`
+  接修订和独立验收后的 bundle；默认 Monitor 统一提供观测、历史和测量恢复，旧串行 bundle 拒绝部署到原生 scope。
 - `ConfigApplication` 保留 CAS、持久意图／回执和恢复；原生 executor 只接受相同固定布局，独立拓扑调整待实现。
 - 2026-10-24：Runtime新增[显式纯FSDP Actor DP及资源切换](../../areal/elastic/RECONFIGURATION.md)，支持受控重建Rollout副本与并集内GPU转移；CPU正常路径已验证，GPU闭环待验收。上述AutoPilot
   executor仍保持固定布局。
@@ -249,7 +237,7 @@ Actor 代次存活；复用 elastic 机制，不直接套用严格串行的 `Ela
 - 发布：controller 检查成功状态及所有目标副本的版本，再恢复生成。 部分更新失败时隔离受影响副本，用已提交完整权重修复，确认一致后再恢复服务。
 - 调度与收益：首轮只在已分配 GPU 池内释放／唤起，跨作业租约与 Slurm 资源归还另验。 使用 batch readiness 与 idle
   timeout，记录启停／恢复／发布耗时、两侧 GPU·h、队列等待与服务延迟； 与常驻 Actor 在相同输入和训练语义下比较，收益尚未确认。异步执行接
-  policy／revision 前需重新验证模型及执行契约。
+  reconfigurator／revision 前需重新验证模型及执行契约。
 
 用户已授权实现期间使用 8×H20。以下为验收任务定义；实际配置、失败记录与结果见 `PROGRESS.md` 链接的 GPU
 证据。运行前核对现有作业、模型／环境与布局支持，只操作本轮自有资源。
@@ -296,19 +284,19 @@ CPU 测试扩展现有 trainer、queue、recovery、inference 和 weight-update 
 
 ```text
 areal/trainer/rl_trainer.py             # 唯一 PPO 执行与每轮工作顺序
-areal/elastic/runtime.py               # Actor 生命周期、发布、保存与恢复
+areal/elastic/infra/runtime.py               # Actor 生命周期、发布、保存与恢复
 areal/elastic/{state,control,monitor}/   # 持久状态、控制事务与运行观测／实测
 areal/v2/training_service/{checkpoint,runtime_state}.py # 原生状态读写与各 rank LR／RNG
 areal/elastic/simulation/               # 共用事件内核与online条件模拟
-areal/elastic/policy/basic/             # Basic 模型／simulator／optimizer
-areal/elastic/policy/reference/         # 独立 Expert 对照
+areal/elastic/reconfigurator/basic/             # Basic 模型／simulator／optimizer
+areal/elastic/reconfigurator/reference/         # 独立 Expert 对照
 areal/autopilot/revision/               # 通用 proposal／评测编排／接受／store
 areal/autopilot/domains/elastic/        # Elastic evaluator、worker、bundle 与 native bridge
 ```
 
-暂不添加 benchmark、Tau2 实验入口、合成场景或新测试文件；扩展既有测试。 Expert 不含 optimizer、不实现调度策略；实验中冻结，Basic
-不依赖其实现。 详细接口与限制见
-[执行文档](elastic/README.md)、[Basic](../../areal/elastic/policy/basic/README.md) 和
+暂不添加 benchmark、Tau2 实验入口、合成场景或新测试文件；扩展既有测试。Evaluator 负责候选预测，搜索由所在版本的 optimizer 负责；Basic
+使用自己的 JointSimulator。详细接口与限制见
+[执行文档](elastic/README.md)、[Basic](../../areal/elastic/reconfigurator/basic/README.md) 和
 [revision](../../areal/autopilot/revision/README.md)。
 
 ## 代码入口与复核
@@ -317,7 +305,7 @@ areal/autopilot/domains/elastic/        # Elastic evaluator、worker、bundle �
 
 ```bash
 python tests/run_autopilot_cpu.py -q \
-  tests/test_elastic_basic_policy.py tests/test_elastic_lifecycle_optimizer.py \
+  tests/test_elastic_basic_reconfigurator.py tests/test_elastic_prediction_separation.py \
   tests/test_autopilot_actor_cost.py tests/test_autopilot_revision.py
 ```
 

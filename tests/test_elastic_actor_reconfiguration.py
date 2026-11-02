@@ -3,6 +3,7 @@
 """CPU coordinator acceptance; fake Actors do not establish tensor resharding."""
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -12,7 +13,11 @@ from tests.test_elastic_checkpoint import (
     native_lifecycle,  # noqa: F401 -- shared protocol fixture
 )
 
-from areal.elastic.control.actor_reconfiguration import poll_request, submit_request
+from areal.elastic.infra.reconfiguration import (
+    ExecutionLayout,
+    poll_request,
+    submit_request,
+)
 
 pytestmark = pytest.mark.usefixtures("native_lifecycle")
 
@@ -24,6 +29,179 @@ def update(manager, first):
     _complete_native_update(manager, manager.applied_version + 1)
 
 
+@pytest.mark.parametrize("suspend_before_rollout", [False, True])
+@pytest.mark.parametrize("native_lifecycle", [(2, 4)], indirect=True)
+def test_one_journal_plans_only_changed_engines_and_continues_training(
+    request, suspend_before_rollout
+):
+    """Actor-only, Rollout-only, joint and unchanged layouts use the same executor."""
+    from unittest.mock import MagicMock
+
+    fixture = request.getfixturevalue("native_lifecycle")
+    manager, rollout, events = fixture.manager, fixture.rollout, fixture.events
+    manager._actor_pool_setter = MagicMock(
+        side_effect=lambda devices: events.append("placement")
+    )
+    rollout.resource_reconfiguration_enabled = True
+    rollout.drain_model_calls = MagicMock(side_effect=lambda: events.append("drain"))
+    rollout.open_model_calls = MagicMock(side_effect=lambda: events.append("open"))
+    rollout.stop_inference_replicas = MagicMock(
+        side_effect=lambda: events.append("stop-rollout")
+    )
+    rollout.rebuild_inference_replicas = MagicMock(
+        side_effect=lambda devices, **kwargs: events.append("start-rollout")
+    )
+    update(manager, 0)
+
+    target = ExecutionLayout(2, (0, 1), (4,))
+    actor = manager.actor
+    journal = manager.reconfiguration_application.root / "state.json"
+    before, history = journal.read_bytes(), list(events)
+    plan = manager.plan_reconfiguration(target)
+    assert (
+        journal.read_bytes() == before and events == history and manager.actor is actor
+    )
+    first = manager.reconfigure(
+        target=target,
+        request_id="actor-only",
+        expected_generation=0,
+        expected_weights_version=1,
+    )
+    assert manager.actor is not actor and manager.actor.updates == 1
+    assert first["plan"]["steps"] == list(plan.steps)
+    assert not plan.rebuilds_rollout
+    rollout.stop_inference_replicas.assert_not_called()
+    rollout.drain_model_calls.assert_not_called()
+    assert not (manager.root / "actor-reconfiguration").exists()
+    update(manager, 4)
+
+    if suspend_before_rollout:
+        manager.save_checkpoint(reason="release")
+        manager._release()
+    actor, owner = manager.actor, manager.owner
+    target = ExecutionLayout(2, (0, 1), (2, 3, 4))
+    events.clear()
+    cursor = manager.consumer.cursor.copy()
+    second = manager.reconfigure(
+        target=target,
+        request_id="rollout-only",
+        expected_generation=1,
+        expected_weights_version=2,
+    )
+    assert manager.consumer.cursor == cursor and manager.actor.updates == 2
+    assert second["generation"] == 2
+    if actor is not None:
+        assert manager.actor is actor and manager.owner == owner
+        actor.disconnect_engine.assert_called_once_with()
+        actor.destroy.assert_not_called()
+        assert events.index("disconnect-weights") < events.index("stop-rollout")
+    else:
+        assert "restore_actor" in second["plan"]["steps"]
+    assert (
+        events.index("stop-rollout")
+        < events.index("start-rollout")
+        < events.index("publish-2")
+        < events.index("open")
+    )
+    update(manager, 8)
+
+    events.clear()
+    target = ExecutionLayout(4, (0, 1, 2, 3), (4,))
+    third = manager.reconfigure(
+        target=target,
+        request_id="both",
+        expected_generation=2,
+        expected_weights_version=3,
+    )
+    assert third["generation"] == 3 and manager.actor.updates == 3
+    assert (
+        events.index("release")
+        < events.index("stop-rollout")
+        < events.index("placement")
+        < events.index("start-rollout")
+    )
+    assert manager.actor.restore_plan["source_world_size"] == 2
+    assert manager.actor.restore_plan["target_world_size"] == 4
+    actor, history = manager.actor, list(events)
+    assert (
+        manager.reconfigure(
+            target=target,
+            request_id="both",
+            expected_generation=2,
+            expected_weights_version=3,
+        )
+        == third
+    )
+    unchanged = manager.reconfigure(
+        target=target,
+        request_id="unchanged",
+        expected_generation=3,
+        expected_weights_version=3,
+    )
+    assert unchanged["status"] == "unchanged" and unchanged["plan"]["steps"] == []
+    assert manager.actor is actor and events == history
+    update(manager, 12)
+    assert manager.data_progress["samples"] == 16
+
+
+@pytest.mark.parametrize("native_lifecycle", [(2, 4)], indirect=True)
+def test_dp_journal_import_preserves_generation_receipts_and_source_file(request):
+    """A completed DP-only run resumes through the single full-layout journal."""
+    from areal.utils.atomic import atomic_json, json_digest
+
+    fixture = request.getfixturevalue("native_lifecycle")
+    manager = fixture.manager
+    update(manager, 0)
+    manager.reconfigure(
+        target=replace(manager.execution_layout, world_size=4),
+        request_id="grow",
+        expected_generation=0,
+        expected_weights_version=1,
+    )
+    state = manager.reconfiguration_application.state()
+    manager._release()
+    manager._checkpoint_dirty = False
+    manager.close()
+    state["config"] = {"world_size": 4}
+    state["context_id"] = json_digest(
+        {
+            "scope": "native-fsdp-dp-v1",
+            "run": manager.identity,
+            "queue": manager.inbox.queue.queue_id,
+            "actor_gpu_pool": list(manager.options.actor_devices),
+            "rollout_gpu_pool": list(manager.options.rollout_devices),
+        }
+    )
+    for receipt in state["receipts"].values():
+        receipt.pop("plan", None)
+        receipt["request"]["target"] = {
+            "world_size": receipt["request"]["target"]["world_size"]
+        }
+        receipt["actual"]["config"] = {
+            "world_size": receipt["actual"]["config"]["world_size"]
+        }
+    legacy = manager.root / "actor-reconfiguration/state.json"
+    legacy.parent.mkdir()
+    atomic_json(legacy, state)
+    original = legacy.read_bytes()
+    (manager.reconfiguration_application.root / "state.json").unlink()
+    restored = fixture.create()
+    try:
+        assert restored.actor_world_size == 4
+        assert restored.reconfiguration_application.state()["generation"] == 1
+        restored.ensure_actor()
+        restored.reconfigure(
+            target=replace(restored.execution_layout, world_size=2),
+            request_id="shrink",
+            expected_generation=1,
+            expected_weights_version=1,
+        )
+        assert restored.reconfiguration_application.state()["generation"] == 2
+        assert legacy.read_bytes() == original
+    finally:
+        restored.close()
+
+
 @pytest.mark.parametrize("native_lifecycle", [(2, 4)], indirect=True)
 def test_actor_dp_roundtrip_preserves_cursor_and_continues_updates(request):
     """2→4→2 changes GPU generation only, retaining the same run and inbox."""
@@ -33,9 +211,9 @@ def test_actor_dp_roundtrip_preserves_cursor_and_continues_updates(request):
     update(manager, 0)
     cursor = manager.consumer.cursor.copy()
     serving = fixture.rollout
-    old_measurement = manager.policy_adapter.execution_id
-    first = manager.reconfigure_actor(
-        world_size=4,
+    old_measurement = manager.reconfigurator_adapter.execution_id
+    first = manager.reconfigure(
+        target=replace(manager.execution_layout, world_size=4),
         request_id="grow",
         expected_generation=0,
         expected_weights_version=1,
@@ -51,13 +229,13 @@ def test_actor_dp_roundtrip_preserves_cursor_and_continues_updates(request):
     assert manager.actor.config.backend == "fsdp:d4"
     assert manager.config.actor.backend == "fsdp:d2"
     assert manager.allocation.parallel.world_size == 4
-    assert manager.policy_adapter.profile["native_actor_world_size"] == 4
-    assert manager.policy_adapter.execution_id != old_measurement
+    assert manager.reconfigurator_adapter.profile["native_actor_world_size"] == 4
+    assert manager.reconfigurator_adapter.execution_id != old_measurement
     assert manager.rollout is serving
     assert fixture.events.index("release") < fixture.events.index("load-1")
     assert (
-        manager.reconfigure_actor(
-            world_size=4,
+        manager.reconfigure(
+            target=replace(manager.execution_layout, world_size=4),
             request_id="grow",
             expected_generation=0,
             expected_weights_version=1,
@@ -65,8 +243,8 @@ def test_actor_dp_roundtrip_preserves_cursor_and_continues_updates(request):
         == first
     )
     update(manager, 4)
-    second = manager.reconfigure_actor(
-        world_size=2,
+    second = manager.reconfigure(
+        target=replace(manager.execution_layout, world_size=2),
         request_id="shrink",
         expected_generation=1,
         expected_weights_version=2,
@@ -98,8 +276,8 @@ def test_committed_target_restarts_while_checkpoint_still_has_source_layout(
     fixture = request.getfixturevalue("native_lifecycle")
     manager = fixture.manager
     update(manager, 0)
-    manager.reconfigure_actor(
-        world_size=4,
+    manager.reconfigure(
+        target=replace(manager.execution_layout, world_size=4),
         request_id="grow",
         expected_generation=0,
         expected_weights_version=1,
@@ -143,7 +321,7 @@ def test_manual_mailbox_changes_dp_at_completed_update(request):
     update(manager, 0)
     path = submit_request(
         manager.root,
-        world_size=4,
+        target=replace(manager.execution_layout, world_size=4),
         request_id="manual-grow",
         expected_generation=0,
         expected_weights_version=1,
@@ -158,11 +336,11 @@ def test_manual_mailbox_changes_dp_at_completed_update(request):
 
 
 @pytest.mark.parametrize("native_lifecycle", [(2, 4)], indirect=True)
-def test_resource_layout_roundtrip_preserves_cpu_service_and_progress(request):
+def test_execution_layout_roundtrip_preserves_cpu_service_and_progress(request):
     from unittest.mock import MagicMock
 
-    from areal.elastic.control.resource_reconfiguration import (
-        ResourceLayout,
+    from areal.elastic.infra.reconfiguration import (
+        ExecutionLayout,
         poll_request,
         submit_request,
     )
@@ -188,18 +366,19 @@ def test_resource_layout_roundtrip_preserves_cpu_service_and_progress(request):
     )
     update(manager, 0)
     original_identity = manager.identity
-    source = manager.resource_layout
+    source = manager.execution_layout
     cursor = manager.consumer.cursor.copy()
-    # Legacy Actor receipt becomes read-only when complete layouts take authority.
-    manager.reconfigure_actor(
-        world_size=2,
+    # Unchanged and changed layouts share one request journal.
+    manager.reconfigure(
+        target=replace(manager.execution_layout, world_size=2),
         request_id="legacy",
         expected_generation=0,
         expected_weights_version=1,
     )
-    legacy_bytes = (manager.root / "actor-reconfiguration/state.json").read_bytes()
+    unchanged = manager.reconfiguration_application.state()["receipts"]["legacy"]
+    assert unchanged["status"] == "unchanged"
     events.clear()
-    target = ResourceLayout(1, (0,), (1, 2, 3, 4))
+    target = ExecutionLayout(1, (0,), (1, 2, 3, 4))
     submit_request(
         manager.root,
         target=target,
@@ -212,7 +391,7 @@ def test_resource_layout_roundtrip_preserves_cpu_service_and_progress(request):
         (manager.root / "resource-reconfiguration/response.json").read_text()
     )["receipt"]
     assert first["status"] == "applied" and first["generation"] == 1
-    assert manager.resource_layout == target
+    assert manager.execution_layout == target
     assert manager.actor_world_size == 1 and manager.actor.updates == 1
     assert manager.consumer.cursor == cursor and manager.rollout is rollout
     assert (
@@ -226,7 +405,7 @@ def test_resource_layout_roundtrip_preserves_cpu_service_and_progress(request):
         < events.index("open")
     )
     assert (
-        manager.reconfigure_resources(
+        manager.reconfigure(
             target=target,
             request_id="more-rollout",
             expected_generation=0,
@@ -262,23 +441,27 @@ def test_resource_layout_roundtrip_preserves_cpu_service_and_progress(request):
     assert placement["format_version"] == 2
     assert placement["reservation"] == [0, 1, 2, 3, 4]
     assert placement["gpu_pool"] == [0] and placement["rollout_devices"] == [1, 2, 3, 4]
-    assert manager.policy_adapter.profile["inference_gpus"] == 4
+    assert manager.reconfigurator_adapter.placements.current().rollout_replicas == 4
     assert (
-        manager.root / "actor-reconfiguration/state.json"
-    ).read_bytes() == legacy_bytes
+        manager.reconfigurator_adapter.placements.current()
+        in manager.reconfigurator_adapter.reconfigurator.candidates
+    )
+    assert (
+        manager.reconfiguration_application.state()["receipts"]["legacy"] == unchanged
+    )
     # Restart selects the authoritative target lease BEFORE the first Actor.
     manager.close()
     restored = fixture.create(actor_pool_setter=setter)
     try:
         restored.ensure_actor()
-        assert restored.resource_layout == target and restored.actor.updates == 2
-        restored.reconfigure_resources(
+        assert restored.execution_layout == target and restored.actor.updates == 2
+        restored.reconfigure(
             target=source,
             request_id="more-actor",
             expected_generation=1,
             expected_weights_version=2,
         )
-        assert restored.resource_layout == source
+        assert restored.execution_layout == source
         assert restored.actor.restore_plan["target_world_size"] == 2
         assert restored.identity == original_identity
         assert restored.consumer.cursor["applied_batches"] == 2
@@ -292,7 +475,7 @@ def test_resource_layout_roundtrip_preserves_cpu_service_and_progress(request):
 def test_resource_device_movement_same_dp_uses_rank_state(request):
     from unittest.mock import MagicMock
 
-    from areal.elastic.control.resource_reconfiguration import ResourceLayout
+    from areal.elastic.infra.reconfiguration import ExecutionLayout
 
     fixture = request.getfixturevalue("native_lifecycle")
     manager = fixture.manager
@@ -306,8 +489,8 @@ def test_resource_device_movement_same_dp_uses_rank_state(request):
     ):
         setattr(fixture.rollout, method, MagicMock())
     update(manager, 0)
-    manager.reconfigure_resources(
-        target=ResourceLayout(2, (3, 4), (0, 1, 2)),
+    manager.reconfigure(
+        target=ExecutionLayout(2, (3, 4), (0, 1, 2)),
         request_id="move",
         expected_generation=0,
         expected_weights_version=1,
@@ -315,241 +498,3 @@ def test_resource_device_movement_same_dp_uses_rank_state(request):
     assert manager.actor.restore_plan is None
     assert manager.actor.updates == manager.applied_version == 1
     assert manager.gpu_uuids == ["GPU-3", "GPU-4"]
-
-
-@pytest.mark.parametrize("native_lifecycle", [(4, 4)], indirect=True)
-def test_native_joint_planner_synthetic_trace_roundtrip(request, tmp_path):
-    """Real optimizer/SQLite/native transactions; synthetic costs and GPU workers."""
-    from dataclasses import asdict, replace
-    from unittest.mock import MagicMock
-
-    from tests.test_elastic_lifecycle_optimizer import joint_simulator
-
-    from areal.elastic.contracts import BatchWorkload, TrainingConfig, WorkloadStats
-    from areal.elastic.control.resource_reconfiguration import ResourceLayout
-    from areal.elastic.policy.basic import (
-        JointBatch,
-        JointConfig,
-        JointOptimizer,
-        JointPolicy,
-        JointScenario,
-        RolloutConfig,
-        RolloutStage,
-        RolloutWorkload,
-    )
-    from areal.elastic.policy.basic.actor_cost import ActorPrediction
-    from areal.elastic.policy.native_joint import JointPlacement, NativeJointPlanner
-    from areal.utils.atomic import atomic_json
-
-    fixture = request.getfixturevalue("native_lifecycle")
-    manager = fixture.manager
-    manager._actor_pool_setter = MagicMock()
-    fixture.rollout.resource_reconfiguration_enabled = True
-    for method in (
-        "drain_model_calls",
-        "open_model_calls",
-        "stop_inference_replicas",
-        "rebuild_inference_replicas",
-    ):
-        setattr(fixture.rollout, method, MagicMock())
-
-    placements = tuple(
-        JointPlacement(
-            JointConfig(
-                TrainingConfig(actor),
-                RolloutConfig(
-                    "synthetic-model",
-                    "synthetic-gpu",
-                    "synthetic-runtime",
-                    "fixed-sampling",
-                    5 - actor,
-                    1,
-                    8,
-                    32768,
-                    32768,
-                    3,
-                ),
-            ),
-            ResourceLayout(actor, tuple(range(actor)), tuple(range(actor, 5))),
-        )
-        for actor in (4, 2, 3)
-    )
-    configs = tuple(p.config for p in placements)
-    simulator = joint_simulator(configs, switch=2, publish=0.1, checkpoint=0.2)
-    simulator.rollout = replace(
-        simulator.rollout,
-        profiles=tuple(
-            replace(
-                p,
-                prefill_tokens_per_second=100000,
-                max_tokens=100000,
-                max_request_tokens=32768,
-            )
-            for p in simulator.rollout.profiles
-        ),
-    )
-
-    class SyntheticActor:
-        def actor_config(self, config):
-            return config
-
-        def predict(self, config, stats):
-            return ActorPrediction(
-                (("train_step", stats.sequence_tokens / (100 * config.world_size)),),
-                False,
-                ("Synthetic linear Actor throughput; not measured",),
-            )
-
-    simulator.actors = SyntheticActor()
-    trace = []
-
-    def forecast(owner):
-        # Each of four episodes has two sequential requests separated by a tool.
-        # These future lengths/outcomes are synthetic inputs, not online facts.
-        heavy = owner.applied_version < 3
-        prefill, decode, tool = (16, 600, 5) if heavy else (4000, 1, 20)
-        prompts = (prefill, prefill + decode + 16)
-        lengths = tuple(p + decode for _ in range(4) for p in prompts)
-        stats = WorkloadStats(
-            8,
-            sum(lengths),
-            loss_tokens=8 * decode,
-            sequence_lengths=lengths,
-            trajectory_group_sizes=(2,) * 4,
-        )
-        batch = JointBatch(
-            BatchWorkload(4, 8 * decode, sum(lengths), actor_stats=stats),
-            RolloutWorkload(
-                tuple(
-                    RolloutStage(4 * p, 4 * decode, tool if i == 0 else 0, 4)
-                    for i, p in enumerate(prompts)
-                ),
-                8,
-                max(lengths),
-            ),
-            4,
-        )
-        current = next(
-            p.config for p in placements if p.layout == owner.resource_layout
-        )
-        scenario = JointScenario(
-            (batch,),
-            current,
-            1,
-            owner.inbox.max_staleness,
-            4,
-            4,
-            5,
-            provider_version=owner.applied_version,
-            accepted_batches=owner.applied_version,
-            checkpoint_every=1,
-        )
-        trace.append(
-            {
-                "observed_version": owner.applied_version,
-                "episodes": [
-                    {
-                        "episode_id": f"synthetic-{owner.applied_version}-{i}",
-                        "requests": [
-                            {
-                                "prefill_tokens": p,
-                                "decode_tokens": decode,
-                                "tool_after_seconds": tool if j == 0 else 0,
-                            }
-                            for j, p in enumerate(prompts)
-                        ],
-                    }
-                    for i in range(4)
-                ],
-                "scenario": asdict(scenario),
-            }
-        )
-        return scenario
-
-    planner = NativeJointPlanner(
-        JointPolicy(simulator, JointOptimizer(configs)),
-        placements,
-        model_id="synthetic-linear-v1",
-        forecast_source="handcrafted-two-turn-trace-v1",
-        forecast=forecast,
-    )
-    manager.resource_planner = planner
-    # A real native protocol update is needed before any topology change.
-    update(manager, 0)
-    decisions = []
-    identity = manager.identity
-    for index, (status, actor, rollout) in enumerate(
-        (("applied", 2, 3), ("unchanged", 2, 3), ("applied", 4, 1))
-    ):
-        cursor = manager.consumer.cursor.copy()
-        progress = manager.data_progress.copy()
-        assert manager._poll_batch() is None
-        decision = planner.last_result
-        decisions.append(decision)
-        assert decision["status"] == status
-        assert manager.resource_layout.world_size == actor
-        assert len(manager.resource_layout.rollout_devices) == rollout
-        assert manager.consumer.cursor == cursor and manager.data_progress == progress
-        assert manager.inbox.status()["admission_open"]
-        assert len(decision["excluded"]) == 1  # DP3 cannot divide batch4.
-        assert decision["search"]["unevaluated"] == 0
-        if status == "applied":
-            receipt = decision["receipt"]
-            assert receipt["request"]["policy_bundle_id"].startswith("native-joint-")
-            assert receipt["actual"]["weights_version"] == index + 1
-        # Repeated polling at the same version must not rerun the provider/search.
-        assert manager._poll_batch() is None and len(trace) == index + 1
-        update(manager, (index + 1) * 4)
-        assert manager.applied_version == index + 2
-    assert manager.identity == identity
-    assert manager.consumer.cursor["applied_batches"] == 4
-    assert manager.data_progress == {"samples": 16, "effective_tokens": 32}
-    assert manager.resource_config_application.state()["generation"] == 2
-    fixture.rollout.stop_inference_replicas.assert_called()
-    assert fixture.rollout.stop_inference_replicas.call_count == 2
-    atomic_json(
-        tmp_path / "synthetic-trace.json",
-        {
-            "evidence": "synthetic forecasts and GPU workers; real CPU control protocol",
-            "trace": trace,
-            "decisions": decisions,
-            "final": {
-                "updates": manager.applied_version,
-                "cursor": manager.consumer.cursor,
-                "data_progress": manager.data_progress,
-                "config_generation": 2,
-            },
-        },
-    )
-
-
-@pytest.mark.parametrize("native_lifecycle", [(4, 4)], indirect=True)
-def test_native_joint_boundary_allows_arriving_training_work(request):
-    """Healthy incoming episodes finish admission before the planning fence."""
-    from unittest.mock import MagicMock
-
-    from areal.elastic.policy.native_joint import NativeJointPlanner
-
-    fixture = request.getfixturevalue("native_lifecycle")
-    manager = fixture.manager
-    manager._actor_pool_setter = MagicMock()
-    fixture.rollout.resource_reconfiguration_enabled = True
-    update(manager, 0)
-
-    def arriving_calls():
-        assert manager.inbox.status()["admission_open"]
-        _ready_native_episodes(manager, 4, manager.applied_version)
-
-    fixture.rollout.drain_model_calls = MagicMock(side_effect=arriving_calls)
-    fixture.rollout.open_model_calls = MagicMock()
-    with manager.control_operation():
-        with NativeJointPlanner._quiet_boundary(manager) as quiet:
-            assert not quiet
-            assert manager.inbox.status()["admission_open"]
-            assert manager.inbox.status()["active_credits"] == 4
-    fixture.rollout.open_model_calls.assert_called_once()
-    manager.next_batch()
-    manager.actor.updates += 1
-    _complete_native_update(manager, 2)
-    assert manager.consumer.cursor["applied_batches"] == 2
-    assert manager.data_progress["samples"] == 8

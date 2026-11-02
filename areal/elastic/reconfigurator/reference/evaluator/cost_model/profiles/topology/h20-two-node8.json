@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "kind": "topology",
+  "id": "h20-two-node8",
+  "version": "1",
+  "values": {
+    "hardware_profile": "h20",
+    "hardware": {
+      "name": "H20-node8-component-calibration-prior",
+      "intra_node_gbps": 450,
+      "inter_node_gbps": 1,
+      "gpus_per_node": 8,
+      "intra_latency_us": 3,
+      "inter_latency_us": 12
+    },
+    "group_gbps": [],
+    "nodes": {
+      "node0": [
+        "node0/gpu0",
+        "node0/gpu1",
+        "node0/gpu2",
+        "node0/gpu3",
+        "node0/gpu4",
+        "node0/gpu5",
+        "node0/gpu6",
+        "node0/gpu7"
+      ],
+      "node1": [
+        "node1/gpu0",
+        "node1/gpu1",
+        "node1/gpu2",
+        "node1/gpu3",
+        "node1/gpu4",
+        "node1/gpu5",
+        "node1/gpu6",
+        "node1/gpu7"
+      ]
+    }
+  },
+  "provenance": {
+    "evidence": "assumed",
+    "scope": "Two logical H20 nodes with eight GPUs each, composed from component observations. Role calibration limits are recorded in execution profiles; this is not a physical joint-run observation.",
+    "network": "450GB/s intra-node one-direction peak prior, not effective measured bandwidth. Required positive inter_node_gbps=1 is an unused placeholder; no off-node parallel groups allowed.",
+    "transitions": "Publication, restore, rebuild, optimizer redistribution and interference require separate explicit transition profiles; missing costs remain unsupported."
+  }
+}

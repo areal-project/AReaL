@@ -1,187 +1,68 @@
-# Elastic training with AReaL v2.1.0
+# Elastic training and Online reconfiguration
 
-The execution entry is native `PPOTrainer`. With `actor_lifecycle.mode=on_demand`,
-Rollout and CPU data services survive Actor worker release and restart. PPO computation,
-checkpointing and publication stay in the native trainer. Current verification and GPU
-blockers: [PROGRESS](../../../PROGRESS.md); research scope: [plan](../PLAN.md).
+训练使用原生 `PPOTrainer / OnDemandActor`。`areal/elastic` 提供执行、观测、Reconfigurator 和 CPU
+模拟；AutoPilot 提供通用 revision 和 Elastic 领域的评测／激活。
 
-The former serial `ElasticLoop`, `QueuedTrainer`, `TrainGroup`, fixture engines and SWE
-runner have been removed. Their durable state mechanisms are shared under
-`areal/elastic/state` and `control`; raw history and models also belong to AReaL.
-AutoPilot provides generic revision plus an Elastic adapter. Historical
-[M1](../../../../artifacts/repository-archive-20261021/files/examples/autopilot/elastic/milestones/m1/README.md)
-and
-[M2](../../../../artifacts/repository-archive-20261021/files/examples/autopilot/elastic/milestones/m2/README.md)
-records describe the retired executor, not GPU acceptance of the current path.
-
-## Policy and revision loops
+## Reconfiguration and revision loops
 
 ```text
-Agent Service → resident Rollout → durable episode inbox → complete eligible batch
-  → PPOTrainer / OnDemandActor → native PPO update → weight publication + acknowledgement
-  → periodic checkpoint → evaluation / cleanup / resume → release decision / next batch
-  → if releasing: latest full checkpoint + cursor → destroy Actor workers
-                         ↑                         ↓
-              PolicyAdapter ← ElasticMonitor → completed-update RuntimeHistory
-                         ↑                              ↓
-              RevisionAdapter ← frozen measured window
-                         ↑                         ↓
-                 accepted bundle ← model gate → frozen model → optimizer gate
+任务 → Rollout → episode inbox → 完整 batch → 原生 PPO → 发布／保存
+                 ↓                                  ↓
+           OnlineObservation ← 已有状态／完成历史 ← 运行反馈
+                 ↓
+      basic 或 reference Reconfigurator
+      预测 → optimizer 搜索 → 复核 → 原生 reconfigure / 模拟交接
+
+已有测量 → 固定历史分区 → 模型 revision → 固定模型 → optimizer revision
+         → 接受的完整 bundle → 模拟 / 原生 adapter 加载
 ```
 
-AReaL's `elastic/policy/adapter.py::PolicyAdapter` assembles timeout or measured Basic
-and supplies the single runtime decision entry. AutoPilot's `RevisionAdapter` extends it
-with revision and accepted-bundle activation. AReaL's default `ElasticMonitor` supplies
-observations, phase measurements and causal history to both. Neither creates workers or
-performs PPO. The native executor retains batch, version, checkpoint, publication,
-minimum-residence and release safety checks.
+`basic` 为使用旧 JointSimulator 的 **Basic v1**；`reference` 是当前优化版，也是默认版本。两者都包含 optimizer、模型和
+Simulator。原生与模拟共用所选版本，分别提供观测和执行能力。
 
-On-demand always selects an Elastic policy. The default `actor_lifecycle.policy=basic`
-currently uses `IdleTimeoutPolicy`; the runtime has no separate idle-timeout rule. Full
-model-based Basic remains a later integration. `actor_lifecycle.policy=reference` is
-reserved and fails explicitly before services start until Reference scheduling exists.
+## 入口
 
-CPU条件模拟位于
-[areal/elastic/simulation](../../../areal/elastic/simulation/README.md)，独立于AutoPilot修订流程。
+- `simulate_online.py`：读取 workload、配置和冻结组件，运行 fixed／dynamic CPU
+  条件模拟；`--reconfigurator basic|reference` 显式选择版本。
+- `online-v1-example.json`：v1 基线配置；`online-v3-example.json`：当前示例配置。
+- `workload-*`、`WORKLOAD.md`：工作量与到达过程；`RESULTS_V3.md`：已保存的历史结果。
+- `../revising.py`：完整 Online 模型／optimizer 的代码修订入口。
+- `revision_demo.py`：显式闭式公式的 CPU 示例，供修订流程验证使用。
+- `../../hermes/train.py`：真实任务和原生 Trainer 接入。
 
-## Code map
+CPU 修订示例：
 
-| Responsibility                                                       | Current module                                            |
-| -------------------------------------------------------------------- | --------------------------------------------------------- |
-| Native PPO execution and per-update ordering                         | `areal/trainer/rl_trainer.py`                             |
-| Actor lifecycle, publication, save and recovery coordination         | `areal/elastic/runtime.py`                                |
-| Durable inbox, queue and checkpoint                                  | `areal/elastic/state/`                                    |
-| Full native checkpoint I/O and per-rank LR/RNG state                 | `areal/v2/training_service/{checkpoint,runtime_state}.py` |
-| Process ownership, native control and activation/config transactions | `areal/elastic/control/`                                  |
-| Runtime observations and measured history                            | `areal/elastic/monitor/`                                  |
-| Basic models, simulator and search                                   | `areal/elastic/policy/basic/`                             |
-| Independent optional Expert reference                                | `areal/elastic/policy/reference/`                         |
-| Generic proposal, evaluation orchestration, acceptance and store     | `areal/autopilot/revision/`                               |
-| Elastic evaluators, worker, bundle verification and native bridge    | `areal/autopilot/domains/elastic/`                        |
-| Real online application                                              | `examples/hermes/{train,hermes}.py`                       |
-
-In `control/`, `policy_hooks.py` defines optional revision polling/recovery callbacks,
-`policy_activation.py` manages policy activation, `config_application.py` manages
-configuration transactions and the fixed-layout executor, and `boundary.py` provides
-only the execution interface and snapshots. The runtime's boundary import does not load
-configuration transactions. Each executor decodes its schema; the control layer does not
-import Basic planning models.
-
-`monitor/collector.py::ElasticMonitor` is enabled for every on-demand run. It owns live
-observation assembly, batch workload extraction, phase collection, completed-token
-accounting and measurement recovery. `history.py` supplies bounded persistence;
-`trace.py` parses existing logs on demand. Policy decisions use an in-memory causal
-window; revision freezes completed records from the same store. Update records are
-published after `finish_update()` resumes Rollout. Recovery timings remain separate
-lifecycle events, and observation sequence numbers preserve history order on restart.
-
-## Run and policy integration
-
-Use the normal Hermes training entry with a verified local model, explicit disjoint GPU
-pools, sufficient checkpoint space and a new persistent `state_root`. Default lifecycle
-mode remains `resident`; on-demand requires v2 online mode and supported native
-backends. See [ActorLifecycleConfig](../../../areal/api/cli_args.py) for capability
-validation.
-
-The existing `examples/hermes/train.py` accepts `--elastic-policy` for AutoPilot
-activation/revision integration, `--elastic-profile path.json` for measured Basic,
-optional `--elastic-settings path.json` and `--elastic-bundle path.json` for accepted
-deployment. These flags require `actor_lifecycle.mode=on_demand`; normal config
-arguments continue to pass unchanged. Profile/settings alone select AReaL's ordinary
-`PolicyAdapter`. `--elastic-policy` or `--elastic-bundle` explicitly selects AutoPilot's
-`RevisionAdapter` and its activation transactions. With no flags, on-demand creates the
-ordinary adapter, uses Basic timeout and collects default Monitor history.
-
-A custom native entry can enable policy activation/revision without changing PPO:
-
-```python
-from areal import PPOTrainer
-from areal.autopilot.domains.elastic.native import RevisionAdapter
-
-adapter = RevisionAdapter()
-with PPOTrainer(config, elastic_policy=adapter) as trainer:
-    trainer.train()
+```bash
+python -m examples.autopilot.revising --demo --target model --output /tmp/online-model-revision
+python -m examples.autopilot.revising --demo --target optimizer --output /tmp/online-optimizer-revision
 ```
 
-A measured Basic run can use `areal.elastic.policy.adapter.PolicyAdapter` directly,
-supplying `profile=` and `settings={"horizon": 1}` without importing AutoPilot. This
-ordinary path uses the supplied measurements and the shared live Monitor history. The
-generated `native-profile.json` identifies measurement applicability: training/model,
-physical placement, tokenizer, sampling, CPU hooks and timing-relevant semantic source
-hashes. Comments, formatting and offline trace parsing do not affect it. Collect and
-audit measurements under that identity. Queue/checkpoint compatibility binds training
-recovery separately; accepted bundles retain exact protected-source verification.
-Ordinary checkpoints may carry optional `monitor-state.json`. Missing or incompatible
-measurement state starts a fresh history series while restoring valid model state and
-logical counts. An existing policy activation store still requires an activation-capable
-adapter on resume; its accepted proof is not bypassed. A revision root bound to an older
-history series must be replaced before revisions resume.
+非 demo 需提供 `--profile`、`--cases`，并通过 `--agent-command` 或 `--llm-model` 选择 proposer。模型
+profile 提供 `model_settings` 和 `primary_metrics`；cases 使用 `HistoricalCase`。Optimizer
+profile 提供 `assembly`、`model_source`、`model_settings`、可选 calibration cases；cases 使用
+`OnlineProblem`。具体 factory 和接受规则见
+[Elastic revision](../../../areal/autopilot/domains/elastic/README.md)。
 
-For bounded automatic revision, construct `RuntimeRevisionLoop` with the same profile,
-`settings=runtime.settings`, `scope="native-async-v1"`, `horizon=1` and matching
-`idle_seconds`, then attach it as `runtime.revision` before `trainer.train()`. Explicit
-proposal agents and durable window/round budgets are required; see the
-[Elastic revision contract](../../../areal/autopilot/domains/elastic/README.md).
+## 原生接入
 
-Accepted bundles can be preloaded with `RevisionAdapter(bundle=path)`, or prepared and
-applied with `PolicyRequest` at a completed, fully published boundary. Both components
-are independently evaluated; loading checks scope, source/proof hashes, execution
-identity, settings and idle timeout. An uncertain activation closes admission until
-recovery follows the durable pointer. History survives policy replacement.
+Hermes 入口支持 `--elastic-profile`／`--elastic-settings` 装配普通 `ReconfiguratorAdapter`，支持
+`--elastic-revision`／`--elastic-bundle` 显式接入 `RevisionAdapter`；其余训练配置参数继续传给原入口。普通
+adapter 不导入 AutoPilot。
 
-## Behavior and boundaries
+Native profile 可提供所选版本的 `reconfigurator`、`replay` 或
+`forecast`、`slo`、`model`、`run`、`handoff`。模型字段引用冻结 bundle、mechanism fits 和 publication
+metadata。旧的 phase-only `measurements` profile 不再用于 Online 决策。原生调用仍以真实
+batch／staleness、GPU 预留和执行器能力为准。Native 使用 `handoff.mode="cold"` 与显式 `phase_seconds`；当前仅支持
+FSDP DP／SGLang TP1 的动态调整。
 
-- One fixed Actor layout and one fixed Rollout placement per run. Native configuration
-  transactions accept the identical configuration only; topology changes fail before
-  mutation. Serial joint models and accepted bundles remain offline references.
-- A complete eligible batch wakes Actor; no predictive prewarm. Default release requires
-  idle ≥60s and residence ≥120s, no active update and confirmed published weights. Basic
-  owns the idle timeout; runtime enforces minimum residence and execution safety. Zero
-  idle timeout requests release immediately once those constraints allow it. Production
-  starting point: B=4, S=2; lifecycle smoke: S=0, idle=5s, residence=0.
-- Weight publication precedes HF saving and periodic recovery checkpoints. HF saving
-  follows `saver.freq_*`; full recovery saving follows `recover.mode` and
-  `recover.freq_*`. Evaluation, cleanup and logging finish before serving resumes or
-  release is considered. Planned idle release and clean shutdown save the latest full
-  state regardless of periodic recovery being disabled. A snapshot from before the
-  end-of-update CPU hooks is refreshed before release.
-- Runtime and control snapshots expose `applied_version`, `published_version` and
-  `checkpoint_version`. `publish_update()` advances live PPO/publication progress;
-  checkpoint saving is separate. `OnlineInbox.status()` reports the durable cursor as
-  `checkpoint_version`. The shared planning schema keeps its legacy `committed` and
-  `committed_*` work counters; these describe completed/published work, not durability.
-  SQLite and the shared planning schema remain unchanged. Runtime logical counts are
-  saved as `data_progress` with the strict full-state checkpoint; legacy counts are
-  rebuilt from the validated queue prefix. Optional `monitor-state.json` is written
-  after that commit; `monitor-pending.json` supplements pending timings, and completed
-  same-version snapshots supersede old sidecars. Histories are isolated under
-  `monitor/<measurement_id>/<series_id>/`. Metric I/O/schema failures fall back to Basic
-  timeout and pause revision until recovery reopens measurements. They do not roll back
-  successful PPO updates or prevent full-state release saving. Critical checkpoint and
-  queue failures remain strict.
-- Applied, published and durable-checkpoint versions may differ. Fault recovery pauses
-  serving, restores the last full checkpoint (or pinned base), reconciles serving
-  weights and replays unsaved batches through native PPO. Unsealed episodes from the
-  abandoned branch are explicitly rejected. Payloads survive publication until
-  checkpoint recovery; unknown owners or communication outcomes remain fenced.
-- Native phase measurements include actual CPU hooks and distinguish release boundaries
-  from committed updates. Missing phase durations remain unknown. Fixed-layout, one-step
-  prediction and revision do not establish asynchronous makespan, GPU-hour savings,
-  cross-layout accuracy or training quality.
-- CPU tests exercise real durable stores and protocol logic with fake workers/model
-  endpoints. Actual FSDP/Megatron restore, Agent Service → GSM8K → Hermes training,
-  asynchronous overlap and resource cleanup still require GPU acceptance.
+接受后的 bundle 通过模拟侧的 `load_bundle()` 或原生 `RevisionAdapter(bundle=...)` 加载。CPU 实验将其模型传入
+`prediction_models`，保持外层执行成本模型固定。原生预加载、探测后在已发布、无活动更新的边界激活，保留训练进度和已有观测。后台
+`RuntimeRevisionLoop` 由调用方提供 `problem_builder`，明确从已有完成历史构造 calibration／validation 和
+Online 搜索输入。
 
-## Archived development tools
+当前原生真实 TTFT／最大 TBT 采集另列待办，本轮不改推理通路。模拟保留显式 hot／cold，原生使用 cold；阶段耗时由输入提供。校准迁移副本保持原系数。CPU
+结果不代替 GPU 验收。
 
-Offline CLIs, the R10 experiment driver, conditional replay helpers and their dedicated
-validation cases are in the
-[local development archive](../../../../artifacts/elastic-policy-development-20261021/README.md).
-The source package retains numerical models, simulators, optimizers, built-in profiles
-and required test inputs. Existing-log parsing is under
-`areal/elastic/monitor/trace.py`.
-
-External-catalog tests still use `AREAL_TEST_EXPERT_CATALOG`; the explicit catalog must
-have audited source/NumPy compatibility. Historical replay evidence remains distinct
-from native GPU acceptance. Original observations and methods are preserved in the
-[original archive](../../../../artifacts/repository-archive-20261021/README.md).
+[实现](../../../areal/elastic/README.md) ·
+[调整调用树](../../../areal/elastic/RECONFIGURATION.md) · [项目进度](../../../PROGRESS.md) ·
+[GPU 验收准备](../../task_workflows/RECONFIGURATION_ACCEPTANCE.md)

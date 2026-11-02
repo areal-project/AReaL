@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""One resumable offline cycle: historical model, frozen joint model, optimizer."""
+"""One resumable offline cycle: Online component model followed by Online optimizer."""
 
 from __future__ import annotations
 
@@ -12,15 +12,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE
-from areal.autopilot.domains.elastic.joint_evaluator import JointOptimizerEvaluator
-from areal.autopilot.domains.elastic.model_execution import HistoricalSourceEvaluator
-from areal.autopilot.revision.agent import RevisionAgent
 from areal.autopilot.revision.contracts import digest, source_digest
 from areal.autopilot.revision.loop import RevisionLoop
 from areal.utils.atomic import atomic_json
 
 
 def _fixed_json(path: Path, value: dict) -> None:
+    value = json.loads(json.dumps(value, allow_nan=False))
     if path.exists():
         if json.loads(path.read_text()) != value:
             raise ValueError(f"Saved {path.name} differs from the fixed revision cycle")
@@ -159,7 +157,7 @@ def _stage(loop: RevisionLoop, budget: int) -> _Stage:
             source.read_text(), root / f"verify-{uuid.uuid4().hex}"
         )
         keys = (
-            ("prediction_sha256", "joint_snapshot_sha256")
+            ("prediction_sha256",)
             if evaluator.target == "model"
             else ("prediction_sha256",)
             if evaluator.target in {"simulator", "serial_model"}
@@ -175,143 +173,169 @@ def _stage(loop: RevisionLoop, budget: int) -> _Stage:
         return _Stage(root, source, record)
 
 
-class PolicyRevisionCycle:
-    """Bounded offline model→optimizer handoff, idempotent for one fixed root.
-
-    The model factory must export predictor.joint.evaluate. Baseline and accepted
-    models follow identical export checks. A new training window or experiment
-    uses a new root with explicit initial sources and fit provenance.
-    """
+class ReconfiguratorRevisionCycle:
+    """Freeze a model revision, then evaluate Online search against that same model."""
 
     def __init__(
         self,
-        model_evaluator: HistoricalSourceEvaluator,
-        optimizer_problem: JointOptimizerEvaluator,
-        root: Path,
+        model_evaluator,
+        optimizer_cases,
+        root,
         *,
-        initial_model_source: str,
-        initial_optimizer_source: str | None = None,
+        assembly,
+        initial_model_source=None,
+        initial_optimizer_source=None,
+        optimizer_settings=None,
+        optimizer_limits=None,
+        parent_bundle=None,
     ):
-        if (
-            not isinstance(initial_model_source, str)
-            or not initial_model_source.strip()
+        self.model = model_evaluator
+        self.cases = tuple(optimizer_cases)
+        self.root = Path(root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.assembly = json.loads(json.dumps(assembly, allow_nan=False))
+        from areal.elastic.contracts import OnlineLayout
+
+        from .contracts import OnlineProblem, decode
+
+        catalog = tuple(decode(OnlineLayout, c) for c in self.assembly["candidates"])
+        if any(
+            not set((decode(OnlineProblem, c) if isinstance(c, dict) else c).candidates)
+            <= set(catalog)
+            for c in self.cases
         ):
             raise ValueError(
-                "A revision cycle requires an explicit initial model factory"
+                "Optimizer problems must use the assembly's frozen candidate catalog"
             )
-        if initial_optimizer_source is not None and (
-            not isinstance(initial_optimizer_source, str)
-            or not initial_optimizer_source.strip()
-        ):
-            raise ValueError("Initial optimizer source must be a nonempty factory")
-        self._requests = optimizer_problem.model_requests
-        self._model = model_evaluator.with_joint_export(self._requests)
-        self._problem = optimizer_problem
-        self._model_source = initial_model_source
-        self._optimizer_source = (
-            initial_optimizer_source or BASELINE_SOURCE["joint_optimizer"]
-        )
-        self.root = root.resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._code = source_digest(Path(__file__).read_text())
-
-    def _check(self):
-        self._model.assert_unchanged()
-        self._problem.assert_unchanged()
-        if source_digest(Path(__file__).read_text()) != self._code:
-            raise ValueError("Revision cycle implementation changed")
+        self.model_source = initial_model_source or model_evaluator.initial_source
+        self.optimizer_source = initial_optimizer_source or BASELINE_SOURCE["optimizer"]
+        self.optimizer_settings = optimizer_settings or {}
+        self.optimizer_limits = optimizer_limits or {}
+        self.parent_bundle = parent_bundle
 
     def run(
         self,
-        model_agent: RevisionAgent,
-        optimizer_agent: RevisionAgent,
+        model_agent,
+        optimizer_agent,
         *,
-        max_model_rounds: int = 3,
-        max_optimizer_rounds: int = 3,
-    ) -> dict:
-        if any(
-            type(n) is not int or n < 1
-            for n in (max_model_rounds, max_optimizer_rounds)
-        ):
-            raise ValueError("Cycle round budgets must be positive integers")
+        max_model_rounds=3,
+        max_optimizer_rounds=3,
+    ):
+        from dataclasses import asdict
+
+        from areal.elastic.reconfigurator import build_reconfigurator
+        from areal.elastic.serving import ServingSLO
+        from areal.elastic.simulation.online_transitions import HandoffConfig
+        from areal.elastic.simulation.simulation_core import SimulationConfig
+
+        from .bundle import export_accepted_bundle
+        from .contracts import decode
+        from .optimizer_evaluator import OnlineOptimizerEvaluator
+
         with (self.root / "cycle.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._check()
-            context = {
-                "format_version": 1,
-                "model_context_sha256": self._model.benchmark_sha256,
-                "optimizer_problem_sha256": self._problem.problem_sha256,
-                "initial_model_sha256": source_digest(self._model_source),
-                "initial_optimizer_sha256": source_digest(self._optimizer_source),
-                "max_model_rounds": max_model_rounds,
-                "max_optimizer_rounds": max_optimizer_rounds,
-                "cycle_code_sha256": self._code,
-            }
-            _fixed_json(self.root / "context.json", context)
+            _fixed_json(
+                self.root / "context.json",
+                dict(
+                    model=self.model.benchmark_sha256,
+                    cases=[
+                        asdict(c) if hasattr(c, "__dataclass_fields__") else c
+                        for c in self.cases
+                    ],
+                    assembly=self.assembly,
+                    model_source=source_digest(self.model_source),
+                    optimizer_source=source_digest(self.optimizer_source),
+                    settings=self.optimizer_settings,
+                    limits=self.optimizer_limits,
+                    budgets=[max_model_rounds, max_optimizer_rounds],
+                    parent_bundle_id=self.parent_bundle,
+                ),
+            )
             model_stage = _stage(
                 RevisionLoop(
                     model_agent,
-                    self._model,
+                    self.model,
                     self.root / "model",
-                    initial_source=self._model_source,
+                    initial_source=self.model_source,
                 ),
                 max_model_rounds,
             )
-            self._check()
-            model_stage.check()
+            model_source = model_stage.source.read_text()
             model_report = json.loads(
-                (self.root / "model" / model_stage.record["report"]).read_text()
+                (model_stage.root / model_stage.record["report"]).read_text()
             )
-            joint = self._model.export_joint(
-                model_stage.source.read_text(),
-                self._requests,
-                self.root / f"export-{uuid.uuid4().hex}",
-                expected_prediction_sha=model_report["metrics"]["prediction_sha256"],
-                expected_joint_sha=model_report["metrics"]["joint_snapshot_sha256"],
+            models = self.model.build(model_source)
+            self.model.verify_loaded(
+                models,
+                model_report["metrics"]["prediction_sha256"],
+                model_report["metrics"]["source_ids"],
             )
-            model_version = "history-model:" + digest(
-                {
-                    "source_sha256": model_stage.record["source_sha256"],
-                    "history_context_sha256": self._model.benchmark_sha256,
-                    "prediction_sha256": model_report["metrics"]["prediction_sha256"],
-                    "joint_snapshot_sha256": joint.sha256,
-                }
+            run = decode(SimulationConfig, self.assembly["run"])
+            handoff = decode(HandoffConfig, self.assembly["handoff"])
+            slo = decode(ServingSLO, self.assembly["slo"])
+            context = dict(
+                api_version="online-reference-optimizer-v1",
+                assembly_sha256=digest(self.assembly),
+                model_source_sha256=source_digest(model_source),
+                model_prediction_sha256=model_report["metrics"]["prediction_sha256"],
+                model_settings_sha256=digest(self.model.settings),
             )
-            search = self._problem.with_model(joint, model_version=model_version)
-            handoff = {
-                "model_stage_sha256": digest(model_stage.record),
-                "model_version": model_version,
-                "joint_snapshot_sha256": joint.sha256,
-                "optimizer_context_sha256": search.benchmark_sha256,
-            }
-            _fixed_json(self.root / "handoff.json", handoff)
+            from areal.elastic.contracts import OnlineLayout
+
+            prototype = build_reconfigurator(
+                "reference",
+                candidates=tuple(
+                    decode(OnlineLayout, c) for c in self.assembly["candidates"]
+                ),
+                settings=self.assembly.get("reconfigurator"),
+                replay=self.assembly.get("replay"),
+                forecast=self.assembly.get("forecast"),
+                slo=slo,
+            )
+
+            def make_model():
+                return prototype.make_model(
+                    models,
+                    run,
+                    handoff,
+                    slo,
+                    prototype.config.decision_delay_seconds,
+                    actor_memory_reserve_fraction=prototype.config.actor_memory_reserve_fraction,
+                    actor_memory_scope=prototype.config.actor_memory_scope,
+                )
+
+            evaluator = OnlineOptimizerEvaluator(
+                self.cases,
+                model_factory=make_model,
+                context=context,
+                settings=self.optimizer_settings,
+                runner=self.model.runner,
+                **self.optimizer_limits,
+            )
             optimizer_stage = _stage(
                 RevisionLoop(
                     optimizer_agent,
-                    search,
+                    evaluator,
                     self.root / "optimizer",
-                    initial_source=self._optimizer_source,
+                    initial_source=self.optimizer_source,
                 ),
                 max_optimizer_rounds,
             )
-            self._check()
-            model_stage.check()
-            optimizer_stage.check()
-            baseline = json.loads((self.root / "optimizer/baseline.json").read_text())
-            selected = json.loads(
-                (self.root / "optimizer" / optimizer_stage.record["report"]).read_text()
+            path = export_accepted_bundle(
+                self.root / "bundles",
+                model_evaluator=self.model,
+                model_stage=model_stage,
+                optimizer_evaluator=evaluator,
+                optimizer_stage=optimizer_stage,
+                assembly=self.assembly,
+                parent_bundle_id=self.parent_bundle,
             )
-            result = {
-                "status": "complete",
-                "cycle_context_sha256": digest(context),
-                "model": model_stage.record,
-                "optimizer": optimizer_stage.record,
-                "handoff": handoff,
-                "optimizer_scores": {
-                    "benchmark_sha256": search.benchmark_sha256,
-                    "baseline": baseline["score"],
-                    "effective": selected["score"],
-                },
-            }
+            result = dict(
+                model_accepted=model_stage.record["accepted"],
+                optimizer_accepted=optimizer_stage.record["accepted"],
+                bundle=None if path is None else str(path),
+                model_source=str(model_stage.source),
+                optimizer_source=str(optimizer_stage.source),
+            )
             _fixed_json(self.root / "result.json", result)
             return result

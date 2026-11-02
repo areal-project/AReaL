@@ -14,11 +14,7 @@ def protected_files() -> tuple[Path, ...]:
         AREAL_ROOT / "elastic",
     )
     paths = {
-        p
-        for root in roots
-        for p in root.rglob("*")
-        if p.suffix in {".py", ".json"}
-        and not p.is_relative_to(AREAL_ROOT / "elastic/policy/reference")
+        p for root in roots for p in root.rglob("*") if p.suffix in {".py", ".json"}
     }
     paths.update(
         AREAL_ROOT / name

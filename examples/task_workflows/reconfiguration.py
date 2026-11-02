@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from areal.elastic.control.resource_reconfiguration import ResourceLayout
+from areal.elastic.infra.reconfiguration import ExecutionLayout
 from areal.utils.atomic import atomic_json
 
 
@@ -25,13 +25,13 @@ def layouts(case: str, devices: tuple[int, ...]) -> tuple[int, list]:
         return 2, [4, 2]
     if case == "rollout":
         return 4, [
-            ResourceLayout(4, devices[:4], devices[6:]),
-            ResourceLayout(4, devices[:4], devices[4:]),
+            ExecutionLayout(4, devices[:4], devices[6:]),
+            ExecutionLayout(4, devices[:4], devices[4:]),
         ]
     if case == "joint":
         return 4, [
-            ResourceLayout(2, devices[:2], devices[2:]),
-            ResourceLayout(4, devices[:4], devices[4:]),
+            ExecutionLayout(2, devices[:2], devices[2:]),
+            ExecutionLayout(4, devices[:4], devices[4:]),
         ]
     raise ValueError("Unknown acceptance case")
 
@@ -124,7 +124,7 @@ def prepare(args):
         "initial_rollout_devices": args.devices[4:],
         "targets": [
             dataclasses.asdict(target)
-            if isinstance(target, ResourceLayout)
+            if isinstance(target, ExecutionLayout)
             else {"world_size": target}
             for target in targets
         ],
@@ -179,14 +179,18 @@ def snapshot(manager) -> dict:
 
 
 def audit_transition(manager, source: dict, output: Path) -> dict:
-    from areal.elastic.control.checkpoint_audit import compare_dcp, compare_runtime
+    from examples.task_workflows.checkpoint_audit import compare_dcp, compare_runtime
 
     destination = output / "restored"
     destination.mkdir(parents=True)
-    if not isinstance(manager.last_restore_reports, list):
-        raise RuntimeError(
-            "Acceptance requires actual per-rank checkpoint load reports"
-        )
+    actor_preserved = "restore_actor" not in manager.last_reconfiguration_plan.steps
+    approved_reports = (
+        manager.last_checkpoint_reports
+        if actor_preserved
+        else manager.last_restore_reports
+    )
+    if not isinstance(approved_reports, list):
+        raise RuntimeError("Acceptance requires actual per-rank state reports")
     import shutil
 
     preserved = output / "source-metadata"
@@ -208,17 +212,21 @@ def audit_transition(manager, source: dict, output: Path) -> dict:
     atomic_json(
         output / "restore.json",
         {
-            "plan": manager.last_restore_plan,
-            "load_reports": manager.last_restore_reports,
+            "plan": None if actor_preserved else manager.last_restore_plan,
+            "transition_plan": dataclasses.asdict(manager.last_reconfiguration_plan),
+            "actor_preserved": actor_preserved,
+            "approved_reports": approved_reports,
             "save_reports": reports,
         },
     )
     result = {
         "runtime": compare_runtime(
-            Path(source["checkpoint"]), destination, manager.last_restore_reports
+            Path(source["checkpoint"]), destination, approved_reports
         ),
         "dcp": compare_dcp(Path(source["checkpoint"]), destination),
     }
+    if actor_preserved:
+        result["runtime"]["rng"] = "matches source checkpoint; Actor retained"
     atomic_json(output / "audit.json", result)
     return {
         "runtime": result["runtime"],
@@ -229,20 +237,30 @@ def audit_transition(manager, source: dict, output: Path) -> dict:
 
 
 def verify_owners(manager, old_actor, old_rollout, previous_urls):
-    from areal.elastic.control.processes import (
+    from areal.elastic.infra.reconfiguration import (
         gpu_processes,
         owned_processes,
         resolve_gpu_uuids,
     )
 
-    if old_actor and owned_processes(old_actor):
+    plan = manager.last_reconfiguration_plan
+    actor_preserved = "restore_actor" not in plan.steps
+    if actor_preserved:
+        if manager.owner != old_actor:
+            raise RuntimeError("Rollout-only transition replaced the Actor")
+    elif old_actor and owned_processes(old_actor):
         raise RuntimeError("Source Actor processes still exist")
-    if any(owned_processes(owner) for owner in old_rollout):
+    if plan.rebuilds_rollout and any(owned_processes(owner) for owner in old_rollout):
         raise RuntimeError("Source Rollout processes still exist")
     rollout = manager.rollout
+    reports = (
+        manager.last_checkpoint_reports
+        if actor_preserved
+        else manager.last_restore_reports
+    )
     observed = [
         tuple(int(device) for device in report["visible_devices"].split(","))
-        for report in manager.last_restore_reports
+        for report in reports
     ]
     if (
         len(observed) != manager.actor_world_size
@@ -253,7 +271,7 @@ def verify_owners(manager, old_actor, old_rollout, previous_urls):
         or len(set(observed)) != len(observed)
     ):
         raise RuntimeError("Actual Actor rank devices differ from its lease")
-    if manager.resource_config_application is None:
+    if not plan.rebuilds_rollout:
         if rollout.inference_worker_urls != previous_urls:
             raise RuntimeError("Actor-only transition replaced Rollout")
         return {"source_actor_gone": True, "rollout_urls_unchanged": True}
@@ -279,7 +297,8 @@ def verify_owners(manager, old_actor, old_rollout, previous_urls):
         if device in leases and not pids:
             raise RuntimeError("Active GPU lease has no observed compute process")
     return {
-        "source_actor_gone": True,
+        "source_actor_gone": not actor_preserved,
+        "actor_preserved": actor_preserved,
         "source_rollout_gone": True,
         "gpu_leases_verified": True,
     }
@@ -296,9 +315,6 @@ def validate_telemetry(state_root: Path, case: str) -> dict:
         raise RuntimeError("Require timing evidence for both applied transitions")
     required = {
         "checkpoint",
-        "actor_release",
-        "actor_start",
-        "actor_restore",
         "awex_connect",
         "publish",
         "application_and_commit",
@@ -306,6 +322,10 @@ def validate_telemetry(state_root: Path, case: str) -> dict:
         "generation_resume",
         "total",
     }
+    if case != "rollout":
+        required |= {"actor_release", "actor_start", "actor_restore"}
+    else:
+        required.add("awex_disconnect")
     if case != "actor":
         required |= {
             "drain",
@@ -469,10 +489,15 @@ async def drive(args, manager, tasks, targets, output, stopped):
                     expected_generation=batch,
                     expected_weights_version=batch + 1,
                 )
-                if isinstance(target, ResourceLayout):
-                    receipt = manager.reconfigure_resources(target=target, **request)
+                if isinstance(target, ExecutionLayout):
+                    receipt = manager.reconfigure(target=target, **request)
                 else:
-                    receipt = manager.reconfigure_actor(world_size=target, **request)
+                    receipt = manager.reconfigure(
+                        target=ExecutionLayout(
+                            target, manager.actor_devices, manager.rollout_devices
+                        ),
+                        **request,
+                    )
                 # The request may refresh the completed source checkpoint before
                 # capturing its durable boundary; that save must remain timed.
                 source["checkpoint"] = str(manager.latest_path)

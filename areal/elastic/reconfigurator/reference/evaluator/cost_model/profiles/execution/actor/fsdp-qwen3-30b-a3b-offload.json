@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "kind": "execution/actor",
+  "id": "fsdp-qwen3-30b-a3b-offload",
+  "version": "1",
+  "values": {
+    "config": {
+      "backend": "fsdp",
+      "max_tokens_per_mb": 16384,
+      "n_mbs": 1,
+      "n_mbs_divisor": 1,
+      "granularity": 1,
+      "packing_algorithm": "ffd",
+      "pad_to_maximum": false,
+      "dtype": "bfloat16",
+      "gradient_checkpointing": true,
+      "checkpoint_recompute_fraction": 1.0,
+      "checkpoint_note": "Full layer recomputation when enabled",
+      "expert_dispatcher": "alltoall",
+      "reshard_after_forward": true,
+      "reshard_head_after_forward": false,
+      "ppo_n_minibatches": 1,
+      "recompute_logprob": false,
+      "use_decoupled_loss": true,
+      "prox_logp_method": "recompute",
+      "distributed_optimizer": true,
+      "grad_bytes": 2,
+      "overlap_grad_reduce": false,
+      "compile": false,
+      "enable_tree_training": false,
+      "pipeline_layers": null,
+      "pipeline_first_less_layers": 1,
+      "pipeline_last_less_layers": 1,
+      "optimizer_type": "adam_bf16",
+      "optimizer_dtype": "bfloat16",
+      "offload_params": true,
+      "optimizer_weight_decay": true,
+      "fsdp_root_reshard_after_forward": true,
+      "fsdp_parameter_tensors": 531
+    },
+    "runtime_revision": "8aaafd1e+trial-TF5-packed-MoE+torch2.9.1",
+    "efficiency": {
+      "dense": 0.45,
+      "moe": 0.28,
+      "attention": 0.3,
+      "hbm": 0.65,
+      "network": 0.65,
+      "moe_imbalance": 1.15,
+      "kernel_launch_us": 5.0,
+      "fsdp_overlap": 0.5,
+      "ep_overlap": 0.25
+    },
+    "dispatch": {
+      "mode": "controller",
+      "group_size": 1
+    },
+    "advantage": {
+      "execution_id": "r10-v2-fsdp-cpuoffload-group-grpo-host-wall",
+      "form": "affine_tokens",
+      "timing_boundary": "trainer_host_wall_with_stats"
+    },
+    "software": {
+      "torch": "2.9.1",
+      "transformers": "5.x; r10 packed expert trial adapter"
+    },
+    "model_profile": "qwen3-30b-a3b"
+  },
+  "provenance": {
+    "scope": "FSDP2 pure DP BF16 Adam/Kahan; physical tensor count is a measured execution property, not a model dimension",
+    "resolved_config_source_sha256": "4c49ab784110040c367a72c4b3dcd96e2b615db8779fd21e5522c9a2086420a8",
+    "awex_source_sha256": "1babf73dc299e9a7532874a782ef69c852ca1ec697675964db7fba1cf204e315"
+  }
+}

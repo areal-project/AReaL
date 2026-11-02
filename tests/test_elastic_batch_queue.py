@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from areal.elastic.state.batch_queue import BatchQueue
+from areal.elastic.infra.state.batch_queue import BatchQueue
 
 
 def _online_payload(version=0, rows=1):
@@ -36,7 +36,7 @@ def _receive_episode(inbox, number, version=0, rows=1):
 def test_online_explicit_abort_reclaims_credit_once_and_fences_delayed_admit(
     tmp_path, lost_admission
 ):
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
     inbox = OnlineInbox(tmp_path, batch_size=1, max_staleness=0)
     episode = None if lost_admission else inbox.admit("source", "session", 0)
@@ -77,7 +77,7 @@ def test_online_explicit_abort_reclaims_credit_once_and_fences_delayed_admit(
 
 
 def test_online_abort_admission_race_never_revives_cancelled_credit(tmp_path):
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
     inbox = OnlineInbox(tmp_path, batch_size=1, max_staleness=0)
 
@@ -100,7 +100,7 @@ def test_online_abort_admission_race_never_revives_cancelled_credit(tmp_path):
 
 @pytest.mark.parametrize("reserve", [False, True])
 def test_online_abort_cannot_discard_durably_received_episode(tmp_path, reserve):
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
     inbox = OnlineInbox(tmp_path, batch_size=1, max_staleness=0)
     episode = _receive_episode(inbox, 0)
@@ -119,7 +119,7 @@ def test_online_abort_cannot_discard_durably_received_episode(tmp_path, reserve)
 
 
 def test_online_admission_is_durable_idempotent_and_bounded(tmp_path):
-    from areal.elastic.state.episode_inbox import AdmissionFull, OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import AdmissionFull, OnlineInbox
 
     inbox = OnlineInbox(tmp_path, batch_size=4, max_staleness=2)
     first = inbox.admit("source", "session", 0)
@@ -142,10 +142,7 @@ def test_online_admission_is_durable_idempotent_and_bounded(tmp_path):
 
 
 def test_online_recovery_gate_is_durable_and_does_not_consume_credit(tmp_path):
-    from areal.elastic.state.episode_inbox import (
-        AdmissionPaused,
-        OnlineInbox,
-    )
+    from areal.elastic.infra.state.episode_inbox import AdmissionPaused, OnlineInbox
 
     inbox = OnlineInbox(tmp_path, batch_size=4, max_staleness=2)
     first = inbox.admit("source", "first", 0)
@@ -180,7 +177,7 @@ def test_consumer_restores_uncertain_update_without_releasing_its_fence(tmp_path
 def test_online_receive_survives_lost_ack_and_rejects_conflicting_retry(tmp_path):
     import torch
 
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
     from areal.infra.rpc.serialization import deserialize_value
 
     inbox = OnlineInbox(tmp_path, batch_size=4, max_staleness=2)
@@ -205,7 +202,7 @@ def test_online_receive_survives_lost_ack_and_rejects_conflicting_retry(tmp_path
 
 
 def test_online_episode_rows_do_not_replace_independent_episode_batch(tmp_path):
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
     inbox = OnlineInbox(tmp_path, batch_size=4, max_staleness=2)
     _receive_episode(inbox, 0, rows=4)
@@ -235,7 +232,7 @@ def test_online_episode_rows_do_not_replace_independent_episode_batch(tmp_path):
 
 
 def test_online_checkpoint_recovery_never_replays_committed_update(tmp_path):
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
     inbox = OnlineInbox(tmp_path, batch_size=1, max_staleness=2)
     episode = _receive_episode(inbox, 0)
@@ -258,7 +255,7 @@ def test_online_staleness_checks_oldest_effective_token_and_preserves_versions(
 ):
     import torch
 
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
     inbox = OnlineInbox(tmp_path, batch_size=1, max_staleness=2)
     with inbox.queue.consumer() as consumer:
@@ -283,7 +280,7 @@ def test_online_staleness_checks_oldest_effective_token_and_preserves_versions(
 def test_online_invalid_or_future_training_payload_cannot_be_consumed(tmp_path, kind):
     import torch
 
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
     inbox = OnlineInbox(tmp_path, batch_size=1, max_staleness=2)
     episode = inbox.admit("source", "session", 0)

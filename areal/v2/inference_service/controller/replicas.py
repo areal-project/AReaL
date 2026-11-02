@@ -8,7 +8,7 @@ import json
 import uuid
 from pathlib import Path
 
-from areal.elastic.control.processes import (
+from areal.elastic.infra.reconfiguration import (
     OWNER_ENV,
     gpu_processes,
     owned_processes,

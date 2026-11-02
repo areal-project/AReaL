@@ -27,7 +27,7 @@ def trajectory_payload(
     ):
         raise ValueError("Task, rollout and pinned model revision are required")
     if type(policy_version) is not int or policy_version < 0:
-        raise ValueError("Invalid policy version")
+        raise ValueError("Invalid reconfigurator version")
     required = {*_TOKEN_FIELDS, "rewards"}
     if not required.issubset(tensors):
         raise ValueError(
@@ -86,7 +86,7 @@ def trajectory_payload(
             if type(logprob) not in (int, float) or not math.isfinite(logprob):
                 raise ValueError("Token logprobs must be finite numbers")
             if type(version) is not int or (selected and version != policy_version):
-                raise ValueError("Generated token policy version mismatch")
+                raise ValueError("Generated token reconfigurator version mismatch")
             generated += int(selected)
     if not generated or any(not any(row) for row in values["loss_mask"]):
         raise ValueError("Each interaction must contain generated tokens")

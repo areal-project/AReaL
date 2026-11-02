@@ -33,8 +33,6 @@ class ElasticEvaluator:
 
     @property
     def replay_fingerprints(self):
-        return {
-            "model": ("prediction_sha256", "joint_snapshot_sha256"),
-            "serial_model": ("prediction_sha256",),
-            "joint_optimizer": ("selection_sha256",),
-        }.get(self.target, ())
+        return (
+            ("prediction_sha256",) if self.target == "model" else ("selection_sha256",)
+        )

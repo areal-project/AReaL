@@ -1,14 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared, CPU-only observations and lifecycle decisions for AutoPilot."""
+"Shared observations, predictions, layouts and execution interfaces."
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import (
+        RolloutConfig,
+        ServiceSlice,
+    )
 
 import math
 import threading
 from collections import deque
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Literal, Protocol
+
+
+def nonnegative(name: str, value: float, *, positive: bool = False) -> None:
+    if (
+        isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+        or (positive and value == 0)
+    ):
+        raise ValueError(
+            f"{name} must be finite and {'positive' if positive else 'nonnegative'}"
+        )
+
+
+def positive_int(name: str, value: int) -> None:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+
 
 Decision = Literal["train", "keep", "release"]
 
@@ -112,7 +139,7 @@ class ElasticObservation:
     checkpoint_config: TrainingConfig | None = None
 
 
-# Decision preserves the original string-based baseline policy interface.
+# Decision preserves the original string-based baseline reconfigurator interface.
 
 
 def _positive_stat(name: str, value: float) -> None:
@@ -414,7 +441,406 @@ class SearchResult:
     fallback_allowed: bool = False
 
 
-class SchedulingPolicy(Protocol):
+class Reconfigurator(Protocol):
     def decide(
-        self, observation: ElasticObservation
-    ) -> Decision | ResourceDecision: ...
+        self, observation: OnlineObservation, model: OnlineModel
+    ) -> OnlineDecision: ...
+
+
+# Causal online planning contracts shared by Basic and Reference.
+@dataclass(frozen=True, order=True)
+class OnlineLayout:
+    actor_dp: int
+    actor_tp: int
+    rollout_replicas: int
+    rollout_tp: int
+
+    def __post_init__(self):
+        for name in ("actor_dp", "actor_tp", "rollout_replicas", "rollout_tp"):
+            positive_int(name, getattr(self, name))
+        if max(self.actor_gpus, self.rollout_gpus) > 16:
+            raise ValueError("An online role uses at most sixteen GPUs")
+        if self.actor_tp not in (1, 2, 4, 8) or self.rollout_tp not in (1, 2, 4, 8):
+            raise ValueError("Online TP candidates are 1, 2, 4 or 8")
+
+    @property
+    def actor_gpus(self):
+        return self.actor_dp * self.actor_tp
+
+    @property
+    def rollout_gpus(self):
+        return self.rollout_replicas * self.rollout_tp
+
+    @property
+    def key(self):
+        return f"a{self.actor_dp}t{self.actor_tp}-r{self.rollout_replicas}t{self.rollout_tp}"
+
+
+@dataclass(frozen=True)
+class Turn:
+    """A completed historical turn, or a sampled turn in a forecast.
+
+    tool_seconds=None denotes a terminal response. A live observation only puts
+    fully observed turns here; its current unfinished turn has a separate view.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    tool_seconds: float | None = None
+    tool_output_tokens: int = 0
+    tool_pool: str = "python"
+    next_input_overhead: int = 0
+
+    def __post_init__(self):
+        positive_int("input_tokens", self.input_tokens)
+        positive_int("output_tokens", self.output_tokens)
+        if self.tool_seconds is not None:
+            nonnegative("tool_seconds", self.tool_seconds)
+        for name in ("tool_output_tokens", "next_input_overhead"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
+                raise ValueError(f"Invalid {name}")
+
+
+@dataclass(frozen=True)
+class EpisodeSample:
+    episode_id: str
+    family: str
+    available_at: float
+    turns: tuple[Turn, ...]
+
+    def __post_init__(self):
+        if (
+            not self.episode_id
+            or not self.turns
+            or self.turns[-1].tool_seconds is not None
+        ):
+            raise ValueError("An episode needs an identity and a terminal response")
+        if any(t.tool_seconds is None for t in self.turns[:-1]):
+            raise ValueError("Forecast episodes strictly alternate inference and tools")
+        nonnegative("available_at", self.available_at)
+
+
+@dataclass(frozen=True)
+class RequestView:
+    request_id: str
+    episode_id: str
+    turn: int
+    input_tokens: int
+    ready_at: float
+    prefilled: int = 0
+    generated: int = 0
+    first_token_at: float | None = None
+    last_token_at: float | None = None
+    maximum_tbt_seconds: float = 0.0
+    completed_at: float | None = None
+    deployment: int | None = None
+    replica: int | None = None
+    version_counts: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class ToolView:
+    pool: str
+    ready_at: float
+    started_at: float | None
+
+
+@dataclass(frozen=True)
+class EpisodeView:
+    episode_id: str
+    family: str
+    available_at: float
+    admitted: bool
+    completed_at: float | None
+    completed_turns: tuple[Turn, ...]
+    current: RequestView | None
+    tool: ToolView | None
+
+
+@dataclass(frozen=True)
+class ServiceView:
+    replica: int
+    started_at: float
+    # id, known context, query, phase, emits a token. No final output length.
+    slices: tuple[tuple[str, int, int, str, bool], ...]
+    version: int
+
+
+@dataclass(frozen=True)
+class ActorWaitView:
+    batch: tuple[str, ...]
+    deployment: int
+    since: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class ActorView:
+    batch: tuple[str, ...] = ()
+    phase: int = 0
+    phase_started_at: float = 0.0
+    waiting: ActorWaitView | None = None
+    running: bool = True
+
+
+@dataclass(frozen=True)
+class OnlineObservation:
+    now: float
+    layout: OnlineLayout
+    episodes: tuple[EpisodeView, ...]
+    requests: tuple[RequestView, ...]
+    services: tuple[ServiceView, ...]
+    actor: ActorView
+    consumed_episodes: int
+    training_version: int
+    provider_version: int
+    busy: bool
+    input_closed: bool
+    actor_deployment: int = 0
+    rollout_deployment: int = 1
+    leases: tuple[tuple[int, str, tuple[tuple[int, int], ...]], ...] = ()
+
+
+@dataclass(frozen=True)
+class ReplayWindow:
+    regime_started_at: float
+    previous_regime_seconds: float | None
+    expected_remaining_seconds: float
+    duration_source: str
+    template_started_at: float
+    template_seconds: float
+    observed_arrivals: int
+    complete_templates: int
+    historical_substitutions: int
+
+
+@dataclass(frozen=True)
+class Forecast:
+    seed: int
+    episodes: tuple[EpisodeSample, ...]
+    input_closes_at: float
+    notes: tuple[str, ...] = (
+        "Empirical complete-episode resampling; short-term stationary arrival prior",
+        "Completed-episode history has censoring/selection bias; not a calibrated tail forecast",
+        "Tools use duration samples conditional on survival; beyond observed support use a sampled positive residual, or the explicit unseen-tool fallback",
+    )
+    replay: ReplayWindow | None = None
+
+
+@dataclass(frozen=True)
+class WorkloadFeatures:
+    arrivals_per_second: float
+    mean_initial_input: float
+    families: tuple[tuple[str, float], ...]
+
+    def distance(self, other: WorkloadFeatures) -> float:
+        def relative(a, b):
+            return abs(a - b) / max(abs(a), abs(b), 1e-12)
+
+        left, right = dict(self.families), dict(other.families)
+        mixture = (
+            sum(
+                abs(left.get(k, 0) - right.get(k, 0))
+                for k in left.keys() | right.keys()
+            )
+            / 2
+        )
+        return max(
+            relative(self.arrivals_per_second, other.arrivals_per_second),
+            relative(self.mean_initial_input, other.mean_initial_input),
+            mixture,
+        )
+
+
+@dataclass(frozen=True)
+class RollingSLO:
+    completed: int
+    pending: int
+    decided: int
+    jointly_passed: int
+    fraction: float | None
+    ttft_quantile_seconds: float
+    tbt_quantile_seconds: float
+
+
+@dataclass(frozen=True)
+class ActorSupply:
+    """Conditional target-only capacity; excludes old Actor work and idle time."""
+
+    offered_episodes: int
+    history_seconds: float
+    arrival_rate: float
+    actor_seconds_per_batch: float | None
+    publication_seconds_per_batch: float | None
+    capacity_rate: float | None
+    credit_balance_rate: float | None
+    sustainable: bool | None
+    representative_batches: int
+    padded_episodes: int
+    substituted_episodes: int
+    input_closed: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class ActorMemorySafety:
+    """Candidate-only margin; evaluation batches can contain replay templates."""
+
+    admissible: bool
+    reserve_fraction: float
+    checked_batches: int
+    peak_gib: float | None
+    capacity_gib: float | None
+    allowed_gib: float | None
+    worst_batch: tuple[str, ...]
+    observed_through: float
+    reason: str
+    scope: str = "all_completed"
+
+
+@dataclass(frozen=True)
+class CandidatePrediction:
+    """Historical mean_gpu_seconds aliases score_gpu_seconds (K + H * GPUs).
+
+    Request/update counts describe the serving window, not a completed workload.
+    Legacy sampled forecasts retain their complete-work mean cost.
+    """
+
+    layout: OnlineLayout
+    supported: bool
+    worst_request_fraction: float | None
+    mean_gpu_seconds: float | None
+    work_ids: tuple[str, ...]
+    reason: str = ""
+    source_ids: tuple[str, ...] = ()
+    window_gpu_seconds: float | None = None
+    tail_gpu_seconds: float | None = None
+    actor_coverage: str = "legacy_sampled_execution"
+    pruned: bool = False
+    fraction_upper_bound: float | None = None
+    mean_cost_lower_bound: float | None = None
+    pruning_incumbent: tuple[str, float, float] | None = None
+    switching_gpu_seconds: float | None = None
+    running_gpu_seconds_per_second: float | None = None
+    evaluation_seconds: float | None = None
+    running_gpu_seconds: float | None = None
+    score_gpu_seconds: float | None = None
+    completed_requests: int | None = None
+    pending_requests: int | None = None
+    failed_pending_requests: int | None = None
+    completed_updates: int | None = None
+    retained_episodes: int | None = None
+    actor_supply: tuple[ActorSupply, ...] = ()
+    admission_credits_start: int | None = None
+    admission_credits_end: float | None = None
+    admission_credit_blocked_seconds: float | None = None
+    actor_memory: ActorMemorySafety | None = None
+
+
+@dataclass(frozen=True)
+class CandidateWave:
+    """Model-owned results and measured execution costs for one requested wave."""
+
+    indices: tuple[int, ...]
+    predictions: tuple[CandidatePrediction, ...]
+    worker_pids: tuple[int, ...] = ()
+    task_cpu_seconds: float = 0.0
+    input_preparations: int = 0
+    chunks: int = 0
+
+
+class OnlineModel(Protocol):
+    def evaluate(
+        self,
+        view: OnlineObservation,
+        forecasts: tuple[Forecast, ...],
+        layout: OnlineLayout,
+    ) -> CandidatePrediction: ...
+
+
+@dataclass(frozen=True)
+class OnlineDecision:
+    observed_at: float
+    trigger: str
+    target: OnlineLayout
+    predictions: tuple[CandidatePrediction, ...]
+    forecast_seeds: tuple[int, ...]
+    statistics: RollingSLO
+    search_cpu_seconds: float
+    reason: str
+    replay_window: ReplayWindow | None = None
+    workload_features: WorkloadFeatures | None = None
+    net_window_gpu_seconds: float | None = None
+    net_total_gpu_seconds: float | None = None
+
+
+class ControlBusy(RuntimeError):
+    """The native lifecycle is executing another operation."""
+
+
+@dataclass(frozen=True)
+class ControlSnapshot:
+    """Live applied/published progress and independent durable checkpoint progress.
+
+    ``boundary_ready`` requires completed publication and no active update;
+    it does not require a checkpoint at the applied version.
+    """
+
+    closed: bool
+    boundary_ready: bool
+    generation: int
+    applied_version: int
+    published_version: int
+    boundary_id: str
+    checkpoint_version: int = 0
+
+
+class NativeControlPort(Protocol):
+    def control_snapshot(self) -> ControlSnapshot: ...
+    def control_operation(
+        self, *, blocking: bool = False
+    ) -> AbstractContextManager[ControlSnapshot]: ...
+    def fence_admission(self) -> None: ...
+
+
+class SimulationModels(Protocol):
+    source_ids: tuple[str, ...]
+
+    def rollout_config(self, layout: OnlineLayout) -> RolloutConfig: ...
+    def service(
+        self, layout: OnlineLayout, kv: int, slices: tuple[ServiceSlice, ...]
+    ) -> float: ...
+    def actor(
+        self, layout: OnlineLayout, batch: tuple[tuple[Turn, ...], ...]
+    ) -> tuple[tuple[str, float], ...]: ...
+    def publication(
+        self, layout: OnlineLayout, recipients: tuple[OnlineLayout, ...]
+    ) -> float: ...
+
+
+@dataclass(frozen=True)
+class SimulationConfig:
+    batch_size: int
+    staleness: int
+    client_concurrency: int
+    tool_capacities: tuple[tuple[str, int], ...]
+    max_new_tokens: int
+    max_context_tokens: int
+    max_events: int
+    max_simulated_seconds: float
+
+    def __post_init__(self):
+        for name in (
+            "batch_size",
+            "client_concurrency",
+            "max_new_tokens",
+            "max_context_tokens",
+            "max_events",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"Invalid {name}")
+        if self.staleness < 0 or self.max_simulated_seconds <= 0:
+            raise ValueError("Explicit staleness and simulation budget are required")
+        if not self.tool_capacities or any(n < 1 for _, n in self.tool_capacities):
+            raise ValueError("Explicit positive tool pool capacities are required")

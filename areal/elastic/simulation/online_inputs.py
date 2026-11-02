@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 
-from areal.elastic.policy.basic.observations import (
+from areal.elastic.contracts import (
     EpisodeSample,
     Forecast,
     OnlineObservation,

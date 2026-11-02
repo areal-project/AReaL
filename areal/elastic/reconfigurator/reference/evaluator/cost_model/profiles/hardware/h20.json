@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "kind": "hardware",
+  "id": "h20",
+  "version": "1",
+  "values": {
+    "bf16_tflops": 148,
+    "hbm_gbps": 4096,
+    "memory_gb": 102.625181696
+  },
+  "provenance": {
+    "scope": "H20 reference used by r10; capacity is this observed device variant, not all H20 products",
+    "units": {
+      "bf16_tflops": "TFLOP/s",
+      "hbm_gbps": "GB/s",
+      "memory_gb": "decimal GB"
+    },
+    "fields": {
+      "bf16_tflops": {
+        "evidence": "assumed",
+        "source": "https://arxiv.org/html/2504.02263v1#S4.T3"
+      },
+      "hbm_gbps": {
+        "evidence": "assumed",
+        "source": "https://arxiv.org/html/2504.02263v1#S4.T3"
+      },
+      "memory_gb": {
+        "evidence": "measured",
+        "source": "r10 nvidia-smi memory.total: 97871 MiB * 2**20 / 1e9"
+      }
+    }
+  }
+}

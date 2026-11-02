@@ -162,9 +162,9 @@ def test_native_dcp_two_four_two_restores_parameters_and_adam(tmp_path, device):
 def test_checkpoint_audit_reads_model_adam_and_param_groups_with_bounded_dcp(tmp_path):
     import torch.distributed.checkpoint as dcp
 
+    from examples.task_workflows.checkpoint_audit import compare_dcp, compare_runtime
     from tests.test_elastic_runtime_state import make_engine
 
-    from areal.elastic.control.checkpoint_audit import compare_dcp, compare_runtime
     from areal.engine.fsdp_utils.checkpoint import DCPState
     from areal.v2.training_service.checkpoint import _capture, _report
 

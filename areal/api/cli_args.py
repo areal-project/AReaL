@@ -3411,10 +3411,10 @@ class ActorLifecycleConfig:
             "choices": ["resident", "on_demand"],
         },
     )
-    policy: str = field(
-        default="basic",
+    reconfigurator: str = field(
+        default="reference",
         metadata={
-            "help": "On-demand policy; basic currently uses an idle timeout; reference is not implemented.",
+            "help": "Complete Online reconfigurator: basic is frozen v1; reference is the current implementation.",
             "choices": ["basic", "reference"],
         },
     )
@@ -3434,8 +3434,10 @@ class ActorLifecycleConfig:
 
         if self.mode not in ("resident", "on_demand"):
             raise ValueError("actor_lifecycle.mode must be resident or on_demand")
-        if self.policy not in ("basic", "reference"):
-            raise ValueError("actor_lifecycle.policy must be basic or reference")
+        if self.reconfigurator not in ("basic", "reference"):
+            raise ValueError(
+                "actor_lifecycle.reconfigurator must be basic or reference"
+            )
         if (
             any(
                 not math.isfinite(value) or value < 0

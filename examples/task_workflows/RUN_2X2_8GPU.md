@@ -419,9 +419,9 @@ profiler。长度来自引擎实际tokenization，不从字符数估计；生成
 
 逐调用长度／依赖和导出工作量已补采，见[字段与限制](README.md#%E8%AF%84%E5%88%86%E4%B8%8E%E8%AE%B0%E5%BD%95)。代码同步后重启Agent与推理／训练进程才对新运行生效；26项离线正常路径检查通过，真实GPU待验收，见[检查记录](../../../artifacts/expert-trace-collection-20261023/offline-validation.json)。现有调用墙钟不拆成prefill／decode；v2会等底层生成完成再构造流式响应，SDK首包不能代表真实首token。
 
-对[现有Expert输入](../../areal/elastic/policy/reference/scenario.py)，应区分：
+对[当前工作负载输入](../../areal/elastic/contracts.py)，应区分：
 
-- **模拟输入**：Request长度／predecessors、ExternalCall服务耗时／资源池已写入simulation_trace；客户端清单就绪时间与导出工作量分别落盘。先检查lengths_complete／dependencies_complete；缓存未知不能擅自填0。Group后处理、实际消费／初态及目标配置仍须组装，导出不代表已训练。
+- **模拟输入**：模型调用长度／依赖、工具调用耗时／资源池已写入simulation_trace；客户端清单就绪时间与导出工作量分别落盘。先检查lengths_complete／dependencies_complete；缓存未知不能擅自填0。episode后处理、实际消费／初态及目标配置仍须组装，导出不代表已训练。
 - **校准／验证记录**：逐batch执行时间、成员、query／已有context及KV状态。Expert自行组batch并推进decode，历史成员列表和逐token时间不是运行它的必需输入；但当前聚合trace不足以完整核验mixed／chunked服务成本。采集器的context_tokens包含完整prompt，Expert的同名字段指当前query之前的已缓存上下文，必须转换口径。
 
 现有调度为decode-first＋完整长度KV预留的显式假设，不是SGLang调度复刻。Catalog模型加载器目前只覆盖qwen3_moe，内置Qwen3-30B-A3B；1.7B

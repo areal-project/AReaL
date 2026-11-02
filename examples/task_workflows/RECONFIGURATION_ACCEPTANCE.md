@@ -52,8 +52,8 @@ tokens、单次等待900秒；这些是冒烟预算，不验证原1.7B长上下�
 - 每批第一题复用同一个RL session，刷新trajectory identity，验证凭据、incarnation及轨迹编号保留；Agent
   Service会话仍逐题独立，保持TaskAgent协议。
 - 恢复后、下次更新前，额外保存同版本状态，逐个全局DCP叶比较模型／Adam张量及param
-  groups；按加载报告核对LR、版本及目标RNG。DP改变时核对派生后的RNG，不要求与旧rank相同。读取以单个全局张量为单位，仍需容纳最大张量和读取缓冲。源manifest／sidecar及逐叶指纹保留；源DCP文件仍按checkpoint保留策略清理，旧路径之后可能不存在。
-- 核对旧Actor退出、Rollout保留或旧副本退出，以及实际rank设备／活动GPU租约；不根据客户端完成数推断训练完成。
+  groups；Actor重建时按加载报告核对LR、版本及目标RNG；Actor保留时与切换前checkpoint报告核对。DP改变时核对派生后的RNG，不要求与旧rank相同。读取以单个全局张量为单位，仍需容纳最大张量和读取缓冲。源manifest／sidecar及逐叶指纹保留；源DCP文件仍按checkpoint保留策略清理，旧路径之后可能不存在。
+- 按调整方案核对引擎生命周期：Actor-only保留Rollout；Rollout-only保留Actor并重建权重连接；joint调整两侧。核对实际rank设备与活动GPU租约。
 - 只有3次更新、12个持久交接、两次切换的完整计时及首次后端调用证据、无基础设施错误／拒绝、最终完整checkpoint及Trainer／客户端正常退出，才写`result.json`的`status=passed`。审计和等待耗时包含在整组运行时间里，因此不是吞吐或端到端收益测量。
 
 | 文件                                 | 内容                                         |
@@ -67,7 +67,7 @@ tokens、单次等待900秒；这些是冒烟预算，不验证原1.7B长上下�
 
 ## 耗时定义
 
-切换记录包含request／transition身份、源／目标布局、权重版本及消费游标；各阶段使用单调时钟记录起止和耗时：checkpoint、drain、Actor释放（含AWEX断开）、Rollout停止及GPU确认、布局应用、Rollout启动至healthy、proxy重绑、Actor初始化、全状态恢复、AWEX建联、发布确认及恢复准入。
+切换记录包含request／transition身份、源／目标布局、实际调整方案、权重版本及消费游标；各阶段使用单调时钟记录起止和耗时：checkpoint、drain、Actor释放（含AWEX断开）、Rollout停止及GPU确认、布局应用、Rollout启动至healthy、proxy重绑、Actor初始化、全状态恢复、AWEX建联、发布确认及恢复准入。
 
 `application_and_commit`包含内部阶段和事务提交；`total`还包含源checkpoint及恢复准入。它们是包含关系，不能与内部阶段直接相加。
 

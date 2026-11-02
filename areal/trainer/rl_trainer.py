@@ -34,7 +34,7 @@ from areal.api.cli_args import (
     ValidDatasetConfig,
     vLLMConfig,
 )
-from areal.elastic.control.policy_hooks import validate_unbound_adapter
+from areal.elastic.infra.adapter import validate_unbound_adapter
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
 from areal.infra import (
     LocalScheduler,
@@ -111,10 +111,10 @@ class PPOTrainer:
         train_dataset: Dataset | None = None,
         valid_dataset: Dataset | None = None,
         *,
-        elastic_policy=None,
+        elastic_reconfigurator=None,
     ):
-        validate_unbound_adapter(elastic_policy)
-        self._elastic_policy = elastic_policy
+        validate_unbound_adapter(elastic_reconfigurator)
+        self._elastic_reconfigurator = elastic_reconfigurator
         self._on_demand = None
         self.actor = None
         self.rollout = None
@@ -145,10 +145,12 @@ class PPOTrainer:
 
         self.config = config
         self._on_demand_mode = config.actor_lifecycle.mode == "on_demand"
-        if self._elastic_policy is not None and not self._on_demand_mode:
-            raise ValueError("elastic_policy requires actor_lifecycle.mode='on_demand'")
+        if self._elastic_reconfigurator is not None and not self._on_demand_mode:
+            raise ValueError(
+                "elastic_reconfigurator requires actor_lifecycle.mode='on_demand'"
+            )
         if self._on_demand_mode:
-            from areal.elastic.runtime import validate_on_demand
+            from areal.elastic.infra.runtime import validate_on_demand
 
             validate_on_demand(config)
         self._apply_dte_config_envvars()
@@ -347,7 +349,7 @@ class PPOTrainer:
         # before the data controller can colocate with them.
         engine_init_kwargs = {"addr": None, "ft_spec": ft_spec}
         if self._on_demand_mode:
-            from areal.elastic.runtime import OnDemandActor
+            from areal.elastic.infra.runtime import OnDemandActor
 
             self._on_demand = OnDemandActor(
                 config,
@@ -356,7 +358,7 @@ class PPOTrainer:
                     self._create_lifecycle_actor,
                     scheduler=self.scheduler,
                 ),
-                policy_adapter=self._elastic_policy,
+                reconfigurator_adapter=self._elastic_reconfigurator,
                 actor_pool_setter=self.scheduler.set_gpu_pool,
             )
         else:
@@ -1148,8 +1150,11 @@ class PPOTrainer:
                 self._on_demand.actor is None and self._on_demand.owner is None
             )
         else:
-            if getattr(getattr(self, "_elastic_policy", None), "owner", None) is None:
-                finish("_elastic_policy", "close")
+            if (
+                getattr(getattr(self, "_elastic_reconfigurator", None), "owner", None)
+                is None
+            ):
+                finish("_elastic_reconfigurator", "close")
             before = len(errors)
             finish("actor", "destroy")
             actor_released = len(errors) == before
@@ -1419,7 +1424,7 @@ class PPOTrainer:
             if self._on_demand is not None:
                 if self._on_demand.supports_resource_reconfiguration and (
                     os.environ.get("AREAL_ELASTIC_RESOURCE_RECONFIGURATION") == "1"
-                    or self._on_demand.resource_config_application is not None
+                    or self._on_demand.managed_rollout
                 ):
                     controller.configure_resource_pool(
                         self._on_demand.resource_reservation,

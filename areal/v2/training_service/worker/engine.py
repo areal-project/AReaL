@@ -95,7 +95,7 @@ def create_engine_module(
             def create_in_engine_thread():
                 engine = engine_class(*init_args, **init_kwargs)
                 if os.environ.get("AREAL_ROLLOUT_TRACE_DIR"):
-                    from areal.elastic.monitor.actor import install_actor_observer
+                    from areal.elastic.infra.monitor.actor import install_actor_observer
 
                     install_actor_observer(engine)
                 return engine

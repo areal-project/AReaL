@@ -6,32 +6,37 @@ from dataclasses import asdict, replace
 
 import pytest
 
-from areal.elastic.policy.basic.history import HistoricalReplay, HistoryReplayConfig
-from areal.elastic.policy.basic.observations import (
+from areal.elastic.contracts import (
+    ActorSupply,
     ActorWaitView,
+    CandidatePrediction,
     EpisodeSample,
     Forecast,
+    OnlineDecision,
     OnlineLayout,
     Turn,
 )
-from areal.elastic.policy.basic.online import (
-    ActorSupply,
-    CandidatePrediction,
-    OnlineDecision,
-    OnlinePolicy,
-    OnlinePolicyConfig,
-    rolling_slo,
+from areal.elastic.reconfigurator.reference.evaluator import Evaluator
+from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import (
+    RolloutConfig,
 )
-from areal.elastic.policy.basic.online_forecast import (
+from areal.elastic.reconfigurator.reference.forecast import (
     ForecastConfig,
     HistoricalForecaster,
+    HistoricalReplay,
+    HistoryReplayConfig,
 )
-from areal.elastic.policy.basic.search import SearchBound, select_prediction
-from areal.elastic.policy.basic.serving import ServingSLO
-from areal.elastic.policy.reference.core import fingerprint
-from areal.elastic.policy.reference.cost_model.rollout import RolloutConfig
-from areal.elastic.simulation.online_candidates import OnlineForecastModel
-from areal.elastic.simulation.online_control import OnlineControl, _Search
+from areal.elastic.reconfigurator.reference.identity import fingerprint
+from areal.elastic.reconfigurator.reference.optimizer import (
+    SearchBound,
+    select_prediction,
+)
+from areal.elastic.reconfigurator.reference.reconfigurator import (
+    OnlineReconfigurator,
+    OnlineReconfiguratorConfig,
+    _Search,
+)
+from areal.elastic.serving import ServingSLO, rolling_slo
 from areal.elastic.simulation.online_decode import _Run
 from areal.elastic.simulation.online_simulation import OnlineRunConfig, OnlineSimulation
 from areal.elastic.simulation.online_transitions import (
@@ -132,7 +137,7 @@ def episodes(n=16, spacing=1.0, output=4):
     )
 
 
-def simulation(workload, *, policy=None, event_sink=None):
+def simulation(workload, *, reconfigurator=None, event_sink=None):
     return OnlineSimulation(
         workload,
         INITIAL,
@@ -141,7 +146,7 @@ def simulation(workload, *, policy=None, event_sink=None):
         handoff(),
         SLO,
         input_closes_at=max(e.available_at for e in workload),
-        policy=policy,
+        reconfigurator=reconfigurator,
         event_sink=event_sink,
     )
 
@@ -308,7 +313,7 @@ def test_shared_forecast_templates_keep_candidate_state_and_observations_indepen
     view = main.observe()
     forecasts = (Forecast(42, workload, 5),)
     identity = fingerprint(view, forecasts)
-    evaluator = OnlineForecastModel(
+    evaluator = Evaluator(
         main.models, main.config, main.handoff, SLO, prune_irreversible_slo=False
     )
     for layout in (view.layout, SMALL):
@@ -342,7 +347,7 @@ def test_shared_forecast_templates_keep_candidate_state_and_observations_indepen
     main.run(until=0.3)
     later = main.observe()
     actual = evaluator.evaluate(later, forecasts, later.layout)
-    expected = OnlineForecastModel(
+    expected = Evaluator(
         main.models, main.config, main.handoff, SLO, prune_irreversible_slo=False
     ).evaluate(later, forecasts, later.layout)
     assert actual == expected
@@ -552,7 +557,7 @@ def test_actor_wait_restores_and_allows_a_delayed_repair_decision():
     assert view.consumed_episodes == view.training_version == view.provider_version == 0
     assert not sim.training_records
     forecasts = (Forecast(42, workload, 2),)
-    evaluator = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO, 1)
+    evaluator = Evaluator(sim.models, sim.config, sim.handoff, SLO, 1)
     keep = evaluator.evaluate(view, forecasts, view.layout)
     repair = evaluator.evaluate(view, forecasts, INITIAL)
     assert not keep.supported and "no planned Actor migration" in keep.reason
@@ -586,7 +591,7 @@ def test_forecast_restore_continues_current_gpu_tool_and_actor_work():
     view = main.observe()
     assert not view.busy
     assert view.services or any(e.tool for e in view.episodes) or view.actor.batch
-    # This explicit oracle fixture checks physical restoration. The policy's real
+    # This explicit oracle fixture checks physical restoration. The reconfigurator's real
     # forecast is separately checked below and never receives this true suffix.
     forecast = Forecast(1, workload, 2)
     branch = OnlineSimulation.from_forecast(
@@ -603,19 +608,22 @@ def test_forecast_restore_continues_current_gpu_tool_and_actor_work():
     assert actual["completed_requests"] == expected["completed_requests"]
 
 
-def policy():
-    return OnlinePolicy(
+def reconfigurator():
+    return OnlineReconfigurator(
         (INITIAL, SMALL),
         HistoricalForecaster(ForecastConfig(20, 60, 1, 1, 42, 4096, 1)),
-        OnlinePolicyConfig(0.2, 20, 1, 0.01, 1, 2),
+        OnlineReconfiguratorConfig(0.2, 20, 1, 0.01, 1, 2),
         SLO,
     )
 
 
-def test_online_policy_reconfigures_from_the_fixed_initial_deployment():
+def test_online_reconfigurator_reconfigures_from_the_fixed_initial_deployment():
     """A real empirical forecast/search selects a cheaper serving-feasible layout."""
     workload = episodes(12, spacing=3)
-    fixed, dynamic = simulation(workload), simulation(workload, policy=policy())
+    fixed, dynamic = (
+        simulation(workload),
+        simulation(workload, reconfigurator=reconfigurator()),
+    )
     baseline, adaptive = fixed.run(), dynamic.run()
     assert baseline["status"] == adaptive["status"] == "complete"
     assert adaptive["completed_updates"] == baseline["completed_updates"] == 3
@@ -644,7 +652,7 @@ def test_online_decisions_do_not_change_when_hidden_future_changes():
             ),
             EpisodeSample("future", "math", future_at, (Turn(16, 1),)),
         )
-        sim = simulation(workload, policy=policy())
+        sim = simulation(workload, reconfigurator=reconfigurator())
         sim.run(until=0.8)
         views.append(sim.observe())
         decisions.append(
@@ -701,10 +709,10 @@ def test_irreversible_slo_bound_matches_complete_sampled_prediction():
     sim.run(until=6)
     view = sim.observe()
     forecasts = (Forecast(42, workload, 6),)
-    pruned = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO).evaluate(
+    pruned = Evaluator(sim.models, sim.config, sim.handoff, SLO).evaluate(
         view, forecasts, INITIAL
     )
-    full = OnlineForecastModel(
+    full = Evaluator(
         sim.models, sim.config, sim.handoff, SLO, prune_irreversible_slo=False
     ).evaluate(view, forecasts, INITIAL)
     assert not pruned.supported and pruned.mean_gpu_seconds is None
@@ -737,10 +745,10 @@ def test_sampled_slo_branch_stops_after_infeasibility_is_known():
     sim.run(until=0)
     view, forecasts = sim.observe(), (Forecast(42, workload, 0),)
     pruned_costs, full_costs = CountedCosts(), CountedCosts()
-    pruned = OnlineForecastModel(pruned_costs, sim.config, sim.handoff, SLO).evaluate(
+    pruned = Evaluator(pruned_costs, sim.config, sim.handoff, SLO).evaluate(
         view, forecasts, INITIAL
     )
-    full = OnlineForecastModel(
+    full = Evaluator(
         full_costs, sim.config, sim.handoff, SLO, prune_irreversible_slo=False
     ).evaluate(view, forecasts, INITIAL)
     assert not pruned.supported and "Sampled branch" in pruned.reason
@@ -811,7 +819,7 @@ def test_forecast_keeps_actual_node_placement_after_two_hot_changes():
     forecasts = HistoricalForecaster(
         ForecastConfig(120, 60, 1, 1, 42, 4096, 1)
     ).predict(view, 0)
-    prediction = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO).evaluate(
+    prediction = Evaluator(sim.models, sim.config, sim.handoff, SLO).evaluate(
         view, forecasts, INITIAL
     )
     assert not prediction.supported
@@ -841,33 +849,30 @@ def test_tool_forecast_conditions_on_elapsed_time_with_positive_residual():
     assert sampled.turns[0].tool_seconds != live.turns[0].tool_seconds
 
 
-def history_policy(candidates=(INITIAL, SMALL), *, history_seconds=20):
-    return OnlinePolicy(
+def history_reconfigurator(candidates=(INITIAL, SMALL), *, history_seconds=20):
+    return OnlineReconfigurator(
         candidates,
         HistoricalReplay(HistoryReplayConfig(history_seconds, 2, 0.5, 2, 60, 4096, 1)),
-        OnlinePolicyConfig(0.2, 20, 1, 0.01, 1, len(candidates)),
+        OnlineReconfiguratorConfig(0.2, 20, 1, 0.01, 1, len(candidates)),
         ServingSLO(5, 0.1, 0.8),
     )
 
 
 @pytest.mark.parametrize("measured", [False, True])
-def test_actor_residency_saves_restores_and_preserves_training_and_cost(measured):
-    """Low arrival rate permits sleep without changing layouts or training work."""
+def test_actor_stays_resident_between_sparse_training_batches(measured):
+    """An idle gap keeps Actor allocated; only final cleanup releases its lease."""
     work = episodes(12, spacing=20)
-    controller = history_policy((INITIAL,), history_seconds=10)
+    controller = history_reconfigurator((INITIAL,), history_seconds=10)
     controller.config = replace(controller.config, check_interval_seconds=5)
-    cfg = replace(
-        config(), actor_lifecycle_enabled=True, actor_lifecycle_history_seconds=10
-    )
     sim = OnlineSimulation(
         work,
         INITIAL,
         _KnownCosts(),
-        cfg,
+        config(),
         handoff(),
         SLO,
         input_closes_at=220,
-        policy=controller,
+        reconfigurator=controller,
         measured_search_time=measured,
     )
     result = sim.run()
@@ -875,46 +880,29 @@ def test_actor_residency_saves_restores_and_preserves_training_and_cost(measured
     assert result["completed_updates"] == result["published_version"] == 3
     assert result["trained_episodes"] == result["completed_episodes"] == 12
     assert result["retained_episodes"] == 0 and not result["remaining_leases"]
-    assert result["actor_lifecycle"]["suspends"] >= 2
-    assert result["actor_lifecycle"]["suspends"] == result["actor_lifecycle"]["resumes"]
-    assert not sim.counters["handoff_start"]
-    sleeps = [e for e in sim.events if e["kind"] == "actor_suspended"]
-    resumes = [e for e in sim.events if e["kind"] == "actor_resumed"]
-    for sleep, resume in zip(sleeps, resumes, strict=True):
-        assert sleep["snapshot"] == resume["snapshot"]
-        assert not any(
-            sleep["time"] <= e["time"] < resume["time"]
-            and e["kind"] in {"actor_start", "search_start", "handoff_start"}
-            for e in sim.events
-        )
-    births = {0: 0.0}
-    births.update(
-        {
-            e["deployment"]: e["time"]
-            for e in sim.events
-            if e["kind"] == "actor_resume_start"
-        }
+    assert result["actor_gpu_seconds"] == pytest.approx(
+        result["seconds"] * INITIAL.actor_gpus
     )
-    charged = sum(
-        (e["time"] - births[e["deployment"]]) * INITIAL.actor_gpus
+    releases = [
+        e
         for e in sim.events
         if e["kind"] == "deployment_release" and e["role"] == "actor"
-    )
-    assert result["actor_gpu_seconds"] == pytest.approx(charged)
-    assert charged < result["seconds"] * INITIAL.actor_gpus
-    assert controller.last_switch < 0  # Sleep/wake never resets serving history.
-    flattened = [e for record in sim.training_records for e in record["episodes"]]
-    assert flattened == [e.episode_id for e in work]
+    ]
+    assert len(releases) == 1 and releases[0]["time"] == result["seconds"]
+    assert not sim.counters["handoff_start"]
+    assert not any(e["kind"].startswith("actor_lifecycle") for e in sim.events)
+    assert [e for r in sim.training_records for e in r["episodes"]] == [
+        e.episode_id for e in work
+    ]
 
 
-def test_candidate_residency_uses_original_check_time_and_actual_gpu_integral():
-    """The inner current branch reproduces lifecycle timing and its occupancy cost."""
-    cfg = replace(config(), actor_lifecycle_enabled=True)
+def test_current_candidate_charges_resident_actor_over_the_history_window():
+    """A current-layout prediction covers idle gaps with the same resident Actor."""
     sim = OnlineSimulation(
         episodes(16, spacing=20),
         INITIAL,
         _KnownCosts(),
-        cfg,
+        config(),
         handoff(),
         SLO,
         input_closes_at=300,
@@ -924,124 +912,37 @@ def test_candidate_residency_uses_original_check_time_and_actual_gpu_integral():
     forecaster = HistoricalReplay(HistoryReplayConfig(80, 20, 0.5, 2, 120, 4096, 1))
     forecasts = forecaster.predict(view, 0)
     assert len(forecasts) == 1
-    forecast = forecasts[0]
-    branch = OnlineSimulation.from_forecast(
-        view, forecast, _KnownCosts(), cfg, handoff(), SLO
-    )
-    assert branch.lifecycle.check_pending == sim.lifecycle.check_pending
-    expected = branch.run(until=forecast.input_closes_at)
-    model = OnlineForecastModel(_KnownCosts(), cfg, handoff(), SLO, 0)
+    model = Evaluator(_KnownCosts(), config(), handoff(), SLO, 0)
     prediction = model.evaluate(view, forecasts, INITIAL)
     assert prediction.supported and prediction.switching_gpu_seconds == 0
-    assert branch.lifecycle.first_check_at == 120
-    assert branch.counters["actor_suspended"] > 0
-    assert prediction.mean_gpu_seconds == pytest.approx(expected["total_gpu_seconds"])
-    assert prediction.mean_gpu_seconds == pytest.approx(prediction.running_gpu_seconds)
-    assert prediction.mean_gpu_seconds < 80 * (
-        INITIAL.actor_gpus + INITIAL.rollout_gpus
-    )
+    expected = 80 * (INITIAL.actor_gpus + INITIAL.rollout_gpus)
+    assert prediction.mean_gpu_seconds == pytest.approx(expected)
+    assert prediction.running_gpu_seconds == pytest.approx(expected)
+    assert sim.observe() == view
 
 
-def test_actor_residency_waits_for_existing_handoff_before_saving():
-    """A normal layout transition completes before lifecycle takes authority."""
-    cfg = replace(
-        config(), actor_lifecycle_enabled=True, actor_lifecycle_history_seconds=10
+@pytest.mark.parametrize("mode", ["hot", "cold"])
+def test_uninitialized_actor_starts_at_first_batch_and_then_stays_resident(mode):
+    """Native-style lazy initialization is a mechanical training prerequisite."""
+    source = simulation(episodes(8, spacing=20))
+    view = source.observe()
+    view = replace(
+        view,
+        actor=replace(view.actor, running=False),
+        leases=tuple(lease for lease in view.leases if lease[1] != "actor"),
     )
-    sim = OnlineSimulation(
-        episodes(12, spacing=20),
-        INITIAL,
-        _KnownCosts(),
-        cfg,
-        handoff(),
-        SLO,
-        input_closes_at=220,
-    )
-    sim.schedule_at(9, "decision_apply", SMALL)
-    result = sim.run()
-    assert result["status"] == "complete" and result["completed_updates"] == 3
-    end = next(e["time"] for e in sim.events if e["kind"] == "handoff_complete")
-    assert sim.counters["actor_suspended"] > 0
-    assert all(
-        e["time"] >= end for e in sim.events if e["kind"] == "actor_suspend_start"
-    )
-    assert sim.layout == SMALL
-
-
-def test_actor_residency_decisions_ignore_unseen_future_lengths():
-    """Changing an unarrived episode cannot change the sleep/wake prefix."""
-    prefixes = []
-    for output in (4, 400):
-        work = episodes(3, spacing=20) + (
-            EpisodeSample("later", "math", 80, (Turn(16, output),)),
-        )
-        cfg = replace(
-            config(), actor_lifecycle_enabled=True, actor_lifecycle_history_seconds=10
-        )
-        sim = OnlineSimulation(
-            work, INITIAL, _KnownCosts(), cfg, handoff(), SLO, input_closes_at=80
-        )
-        sim.run(until=50)
-        prefixes.append([e for e in sim.events if e["kind"].startswith("actor_")])
-    assert prefixes[0] == prefixes[1]
-
-
-@pytest.mark.parametrize("rollout_tp", [1, 2])
-def test_stopped_actor_allows_rollout_search_and_recovers_during_handoff(rollout_tp):
-    """Rollout changes independently while the original Actor wakes on time."""
-    cfg = replace(
-        config(),
-        actor_lifecycle_enabled=True,
-        actor_lifecycle_history_seconds=10,
-        actor_stopped_rollout_reconfig=True,
-    )
-    work = episodes(12, spacing=20)
-    sim = OnlineSimulation(
-        work, INITIAL, _KnownCosts(), cfg, handoff(), SLO, input_closes_at=220
-    )
-    sim.run(until=24)
-    view = sim.observe()
-    assert view.actor.lifecycle.state == "stopped" and not view.busy
-    assert sim.actor_id not in sim.deployments
-    target = OnlineLayout(
-        INITIAL.actor_dp, INITIAL.actor_tp, 2 // rollout_tp, rollout_tp
-    )
-    policy = history_policy((INITIAL, SMALL, target), history_seconds=10)
-    policy.config = replace(
-        policy.config, minimum_completed_requests=1, slo_window_seconds=120
-    )
-    model = OnlineForecastModel(_KnownCosts(), cfg, handoff(), SLO, 0)
-    decision = policy.decide(view, model)
-    assert decision.target == target
-    assert {p.layout for p in decision.predictions} == {INITIAL, target}
-    forecasts = policy.forecaster.predict(view, policy.decision_index)
+    forecast = Forecast(0, tuple(source._truth.values()), 140)
     branch = OnlineSimulation.from_forecast(
-        view, forecasts[0], _KnownCosts(), cfg, handoff(), SLO
+        view, forecast, _KnownCosts(), config(), replace(handoff(), mode=mode), SLO
     )
-    assert branch.lifecycle.observe() == view.actor.lifecycle
-    assert branch.pool.count("actor") == 0 and branch.actor_id not in branch.deployments
-    assert branch.request_handoff(target)
-    branch.run(until=forecasts[0].input_closes_at)
-    assert branch.layout == target and branch.pending_handoff is None
-    assert branch.counters["actor_resume_start"] == 1
-    assert sim.request_handoff(target)
-    result = sim.run()
-    assert result["status"] == "complete" and result["completed_updates"] == 3
-    assert result["trained_episodes"] == 12 and not result["remaining_leases"]
-    begun = next(e for e in sim.events if e["kind"] == "actor_resume_start")
-    end = next(e for e in sim.events if e["kind"] == "handoff_complete")
-    assert begun["time"] == view.actor.lifecycle.wake_at
-    assert begun["time"] < end["time"]
-    assert not sim.counters["handoff_deferred"]
-    handoff_event = next(e for e in sim.events if e["kind"] == "handoff_start")
-    assert handoff_event["actor_stopped"]
-    recovery = handoff_event["actor_recovery_placement"]
-    assert len(recovery) == INITIAL.actor_gpus
-    occupied = {
-        tuple(gpu) for _, devices in handoff_event["leases"].values() for gpu in devices
-    }
-    assert occupied.isdisjoint(recovery)
-    assert [e for r in sim.training_records for e in r["episodes"]] == [
-        e.episode_id for e in work
+    assert branch.actor_id not in branch.deployments
+    result = branch.run()
+    assert result["status"] == "complete" and result["completed_updates"] == 2
+    starts = [e for e in branch.events if e["kind"] == "actor_restore_start"]
+    assert len(starts) == 1
+    assert starts[0]["time"] >= 60
+    assert [e for r in branch.training_records for e in r["episodes"]] == [
+        e.episode_id for e in source._truth.values()
     ]
 
 
@@ -1069,8 +970,8 @@ def test_regime_duration_updates_while_search_is_busy():
         replace(e, family="terminal" if e.available_at >= 11 else "math")
         for e in base.episodes
     )
-    policy = history_policy()
-    policy.forecaster = HistoricalReplay(
+    reconfigurator = history_reconfigurator()
+    reconfigurator.forecaster = HistoricalReplay(
         HistoryReplayConfig(30, 10, 0.5, 2, 100, 4096, 1)
     )
     for now in (10, 20, 30):
@@ -1080,8 +981,8 @@ def test_regime_duration_updates_while_search_is_busy():
             busy=True,
             episodes=tuple(e for e in rows if e.available_at < now),
         )
-        policy.decide(view, None)
-    replay = policy.forecaster.predict(
+        reconfigurator.decide(view, None)
+    replay = reconfigurator.forecaster.predict(
         replace(view, busy=False, input_closed=False), 0
     )[0]
     assert replay.replay.previous_regime_seconds == 20
@@ -1139,7 +1040,9 @@ def test_role_history_only_locks_the_changed_side(changed_role, passed):
     """Pressure and slack can change the untouched side during the other wait."""
     actor = OnlineLayout(1, 2, 8, 1)
     rollout = OnlineLayout(4, 2, 2, 1)
-    controller = history_policy((INITIAL, actor, rollout, SMALL), history_seconds=120)
+    controller = history_reconfigurator(
+        (INITIAL, actor, rollout, SMALL), history_seconds=120
+    )
     controller.config = replace(
         controller.config, independent_role_history=True, deduplicate_searches=False
     )
@@ -1167,9 +1070,9 @@ def test_role_history_starts_at_each_old_deployment_release(joint):
     """Real transfer/drain events clock each side before the whole handoff ends."""
     sim = simulation(episodes(120))
     sim.run(until=20)
-    controller = history_policy((INITIAL,), history_seconds=10)
+    controller = history_reconfigurator((INITIAL,), history_seconds=10)
     controller.config = replace(controller.config, independent_role_history=True)
-    sim.policy = controller
+    sim.reconfigurator = controller
     target = SMALL if joint else OnlineLayout(1, 2, 8, 1)
     assert sim.request_handoff(target)
     sim.run(stop_after_handoff=True)
@@ -1218,7 +1121,7 @@ def test_role_history_starts_at_each_old_deployment_release(joint):
 def test_service_conditions_search_on_the_first_check(passed, trigger):
     """Only fractions outside [80%, 90%] search after a full history window."""
     view = _service_trigger_snapshot(passed)
-    controller = history_policy(history_seconds=120)
+    controller = history_reconfigurator(history_seconds=120)
     controller.config = replace(
         controller.config,
         slo_window_seconds=120,
@@ -1237,7 +1140,7 @@ def test_service_conditions_search_on_the_first_check(passed, trigger):
 @pytest.mark.parametrize("passed", [15, 19])
 def test_service_judgment_waits_for_the_full_history_window(passed):
     """Neither pressure nor slack can search on a short startup history."""
-    controller = history_policy(history_seconds=120)
+    controller = history_reconfigurator(history_seconds=120)
     controller.config = replace(controller.config, deduplicate_searches=False)
     scores = _ScoredReplay({INITIAL: (0.9, 100, 200), SMALL: (0.9, 90, 150)})
     for now in (110, 119, 120):
@@ -1256,7 +1159,7 @@ def test_service_judgment_waits_for_the_full_history_window(passed):
 @pytest.mark.parametrize("measured_search_time", [False, True])
 def test_simulation_first_search_follows_full_120_second_history(measured_search_time):
     """Both timeline control paths keep serving before the first eligible poll."""
-    controller = history_policy(candidates=(INITIAL,), history_seconds=120)
+    controller = history_reconfigurator(candidates=(INITIAL,), history_seconds=120)
     controller.config = replace(controller.config, check_interval_seconds=10)
     sim = OnlineSimulation(
         episodes(160),
@@ -1266,7 +1169,7 @@ def test_simulation_first_search_follows_full_120_second_history(measured_search
         handoff(),
         SLO,
         input_closes_at=159,
-        policy=controller,
+        reconfigurator=controller,
         measured_search_time=measured_search_time,
         search_clock=_DecisionClock(0),
     )
@@ -1279,7 +1182,7 @@ def test_simulation_first_search_follows_full_120_second_history(measured_search
 
 @pytest.mark.parametrize("passed", [13, 19])
 @pytest.mark.parametrize("independent", [False, True])
-def test_example_policy_waits_after_handoff_then_searches_each_matching_poll(
+def test_example_reconfigurator_waits_after_handoff_then_searches_each_matching_poll(
     passed, independent
 ):
     """Joint completion clocks both roles; legacy and role polling resume at H."""
@@ -1290,9 +1193,9 @@ def test_example_policy_waits_after_handoff_then_searches_each_matching_poll(
         Path(__file__).resolve().parents[1]
         / "examples/autopilot/elastic/online-example.json"
     )
-    controller = history_policy(history_seconds=120)
+    controller = history_reconfigurator(history_seconds=120)
     controller.config = replace(
-        OnlinePolicyConfig(**json.loads(path.read_text())["policy"]),
+        OnlineReconfiguratorConfig(**json.loads(path.read_text())["reconfigurator"]),
         independent_role_history=independent,
     )
     scores = _ScoredReplay({INITIAL: (0.9, 100, 200), SMALL: (0.9, 110, 220)})
@@ -1323,7 +1226,7 @@ def test_post_handoff_history_starts_after_old_requests_drain(measured_search_ti
     workload = episodes(200)
     workload = (replace(workload[0], turns=(Turn(16, 4000),)),) + workload[1:]
     target = OnlineLayout(4, 2, 2, 1)
-    controller = history_policy(candidates=(target,), history_seconds=120)
+    controller = history_reconfigurator(candidates=(target,), history_seconds=120)
     controller.config = replace(controller.config, check_interval_seconds=10)
     sim = OnlineSimulation(
         workload,
@@ -1333,7 +1236,7 @@ def test_post_handoff_history_starts_after_old_requests_drain(measured_search_ti
         handoff(),
         SLO,
         input_closes_at=199,
-        policy=controller,
+        reconfigurator=controller,
         measured_search_time=measured_search_time,
         search_clock=_DecisionClock(0),
     )
@@ -1378,7 +1281,7 @@ def test_initialization_and_load_changes_do_not_search_without_service_trigger(
                 ),
             ),
         )
-    controller = history_policy()
+    controller = history_reconfigurator()
     controller.config = replace(controller.config, slo_window_seconds=120)
     scores = _ScoredReplay({INITIAL: (0.9, 100, 200), SMALL: (0.9, 90, 150)})
     for now in (120, 130, 140):
@@ -1415,14 +1318,14 @@ def test_history_selection_uses_window_score_and_trigger_filter(
 ):
     """Pressure and slack share the new cost objective, with different SLO filters."""
     view = _service_trigger_snapshot(13 if trigger == "pressure" else 19)
-    policy = history_policy()
+    reconfigurator = history_reconfigurator()
     scores = _ScoredReplay(
         {
             INITIAL: (current_fraction, 100, 200),
             SMALL: (new_fraction, new_window, new_total),
         }
     )
-    decision = policy.decide(view, scores)
+    decision = reconfigurator.decide(view, scores)
     assert scores.calls == [INITIAL, SMALL]
     assert decision.trigger == trigger
     assert decision.target == (SMALL if should_switch else INITIAL)
@@ -1499,8 +1402,8 @@ def test_actor_supply_blocks_buffered_short_window_scale_down():
     sim = credit_simulation()
     sim.run(until=120)
     view = sim.observe()
-    forecasts = history_policy(history_seconds=120).forecaster.predict(view, 0)
-    model = OnlineForecastModel(sim.models, sim.config, sim.handoff, sim.slo)
+    forecasts = history_reconfigurator(history_seconds=120).forecaster.predict(view, 0)
+    model = Evaluator(sim.models, sim.config, sim.handoff, sim.slo)
     keep, shrink = model.evaluate_many(view, forecasts, (INITIAL, SMALL))
     assert shrink.supported and shrink.worst_request_fraction >= 0.8
     assert shrink.mean_gpu_seconds < keep.mean_gpu_seconds
@@ -1519,7 +1422,7 @@ def test_actor_supply_blocks_buffered_short_window_scale_down():
 
 
 class _HeadroomCosts(_AffineCosts):
-    """Declared physical footprints; all shapes fit, some lack policy headroom."""
+    """Declared physical footprints; all shapes fit, some lack reconfigurator headroom."""
 
     def actor_memory(self, layout, batch):
         long = max(t.input_tokens for e in batch for t in e) >= 2048
@@ -1548,9 +1451,9 @@ def test_memory_reserve_uses_completed_history_beyond_the_serving_window():
     )
     sim.run(until=200)
     view = sim.observe()
-    forecasts = history_policy(history_seconds=120).forecaster.predict(view, 0)
+    forecasts = history_reconfigurator(history_seconds=120).forecaster.predict(view, 0)
     target = OnlineLayout(2, 1, 2, 1)
-    model = OnlineForecastModel(
+    model = Evaluator(
         sim.models,
         sim.config,
         sim.handoff,
@@ -1566,8 +1469,8 @@ def test_memory_reserve_uses_completed_history_beyond_the_serving_window():
     assert guard.worst_batch == tuple(f"episode-{i:02}" for i in range(4))
     assert guard.observed_through == 200
     assert all(e.completed_at < 80 for e in view.episodes[:4])
-    # Same physical simulation remains executable when only the policy margin is off.
-    unguarded = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO)
+    # Same physical simulation remains executable when only the reconfigurator margin is off.
+    unguarded = Evaluator(sim.models, sim.config, sim.handoff, SLO)
     assert unguarded.evaluate(view, forecasts, target).supported
     fallback = replace(keep, worst_request_fraction=0.7)
     assert select_prediction((fallback, shrink), INITIAL, 0.8) == fallback
@@ -1576,7 +1479,7 @@ def test_memory_reserve_uses_completed_history_beyond_the_serving_window():
     assert select_prediction(bounded, INITIAL, 0.8, trigger="slack") == keep
     # The ablation checks only the original evaluator's workload, so the old
     # long batch is never requested and cannot affect this candidate.
-    local = OnlineForecastModel(
+    local = Evaluator(
         sim.models,
         sim.config,
         sim.handoff,
@@ -1594,7 +1497,9 @@ def test_memory_reserve_uses_completed_history_beyond_the_serving_window():
 
 def test_evaluation_reserve_checks_target_calls_without_changing_physical_model():
     """Ordinary evaluated shapes apply headroom to the target Actor only."""
-    from areal.elastic.simulation.online_memory import EvaluationMemoryModels
+    from areal.elastic.reconfigurator.reference.evaluator.evaluator import (
+        EvaluationMemoryModels,
+    )
 
     physical = _HeadroomCosts()
     target = OnlineLayout(2, 1, 2, 1)
@@ -1613,7 +1518,7 @@ def test_evaluation_reserve_checks_target_calls_without_changing_physical_model(
 
 def test_memory_reserve_is_carried_into_latest_state_verification():
     """The measured decision clock uses the same configured guard for revalidation."""
-    controller = history_policy(history_seconds=120)
+    controller = history_reconfigurator(history_seconds=120)
     controller.config = replace(
         controller.config,
         actor_memory_reserve_fraction=0.1,
@@ -1627,9 +1532,10 @@ def test_memory_reserve_is_carried_into_latest_state_verification():
         handoff(),
         SLO,
         input_closes_at=15,
-        policy=controller,
+        reconfigurator=controller,
         measured_search_time=True,
     )
+    assert sim.control is controller
     assert sim.control.model(1).actor_memory_reserve_fraction == 0.1
     assert sim.control.model(1).actor_memory_scope == "evaluation"
 
@@ -1642,8 +1548,10 @@ def test_actor_supply_counts_waiting_arrivals_and_preserves_credit_clock():
         view = sim.observe()
         recent = [e for e in view.episodes if 180 <= e.available_at < 300]
         assert any(not e.admitted for e in recent)
-        forecasts = history_policy(history_seconds=120).forecaster.predict(view, 0)
-        model = OnlineForecastModel(sim.models, sim.config, sim.handoff, sim.slo)
+        forecasts = history_reconfigurator(history_seconds=120).forecaster.predict(
+            view, 0
+        )
+        model = Evaluator(sim.models, sim.config, sim.handoff, sim.slo)
         score = model.evaluate(view, forecasts, SMALL)
         assert score.actor_supply[0].arrival_rate == pytest.approx(len(recent) / 120)
         assert score.actor_supply[0].offered_episodes == len(recent)
@@ -1714,7 +1622,7 @@ def test_window_cost_separates_old_rollout_overlap_from_target_residency(horizon
         HistoryReplayConfig(history_seconds=horizon, max_new_tokens=4096)
     ).predict(view, 0)
     target = OnlineLayout(4, 2, 4, 1)
-    model = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO)
+    model = Evaluator(sim.models, sim.config, sim.handoff, SLO)
     keep, change = model.evaluate_many(view, forecasts, (INITIAL, target))
     assert keep.supported and change.supported
     assert keep.switching_gpu_seconds == 0
@@ -1751,7 +1659,7 @@ def test_fixed_serving_window_does_not_drain_late_requests(tail_output):
     )
     sim.run(until=5)
     view = sim.observe()
-    original = history_policy().forecaster.predict(view, 0)[0]
+    original = history_reconfigurator().forecaster.predict(view, 0)[0]
     forecast = replace(
         original,
         episodes=tuple(
@@ -1761,7 +1669,7 @@ def test_fixed_serving_window_does_not_drain_late_requests(tail_output):
         )
         + (EpisodeSample("late", "math", 24.999, (Turn(16, tail_output),)),),
     )
-    score = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO).evaluate(
+    score = Evaluator(sim.models, sim.config, sim.handoff, SLO).evaluate(
         view, (forecast,), INITIAL
     )
     assert score.supported
@@ -1787,7 +1695,7 @@ def test_fixed_serving_window_counts_overdue_pending_admission_as_failure():
     )
     sim.run(until=5)
     view = sim.observe()
-    original = history_policy().forecaster.predict(view, 0)[0]
+    original = history_reconfigurator().forecaster.predict(view, 0)[0]
     forecast = replace(
         original,
         episodes=tuple(
@@ -1800,7 +1708,7 @@ def test_fixed_serving_window_counts_overdue_pending_admission_as_failure():
             EpisodeSample("queued", "math", 5.2, (Turn(16, 1),)),
         ),
     )
-    score = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO).evaluate(
+    score = Evaluator(sim.models, sim.config, sim.handoff, SLO).evaluate(
         view, (forecast,), INITIAL
     )
     assert score.supported and score.pending_requests == 2
@@ -1829,7 +1737,7 @@ def test_history_evaluation_retains_slo_failures_and_checks_actor_capacity():
     replay = HistoricalReplay(HistoryReplayConfig(max_new_tokens=4096)).predict(
         sim.observe(), 0
     )
-    score = OnlineForecastModel(
+    score = Evaluator(
         sim.models, sim.config, sim.handoff, ServingSLO(5, 0.1, 0.8)
     ).evaluate(sim.observe(), replay, INITIAL)
     assert score.supported and score.worst_request_fraction < 0.8
@@ -1853,7 +1761,7 @@ def test_history_evaluation_retains_slo_failures_and_checks_actor_capacity():
             history_seconds=1, initial_regime_seconds=1, max_new_tokens=4096
         )
     ).predict(view, 0)
-    evaluator = OnlineForecastModel(
+    evaluator = Evaluator(
         blocked.models, blocked.config, blocked.handoff, ServingSLO(5, 0.1, 0.8)
     )
     old, repair = (
@@ -1867,11 +1775,11 @@ def test_history_evaluation_retains_slo_failures_and_checks_actor_capacity():
     assert replay[0].replay.expected_remaining_seconds == 1
 
 
-def test_history_policy_completes_equal_work_from_eight_plus_eight():
+def test_history_reconfigurator_completes_equal_work_from_eight_plus_eight():
     """The real replay evaluator preserves ordered training and conservative costs."""
     workload = episodes(32, spacing=1)
     baseline = simulation(workload).run()
-    dynamic = simulation(workload, policy=history_policy())
+    dynamic = simulation(workload, reconfigurator=history_reconfigurator())
     result = dynamic.run()
     assert baseline["status"] == result["status"] == "complete"
     assert result["completed_updates"] == 8 and result["trained_episodes"] == 32
@@ -1896,7 +1804,9 @@ def test_history_decisions_are_independent_of_unseen_future():
             ),
             EpisodeSample("future", "math", future_at, (Turn(16, 1),)),
         )
-        sim = simulation(workload, policy=history_policy(history_seconds=0.2))
+        sim = simulation(
+            workload, reconfigurator=history_reconfigurator(history_seconds=0.2)
+        )
         sim.run(until=0.8)
         prefixes.append(
             [
@@ -1931,12 +1841,12 @@ def test_bounded_search_matches_exhaustive_historical_selection(ttft, trigger):
     sim = simulation(episodes(16))
     sim.run(until=5)
     view = sim.observe()
-    forecasts = history_policy().forecaster.predict(view, 0)
+    forecasts = history_reconfigurator().forecaster.predict(view, 0)
     # Two equal replay samples check mean-cost and worst-fraction aggregation.
     forecasts = forecasts + (replace(forecasts[0], seed=1),)
     layouts = (INITIAL, SMALL, OnlineLayout(2, 2, 4, 1), OnlineLayout(1, 1, 1, 1))
     slo = ServingSLO(ttft, 0.1, 0.8)
-    model = OnlineForecastModel(sim.models, sim.config, sim.handoff, slo)
+    model = Evaluator(sim.models, sim.config, sim.handoff, slo)
     exhaustive = model.evaluate_many(view, forecasts, layouts)
     bounded = model.search(view, forecasts, layouts, trigger=trigger)
     assert select_prediction(
@@ -1961,7 +1871,7 @@ def test_unchanged_search_evidence_is_reused_until_refresh_or_resource_change():
     sim = simulation(episodes(16))
     sim.run(until=5)
     view = sim.observe()
-    controller = history_policy(history_seconds=5)
+    controller = history_reconfigurator(history_seconds=5)
     scores = _ScoredReplay({INITIAL: (0.9, 100, 200), SMALL: (0.9, 110, 150)})
     first = controller.decide(view, scores)
     repeated = controller.decide(replace(view, now=5.2), scores)
@@ -1982,7 +1892,7 @@ def test_observed_burst_or_changed_cpu_delay_bypasses_search_deduplication():
     )
     sim = simulation(work)
     sim.run(until=5)
-    controller = history_policy(history_seconds=5)
+    controller = history_reconfigurator(history_seconds=5)
     controller.config = replace(controller.config, cooldown_seconds=60)
     scores = _ScoredReplay({INITIAL: (0.9, 100, 200), SMALL: (0.9, 110, 150)})
     original = sim.observe()
@@ -2061,11 +1971,13 @@ def test_normal_publication_keeps_candidate_and_hands_off_latest_state(
     sim.run(until=3.2)
     view = sim.observe()
     assert view.actor.batch and view.training_version == 0
-    sim.policy = history_policy()
-    sim.policy.config = replace(
-        sim.policy.config, check_interval_seconds=10, decision_delay_seconds=0.05
+    sim.reconfigurator = history_reconfigurator()
+    sim.reconfigurator.config = replace(
+        sim.reconfigurator.config,
+        check_interval_seconds=10,
+        decision_delay_seconds=0.05,
     )
-    control = sim.control = OnlineControl(sim, clock=_DecisionClock(0))
+    control = sim.control = sim.reconfigurator.bind(sim, clock=_DecisionClock(0))
     regime = control.observe_history(view)
     scores = Scores({INITIAL: (1.0, 100, 100), SMALL: (1.0, 50, 50)})
     predictions = scores.evaluate_many(view, (), (INITIAL, SMALL))
@@ -2114,11 +2026,11 @@ def test_normal_publication_keeps_candidate_and_hands_off_latest_state(
 
 @pytest.mark.parametrize("interval", [1, 2.5])
 @pytest.mark.parametrize("measured_search_time", [False, True])
-def test_policy_observes_at_the_configured_seconds_interval(
+def test_reconfigurator_observes_at_the_configured_seconds_interval(
     interval, measured_search_time
 ):
     """Both control paths check at x, 2x, ... without hidden extra checks."""
-    controller = history_policy()
+    controller = history_reconfigurator()
     controller.config = replace(
         controller.config,
         check_interval_seconds=interval,
@@ -2133,7 +2045,7 @@ def test_policy_observes_at_the_configured_seconds_interval(
         handoff(),
         controller.slo,
         input_closes_at=63,
-        policy=controller,
+        reconfigurator=controller,
         measured_search_time=measured_search_time,
         search_clock=_DecisionClock(0),
     )
@@ -2146,7 +2058,7 @@ def test_policy_observes_at_the_configured_seconds_interval(
 def test_measured_decisions_allow_serving_and_apply_only_after_latest_verification():
     """Old GPUs keep working while CPU search and revalidation consume time."""
     workload = episodes(16, spacing=3, output=220)
-    controller = history_policy()
+    controller = history_reconfigurator()
     controller.config = replace(controller.config, check_interval_seconds=1)
     controller.forecaster = HistoricalReplay(
         replace(controller.forecaster.config, feature_window_seconds=10)
@@ -2160,7 +2072,7 @@ def test_measured_decisions_allow_serving_and_apply_only_after_latest_verificati
         handoff(),
         SLO,
         input_closes_at=45,
-        policy=controller,
+        reconfigurator=controller,
         measured_search_time=True,
         search_clock=_DecisionClock(0.3),
         event_sink=serving_events.append,
@@ -2208,7 +2120,7 @@ def test_finite_work_does_not_wait_for_irrelevant_cpu_search():
         handoff(),
         SLO,
         input_closes_at=7,
-        policy=history_policy(history_seconds=1),
+        reconfigurator=history_reconfigurator(history_seconds=1),
         measured_search_time=True,
         search_clock=_DecisionClock(100),
     )
@@ -2240,7 +2152,7 @@ def test_measured_decision_prefix_cannot_read_hidden_future_work():
             handoff(),
             SLO,
             input_closes_at=future_at,
-            policy=history_policy(history_seconds=0.2),
+            reconfigurator=history_reconfigurator(history_seconds=0.2),
             measured_search_time=True,
             search_clock=_DecisionClock(0.1),
         )

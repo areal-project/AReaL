@@ -32,7 +32,7 @@ from areal.infra.utils.http import async_http_retry, create_httpx_client
 
 if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler, Worker
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
 from areal.api.cli_args import InferenceEngineConfig
 from areal.api.io_struct import LocalInfServerInfo
@@ -862,7 +862,7 @@ class RolloutControllerV2:
 
         @app.route("/callback/online_admit", methods=["POST"])
         def online_admit():
-            from areal.elastic.state.episode_inbox import (
+            from areal.elastic.infra.state.episode_inbox import (
                 AdmissionFull,
                 AdmissionPaused,
             )

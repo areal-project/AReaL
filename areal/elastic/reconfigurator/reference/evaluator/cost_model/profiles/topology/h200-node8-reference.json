@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "kind": "topology",
+  "id": "h200-node8-reference",
+  "version": "1",
+  "values": {
+    "hardware_profile": "h200-sxm-reference",
+    "hardware": {
+      "name": "H200-SXM-8GPU-reference-prior",
+      "intra_node_gbps": 450,
+      "inter_node_gbps": 50,
+      "gpus_per_node": 8,
+      "intra_latency_us": 3,
+      "inter_latency_us": 12
+    },
+    "nodes": {
+      "node0": [
+        "node0/gpu0",
+        "node0/gpu1",
+        "node0/gpu2",
+        "node0/gpu3",
+        "node0/gpu4",
+        "node0/gpu5",
+        "node0/gpu6",
+        "node0/gpu7"
+      ]
+    },
+    "group_gbps": []
+  },
+  "provenance": {
+    "source": "https://www.nvidia.com/en-us/data-center/h200/",
+    "checked": "2026-10-20",
+    "evidence": "assumed reference topology; not company cluster telemetry",
+    "intra_node_gbps": "One-direction prior 450 = vendor aggregate 900 / 2 GB/s; actual collectives may differ",
+    "inter_node_gbps": "Explicit 400 Gb/s per-GPU scenario prior; cannot infer this from GPU model",
+    "latencies": "Unmeasured analytical priors in microseconds",
+    "calibration": "No H20 coefficients transferred; host/offload and RPC rates remain explicit unmeasured priors"
+  }
+}

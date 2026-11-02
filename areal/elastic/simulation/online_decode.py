@@ -9,12 +9,16 @@ import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from areal.elastic.policy.basic.observations import ServiceView
-from areal.elastic.policy.reference.cost_model._rollout.scheduling import policy_for
-from areal.elastic.policy.reference.cost_model._rollout.types import ServiceSlice
+from areal.elastic.contracts import ServiceView
+from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import (
+    ServiceSlice,
+)
+from areal.elastic.reconfigurator.reference.evaluator.cost_model.rollout.scheduling import (
+    scheduler_for,
+)
 
 if TYPE_CHECKING:
-    from .simulation_core import SimulationCore
+    from areal.elastic.simulation.simulation_core import SimulationCore
 
 
 @dataclass(frozen=True)
@@ -122,7 +126,7 @@ def advance_decode(sim: SimulationCore, until: float | None) -> None:
             # can enter or change priority before a membership revision.
             same_members = len(batch.slices) == len(group.rows)
             if not same_members:
-                upcoming, _ = policy_for(cfg.backend).batch(
+                upcoming, _ = scheduler_for(cfg.backend).batch(
                     cfg, list(group.rows.values())
                 )
                 same_members = tuple(
@@ -133,7 +137,7 @@ def advance_decode(sim: SimulationCore, until: float | None) -> None:
                     for key, _, query, phase, emits in batch.slices
                 )
             if same_members:
-                # Lengths belong to this simulator's workload, never the policy.
+                # Lengths belong to this simulator's workload, never the reconfigurator.
                 selected = [sim.requests[s[0]] for s in batch.slices]
                 remaining = min(
                     sim._truth[r.view.episode_id].turns[r.view.turn].output_tokens

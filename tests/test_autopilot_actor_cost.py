@@ -5,8 +5,6 @@
 import ast
 import bisect
 import json
-import math
-import os
 import random
 import shutil
 from dataclasses import fields, replace
@@ -15,53 +13,17 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from areal.autopilot.domains.elastic.model_adapters import (
-    ACTOR_BOUNDARY,
-    BasicHistoryPredictor,
-)
-from areal.autopilot.domains.elastic.model_evaluator import HistoricalInput
-from areal.elastic.monitor.trace import (
+from examples.profile import cost_model_tools
+
+from areal.elastic.contracts import WorkloadStats
+from areal.elastic.infra.monitor.trace import (
     actor_trace_times,
     parse_microbatch_log,
     stage_metrics,
     trace_events,
 )
-from areal.elastic.policy import reference as expert
-from areal.elastic.policy.basic.cost_model import (
-    ActorComponents,
-    ActorConfig,
-    ActorCostModel,
-    Efficiency,
-    Parallel,
-    ParallelLayout,
-    Scale,
-    Serial,
-    WorkloadStats,
-    hardware_profile,
-    qwen3_30b_a3b,
-    trial_config,
-)
-from areal.elastic.policy.basic.cost_model.calibration import (
-    Calibration,
-    bundled_calibration,
-    point_inputs,
-    public_validation,
-)
-from areal.elastic.policy.basic.cost_model.catalog import DATA, read_data
-from areal.elastic.policy.basic.cost_model.components import (
-    Communications,
-    Constant,
-    Context,
-    Operators,
-    Optimizer,
-    Transformer,
-)
-from areal.elastic.policy.basic.cost_model.packing import (
-    _pad,
-    balanced_partition,
-    ffd,
-    plan_workload,
-)
+from areal.elastic.reconfigurator import reference as expert
+from areal.elastic.reconfigurator.reference.identity import fingerprint
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -69,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def qwen4b_components(*, dp=1, tp=1, replicas=1, rollout_tp=1):
     return expert.Catalog().assemble(
         hardware="h20",
-        system="h20-actor8-rollout8",
+        topology="h20-two-node8",
         model="qwen3-4b-instruct-2507",
         actor="megatron-qwen3-4b-ppo",
         rollout="sglang-qwen3-4b",
@@ -77,6 +39,10 @@ def qwen4b_components(*, dp=1, tp=1, replicas=1, rollout_tp=1):
         rollout_tp=rollout_tp,
         rollout_replicas=replicas,
         kv_capacity_tokens=65536,
+        resource_pools={
+            "actor": tuple(f"node0/gpu{i}" for i in range(8)),
+            "rollout": tuple(f"node1/gpu{i}" for i in range(8)),
+        },
     )
 
 
@@ -84,7 +50,7 @@ def test_expert_qwen4b_model_and_megatron_recipe_match_target():
     """Dense Qwen3 dimensions include shared embedding and no router weights."""
     bundle = qwen4b_components(dp=3)
     shape = bundle.actor.model
-    assert shape.total_parameters == 4_022_468_096
+    assert shape.total_parameters == 4022468096
     assert shape.mlp_type == "dense" and shape.tied_embeddings
     assert shape.router_parameters_per_layer == 0
     parsed = expert.ActorConfig.from_areal(
@@ -117,27 +83,56 @@ def test_expert_qwen4b_model_and_megatron_recipe_match_target():
     workload = WorkloadStats(3, 3072, sequence_lengths=(1024,) * 3)
     estimate = bundle.actor.estimate(parsed, workload)
     assert dict(estimate.stages)["train_step"].seconds > 0
-    assert estimate.total.seconds is None  # Unmeasured advantage is not a zero cost.
+    assert estimate.total.seconds is None
+
+
+def test_profile_resource_pools_are_supplied_by_each_assembly():
+    """Changing role assignment leaves the component model and compute recipe intact."""
+    first = qwen4b_components(dp=2, tp=2, replicas=2, rollout_tp=2)
+    swapped = expert.Catalog().assemble(
+        hardware="h20",
+        topology="h20-two-node8",
+        model="qwen3-4b-instruct-2507",
+        actor="megatron-qwen3-4b-ppo",
+        rollout="sglang-qwen3-4b",
+        actor_parallel=expert.ParallelLayout(dp=2, tp=2),
+        rollout_tp=2,
+        rollout_replicas=2,
+        kv_capacity_tokens=65536,
+        resource_pools={
+            "actor": tuple(f"node1/gpu{i}" for i in range(8)),
+            "rollout": tuple(f"node0/gpu{i}" for i in range(8)),
+        },
+    )
+    assert swapped.config.actor_devices == first.config.rollout_devices
+    assert swapped.config.rollout_devices == first.config.actor_devices
+    assert swapped.config.actor == first.config.actor
+    assert swapped.config.rollout == first.config.rollout
+    work = WorkloadStats(4, 512, sequence_lengths=(128,) * 4)
+    assert swapped.actor.estimate(swapped.config.actor, work) == first.actor.estimate(
+        first.config.actor, work
+    )
+    assert swapped.binding != first.binding
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
 def test_expert_dense_tp_partitions_ffn_and_keeps_replicated_norms(tp):
     """Dense weights shard over TP and all gradient traffic uses the true DP group."""
-    from areal.elastic.policy.reference.cost_model._actor.components import (
-        Communications as ExpertCommunications,
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor import (
+        backend_for,
     )
-    from areal.elastic.policy.reference.cost_model._actor.components import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
         Context as ExpertContext,
     )
-    from areal.elastic.policy.reference.cost_model._actor.components import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
         Operators as ExpertOperators,
     )
-    from areal.elastic.policy.reference.cost_model._actor.components import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
         Transformer as ExpertTransformer,
     )
 
     bundle = qwen4b_components(tp=tp)
-    cfg, model = bundle.config.actor, bundle.actor.model
+    cfg, model = (bundle.config.actor, bundle.actor.model)
     op = ExpertOperators(bundle.actor.hardware)
     ctx = ExpertContext(cfg, model, op, model.layers, True, True)
     dense, experts = ctx.owned_parameters
@@ -146,7 +141,6 @@ def test_expert_dense_tp_partitions_ffn_and_keeps_replicated_norms(tp):
     )
     assert experts == 0
     assert tp * dense == model.total_parameters + (tp - 1) * replicated
-    # Changing MoE efficiency cannot change the dense FFN's roofline.
     mb = expert.Microbatch(128, 128, 128**2, 0)
     before = ExpertTransformer().forward(ctx, mb)
     slow_moe = replace(
@@ -157,7 +151,7 @@ def test_expert_dense_tp_partitions_ffn_and_keeps_replicated_norms(tp):
     dp = 2 if tp < 8 else 1
     cfg = replace(cfg, parallel=expert.ParallelLayout(dp=dp, tp=tp))
     ctx = replace(ctx, config=cfg)
-    assert ExpertCommunications().gradient_sync(ctx) == pytest.approx(
+    assert backend_for(ctx.config.backend).gradient_sync(ctx) == pytest.approx(
         op.collective(dense * cfg.grad_bytes, dp, "dense_dp", dp * tp)
     )
 
@@ -166,7 +160,7 @@ def test_expert_dense_tp_partitions_ffn_and_keeps_replicated_norms(tp):
 def test_expert_dense_rollout_reuses_single_replica_calibration_and_kv_width(tp):
     """Per-TP service calibration transfers across replica counts, not phases."""
     bundle = qwen4b_components(rollout_tp=tp)
-    model, cfg = bundle.rollout, bundle.config.rollout
+    model, cfg = (bundle.rollout, bundle.config.rollout)
     multi = replace(cfg, replicas=8 // tp)
     assert model.profile_key(cfg) == model.profile_key(multi)
     batches = {
@@ -185,7 +179,7 @@ def test_expert_dense_rollout_reuses_single_replica_calibration_and_kv_width(tp)
             raw.profile,
             phase,
             index,
-            tuple((key, value, value) for key, value in raw.features),
+            tuple(((key, value, value) for key, value in raw.features)),
             (f"unit-{phase}",),
             timing_boundary=model.timing_boundary,
         )
@@ -199,8 +193,8 @@ def test_expert_new_dense_adapter_preserves_old_moe_numerics():
     """Pre-change 30B vectors are frozen; no calibration is loaded or refitted."""
     catalog = expert.Catalog()
     shape = catalog.model("qwen3-30b-a3b")
-    hardware = catalog.hardware("h20", "h20-8gpu-r10")
-    assert shape.total_parameters == 30_532_122_624
+    hardware = catalog.hardware("h20", "h20-node8-r10")
+    assert shape.total_parameters == 30532122624
     actor = expert.ExpertActorModel(shape, hardware, "old-numeric-audit")
     cfg = expert.ActorConfig(
         "megatron",
@@ -220,236 +214,9 @@ def test_expert_new_dense_adapter_preserves_old_moe_numerics():
 
 @pytest.fixture
 def expert_catalog_copy(tmp_path):
-    source = Path(expert.__file__).parent
+    source = expert.Catalog().root
     shutil.copytree(source / "profiles", tmp_path / "profiles")
     return expert.Catalog(tmp_path)
-
-
-def r10_catalog():
-    """Historical inputs are optional; an explicitly selected archive must exist."""
-    selected = os.environ.get("AREAL_TEST_EXPERT_CATALOG")
-    catalog = (
-        expert.Catalog(Path(selected).expanduser()) if selected else expert.Catalog()
-    )
-    if "r10" not in catalog.names("trials"):
-        if selected:
-            pytest.fail(
-                "AREAL_TEST_EXPERT_CATALOG does not contain trials/r10/manifest.json"
-            )
-        pytest.skip(
-            "Optional R10 archive: set AREAL_TEST_EXPERT_CATALOG to run this test"
-        )
-    return catalog
-
-
-@pytest.fixture
-def expert_trial_copy(expert_catalog_copy):
-    shutil.copytree(r10_catalog().root / "trials", expert_catalog_copy.root / "trials")
-    return expert_catalog_copy
-
-
-def test_expert_catalog_archives_resolved_r10_inputs_and_observations():
-    catalog = r10_catalog()
-    assert catalog.names("hardware") == ("h20", "h200-sxm-reference")
-    assert "r10" in catalog.names("trials")
-    trial = catalog.trial("r10")
-    assert trial.verify()["data_files"] == 14
-    assembled = trial.models()
-    assert assembled.config.actor.parallel.dp == 4
-    assert assembled.config.rollout.world_size == 4
-    assert assembled.raw_actor.hardware.memory_gb == 97871 * 2**20 / 1e9
-    assert assembled.raw_actor.model.experts == 128
-    assert assembled.raw_actor.fsdp_host_rates.source_ids == (
-        "explicit-unmeasured-host-prior",
-    )
-    assert len(trial.read("sample_observations")) == 324
-    requests = trial.read("request_observations")
-    assert len(requests) == 2286
-    assert sum(row["output_tokens"] for row in requests) == 1_112_248
-    assert len({(row["episode_id"], row["index"]) for row in requests}) == len(requests)
-    groups = trial.read("group_observations")
-    assert len(groups) == 81
-    assert sum(row["completed"] is not None for row in groups) == 77
-    assert sum(row["export"] is not None for row in groups) == 69
-
-
-def test_expert_catalog_loads_frozen_coefficients_without_fitting(monkeypatch):
-    def no_fit(*args, **kwargs):
-        raise AssertionError("Archive loading must not fit labels")
-
-    monkeypatch.setattr(expert.PhaseCalibration, "fit", no_fit)
-    monkeypatch.setattr(expert.AggregateAdvantageModel, "fit", no_fit)
-    trial = r10_catalog().trial("r10")
-    models = trial.models()
-    archived = trial.read("calibration")
-    for phase, stored in zip(
-        models.actor.calibration, archived["actor"]["phase_scales"], strict=True
-    ):
-        assert phase.scale == stored["scale"]
-        assert phase.bounds == tuple(tuple(v) for v in stored["bounds"])
-        assert phase.sample_ids == tuple(stored["sample_ids"])
-        assert phase.profile == models.actor.profile_key(models.config.actor)
-    assert models.rpc_timing.service_scale == archived["rpc"]["service_scale"]
-    assert models.rpc_timing.response_seconds == archived["rpc"]["response_seconds"]
-    assert (
-        models.rpc_timing.response_delay(models.rpc_timing.profile, 791, 976).evidence
-        == "assumed"
-    )
-    assert r10_catalog().trial("r10").models(calibrated=False).rpc_timing is None
-
-
-def test_expert_catalog_preserves_strict_coverage_and_explicit_diagnostic_fallback():
-    trial = r10_catalog().trial("r10")
-    assembled = trial.models()
-    unsupported = []
-    for row in trial.read("batch_observations"):
-        lengths = tuple(row["sequence_lengths"])
-        work = WorkloadStats(
-            16,
-            sum(lengths),
-            min_seq_len=min(lengths),
-            max_seq_len=max(lengths),
-            loss_tokens=row["loss_tokens"],
-            sequence_lengths=lengths,
-            trajectory_group_sizes=(4,) * 4,
-            trajectory_dispatch_weights=tuple(row["trajectory_dispatch_weights"]),
-        )
-        if assembled.actor.estimate(assembled.config.actor, work).total.seconds is None:
-            unsupported.append(row["step"])
-    assert unsupported == [9, 11, 16]
-    strict_models, scenario, plan = trial.simulation()
-    diagnostic, zero, zero_plan = trial.simulation(
-        cleanup_seconds=0, diagnostic_fallback=True
-    )
-    assert (
-        strict_models.actor is not None
-        and strict_models.actor == diagnostic.actor.bounded
-    )
-    assert len(scenario.groups) == len(zero.groups) == 77
-    assert len(plan) == len(zero_plan) == 16
-    assert plan[-1].checkpoint and not any(p.checkpoint for p in plan[:-1])
-    assert scenario.staleness == 2 and scenario.workflow == "v2_inline"
-    assert (
-        sum(isinstance(n, expert.Request) for g in scenario.groups for n in g.nodes)
-        == 2286
-    )
-    cleanups = [
-        n
-        for g in scenario.groups
-        for n in g.nodes
-        if isinstance(n, expert.ExternalCall) and n.pool == "cleanup"
-    ]
-    assert len(cleanups) == 308 and all(n.duration.seconds == 30 for n in cleanups)
-    assert all(
-        n.duration.seconds == 0
-        for g in zero.groups
-        for n in g.nodes
-        if isinstance(n, expert.ExternalCall) and n.pool == "cleanup"
-    )
-    with pytest.raises(ValueError, match="nonnegative"):
-        trial.simulation(cleanup_seconds=-1)
-
-
-@pytest.mark.parametrize("key", ["request_observations", "groups"])
-def test_expert_catalog_rejects_changed_numeric_or_compressed_data(
-    expert_trial_copy, key
-):
-    trial = expert_trial_copy.trial("r10")
-    path = trial.root / trial.manifest()["data"][key]["path"]
-    path.write_bytes(path.read_bytes() + b" ")
-    with pytest.raises(ValueError, match="content hash mismatch"):
-        trial.read(key)
-
-
-def test_expert_catalog_rejects_profile_changes_and_unreviewed_formulas(
-    expert_trial_copy, monkeypatch
-):
-    import areal.elastic.policy.reference.catalog as catalog_module
-
-    trial = expert_trial_copy.trial("r10")
-    monkeypatch.setattr(catalog_module, "code_revision", lambda: "unreviewed-formula")
-    with pytest.raises(ValueError, match="compatibility audit"):
-        trial.models()
-    assert trial.models(calibrated=False).rpc_timing is None
-    path = expert_trial_copy.root / "profiles/hardware/h20.json"
-    value = json.loads(path.read_text())
-    value["values"]["bf16_tflops"] *= 2
-    path.write_text(json.dumps(value))
-    with pytest.raises(ValueError, match="content hash mismatch"):
-        trial.configuration()
-
-
-def test_expert_catalog_accepts_new_model_profile_but_rejects_old_calibration(
-    expert_trial_copy,
-):
-    import hashlib
-
-    path = expert_trial_copy.root / "profiles/models/qwen3-30b-a3b.json"
-    value = json.loads(path.read_text())
-    value["id"] = "another-qwen3-moe"
-    value["values"]["shape"]["layers"] += 1
-    value["values"]["hf_config"]["num_hidden_layers"] += 1
-    other = path.with_name("another-qwen3-moe.json")
-    other.write_text(json.dumps(value))
-    assert expert_trial_copy.model("another-qwen3-moe").layers == 49
-    assert expert_trial_copy.model("qwen3-30b-a3b").layers == 48
-    trial = expert_trial_copy.trial("r10")
-    manifest = trial.manifest()
-    manifest["profiles"]["model"] = {
-        "name": value["id"],
-        "sha256": hashlib.sha256(other.read_bytes()).hexdigest(),
-    }
-    (trial.root / "manifest.json").write_text(json.dumps(manifest))
-    assert trial.models(calibrated=False).raw_actor.model.layers == 49
-    with pytest.raises(ValueError, match="another resolved trial profile"):
-        trial.models()
-
-
-@pytest.mark.parametrize("name", ["../r10", "/tmp/r10", "r10/name", ""])
-def test_expert_catalog_rejects_nonlocal_trial_names(name):
-    with pytest.raises(ValueError, match="simple identifiers"):
-        expert.Catalog().trial(name)
-
-
-def test_expert_catalog_rejects_escaped_data_reference(expert_trial_copy):
-    trial = expert_trial_copy.trial("r10")
-    manifest = trial.manifest()
-    manifest["data"]["workload"]["path"] = "../manifest.json"
-    (trial.root / "manifest.json").write_text(json.dumps(manifest))
-    with pytest.raises(ValueError, match="inside"):
-        trial.read("workload")
-
-
-def test_expert_catalog_assembles_only_the_hash_verified_profile_snapshot(monkeypatch):
-    original = expert.Catalog.profile
-
-    def changing_profile(self, kind, name, *, sha256=None):
-        value = original(self, kind, name, sha256=sha256)
-        if sha256 is None:
-            if kind == "hardware":
-                value["values"]["bf16_tflops"] *= 2
-            elif kind == "rollout":
-                value["values"]["config"]["max_batch_sequences"] *= 2
-        return value
-
-    monkeypatch.setattr(expert.Catalog, "profile", changing_profile)
-    trial = r10_catalog().trial("r10")
-    assembled = trial.models()
-    assert assembled.raw_actor.hardware.bf16_tflops == 148
-    assert assembled.config.rollout.max_batch_sequences == 4
-    assert trial.configuration() == assembled.config
-
-
-def test_expert_catalog_rejects_unreviewed_numpy_environment(monkeypatch):
-    import areal.elastic.policy.reference.catalog as catalog_module
-
-    monkeypatch.setattr(
-        catalog_module, "numerical_environment", lambda: {"numpy": "unreviewed"}
-    )
-    trial = r10_catalog().trial("r10")
-    with pytest.raises(ValueError, match="compatibility audit"):
-        trial.models()
-    assert trial.models(calibrated=False).actor.calibration == ()
 
 
 def test_expert_catalog_rejects_model_dimensions_inconsistent_with_hf_config(
@@ -463,13 +230,18 @@ def test_expert_catalog_rejects_model_dimensions_inconsistent_with_hf_config(
         expert_catalog_copy.model("qwen3-30b-a3b")
 
 
-def test_expert_catalog_rejects_unknown_rollout_policy(expert_catalog_copy):
-    path = expert_catalog_copy.root / "profiles/rollout/sglang-dp2-tp2.json"
+def test_expert_catalog_rejects_unknown_rollout_scheduler(expert_catalog_copy):
+    path = (
+        expert_catalog_copy.root
+        / "profiles/execution/rollout/sglang-qwen3-30b-a3b.json"
+    )
     value = json.loads(path.read_text())
     value["values"]["policy"] = "another_batching_rule"
     path.write_text(json.dumps(value))
-    with pytest.raises(ValueError, match="scheduling policy"):
-        expert_catalog_copy.rollout("sglang-dp2-tp2")
+    with pytest.raises(ValueError, match="scheduler"):
+        expert_catalog_copy.rollout(
+            "sglang-qwen3-30b-a3b", tp=2, replicas=2, kv_capacity_tokens=65536
+        )
 
 
 def _fsdp_cost_config(**changes):
@@ -513,10 +285,12 @@ def test_expert_fsdp_reads_real_offload_and_optimizer_recipe():
 
 def test_expert_fsdp_packing_and_cpu_work_preserve_microbatch_boundaries(expert_model):
     """PPO calls reset CPU accumulation; checkpointing adds compute, not gathers."""
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.fsdp import (
+        fsdp_work,
+    )
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         plan_workload as expert_plan,
     )
-    from areal.elastic.policy.reference.cost_model.fsdp import fsdp_work
 
     workload = WorkloadStats(8, 8 * 129, per_dp_sequence_lengths=((129, 129),) * 4)
     config = _fsdp_cost_config()
@@ -563,13 +337,13 @@ def test_expert_fsdp_missing_host_rates_remains_unknown(expert_model):
         config, workload, source_profile=expert_model.profile_key(config)
     )
     assert dict(unknown.stages)["train_step"].seconds is None
-    assert dict(unknown.stages)["recompute_logp"].seconds == 0  # Disabled in config.
-    rates = expert.FSDPHostRates(8, 7, 20, 0.00001, 0.001, ("unit-only",))
+    assert dict(unknown.stages)["recompute_logp"].seconds == 0
+    rates = expert.FSDPHostRates(8, 7, 20, 1e-05, 0.001, ("unit-only",))
     model = replace(expert_model, fsdp_host_rates=rates)
     known = model.estimate(config, workload, source_profile=model.profile_key(config))
     assert dict(known.stages)["train_step"].seconds > 0
     assert known.host_memory_gb[0] == pytest.approx(
-        expert_model.model.total_parameters / 4 * 10 / 1e9
+        expert_model.model.total_parameters / 4 * 10 / 1000000000.0
     )
     assert known.static_memory_gb == (0,)
     assert model.profile_key(config) != expert_model.profile_key(config)
@@ -578,16 +352,16 @@ def test_expert_fsdp_missing_host_rates_remains_unknown(expert_model):
 
 def test_expert_fsdp_checkpoint_does_not_gather_a_third_time(expert_model):
     """PyTorch PRE_BACKWARD suppresses checkpoint forward hooks."""
-    from areal.elastic.policy.reference.cost_model._actor.components import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
         Context as ExpertContext,
     )
-    from areal.elastic.policy.reference.cost_model._actor.components import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
         Operators as ExpertOperators,
     )
-    from areal.elastic.policy.reference.cost_model._actor.components import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
         Transformer as ExpertTransformer,
     )
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         Microbatch,
     )
 
@@ -634,9 +408,9 @@ def test_expert_fsdp_publish_stages_are_serial_and_unknowns_stay_unknown():
     """Staging uses current CPU shards; train service never pays AWEX twice."""
     rates = expert.FSDPHostRates(h2d_gbps=10, transfer_launch_seconds=0.001)
     tasks = expert.fsdp_publish_tasks(
-        parameter_shard_bytes=10e9,
+        parameter_shard_bytes=10000000000.0,
         staging_tensors=2,
-        contiguous_tensor_bytes=1e9,
+        contiguous_tensor_bytes=1000000000.0,
         rates=rates,
         gpu_copy_gbps=100,
         network=expert.Estimate(3, "assumed"),
@@ -649,9 +423,9 @@ def test_expert_fsdp_publish_stages_are_serial_and_unknowns_stay_unknown():
     )
     assert result.duration.seconds == pytest.approx(0.1 + 1 + 0.002 + 0.02 + 3)
     unknown_tasks = expert.fsdp_publish_tasks(
-        parameter_shard_bytes=10e9,
+        parameter_shard_bytes=10000000000.0,
         staging_tensors=2,
-        contiguous_tensor_bytes=1e9,
+        contiguous_tensor_bytes=1000000000.0,
         rates=rates,
         gpu_copy_gbps=None,
         network=expert.Estimate(3, "assumed"),
@@ -663,9 +437,9 @@ def test_expert_fsdp_publish_stages_are_serial_and_unknowns_stay_unknown():
     ).estimate("publish", "same", "same")
     assert unknown.duration.seconds is None
     copy_setup = expert.fsdp_publish_tasks(
-        parameter_shard_bytes=10e9,
+        parameter_shard_bytes=10000000000.0,
         staging_tensors=2,
-        contiguous_tensor_bytes=1e9,
+        contiguous_tensor_bytes=1000000000.0,
         contiguous_tensors=3,
         rates=rates,
         gpu_copy_gbps=100,
@@ -676,7 +450,7 @@ def test_expert_fsdp_publish_stages_are_serial_and_unknowns_stay_unknown():
     assert copy_setup[2].estimate().seconds == pytest.approx(0.023)
     assert replace(copy_setup[2], setup_seconds=None).estimate().seconds is None
     no_copy = expert.fsdp_publish_tasks(
-        parameter_shard_bytes=10e9,
+        parameter_shard_bytes=10000000000.0,
         staging_tensors=2,
         contiguous_tensor_bytes=0,
         contiguous_tensors=0,
@@ -689,13 +463,13 @@ def test_expert_fsdp_publish_stages_are_serial_and_unknowns_stay_unknown():
 
 
 def test_expert_fsdp_collectives_use_one_dp_group_and_each_wrap_startup(expert_model):
-    from areal.elastic.policy.reference.cost_model._actor.components import (
-        Communications as ExpertCommunications,
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor import (
+        backend_for,
     )
-    from areal.elastic.policy.reference.cost_model._actor.components import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
         Context as ExpertContext,
     )
-    from areal.elastic.policy.reference.cost_model._actor.components import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
         Operators as ExpertOperators,
     )
 
@@ -706,7 +480,7 @@ def test_expert_fsdp_collectives_use_one_dp_group_and_each_wrap_startup(expert_m
     ctx = ExpertContext(config, expert_model.model, ops, 4, True, True)
     params = expert_model.model.total_parameters
     groups = expert_model.model.layers + 2
-    comm = ExpertCommunications()
+    comm = backend_for("fsdp")
     assert comm.gradient_sync(ctx) == pytest.approx(
         ops.collective(params * 2, 4, "dense_dp", 4)
         + (groups - 1) * ops.collective(0, 4, "dense_dp", 4)
@@ -721,19 +495,21 @@ def test_expert_fsdp_collectives_use_one_dp_group_and_each_wrap_startup(expert_m
 
 def test_expert_fsdp_resident_shards_count_foreach_gather_input_copy(expert_model):
     """Torch's resident path packs a BF16 shard before collective copy-in."""
-    from areal.elastic.policy.reference.cost_model._actor.components import (
-        Communications as ExpertCommunications,
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor import (
+        backend_for,
     )
-    from areal.elastic.policy.reference.cost_model._actor.components import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.fsdp import (
+        fsdp_work,
+    )
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
         Context as ExpertContext,
     )
-    from areal.elastic.policy.reference.cost_model._actor.components import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
         Operators as ExpertOperators,
     )
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         plan_workload as expert_plan,
     )
-    from areal.elastic.policy.reference.cost_model.fsdp import fsdp_work
 
     config = _fsdp_cost_config(recompute_logprob=True, n_mbs=2)
     resident = replace(config, offload_params=False)
@@ -741,7 +517,6 @@ def test_expert_fsdp_resident_shards_count_foreach_gather_input_copy(expert_mode
     plan = expert_plan(config, workload, expert_model.model.hidden_size)
     offload_work = dict(fsdp_work(config, expert_model.model, plan))
     resident_work = dict(fsdp_work(resident, expert_model.model, plan))
-    # One local BF16 read and write per gather, twice per train microbatch.
     local_copy = 2 * 2 * expert_model.model.total_parameters / config.parallel.dp
     assert dict(resident_work["recompute_logp"])["ag_copy_logical_bytes"] - dict(
         offload_work["recompute_logp"]
@@ -756,7 +531,7 @@ def test_expert_fsdp_resident_shards_count_foreach_gather_input_copy(expert_mode
     context = ExpertContext(
         config, expert_model.model, operators, expert_model.model.layers, True, True
     )
-    comm = ExpertCommunications()
+    comm = backend_for("fsdp")
     assert comm.parameter_gather(
         replace(context, config=resident)
     ) - comm.parameter_gather(context) == pytest.approx(operators.memory(local_copy))
@@ -771,8 +546,10 @@ def test_expert_fsdp_cpu_offload_keeps_gpu_working_memory_bounds(expert_model):
     )
     assert prediction.static_memory_gb == (0,)
     bounds = dict(prediction.gpu_working_set_lower_bounds_gb)
-    assert bounds["largest_bf16_logits"] == 512 * model.model.vocab_size * 2 / 1e9
-    assert all(stage.feasibility == "unknown" for _, stage in prediction.stages)
+    assert (
+        bounds["largest_bf16_logits"] == 512 * model.model.vocab_size * 2 / 1000000000.0
+    )
+    assert all((stage.feasibility == "unknown" for _, stage in prediction.stages))
     tiny = replace(
         model, hardware=replace(model.hardware, memory_gb=min(bounds.values()) / 2)
     )
@@ -789,102 +566,6 @@ def test_expert_fsdp_cpu_offload_keeps_gpu_working_memory_bounds(expert_model):
     assert dict(resident.stages)["train_step"].seconds > 0
     assert resident.host_memory_gb == (0.0,)
     assert resident.static_memory_gb[0] > 0
-
-
-@pytest.fixture
-def model():
-    return ActorCostModel(qwen3_30b_a3b(), hardware_profile("h200_sxm_reference"))
-
-
-@pytest.fixture
-def workload():
-    return WorkloadStats(128, 128 * 4096, min_seq_len=1024, max_seq_len=8192)
-
-
-def test_model_shape_matches_frozen_hf_config():
-    """Active MoE compute and full weight storage must use different dimensions."""
-    shape = qwen3_30b_a3b()
-    assert shape.attention_parameters_per_layer == 18_874_368
-    assert shape.expert_parameters_per_layer == 603_979_776
-    assert shape.layers == 48 and shape.top_k == 8 and shape.experts == 128
-    assert 30e9 < shape.total_parameters < 31e9
-    assert len(read_data("qwen3_30b_a3b.json")["source_sha256"]) == 64
-
-
-@pytest.mark.parametrize(
-    "trial,expected",
-    [
-        ("S031", (4, 2, 4, 1, 4, 2)),
-        ("S029", (4, 4, 1, 2, 8, 4)),
-        ("S026", (32, 1, 1, 1, 1, 32)),
-        ("T0390", (8, 4, 1, 1, 4, 8)),
-    ],
-)
-def test_trial_geometry_matches_screenshot(trial, expected):
-    """EP replaces other dimensions; it is not multiplied into world_size."""
-    config = trial_config(trial)
-    p = config.parallel
-    assert (p.dp, p.tp, p.pp, p.cp, p.ep, p.expert_dp) == expected
-    assert p.world_size == 32
-    assert config.pad_to_maximum and config.max_tokens_per_mb == 32768
-    assert config.n_mbs == 1
-
-
-def test_nine_trials_include_duplicates_without_deleted_trial(model, workload):
-    """The screenshot contains nine names but four distinct actor layouts."""
-    rows = read_data("trials.json")["trials"]
-    assert {row["id"] for row in rows} == {
-        "S031",
-        "S029",
-        "S026",
-        "S030",
-        "T0390",
-        "S028",
-        "S025",
-        "S013",
-        "S024",
-    }
-    times = {
-        row["id"]: model.predict(trial_config(row["id"]), workload) for row in rows
-    }
-    assert times["S031"] == times["S030"] == times["S013"]
-    assert times["S029"] == times["S028"]
-    assert times["T0390"] == times["S025"] == times["S024"]
-
-
-@pytest.mark.parametrize(
-    "allocation",
-    [
-        "megatron:(attn:d4p4t2|ffn:d3p4e4)",
-        "archon:(attn:d4t4|ffn:e3)",
-        "archon:(attn:d4|ffn:e4",
-        "archon:attn:d4|ffn:e4)",
-        "archon:(attn:d4d4|ffn:e4)",
-    ],
-)
-def test_bad_layout_is_rejected(allocation):
-    """Malformed allocations cannot silently turn into another GPU count."""
-    with pytest.raises(ValueError):
-        ParallelLayout.from_allocation(allocation)
-
-
-def test_resolved_config_maps_source_defaults_and_checkpoint_mode():
-    """Unknown selective checkpoint work is a declared prior, not full recompute."""
-    data = {
-        "actor": {
-            "backend": "archon:(attn:d8t4|ffn:d8e4)",
-            "mb_spec": {"max_tokens_per_mb": 32768},
-            "gradient_checkpointing": True,
-            "archon": {"ac_mode": "selective", "selective_ac_option": "2"},
-        }
-    }
-    cfg = ActorConfig.from_areal(data)
-    assert cfg.checkpoint_recompute_fraction == 0.5
-    assert cfg.pad_to_maximum is False  # Actual TrainEngineConfig default.
-    assert cfg.expert_dispatcher == "alltoall"
-    data["actor"]["archon"]["fp8_config"] = {"mode": "blockwise"}
-    with pytest.raises(ValueError, match="FP8"):
-        ActorConfig.from_areal(data)
 
 
 def test_metrics_adapter_does_not_confuse_loss_and_outer_padding():
@@ -938,220 +619,6 @@ def test_exact_lengths_reject_inconsistent_stats():
         WorkloadStats(0, 7)
 
 
-def test_value_packing_matches_actual_areal_source():
-    """Execute only the CPU allocation functions from current source as an oracle."""
-    tree = ast.parse((ROOT / "areal/utils/seqpack.py").read_text())
-    names = {"_ffd_allocate", "ffd_allocate", "balanced_greedy_partition"}
-    functions = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in names
-    ]
-    namespace = {"np": np, "bisect": bisect}
-    exec(
-        compile(
-            ast.Module(body=functions, type_ignores=[]),
-            "AReaL seqpack allocation",
-            "exec",
-        ),
-        namespace,
-    )
-    rng = random.Random(127)
-    for _ in range(50):
-        lengths = rng.sample(range(1, 500), 32)
-        actual = namespace["ffd_allocate"](lengths, 1200, 4, 2)
-        expected_values = sorted(sorted(lengths[i] for i in group) for group in actual)
-        assert (
-            sorted(sorted(group) for group in ffd(lengths, 1200, 4, 2))
-            == expected_values
-        )
-        assert ffd(lengths, 1200, 4, 2) == [
-            [lengths[i] for i in group]
-            for group in sorted(sorted(group) for group in actual)
-        ]
-        groups = namespace["balanced_greedy_partition"](lengths, 4)
-        assert balanced_partition(lengths, 4) == [
-            [lengths[i] for i in group] for group in groups
-        ]
-
-
-def test_padding_includes_one_quadratic_dummy_segment():
-    """Packed padding is computed by attention, even though loss strips it."""
-    cfg = ActorConfig(
-        "archon", ParallelLayout(), max_tokens_per_mb=32768, pad_to_maximum=True
-    )
-    mb = _pad([2048, 4096], cfg, 2048)
-    assert mb.compute_tokens == 32768
-    assert mb.attention_length_squared == 2048**2 + 4096**2 + (32768 - 6144) ** 2
-    assert _pad([513], replace(cfg, pad_to_maximum=False), 2048).compute_tokens == 1024
-
-
-def test_megatron_pipeline_overrides_n_mbs_one(workload):
-    """PP4 enforces eight microbatches and PP divisibility for both passes."""
-    cfg = replace(trial_config("S031"), recompute_logprob=True)
-    plan = plan_workload(cfg, workload, 2048)
-    assert len(plan.train[0][0]) == 8 and len(plan.logprob[0]) == 8
-    assert plan.train_compute_tokens == 4 * 8 * 32768
-    with pytest.raises(ValueError, match="too few"):
-        plan_workload(cfg, WorkloadStats(16, 16 * 4096), 2048)
-
-
-def test_prompt_batch_is_not_inferred_as_actor_sequences():
-    """A prompt batch of 16 is not enough to infer PP4 actor microbatch count."""
-    data = {
-        "actor": {
-            "backend": "megatron:(attn:d4p4t2|ffn:d2p4e4)",
-            "mb_spec": {"max_tokens_per_mb": 32768},
-        },
-        "train_dataset": {"batch_size": 16},
-    }
-    cfg = ActorConfig.from_areal(data)
-    assert cfg.parallel.dp == 4 and not hasattr(cfg, "n_seqs")
-
-
-def test_observed_microbatch_count_is_optional_and_checked(workload):
-    """An observed per-rank count refines packing but cannot override capacity."""
-    cfg = trial_config("S026")
-    plan = plan_workload(cfg, replace(workload, train_microbatches=2), 2048)
-    assert len(plan.train[0][0]) == 2
-    with pytest.raises(ValueError, match="incompatible"):
-        plan_workload(
-            replace(cfg, max_tokens_per_mb=8192),
-            replace(workload, train_microbatches=1),
-            2048,
-        )
-
-
-@pytest.mark.parametrize(
-    "decoupled,method,recompute,enabled",
-    [
-        (False, "recompute", False, False),
-        (False, "loglinear", True, True),
-        (True, "recompute", False, True),
-        (True, "metrics", False, True),
-        (True, "loglinear", True, False),
-        (True, "reuse_train_logp", False, False),
-    ],
-)
-def test_logprob_phase_matches_proximal_config(
-    model, workload, decoupled, method, recompute, enabled
-):
-    """Conditional logprob timing follows AReaL should_compute_prox_logp."""
-    cfg = replace(
-        trial_config("S026"),
-        use_decoupled_loss=decoupled,
-        prox_logp_method=method,
-        recompute_logprob=recompute,
-    )
-    assert (model.predict(cfg, workload)["recompute_logp"] > 0) == enabled
-
-
-def test_full_checkpoint_only_changes_training_phase(model, workload):
-    """Logprob executes eval forward and does not pay checkpoint recomputation."""
-    cfg = replace(trial_config("S026"), recompute_logprob=True)
-    before = model.predict(cfg, workload)
-    after = model.predict(replace(cfg, gradient_checkpointing=True), workload)
-    assert after["recompute_logp"] == before["recompute_logp"]
-    assert after["train_step"] > before["train_step"]
-
-
-def test_ppo_minibatches_count_optimizer_steps_and_respect_padding(model, workload):
-    """Each PPO minibatch causes one update; no invented PPO epoch multiplier."""
-    cfg = replace(trial_config("S026"), ppo_n_minibatches=2)
-    report = model.estimate(cfg, workload, sensitivity=False)
-    assert len(report["packing"]["train_microbatches_per_rank"]) == 2
-    assert report["total_actor_seconds"] == sum(report["stages_seconds"].values())
-
-
-def test_components_can_be_replaced_independently(model, workload):
-    """Replacing one phase preserves the other component estimates."""
-
-    class FixedAdvantages:
-        def estimate(self, config, tokens, op):
-            return 7.0
-
-    cfg = trial_config("S026")
-    before = model.predict(cfg, workload)
-    custom = replace(model, components=ActorComponents(advantages=FixedAdvantages()))
-    after = custom.predict(cfg, workload)
-    assert after["compute_advantage"] == 7
-    assert after["train_step"] == before["train_step"]
-    assert Serial((Constant(2), Parallel((Constant(3), Constant(4))))).seconds() == 6
-    assert Scale(Constant(2), 3).seconds() == 6
-
-
-def test_fsdp_uses_all_expert_weights_and_optimizer_shards():
-    """FSDP gathers full experts, while Adam state shards use expert DP."""
-    cfg = trial_config("S029")
-    shape = qwen3_30b_a3b()
-    ctx = Context(
-        cfg,
-        shape,
-        Operators(hardware_profile("h200_sxm_reference")),
-        shape.layers,
-        True,
-        True,
-    )
-    dense, expert = ctx.owned_parameters
-    assert expert == shape.layers * shape.expert_parameters_per_layer / 8
-    assert dense > 0 and expert > 3e9
-    opt = Optimizer().estimate(ctx)
-    assert opt["optimizer"] > 0 and opt["gradient_sync_raw"] == 0
-    mb = _pad([4096], cfg, shape.hidden_size)
-    assert Transformer().forward(ctx, mb)["raw_fsdp"] > 0
-    assert Transformer().estimate(ctx, mb, training=True)["raw_gradient_sync"] > 0
-
-
-def test_hierarchical_ep_is_not_applied_to_regular_alltoall():
-    """Public HybridEP optimizations must not leak into target backend defaults."""
-    shape = qwen3_30b_a3b()
-    cfg = ActorConfig("megatron", ParallelLayout(dp=16, ep=16))
-    ctx = Context(
-        cfg, shape, Operators(hardware_profile("h100_sxm_reference")), 48, True, True
-    )
-    regular = Communications().expert_exchange(ctx, 4096)
-    hierarchical = Communications().expert_exchange(
-        replace(ctx, config=replace(cfg, expert_dispatcher="hierarchical")), 4096
-    )
-    assert regular > hierarchical > 0
-
-
-def test_estimate_reports_uncertainty_without_claiming_confidence(model, workload):
-    """Summary-only scenarios and backend transfer have visible limitations."""
-    report = model.estimate(trial_config("S029"), workload)
-    assert "NOT a confidence interval" in report["sensitivity"]["kind"]
-    assert "bounded_tail_lengths" in report["sensitivity"]["scenarios_seconds"]
-    assert report["packing"]["exact_lengths"] is False
-    assert report["calibration"]["independent_stage_validation"] is False
-    assert any("Archon" in item for item in report["assumptions"])
-
-
-def test_public_fit_excludes_holdout_and_requires_transfer_opt_in(model):
-    """Independent evaluation is reproducible and target-domain claims stay honest."""
-    report = public_validation()
-    assert report["holdout_count"] == 1
-    heldout = next(row for row in report["points"] if row["split"] == "holdout")
-    assert heldout["used_for_fit"] is False
-    assert (
-        0 < report["holdout_mape"] < 1
-    )  # Broad sanity, not an accuracy acceptance gate.
-    points = read_data("public_training.json")["points"]
-    with pytest.raises(ValueError, match="Holdout"):
-        Calibration.fit(points)
-    cfg = trial_config("S029")
-    with pytest.raises(ValueError, match="opt into transfer"):
-        bundled_calibration().apply(model, cfg)
-    transferred = bundled_calibration().apply(model, cfg, allow_transfer=True)
-    assert "UNVALIDATED" in transferred.calibration_note
-    config, workload = point_inputs(points[0])
-    fitted = bundled_calibration().apply(
-        ActorCostModel(qwen3_30b_a3b(), hardware_profile("h100_sxm_reference")), config
-    )
-    assert fitted.predict(config, workload)["train_step"] == pytest.approx(
-        points[0]["step_seconds"]
-    )
-
-
 def test_rank_log_adapter_keeps_scope_ambiguous_until_provided():
     """One line does not identify actor phase or global optimizer iteration."""
     line = "[Megatron Rank 3] #microbatch: 2, microbatch #tokens: [100, 200], aligned to: [100, 200], padded to: [512, 512], padding lengths: [412, 312]."
@@ -1174,7 +641,7 @@ def test_trace_adapter_avoids_nested_and_cross_rank_double_counting():
             "name": "train.ppo_update",
             "ph": "X",
             "ts": 0,
-            "dur": 1e6,
+            "dur": 1000000.0,
             "pid": 0,
             "tid": 1,
             "args": {"global_step": 4},
@@ -1182,8 +649,8 @@ def test_trace_adapter_avoids_nested_and_cross_rank_double_counting():
         {
             "name": "train.ppo_update",
             "ph": "X",
-            "ts": 1e5,
-            "dur": 5e5,
+            "ts": 100000.0,
+            "dur": 500000.0,
             "pid": 0,
             "tid": 1,
             "args": {"global_step": 4},
@@ -1192,7 +659,7 @@ def test_trace_adapter_avoids_nested_and_cross_rank_double_counting():
             "name": "ppo_actor.ppo_update",
             "ph": "X",
             "ts": 0,
-            "dur": 9e5,
+            "dur": 900000.0,
             "pid": 1,
             "tid": 1,
             "args": {"global_step": 4},
@@ -1201,7 +668,7 @@ def test_trace_adapter_avoids_nested_and_cross_rank_double_counting():
             "name": "ppo_actor.ppo_update",
             "ph": "X",
             "ts": 0,
-            "dur": 8e5,
+            "dur": 800000.0,
             "pid": 2,
             "tid": 1,
             "args": {"global_step": 4},
@@ -1220,22 +687,6 @@ def test_trace_adapter_avoids_nested_and_cross_rank_double_counting():
     }
 
 
-@pytest.mark.parametrize(
-    "kwargs", [{"moe": 0}, {"network": math.nan}, {"fsdp_overlap": 2}]
-)
-def test_efficiency_rejects_invalid_physical_rates(kwargs):
-    """Invalid priors cannot silently produce nan/negative predictions."""
-    with pytest.raises(ValueError):
-        Efficiency(**kwargs)
-
-
-def test_bundled_data_all_have_valid_json():
-    """The model ships no network dependency for loading facts or trial templates."""
-    assert len(list(DATA.glob("*.json"))) >= 5
-    for path in DATA.glob("*.json"):
-        assert isinstance(json.loads(path.read_text()), dict)
-
-
 def test_trace_rank_identity_handles_reused_pids_across_nodes():
     """Remote ranks may reuse the same OS pid; union must not merge their steps."""
     events = [
@@ -1243,7 +694,7 @@ def test_trace_rank_identity_handles_reused_pids_across_nodes():
             "name": "ppo_actor.ppo_update",
             "ph": "X",
             "ts": 0,
-            "dur": 1e6,
+            "dur": 1000000.0,
             "pid": 10,
             "tid": 1,
             "args": {"global_step": 4, "rank": 0},
@@ -1251,8 +702,8 @@ def test_trace_rank_identity_handles_reused_pids_across_nodes():
         {
             "name": "ppo_actor.ppo_update",
             "ph": "X",
-            "ts": 2e6,
-            "dur": 1e6,
+            "ts": 2000000.0,
+            "dur": 1000000.0,
             "pid": 10,
             "tid": 1,
             "args": {"global_step": 4, "rank": 8},
@@ -1261,184 +712,13 @@ def test_trace_rank_identity_handles_reused_pids_across_nodes():
     assert actor_trace_times(events)["steps_seconds"] == {"4": {"train_step": 1}}
 
 
-def test_calibration_rejects_changed_hardware_with_same_profile_name():
-    """A name alone cannot prove matching bandwidth and layout assumptions."""
-    point = read_data("public_training.json")["points"][0]
-    cfg, _ = point_inputs(point)
-    changed = replace(hardware_profile("h100_sxm_reference"), inter_node_gbps=10)
-    with pytest.raises(ValueError, match="opt into transfer"):
-        bundled_calibration().apply(ActorCostModel(qwen3_30b_a3b(), changed), cfg)
-
-
-def test_config_rejects_string_booleans():
-    """A JSON string 'false' must not enable a computational phase."""
-    with pytest.raises(ValueError, match="boolean"):
-        replace(trial_config("S026"), recompute_logprob="false")
-
-
-def test_archon_gradient_sync_is_charged_per_microbatch(model, workload):
-    """Current SequentialRunner has no FSDP no_sync across microbatches."""
-
-    class NoGradientSync(Communications):
-        def gradient_sync(self, ctx):
-            return 0.0
-
-    cfg = replace(trial_config("S026"), n_mbs=2)
-    synced = replace(model, efficiency=replace(model.efficiency, fsdp_overlap=0))
-    unsynced = replace(
-        synced, components=ActorComponents(transformer=Transformer(NoGradientSync()))
-    )
-    ctx = Context(
-        cfg, model.model, Operators(model.hardware, synced.efficiency), 48, True, True
-    )
-    difference = (
-        synced.predict(cfg, workload)["train_step"]
-        - unsynced.predict(cfg, workload)["train_step"]
-    )
-    assert difference == pytest.approx(2 * Communications().gradient_sync(ctx))
-
-
-def test_archon_final_head_gather_is_cached_in_eval(model):
-    """Default final norm/head is not resharded between eval microbatches."""
-    cfg = trial_config("S029")
-    ctx = Context(cfg, model.model, Operators(model.hardware), 48, True, True)
-    comm = Communications()
-    first = comm.parameter_gather(ctx)
-    later = comm.parameter_gather(replace(ctx, microbatch_index=1))
-    assert first > later > 0
-    assert comm.parameter_gather(ctx, backward=True) == later
-    no_reshard = replace(
-        ctx, config=replace(cfg, reshard_after_forward=False), microbatch_index=1
-    )
-    assert comm.parameter_gather(no_reshard) == 0
-
-
-def test_archon_cp_repeats_kv_after_tp_sharding(model, monkeypatch):
-    """TP4/CP2 expands local KV1 to KV2, equivalent to global KV8."""
-    recorded = []
-    original = Operators.collective
-
-    def capture(self, payload_bytes, size, group, world, **kwargs):
-        if group == "cp":
-            recorded.append(payload_bytes)
-        return original(self, payload_bytes, size, group, world, **kwargs)
-
-    monkeypatch.setattr(Operators, "collective", capture)
-    cfg = trial_config("S029")
-    ctx = Context(cfg, model.model, Operators(model.hardware), 48, True, True)
-    Communications().forward(ctx, _pad([4096], cfg, 2048))
-    assert recorded == [32768 / (4 * 2) * 128 * (2 * 32 + 2 * 8) * 2]
-
-
-def test_megatron_pp_partition_matches_current_source():
-    """The backend balances local expert params, so EP4 splits 11/13/13/11."""
-    from types import SimpleNamespace
-
-    from areal.elastic.policy.basic.cost_model.actor import layer_partition
-
-    path = ROOT / "areal/engine/megatron_utils/pipeline_parallel.py"
-    tree = ast.parse(path.read_text())
-    names = {"estimate_stage_parameter_buckets", "_compute_stage_layer_lengths"}
-    functions = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in names
-    ]
-    namespace = {"math": math, "PretrainedConfig": object, "TransformerConfig": object}
-    exec(
-        compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
-        namespace,
-    )
-    hf = SimpleNamespace(**read_data("qwen3_30b_a3b.json")["config"])
-    tf = SimpleNamespace(
-        num_layers=48,
-        expert_model_parallel_size=4,
-        num_moe_experts=128,
-        gated_linear_unit=True,
-    )
-    weights, embedding, output = namespace["estimate_stage_parameter_buckets"](hf, tf)
-    expected = tuple(
-        namespace["_compute_stage_layer_lengths"](weights, embedding, output, 4)
-    )
-    assert (
-        layer_partition(trial_config("S031"), qwen3_30b_a3b())
-        == expected
-        == (11, 13, 13, 11)
-    )
-
-
-def test_megatron_dp_groups_fit_inside_pipeline_stage_node(model):
-    """PP4 splits the 32 ranks into four 8-rank blocks; DP need not use IB."""
-    first = Operators(model.hardware, stage_world_size=8)
-    second = Operators(replace(model.hardware, inter_node_gbps=1), stage_world_size=8)
-    assert first.collective(1e9, 4, "dense_dp", 32) == second.collective(
-        1e9, 4, "dense_dp", 32
-    )
-    assert first.collective(1e9, 2, "pp", 32) < second.collective(1e9, 2, "pp", 32)
-
-
-def test_megatron_alignment_expands_capacity_after_ffd():
-    """Backend grows the padded target when per-sequence alignment exceeds cap."""
-    cfg = ActorConfig(
-        "megatron", ParallelLayout(tp=2), max_tokens_per_mb=32768, pad_to_maximum=True
-    )
-    mb = _pad([16383, 16385], cfg, 2048)
-    assert mb.compute_tokens == 33024
-    assert _pad([513], replace(cfg, pad_to_maximum=False), 2048).compute_tokens == 768
-
-
-def test_multiturn_trajectories_are_atomic_dispatch_items():
-    """Sequence count need not divide DP when one trajectory contains many rows."""
-    from areal.elastic.policy.basic.cost_model.packing import (
-        dispatch_workload,
-    )
-
-    stats = WorkloadStats(
-        5,
-        50,
-        sequence_lengths=(10, 10, 10, 10, 10),
-        trajectory_group_sizes=(1, 2, 1, 1),
-    )
-    shards = dispatch_workload(stats, stats.lengths(), 2)
-    assert sorted(len(rank) for rank in shards) == [2, 3]
-    cfg = ActorConfig("archon", ParallelLayout(dp=2), max_tokens_per_mb=32768)
-    plan = plan_workload(cfg, stats, 2048)
-    assert plan.exact_lengths and not plan.exact_dispatch
-    assert plan.exact_dispatch is False  # RTensor weights are not supplied.
-    with pytest.raises(ValueError, match="Atomic dispatch"):
-        plan_workload(cfg, replace(stats, trajectory_group_sizes=(5,)), 2048)
-
-
-def test_summary_only_dispatch_does_not_assert_sequence_divisibility():
-    """Without trajectory metadata, nondivisible row counts remain an approximation."""
-    stats = WorkloadStats(5, 50)
-    cfg = ActorConfig("archon", ParallelLayout(dp=2))
-    plan = plan_workload(cfg, stats, 2048)
-    assert not plan.exact_dispatch
-    assert any("trajectory grouping" in item for item in plan.assumptions)
-    observed = replace(stats, per_dp_sequence_lengths=((10, 10), (10, 10, 10)))
-    assert plan_workload(cfg, observed, 2048).exact_dispatch
-
-
-@pytest.mark.parametrize("optimizer", [None, {"type": "sgd"}, {"type": "adam_bf16"}])
-def test_resolved_config_rejects_optimizer_outside_traffic_model(optimizer):
-    """Adam FP32-state traffic cannot be silently reused for another optimizer."""
-    actor = {
-        "backend": "archon:(attn:d32|ffn:d32)",
-        "mb_spec": {"max_tokens_per_mb": 32768},
-        "optimizer": optimizer,
-    }
-    with pytest.raises(ValueError, match="Adam"):
-        ActorConfig.from_areal(actor)
-
-
 def test_jsonl_trace_inherits_parent_step_without_summing_parent():
     """Real JSONL scopes can inherit step metadata from a containing event."""
     parent = {
         "name": "worker.step",
         "ph": "X",
         "ts": 0,
-        "dur": 2e6,
+        "dur": 2000000.0,
         "pid": 1,
         "tid": 2,
         "args": {"global_step": 3, "rank": 4},
@@ -1446,8 +726,8 @@ def test_jsonl_trace_inherits_parent_step_without_summing_parent():
     child = {
         "name": "ppo_actor.compute_logp",
         "ph": "X",
-        "ts": 1e5,
-        "dur": 5e5,
+        "ts": 100000.0,
+        "dur": 500000.0,
         "pid": 1,
         "tid": 2,
         "args": {"rank": 4},
@@ -1457,26 +737,6 @@ def test_jsonl_trace_inherits_parent_step_without_summing_parent():
     )
     assert report["steps_seconds"] == {"3": {"recompute_logp": 0.5}}
     assert report["unassigned_events"] == 0
-
-
-def test_history_actor_adapter_preserves_phase_and_runtime_identity(model, workload):
-    """Phase predictions use the recorded configuration and matching timing scope."""
-    config = trial_config("S026")
-    inputs = HistoricalInput("actor", config, workload, "synthetic", ACTOR_BOUNDARY)
-    predictor = BasicHistoryPredictor("synthetic", actor=model)
-    values = dict(predictor.predict(inputs).values)
-    assert values["train_step_seconds"] > 0
-    assert values["actor_total_seconds"] == pytest.approx(
-        sum(
-            values[name + "_seconds"]
-            for name in ("recompute_logp", "compute_advantage", "train_step")
-        )
-    )
-    assert not predictor.predict(replace(inputs, execution_id="other-runtime")).values
-    assert not predictor.predict(
-        replace(inputs, timing_boundary="gpu-kernel-only")
-    ).values
-    assert not BasicHistoryPredictor("synthetic").predict(inputs).values
 
 
 @pytest.fixture
@@ -1509,15 +769,19 @@ def unit_advantage_model():
         "single",
         "token",
         (
-            expert.AdvantageTerm("batching", (("padded_slots", 1e-8),), ("unit-only",)),
             expert.AdvantageTerm(
-                "recurrence", (("gae_iterations", 1e-6),), ("unit-only",)
+                "batching", (("padded_slots", 1e-08),), ("unit-only",)
             ),
             expert.AdvantageTerm(
-                "normalization", (("constant", 1e-5),), ("unit-only",)
+                "recurrence", (("gae_iterations", 1e-06),), ("unit-only",)
             ),
-            expert.AdvantageTerm("transport", (("constant", 1e-4),), ("unit-only",)),
-            expert.AdvantageTerm("diagnostics", (("constant", 1e-4),), ("unit-only",)),
+            expert.AdvantageTerm(
+                "normalization", (("constant", 1e-05),), ("unit-only",)
+            ),
+            expert.AdvantageTerm("transport", (("constant", 0.0001),), ("unit-only",)),
+            expert.AdvantageTerm(
+                "diagnostics", (("constant", 0.0001),), ("unit-only",)
+            ),
         ),
     )
 
@@ -1526,18 +790,21 @@ def _expert_actor_input():
     cfg = expert.ActorConfig(
         "archon", expert.ParallelLayout(dp=2), max_tokens_per_mb=256
     )
-    return cfg, WorkloadStats(
-        16,
-        1024,
-        sequence_lengths=(64,) * 16,
-        trajectory_group_sizes=(1,) * 16,
-        trajectory_dispatch_weights=(64,) * 16,
+    return (
+        cfg,
+        WorkloadStats(
+            16,
+            1024,
+            sequence_lengths=(64,) * 16,
+            trajectory_group_sizes=(1,) * 16,
+            trajectory_dispatch_weights=(64,) * 16,
+        ),
     )
 
 
 def test_expert_pipeline_uses_dependencies_for_forward_and_one_f_one_b():
     """Two-stage/two-microbatch schedules have independently countable critical paths."""
-    from areal.elastic.policy.reference.cost_model.actor import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.model import (
         _pipeline_time,
     )
 
@@ -1552,13 +819,12 @@ def test_expert_actor_is_independent_of_basic_prediction_and_preserves_ppo_work(
     """Basic changes cannot alter the reference; PPO splits do not duplicate token work."""
     config, workload = _expert_actor_input()
     before = expert_model.estimate(config, workload)
-    monkeypatch.setattr(
-        ActorCostModel,
-        "predict",
-        lambda *args: (_ for _ in ()).throw(AssertionError("Basic called")),
+    from areal.elastic.reconfigurator.basic.cost_model.actor import (
+        ExpertActorModel as BasicActorModel,
     )
+
     monkeypatch.setattr(
-        ActorCostModel,
+        BasicActorModel,
         "estimate",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Basic called")),
     )
@@ -1586,22 +852,24 @@ def test_expert_actor_phase_calibration_has_explicit_scope_and_no_silent_extrapo
     config, workload = _expert_actor_input()
     raw = expert_model.estimate(config, workload)
     calibrations = tuple(
-        expert.PhaseCalibration.fit(
-            "unit-fit",
-            (
-                expert.CalibrationPoint(
-                    f"measured-{name}",
-                    raw.profile,
-                    name,
-                    value.seconds,
-                    value.seconds * 2,
-                    raw.features_for(name),
-                    timing_boundary=raw.timing_boundary,
+        (
+            cost_model_tools.fit_phase_calibration(
+                "unit-fit",
+                (
+                    expert.CalibrationPoint(
+                        f"measured-{name}",
+                        raw.profile,
+                        name,
+                        value.seconds,
+                        value.seconds * 2,
+                        raw.features_for(name),
+                        timing_boundary=raw.timing_boundary,
+                    ),
                 ),
-            ),
+            )
+            for name, value in raw.stages
+            if value.seconds
         )
-        for name, value in raw.stages
-        if value.seconds
     )
     calibrated_model = replace(expert_model, calibration=calibrations)
     calibrated = calibrated_model.estimate(config, workload)
@@ -1665,7 +933,7 @@ def test_expert_actor_logprob_auxiliary_stages_and_memory_bound_are_explicit(
     assert result.stages[0][0] == "ref_logp"
     assert dict(result.stages)["recompute_logp"].seconds > 0
     impossible = replace(
-        expert_model, hardware=replace(expert_model.hardware, memory_gb=1e-8)
+        expert_model, hardware=replace(expert_model.hardware, memory_gb=1e-08)
     ).estimate(config, workload)
     assert impossible.total.feasibility == "infeasible"
     assert (
@@ -1699,7 +967,7 @@ def test_expert_rollout_models_mixed_service_and_rejects_capacity_overflow(
     rollout = expert.ExpertRolloutModel(
         expert_model.model,
         expert_model.hardware,
-        expert.InferenceRates(0.5, 0.5, 0.5, 0.5, 1e-6),
+        expert.InferenceRates(0.5, 0.5, 0.5, 0.5, 1e-06),
         "unit-runtime",
     )
     config = expert.RolloutConfig(2, 2, 4, 128, 4096)
@@ -1774,14 +1042,14 @@ def test_expert_transition_critical_path_uses_source_target_and_explicit_unknown
 def test_expert_pipeline_config_and_transfers_preserve_backend_boundaries(
     expert_model, monkeypatch
 ):
-    from areal.elastic.policy.reference.cost_model._actor.components import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor import (
+        backend_for,
+    )
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
         Communications,
         Context,
         Operators,
         Transformer,
-    )
-    from areal.elastic.policy.reference.cost_model.actor import (
-        _pipeline_partition,
     )
 
     data = {
@@ -1792,7 +1060,9 @@ def test_expert_pipeline_config_and_transfers_preserve_backend_boundaries(
         expert.ActorConfig.from_areal(data)
     data["archon"] = {"pp_schedule": "1F1B"}
     cfg = expert.ActorConfig.from_areal(data)
-    assert _pipeline_partition(cfg, replace(expert_model.model, layers=8)) == (
+    assert backend_for(cfg.backend).pipeline_partition(
+        cfg, replace(expert_model.model, layers=8)
+    ) == (
         2,
         3,
         2,
@@ -1871,9 +1141,8 @@ def test_expert_advantage_accounts_padded_width_and_slowest_worker(expert_model)
         input_bytes=10,
     )
     prediction = model.estimate(config, workload, advantage_workload=observed)
-    # Rank 0 = 512+63+800=1375; rank 1 = 1024+127+100=1251.
     assert dict(prediction.stages)["compute_advantage"].seconds == 1387
-    assert sum(e.seconds for _, e in prediction.advantage_components) == 1387
+    assert sum((e.seconds for _, e in prediction.advantage_components)) == 1387
     assert (
         dict(prediction.features_for("compute_advantage"))["advantage_padded_slots_max"]
         == 1024
@@ -1945,7 +1214,7 @@ def test_expert_calibration_rejects_mixed_boundaries_and_reports_bounds(expert_m
         raw.timing_boundary,
     )
     with pytest.raises(ValueError, match="timing boundary"):
-        expert.PhaseCalibration.fit(
+        cost_model_tools.fit_phase_calibration(
             "unit",
             (
                 point,
@@ -1954,14 +1223,16 @@ def test_expert_calibration_rejects_mixed_boundaries_and_reports_bounds(expert_m
                 ),
             ),
         )
-    fitted = expert.PhaseCalibration.fit("unit", (point,))
+    fitted = cost_model_tools.fit_phase_calibration("unit", (point,))
     wrong = fitted.apply(
         1, raw.profile, point.phase, point.features, timing_boundary="rank_mean"
     )
     assert wrong.seconds is None and "boundary mismatch" in " ".join(wrong.notes)
     features = tuple(
-        (name, value * 2 if name == "n_seqs" else value)
-        for name, value in point.features
+        (
+            (name, value * 2 if name == "n_seqs" else value)
+            for name, value in point.features
+        )
     )
     outside = fitted.apply(
         1, raw.profile, point.phase, features, timing_boundary=raw.timing_boundary
@@ -2165,7 +1436,7 @@ def test_expert_advantage_component_priors_remain_explicit_after_phase_fit(
     config, workload = _expert_actor_input()
     raw = expert_model.estimate(config, workload)
     total = dict(raw.stages)["compute_advantage"].seconds
-    fitted = expert.PhaseCalibration.fit(
+    fitted = cost_model_tools.fit_phase_calibration(
         "unit",
         (
             expert.CalibrationPoint(
@@ -2183,12 +1454,14 @@ def test_expert_advantage_component_priors_remain_explicit_after_phase_fit(
     assert dict(prediction.stages)["compute_advantage"].seconds == pytest.approx(
         total * 2
     )
-    assert sum(e.seconds for _, e in prediction.advantage_components) == pytest.approx(
-        total
-    )
+    assert sum(
+        (e.seconds for _, e in prediction.advantage_components)
+    ) == pytest.approx(total)
     assert all(
-        e.evidence == "assumed" and "Uncalibrated component prior" in e.notes[0]
-        for _, e in prediction.advantage_components
+        (
+            e.evidence == "assumed" and "Uncalibrated component prior" in e.notes[0]
+            for _, e in prediction.advantage_components
+        )
     )
 
 
@@ -2210,7 +1483,7 @@ def _aggregate_advantage_fit(expert_model):
     fitted = replace(
         base, advantage_model=base.advantage_model.fit("unit-fit", observations)
     )
-    return config, base, fitted, observations
+    return (config, base, fitted, observations)
 
 
 def test_expert_aggregate_advantage_fits_phase_and_preserves_scope(expert_model):
@@ -2225,7 +1498,7 @@ def test_expert_aggregate_advantage_fits_phase_and_preserves_scope(expert_model)
     assert stage.source_ids == tuple(p.sample_id for p in observations)
     assert not prediction.advantage_components
     assert prediction.total.seconds == pytest.approx(
-        sum(e.seconds for _, e in prediction.stages)
+        sum((e.seconds for _, e in prediction.stages))
     )
     assert prediction.profile == base.profile_key(config)
     assert fitted.advantage_model.intercept_seconds == pytest.approx(1)
@@ -2244,10 +1517,12 @@ def test_expert_aggregate_fit_uses_constrained_boundary_optimum(labels, expected
     """Clipping unconstrained slope/intercept would not minimize squared error."""
     model = expert.AggregateAdvantageModel("unit")
     points = tuple(
-        expert.AdvantageObservation(
-            str(n), "profile", WorkloadStats(1, n), y, model.timing_boundary
+        (
+            expert.AdvantageObservation(
+                str(n), "profile", WorkloadStats(1, n), y, model.timing_boundary
+            )
+            for n, y in zip((1, 2, 3), labels, strict=True)
         )
-        for n, y in zip((1, 2, 3), labels, strict=True)
     )
     fitted = model.fit("unit", points)
     assert (fitted.intercept_seconds, fitted.seconds_per_token) == pytest.approx(
@@ -2355,10 +1630,9 @@ def test_expert_aggregate_rejects_double_calibration_and_keeps_fit_in_snapshot(
     guard = fitted.advantage_model.calibration
     with pytest.raises(ValueError, match="already fitted"):
         replace(fitted, calibration=(guard,))
-    # The other stages retain their independent phase scales.
     prediction = fitted.estimate(config, observations[1].workload)
     train = dict(prediction.stages)["train_step"].seconds
-    scale = expert.PhaseCalibration.fit(
+    scale = cost_model_tools.fit_phase_calibration(
         "unit-train",
         (
             expert.CalibrationPoint(
@@ -2388,11 +1662,7 @@ def test_expert_aggregate_rejects_double_calibration_and_keeps_fit_in_snapshot(
         ),
     )
     assert refitted.profile_key(config) == fitted.profile_key(config)
-    # ExpertModels hashes the entire immutable fit, including labels and coefficients.
-    assert (
-        expert.ExpertModels(fitted, None, None).snapshot_id
-        != expert.ExpertModels(refitted, None, None).snapshot_id
-    )
+    assert fingerprint(fitted) != fingerprint(refitted)
 
 
 def _runtime_ffd():
@@ -2414,10 +1684,10 @@ def _runtime_ffd():
 
 def test_expert_ffd_matches_runtime_with_ties_and_ppo_dp_synchronization():
     """Unstable NumPy ties affect PPO membership and synchronized MB counts."""
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         ffd as expert_ffd,
     )
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         plan_workload as expert_plan,
     )
 
@@ -2469,17 +1739,15 @@ def test_expert_ffd_matches_runtime_with_ties_and_ppo_dp_synchronization():
 
 def test_expert_archon_padding_uses_shared_page_then_backend_alignment():
     """A non-power-of-two page exposes the two runtime rounding operations."""
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         _pad as expert_pad,
     )
 
     config = expert.ActorConfig(
         "archon", expert.ParallelLayout(), max_tokens_per_mb=2048
     )
-    # utils/data.py: round 600 -> 768 (256 page), then Archon: page=682 -> 1364.
     result = expert_pad([600], config, 1536)
     assert result.compute_tokens == 1364 and result.padding_tokens == 764
-    # seq_len_divisor=2*TP*CP matters even when a page is odd.
     assert expert_pad([1], config, 2049).compute_tokens == 1022
     assert (
         expert_pad([600], replace(config, pad_to_maximum=True), 1536).compute_tokens
@@ -2489,7 +1757,7 @@ def test_expert_archon_padding_uses_shared_page_then_backend_alignment():
 
 def test_expert_equal_token_summaries_do_not_identify_microbatch_counts():
     """Summary equality is not evidence of equal packing or compute work."""
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         plan_workload as expert_plan,
     )
 
@@ -2510,7 +1778,7 @@ def test_expert_equal_token_summaries_do_not_identify_microbatch_counts():
     ]
     assert [len(plan.train[0][0]) for plan in plans] == [6, 7]
     proxy = expert_plan(config, WorkloadStats(12, 68, max_seq_len=10), 128)
-    assert not proxy.exact_lengths and not proxy.exact_dispatch
+    assert not proxy.exact_lengths and (not proxy.exact_dispatch)
 
 
 def test_expert_partial_packing_retains_known_work_and_independent_phase(expert_model):
@@ -2532,8 +1800,8 @@ def test_expert_partial_packing_retains_known_work_and_independent_phase(expert_
     )
     work = expert_model.observe_packing_work(config, workload, records)
     assert work.phase_microbatches("train_step") == len(raw.packing.train[0][0])
-    assert len(work.calls) == 2  # TP copies removed; DP retained.
-    assert all(s.attention_length_squared is None for _, s in work.calls)
+    assert len(work.calls) == 2
+    assert all((s.attention_length_squared is None for _, s in work.calls))
     assert work.missing_calls == (("recompute_logp", 0, 0), ("recompute_logp", 0, 1))
     comparison = work.compare(raw.packing)
     assert comparison.metric("microbatch_count") == (0, 2, 4)
@@ -2603,16 +1871,16 @@ def test_expert_count_only_diagnostic_separates_packing_from_conditional_timing(
 ):
     """Fit calibration only, then freeze the SAME g for observed/predicted counts."""
     points = tuple(
-        _packing_timing_point(expert_model, n, i) for i, n in enumerate((2, 4, 8))
+        (_packing_timing_point(expert_model, n, i) for i, n in enumerate((2, 4, 8)))
     )
-    diagnostic = expert.PackingTimingDiagnostic("train_step").fit(
+    diagnostic = cost_model_tools.PackingTimingDiagnostic("train_step").fit(
         "synthetic-fit", points
     )
     heldout = _packing_timing_point(expert_model, 6, 20)
     work = heldout.work
     predicted = expert_model.estimate(work.config, work.workload).packing
     result = diagnostic.evaluate(heldout, predicted)
-    assert work.phase_microbatches("train_step") == 6  # Not 24 (DP2/TP2).
+    assert work.phase_microbatches("train_step") == 6
     assert diagnostic.intercept_seconds == pytest.approx(1)
     assert diagnostic.seconds_per_microbatch == pytest.approx(2)
     assert result.given_observed_packing.seconds == pytest.approx(13)
@@ -2647,9 +1915,9 @@ def test_expert_count_only_diagnostic_separates_packing_from_conditional_timing(
 def test_expert_packing_diagnostic_keeps_unsupported_bounds(expert_model, problem):
     """Held-out long sequences and incomplete ranks cannot inflate coverage."""
     points = tuple(
-        _packing_timing_point(expert_model, n, i) for i, n in enumerate((2, 4, 8))
+        (_packing_timing_point(expert_model, n, i) for i, n in enumerate((2, 4, 8)))
     )
-    diagnostic = expert.PackingTimingDiagnostic("train_step").fit(
+    diagnostic = cost_model_tools.PackingTimingDiagnostic("train_step").fit(
         "synthetic-fit", points
     )
     point = _packing_timing_point(
@@ -2668,7 +1936,7 @@ def test_expert_packing_diagnostic_keeps_unsupported_bounds(expert_model, proble
     if problem == "missing_dp":
         work = replace(work, records=work.records[:1])
     if problem == "unfitted":
-        diagnostic = expert.PackingTimingDiagnostic("train_step")
+        diagnostic = cost_model_tools.PackingTimingDiagnostic("train_step")
     result = diagnostic.predict(work)
     assert result.seconds is None and result.evidence == "unsupported"
 
@@ -2678,20 +1946,22 @@ def test_expert_packing_diagnostic_rejects_mixed_phase_duplicate_fit_and_rank_me
 ):
     """Calibration keeps run/step provenance, phase and trainer wall-clock scope."""
     points = tuple(
-        _packing_timing_point(expert_model, n, i) for i, n in enumerate((2, 4, 8))
+        (_packing_timing_point(expert_model, n, i) for i, n in enumerate((2, 4, 8)))
     )
     with pytest.raises(ValueError, match="wall"):
         replace(points[0], timing_boundary="rank_mean")
     with pytest.raises(ValueError, match="phase"):
-        expert.PackingTimingDiagnostic("recompute_logp").fit("bad", points)
+        cost_model_tools.PackingTimingDiagnostic("recompute_logp").fit("bad", points)
     with pytest.raises(ValueError, match="Duplicate"):
-        expert.PackingTimingDiagnostic("train_step").fit("bad", points + (points[0],))
+        cost_model_tools.PackingTimingDiagnostic("train_step").fit(
+            "bad", points + (points[0],)
+        )
     same = tuple(_packing_timing_point(expert_model, 4, i) for i in range(2))
     with pytest.raises(ValueError, match="distinct"):
-        expert.PackingTimingDiagnostic("train_step").fit("bad", same)
-    constant = expert.PackingTimingDiagnostic("train_step", form="constant").fit(
-        "constant", same
-    )
+        cost_model_tools.PackingTimingDiagnostic("train_step").fit("bad", same)
+    constant = cost_model_tools.PackingTimingDiagnostic(
+        "train_step", form="constant"
+    ).fit("constant", same)
     assert constant.predict(
         _packing_timing_point(expert_model, 4, 50).work
     ).seconds == pytest.approx(9)
@@ -2759,7 +2029,7 @@ def test_expert_summary_rejects_zero_work_even_without_real_tokens(metric):
     assert expert.PackingSummary(2, padding_tokens=0).padding_tokens == 0
 
 
-@pytest.mark.parametrize("delta", [-0.00001, 0.00001, 2.0])
+@pytest.mark.parametrize("delta", [-1e-05, 1e-05, 2.0])
 def test_expert_observed_summary_uses_same_token_rounding_tolerance(
     expert_model, delta
 ):
@@ -2775,7 +2045,7 @@ def test_expert_observed_summary_uses_same_token_rounding_tolerance(
 
 def test_expert_packing_comparison_rejects_observed_count_leakage(expert_model):
     """An observed minimum must never turn an independent packing error into zero."""
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         plan_workload as expert_plan,
     )
 
@@ -2838,10 +2108,10 @@ def _runtime_balanced_partition():
 
 def test_expert_controller_dispatch_preserves_trajectories_and_rectangular_weights():
     """RTensor numel and attended tokens can assign a different heavy trajectory."""
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         dispatch_workload,
     )
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         plan_workload as expert_plan,
     )
 
@@ -2878,7 +2148,7 @@ def test_expert_controller_dispatch_preserves_trajectories_and_rectangular_weigh
 
 def test_expert_controller_atomic_dispatch_groups_match_runtime():
     """Controller group_size groups consecutive trajectories before DP allocation."""
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         dispatch_workload,
     )
 
@@ -2911,10 +2181,10 @@ def test_expert_controller_atomic_dispatch_groups_match_runtime():
 
 def test_expert_redistribution_preserves_runtime_ffd_rank_and_row_order():
     """Multi-controller FFD retains raw bin order and may assign unequal local counts."""
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         dispatch_workload,
     )
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         plan_workload as expert_plan,
     )
 
@@ -2936,7 +2206,7 @@ def test_expert_redistribution_preserves_runtime_ffd_rank_and_row_order():
             sequence_lengths=flat,
             trajectory_group_sizes=tuple(map(len, trajectories)),
         )
-        groups = allocate(list(map(sum, trajectories)), int(1e12), 4)
+        groups = allocate(list(map(sum, trajectories)), int(1000000000000.0), 4)
         expected = [[n for i in rank for n in trajectories[i]] for rank in groups]
         assert dispatch_workload(work, list(flat), 4, dispatch) == expected
         assert expert_plan(config, work, 128, dispatch=dispatch).exact_dispatch
@@ -2949,7 +2219,7 @@ def test_expert_redistribution_preserves_runtime_ffd_rank_and_row_order():
 
 def test_expert_atomic_rank_skew_explains_more_mbs_than_global_average():
     """Synthetic S026-scale example: a heavy atomic trajectory survives DP dispatch."""
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         plan_workload as expert_plan,
     )
 
@@ -3049,9 +2319,11 @@ def test_expert_count_extrapolation_is_explicit_and_does_not_change_other_bounds
 ):
     """Calibration count support is distinct from runtime legality and length support."""
     points = tuple(
-        _packing_timing_point(expert_model, n, i) for i, n in enumerate((2, 4))
+        (_packing_timing_point(expert_model, n, i) for i, n in enumerate((2, 4)))
     )
-    diagnostic = expert.PackingTimingDiagnostic("train_step").fit("frozen", points)
+    diagnostic = cost_model_tools.PackingTimingDiagnostic("train_step").fit(
+        "frozen", points
+    )
     heldout = _packing_timing_point(expert_model, 6, 63)
     predicted = expert_model.estimate(
         heldout.work.config, heldout.work.workload
@@ -3081,7 +2353,7 @@ def test_expert_count_extrapolation_is_explicit_and_does_not_change_other_bounds
 
 def test_expert_redistribution_checks_runtime_gather_shape_before_assignment():
     """Exact redistribution requires equal input-list sizes on original DP heads."""
-    from areal.elastic.policy.reference.cost_model._actor.packing import (
+    from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.packing import (
         dispatch_workload,
     )
 
@@ -3146,10 +2418,11 @@ def test_expert_advantage_and_packing_share_the_audited_dispatch(expert_model):
         "archon", expert.ParallelLayout(dp=2), max_tokens_per_mb=128
     )
     result = model.estimate(config, work)
-    # The actual runtime FFD gives DP0 (99,99,79), DP1 (100,1,1,1,80).
     expected = [
         [n for i in group for n in trajectories[i]]
-        for group in _runtime_ffd()(list(map(sum, trajectories)), int(1e12), 2)
+        for group in _runtime_ffd()(
+            list(map(sum, trajectories)), int(1000000000000.0), 2
+        )
     ]
     features = dict(result.features_for("compute_advantage"))
     assert features["advantage_padded_slots_sum"] == sum(
@@ -3180,10 +2453,7 @@ def publication_case(expert_model):
         expert.PublicationRank("a0", "actor", "node0", **zeros),
         expert.PublicationRank("a1", "actor", "node0", **zeros),
         expert.PublicationRank(
-            "r0",
-            "rollout",
-            "node0",
-            **(zeros | {"expected_receive_bytes": 2_000_000_000}),
+            "r0", "rollout", "node0", **zeros | {"expected_receive_bytes": 2000000000}
         ),
     )
     work = expert.PublicationWork(
@@ -3193,8 +2463,8 @@ def publication_case(expert_model):
         "unit-traffic-oracle",
         ranks,
         (
-            expert.PublicationFlow("a0", "r0", 1_000_000_000, 1),
-            expert.PublicationFlow("a1", "r0", 1_000_000_000, 1),
+            expert.PublicationFlow("a0", "r0", 1000000000, 1),
+            expert.PublicationFlow("a1", "r0", 1000000000, 1),
         ),
         complete=True,
     )
@@ -3215,15 +2485,15 @@ def publication_case(expert_model):
         resume_seconds=0,
     )
     model = expert.ExpertPublicationModel(hardware, rates)
-    return model, raw, actor, rollout, work
+    return (model, raw, actor, rollout, work)
 
 
 def test_publication_shared_receiver_is_a_bottleneck(publication_case):
     model, raw, actor, rollout, work = publication_case
     result = model.estimate(raw, actor, rollout, work)
     assert result.duration.seconds == pytest.approx(2.000002)
-    assert dict(result.features) == {"wire_bytes": 2e9, "messages": 2}
-    assert result.rounds[0]["resource_bytes"]["receive:r0"] == 2e9
+    assert dict(result.features) == {"wire_bytes": 2000000000.0, "messages": 2}
+    assert result.rounds[0]["resource_bytes"]["receive:r0"] == 2000000000.0
     transition = expert.ExpertTransitionModel((result.transition("a", "a"),))
     assert (
         transition.estimate("publish", "a", "a").duration.seconds
@@ -3238,8 +2508,8 @@ def test_publication_all_rank_prepare_work_counts_even_without_sending(
     actor = replace(actor, backend="megatron")
     ranks = (
         work.ranks[0],
-        replace(work.ranks[1], gather_bytes=3_000_000_000, gather_calls=1),
-        replace(work.ranks[2], expected_receive_bytes=1_000_000_000),
+        replace(work.ranks[1], gather_bytes=3000000000, gather_calls=1),
+        replace(work.ranks[2], expected_receive_bytes=1000000000),
     )
     work = replace(
         work,
@@ -3258,9 +2528,9 @@ def test_publication_shared_host_capacity_and_serial_rank_components(publication
     ranks = tuple(
         replace(
             r,
-            h2d_bytes=1_000_000_000,
+            h2d_bytes=1000000000,
             h2d_tensors=1,
-            send_copy_bytes=1_000_000_000,
+            send_copy_bytes=1000000000,
             send_copy_tensors=1,
         )
         if r.role == "actor"
@@ -3268,7 +2538,7 @@ def test_publication_shared_host_capacity_and_serial_rank_components(publication
         for r in work.ranks
     )
     result = model.estimate(raw, actor, rollout, replace(work, ranks=ranks))
-    assert dict(result.stages)["prepare"].seconds == 3  # 2s shared staging + 1s copy
+    assert dict(result.stages)["prepare"].seconds == 3
     assert result.duration.seconds == pytest.approx(5.000002)
 
 
@@ -3277,9 +2547,9 @@ def test_publication_pre_receive_and_writeback_copies_are_separate(publication_c
     ranks = work.ranks[:2] + (
         replace(
             work.ranks[2],
-            receive_prepare_bytes=1_000_000_000,
+            receive_prepare_bytes=1000000000,
             receive_prepare_tensors=1,
-            receive_copy_bytes=2_000_000_000,
+            receive_copy_bytes=2000000000,
             receive_copy_tensors=1,
         ),
     )
@@ -3295,8 +2565,8 @@ def test_publication_shared_node_nic_is_not_per_flow_bandwidth(publication_case)
     assert model.estimate(raw, actor, rollout, work).duration.seconds is None
     model = replace(model, rates=replace(model.rates, node_network_gbps=1))
     result = model.estimate(raw, actor, rollout, work)
-    assert result.rounds[0]["resource_bytes"]["nic-out:node0"] == 2e9
-    assert result.duration.seconds == 2  # shared NIC dominates per-GPU links
+    assert result.rounds[0]["resource_bytes"]["nic-out:node0"] == 2000000000.0
+    assert result.duration.seconds == 2
 
 
 @pytest.mark.parametrize(
@@ -3340,7 +2610,7 @@ def test_publication_rejects_unbound_or_partial_geometry(publication_case, chang
 def test_publication_calibration_replaces_whole_dag_and_is_bound(publication_case):
     model, raw, actor, rollout, work = publication_case
     prior = model.estimate(raw, actor, rollout, work)
-    fit = expert.PhaseCalibration.fit(
+    fit = cost_model_tools.fit_phase_calibration(
         "unit",
         (
             expert.CalibrationPoint(
@@ -3356,7 +2626,7 @@ def test_publication_calibration_replaces_whole_dag_and_is_bound(publication_cas
     )
     scaled = prior.calibrated(fit)
     assert scaled.duration.seconds == 2 * prior.duration.seconds
-    assert scaled.stages == prior.stages  # raw components were not independently fitted
+    assert scaled.stages == prior.stages
     transition = expert.ExpertTransitionModel((scaled.transition("a", "a"),))
     assert (
         transition.estimate("publish", "a", "a").duration.seconds
@@ -3389,37 +2659,6 @@ def test_publication_archon_uses_legacy_bucket_ack_not_v2_awex(publication_case)
     assert "not an inferred NCCL broadcast tree" in " ".join(result.duration.notes)
 
 
-def test_r10_publication_archives_actual_peer_geometry_without_timing_fit():
-    assembled = r10_catalog().trial("r10").models(calibrated=False)
-    document = json.loads(
-        (
-            ROOT
-            / "examples/autopilot/elastic/profiles/r10-publication-structural-v1.json"
-        ).read_text()
-    )
-    model, work = expert.ExpertPublicationModel.from_dict(
-        document, assembled.raw_actor.hardware
-    )
-    result = model.estimate(
-        assembled.raw_actor, assembled.config.actor, assembled.config.rollout, work
-    )
-    assert result.duration.evidence == "assumed"
-    assert dict(result.features) == {"wire_bytes": 122_179_665_920, "messages": 79_520}
-    for rank in work.ranks[:4]:
-        assert rank.h2d_bytes == 15_266_061_312 and rank.h2d_tensors == 5043
-        assert rank.send_copy_bytes == 10_066_329_600 and rank.send_copy_tensors == 3168
-    changed = replace(
-        assembled.raw_actor,
-        hardware=expert.Catalog().hardware("h200-sxm-reference", "h200-8gpu-reference"),
-    )
-    assert (
-        replace(model, hardware=changed.hardware)
-        .estimate(changed, assembled.config.actor, assembled.config.rollout, work)
-        .duration.seconds
-        is None
-    )
-
-
 def test_publication_disjoint_endpoints_overlap_but_explicit_rounds_serialize(
     publication_case,
 ):
@@ -3427,12 +2666,9 @@ def test_publication_disjoint_endpoints_overlap_but_explicit_rounds_serialize(
     rollout = replace(rollout, replicas=2)
     zero = {f.name: 0 for f in fields(expert.PublicationRank)[3:]}
     ranks = work.ranks[:2] + (
-        replace(work.ranks[2], expected_receive_bytes=1_000_000_000),
+        replace(work.ranks[2], expected_receive_bytes=1000000000),
         expert.PublicationRank(
-            "r1",
-            "rollout",
-            "node0",
-            **(zero | {"expected_receive_bytes": 1_000_000_000}),
+            "r1", "rollout", "node0", **zero | {"expected_receive_bytes": 1000000000}
         ),
     )
     work = replace(
@@ -3456,10 +2692,8 @@ def test_publication_shared_local_fabric_caps_disjoint_peers(publication_case):
     model, raw, actor, rollout, work = publication_case
     model = replace(model, rates=replace(model.rates, node_fabric_gbps=0.5))
     result = model.estimate(raw, actor, rollout, work)
-    assert result.rounds[0]["resource_bytes"]["fabric:node0"] == 2e9
-    assert (
-        result.duration.seconds == 4
-    )  # shared fabric, rather than each 1 GB/s endpoint
+    assert result.rounds[0]["resource_bytes"]["fabric:node0"] == 2000000000.0
+    assert result.duration.seconds == 4
     missing = replace(
         model, rates=replace(model.rates, node_fabric_gbps=None)
     ).estimate(raw, actor, rollout, work)

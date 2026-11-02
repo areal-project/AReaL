@@ -914,20 +914,20 @@ physical device indices within the task's allocation. The checkpoint estimate re
 space before another complete generation is written; it must cover model, optimizer and
 rank sidecars.
 
-| Parameter                     | Type           | Default      | Description                                                                                                             |
-| ----------------------------- | -------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| `mode`                        | string         | `"resident"` | Actor lifecycle; on_demand requires native online mode. **Choices:** `resident`, `on_demand`                            |
-| `policy`                      | string         | `"basic"`    | On-demand policy; basic currently uses an idle timeout; reference is not implemented. **Choices:** `basic`, `reference` |
-| `state_root`                  | string \| None | `None`       | -                                                                                                                       |
-| `actor_devices`               | `tuple`        | `()`         | -                                                                                                                       |
-| `rollout_devices`             | `tuple`        | `()`         | -                                                                                                                       |
-| `idle_timeout`                | float          | `60.0`       | -                                                                                                                       |
-| `min_ready_seconds`           | float          | `120.0`      | -                                                                                                                       |
-| `poll_interval`               | float          | `0.2`        | -                                                                                                                       |
-| `checkpoint_keep`             | integer        | `2`          | -                                                                                                                       |
-| `checkpoint_estimated_bytes`  | integer        | `0`          | -                                                                                                                       |
-| `checkpoint_free_space_floor` | integer        | `1073741824` | -                                                                                                                       |
-| `max_recovery_attempts`       | integer        | `3`          | -                                                                                                                       |
+| Parameter                     | Type           | Default       | Description                                                                                                                    |
+| ----------------------------- | -------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `mode`                        | string         | `"resident"`  | Actor lifecycle; on_demand requires native online mode. **Choices:** `resident`, `on_demand`                                   |
+| `reconfigurator`              | string         | `"reference"` | Complete Online reconfigurator: basic is frozen v1; reference is the current implementation. **Choices:** `basic`, `reference` |
+| `state_root`                  | string \| None | `None`        | -                                                                                                                              |
+| `actor_devices`               | `tuple`        | `()`          | -                                                                                                                              |
+| `rollout_devices`             | `tuple`        | `()`          | -                                                                                                                              |
+| `idle_timeout`                | float          | `60.0`        | -                                                                                                                              |
+| `min_ready_seconds`           | float          | `120.0`       | -                                                                                                                              |
+| `poll_interval`               | float          | `0.2`         | -                                                                                                                              |
+| `checkpoint_keep`             | integer        | `2`           | -                                                                                                                              |
+| `checkpoint_estimated_bytes`  | integer        | `0`           | -                                                                                                                              |
+| `checkpoint_free_space_floor` | integer        | `1073741824`  | -                                                                                                                              |
+| `max_recovery_attempts`       | integer        | `3`           | -                                                                                                                              |
 
 (section-agent)=
 

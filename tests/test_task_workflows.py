@@ -888,7 +888,7 @@ def test_reconfiguration_telemetry_requires_correlated_phases_and_backend_calls(
 
     from examples.task_workflows.reconfiguration import validate_telemetry
 
-    from areal.elastic.control.transition_timing import TransitionTiming
+    from areal.elastic.infra.monitor.collector import TransitionTiming
 
     phases = (
         "checkpoint",

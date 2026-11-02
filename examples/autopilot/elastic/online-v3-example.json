@@ -1,5 +1,5 @@
 {
-  "description": "Current v3 conditional CPU simulation: Actor lifecycle, stopped-Actor Rollout search, independent role history; maximum-TBT SLO",
+  "description": "Reference conditional CPU simulation: Actor supply, memory reserve and independent role history; Actor stays resident between updates; maximum-TBT SLO",
   "input_closes_at": 1800,
   "initial_layout": {
     "actor_dp": 4,
@@ -29,11 +29,7 @@
     "max_new_tokens": 32768,
     "max_context_tokens": 65536,
     "max_events": 8000000,
-    "max_simulated_seconds": 20000,
-    "actor_lifecycle_enabled": true,
-    "actor_lifecycle_history_seconds": 120,
-    "actor_lifecycle_margin_seconds": 5,
-    "actor_stopped_rollout_reconfig": true
+    "max_simulated_seconds": 20000
   },
   "handoff": {
     "node_gpus": [
@@ -51,7 +47,8 @@
     "effective_bandwidth_GBps": 50,
     "actor_sync_setup_seconds": 1,
     "rollout_sync_setup_seconds": 0.1,
-    "provenance": "ILLUSTRATIVE ASSUMPTIONS: 4x8 pool; startup30s/warmup5s; Adam checkpoint14bytes/parameter; serialized50GBps; immutable published snapshot materialization included in setup. Not measured reconfiguration costs."
+    "provenance": "ILLUSTRATIVE ASSUMPTIONS: 4x8 pool; startup30s/warmup5s; Adam checkpoint14bytes/parameter; serialized50GBps; immutable published snapshot materialization included in setup. Not measured reconfiguration costs.",
+    "mode": "hot"
   },
   "replay": {
     "history_seconds": 120,
@@ -62,7 +59,7 @@
     "max_new_tokens": 32768,
     "unseen_tool_residual_seconds": 5
   },
-  "policy": {
+  "reconfigurator": {
     "check_interval_seconds": 10,
     "slo_window_seconds": 120,
     "pressure_request_fraction": 0.8,

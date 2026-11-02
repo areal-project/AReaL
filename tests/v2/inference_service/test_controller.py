@@ -1219,7 +1219,7 @@ async def test_managed_replicas_rebuild_keeps_cpu_plane(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
     from areal.api.cli_args import SchedulingSpec
-    from areal.elastic.control.processes import OWNER_ENV
+    from areal.elastic.infra.reconfiguration import OWNER_ENV
     from areal.infra.scheduler.local import LocalScheduler
     from areal.v2.inference_service.controller import replicas
 

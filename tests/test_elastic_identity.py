@@ -11,7 +11,7 @@ from tests.test_elastic_checkpoint import (
 )
 from tests.test_elastic_monitor import _update
 
-from areal.elastic.identity import measurement_identity, semantic_digest
+from areal.elastic.infra.monitor.identity import measurement_identity, semantic_digest
 
 
 def test_measurement_digest_ignores_comments_formatting_and_docstrings():
@@ -59,7 +59,7 @@ def test_changed_timing_identity_restores_model_and_starts_fresh_history(
 
     def changed_timing(path, *args, **kwargs):
         source = original(path, *args, **kwargs)
-        if path.as_posix().endswith("elastic/runtime.py"):
+        if path.as_posix().endswith("elastic/infra/runtime.py"):
             source += "\nMEASUREMENT_IMPLEMENTATION_CHANGED = True\n"
         return source
 
@@ -68,7 +68,8 @@ def test_changed_timing_identity_restores_model_and_starts_fresh_history(
     try:
         assert restored.identity == identity
         assert (
-            restored.policy_adapter.execution_id != manager.policy_adapter.execution_id
+            restored.reconfigurator_adapter.execution_id
+            != manager.reconfigurator_adapter.execution_id
         )
         assert restored.applied_version == restored.checkpoint_version == 1
         assert restored.data_progress == {"samples": 4, "effective_tokens": 8}
@@ -100,7 +101,7 @@ def test_invalid_logical_progress_rejected_before_writing_checkpoint(
     tmp_path, progress
 ):
     """Optional metrics never weaken validation of critical manifest counters."""
-    from areal.elastic.state.checkpoint_store import CheckpointStore
+    from areal.elastic.infra.state.checkpoint_store import CheckpointStore
 
     store = CheckpointStore(tmp_path, free_space_floor=0)
     with pytest.raises(ValueError, match="logical data progress"):

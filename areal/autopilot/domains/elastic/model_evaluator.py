@@ -14,18 +14,12 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Protocol
 
+from areal.autopilot.domains.elastic.identity import protected_files
 from areal.autopilot.revision.contracts import digest, source_digest
-from areal.elastic.contracts import WorkloadStats
-from areal.elastic.policy.basic.cost_model.config import ActorConfig
-from areal.elastic.policy.basic.cost_model.rollout import (
-    RolloutConfig,
-    RolloutWorkload,
+from areal.elastic.contracts import OnlineLayout, Turn
+from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import (
+    ServiceSlice,
 )
-from areal.elastic.policy.basic.joint import JointConfig, JointScenario
-
-from .identity import protected_files
-
-JOINT_BOUNDARY = "committed_drained_window_through_shutdown"
 
 METRICS = {
     "actor": frozenset(
@@ -36,16 +30,8 @@ METRICS = {
             "actor_total_seconds",
         }
     ),
-    "rollout": frozenset({"inference_seconds", "external_seconds", "rollout_seconds"}),
-    "joint": frozenset(
-        {
-            "seconds",
-            "actor_gpu_seconds",
-            "rollout_gpu_seconds",
-            "total_gpu_seconds",
-            "queue_wait_seconds",
-        }
-    ),
+    "service": frozenset({"service_seconds"}),
+    "publication": frozenset({"publication_seconds"}),
 }
 
 
@@ -79,90 +65,44 @@ class HistorySpan:
 
 @dataclass(frozen=True)
 class HistoricalInput:
-    """One actual configuration/workload, without labels or run/step identifiers.
-
-    execution_id identifies model, hardware, runtime and unrepresented execution
-    options. Timing scope is explicit. Logical mode rejects dispatch/packing
-    observations; given_packing is conditional and scored separately.
-    Rollout/joint inputs always declare their supplied external wait durations.
-    Joint initial-state/cleanup flags require an audit of the actual trace.
-    """
+    """Causal component work at its actual layout, without private timing labels."""
 
     kind: str
-    config: ActorConfig | RolloutConfig | JointConfig
-    workload: WorkloadStats | RolloutWorkload | JointScenario
+    layout: OnlineLayout
     execution_id: str
     timing_boundary: str
-    input_mode: str = "logical"
-    initial_state_verified: bool | None = None
-    shutdown_included: bool | None = None
+    batch: tuple[tuple[Turn, ...], ...] = ()
+    kv_tokens: int = 0
+    slices: tuple[ServiceSlice, ...] = ()
+    rollout_layouts: tuple[OnlineLayout, ...] = ()
+    input_mode: str = "given_work"
 
-    def __post_init__(self) -> None:
-        types = {
-            "actor": (ActorConfig, WorkloadStats),
-            "rollout": (RolloutConfig, RolloutWorkload),
-            "joint": (JointConfig, JointScenario),
-        }
+    def __post_init__(self):
         if (
-            self.kind not in types
-            or not isinstance(self.config, types[self.kind][0])
-            or not isinstance(self.workload, types[self.kind][1])
-        ):
-            raise ValueError("Historical kind/config/workload types disagree")
-        if not all(
-            isinstance(x, str) and x.strip()
-            for x in (self.execution_id, self.timing_boundary)
+            self.kind not in METRICS
+            or not self.execution_id
+            or not self.timing_boundary
         ):
             raise ValueError(
-                "Execution identity and measured timing boundary are required"
+                "A component input needs an operation, execution identity and timing boundary"
             )
-        modes = {
-            "actor": {"logical", "given_packing"},
-            "rollout": {"given_external"},
-            "joint": {"given_external", "given_packing_and_external"},
-        }
-        if self.input_mode not in modes[self.kind]:
-            raise ValueError("Unknown historical input mode")
-        for value in (self.initial_state_verified, self.shutdown_included):
-            if value is not None and type(value) is not bool:
-                raise ValueError(
-                    "Trace boundary assertions must be explicit booleans or unknown"
-                )
-        stats = (
-            (self.workload,)
-            if self.kind == "actor"
-            else (
-                tuple(batch.actor.actor_stats for batch in self.workload.batches)
-                if self.kind == "joint"
-                else ()
-            )
-        )
-        if self.input_mode in {"logical", "given_external"} and any(
-            s.train_microbatches is not None or s.per_dp_sequence_lengths is not None
-            for s in stats
-        ):
+        if self.input_mode != "given_work" or self.kv_tokens < 0:
             raise ValueError(
-                "Logical prediction must not receive measured rank packing/counts; use given_packing explicitly"
+                "Online component timing is conditional on supplied observed work"
             )
+        if self.kind == "actor" and not self.batch:
+            raise ValueError("Actor timing requires a complete observed batch")
+        if self.kind == "service" and not self.slices:
+            raise ValueError("Service timing requires observed forward slices")
+        if self.kind == "publication" and not self.rollout_layouts:
+            raise ValueError("Publication timing requires destination layouts")
 
     @property
-    def config_id(self) -> str:
-        return digest(
-            {
-                "kind": self.kind,
-                "execution_id": self.execution_id,
-                "config": asdict(self.config),
-            }
-        )
+    def config_id(self):
+        return digest((asdict(self.layout), self.execution_id))
 
     @property
-    def unsupported_reason(self) -> str:
-        if self.kind == "joint" and (
-            self.initial_state_verified is not True
-            or self.shutdown_included is not True
-            or self.timing_boundary != JOINT_BOUNDARY
-        ):
-            return "Joint history requires verified committed/drained initial state and measured shutdown boundary"
+    def unsupported_reason(self):
         return ""
 
 

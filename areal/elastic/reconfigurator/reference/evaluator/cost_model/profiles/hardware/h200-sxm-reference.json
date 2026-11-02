@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "kind": "hardware",
+  "id": "h200-sxm-reference",
+  "version": "1",
+  "values": {
+    "bf16_tflops": 989.5,
+    "hbm_gbps": 4800,
+    "memory_gb": 141
+  },
+  "provenance": {
+    "source": "https://www.nvidia.com/en-us/data-center/h200/",
+    "checked": "2026-10-20",
+    "scope": "H200 SXM vendor reference; not a measurement of company hardware or H200 NVL",
+    "bf16_tflops": "Dense BF16 peak = vendor sparse 1979 / 2; no sparse speedup assumed",
+    "units": "Decimal GB, GB/s and dense BF16 TFLOP/s",
+    "evidence": "specification; effective rates and usable memory require target measurements"
+  }
+}

@@ -6,20 +6,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 
-from areal.elastic.policy.basic.observations import (
-    OnlineLayout,
-    RequestView,
-)
-from areal.elastic.policy.basic.search import (
-    SearchBound,
-)
-from areal.elastic.policy.reference.core import fingerprint
-
-from .online_transitions import (
-    ActorMemoryRejected,
-)
-from .simulation_core import SimulationConfig as OnlineRunConfig
-from .simulation_core import SimulationCore, _Deployment
+from areal.elastic.contracts import OnlineLayout, RequestView
+from areal.elastic.reconfigurator.reference.identity import fingerprint
+from areal.elastic.reconfigurator.reference.optimizer import SearchBound
+from areal.elastic.simulation.online_transitions import ActorMemoryRejected
+from areal.elastic.simulation.simulation_core import SimulationConfig as OnlineRunConfig
+from areal.elastic.simulation.simulation_core import SimulationCore, _Deployment
 
 __all__ = ["OnlineRunConfig", "OnlineSimulation"]
 
@@ -53,22 +45,39 @@ class OnlineSimulation(SimulationCore):
     def __init__(
         self,
         *args,
-        policy=None,
+        reconfigurator=None,
+        prediction_models=None,
         measured_search_time=False,
         search_clock=None,
         **kwargs,
     ):
-        super().__init__(*args, policy=policy, **kwargs)
+        super().__init__(*args, reconfigurator=reconfigurator, **kwargs)
+        self.prediction_models = (
+            self.models if prediction_models is None else prediction_models
+        )
+        if self.handoff.mode == "cold" and type(self) is OnlineSimulation:
+            raise ValueError(
+                "Use OnlineSimulation.create() for an explicit cold handoff"
+            )
         self._forecast_slo_guard = None
         self._candidate_guard = None
-        if measured_search_time and policy is not None:
-            from .online_control import OnlineControl
-
-            self.control = OnlineControl(self, search_clock)
-        if policy:
+        if measured_search_time and reconfigurator is not None:
+            self.control = reconfigurator.bind(self, search_clock)
+        if reconfigurator:
             self.schedule_at(
-                self.now + policy.config.check_interval_seconds, "policy", priority=10
+                self.now + reconfigurator.config.check_interval_seconds,
+                "reconfigurator",
+                priority=10,
             )
+
+    @classmethod
+    def create(cls, *args, **kwargs):
+        handoff = kwargs.get("handoff") if "handoff" in kwargs else args[4]
+        if handoff.mode == "cold":
+            from areal.elastic.simulation.cold_transitions import ColdSimulation
+
+            return ColdSimulation(*args, **kwargs)
+        return cls(*args, **kwargs)
 
     def before_work(self):
         self.maybe_actor_handoff()
@@ -84,6 +93,12 @@ class OnlineSimulation(SimulationCore):
 
     @classmethod
     def from_forecast(cls, view, forecast, models, config, handoff, slo, **kwargs):
+        if handoff.mode == "cold" and cls is OnlineSimulation:
+            from areal.elastic.simulation.cold_transitions import ColdSimulation
+
+            return ColdSimulation.from_forecast(
+                view, forecast, models, config, handoff, slo, **kwargs
+            )
         return cls.restore(view, forecast, models, config, handoff, slo, **kwargs)
 
     def result(self):
@@ -113,19 +128,12 @@ class OnlineSimulation(SimulationCore):
                 source=identity,
                 target=self.actor_id if deployment.role == "actor" else self.rollout_id,
             )
-            if self.policy is not None:
-                self.policy.role_switched(deployment.role, self.now)
+            if self.reconfigurator is not None:
+                self.reconfigurator.role_switched(deployment.role, self.now)
 
     def handle_transition_event(self, kind, data):
-        if kind == "actor_lifecycle_check":
-            self.lifecycle.request_check()
-        elif kind == "actor_lifecycle_saved":
-            self.lifecycle.saved()
-        elif kind == "actor_lifecycle_wake":
-            if self.lifecycle.wake_at == data:
-                self.lifecycle.wake("estimated_batch_ready")
-        elif kind == "policy":
-            self.poll_policy()
+        if kind == "reconfigurator":
+            self.poll_reconfigurator()
         elif kind == "search_complete":
             self.control.complete(data)
         elif kind == "verification_complete":
@@ -219,7 +227,7 @@ class OnlineSimulation(SimulationCore):
     def reject_unrepairable_forecast_wait(self):
         target = self._forecast_target
         if target is None:
-            return  # A real policy or externally scheduled action may repair it.
+            return  # A real reconfigurator or externally scheduled action may repair it.
         changes_actor = (target.actor_dp, target.actor_tp) != (
             self.layout.actor_dp,
             self.layout.actor_tp,
@@ -248,8 +256,11 @@ class OnlineSimulation(SimulationCore):
         if self.config.batch_size % target.actor_dp:
             raise ValueError("Target Actor DP must divide the configured episode batch")
         current = self.layout
-        if self.policy is not None and self.policy.config.independent_role_history:
-            allowed = self.policy.allowed_roles(self.now)
+        if (
+            self.reconfigurator is not None
+            and self.reconfigurator.config.independent_role_history
+        ):
+            allowed = self.reconfigurator.allowed_roles(self.now)
             if (
                 not allowed["actor"]
                 and (target.actor_dp, target.actor_tp)
@@ -260,11 +271,7 @@ class OnlineSimulation(SimulationCore):
                 != (current.rollout_replicas, current.rollout_tp)
             ):
                 return False
-        stopped = self.lifecycle is not None and self.lifecycle.state == "stopped"
-        if stopped and (target.actor_dp, target.actor_tp) != (
-            current.actor_dp,
-            current.actor_tp,
-        ):
+        if self.actor_id not in self.deployments:
             return False
         roles = []
         if (current.actor_dp, current.actor_tp) != (target.actor_dp, target.actor_tp):
@@ -291,26 +298,6 @@ class OnlineSimulation(SimulationCore):
                 )
                 return False
             acquired[role] = identity
-        recovery_placement = None
-        if stopped:
-            # Probe recovery while both Rollout generations still occupy GPUs.
-            # This is a feasibility check, not a charged or persistent lease.
-            actual_peak = self.pool.peak_gpus
-            recovery_placement = self.pool.acquire(
-                "actor-recovery-probe", "actor", current.actor_gpus, tp=current.actor_tp
-            )
-            if recovery_placement is None:
-                for previous in acquired.values():
-                    self.pool.release(str(previous))
-                self.pool.peak_gpus = previous_peak
-                self.emit(
-                    "handoff_deferred",
-                    target=asdict(target),
-                    reason="Rollout overlap would prevent Actor recovery",
-                )
-                return False
-            self.pool.release("actor-recovery-probe")
-            self.pool.peak_gpus = actual_peak
         self.pending_handoff = dict(
             target=target,
             new_actor=acquired.get("actor"),
@@ -343,8 +330,6 @@ class OnlineSimulation(SimulationCore):
             source=asdict(current),
             target=asdict(target),
             leases=dict(self.pool.leases),
-            actor_stopped=stopped,
-            actor_recovery_placement=recovery_placement,
         )
         return True
 
@@ -387,8 +372,10 @@ class OnlineSimulation(SimulationCore):
         deployment = self.deployments[identity]
         deployment.version, deployment.status = version, "prepared"
         if deployment.role == "actor":
-            if self.lifecycle is not None and self.lifecycle.restore_id == identity:
-                self.lifecycle.prepared(identity)
+            if self._restoring_actor == identity:
+                self.actor_id = identity
+                deployment.status = "active"
+                self._restoring_actor = None
             else:
                 self.pending_handoff["actor_ready"] = True
         self.emit(
@@ -518,8 +505,8 @@ class OnlineSimulation(SimulationCore):
             pending["new_actor"] is None or pending["new_actor"] == self.actor_id
         )
         active = {self.actor_id, self.rollout_id}
-        if self.lifecycle is not None and self.lifecycle.restore_id is not None:
-            active.add(self.lifecycle.restore_id)
+        if self._restoring_actor is not None:
+            active.add(self._restoring_actor)
         if (
             actor_done
             and pending["rollout_switched"]
@@ -527,35 +514,29 @@ class OnlineSimulation(SimulationCore):
         ):
             self.emit("handoff_complete", layout=asdict(self.layout))
             self.pending_handoff = None
-            if self.policy:
-                self.policy.switched(self.now)
+            if self.reconfigurator:
+                self.reconfigurator.switched(self.now)
 
-    def poll_policy(self):
-        from .online_candidates import OnlineForecastModel
-
-        if not self.policy or self.done:
+    def poll_reconfigurator(self):
+        if not self.reconfigurator or self.done:
             return
-        if self.lifecycle is not None:
-            self.lifecycle.tick()
         if self.control is not None:
             return self.control.poll()
         view = self.observe()
-        model = OnlineForecastModel(
-            self.models,
+        model = self.reconfigurator.make_model(
+            self.prediction_models,
             self.config,
             self.handoff,
             self.slo,
-            self.policy.config.decision_delay_seconds,
+            self.reconfigurator.config.decision_delay_seconds,
             executor=self.candidate_executor,
-            actor_memory_reserve_fraction=self.policy.config.actor_memory_reserve_fraction,
-            actor_memory_scope=self.policy.config.actor_memory_scope,
+            actor_memory_reserve_fraction=self.reconfigurator.config.actor_memory_reserve_fraction,
+            actor_memory_scope=self.reconfigurator.config.actor_memory_scope,
         )
-        decision = self.policy.decide(view, model)
+        decision = self.reconfigurator.decide(view, model)
         record = asdict(decision)
-        record["actor_lifecycle_state"] = (
-            view.actor.lifecycle.state if view.actor.lifecycle is not None else None
-        )
-        record["role_history"] = self.policy.role_history_status(view.now)
+        record["actor_running"] = view.actor.running
+        record["role_history"] = self.reconfigurator.role_history_status(view.now)
         record["observation_id"] = fingerprint(view)
         record["evaluation"] = model.execution_stats
         self.decisions.append(record)
@@ -563,13 +544,15 @@ class OnlineSimulation(SimulationCore):
         if decision.target != view.layout:
             self.decision_pending = True
             self.schedule_at(
-                self.now + self.policy.config.decision_delay_seconds,
+                self.now + self.reconfigurator.config.decision_delay_seconds,
                 "decision_apply",
                 decision.target,
                 priority=9,
             )
         self.schedule_at(
-            self.now + self.policy.config.check_interval_seconds, "policy", priority=10
+            self.now + self.reconfigurator.config.check_interval_seconds,
+            "reconfigurator",
+            priority=10,
         )
 
     def prediction_guard_active(self):

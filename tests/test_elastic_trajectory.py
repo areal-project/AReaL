@@ -12,7 +12,7 @@ from examples.autopilot.elastic.swe.process_env import SandboxProcess
 from examples.autopilot.elastic.swe.sandbox_worker import call_tool
 from examples.autopilot.elastic.swe.trajectory import trajectory_payload
 
-from areal.elastic.state.batch_queue import BatchQueue
+from areal.elastic.infra.state.batch_queue import BatchQueue
 
 
 @pytest.fixture
@@ -75,7 +75,7 @@ def test_materialized_trajectory_survives_producer_deletion(tmp_path, trajectory
     ],
 )
 def test_malformed_or_stale_trajectory_is_rejected(trajectory, field, value, match):
-    """Reject data that would silently corrupt a later policy update."""
+    """Reject data that would silently corrupt a later reconfigurator update."""
     trajectory[field] = value
     with pytest.raises(ValueError, match=match):
         payload(trajectory)

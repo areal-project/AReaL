@@ -1,169 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run a bounded code-revision loop or its synthetic CPU demonstration."""
+"""Run Online Reference model/optimizer revisions or a synthetic CPU demonstration."""
 
 import argparse
 import json
 import sys
-from dataclasses import asdict, replace
 from pathlib import Path
 
-from areal.autopilot.domains.elastic import RevisionEvaluator
-from areal.autopilot.revision import CommandRevisionAgent, RevisionLoop
-from areal.elastic.contracts import BatchWorkload, ElasticObservation, TrainingConfig
-from areal.elastic.policy.basic.simulator import (
-    ConstantComponent,
-    ForecastUpdate,
-    HistorySnapshot,
-    Measurement,
-    PlanStep,
-    WorkflowModel,
-    WorkflowSimulator,
+from examples.autopilot.elastic.revision_demo import (
+    GOOD_MODEL_SOURCE,
+    REDUNDANT_OPTIMIZER_SOURCE,
+    demo_evaluator,
 )
 
-AFFINE_SOURCE = """from dataclasses import replace
-from areal.elastic.policy.basic.simulator import Estimate, WorkflowSimulator
-
-class AffineTrain:
-    def __init__(self, base):
-        self.base = base
-    def estimate(self, context):
-        rows = [x for x in (*self.base.seed, *context.history.measurements)
-                if x.phase == "train" and x.world_size == context.config.world_size and x.sequence_tokens > 0]
-        if len(rows) < 2:
-            return self.base.estimate(context)
-        mean_x = sum(x.sequence_tokens for x in rows) / len(rows)
-        mean_y = sum(x.seconds for x in rows) / len(rows)
-        denominator = sum((x.sequence_tokens - mean_x)**2 for x in rows)
-        if not denominator:
-            return self.base.estimate(context)
-        slope = sum((x.sequence_tokens - mean_x)*(x.seconds - mean_y) for x in rows) / denominator
-        return Estimate(max(0, mean_y + slope*(context.workload.sequence_tokens - mean_x)))
-
-def build_simulator(workflow):
-    return WorkflowSimulator(replace(workflow, train=AffineTrain(workflow.train)))
-"""
-
-CACHE_SOURCE = """from dataclasses import replace
-from areal.elastic.policy.basic.optimizer import BasicOptimizer
-
-class CachedOptimizer:
-    def __init__(self, settings):
-        self.base = BasicOptimizer(**settings)
-    def optimize(self, observation, simulator, history):
-        cache = {}
-        class CachedReference:
-            def evaluate(self, obs, forecast, plan, hist):
-                canonical = ((replace(plan[0], release_before=False), *plan[1:])
-                             if not obs.training_active else plan)
-                key = tuple((x.config.world_size, x.release_before) for x in canonical)
-                if key not in cache:
-                    cache[key] = simulator.evaluate(obs, forecast, canonical, hist)
-                return cache[key]
-        return self.base.optimize(observation, CachedReference(), history)
-
-def build_optimizer(settings):
-    return CachedOptimizer(settings)
-"""
-
-
-def demo_inputs(target):
-    """Training tokens 100/400; simulator validation tokens 200/300 are held out."""
-    phases = {"start": 4, "restore": 3, "checkpoint": 1, "publish": 1, "release": 1}
-    records = []
-    for count in range(1, 4):
-        records.extend(
-            Measurement(phase, count, seconds) for phase, seconds in phases.items()
-        )
-        records.extend(
-            Measurement("train", count, 5 + tokens / (10 * count), tokens)
-            for tokens in (100, 400)
-        )
-    profile = {
-        "format_version": 1,
-        "inference_gpus": 1,
-        "compatibility": {"workflow": "synthetic-affine-cpu-demo-v1"},
-        "measurements": [asdict(x) for x in records],
-    }
-
-    def obs(tokens=200, active=False):
-        return ElasticObservation(
-            "ACTIVE" if active else "SUSPENDED",
-            1,
-            1,
-            active,
-            True,
-            0,
-            True,
-            False,
-            True,
-            10,
-            training_config=TrainingConfig(2),
-            next_batch=BatchWorkload(1, tokens // 2, tokens),
-            max_train_gpus=3,
-            has_checkpoint=True,
-        )
-
-    if target == "simulator":
-        cases = []
-        for count in range(1, 4):
-            for tokens in (200, 300):
-                observation = obs(tokens)
-                workload = observation.next_batch
-                forecast = (ForecastUpdate(workload, 0),)
-                plan = (PlanStep(TrainingConfig(count)),)
-                truth = WorkflowModel(
-                    ConstantComponent(5 + tokens / (10 * count)),
-                    **{key: ConstantComponent(value) for key, value in phases.items()},
-                    inference_gpus=1,
-                )
-                measured = WorkflowSimulator(truth).evaluate(
-                    observation, forecast, plan, HistorySnapshot()
-                )
-                cases.append(
-                    {
-                        "observation": asdict(observation),
-                        "history": asdict(HistorySnapshot()),
-                        "forecast": [asdict(x) for x in forecast],
-                        "plan": [asdict(x) for x in plan],
-                        "observed": {
-                            "feasible": True,
-                            "seconds": measured.seconds,
-                            "total_gpu_seconds": measured.total_gpu_seconds,
-                        },
-                    }
-                )
-        invalid = dict(
-            cases[0],
-            plan=[asdict(PlanStep(TrainingConfig(4)))],
-            observed={"feasible": False},
-        )
-        cases.append(invalid)
-    else:
-        history = HistorySnapshot((BatchWorkload(1, 150, 300, 20),))
-        observations = [
-            obs(200),
-            obs(300),
-            obs(200, True),
-            replace(
-                obs(active=True),
-                batch_ready=False,
-                next_batch=None,
-                episode_active=True,
-                episode_elapsed=5,
-            ),
-            replace(obs(active=True), pending_publication=True),
-        ]
-        cases = [
-            {"observation": asdict(item), "history": asdict(history)}
-            for item in observations
-        ]
-    return profile, cases
+from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE
+from areal.autopilot.domains.elastic.model_evaluator import HistoricalModelEvaluator
+from areal.autopilot.domains.elastic.model_execution import (
+    HistoricalSourceEvaluator,
+    historical_case_from_dict,
+)
+from areal.autopilot.domains.elastic.optimizer_evaluator import OnlineOptimizerEvaluator
+from areal.autopilot.revision import CommandRevisionAgent, RevisionLoop
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", choices=["simulator", "optimizer"])
+    parser.add_argument("--target", choices=["model", "optimizer"])
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--cases", type=Path)
     parser.add_argument("--settings", type=Path)
@@ -192,14 +54,16 @@ def main():
     args = parser.parse_args()
     if args.demo_agent:
         request = json.load(sys.stdin)
-        source = AFFINE_SOURCE if request["target"] == "simulator" else CACHE_SOURCE
+        source = (
+            GOOD_MODEL_SOURCE
+            if request["target"] == "model"
+            else BASELINE_SOURCE["optimizer"]
+        )
         sys.stdout.write(
             json.dumps(
                 {
                     "source": source,
-                    "rationale": "Fit affine train costs from calibration"
-                    if request["target"] == "simulator"
-                    else "Reuse reference queries for equivalent suspended-state plans",
+                    "rationale": "Controlled CPU example: improve model timing or remove redundant model queries",
                 }
             )
         )
@@ -207,7 +71,7 @@ def main():
     if args.target is None or args.output is None:
         parser.error("--target and --output are required")
     if args.demo:
-        profile, cases = demo_inputs(args.target)
+        evaluator = demo_evaluator(args.target)
     else:
         if (
             args.profile is None
@@ -252,9 +116,51 @@ def main():
             else (sys.executable, "-m", "examples.autopilot.revising", "--demo-agent")
         )
         agent = CommandRevisionAgent(command)
-    settings = None if args.settings is None else json.loads(args.settings.read_text())
-    evaluator = RevisionEvaluator(args.target, profile, cases, settings=settings)
-    loop = RevisionLoop(agent, evaluator, args.output)
+    if not args.demo:
+        settings = (
+            {} if args.settings is None else json.loads(args.settings.read_text())
+        )
+        if args.target == "model":
+            history = HistoricalModelEvaluator(
+                tuple(historical_case_from_dict(c) for c in cases),
+                primary_metrics=tuple(profile["primary_metrics"]),
+            )
+            evaluator = HistoricalSourceEvaluator(
+                history,
+                settings=profile["model_settings"],
+                initial_source=profile.get("initial_model_source"),
+            )
+        else:
+            from areal.autopilot.domains.elastic.contracts import decode
+            from areal.autopilot.revision.execution import load_source
+            from areal.elastic.reconfigurator.reference.evaluator import Evaluator
+            from areal.elastic.serving import ServingSLO
+            from areal.elastic.simulation.online_transitions import HandoffConfig
+            from areal.elastic.simulation.simulation_core import SimulationConfig
+
+            assembly = profile["assembly"]
+            models = load_source(profile["model_source"]).build_model(
+                tuple(
+                    historical_case_from_dict(c)
+                    for c in profile.get("calibration_cases", ())
+                ),
+                profile["model_settings"],
+            )
+            evaluator = OnlineOptimizerEvaluator(
+                cases,
+                model_factory=lambda: Evaluator(
+                    models,
+                    decode(SimulationConfig, assembly["run"]),
+                    decode(HandoffConfig, assembly["handoff"]),
+                    decode(ServingSLO, assembly["slo"]),
+                ),
+                context={"assembly": assembly},
+                settings=settings,
+            )
+    initial_source = (
+        REDUNDANT_OPTIMIZER_SOURCE if args.demo and args.target == "optimizer" else None
+    )
+    loop = RevisionLoop(agent, evaluator, args.output, initial_source=initial_source)
     result = loop.run(max_rounds=args.max_rounds)
     if (
         args.demo

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "kind": "execution/rollout",
+  "id": "sglang-qwen3-30b-a3b",
+  "version": "1",
+  "values": {
+    "config": {
+      "max_batch_sequences": 4,
+      "max_batch_tokens": 4096,
+      "backend": "sglang",
+      "weight_bytes": 2,
+      "kv_bytes": 2,
+      "cache_mode": "none"
+    },
+    "rates": {
+      "dense": 0.45,
+      "attention": 0.3,
+      "hbm": 0.65,
+      "network": 0.65,
+      "launch_seconds": 5e-06
+    },
+    "runtime_revision": "8aaafd1e+r10-sglang-runtime",
+    "policy": "decode_first_full_reservation_v1",
+    "model_profile": "qwen3-30b-a3b"
+  },
+  "provenance": {
+    "scope": "Explicit service/batching priors; actual batches, KV/cache and replica routing remain unobserved",
+    "source_sha256": "338d7b9b22dba1f7edaa5971d9fb4b77cbb28a73e270a1943e96d5916eef3a8d"
+  }
+}

@@ -1,6 +1,6 @@
 # 统计合成 workload
 
-生成器：[areal/elastic/workload.py](../../../areal/elastic/workload.py)；配置：[workload-spec.json](workload-spec.json)。
+生成器：[areal/elastic/simulation/workload.py](../../../areal/elastic/simulation/workload.py)；配置：[workload-spec.json](workload-spec.json)。
 全部为人工先验，不宣称拟合真实业务。当前 v2 生成器使用固定类型分布，推理与工具严格交替。
 
 ## 形式化定义
@@ -245,16 +245,16 @@ ID、logprob、奖励或真实训练张量。
 默认生成单次高峰；`--arrivals` 仅覆盖到达率区间，合并后的完整配置保存在输出目录：
 
 ```bash
-python -m areal.elastic.workload \
+python -m areal.elastic.simulation.workload \
   --spec examples/autopilot/elastic/workload-spec.json \
   --output /path/to/single-peak
 
-python -m areal.elastic.workload \
+python -m areal.elastic.simulation.workload \
   --spec examples/autopilot/elastic/workload-spec.json \
   --arrivals examples/autopilot/elastic/workload-arrivals/periodic.json \
   --output /path/to/periodic
 
-python -m areal.elastic.workload \
+python -m areal.elastic.simulation.workload \
   --spec examples/autopilot/elastic/workload-spec.json \
   --arrivals examples/autopilot/elastic/workload-arrivals/short-bursts.json \
   --output /path/to/short-bursts
@@ -274,10 +274,10 @@ GPU 部署时保持工具环境及该系数固定。JSONL 不预写排队时间�
 
 ```bash
 python -m pytest -q \
-  tests/test_elastic_policy.py::test_synthetic_workload_preserves_seed_dag_and_roundtrip \
-  tests/test_elastic_policy.py::test_synthetic_workload_arrival_and_composition_axes_are_independent \
-  tests/test_elastic_policy.py::test_synthetic_workload_poisson_counts_match_mean_and_variance \
-  tests/test_elastic_policy.py::test_basic_joint_optimizer_uses_frozen_expert_request_simulator
+  tests/test_elastic_reconfigurator.py::test_synthetic_workload_preserves_seed_dag_and_roundtrip \
+  tests/test_elastic_reconfigurator.py::test_synthetic_workload_arrival_and_composition_axes_are_independent \
+  tests/test_elastic_reconfigurator.py::test_synthetic_workload_poisson_counts_match_mean_and_variance \
+  tests/test_elastic_reconfigurator.py::test_basic_joint_optimizer_uses_frozen_expert_request_simulator
 ```
 
 有限窗口任务数不按训练 batch 补齐、重采样或删题。当前 ExpertJointWindow 要求固定完整训练批次；接通例显式选择 batch4

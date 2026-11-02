@@ -228,5 +228,5 @@ examples/autopilot/revising-validation-20261018.json
 examples/autopilot/revising-llm-validation-20261018.json
 
 # Historical Expert inputs remain in the external development archive.
-areal/elastic/policy/reference/trials/
-areal/elastic/policy/reference/figures/
+areal/elastic/reconfigurator/reference/trials/
+areal/elastic/reconfigurator/reference/figures/

@@ -13,6 +13,59 @@ from areal.v2.training_service.controller.controller import (
 MODULE = "areal.v2.training_service.controller.controller"
 
 
+def test_disconnect_engine_retains_training_workers_and_reconnects_new_rollout():
+    """Rollout replacement releases only the weight-transfer connection."""
+    from areal.api.io_struct import WeightUpdateMeta
+    from areal.v2.inference_service.controller.controller import RolloutControllerV2
+    from areal.v2.weight_update.gateway.config import WeightUpdateResult
+
+    controller = _make_controller()
+    controller._ensure_initialized = MagicMock()
+    controller._worker_addrs = ["http://train-rank-0"]
+    controller._service_roles = ["actor-guard"]
+    controller._version = 3
+    weights = controller._weight_update_ctrl = MagicMock()
+    controller._weight_update_identity = ("old-rollout",)
+    controller.disconnect_engine()
+    weights.disconnect.assert_called_once_with()
+    weights.destroy.assert_called_once_with()
+    assert controller._worker_addrs == ["http://train-rank-0"]
+    assert controller._service_roles == ["actor-guard"]
+    assert controller._version == 3
+    assert controller._weight_update_ctrl is None
+    assert controller._weight_update_identity is None
+    controller.scheduler.delete_workers.assert_not_called()
+
+    rollout = MagicMock(spec=RolloutControllerV2)
+    rollout.inference_worker_urls = ["http://new-infer"]
+    rollout.inference_guard_addrs = ["http://guard"]
+    replacement = MagicMock()
+    replacement.update_weights.return_value = WeightUpdateResult(
+        status="ok", version=3, duration_ms=1.0
+    )
+    with (
+        patch(
+            "areal.v2.weight_update.controller.controller.WeightUpdateController",
+            return_value=replacement,
+        ),
+        patch("requests.post") as post,
+    ):
+        post.return_value.json.return_value = {"host": "127.0.0.1", "ports": [30000]}
+        controller.connect_engine(rollout, WeightUpdateMeta(type="awex", version=3))
+        controller.update_weights(WeightUpdateMeta(type="awex", version=3))
+    assert replacement.connect.call_args.kwargs["train_worker_urls"] == [
+        "http://train-rank-0"
+    ]
+    assert replacement.connect.call_args.kwargs["inference_worker_urls"] == [
+        "http://new-infer"
+    ]
+    replacement.update_weights.assert_called_once_with(version=3)
+    rollout.set_version.assert_called_once_with(3)
+    assert controller._service_roles == ["actor-guard"]
+    assert controller._version == 3
+    controller.scheduler.delete_workers.assert_not_called()
+
+
 def test_tracer_flush_uses_bounded_timeout_without_shortening_training_rpcs():
     """Optional tracing never inherits the hour-long training RPC timeout."""
     controller = _make_controller()

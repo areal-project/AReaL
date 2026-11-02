@@ -1902,7 +1902,7 @@ async def test_durable_abort_http_rejects_late_generation_and_reward(
 ):
     import json
 
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
     inbox = OnlineInbox(tmp_path, batch_size=1, max_staleness=0)
     config.online_training_admission = True
@@ -2028,7 +2028,7 @@ async def test_lost_online_reply_only_allows_abort_before_backend_dispatch(
 ):
     import json
 
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
     inbox = OnlineInbox(tmp_path, batch_size=1, max_staleness=0)
     config.online_training_admission = True
@@ -2087,7 +2087,7 @@ async def test_durable_online_handoff_retries_without_dummy_workflows(
     import json
 
     from areal.api.cli_args import AgentConfig, InferenceEngineConfig
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
     from areal.v2.inference_service.controller.controller import RolloutControllerV2
 
     monkeypatch.setattr("areal.utils.network.gethostip", lambda: "127.0.0.1")

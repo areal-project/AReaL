@@ -126,7 +126,7 @@ async def test_hermes_math_client_scores_and_confirms_durable_episode(tmp_path):
     from examples.task_workflows.benchmarks.dapo_math import MathTask, question_id
     from examples.task_workflows.client import ClientSettings, EpisodeClient
 
-    from areal.elastic.state.episode_inbox import OnlineInbox
+    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
     state = tmp_path / "state"
     inbox = OnlineInbox(state / "inbox", batch_size=1, max_staleness=2)

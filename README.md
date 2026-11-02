@@ -6,8 +6,8 @@ AReaL. Current research scope: configuration cost efficiency for nine Tau2 trial
 - [Current progress](PROGRESS.md) and
   [Tau2 plan / company handoff](examples/autopilot/PLAN.md)
 - [AReaL Elastic capabilities](areal/elastic/README.md)
-- [Basic planning](areal/elastic/policy/basic/README.md) and
-  [independent Expert](areal/elastic/policy/reference/README.md)
+- [Basic planning](areal/elastic/reconfigurator/basic/README.md) and
+  [independent Expert](areal/elastic/reconfigurator/reference/README.md)
 - [AutoPilot revision](areal/autopilot/revision/README.md) and
   [Elastic adapter](areal/autopilot/domains/elastic/README.md)
 - [Execution architecture and validation](examples/autopilot/elastic/README.md)

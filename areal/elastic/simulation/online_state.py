@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING
 
-from areal.elastic.policy.basic.observations import RequestView
+from areal.elastic.contracts import RequestView
 
 if TYPE_CHECKING:
     from .online_decode import _Plan

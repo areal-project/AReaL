@@ -32,7 +32,7 @@ def cpu_math_imports():
 
 
 def load_workload(path, tool_seconds_per_unit):
-    from areal.elastic.policy.basic.observations import EpisodeSample, Turn
+    from areal.elastic.contracts import EpisodeSample, Turn
 
     result = []
     for line in Path(path).read_text().splitlines():
@@ -89,7 +89,7 @@ def load_workload(path, tool_seconds_per_unit):
 
 
 def candidates(batch_size, *, steady_gpu_budget=16, role_gpu_limit=8):
-    from areal.elastic.policy.basic.observations import OnlineLayout
+    from areal.elastic.contracts import OnlineLayout
 
     if not 2 <= steady_gpu_budget <= 16 or not 1 <= role_gpu_limit <= 16:
         raise ValueError("Search requires a2–16GPU steady budget and1–16GPU role limit")
@@ -113,6 +113,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workload", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--reconfigurator", choices=("basic", "reference"))
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--mechanism-fits", type=Path, required=True)
     parser.add_argument("--publication-metadata", type=Path, required=True)
@@ -133,15 +134,9 @@ def main():
         cpu_math_imports as initialize_worker,
     )
 
-    from areal.elastic.policy.basic.history import HistoricalReplay, HistoryReplayConfig
-    from areal.elastic.policy.basic.observations import OnlineLayout
-    from areal.elastic.policy.basic.online import OnlinePolicy, OnlinePolicyConfig
-    from areal.elastic.policy.basic.online_forecast import (
-        ForecastConfig,
-        HistoricalForecaster,
-    )
-    from areal.elastic.policy.basic.serving import ServingSLO
-    from areal.elastic.simulation.online_models import CalibratedOnlineModels
+    from areal.elastic.contracts import OnlineLayout
+    from areal.elastic.reconfigurator import build_reconfigurator, component_module
+    from areal.elastic.serving import ServingSLO
     from areal.elastic.simulation.online_simulation import (
         OnlineRunConfig,
         OnlineSimulation,
@@ -149,12 +144,14 @@ def main():
     from areal.elastic.simulation.online_transitions import HandoffConfig
 
     raw = json.loads(args.config.read_text())
+    implementation = args.reconfigurator or raw.get("implementation", "reference")
+    CalibratedOnlineModels = component_module(
+        implementation, "models"
+    ).CalibratedOnlineModels
     run_raw = dict(raw["run"])
     run_raw["tool_capacities"] = tuple(tuple(row) for row in run_raw["tool_capacities"])
     run = OnlineRunConfig(**run_raw)
-    handoff_raw = dict(raw["handoff"])
-    handoff_raw["node_gpus"] = tuple(handoff_raw["node_gpus"])
-    handoff = HandoffConfig(**handoff_raw)
+    handoff = HandoffConfig.from_dict(raw["handoff"])
     initial = OnlineLayout(**raw["initial_layout"])
     slo = ServingSLO(**raw["slo"])
     workload_config = raw.get("replay", raw.get("forecast"))
@@ -163,6 +160,13 @@ def main():
     if workload_config["max_new_tokens"] != run.max_new_tokens:
         parser.error("Forecast and serving must share the declared generation budget")
     models = CalibratedOnlineModels(
+        args.bundle,
+        args.mechanism_fits,
+        args.publication_metadata,
+        handoff.effective_bandwidth_GBps,
+        inter_node_dp_GBps=raw.get("model_assumptions", {}).get("inter_node_dp_GBps"),
+    )
+    prediction_models = CalibratedOnlineModels(
         args.bundle,
         args.mechanism_fits,
         args.publication_metadata,
@@ -187,30 +191,18 @@ def main():
         args.publication_metadata,
         args.bundle / "manifest.json",
     ]
-    sources = [Path(__file__)] + [
-        repo / p
-        for p in (
-            "areal/elastic/policy/basic/online_forecast.py",
-            "areal/elastic/policy/basic/observations.py",
-            "areal/elastic/policy/basic/forecast_workload.py",
-            "areal/elastic/policy/basic/history.py",
-            "areal/elastic/policy/basic/online.py",
-            "areal/elastic/policy/basic/search.py",
-            "areal/elastic/policy/basic/serving.py",
-            "areal/elastic/simulation/online_models.py",
-            "areal/elastic/simulation/online_decode.py",
-            "areal/elastic/simulation/online_inputs.py",
-            "areal/elastic/simulation/online_control.py",
-            "areal/elastic/simulation/online_lifecycle.py",
-            "areal/elastic/simulation/online_state.py",
-            "areal/elastic/simulation/online_parallel.py",
-            "areal/elastic/simulation/online_simulation.py",
-            "areal/elastic/simulation/simulation_core.py",
-            "areal/elastic/simulation/online_candidates.py",
-            "areal/elastic/simulation/online_memory.py",
-            "areal/elastic/simulation/online_transitions.py",
-        )
-    ]
+    sources = (
+        [Path(__file__)]
+        + sorted((repo / "areal/elastic/reconfigurator").rglob("*.py"))
+        + sorted((repo / "areal/elastic/simulation").glob("*.py"))
+        + [
+            repo / "areal/elastic/contracts.py",
+            repo / "areal/elastic/serving.py",
+            repo / "areal/elastic/contracts.py",
+            repo / "areal/elastic/contracts.py",
+            repo / "areal/elastic/reconfigurator/__init__.py",
+        ]
+    )
     identity = dict(
         inputs={
             str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest() for p in files
@@ -220,8 +212,13 @@ def main():
             for p in sources
         },
         models=models.source_ids,
+        prediction_models=prediction_models.source_ids,
+        prediction_simulator="JointSimulator"
+        if implementation == "basic"
+        else "Evaluator",
         config=raw,
         candidate_count=len(configurations),
+        reconfigurator_implementation=implementation,
         search_workers=args.search_workers,
         decision_clock=args.decision_clock,
         event_detail=args.event_detail,
@@ -230,15 +227,15 @@ def main():
     (args.output / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
     results = {}
     for mode in ("fixed", "dynamic") if args.mode == "both" else (args.mode,):
-        policy = None
+        reconfigurator = None
         if mode == "dynamic":
-            policy = OnlinePolicy(
-                configurations,
-                HistoricalReplay(HistoryReplayConfig(**raw["replay"]))
-                if "replay" in raw
-                else HistoricalForecaster(ForecastConfig(**raw["forecast"])),
-                OnlinePolicyConfig(**raw["policy"]),
-                slo,
+            reconfigurator = build_reconfigurator(
+                implementation,
+                candidates=configurations,
+                replay=raw.get("replay"),
+                forecast=raw.get("forecast"),
+                settings=raw["reconfigurator"],
+                slo=slo,
             )
         path = args.output / mode
         path.mkdir()
@@ -255,7 +252,7 @@ def main():
                 else nullcontext(None)
             ) as candidate_executor,
         ):
-            simulation = OnlineSimulation(
+            simulation = OnlineSimulation.create(
                 workload,
                 initial,
                 models,
@@ -263,7 +260,8 @@ def main():
                 handoff,
                 slo,
                 input_closes_at=raw["input_closes_at"],
-                policy=policy,
+                reconfigurator=reconfigurator,
+                prediction_models=prediction_models,
                 candidate_executor=candidate_executor,
                 measured_search_time=args.decision_clock == "measured",
                 event_sink=(

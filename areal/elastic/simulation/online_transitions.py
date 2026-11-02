@@ -7,11 +7,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from itertools import combinations
 
-from areal.elastic.policy.basic.cost_model.rollout import nonnegative, positive_int
+from areal.elastic.contracts import OnlineLayout, nonnegative, positive_int
+from areal.elastic.layout import ExecutionLayout
 
 
 class ActorMemoryRejected(ValueError):
     """The declared Actor recipe cannot safely train this completed batch."""
+
+
+@dataclass(frozen=True)
+class NativePlacement:
+    layout: OnlineLayout
+    execution: ExecutionLayout
 
 
 @dataclass(frozen=True)
@@ -27,8 +34,67 @@ class HandoffConfig:
     actor_sync_setup_seconds: float
     rollout_sync_setup_seconds: float
     provenance: str
+    mode: str = "hot"
+    native_source: ExecutionLayout | None = None
+    native_devices: tuple[int, ...] = ()
+    native_placements: tuple[NativePlacement, ...] = ()
+    phase_seconds: tuple[tuple[str, float], ...] = ()
+    native_checkpoint_version: int | None = None
+
+    @classmethod
+    def from_dict(cls, raw):
+        values = dict(raw)
+        values["node_gpus"] = tuple(values["node_gpus"])
+        values["native_devices"] = tuple(values.get("native_devices", ()))
+        values["phase_seconds"] = tuple(
+            tuple(x) for x in values.get("phase_seconds", ())
+        )
+        if values.get("native_source") is not None:
+            values["native_source"] = ExecutionLayout.decode(values["native_source"])
+        values["native_placements"] = tuple(
+            NativePlacement(
+                OnlineLayout(**p["layout"]), ExecutionLayout.decode(p["execution"])
+            )
+            for p in values.get("native_placements", ())
+        )
+        return cls(**values)
 
     def __post_init__(self):
+        if self.mode not in {"hot", "cold"}:
+            raise ValueError("Handoff mode must be hot or cold")
+        if len(dict(self.phase_seconds)) != len(self.phase_seconds):
+            raise ValueError("Native transition timing names must be unique")
+        for name, seconds in self.phase_seconds:
+            nonnegative(name, seconds)
+        if self.native_source is not None:
+            if len(set(self.native_devices)) != len(self.native_devices) or sum(
+                self.node_gpus
+            ) != len(self.native_devices):
+                raise ValueError(
+                    "Native topology must contain exactly the immutable reservation"
+                )
+            for placement in self.native_placements:
+                target = placement.execution
+                if (
+                    placement.layout.actor_tp != 1
+                    or placement.layout.rollout_tp != 1
+                    or target.world_size != placement.layout.actor_dp
+                    or len(target.rollout_devices) != placement.layout.rollout_replicas
+                ):
+                    raise ValueError(
+                        "Native prediction requires matching FSDP DP / SGLang TP1 layouts"
+                    )
+                if not set(target.actor_devices + target.rollout_devices) <= set(
+                    self.native_devices
+                ):
+                    raise ValueError(
+                        "Native candidate exceeds the original reservation"
+                    )
+        if self.native_checkpoint_version is not None and (
+            type(self.native_checkpoint_version) is not int
+            or self.native_checkpoint_version < 0
+        ):
+            raise ValueError("Native checkpoint version must be nonnegative or unknown")
         if not self.node_gpus or not self.provenance:
             raise ValueError(
                 "Explicit pool topology and timing provenance are required"
@@ -93,6 +159,27 @@ class GPUAllocator:
                         owner, role, left[:left_count] + right[:right_count]
                     )
         return None
+
+    def acquire_exact(self, owner, role, devices):
+        devices = tuple(devices)
+        occupied = {d for _, lease in self.leases.values() for d in lease}
+        if (
+            owner in self.leases
+            or role not in self.gpu_seconds
+            or len(set(devices)) != len(devices)
+            or any(
+                d in occupied
+                or node < 0
+                or node >= len(self.nodes)
+                or not 0 <= rank < self.nodes[node]
+                for d in devices
+                for node, rank in (d,)
+            )
+        ):
+            raise ValueError(
+                "Native target leases must fit the immutable reservation without overlap"
+            )
+        return self._lease(owner, role, devices)
 
     def _lease(self, owner, role, devices):
         self.leases[owner] = role, devices

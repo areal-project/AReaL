@@ -132,7 +132,7 @@ Proxy gateway available at http://X.X.X.X:PORT
 > layout.
 
 For opt-in on-demand Actor lifecycle and AutoPilot flags, see the
-[native elastic training contract](../autopilot/elastic/README.md#run-and-policy-integration).
+[native elastic training contract](../autopilot/elastic/README.md#run-and-reconfigurator-integration).
 This requires an audited fixed GPU layout and persistent state root. GPU acceptance of
 the new lifecycle remains pending; the default resident flow is unchanged.
 

@@ -105,7 +105,7 @@ actor:
 # Configure physical device indices within the current job allocation.
 actor_lifecycle:
   mode: ${oc.env:AREAL_ACTOR_LIFECYCLE,resident}
-  policy: basic
+  reconfigurator: basic
   state_root: ${oc.env:AREAL_TASK_STATE_ROOT}
   actor_devices: [0, 1, 2, 3]
   rollout_devices: [4]

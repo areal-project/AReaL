@@ -10,10 +10,10 @@ import httpx
 import openai
 import pytest
 
-from examples.autopilot.revising import AFFINE_SOURCE, demo_inputs
+from examples.autopilot.elastic.revision_demo import GOOD_MODEL_SOURCE as AFFINE_SOURCE
+from examples.autopilot.elastic.revision_demo import demo_evaluator
 
-from areal.autopilot.domains.elastic import RevisionEvaluator
-from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE, proposal_context
+from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE
 from areal.autopilot.domains.elastic.contracts import (
     elastic_proposal_request as ProposalRequest,
 )
@@ -79,11 +79,11 @@ def proposer(**kwargs):
 
 
 def proposal_request():
-    profile, _ = demo_inputs("simulator")
+    profile = demo_evaluator("model").calibration
     return ProposalRequest(
-        "simulator",
+        "model",
         2,
-        BASELINE_SOURCE["simulator"],
+        BASELINE_SOURCE["model"],
         "incumbent-hash",
         profile,
         {},
@@ -108,12 +108,16 @@ def test_llm_sends_public_api_calibration_and_feedback_and_records_usage(
     assert context["request"] == expected
     assert context["request"]["previous_source"] == "broken python !"
     assert (
-        "class BasicOptimizer"
-        in context["reference_sources"]["areal/elastic/policy/basic/optimizer.py"]
+        "class HistoricalInput"
+        in context["reference_sources"][
+            "areal/autopilot/domains/elastic/model_evaluator.py"
+        ]
     )
     assert (
-        "class WorkflowSimulator"
-        in context["reference_sources"]["areal/elastic/policy/basic/simulator.py"]
+        "class OnlineHistoryPredictor"
+        in context["reference_sources"][
+            "areal/autopilot/domains/elastic/model_adapters.py"
+        ]
     )
     assert "observed" not in context["request"]["calibration"]
     assert "test-credential" not in json.dumps(sent)
@@ -139,12 +143,8 @@ def test_llm_repairs_rejected_source_after_loop_resume(model_endpoint, tmp_path)
     )
     root = str(Path(__file__).resolve().parents[1])
     bootstrap = f"import sys,types,runpy; p=types.ModuleType('areal'); p.__path__=[{root!r}+'/areal']; sys.modules['areal']=p; runpy.run_module('areal.autopilot.domains.elastic.worker',run_name='__main__')"
-    profile, cases = demo_inputs("simulator")
-    evaluation = RevisionEvaluator(
-        "simulator",
-        profile,
-        cases,
-        runner=CandidateRunner(command=(sys.executable, "-c", bootstrap)),
+    evaluation = demo_evaluator(
+        "model", CandidateRunner(command=(sys.executable, "-c", bootstrap))
     )
     store = tmp_path / "revision"
     first = RevisionLoop(proposer(), evaluation, store).run(max_rounds=1)
@@ -244,12 +244,8 @@ def test_llm_timeout_is_feedback_and_does_not_abort_revision(model_endpoint, tmp
     )
     root = str(Path(__file__).resolve().parents[1])
     bootstrap = f"import sys,types,runpy; p=types.ModuleType('areal'); p.__path__=[{root!r}+'/areal']; sys.modules['areal']=p; runpy.run_module('areal.autopilot.domains.elastic.worker',run_name='__main__')"
-    profile, cases = demo_inputs("simulator")
-    evaluation = RevisionEvaluator(
-        "simulator",
-        profile,
-        cases,
-        runner=CandidateRunner(command=(sys.executable, "-c", bootstrap)),
+    evaluation = demo_evaluator(
+        "model", CandidateRunner(command=(sys.executable, "-c", bootstrap))
     )
     result = RevisionLoop(proposer(), evaluation, tmp_path).run(max_rounds=2)
     assert [item["status"] for item in result["rounds"]] == ["rejected", "accepted"]
@@ -264,14 +260,14 @@ def test_cli_selects_llm_command_without_exposing_api_key(monkeypatch, tmp_path)
     seen = []
 
     class Loop:
-        def __init__(self, agent, evaluation, root):
+        def __init__(self, agent, evaluation, root, **kwargs):
             seen.append(agent)
 
         def run(self, **kwargs):
             return {"active_source": None, "accepted": 0}
 
     monkeypatch.setattr(cli, "RevisionLoop", Loop)
-    monkeypatch.setattr(cli, "RevisionEvaluator", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "demo_evaluator", lambda *a, **k: None)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -306,8 +302,8 @@ def test_historical_model_proposal_supplies_matching_factory_and_reference_api()
     )
     messages = proposer().messages(request)
     data = json.loads(messages[1]["content"])
-    assert "build_model" in data["request"]["api"]
-    assert "HistoricalInput" in data["request"]["component_api"]
+    assert "build_model" in data["request"]["factory"]
+    assert "calibration_cases" in data["request"]["factory"]
     assert (
         "areal/autopilot/domains/elastic/model_evaluator.py"
         in data["reference_sources"]
@@ -323,43 +319,22 @@ def test_historical_model_proposal_supplies_matching_factory_and_reference_api()
     )
 
 
-def test_joint_optimizer_proposal_supplies_frozen_search_api():
-    """Joint proposals receive their factory/contracts without calling an endpoint."""
+def test_online_optimizer_proposal_supplies_the_reference_search_port():
     request = ProposalRequest(
-        "joint_optimizer",
-        1,
-        BASELINE_SOURCE["joint_optimizer"],
-        "hash",
-        {"model_version": "frozen-basic"},
-        {"max_evaluations": 2},
-        (),
+        "optimizer", 1, BASELINE_SOURCE["optimizer"], "hash", {}, {}, ()
     )
     data = json.loads(proposer().messages(request)[1]["content"])
-    assert "build_joint_optimizer" in data["request"]["api"]
-    assert "claimed metrics are ignored" in data["request"]["component_api"]
-    assert "areal/elastic/policy/basic/joint.py" in data["reference_sources"]
+    assert "build_optimizer" in data["request"]["factory"]
     assert (
-        "areal/autopilot/domains/elastic/joint_evaluator.py"
+        "areal/elastic/reconfigurator/reference/optimizer.py"
         in data["reference_sources"]
     )
-
-
-def test_serial_model_proposals_receive_the_correct_timing_api_sources():
-    from dataclasses import replace
-
-    request = replace(
-        proposal_request(),
-        target="serial_model",
-        context=proposal_context("serial_model"),
-    )
-    messages = proposer().messages(request)
-    value = json.loads(messages[1]["content"])
-    assert "build_serial_model" in value["request"]["api"]
     assert (
-        "SerialTimingInput"
-        in value["reference_sources"]["areal/elastic/policy/basic/serial_planning.py"]
+        "SearchPort"
+        in data["reference_sources"][
+            "areal/autopilot/domains/elastic/optimizer_evaluator.py"
+        ]
     )
-    assert "predict_timing" in messages[0]["content"]
 
 
 def test_llm_domain_reference_sources_are_serialized_once():

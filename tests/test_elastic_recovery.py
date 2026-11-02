@@ -5,18 +5,12 @@ from dataclasses import asdict, replace
 
 import pytest
 
-from areal.elastic.contracts import TrainingConfig
-from areal.elastic.control.config_application import (
+from areal.elastic.infra.reconfiguration import (
     ConfigApplication,
     ConfigRequest,
     ConfigSnapshot,
 )
-from areal.elastic.policy.basic.cost_model.rollout import RolloutConfig
-from areal.elastic.policy.basic.joint import JointConfig
-
-
-def rollout_config():
-    return RolloutConfig("model", "cpu", "fixture", "fixed", 1, 1, 8, 64, 128, 1)
+from areal.elastic.layout import ExecutionLayout
 
 
 class ConfigFixture:
@@ -26,7 +20,7 @@ class ConfigFixture:
 
     def __init__(self):
         self.current = ConfigSnapshot(
-            JointConfig(TrainingConfig(1), rollout_config()), 5, "checkpoint-5", True
+            ExecutionLayout(1, (0, 1, 2, 3, 4, 5, 6, 7), (8,)), 5, "checkpoint-5", True
         )
         self.applies = []
         self.recoveries = []
@@ -37,9 +31,7 @@ class ConfigFixture:
         return self.current
 
     def decode_config(self, value):
-        return JointConfig(
-            TrainingConfig(**value["actor"]), RolloutConfig(**value["rollout"])
-        )
+        return ExecutionLayout.decode(value)
 
     def validate(self, target):
         if target.world_size > 8:
@@ -62,10 +54,10 @@ def config_request(executor, generation=0, request_id="request-one", target=None
     current = executor.observe()
     return ConfigRequest(
         request_id,
-        target or replace(current.config, actor=TrainingConfig(2)),
+        target or replace(current.config, world_size=2),
         generation,
         current.weights_version,
-        "policy-v0",
+        "reconfigurator-v0",
     )
 
 
@@ -75,7 +67,7 @@ def test_config_application_commits_joint_target_and_retries_without_execution(
     executor = ConfigFixture()
     application = ConfigApplication(executor, tmp_path)
     source = executor.observe()
-    target = JointConfig(TrainingConfig(3), replace(rollout_config(), replicas=2))
+    target = ExecutionLayout(3, (0, 1, 2), (3, 4))
     request = config_request(executor, target=target)
     receipt = application.apply(request)
     assert receipt["status"] == "applied" and receipt["generation"] == 1
@@ -126,7 +118,7 @@ def test_config_application_noop_and_context_mismatch_are_explicit(tmp_path):
 def test_config_application_recovers_interruption_without_replaying_target(
     tmp_path, monkeypatch, point
 ):
-    import areal.elastic.control.config_application as module
+    import areal.elastic.infra.reconfiguration as module
 
     class PowerLoss(BaseException):
         pass
@@ -213,7 +205,7 @@ def test_old_receipt_does_not_bypass_pending_config_intent(tmp_path):
                 executor,
                 1,
                 "next",
-                replace(executor.current.config, actor=TrainingConfig(3)),
+                replace(executor.current.config, world_size=3),
             )
         )
     with pytest.raises(RuntimeError, match="pending config"):

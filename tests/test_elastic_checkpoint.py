@@ -5,10 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from areal.elastic.state.checkpoint_store import (
-    CheckpointStore,
-    atomic_json,
-)
+from areal.elastic.infra.state.checkpoint_store import CheckpointStore, atomic_json
 
 
 @pytest.mark.parametrize("backend", ["fsdp", "megatron"])
@@ -244,7 +241,7 @@ def test_checkpoint_low_space_keeps_existing_checkpoint(tmp_path, monkeypatch):
     store = CheckpointStore(tmp_path, free_space_floor=0)
     previous = commit(store, 1)
     monkeypatch.setattr(
-        "areal.elastic.state.checkpoint_store.shutil.disk_usage",
+        "areal.elastic.infra.state.checkpoint_store.shutil.disk_usage",
         lambda path: SimpleNamespace(free=0),
     )
 
@@ -275,7 +272,9 @@ def test_checkpoint_directory_published_without_pointer_can_be_replayed(
         return original(path, value)
 
     with monkeypatch.context() as patch:
-        patch.setattr("areal.elastic.state.checkpoint_store.atomic_json", fail_pointer)
+        patch.setattr(
+            "areal.elastic.infra.state.checkpoint_store.atomic_json", fail_pointer
+        )
         with pytest.raises(OSError, match="pointer failure"):
             commit(store, 2)
     assert store.latest({"backend": "d2"})[0] == previous
@@ -325,7 +324,9 @@ def test_checkpoint_retention_keeps_previous_commit_instead_of_newer_orphan(
         original(path, value)
 
     with monkeypatch.context() as patch:
-        patch.setattr("areal.elastic.state.checkpoint_store.atomic_json", fail_pointer)
+        patch.setattr(
+            "areal.elastic.infra.state.checkpoint_store.atomic_json", fail_pointer
+        )
         with pytest.raises(OSError):
             commit(store, 2)
     current = commit(store, 2)
@@ -349,7 +350,7 @@ def native_lifecycle(tmp_path, monkeypatch, request):
 
     from areal.api import FinetuneSpec, WeightUpdateMeta
     from areal.api.cli_args import ActorLifecycleConfig, PPOConfig
-    from areal.elastic import runtime as on_demand
+    from areal.elastic.infra import runtime as on_demand
 
     config = PPOConfig()
     base = tmp_path / "base"
@@ -410,6 +411,9 @@ def native_lifecycle(tmp_path, monkeypatch, request):
             self.save_perf_tracer = MagicMock()
             self.quiesce_initialization = MagicMock()
             self.connect_engine = MagicMock()
+            self.disconnect_engine = MagicMock(
+                side_effect=lambda: events.append("disconnect-weights")
+            )
             self.destroy = MagicMock(
                 side_effect=lambda **kwargs: events.append("release")
             )
@@ -469,12 +473,12 @@ def native_lifecycle(tmp_path, monkeypatch, request):
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=48, train_batch_size=4)
     coordinator = {"step": 0}
 
-    def create(policy_adapter=None, actor_pool_setter=None):
+    def create(reconfigurator_adapter=None, actor_pool_setter=None):
         manager = on_demand.OnDemandActor(
             config,
             ft_spec,
             Actor,
-            policy_adapter=policy_adapter,
+            reconfigurator_adapter=reconfigurator_adapter,
             actor_pool_setter=actor_pool_setter,
         )
         try:
@@ -516,105 +520,65 @@ def _complete_native_update(manager, version):
     manager.finish_update()
 
 
-def test_native_on_demand_uses_basic_policy_for_batch_and_release(
-    native_lifecycle, monkeypatch
-):
-    """Default on-demand execution asks Basic before training and idle release."""
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock
-
-    from areal.elastic.policy.basic import IdleTimeoutPolicy
-
+def test_native_online_keeps_actor_resident_after_a_ready_batch(native_lifecycle):
+    """A completed update keeps its Actor ready even when the inbox is idle."""
     manager = native_lifecycle.manager
-    assert manager.policy_adapter.policy == IdleTimeoutPolicy(
-        manager.options.idle_timeout
-    )
-    assert manager.policy_hooks is None
+    adapter = manager.reconfigurator_adapter
+    assert adapter.reconfigurator.implementation == "reference"
+    assert manager.revision_hooks is None
     assert (manager.root / "native-profile.json").is_file()
-    assert manager.monitor.runtime_history.path.is_file()
-    assert not (manager.root / "policy-application").exists()
-    original = manager.policy_adapter.policy
-    decide = MagicMock(return_value="keep")
-    monkeypatch.setattr(
-        manager.policy_adapter, "policy", SimpleNamespace(decide=decide)
-    )
+    assert not (manager.root / "reconfigurator-application").exists()
     _ready_native_episodes(manager, 0, 0)
-    assert manager._poll_batch() is None
-    assert manager.actor is None and native_lifecycle.actors == []
-    assert decide.call_args.args[0].batch_ready
-    monkeypatch.setattr(manager.policy_adapter, "policy", original)
-    manager.next_batch()
+    assert len(manager.next_batch()) == 4
     manager.actor.updates += 1
     _complete_native_update(manager, 1)
-    monkeypatch.setattr(
-        manager.policy_adapter, "policy", SimpleNamespace(decide=decide)
-    )
-    now = max(manager.ready_since + 120, manager.idle_since + 60)
-    assert not manager.maybe_suspend(now=now)
-    assert not decide.call_args.args[0].batch_ready
-    assert manager.actor is not None
-    monkeypatch.setattr(manager.policy_adapter, "policy", original)
-    assert manager.maybe_suspend(now=now)
-    assert manager.actor is None
+    assert manager.monitor.completed_tokens == 8
+    actor = manager.actor
+    assert adapter.decide(None, now=manager.ready_since + 10000) == "keep"
+    assert manager._poll_batch() is None
+    assert manager.actor is actor
+    actor.destroy.assert_not_called()
 
 
-def test_native_measured_basic_without_autopilot_uses_shared_monitor(
-    native_lifecycle, tmp_path, monkeypatch
+@pytest.mark.parametrize("implementation", ["basic", "reference"])
+def test_native_online_without_autopilot_restores_shared_monitor(
+    native_lifecycle, tmp_path, monkeypatch, implementation
 ):
-    """Ordinary measured Basic uses the default decision boundary without AutoPilot."""
     import builtins
-    from dataclasses import asdict
 
-    from areal.elastic.contracts import Measurement
-    from areal.elastic.policy.adapter import PolicyAdapter
-    from areal.elastic.policy.basic.policy import BasicPolicy
+    from areal.elastic.infra.adapter import ReconfiguratorAdapter
 
     fixture = native_lifecycle
-    profile = {
-        **fixture.manager.policy_adapter.profile,
-        "measurements": [
-            asdict(Measurement(phase, 1, 1, 16))
-            for phase in (
-                "start",
-                "restore",
-                "train",
-                "checkpoint",
-                "publish",
-                "release",
-            )
-        ],
-    }
     fixture.manager.close()
-    fixture.config.actor_lifecycle.state_root = str(tmp_path / "measured")
+    fixture.config.actor_lifecycle.state_root = str(tmp_path / "online")
+    fixture.config.actor_lifecycle.reconfigurator = implementation
     original_import = builtins.__import__
 
     def without_autopilot(name, *args, **kwargs):
         if name == "areal.autopilot" or name.startswith("areal.autopilot."):
-            raise AssertionError("Ordinary Basic must not import AutoPilot")
+            raise AssertionError("Ordinary Online must not import AutoPilot")
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", without_autopilot)
-    adapter = PolicyAdapter(profile=profile)
+    adapter = ReconfiguratorAdapter()
     manager = fixture.create(adapter)
     try:
-        assert isinstance(adapter.policy, BasicPolicy)
-        assert manager.policy_adapter is adapter and manager.policy_hooks is None
+        assert adapter.reconfigurator.implementation == implementation
+        assert manager.revision_hooks is None
         _ready_native_episodes(manager, 0, 0)
         manager.next_batch()
-        assert adapter.policy.last_search is not None
         manager.actor.updates += 1
         _complete_native_update(manager, 1)
-        assert manager.monitor.runtime_history.path.is_file()
-        assert not (manager.root / "policy-application").exists()
-        assert not (manager.latest_path / "policy-state.json").exists()
         assert (manager.latest_path / "monitor-state.json").is_file()
-        assert manager.policy_adapter.policy.history is manager.monitor.history
         assert manager.monitor.completed_tokens == 8
         manager.close()
-        resumed = fixture.create(PolicyAdapter(profile=profile))
+        resumed = fixture.create(ReconfiguratorAdapter())
         try:
             assert resumed.applied_version == resumed.checkpoint_version == 1
-            assert isinstance(resumed.policy_adapter.policy, BasicPolicy)
+            assert (
+                resumed.reconfigurator_adapter.reconfigurator.implementation
+                == implementation
+            )
             assert resumed.monitor.completed_tokens == 8
         finally:
             resumed.close()
@@ -622,21 +586,9 @@ def test_native_measured_basic_without_autopilot_uses_shared_monitor(
         manager.close()
 
 
-def test_native_reference_selection_fails_before_creating_actor(native_lifecycle):
-    """A reserved Reference selector cannot start a training generation."""
-    fixture = native_lifecycle
-    fixture.manager.close()
-    fixture.config.actor_lifecycle.policy = "reference"
-    from areal.elastic.runtime import validate_on_demand
-
-    with pytest.raises(NotImplementedError, match="reference.*not implemented"):
-        validate_on_demand(fixture.config)
-    with pytest.raises(NotImplementedError, match="reference.*not implemented"):
-        fixture.create()
-    assert fixture.actors == []
-
-
-def test_native_lifecycle_three_cycles_restore_cursor_and_actor_state(native_lifecycle):
+def test_native_explicit_restart_cycles_restore_cursor_and_actor_state(
+    native_lifecycle,
+):
     fixture = native_lifecycle
     manager = fixture.manager
     assert manager.actor is None and fixture.actors == []
@@ -657,8 +609,8 @@ def test_native_lifecycle_three_cycles_restore_cursor_and_actor_state(native_lif
         fixture.coordinator["step"] = version + 1
         _complete_native_update(manager, version + 1)
         assert manager.inbox.status()["active_credits"] == 0
-        assert not manager.maybe_suspend(now=manager.ready_since + 59)
-        assert manager.maybe_suspend(now=manager.ready_since + 121)
+        manager.save_checkpoint(reason="reconfiguration")
+        manager._release()
         assert manager.actor is None and manager.owner is None
         assert manager.rollout is rollout
     manager.close()
@@ -754,7 +706,6 @@ def test_native_partial_publication_with_unchanged_version_requires_full_restore
         assert not manager.inbox.status()["admission_open"]
         assert not manager.control_snapshot().boundary_ready
         assert fixture.rollout.resume.call_count == resumes
-        assert not manager.maybe_suspend(now=manager.ready_since + 1000)
         manager._checkpoint_dirty = True
         with pytest.raises(RuntimeError, match="fully published"):
             manager.save_checkpoint(reason="uncertain")
@@ -786,7 +737,6 @@ def test_native_publication_precedes_periodic_save_and_release_waits_for_finish(
     assert manager.inbox.status()["checkpoint_version"] == 0
     assert manager.inbox.status()["published_version"] == 1
     assert not manager.control_snapshot().boundary_ready
-    assert not manager.maybe_suspend(now=manager.ready_since + 1000)
     assert manager.maybe_checkpoint(epoch_step=0)
     assert fixture.events[-2:] == ["publish-1", "save-1"]
     manager.finish_update()
@@ -812,9 +762,11 @@ def test_native_multiple_updates_only_save_at_configured_period(native_lifecycle
         assert state.applied_version == state.published_version == version + 1
         assert state.checkpoint_version == checkpoint_version
         assert state.boundary_ready
-        assert manager.policy_adapter.applied_version == state.applied_version
-        assert manager.policy_adapter.published_version == state.published_version
-        assert manager.policy_adapter.checkpoint_version == checkpoint_version
+        assert manager.reconfigurator_adapter.applied_version == state.applied_version
+        assert (
+            manager.reconfigurator_adapter.published_version == state.published_version
+        )
+        assert manager.reconfigurator_adapter.checkpoint_version == checkpoint_version
     assert [event for event in fixture.events if event.startswith("save-")] == [
         "save-3"
     ]
@@ -833,7 +785,8 @@ def test_native_release_refreshes_cpu_state_after_periodic_checkpoint(native_lif
     periodic = manager.latest_path
     fixture.coordinator["step"] = 1
     manager.finish_update()
-    assert manager.maybe_suspend(now=manager.ready_since + 121)
+    manager.save_checkpoint(reason="reconfiguration")
+    manager._release()
     assert manager.latest_path != periodic
     assert json.loads((periodic / "coordinator.json").read_text()) == {"step": 0}
     assert json.loads((manager.latest_path / "coordinator.json").read_text()) == {
@@ -848,7 +801,7 @@ def test_native_release_refreshes_cpu_state_after_periodic_checkpoint(native_lif
         recovered.close()
 
 
-def test_native_idle_release_saves_latest_state_and_does_not_duplicate_save(
+def test_native_explicit_release_saves_latest_state_and_does_not_duplicate_save(
     native_lifecycle,
 ):
     """A release snapshot covers updates newer than the periodic checkpoint."""
@@ -860,7 +813,8 @@ def test_native_idle_release_saves_latest_state_and_does_not_duplicate_save(
     manager.actor.updates += 1
     _complete_native_update(manager, 1)
     assert manager.latest_manifest is None
-    assert manager.maybe_suspend(now=manager.ready_since + 121)
+    manager.save_checkpoint(reason="reconfiguration")
+    manager._release()
     assert fixture.events[-2:] == ["save-1", "release"]
     manager.close()
     recovered = fixture.create()
@@ -892,37 +846,14 @@ def test_native_failed_release_snapshot_retains_actor_and_consumer(
             lambda **kwargs: (_ for _ in ()).throw(OSError("disk full")),
         )
         with pytest.raises(OSError, match="disk full"):
-            manager.maybe_suspend(now=manager.ready_since + 121)
+            manager.save_checkpoint(reason="reconfiguration")
         with pytest.raises(ExceptionGroup, match="Checkpoint incomplete"):
             manager.close()
         actor.destroy.assert_not_called()
         with pytest.raises(BlockingIOError):
             manager.inbox.queue.consumer()
-    assert manager.maybe_suspend(now=manager.ready_since + 121)
-
-
-def test_native_batch_arriving_during_release_snapshot_keeps_actor_ready(
-    native_lifecycle,
-    monkeypatch,
-):
-    """Recheck the inbox after a slow save before destroying the workers."""
-    manager = native_lifecycle.manager
-    manager.config.recover.mode = "off"
-    _ready_native_episodes(manager, 0, 0)
-    manager.next_batch()
-    manager.actor.updates += 1
-    _complete_native_update(manager, 1)
-    save = manager.actor.full_checkpoint
-
-    def receive_while_saving(*args, **kwargs):
-        result = save(*args, **kwargs)
-        _ready_native_episodes(manager, 4, 1)
-        return result
-
-    monkeypatch.setattr(manager.actor, "full_checkpoint", receive_while_saving)
-    assert not manager.maybe_suspend(now=manager.ready_since + 121)
-    manager.actor.destroy.assert_not_called()
-    assert manager.consumer.peek().policy_version == 1
+    manager.save_checkpoint(reason="reconfiguration")
+    manager._release()
 
 
 def test_native_fault_replays_unsaved_prefix_and_rejects_abandoned_episodes(
@@ -988,6 +919,7 @@ def test_native_trainer_defers_actor_initialization_and_legacy_recover(
     fixture = native_lifecycle
     fixture.manager.close()
     config = fixture.config
+    config.actor_lifecycle.state_root = str(fixture.manager.root.parent / "trainer")
     config.actor._version = config.rollout._version = "v2"
     config.rollout.backend = "sglang:d1"
     config.sglang.model_path = config.actor.path
@@ -1012,6 +944,7 @@ def test_native_trainer_defers_actor_initialization_and_legacy_recover(
     legacy_recover = MagicMock()
     monkeypatch.setattr(rl_trainer, "RecoverHandler", legacy_recover)
     serving = MagicMock()
+    serving.resource_reconfiguration_enabled = False
     serving.serving_versions.return_value = [0]
     monkeypatch.setattr(
         rl_trainer.PPOTrainer, "_init_rollout", MagicMock(return_value=serving)
@@ -1032,7 +965,7 @@ def test_native_trainer_defers_actor_initialization_and_legacy_recover(
 def test_native_failed_teardown_preserves_fence_and_retries_same_generation(
     native_lifecycle, monkeypatch
 ):
-    from areal.elastic import runtime as on_demand
+    from areal.elastic.infra import runtime as on_demand
 
     manager = native_lifecycle.manager
     manager.ensure_actor()

@@ -42,6 +42,11 @@ uv run python docs/generate_cli_docs.py
 
 - Keep project documentation concise: retain necessary facts, limits and next steps;
   link detailed evidence instead of repeating logs or history.
+- For implementation/execution-flow docs, lead with one concise paragraph of numbered
+  stages, then a `text` call tree with matching `# N. Stage` comments and actual
+  class/function/method names. Verify order and nesting against source, including
+  callback/RPC boundaries. Focus on the requested operation, use few tables and avoid
+  repetitive defensive language. Honor requests for just one part of this format.
 - Read relevant files before modifying code.
 - Run `pre-commit run --all-files` before committing.
 - Follow existing code patterns in the same module.

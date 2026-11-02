@@ -19,7 +19,7 @@ def test_actor_observer_preserves_nested_execution_and_version(tmp_path, monkeyp
     """Per-rank observations identify nested work without changing engine outputs."""
     import json
 
-    from areal.elastic.monitor.actor import install_actor_observer
+    from areal.elastic.infra.monitor.actor import install_actor_observer
 
     class Engine:
         def get_version(self):

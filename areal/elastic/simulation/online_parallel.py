@@ -25,15 +25,26 @@ class ChunkResult:
 
 def evaluate_chunk(job):
     started = time.process_time()
-    from .online_candidates import OnlineForecastModel
-    from .online_models import CalibratedOnlineModels
+    from areal.elastic.reconfigurator import component_module
 
     global _models, _identity, _search
     payload, indexed = job
+    implementation, payload = payload[0], payload[1:]
+    if implementation not in {"basic", "reference"}:
+        raise ValueError("Unknown reconfigurator implementation")
+    module = component_module(implementation, "evaluator")
+    Evaluator = (
+        module.Evaluator
+        if implementation == "reference"
+        else module.OnlineForecastModel
+    )
+    CalibratedOnlineModels = component_module(
+        implementation, "models"
+    ).CalibratedOnlineModels
     spec, expected, config, handoff, slo, delay, prune, coalesce, view, forecasts = (
         payload[:10]
     )
-    identity = spec, expected
+    identity = implementation, spec, expected
     if identity != _identity:
         bundle, mechanism, publication, bandwidth, *cross_node = spec
         _models = CalibratedOnlineModels(
@@ -63,7 +74,7 @@ def evaluate_chunk(job):
         scope,
     )
     if context is None or _search is None or _search[0] != key:
-        evaluator = OnlineForecastModel(
+        evaluator = Evaluator(
             _models,
             config,
             handoff,
@@ -71,8 +82,11 @@ def evaluate_chunk(job):
             delay,
             prune_irreversible_slo=prune,
             coalesce_decode=coalesce,
-            actor_memory_reserve_fraction=reserve,
-            actor_memory_scope=scope,
+            **(
+                dict(actor_memory_reserve_fraction=reserve, actor_memory_scope=scope)
+                if implementation == "reference"
+                else {}
+            ),
         )
         if context is not None:
             # Keep the first immutable DTOs for this content identity. Repeated
