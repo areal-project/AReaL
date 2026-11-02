@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"Native reconfiguration requests, durable application, engine execution and process cleanup."
+"""Native reconfiguration requests, application journal and layout orchestration."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import fcntl
 import json
 import os
 import re
-import subprocess
 import time
 import uuid
 from contextlib import nullcontext
@@ -19,101 +18,33 @@ from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Generic, Protocol, TypeVar
 
-import psutil
-
 from areal.elastic.contracts import ControlBusy, ControlSnapshot
 from areal.elastic.infra.monitor.collector import ElasticMonitor
 from areal.elastic.layout import ExecutionLayout as ExecutionLayout
 from areal.elastic.layout import ReconfigurationPlan, ReconfigurationPlanner
+
+# Keep legacy runtime and acceptance imports until their Step 5 cleanup.
+from areal.infra.utils.process import (
+    OWNER_ENV as OWNER_ENV,
+)
+from areal.infra.utils.process import (
+    gpu_processes as gpu_processes,
+)
+from areal.infra.utils.process import (
+    owned_processes as owned_processes,
+)
+from areal.infra.utils.process import (
+    resolve_gpu_uuids as resolve_gpu_uuids,
+)
+from areal.infra.utils.process import (
+    stop_owned_processes as stop_owned_processes,
+)
 from areal.utils.atomic import (
     artifact_manifest,
     atomic_json,
     json_digest,
     recovery_digest,
 )
-
-OWNER_ENV = "AREAL_ELASTIC_PROCESS_OWNER"
-
-
-def owned_processes(owner: str) -> list[psutil.Process]:
-    if not owner:
-        raise ValueError("Process owner token must be nonempty")
-    found = []
-    for process in psutil.process_iter():
-        try:
-            if (
-                process.status() != psutil.STATUS_ZOMBIE
-                and process.environ().get(OWNER_ENV) == owner
-            ):
-                found.append(process)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return found
-
-
-def stop_owned_processes(
-    owner: str, *, grace: float = 10, force_timeout: float = 10
-) -> None:
-    """Signal only processes carrying this launch's random token; fence PID reuse.
-
-    Poll again for late descendants instead of treating leader exit as group exit.
-    psutil's signal methods check process identity (PID and creation time).
-    """
-    for operation, timeout in (("terminate", grace), ("kill", force_timeout)):
-        deadline = time.monotonic() + timeout
-        signalled = set()
-        while processes := owned_processes(owner):
-            for process in processes:
-                try:
-                    identity = (process.pid, process.create_time())
-                    if identity not in signalled:
-                        getattr(process, operation)()
-                        signalled.add(identity)
-                except psutil.NoSuchProcess:
-                    pass
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.1)
-        if not owned_processes(owner):
-            return
-    raise RuntimeError(
-        f"Owned processes remain alive: {[p.pid for p in owned_processes(owner)]}"
-    )
-
-
-def gpu_processes() -> dict[str, list[int]]:
-    result = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-compute-apps=gpu_uuid,pid",
-            "--format=csv,noheader,nounits",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    processes: dict[str, list[int]] = {}
-    for line in result.stdout.splitlines():
-        gpu, pid = (part.strip() for part in line.split(","))
-        processes.setdefault(gpu, []).append(int(pid))
-    return processes
-
-
-def resolve_gpu_uuids(devices: list[int]) -> list[str]:
-    result = subprocess.run(
-        ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    mapping = {
-        int(index.strip()): uuid.strip()
-        for index, uuid in (line.split(",") for line in result.stdout.splitlines())
-    }
-    return [mapping[index] for index in devices]
-
 
 ConfigT = TypeVar("ConfigT")
 
@@ -511,7 +442,8 @@ class ReconfigurationExecutor:
                 )
             elif step == "rebind_runtime":
                 if self.owner.reconfigurator_adapter is not None:
-                    self.owner.monitor = ElasticMonitor(self.owner)
+                    if not hasattr(self.owner, "trainer"):
+                        self.owner.monitor = ElasticMonitor(self.owner)
                     self.owner.reconfigurator_adapter.rebind_actor_layout(self.owner)
             elif step == "restore_actor":
                 self.owner.ensure_actor(connect_weights=False)
@@ -556,6 +488,7 @@ class TrainerReconfiguration:
 
     def __init__(self, trainer, ft_spec):
         self.trainer, self.ft_spec = trainer, ft_spec
+        self.monitor = None
         self.config = trainer.config
         self.options = self.config.actor_lifecycle
         self.root = Path(self.options.state_root)
@@ -564,15 +497,14 @@ class TrainerReconfiguration:
         self.rollout_devices = tuple(self.options.rollout_devices)
         self.resource_reservation = self.actor_devices + self.rollout_devices
         uuids = resolve_gpu_uuids(list(self.resource_reservation))
+        self.gpu_uuids = tuple(uuids[: len(self.actor_devices)])
         processes = gpu_processes()
         if any(processes.get(gpu) for gpu in uuids):
             raise RuntimeError("The explicitly assigned GPU pools are not empty")
         self.data_plane_id = uuid.uuid4().hex
         self.reconfiguration_planner = ReconfigurationPlanner()
         self.last_reconfiguration_plan = None
-        self.last_checkpoint_reports = self.last_restore_reports = (
-            self.last_restore_plan
-        ) = None
+        self.last_checkpoint_reports = self.last_restore_reports = None
         self.generation = 1
         self._reconfiguration_incomplete = False
         self._checkpoint_dirty = False
@@ -737,6 +669,7 @@ class TrainerReconfiguration:
             target.actor_devices,
             target.rollout_devices,
         )
+        self.gpu_uuids = tuple(resolve_gpu_uuids(list(self.actor_devices)))
         self.trainer.actor_alloc = ModelAllocation.from_str(
             f"fsdp:d{target.world_size}", name="actor"
         )
@@ -780,43 +713,22 @@ class TrainerReconfiguration:
         return True
 
     def _release(self):
-        self.trainer.actor.destroy()
-        uuids = resolve_gpu_uuids(list(self.actor_devices))
-        processes = gpu_processes()
-        if any(processes.get(gpu) for gpu in uuids):
-            raise RuntimeError("Actor GPU release is not confirmed")
+        self.trainer.actor.destroy(release_devices=self.actor_devices)
         self.trainer.actor = None
 
     def ensure_actor(self, *, connect_weights=True):
         if self.actor is not None:
             return self.actor
-        from areal.v2.training_service.dp_restore import DPStateRestorePlan
-
         config = deepcopy(self.config.actor)
         config.backend = f"fsdp:d{self.actor_world_size}"
         self.trainer._initialize_reconfigured_actor(config, self.ft_spec)
-        source_dp = self.latest_manifest["world_size"]
-        restore = {}
-        self.last_restore_plan = None
-        if source_dp != self.actor_world_size:
-            self.last_restore_plan = asdict(
-                DPStateRestorePlan(
-                    identity_sha256=self.identity,
-                    checkpoint_generation=self.latest_path.name,
-                    policy_version=self.checkpoint_version,
-                    source_world_size=source_dp,
-                    target_world_size=self.actor_world_size,
-                    transition_id=uuid.uuid4().hex + uuid.uuid4().hex,
-                )
-            )
-            restore["restore_plan"] = self.last_restore_plan
         self.last_restore_reports = self.actor.full_checkpoint(
             "load",
             path=str(self.latest_path),
             backend=self.allocation.backend,
             identity_sha256=self.identity,
             version=self.checkpoint_version,
-            **restore,
+            source_world_size=self.latest_manifest["world_size"],
         )
         self.generation += 1
         if connect_weights:

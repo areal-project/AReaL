@@ -73,7 +73,7 @@ def build_reconfigurator(
     )
     options.update(settings or {})
     if slo is None:
-        slo = ServingSLO(5.0, 0.1, 0.8)
+        slo = ServingSLO(5.0, 0.05, 0.8)
     elif isinstance(slo, dict):
         slo = ServingSLO(**slo)
     result = module.OnlineReconfigurator(

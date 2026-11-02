@@ -909,8 +909,9 @@ def test_native_checkpoint_seconds_schedule_works_in_cpu_coordinator(native_life
 
 
 @pytest.mark.parametrize("native_lifecycle", [(1, 1), (2, 4)], indirect=True)
+@pytest.mark.parametrize("enable_control", [False, True])
 def test_native_trainer_owns_actor_initialization_and_standard_recover(
-    native_lifecycle, monkeypatch
+    native_lifecycle, monkeypatch, enable_control
 ):
     from unittest.mock import MagicMock
 
@@ -958,8 +959,14 @@ def test_native_trainer_owns_actor_initialization_and_standard_recover(
     )
     monkeypatch.setattr("areal.elastic.infra.reconfiguration.gpu_processes", lambda: {})
     factory = MagicMock()
+    factory.return_value.config = config.actor
+    factory.return_value.get_version.return_value = 0
+    serving.get_version.return_value = 0
     monkeypatch.setattr(rl_trainer.PPOTrainer, "_create_train_engine", factory)
-    trainer = rl_trainer.PPOTrainer(config)
+    from areal.elastic.infra.adapter import ReconfiguratorAdapter
+
+    adapter = ReconfiguratorAdapter() if enable_control else None
+    trainer = rl_trainer.PPOTrainer(config, elastic_reconfigurator=adapter)
     try:
         assert trainer.actor is factory.return_value and fixture.actors == []
         factory.assert_called_once()
@@ -973,6 +980,9 @@ def test_native_trainer_owns_actor_initialization_and_standard_recover(
         assert trainer.scheduler is not None and trainer.rollout_scheduler is not None
         assert trainer._reconfiguration.trainer is trainer
         assert not (Path(config.actor_lifecycle.state_root) / "inbox").exists()
+        if enable_control:
+            assert adapter.owner is trainer._reconfiguration
+            assert serving.configure_control_callbacks.call_count == 1
     finally:
         trainer.close()
 

@@ -36,6 +36,7 @@ from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts impor
 from areal.elastic.reconfigurator.reference.evaluator.cost_model.rollout.scheduling import (
     scheduler_for,
 )
+from areal.elastic.serving import request_tpot_seconds
 from areal.elastic.simulation.online_inputs import ForecastInputs, WorkInputs
 from areal.elastic.simulation.online_state import ReplicaState, RequestState
 from areal.elastic.simulation.online_transitions import (
@@ -637,7 +638,7 @@ class SimulationCore:
             deployment=view.deployment,
             generated=view.generated,
             ttft_seconds=view.first_token_at - view.ready_at,
-            maximum_tbt_seconds=view.maximum_tbt_seconds,
+            mean_tpot_seconds=request_tpot_seconds(view),
         )
         if truth.tool_seconds is None:
             episode.past.append(truth)

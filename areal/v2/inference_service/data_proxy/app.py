@@ -1194,7 +1194,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     # Trajectory export (admin key required)
     # =========================================================================
 
-    @app.post("/export_trajectories")
+    @app.post("/export_trajectories", response_model_exclude_unset=True)
     async def export_trajectories(
         body: ExportTrajectoriesRequest, request: Request
     ) -> ExportTrajectoriesResponse:
@@ -1294,8 +1294,26 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 merged.update(interactions)
 
         trace_masks = None
+        observation = None
         if all(v.has_tensor_data for v in merged.values()):
             traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
+            if (
+                body.include_observation
+                and merged
+                and traj["attention_mask"].device.type == "cpu"
+            ):
+                times = [s.trajectory_observation_times(tid) for s, tid in exported]
+                tokens = int(traj["attention_mask"].sum())
+                generated = int(traj["loss_mask"].sum())
+                observation = {
+                    "episode_id": ":".join(
+                        f"{s.session_id}/{tid}" for s, tid in exported
+                    ),
+                    "available_wall_time": min(t[0] for t in times),
+                    "completed_wall_time": max(t[1] for t in times),
+                    "input_tokens": max(1, tokens - generated),
+                    "output_tokens": max(1, generated),
+                }
             if merged and os.environ.get("AREAL_ROLLOUT_TRACE_DIR"):
                 trace_masks = {
                     key: traj[key] for key in ("attention_mask", "loss_mask")
@@ -1339,6 +1357,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 list(merged),
                 body.style,
             )
+        if observation is not None:
+            return ExportTrajectoriesResponse(traj=serialized, observation=observation)
         return ExportTrajectoriesResponse(traj=serialized)
 
     # =========================================================================

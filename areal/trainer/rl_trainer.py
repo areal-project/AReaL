@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import os
 import threading
+import time
 from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
@@ -119,6 +120,8 @@ class PPOTrainer:
         self._reconfiguration = None
         self._training_lock = threading.RLock()
         self._training_active = self._training_failed = False
+        self._control_phase = "initializing"
+        self._control_phase_started = time.monotonic()
         self.actor = None
         self.rollout = None
         try:
@@ -149,11 +152,18 @@ class PPOTrainer:
         self.config = config
         self._elastic_mode = config.actor_lifecycle.mode == "on_demand"
         if self._elastic_reconfigurator is not None:
-            raise NotImplementedError(
-                "Native automatic Reconfigurator/revision integration is being migrated "
-                "to Trainer control boundaries; use manual Trainer.reconfigure() "
-                "for this stage. Online simulation remains available."
-            )
+            if getattr(
+                self._elastic_reconfigurator,
+                "supports_reconfigurator_activation",
+                False,
+            ):
+                raise NotImplementedError(
+                    "Native Revision integration is deferred; use a ReconfiguratorAdapter"
+                )
+            if not self._elastic_mode:
+                raise ValueError(
+                    "Native Reconfigurator requires explicit elastic GPU pools"
+                )
         if self._elastic_mode:
             from areal.elastic.infra.runtime import validate_on_demand
 
@@ -534,6 +544,44 @@ class PPOTrainer:
 
         self._config_perf_tracer()
         self._apply_initial_offload_policy()
+        self._control_phase = "idle"
+        if self._elastic_reconfigurator is not None:
+            self._bind_reconfigurator()
+
+    def _bind_reconfigurator(self):
+        from areal.elastic.infra.monitor.collector import TrainerMonitor
+
+        execution = self._reconfiguration
+        execution.monitor = TrainerMonitor(execution)
+        execution.reconfigurator_adapter = self._elastic_reconfigurator
+        self._elastic_reconfigurator.bind(execution)
+        self.rollout.configure_control_callbacks(
+            on_wait=self._poll_reconfigurator,
+            on_trajectory=execution.monitor.record_trajectory,
+        )
+
+    def _poll_reconfigurator(self):
+        adapter = getattr(self, "_elastic_reconfigurator", None)
+        if (
+            adapter is None
+            or adapter.closed
+            or self._training_active
+            or self._training_failed
+        ):
+            return False
+        with self._training_lock:
+            return adapter.poll()
+
+    def _set_control_phase(self, phase):
+        now = time.monotonic()
+        execution = getattr(self, "_reconfiguration", None)
+        monitor = None if execution is None else execution.monitor
+        if monitor is not None:
+            monitor.record_phase(
+                getattr(self, "_control_phase", "idle"),
+                now - getattr(self, "_control_phase_started", now),
+            )
+        self._control_phase, self._control_phase_started = phase, now
 
     @staticmethod
     def _is_colocation(strategy: SchedulingStrategy | None) -> bool:
@@ -746,8 +794,19 @@ class PPOTrainer:
         with self._training_lock:
             self._training_active = True
             self._training_failed = True
-            self._train_step_impl(**kwargs)
-            self._training_active = self._training_failed = False
+            try:
+                self._train_step_impl(**kwargs)
+            except BaseException:
+                self._training_failed = True
+                self._control_phase = "failed"
+                raise
+            else:
+                self._training_active = self._training_failed = False
+                self._set_control_phase("idle")
+                execution = getattr(self, "_reconfiguration", None)
+                if execution is not None and execution.monitor is not None:
+                    execution.monitor.complete_update()
+                self._poll_reconfigurator()
 
     def _train_step_impl(
         self,
@@ -763,6 +822,9 @@ class PPOTrainer:
         """One native PPO update using the standard workflow data pipeline."""
         config = self.config
         epoch, step = divmod(global_step, steps_per_epoch)
+        if getattr(self, "_elastic_reconfigurator", None) is not None:
+            self._training_active = self._training_failed = False
+            self._set_control_phase("waiting")
         if self._should_offload_rollout:
             self._onload_rollout()
         with (
@@ -788,6 +850,12 @@ class PPOTrainer:
             )
         if self._should_offload_rollout:
             self._offload_rollout()
+
+        self._training_active = self._training_failed = True
+        PPOTrainer._set_control_phase(self, "update")
+        execution = getattr(self, "_reconfiguration", None)
+        if execution is not None and execution.monitor is not None:
+            execution.monitor.begin_update(rollout_batch)
 
         if self.critic is not None:
             if self._should_offload_critic:
@@ -951,6 +1019,7 @@ class PPOTrainer:
             )
 
         self.rollout.pause()
+        PPOTrainer._set_control_phase(self, "publication")
 
         # Actor already onloaded; engine-internal _offload_aware_context
         # calls in update_weights/save are no-ops.
@@ -976,6 +1045,7 @@ class PPOTrainer:
                 self.eval_rollout.set_version(new_version)
 
         if not self._is_v1_awex_colocate(config):
+            PPOTrainer._set_control_phase(self, "checkpoint")
             self._save_training_state(
                 epoch=epoch,
                 epoch_step=step,
@@ -983,6 +1053,7 @@ class PPOTrainer:
             )
 
         # Offload actor before eval
+        PPOTrainer._set_control_phase(self, "finishing")
         if self._should_offload_actor:
             self._offload_model(self.actor, role="actor")
 
@@ -1240,6 +1311,7 @@ class PPOTrainer:
         request_id: str,
         expected_generation: int,
         expected_weights_version: int,
+        reconfigurator_bundle_id: str = "manual",
     ):
         """Apply a layout change at a completed Trainer update boundary."""
         execution = self._reconfiguration
@@ -1257,6 +1329,7 @@ class PPOTrainer:
                 request_id=request_id,
                 expected_generation=expected_generation,
                 expected_weights_version=expected_weights_version,
+                reconfigurator_bundle_id=reconfigurator_bundle_id,
             )
         finally:
             self._training_lock.release()

@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from areal.elastic.contracts import OnlineLayout, RequestView
 from areal.elastic.reconfigurator.reference.identity import fingerprint
 from areal.elastic.reconfigurator.reference.optimizer import SearchBound
+from areal.elastic.serving import request_slo_status
 from areal.elastic.simulation.online_transitions import ActorMemoryRejected
 from areal.elastic.simulation.simulation_core import SimulationConfig as OnlineRunConfig
 from areal.elastic.simulation.simulation_core import SimulationCore, _Deployment
@@ -108,8 +109,7 @@ class OnlineSimulation(SimulationCore):
             r
             for r in rows
             if r.completed_at is not None
-            and r.first_token_at - r.ready_at <= self.slo.ttft_seconds + 1e-12
-            and r.maximum_tbt_seconds <= self.slo.tbt_seconds + 1e-12
+            and request_slo_status(r, self.slo, now=r.completed_at) is True
         ]
         result.update(
             jointly_passed_requests=len(passed),
@@ -182,18 +182,7 @@ class OnlineSimulation(SimulationCore):
             self.done = True
 
     def request_has_failed(self, view: RequestView):
-        ttft = (
-            view.first_token_at if view.first_token_at is not None else self.now
-        ) - view.ready_at
-        gap = max(
-            view.maximum_tbt_seconds,
-            self.now - view.last_token_at
-            if view.completed_at is None and view.last_token_at is not None
-            else 0.0,
-        )
-        return (
-            ttft > self.slo.ttft_seconds + 1e-12 or gap > self.slo.tbt_seconds + 1e-12
-        )
+        return request_slo_status(view, self.slo, now=self.now) is False
 
     def check_candidate_bound(self):
         guard = self._candidate_guard

@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
+from areal.infra.utils import process as process_utils
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
@@ -430,6 +431,98 @@ def test_full_checkpoint_preflight_failure_never_starts_collective_load():
     assert controller.get_version() == 0
 
 
+@pytest.mark.parametrize(
+    "source_dp,target_dp",
+    [(2, 2), (2, 4), (4, 2)],
+    ids=["same-dp", "grow-dp", "shrink-dp"],
+)
+def test_full_checkpoint_builds_mapping_from_source_layout(source_dp, target_dp):
+    """Every target rank receives the same Controller-owned restore protocol."""
+    from areal.api.alloc_mode import ModelAllocation
+    from areal.v2.training_service.dp_restore import DPStateRestorePlan
+
+    controller = _make_controller()
+    controller.config.backend = f"fsdp:d{target_dp}"
+    controller.train_alloc = ModelAllocation.from_str(controller.config.backend)
+    controller._worker_addrs = [f"http://rank{rank}" for rank in range(target_dp)]
+    calls = []
+
+    async def endpoint(worker, path, **kwargs):
+        parameters = kwargs["kwargs"]
+        plan = parameters.get("restore_plan")
+        if source_dp == target_dp:
+            assert plan is None
+        else:
+            approved = DPStateRestorePlan(**plan)
+            assert approved.source_world_size == source_dp
+            assert approved.target_world_size == target_dp
+            assert approved.checkpoint_generation == "step-3-saved"
+            assert approved.identity_sha256 == "a" * 64
+            assert approved.policy_version == 3
+        calls.append((path, plan))
+        rank = controller._worker_addrs.index(worker)
+        return {
+            "rank": rank,
+            "world_size": target_dp,
+            "policy_version": 3,
+            "backend": "fsdp",
+            "identity_sha256": "a" * 64,
+            "state_sha256": str(rank) * 64,
+        }
+
+    controller._call_worker_engine_endpoint = AsyncMock(side_effect=endpoint)
+    reports = controller.full_checkpoint(
+        "load",
+        path="/checkpoint/step-3-saved",
+        backend="fsdp",
+        identity_sha256="a" * 64,
+        version=3,
+        source_world_size=source_dp,
+    )
+    assert [path for path, _ in calls] == (
+        ["/checkpoint/inspect"] * target_dp + ["/checkpoint/load"] * target_dp
+    )
+    assert all(plan == calls[0][1] for _, plan in calls)
+    assert len(reports) == target_dp
+    assert controller.get_version() == 3
+
+
+@pytest.mark.parametrize("release_devices", [None, (0, 1)], ids=["standard", "release"])
+def test_destroy_confirms_requested_gpus_after_worker_cleanup(
+    monkeypatch, release_devices
+):
+    """Only explicit local release waits for GPU processes after normal teardown."""
+    controller = _make_controller()
+    controller._worker_addrs = ["http://rank0", "http://rank1"]
+    controller._service_roles = ["actor-guard"]
+    controller._graceful_shutdown_workers = MagicMock()
+    states = iter([{"GPU-0": [123], "GPU-other": [456]}, {"GPU-other": [456]}])
+
+    def processes():
+        assert controller._worker_addrs == []
+        assert controller._service_roles == []
+        controller._graceful_shutdown_workers.assert_called_once_with()
+        controller.scheduler.delete_workers.assert_called_once_with(role="actor-guard")
+        return next(states)
+
+    probe = MagicMock(side_effect=processes)
+    uuids = MagicMock(return_value=["GPU-0", "GPU-1"])
+    sleep = MagicMock()
+    monkeypatch.setattr(process_utils, "gpu_processes", probe)
+    monkeypatch.setattr(process_utils, "resolve_gpu_uuids", uuids)
+    monkeypatch.setattr(process_utils.time, "sleep", sleep)
+    controller.destroy(release_devices=release_devices)
+    assert controller._worker_addrs == []
+    if release_devices is None:
+        probe.assert_not_called()
+        uuids.assert_not_called()
+        sleep.assert_not_called()
+    else:
+        assert probe.call_count == 2
+        uuids.assert_called_once_with([0, 1])
+        sleep.assert_called_once_with(0.1)
+
+
 def test_full_checkpoint_mapped_load_preflights_all_target_ranks():
     """The approved plan reaches every target and target digests agree after load."""
     controller = _make_controller()
@@ -668,10 +761,9 @@ def resident_online_pipeline(tmp_path, monkeypatch):
         checkpoint_free_space_floor=0,
     )
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=12, train_batch_size=4)
-    monkeypatch.setattr(
-        reconfiguration, "resolve_gpu_uuids", lambda devices: list(devices)
-    )
-    monkeypatch.setattr(reconfiguration, "gpu_processes", lambda: {})
+    for module in (reconfiguration, process_utils):
+        monkeypatch.setattr(module, "resolve_gpu_uuids", lambda devices: list(devices))
+        monkeypatch.setattr(module, "gpu_processes", lambda: {})
     trainer.critic = trainer.ref = trainer.teacher = trainer.eval_rollout = None
     trainer.data_controller = None
     trainer.rollout = rollout
@@ -777,6 +869,10 @@ def resident_online_pipeline(tmp_path, monkeypatch):
                 restore(worker, torch.load(path / "cpu-worker.pt", weights_only=True))
                 plan = parameters["restore_plan"]
                 assert plan["target_world_size"] == dp
+                assert (
+                    plan["source_world_size"]
+                    == json.loads((path / "manifest.json").read_text())["world_size"]
+                )
             if endpoint == "/checkpoint/save":
                 (path / f"runtime-{rank}.json").write_text(
                     json.dumps(
@@ -1056,3 +1152,180 @@ def test_resident_online_pipeline_continues_after_actor_rebuild(
         for waiter in tuple(rollout._online_waiters):
             waiter.future.get_loop().call_soon_threadsafe(waiter.future.cancel)
         thread.shutdown(wait=True, cancel_futures=True)
+
+
+def test_native_reconfigurator_switches_during_standard_batch_wait(
+    resident_online_pipeline, monkeypatch, record_property
+):
+    """The real wait callback drives the shared Reconfigurator and Trainer switch."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from dataclasses import replace
+
+    from tests.test_elastic_online_simulation import _KnownCosts, config, handoff
+
+    from areal.elastic.contracts import EpisodeView, OnlineLayout, RequestView, Turn
+    from areal.elastic.infra.adapter import ReconfiguratorAdapter
+
+    p = resident_online_pipeline
+    trainer, rollout = p.trainer, p.rollout
+    adapter = ReconfiguratorAdapter(
+        implementation="reference",
+        models=_KnownCosts(),
+        run_config=config(),
+        candidates=(OnlineLayout(2, 1, 1, 1), OnlineLayout(1, 1, 1, 1)),
+        settings=dict(
+            minimum_completed_requests=1,
+            decision_delay_seconds=1,
+            deduplicate_searches=False,
+        ),
+        replay=dict(history_seconds=120, initial_regime_seconds=120, max_new_tokens=32),
+        handoff=replace(
+            handoff(),
+            mode="cold",
+            phase_seconds=tuple(
+                (name, 0.001)
+                for name in (
+                    "checkpoint",
+                    "release_actor",
+                    "disconnect_weights",
+                    "stop_rollout",
+                    "rebuild_rollout",
+                    "restore_actor",
+                    "connect_weights",
+                )
+            ),
+        ),
+    )
+    trainer._elastic_reconfigurator = adapter
+    trainer._control_phase = "idle"
+    trainer._bind_reconfigurator()
+    observations = trainer._reconfiguration.monitor.online_observations
+    clock = [10.0]
+    monkeypatch.setattr(observations, "now", lambda *args: clock[0])
+
+    def measured(owner):
+        base = observations.observe()
+        if clock[0] < 120:
+            return replace(base, episodes=(), requests=())
+        episodes = tuple(
+            EpisodeView(
+                f"observed-{i}",
+                "fixture",
+                150 + i,
+                True,
+                190 + i,
+                (Turn(4, 8),),
+                None,
+                None,
+            )
+            for i in range(4)
+        )
+        requests = tuple(
+            RequestView(
+                f"r-{i}",
+                e.episode_id,
+                0,
+                4,
+                150 + i,
+                prefilled=4,
+                generated=8,
+                first_token_at=151 + i,
+                last_token_at=151.07 + i,
+                completed_at=151.07 + i,
+                deployment=1,
+                replica=0,
+            )
+            for i, e in enumerate(episodes)
+        )
+        return replace(base, episodes=episodes, requests=requests, consumed_episodes=4)
+
+    adapter.observation_provider = measured
+    phases = []
+    apply = adapter.environment.request_handoff
+
+    def apply_at_boundary(target):
+        phases.append(trainer._control_phase)
+        return apply(target)
+
+    monkeypatch.setattr(adapter.environment, "request_handoff", apply_at_boundary)
+
+    def step(index):
+        trainer._train_step(
+            global_step=index,
+            steps_per_epoch=3,
+            workflow=None,
+            workflow_kwargs=None,
+            dynamic_filter_fn=None,
+            eval_workflow=None,
+            eval_workflow_kwargs=None,
+        )
+
+    def wait_for(predicate, *, advance=False, task=None):
+        deadline = time.monotonic() + 20
+        while not predicate():
+            if task is not None and task.done():
+                task.result()
+            assert time.monotonic() < deadline, (
+                "Native control loop did not make progress: "
+                + str(
+                    [
+                        (d.get("application_status"), d.get("reason"))
+                        for d in adapter.environment.decisions[-2:]
+                    ]
+                )
+            )
+            if advance:
+                clock[0] += 0.01
+            threading.Event().wait(0.02)
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        first = pool.submit(step, 0)
+        wait_for(lambda: len(rollout._online_waiters) == 8)
+        for i in range(8):
+            p.generate(i)
+            if i < 4:
+                p.reward(i)
+        first.result(timeout=10)
+        monitor = trainer._reconfiguration.monitor
+        default = observations.observe()
+        assert len(default.episodes) == default.consumed_episodes == 4
+        assert all(e.completed_turns for e in default.episodes)
+        assert default.requests == ()
+        executor, sessions = p.executor, p.proxy.state.session_store
+        second = pool.submit(step, 1)
+        wait_for(lambda: trainer._control_phase == "waiting")
+        clock[0] = 200
+        wait_for(
+            lambda: adapter.last_receipt is not None
+            and trainer.actor_alloc.parallel.dp_size == 1,
+            advance=True,
+            task=second,
+        )
+        assert phases == ["waiting"]
+        assert adapter.last_receipt["status"] == "applied"
+        assert (
+            adapter.last_receipt["request"]["reconfigurator_bundle_id"]
+            == "builtin-online"
+        )
+        assert rollout.workflow_executor is executor
+        assert p.proxy.state.session_store is sessions
+        assert rollout._online_inbox is None
+        for i in range(4, 8):
+            p.reward(i)
+        second.result(timeout=10)
+        assert trainer.actor.get_version() == rollout.get_version() == 2
+        assert [r[0] for r in p.consumed] == list(range(8))
+        assert len(monitor.history) == 2
+        assert adapter.reconfigurator.slo.tpot_seconds == 0.05
+        record_property("automatic_switch_phase", phases[0])
+        record_property("consumed_ids", str([r[0] for r in p.consumed]))
+        record_property("weights_version", 2)
+    finally:
+        p.stop_waiting.set()
+        for waiter in tuple(rollout._online_waiters):
+            waiter.future.get_loop().call_soon_threadsafe(waiter.future.cancel)
+        pool.shutdown(wait=True, cancel_futures=True)
+        adapter.close()

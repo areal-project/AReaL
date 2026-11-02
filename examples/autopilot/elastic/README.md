@@ -45,7 +45,11 @@ factory 契约见外层[Elastic Revision](../../../../docs/implementation/elasti
 ## 原生训练
 
 使用[任务工作流](../../task_workflows/README.md)或[Hermes 示例](../../hermes/README.md)启动原生
-`PPOTrainer`。客户端使用 `resident` 供数；手动调整入口为 `PPOTrainer.reconfigure()`。当前原生自动
-Reconfigurator／Revision 接入仍在迁移，显式传入 `elastic_reconfigurator` 会在启动前报错。
+`PPOTrainer`。客户端使用 `resident` 供数；手动和自动调整都进入 `PPOTrainer.reconfigure()`。原生自动控制通过
+`--elastic-profile`／`--elastic-settings` 配置 `ReconfiguratorAdapter`，在等待 batch
+及更新完成后轮询。profile 的 `slo` 使用 `ttft_seconds: 5`、`tpot_seconds: 0.05`。
+
+原生预测需提供匹配后端的组件模型、真实 batch／staleness 及 Cold 切换阶段耗时。首末 token 时间缺测保持未知，完整请求观测可通过 adapter 的
+`observation_provider` 提供。Revision 接入暂缓。
 
 完整实现、实验结果与机器操作说明维护在外层[项目文档](../../../../docs/README.md)。

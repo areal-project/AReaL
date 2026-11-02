@@ -9,18 +9,18 @@ from dataclasses import dataclass
 
 from areal.elastic.contracts import nonnegative, positive_int
 
-from .contracts import OnlineObservation, RollingSLO
+from .contracts import OnlineObservation, RequestView, RollingSLO
 
 
 @dataclass(frozen=True)
 class ServingSLO:
     ttft_seconds: float
-    tbt_seconds: float
+    tpot_seconds: float
     minimum_request_fraction: float
 
     def __post_init__(self) -> None:
         nonnegative("ttft_seconds", self.ttft_seconds, positive=True)
-        nonnegative("tbt_seconds", self.tbt_seconds, positive=True)
+        nonnegative("tpot_seconds", self.tpot_seconds, positive=True)
         nonnegative(
             "minimum_request_fraction", self.minimum_request_fraction, positive=True
         )
@@ -41,28 +41,28 @@ class ServingSLO:
         if metrics.joint_fraction + 1e-12 < self.minimum_request_fraction:
             return (
                 f"Serving SLO: {metrics.joint_met_requests}/{expected} requests "
-                f"jointly meet TTFT/TBT; required {self.minimum_request_fraction:.2%}"
+                f"jointly meet TTFT/TPOT; required {self.minimum_request_fraction:.2%}"
             )
         return ""
 
 
 @dataclass(frozen=True)
 class ServingMetrics:
-    """A request passes only when both TTFT and its largest token gap pass.
+    """A request passes when TTFT and its mean time per output token pass.
 
     expected_requests includes requests delayed before admission. Tool execution
-    between requests is never an inter-token gap. Single-token outputs have no
-    token gap and satisfy TBT with a value of zero.
+    between requests is excluded from TPOT. Single-token outputs have no
+    decode interval and use zero TPOT.
     """
 
     slo: ServingSLO
     expected_requests: int
     completed_requests: int
     ttft_met_requests: int
-    tbt_met_requests: int
+    tpot_met_requests: int
     joint_met_requests: int
     maximum_ttft_seconds: float | None
-    maximum_tbt_seconds: float | None
+    maximum_tpot_seconds: float | None
     timing_boundary: str
 
     def __post_init__(self) -> None:
@@ -70,17 +70,22 @@ class ServingMetrics:
         for name in (
             "completed_requests",
             "ttft_met_requests",
-            "tbt_met_requests",
+            "tpot_met_requests",
             "joint_met_requests",
         ):
             value = getattr(self, name)
             if type(value) is not int or not 0 <= value <= self.expected_requests:
                 raise ValueError(f"Invalid {name}")
-        if max(self.ttft_met_requests, self.tbt_met_requests) > self.completed_requests:
+        if (
+            max(self.ttft_met_requests, self.tpot_met_requests)
+            > self.completed_requests
+        ):
             raise ValueError("Only completed requests contribute passing counts")
-        if self.joint_met_requests > min(self.ttft_met_requests, self.tbt_met_requests):
+        if self.joint_met_requests > min(
+            self.ttft_met_requests, self.tpot_met_requests
+        ):
             raise ValueError("Joint passes cannot exceed either marginal pass count")
-        for name in ("maximum_ttft_seconds", "maximum_tbt_seconds"):
+        for name in ("maximum_ttft_seconds", "maximum_tpot_seconds"):
             if getattr(self, name) is not None:
                 nonnegative(name, getattr(self, name))
         if not self.timing_boundary:
@@ -91,29 +96,61 @@ class ServingMetrics:
         return self.joint_met_requests / self.expected_requests
 
 
+def request_tpot_seconds(request: RequestView) -> float | None:
+    """Mean decode gap within one model request; missing timing stays unknown."""
+    if request.first_token_at is None or request.generated < 1:
+        return None
+    if request.generated == 1:
+        return 0.0
+    if request.last_token_at is None:
+        return None
+    return (request.last_token_at - request.first_token_at) / (request.generated - 1)
+
+
+def request_slo_status(
+    request: RequestView, slo: ServingSLO, *, now: float
+) -> bool | None:
+    """Only finalized TPOT can fail: later tokens can improve a pending mean."""
+    first = request.first_token_at
+    if first is None:
+        if (
+            request.completed_at is None
+            and now - request.ready_at > slo.ttft_seconds + 1e-12
+        ):
+            return False
+        return None
+    if first - request.ready_at > slo.ttft_seconds + 1e-12:
+        return False
+    if request.completed_at is None:
+        return None
+    tpot = request_tpot_seconds(request)
+    return None if tpot is None else tpot <= slo.tpot_seconds + 1e-12
+
+
 def rolling_slo(view: OnlineObservation, slo: ServingSLO, seconds: float) -> RollingSLO:
     rows = [
         r
         for r in view.requests
         if r.completed_at is None or r.completed_at >= view.now - seconds
     ]
-    complete = passed = failed_pending = 0
-    ttfts, gaps = [], []
+    complete = passed = decided = unknown_completed = 0
+    ttfts, tpots = [], []
     for request in rows:
         first = request.first_token_at
-        ttft = (first if first is not None else view.now) - request.ready_at
-        gap = request.maximum_tbt_seconds
-        if request.completed_at is None and request.last_token_at is not None:
-            gap = max(gap, view.now - request.last_token_at)
-        ttfts.append(ttft)
-        gaps.append(gap)
-        meets = ttft <= slo.ttft_seconds + 1e-12 and gap <= slo.tbt_seconds + 1e-12
+        if first is not None:
+            ttfts.append(first - request.ready_at)
+        elif request.completed_at is None:
+            ttfts.append(view.now - request.ready_at)
+        tpot = request_tpot_seconds(request)
+        if tpot is not None:
+            tpots.append(tpot)
+        status = request_slo_status(request, slo, now=view.now)
         if request.completed_at is not None:
             complete += 1
-            passed += meets
-        else:
-            failed_pending += not meets
-    decided = complete + failed_pending
+            unknown_completed += status is None
+        if status is not None:
+            decided += 1
+            passed += status
 
     def quantile(values):
         return (
@@ -129,7 +166,7 @@ def rolling_slo(view: OnlineObservation, slo: ServingSLO, seconds: float) -> Rol
         len(rows) - complete,
         decided,
         passed,
-        passed / decided if decided else None,
+        passed / decided if decided and not unknown_completed else None,
         quantile(ttfts),
-        quantile(gaps),
+        quantile(tpots),
     )

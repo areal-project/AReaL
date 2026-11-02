@@ -146,6 +146,8 @@ class RolloutControllerV2:
 
         # WorkflowExecutor (created in initialize)
         self._workflow_executor = None
+        self._control_callback = None
+        self._trajectory_observer = None
 
         # Staleness manager (created in initialize)
         self._staleness_manager = None
@@ -1543,6 +1545,11 @@ class RolloutControllerV2:
         # Return list of trajectories (matching RolloutController API)
         return [r for r in results if r is not None]
 
+    def configure_control_callbacks(self, *, on_wait=None, on_trajectory=None) -> None:
+        """Attach coordinator callbacks; data ownership stays in the native pipeline."""
+        self._control_callback = on_wait
+        self._trajectory_observer = on_trajectory
+
     def prepare_batch(
         self,
         dataloader: Any,
@@ -1607,11 +1614,15 @@ class RolloutControllerV2:
             reward_normalization,
         )
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+        control = {}
+        if self._control_callback is not None:
+            control["on_wait"] = self._control_callback
         results = self.workflow_executor.prepare_batch(
             dataloader=dataloader,
             workflow=resolved_workflow,
             should_accept_fn=resolved_accept_fn,
             dynamic_bs=dynamic_bs,
+            **control,
         )
         # Return list of trajectories (matching RolloutController API)
         return [r for r in results if r is not None]

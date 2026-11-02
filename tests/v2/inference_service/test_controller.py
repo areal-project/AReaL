@@ -1219,8 +1219,9 @@ async def test_managed_replicas_rebuild_keeps_cpu_plane(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
     from areal.api.cli_args import SchedulingSpec
-    from areal.elastic.infra.reconfiguration import OWNER_ENV
     from areal.infra.scheduler.local import LocalScheduler
+    from areal.infra.utils import process as process_utils
+    from areal.infra.utils.process import OWNER_ENV
     from areal.v2.inference_service.controller import replicas
 
     scheduler = object.__new__(LocalScheduler)
@@ -1286,9 +1287,9 @@ async def test_managed_replicas_rebuild_keeps_cpu_plane(tmp_path, monkeypatch):
         return "127.0.0.1", 20000 + len(cpu_calls)
 
     controller._async_fork_on_guard = AsyncMock(side_effect=fork_cpu)
-    monkeypatch.setattr(replicas, "gpu_processes", lambda: {})
+    monkeypatch.setattr(process_utils, "gpu_processes", lambda: {})
     monkeypatch.setattr(
-        replicas,
+        process_utils,
         "resolve_gpu_uuids",
         lambda devices: [str(device) for device in devices],
     )

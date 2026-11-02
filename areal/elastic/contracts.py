@@ -660,7 +660,7 @@ class RollingSLO:
     jointly_passed: int
     fraction: float | None
     ttft_quantile_seconds: float
-    tbt_quantile_seconds: float
+    tpot_quantile_seconds: float
 
 
 @dataclass(frozen=True)

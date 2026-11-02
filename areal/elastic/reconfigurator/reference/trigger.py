@@ -33,7 +33,7 @@ def search_state(owner, view, model):
             sum(t.tool_seconds or 0 for t in recent) / max(1, len(recent)),
             getattr(model, "delay", 0.0),
             statistics.ttft_quantile_seconds,
-            statistics.tbt_quantile_seconds,
+            statistics.tpot_quantile_seconds,
         ),
         (
             statistics.fraction is not None

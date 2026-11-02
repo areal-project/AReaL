@@ -108,11 +108,14 @@ class ExportTrajectoriesRequest(BaseModel):
     lease: str | None = None
     handoff_digest: str | None = None
 
+    include_observation: bool = False
+
 
 class ExportTrajectoriesResponse(BaseModel):
     """Response containing merged serialized interactions."""
 
     traj: dict[str, Any]
+    observation: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +184,7 @@ class SessionData:
         self._set_reward_finish_timeout = set_reward_finish_timeout
         self._prefix_matcher = prefix_matcher
         self._last_access_time = time.time()
+        self.created_at = self._last_access_time
         self._lock = threading.Lock()
         self._active_completions = self._new_interaction_cache()
         self._ready_trajectories: OrderedDict[int, ReadyTrajectory] = OrderedDict()
@@ -679,6 +683,11 @@ class SessionData:
                     ready.lease,
                 )
             return ready.trajectory_id, copy_interactions(ready.exported_interactions)
+
+    def trajectory_observation_times(self, trajectory_id: int) -> tuple[float, float]:
+        """Read timestamps without exporting or consuming trajectory data."""
+        with self._lock:
+            return self.created_at, self._ready_trajectories[trajectory_id].created_at
 
     def validate_trajectory_identity(
         self,

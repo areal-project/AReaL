@@ -19,7 +19,7 @@ from areal.elastic.reconfigurator.basic.core import fingerprint
 from areal.elastic.reconfigurator.basic.optimizer import (
     SearchBound,
 )
-from areal.elastic.serving import ServingSLO, rolling_slo
+from areal.elastic.serving import ServingSLO, request_slo_status, rolling_slo
 from areal.elastic.simulation.online_inputs import ForecastInputs
 from areal.elastic.simulation.online_transitions import (
     HandoffConfig,
@@ -140,18 +140,7 @@ class OnlineForecastModel:
         if self.prune_irreversible_slo and not historical:
             failed = sum(
                 r.completed_at is None
-                and (
-                    (r.first_token_at if r.first_token_at is not None else view.now)
-                    - r.ready_at
-                    > self.slo.ttft_seconds + 1e-12
-                    or max(
-                        r.maximum_tbt_seconds,
-                        view.now - r.last_token_at
-                        if r.last_token_at is not None
-                        else 0.0,
-                    )
-                    > self.slo.tbt_seconds + 1e-12
-                )
+                and request_slo_status(r, self.slo, now=view.now) is False
                 for r in view.requests
             )
             for remaining in self._remaining:
@@ -309,8 +298,7 @@ class OnlineForecastModel:
             ]
             passed = sum(
                 r.completed_at is not None
-                and r.first_token_at - r.ready_at <= self.slo.ttft_seconds + 1e-12
-                and r.maximum_tbt_seconds <= self.slo.tbt_seconds + 1e-12
+                and request_slo_status(r, self.slo, now=r.completed_at) is True
                 for r in future
             )
             fractions.append(passed / len(future) if future else 1.0)

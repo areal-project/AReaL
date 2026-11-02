@@ -1,5 +1,5 @@
 {
-  "description": "Reference conditional CPU simulation: Actor supply, memory reserve and independent role history; Actor stays resident between updates; maximum-TBT SLO",
+  "description": "Reference conditional CPU simulation: Actor supply, memory reserve and independent role history; Actor stays resident between updates; mean-TPOT SLO",
   "input_closes_at": 1800,
   "initial_layout": {
     "actor_dp": 4,
@@ -9,7 +9,7 @@
   },
   "slo": {
     "ttft_seconds": 5,
-    "tbt_seconds": 0.1,
+    "tpot_seconds": 0.05,
     "minimum_request_fraction": 0.8
   },
   "run": {

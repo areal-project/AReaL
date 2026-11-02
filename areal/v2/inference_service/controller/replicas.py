@@ -8,12 +8,11 @@ import json
 import uuid
 from pathlib import Path
 
-from areal.elastic.infra.reconfiguration import (
+from areal.infra.utils.process import (
     OWNER_ENV,
-    gpu_processes,
     owned_processes,
-    resolve_gpu_uuids,
     stop_owned_processes,
+    wait_for_gpu_release,
 )
 from areal.utils.atomic import atomic_json
 from areal.utils.network import format_hostport
@@ -50,9 +49,7 @@ class ManagedReplicas:
 
         if self.records:
             raise RuntimeError("Stop the previous GPU engines before rebuilding")
-        present = gpu_processes()
-        if any(present.get(gpu) for gpu in resolve_gpu_uuids(list(devices))):
-            raise RuntimeError("Target inference GPUs are occupied")
+        wait_for_gpu_release(devices, timeout=0)
         controller = self.controller
         client = await controller._get_async_client()
         controller._inf_addrs = []
@@ -121,11 +118,9 @@ class ManagedReplicas:
             stop_owned_processes(record["owner"])
             if owned_processes(record["owner"]):
                 raise RuntimeError("Inference descendants remain alive")
-            present = gpu_processes()
-            if any(present.get(gpu) for gpu in resolve_gpu_uuids([record["device"]])):
-                raise RuntimeError(
-                    "Inference GPU is still occupied; do not transfer it"
-                )
+            wait_for_gpu_release(
+                [record["device"]], timeout=self.controller.config.setup_timeout
+            )
             self.records.remove(record)
             self.persist()
         self.controller._inf_addrs = []

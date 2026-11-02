@@ -9,7 +9,7 @@
   },
   "slo": {
     "ttft_seconds": 5,
-    "tbt_seconds": 0.1,
+    "tpot_seconds": 0.05,
     "minimum_request_fraction": 0.8
   },
   "run": {

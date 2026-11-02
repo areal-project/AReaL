@@ -8,8 +8,10 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import asdict
 from functools import wraps
+from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -18,6 +20,7 @@ import aiohttp
 
 from areal.infra.utils.concurrent import get_executor, run_async_task
 from areal.infra.utils.http import create_httpx_client
+from areal.infra.utils.process import wait_for_gpu_release
 from areal.utils import logging
 from areal.utils.network import format_hostport, gethostip
 
@@ -845,11 +848,40 @@ class GatewayTrainController:
         identity_sha256: str,
         version: int,
         restore_plan: dict[str, Any] | None = None,
+        source_world_size: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Preflight all ranks before a native collective save/load, with no retries."""
+        """Save/load full state, building the backend DP mapping when requested.
+
+        Callers may supply the source checkpoint world size instead of constructing
+        a FSDP restore protocol. Existing explicit restore plans remain supported.
+        Every target rank is inspected before collective execution starts.
+        """
         self._ensure_initialized()
         if operation not in ("save", "load"):
             raise ValueError("Full checkpoint operation must be save or load")
+        if source_world_size is not None:
+            if operation != "load" or restore_plan is not None:
+                raise ValueError(
+                    "Source world size requires a load without an explicit restore plan"
+                )
+            if type(source_world_size) is not int or source_world_size < 1:
+                raise ValueError("Source world size must be a positive integer")
+            target_world_size = self.train_alloc.parallel.world_size
+            if source_world_size != target_world_size:
+                if backend != "fsdp":
+                    raise ValueError("Cross-DP checkpoint loading requires FSDP")
+                from areal.v2.training_service.dp_restore import DPStateRestorePlan
+
+                restore_plan = asdict(
+                    DPStateRestorePlan(
+                        identity_sha256=identity_sha256,
+                        checkpoint_generation=Path(path).name,
+                        policy_version=version,
+                        source_world_size=source_world_size,
+                        target_world_size=target_world_size,
+                        transition_id=uuid4().hex + uuid4().hex,
+                    )
+                )
         kwargs = {
             "path": path,
             "backend": backend,
@@ -1365,11 +1397,19 @@ class GatewayTrainController:
             self._own_process_group = False
 
     @_exclusive_engine_operation
-    def destroy(self, *, training_stopped: bool = False) -> None:
+    def destroy(
+        self,
+        *,
+        training_stopped: bool = False,
+        release_devices: Sequence[int] | None = None,
+    ) -> None:
+        """Stop training services and optionally confirm declared local GPUs are free."""
         self.quiesce_initialization()
         if training_stopped:
             self.disconnect_stopped_training()
         self._cleanup_runtime_state(training_stopped=training_stopped)
+        if release_devices is not None:
+            wait_for_gpu_release(release_devices, timeout=self.config.setup_timeout)
 
     @_exclusive_engine_operation
     def disconnect_stopped_training(self) -> None:

@@ -61,7 +61,7 @@ class NativePlacements:
             raise ValueError("Native candidate changes require FSDP DP and SGLang TP1")
         if layout.actor_gpus + layout.rollout_gpus > len(owner.resource_reservation):
             raise ValueError("Candidate exceeds the original native reservation")
-        if owner.inbox.batch_size % layout.actor_dp:
+        if owner.config.train_dataset.batch_size % layout.actor_dp:
             raise ValueError("Candidate DP must divide the logical batch")
         if not owner.managed_rollout:
             if layout.rollout_replicas != len(source.rollout_devices):
@@ -94,7 +94,7 @@ class NativePlacements:
             proposed = (
                 OnlineLayout(dp, 1, replicas, 1)
                 for dp in range(1, min(16, len(owner.resource_reservation) - 1) + 1)
-                if owner.inbox.batch_size % dp == 0
+                if owner.config.train_dataset.batch_size % dp == 0
                 for replicas in (
                     range(1, min(16, len(owner.resource_reservation) - dp) + 1)
                     if owner.managed_rollout
@@ -171,7 +171,10 @@ class NativeControlEnvironment:
 
     @property
     def publication(self):
-        return "pending" if self.owner._publication_uncertain else "idle"
+        pending = getattr(self.owner, "_publication_uncertain", False)
+        if hasattr(self.owner, "trainer"):
+            pending = pending or self.owner.trainer._control_phase == "publication"
+        return "pending" if pending else "idle"
 
     def observe(self):
         view = self.adapter.observe()
@@ -188,7 +191,11 @@ class NativeControlEnvironment:
 
     def request_handoff(self, layout):
         owner = self.owner
-        if owner._closed or not owner.control_snapshot().boundary_ready:
+        if (
+            self.adapter.closed
+            or not owner.control_snapshot().boundary_ready
+            or owner.applied_version < 1
+        ):
             return False
         target = self.adapter.placements.resolve(layout)
         source = owner.execution_layout
@@ -197,7 +204,7 @@ class NativeControlEnvironment:
         self.pending_handoff = target
         try:
             generation = owner.reconfiguration_application.state()["generation"]
-            receipt = owner.reconfigure(
+            receipt = getattr(owner, "trainer", owner).reconfigure(
                 target=target,
                 request_id=f"online-{self.reconfigurator.implementation}-{self._sequence}-{owner.applied_version}-{generation}",
                 expected_generation=generation,
@@ -376,8 +383,9 @@ class ReconfiguratorAdapter:
                     "Native candidate prediction requires run and handoff inputs"
                 )
             if (
-                self.run_config.batch_size != owner.inbox.batch_size
-                or self.run_config.staleness != owner.inbox.max_staleness
+                self.run_config.batch_size != owner.config.train_dataset.batch_size
+                or self.run_config.staleness
+                != owner.config.rollout.max_head_offpolicyness
             ):
                 raise ValueError(
                     "Native forecast must use the real batch and staleness"
