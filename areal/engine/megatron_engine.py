@@ -120,7 +120,18 @@ from areal.models.mcore.hf_save import (
     save_critic_value_head,
     save_weights_to_hf_with_mbridge_fast,
 )
-from areal.models.mcore.registry import make_hf_and_mcore_config, make_mcore_model
+from areal.models.mcore.qwen35_decision import (
+    DecisionHeadMeta,
+    PointerHead,
+    load_decision_pointer_head,
+    replace_output_layer_with_pointer_head,
+    save_decision_pointer_head,
+)
+from areal.models.mcore.registry import (
+    make_hf_and_mcore_config,
+    make_mcore_model,
+    unwrap_to_gpt_model,
+)
 from areal.models.tree_attn.functional import (
     _gather_packed_tree_logprobs,
     gather_packed_tree_logprobs_entropy,
@@ -174,6 +185,19 @@ if TYPE_CHECKING:
 # rewriting) collapse to the same canonical form.
 _LAYER_IDX_RE = re.compile(r"\.layers\.\d+\.")
 _EXPERT_NUM_RE = re.compile(r"\.(weight|bias)\d+$")
+_QWEN35_LORA_TARGET_PRESETS = {
+    "all": [
+        "linear_qkv",
+        "linear_proj",
+        "linear_fc1",
+        "linear_fc2",
+        "in_proj",
+        "out_proj",
+    ],
+    "dense": ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+    "attn": ["linear_qkv", "linear_proj", "in_proj", "out_proj"],
+    "qv": ["linear_qkv"],
+}
 
 
 def _normalize_glu_param_name(name: str) -> str:
@@ -343,15 +367,7 @@ class MegatronEngine(TrainEngine):
         """Create a hook that injects LoRA before mixed precision and DDP wrapping."""
         assert self.bridge_cls == "megatron-bridge"
 
-        target_modules = list(self.config.target_modules or [])
-        if not target_modules or "all-linear" in target_modules:
-            # Expand all-linear to explicit Megatron-Bridge linear module targets.
-            target_modules = [
-                "linear_qkv",
-                "linear_proj",
-                "linear_fc1",
-                "linear_fc2",
-            ]
+        target_modules = self._bridge_lora_target_modules()
         from megatron.bridge.peft.lora import LoRA as MegatronBridgeLoRA
 
         from areal.engine.megatron_utils.megatron_bridge_patches import (
@@ -359,7 +375,9 @@ class MegatronEngine(TrainEngine):
         )
 
         if is_qwen3_5_model(self.hf_config.model_type):
-            patch_qwen35_hybrid_lora_specs()
+            patch_qwen35_hybrid_lora_specs(
+                unfuse_gdn=any(n in {"in_proj", "out_proj"} for n in target_modules)
+            )
 
         self.bridge_lora = MegatronBridgeLoRA(
             target_modules=target_modules,
@@ -393,6 +411,110 @@ class MegatronEngine(TrainEngine):
             return model
 
         return apply_lora
+
+    def _bridge_lora_target_modules(self) -> list[str]:
+        """Resolve Megatron-Bridge LoRA targets. PointerHead is never a target."""
+        target_modules = [
+            name
+            for name in (self.config.target_modules or [])
+            if name not in {"output_layer", "PointerHead", "q", "k"}
+        ]
+        if target_modules and "all-linear" not in target_modules:
+            return target_modules
+        model_type = getattr(self.hf_config, "model_type", None)
+        if model_type is not None and is_qwen3_5_model(model_type):
+            preset = getattr(self.config, "lora_targets_preset", "all") or "all"
+            try:
+                return list(_QWEN35_LORA_TARGET_PRESETS[preset])
+            except KeyError as exc:
+                raise ValueError(
+                    "lora_targets_preset must be one of "
+                    f"{sorted(_QWEN35_LORA_TARGET_PRESETS)}, got {preset!r}."
+                ) from exc
+        return ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"]
+
+    def _attach_pointer_heads(self, model):
+        """Replace last-stage output_layer with PointerHead before DDP."""
+        for chunk in model:
+            replace_output_layer_with_pointer_head(
+                chunk, self.tf_config, head_dim=self.config.decision_head_dim
+            )
+        return model
+
+    def _enable_pointer_head_gradients(self, model) -> None:
+        """Keep PointerHead trainable after Megatron-Bridge LoRA freezes the trunk."""
+        enabled = 0
+        for chunk in model:
+            gpt_model = unwrap_to_gpt_model(chunk)
+            head = getattr(gpt_model, "output_layer", None)
+            if not isinstance(head, PointerHead):
+                continue
+            for param in head.parameters():
+                param.requires_grad = True
+                enabled += 1
+        if enabled:
+            self.logger.info(
+                "Enabled gradients on PointerHead (%s parameters).", enabled
+            )
+
+    def _create_pre_wrap_hook(self):
+        """Compose PointerHead attach, LoRA, and head unfreeze before DDP wrap."""
+        want_lora = self.lora_mode and self.bridge_cls == "megatron-bridge"
+        want_head = bool(getattr(self.config, "is_decision_model", False))
+        if not want_lora and not want_head:
+            return None
+        lora_hook = self._create_megatron_bridge_lora_hook() if want_lora else None
+        if not want_head:
+            return lora_hook
+
+        def pre_wrap(model):
+            self._attach_pointer_heads(model)
+            if lora_hook is not None:
+                model = lora_hook(model)
+            self._enable_pointer_head_gradients(model)
+            if self.bridge_lora is not None:
+                self.bridge_lora.set_params_to_save(model)
+            return model
+
+        return pre_wrap
+
+    def _decision_head_checkpoint_meta(self) -> DecisionHeadMeta:
+        dtype = str(getattr(self.config, "dtype", "bfloat16"))
+        weights_dtype = {
+            "float32": "fp32",
+            "bfloat16": "bf16",
+            "float16": "fp16",
+        }.get(dtype, dtype)
+        return DecisionHeadMeta(
+            base=self.config.path,
+            lora=int(self.config.lora_rank) if self.config.use_lora else 0,
+            head_dim=int(self.config.decision_head_dim),
+            weights="lora" if self.config.use_lora else "full",
+            weights_dtype=weights_dtype,
+        )
+
+    def _sync_decision_pointer_head(self, path: str) -> None:
+        if not getattr(self.config, "is_decision_model", False):
+            return
+        load_decision_pointer_head(self.model, path)
+
+    def _reassemble_and_unpad_output(
+        self,
+        output: torch.Tensor,
+        inputs: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
+        if cp_padded_cu_seqlens is None:
+            return output, inputs
+        output = reassemble_cp_packed_logprobs(output, cp_padded_cu_seqlens)
+        output = unpad_logits(
+            output,
+            inputs.get("_cp_padding_length", 0),
+            cp_padded_cu_seqlens,
+            inputs.get("_cp_old_cu_seqlens"),
+        )
+        inputs = {k: v for k, v in inputs.items() if not k.startswith("_cp_")}
+        return output, inputs
 
     def _apply_merged_lora(self) -> None:
         """Inject PEFT LoRA layers while retaining full-weight synchronization."""
@@ -569,6 +691,14 @@ class MegatronEngine(TrainEngine):
         )
         self.engine_lock = DistributedLock("train_engine_lock")
 
+        if (
+            getattr(self.config, "is_decision_model", False)
+            and self.bridge_cls != "megatron-bridge"
+        ):
+            raise NotImplementedError(
+                "Qwen3.5 PointerHead decision training requires "
+                "megatron.bridge_type='megatron-bridge'."
+            )
         if self.config.use_lora and self.bridge_cls != "megatron-bridge":
             raise NotImplementedError(
                 "MegatronEngine LoRA POC currently only supports bridge_type='megatron-bridge'. "
@@ -702,9 +832,7 @@ class MegatronEngine(TrainEngine):
                         f"{', '.join(fallback_reasons)}."
                     )
 
-            pre_wrap_hook = None
-            if self.lora_mode and self.bridge_cls == "megatron-bridge":
-                pre_wrap_hook = self._create_megatron_bridge_lora_hook()
+            pre_wrap_hook = self._create_pre_wrap_hook()
 
             with self.device:
                 models = make_mcore_model(
@@ -730,6 +858,7 @@ class MegatronEngine(TrainEngine):
 
         if self.config.init_from_scratch:
             self.logger.info("init_from_scratch=True; skipping HF weight loading.")
+            self._sync_decision_pointer_head("/nonexistent-decision-pointer-head")
         else:
             with self.device:
                 self._load_model_from_hf(self.config.path)
@@ -2957,7 +3086,18 @@ class MegatronEngine(TrainEngine):
                     self.model,
                     path,
                     source_path=base_model_path,
-                    strict=not self._mtp_head_dropped,
+                    strict=not (
+                        self._mtp_head_dropped
+                        or getattr(self.config, "is_decision_model", False)
+                    ),
+                )
+            if getattr(self.config, "is_decision_model", False):
+                if not self.config.use_lora and dist.get_rank() == 0:
+                    self._rebuild_index_from_saved_shards(path)
+                save_decision_pointer_head(
+                    self.model,
+                    path,
+                    meta=self._decision_head_checkpoint_meta(),
                 )
         else:
             with patch_torch_all_gather_object():
@@ -3296,7 +3436,14 @@ class MegatronEngine(TrainEngine):
             # Force CPU as the factory-op default here; tensor data assignment
             # to GPU model params is unaffected (handled by .copy_()).
             with torch.device("cpu"):
-                self.bridge.load_hf_weights(self.model, hf_path=path)
+                load_kwargs = {"hf_path": path}
+                if getattr(self.config, "is_decision_model", False):
+                    load_kwargs["allowed_mismatched_params"] = [
+                        "*output_layer*",
+                        "lm_head.weight",
+                    ]
+                self.bridge.load_hf_weights(self.model, **load_kwargs)
+            self._sync_decision_pointer_head(path)
         else:
             load_weights_from_hf_with_mbridge_fast(
                 bridge=self.bridge,
@@ -3435,7 +3582,10 @@ class MegatronEngine(TrainEngine):
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
             )
-        if not self.config.is_critic:
+        if getattr(self.config, "is_decision_model", False):
+            output, inputs = self._reassemble_and_unpad_output(output, inputs)
+            loss = loss_fn(output, inputs)
+        elif not self.config.is_critic:
             if self.enable_tree_training:
                 # Handle dummy trie (empty tree for DP synchronization)
                 # When trie has no sequences, return zero loss with grad connection
@@ -3578,6 +3728,9 @@ class MegatronEngine(TrainEngine):
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
             )
+        if getattr(self.config, "is_decision_model", False):
+            output, _ = self._reassemble_and_unpad_output(output, inputs)
+            return output
         if not self.config.is_critic:
             if self.enable_tree_training:
                 logprobs = _gather_packed_tree_logprobs(
@@ -3704,10 +3857,15 @@ class MegatronLMEngine(MegatronEngine):
     """Language model engine for SFT using Megatron backend."""
 
     def __init__(self, config: TrainEngineConfig):
-        from areal.trainer.sft.lm_engine import LMEngine
-
         super().__init__(config)
-        self.lm_engine = LMEngine(self)
+        if getattr(config, "is_decision_model", False):
+            from areal.trainer.sft.decision import DecisionEngine
+
+            self.lm_engine = DecisionEngine(self)
+        else:
+            from areal.trainer.sft.lm_engine import LMEngine
+
+            self.lm_engine = LMEngine(self)
 
     def train_lm(self, data):
         return self.lm_engine.train_lm(data)

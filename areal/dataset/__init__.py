@@ -21,9 +21,16 @@ VALID_DATASETS = [
     "torl_data",
     "aime",
     "leetcode",
+    "decision",
 ]
 
 logger = logging.getLogger("Dataset")
+
+
+def _is_decision_path(path: str | None) -> bool:
+    from .decision import is_decision_path
+
+    return is_decision_path(path)
 
 
 def _add_or_replace_column(dataset: "Dataset", name: str, value: str) -> "Dataset":
@@ -78,6 +85,17 @@ def _get_custom_dataset(
     processor: Optional["ProcessorMixin"] = None,
     **kwargs,
 ) -> "Dataset":
+    if type == "decision" or (type == "sft" and _is_decision_path(path)):
+        from .decision import get_decision_sft_dataset
+
+        return get_decision_sft_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            processor=processor,
+            **kwargs,
+        )
     if "gsm8k" in path and type == "sft":
         from .gsm8k import get_gsm8k_sft_dataset
 

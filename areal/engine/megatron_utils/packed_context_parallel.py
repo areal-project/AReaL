@@ -8,6 +8,7 @@ import torch.distributed.nn.functional as dist_F
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
+from areal.engine.megatron_utils.mindspeed_gdn_patch import remember_cu_seqlens
 from areal.infra.platforms import is_npu_available
 from areal.utils.data import is_multi_modal_key
 
@@ -21,6 +22,7 @@ def preprocess_packed_seqs_context_parallel(
     CP splits sequence into CP*2 chunks, and each GPU gets 2 chunks (GPU0 gets first and last chunks, GPU1 gets second and second last chunks, and so on),
     this is for load balancing with causal masking. See https://github.com/NVIDIA/TransformerEngine/issues/1368
     """
+    remember_cu_seqlens(cu_seqlens)
     input_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     max_seqlen = input_lens.max().item()
     batch_size = input_lens.shape[0]
@@ -317,6 +319,7 @@ def _build_thd_packed_seq_params(cu_seqlens: torch.Tensor) -> PackedSeqParams:
     Sequences in AReaL microbatches are already padded to the parallelism
     alignment, so actual and padded cu_seqlens coincide.
     """
+    remember_cu_seqlens(cu_seqlens)
     input_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()

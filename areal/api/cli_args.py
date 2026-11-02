@@ -1210,6 +1210,34 @@ class TrainEngineConfig:
         default=False,
         metadata={"help": "Whether to use a critic/reward model"},
     )
+    is_decision_model: bool = field(
+        default=False,
+        metadata={"help": "Whether to train a Qwen3.5 PointerHead decision model"},
+    )
+    decision_head_dim: int = field(
+        default=256,
+        metadata={"help": "PointerHead projection dimension (dp)"},
+    )
+    ord_w: float = field(
+        default=0.0,
+        metadata={"help": "Weight of ranked probability score for score questions"},
+    )
+    label_smoothing: float = field(
+        default=0.0,
+        metadata={
+            "help": "Hard-label CE smoothing; existing soft targets are unchanged"
+        },
+    )
+    brier_w: float = field(
+        default=0.0,
+        metadata={
+            "help": "Weight of sum-squared probability error added to hard-label CE"
+        },
+    )
+    focal_gamma: float = field(
+        default=0.0,
+        metadata={"help": "Hard-label CE multiplier (1-p_y)^gamma; 0 is ordinary CE"},
+    )
     temperature: float = field(
         default=1.0, metadata={"help": "Temperature during generation."}
     )
@@ -1301,6 +1329,16 @@ class TrainEngineConfig:
     target_modules: list[str] = field(
         default_factory=list,
         metadata={"help": "lora target_modules."},
+    )
+    lora_targets_preset: str = field(
+        default="all",
+        metadata={
+            "help": (
+                "Preset LoRA target set for Qwen3.5 hybrid models "
+                "('all', 'dense', 'attn', 'qv'). PointerHead is never a LoRA target."
+            ),
+            "choices": ["all", "dense", "attn", "qv"],
+        },
     )
     peft_type: str = field(
         default="lora",
