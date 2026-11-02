@@ -592,6 +592,13 @@ class PPOActor:
             # Keep original masks for reduction denominators and input-token
             # provenance. This extra numerator mask travels through packing/CP.
             data["policy_version_mask"] = version_mask
+            # MCore derives MTP targets from input_ids and rolls once for the
+            # first target, then once per prediction layer. Keep input-token
+            # provenance here; the forward path applies those rolls itself.
+            versions = data["versions"].to(torch.int64)
+            data["mtp_version_mask"] = (versions >= 0) & (
+                self.engine.get_version() - versions <= max_head_offpolicyness
+            )
             with stats_tracker.scope("update"):
                 stats_tracker.stat_compact(
                     loss_mask.bool(),

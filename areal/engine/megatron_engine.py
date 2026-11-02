@@ -2120,11 +2120,6 @@ class MegatronEngine(TrainEngine):
                         "multimodal, padding, and sequence-boundary positions are "
                         "not used as MTP supervision."
                     )
-                if "policy_version_mask" in mb_input.padded_mb:
-                    mtp_loss_mask = (
-                        mtp_loss_mask.bool()
-                        & mb_input.padded_mb["policy_version_mask"].bool()
-                    )
                 input_ids = mb_input.padded_mb["input_ids"]
                 if mtp_loss_mask.shape != input_ids.shape:
                     raise ValueError(
@@ -2133,6 +2128,15 @@ class MegatronEngine(TrainEngine):
                         f"{input_ids.shape}."
                     )
                 mb_input.padded_mb["mtp_loss_mask"] = mtp_loss_mask
+                mtp_version_mask = mb_input.padded_mb.get("mtp_version_mask")
+                if (
+                    mtp_version_mask is not None
+                    and mtp_version_mask.shape != input_ids.shape
+                ):
+                    raise ValueError(
+                        "MTP version mask must match input_ids before layout "
+                        f"conversion, got {mtp_version_mask.shape} and {input_ids.shape}."
+                    )
 
             output = packed_context_parallel_forward(
                 model,

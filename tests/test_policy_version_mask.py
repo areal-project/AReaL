@@ -115,16 +115,19 @@ def test_actor_version_mask_is_opt_in_and_applied_before_packing(enabled):
     assert metrics["update/version_stats/sample_staleness_theta_max"] == 5
     if not enabled:
         assert "policy_version_mask" not in data
+        assert "mtp_version_mask" not in data
         assert "update/version_filtered_fraction" not in metrics
         assert data["loss_mask"].tolist() == [[True, True, True, False]]
         return
     assert data["policy_version_mask"].tolist() == [[False, True, True, False]]
+    assert data["mtp_version_mask"].tolist() == [[False, False, True, True]]
     assert (
         metrics["update/version_filtered/version_stats/sample_staleness_theta_max"] == 1
     )
     assert metrics["update/version_filtered_fraction"] == pytest.approx(1 / 3)
     packed = pack_tensor_dict(data)
     assert packed["policy_version_mask"].tolist() == [False, True, True, False]
+    assert packed["mtp_version_mask"].tolist() == [False, False, True, True]
 
 
 @pytest.mark.parametrize("all_expired", [False, True])
