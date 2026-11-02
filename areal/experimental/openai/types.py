@@ -14,6 +14,7 @@ from openai.types.responses.response_input_param import ResponseInputParam
 
 from areal.api import ModelResponse
 from areal.utils import logging
+from areal.utils.score_centering import pad_topk_ids, pad_topk_logps
 
 logger = logging.getLogger("TokenLogpReward")
 
@@ -68,6 +69,11 @@ class InteractionWithTokenLogpReward:
     chat_template_type: str = "hf"
     trajectory_metadata: dict[str, str] = field(default_factory=dict)
     _cache: dict[str, torch.Tensor] | None = None
+
+    # Score Centering: the sc_top_k from the engine config, used in
+    # to_tensor_dict() to cap k_dim (mirrors rlvr.py's k_dim logic).  Set by
+    # the client when creating the interaction; 0 = SC disabled.
+    sc_top_k: int = 0
 
     # Vision payload for VLM training. ``mm_token_type_ids`` covers the prompt
     # only (it is extended with zeros over the output at tensor-dict time);
@@ -261,6 +267,56 @@ class InteractionWithTokenLogpReward:
                 _align_mm_token_type_ids(self.mm_token_type_ids, resp, len(seq)),
                 dtype=torch.long,
             ).unsqueeze(0)
+        # Score Centering: propagate sampler top-k logprobs if available.
+        # Mirrors rlvr.py SC logic: input positions get zero top-k (no sampler
+        # data), output positions get the actual top-k token ids and logprobs.
+        if resp.output_topk_ids is not None and resp.output_topk_logps is not None:
+            if self.chat_template_type == "concat" and self.parent is not None:
+                raise NotImplementedError(
+                    "Score Centering is not supported with chat_template_type="
+                    "'concat' multi-turn interactions: the parent's top-k sampler "
+                    "data is not propagated into the child trajectory. Use "
+                    "chat_template_type='hf' or disable Score Centering."
+                )
+            pad_k = (
+                max(len(k) for k in resp.output_topk_ids) if resp.output_topk_ids else 0
+            )
+            if pad_k > 0:
+                # Cap k_dim at sc_top_k to match rlvr.py's logic: vLLM returns
+                # 1+N entries (sampled token + top-N), so pad_k may be
+                # sc_top_k + 1.  Without this cap, OpenAI-path trajectories
+                # would have k_dim=sc_top_k+1 while rlvr.py trajectories have
+                # k_dim=sc_top_k, causing dimension mismatch when batched.
+                sc_top_k = self.sc_top_k
+                k_dim = sc_top_k if sc_top_k > 0 else pad_k
+                if sc_top_k > 0 and pad_k < sc_top_k:
+                    raise RuntimeError(
+                        f"Score Centering requires sc_top_k={sc_top_k} "
+                        f"but the sampler returned only {pad_k} "
+                        "top-k entries. Increase vLLM max_logprobs or "
+                        "reduce sc_top_k."
+                    )
+                # Input tokens have no sampler data. Pad ids with 0 and
+                # log-probs with -inf so they contribute zero mass.
+                input_topk_ids = [
+                    pad_topk_ids([], k_dim) for _ in range(resp.input_len)
+                ]
+                input_topk_logps = [
+                    pad_topk_logps([], k_dim) for _ in range(resp.input_len)
+                ]
+                # Output tokens: pad each row to k_dim.
+                output_topk_ids = [
+                    pad_topk_ids(ids, k_dim) for ids in resp.output_topk_ids
+                ]
+                output_topk_logps = [
+                    pad_topk_logps(logps, k_dim) for logps in resp.output_topk_logps
+                ]
+                result["sampler_topk_token_ids"] = torch.tensor(
+                    input_topk_ids + output_topk_ids, dtype=torch.int32
+                ).unsqueeze(0)  # [1, seq_len, k]
+                result["sampler_topk_logps"] = torch.tensor(
+                    input_topk_logps + output_topk_logps, dtype=torch.float32
+                ).unsqueeze(0)  # [1, seq_len, k]
         self._cache = result
         return result
 

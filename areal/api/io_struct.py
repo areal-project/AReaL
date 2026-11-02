@@ -101,6 +101,10 @@ class ModelResponse:
     # MoE routing (only populated when return_routed_experts=True)
     routed_experts: np.ndarray | None = None
 
+    # Score Centering: per-token top-k from sampler
+    output_topk_ids: list[list[int]] | None = None  # [n_output_tokens, k]
+    output_topk_logps: list[list[float]] | None = None  # [n_output_tokens, k]
+
     @property
     def input_len(self) -> int:
         return len(self.input_tokens)
@@ -411,6 +415,9 @@ class HttpGenerationResult:
     output_logprobs: list[float]
     stop_reason: str
     routed_experts: np.ndarray | None = None
+    # Score Centering: per-token top-k token IDs and log-probs from sampler
+    output_topk_ids: list[list[int]] | None = None  # [n_output_tokens, k]
+    output_topk_logps: list[list[float]] | None = None  # [n_output_tokens, k]
 
 
 @dataclass

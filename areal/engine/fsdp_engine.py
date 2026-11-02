@@ -132,6 +132,7 @@ from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.save_load import get_state_dict_from_repo_id_or_path
+from areal.utils.score_centering import check_score_centering_sp_supported
 
 if TYPE_CHECKING:
     from areal.api import Scheduler
@@ -1956,10 +1957,17 @@ class FSDPEngine(TrainEngine):
                 mb["attention_mask"] = None
                 padded_mb["attention_mask"] = None
             else:
-                mb["attention_mask"] = dict(full_attention=None, sliding_attention=None)
-                padded_mb["attention_mask"] = dict(
-                    full_attention=None, sliding_attention=None
-                )
+                # Pass None so that the HF model's create_causal_mask auto-detects
+                # packed sequences from position_ids (which reset to 0 at each sequence
+                # boundary via amend_position_ids) and builds a correct block-diagonal
+                # causal mask.  Using dict(full_attention=None, ...) here bypasses the
+                # mask creation path in Qwen2Model.forward (isinstance check on dict),
+                # which causes eager_attention_forward to receive None and skip the mask
+                # entirely -- making every token attend to every other token across
+                # sequence boundaries.  This was the root cause of the TIM
+                # (Training-Inference Mismatch) that broke Score Centering's tail model.
+                mb["attention_mask"] = None
+                padded_mb["attention_mask"] = None
             _prepare_multimodal_forward_inputs(mb, padded_mb)
         _drop_multimodal_payloads(mb_list.data)
         return mb_list
@@ -2182,6 +2190,16 @@ class FSDPEngine(TrainEngine):
                     entropy = entropy[: -ctx.pad_length]
                     vocab_min_logits = vocab_min_logits[: -ctx.pad_length]
                     vocab_max_logits = vocab_max_logits[: -ctx.pad_length]
+                    logits = logits[: -ctx.pad_length]
+            # Score Centering: inject raw trainer logits into input_data so
+            # grpo_loss_fn can call gather_train_head_logp. Conditional on SC
+            # being enabled (read from the loss_fn partial) to avoid carrying
+            # full-vocab logits when SC is off.
+            if getattr(loss_fn, "keywords", {}).get("use_score_centering", False):
+                # Fail fast: the injected logits below are the local SP slice,
+                # while loss_mask/sampler data are all-gathered across SP.
+                check_score_centering_sp_supported(True, self.parallel_helper.sp_size)
+                ctx.mb_input["logits"] = logits
             loss = loss_fn(
                 logprobs,
                 entropy,
