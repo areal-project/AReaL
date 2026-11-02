@@ -1052,14 +1052,20 @@ class MegatronEngineConfig:
         },
     )
 
-    enable_mtp: bool = field(
+    enable_mtp_training: bool = field(
         default=False,
         metadata={
-            "help": "Build and train the model's Multi-Token-Prediction (MTP) head "
-            "(bridge_type=megatron-bridge only). Default False leaves it unbuilt; "
-            "the frozen head is still copied from the source into exports so they "
-            "stay complete for MTP speculative decoding.",
+            "help": "Train the MTP head with an isolated auxiliary loss "
+            "(megatron-bridge only). MTP loss gradients do not flow into policy "
+            "parameters; MTP and policy gradients share global grad-norm clipping. "
+            "Full HF checkpoints preserve MTP weights whether training is "
+            "enabled or disabled.",
         },
+    )
+
+    mtp_loss_scaling_factor: float = field(
+        default=0.1,
+        metadata={"help": "Non-negative finite weight of the auxiliary MTP loss."},
     )
 
     vision_dp_when_cp: bool = field(
@@ -1095,8 +1101,19 @@ class MegatronEngineConfig:
             raise ValueError(
                 "lm_head_loss_chunk_size requires entropy_requires_grad=False"
             )
-        if self.lm_head_loss_chunk_size > 0 and self.enable_mtp:
-            raise ValueError("lm_head_loss_chunk_size does not support enable_mtp=True")
+        if self.lm_head_loss_chunk_size > 0 and self.enable_mtp_training:
+            raise ValueError(
+                "lm_head_loss_chunk_size does not support enable_mtp_training=True"
+            )
+        if (
+            not math.isfinite(self.mtp_loss_scaling_factor)
+            or self.mtp_loss_scaling_factor < 0
+        ):
+            raise ValueError("mtp_loss_scaling_factor must be finite and non-negative")
+        if self.enable_mtp_training and self.bridge_type != "megatron-bridge":
+            raise ValueError(
+                "enable_mtp_training requires bridge_type='megatron-bridge'"
+            )
 
 
 @dataclass

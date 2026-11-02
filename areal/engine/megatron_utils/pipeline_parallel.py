@@ -88,6 +88,9 @@ def configure_pipeline_layer_splits(
             stage_layers.append("embedding")
         stage_layers.extend(["decoder"] * length)
         if idx == total_stages - 1:
+            stage_layers.extend(
+                ["mtp"] * (getattr(tf_config, "mtp_num_layers", 0) or 0)
+            )
             stage_layers.append("loss")
         layout.append(stage_layers)
     layout = PipelineParallelLayerLayout(

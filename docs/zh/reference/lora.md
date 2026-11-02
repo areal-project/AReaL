@@ -102,7 +102,7 @@ python examples/math/gsm8k_rl.py \
   actor.gradient_checkpointing=false \
   actor.mb_spec.max_tokens_per_mb=5120 \
   ref.mb_spec.max_tokens_per_mb=5120 \
-  '+actor.megatron={bridge_type: megatron-bridge, use_bridge_for_update_weights: true, enable_mtp: false}' \
+  '+actor.megatron={bridge_type: megatron-bridge, use_bridge_for_update_weights: true, enable_mtp_training: false}' \
   vllm.max_model_len=8192 \
   vllm.gpu_memory_utilization=0.8 \
   train_dataset.batch_size=128 \
@@ -129,7 +129,7 @@ python examples/math/gsm8k_rl.py \
   actor.gradient_checkpointing=false \
   actor.mb_spec.max_tokens_per_mb=5120 \
   ref.mb_spec.max_tokens_per_mb=5120 \
-  '+actor.megatron={bridge_type: megatron-bridge, use_bridge_for_update_weights: true, enable_mtp: false}' \
+  '+actor.megatron={bridge_type: megatron-bridge, use_bridge_for_update_weights: true, enable_mtp_training: false}' \
   actor.use_lora=true \
   rollout.use_lora=true \
   "+actor.target_modules=['language_model.*.linear_qkv','language_model.*.linear_proj']" \
@@ -161,7 +161,7 @@ python examples/math/gsm8k_rl.py \
   actor.gradient_checkpointing=false \
   actor.mb_spec.max_tokens_per_mb=5120 \
   ref.mb_spec.max_tokens_per_mb=5120 \
-  '+actor.megatron={bridge_type: megatron-bridge, use_bridge_for_update_weights: true, enable_mtp: false}' \
+  '+actor.megatron={bridge_type: megatron-bridge, use_bridge_for_update_weights: true, enable_mtp_training: false}' \
   actor.use_lora=true \
   rollout.use_lora=true \
   "+actor.target_modules=['language_model.*.linear_qkv','language_model.*.linear_proj']" \
