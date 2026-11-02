@@ -675,7 +675,7 @@ def test_task_training_configs_compose_same_resident_online_recipe(
         "AREAL_TASK_RUN_ROOT": str(tmp_path / "run"),
         "AREAL_TASK_STATE_ROOT": str(tmp_path / "state"),
         "AREAL_MODEL_PATH": str(tmp_path / "model"),
-        "AREAL_ACTOR_LIFECYCLE": "resident",
+        "AREAL_ELASTIC_ENABLED": "false",
         "AREAL_CHECKPOINT_ESTIMATED_BYTES": "10000000000",
         "AREAL_ACTOR_ADMIN_KEY": "actor",
         "AREAL_INFERENCE_ADMIN_KEY": "inference",
@@ -687,7 +687,7 @@ def test_task_training_configs_compose_same_resident_online_recipe(
     for name in ("dapo", "swe"):
         with initialize_config_dir(config_dir=str(root), version_base=None):
             config = OmegaConf.to_container(compose(config_name=name), resolve=True)
-        assert config["actor_lifecycle"]["mode"] == "resident"
+        assert config["elastic"]["enabled"] is False
         assert config["rollout"]["agent"]["mode"] == "online"
         assert config["rollout"]["agent"]["set_reward_finish_timeout"] == 0
         assert (
@@ -751,10 +751,8 @@ async def test_shared_cli_reads_frozen_tasks_and_runs_eval(tmp_path, monkeypatch
         inference_url="http://inference",
         model="Qwen",
         mode="eval",
-        state_root=None,
         concurrency=1,
         request_timeout=60,
-        handoff_timeout=60,
         limit=None,
     )
     assert await client._main(args) == 0
@@ -763,66 +761,10 @@ async def test_shared_cli_reads_frozen_tasks_and_runs_eval(tmp_path, monkeypatch
     assert summary["infrastructure_errors"] == 0
 
 
-@pytest.mark.parametrize("case", ["actor", "rollout", "joint"])
-def test_reconfiguration_prepare_freezes_twelve_tasks_without_services(
-    tmp_path, monkeypatch, case
-):
-    from argparse import Namespace
-
-    from examples.task_workflows.reconfiguration import prepare
-
-    for name in (
-        "AREAL_TASK_RUN_ROOT",
-        "AREAL_TASK_STATE_ROOT",
-        "AREAL_MODEL_PATH",
-        "AREAL_CHECKPOINT_ESTIMATED_BYTES",
-        "AREAL_INFERENCE_ADMIN_KEY",
-        "AREAL_ACTOR_ADMIN_KEY",
-    ):
-        monkeypatch.setenv(name, "acceptance-private-key")
-    model = tmp_path / "model"
-    model.mkdir()
-    tasks = [
-        MathTask(question_id(f"Compute {i}+1."), f"Compute {i}+1.", str(i + 1))
-        for i in range(14)
-    ]
-    write_splits(
-        tasks, tmp_path / "tasks", source={}, seed=1, pilot=1, train=12, evaluation=1
-    )
-    args = Namespace(
-        case=case,
-        devices=list(range(8)),
-        model=model,
-        tasks=tmp_path / "tasks/train.jsonl",
-        output=tmp_path / case,
-        estimate_gib=8,
-        context_length=8192,
-        max_new_tokens=512,
-    )
-    config, selected, targets, output = prepare(args)
-    plan = json.loads((output / "plan.json").read_text())
-    assert len(selected) == 12 and len(targets) == 2
-    assert plan["updates"] == config.total_train_steps == 3
-    assert plan["ordered_task_ids"] == [task.task_id for task in selected]
-    assert config.actor_lifecycle.mode == "on_demand"
-    assert (
-        config.train_dataset.batch_size == 4 and config.rollout.backend == "sglang:d4"
-    )
-    assert "acceptance-private-key" not in (output / "config.json").read_text()
-    assert sorted(path.name for path in output.iterdir()) == [
-        "config.json",
-        "plan.json",
-    ]
-    again = prepare(args)
-    assert [task.task_id for task in again[1]] == plan["ordered_task_ids"]
-
-
 @pytest.mark.asyncio
 async def test_shared_client_reuses_rl_credentials_without_starting_new_session(
     tmp_path,
 ):
-    from unittest.mock import AsyncMock
-
     task = MathTask(
         question_id("Compute six times seven."), "Compute six times seven.", "42"
     )
@@ -866,79 +808,12 @@ async def test_shared_client_reuses_rl_credentials_without_starting_new_session(
         "admin",
         "inference",
         "math",
-        "on_demand",
+        "resident",
         tmp_path,
-        state_root=tmp_path.absolute(),
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
         client = EpisodeClient(settings, http)
-        client._admit = AsyncMock()
-        client._handoff = AsyncMock(return_value={"verified": True})
         row = await client.run_task(task, credentials=credentials)
     assert row["status"] == "completed" and row["session_id"] == "retained"
-    assert row["handoff"]["verified"]
     assert "/rl/start_session" not in paths
     assert "retained-key" not in json.dumps(row)
-
-
-def test_reconfiguration_telemetry_requires_correlated_phases_and_backend_calls(
-    tmp_path,
-):
-    import time
-
-    from examples.task_workflows.reconfiguration import validate_telemetry
-
-    from areal.elastic.infra.monitor.collector import TransitionTiming
-
-    phases = (
-        "checkpoint",
-        "actor_release",
-        "actor_start",
-        "actor_restore",
-        "awex_connect",
-        "publish",
-        "application_and_commit",
-        "admission_open",
-        "generation_resume",
-        "total",
-    )
-    for index in (1, 2):
-        timing = TransitionTiming(
-            tmp_path,
-            f"accept-actor-{index}",
-            {"weights_version": index},
-            {"world_size": 4 if index == 1 else 2},
-        )
-        timing.record("begin", source=timing.source, target=timing.target)
-        for phase in phases:
-            with timing.phase(phase):
-                pass
-        timing.record("end", status="applied", generation=index)
-        now = time.monotonic()
-        timing.record(
-            "first_inference_snapshot",
-            proxies=[
-                {
-                    "proxy": "fixture",
-                    "first_call": {
-                        "transition_id": timing.transition_id,
-                        "status": "completed",
-                        "admitted_to_response_seconds": 0.1,
-                        "response_ready_monotonic": now + 0.1,
-                        "backend_attempts": [
-                            {
-                                "status": "completed",
-                                "version": index,
-                                "input_tokens": 12,
-                                "output_tokens": 4,
-                                "seconds": 0.1,
-                                "response_monotonic": now + 0.1,
-                            }
-                        ],
-                    },
-                }
-            ],
-        )
-    result = validate_telemetry(tmp_path, "actor")
-    assert result["status"] == "complete"
-    assert [row["observed_proxies"] for row in result["transitions"]] == [1, 1]

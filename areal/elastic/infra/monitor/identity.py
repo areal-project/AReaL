@@ -37,7 +37,7 @@ def semantic_digest(source: str) -> str:
 def measurement_identity(owner) -> str:
     """Physical/training facts and timing implementation; never an acceptance proof.
 
-    Checkpoints continue to use owner.identity and their validated queue cursor.
+    Switch checkpoints use owner.identity; the native data services stay alive.
     Accepted bundles separately retain their exact protected-source hashes.
     Offline trace parsing and reconfigurator search code do not define measured phases.
     """
@@ -78,11 +78,9 @@ def measurement_identity(owner) -> str:
             "timing_implementation": {
                 name: semantic_digest((root / name).read_text())
                 for name in (
-                    "elastic/infra/runtime.py",
                     "elastic/infra/reconfiguration.py",
                     "trainer/rl_trainer.py",
                     "elastic/infra/monitor/collector.py",
-                    "elastic/infra/monitor/history.py",
                 )
             },
             "accounting": "conditional-phases; resident-rollout; no-makespan-claim",

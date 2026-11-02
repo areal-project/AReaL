@@ -62,7 +62,6 @@ def main():
         action="store_true",
         help="Derive stable per-session request seeds.",
     )
-    parser.add_argument("--online-training-admission", action="store_true")
     parser.add_argument(
         "--tool-call-parser",
         default="qwen",
@@ -113,7 +112,6 @@ def main():
         admin_api_key=args.admin_api_key,
         callback_server_addr=args.callback_server_addr,
         deterministic_sampling=args.deterministic_sampling,
-        online_training_admission=args.online_training_admission,
         serving_addr=format_hostport(serving_host, args.port),
         tool_call_parser=args.tool_call_parser,
         reasoning_parser=args.reasoning_parser,

@@ -89,8 +89,8 @@ def test_elastic_planning_and_native_controls_import_without_autopilot():
         from areal.elastic.reconfigurator import basic as planning, reference
         from areal.elastic import contracts, layout
         from areal.elastic.infra import adapter, activation, reconfiguration
-        from areal.elastic.infra.state import batch_queue, checkpoint_store, episode_inbox
-        from areal.elastic.infra.monitor import history
+        from areal.elastic.infra.state import checkpoint_store
+        from areal.elastic.infra.monitor import collector
         assert planning.OnlineReconfigurator and reference.OnlineReconfigurator and reference.Catalog
         assert not any(n.startswith("areal.autopilot") for n in sys.modules)
     """)

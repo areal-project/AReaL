@@ -150,7 +150,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
-        self._elastic_mode = config.actor_lifecycle.mode == "on_demand"
+        self._elastic_mode = config.elastic.enabled
         if self._elastic_reconfigurator is not None:
             if getattr(
                 self._elastic_reconfigurator,
@@ -165,9 +165,9 @@ class PPOTrainer:
                     "Native Reconfigurator requires explicit elastic GPU pools"
                 )
         if self._elastic_mode:
-            from areal.elastic.infra.runtime import validate_on_demand
+            from areal.elastic.infra.reconfiguration import validate_config
 
-            validate_on_demand(config)
+            validate_config(config)
         self._apply_dte_config_envvars()
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
             config.tokenizer_path
@@ -180,12 +180,12 @@ class PPOTrainer:
                 # clears trial name-resolve entries during construction.
                 self.scheduler = LocalScheduler(
                     exp_config=config,
-                    gpu_devices=list(config.actor_lifecycle.actor_devices),
+                    gpu_devices=list(config.elastic.actor_devices),
                     worker_device_control_env_var="CUDA_VISIBLE_DEVICES",
                 )
                 self.rollout_scheduler = LocalScheduler(
                     exp_config=config,
-                    gpu_devices=list(config.actor_lifecycle.rollout_devices),
+                    gpu_devices=list(config.elastic.rollout_devices),
                     worker_device_control_env_var="CUDA_VISIBLE_DEVICES",
                 )
             else:
@@ -1334,23 +1334,10 @@ class PPOTrainer:
         finally:
             self._training_lock.release()
 
-    def _create_lifecycle_actor(
-        self, actor_config: PPOActorConfig, *, scheduler: Scheduler
-    ) -> FSDPPPOActor | MegatronPPOActor | ArchonPPOActor | PPOActorController:
-        return self._create_train_engine(
-            actor_config,
-            ModelAllocation.from_str(actor_config.backend),
-            scheduler=scheduler,
-            create_process_group=False,
-        )
-
     def _create_train_engine(
         self,
         actor_config: PPOActorConfig,
         alloc: ModelAllocation,
-        *,
-        scheduler: Scheduler | None = None,
-        create_process_group: bool = True,
     ) -> FSDPPPOActor | MegatronPPOActor | ArchonPPOActor | PPOActorController:
         """Create a training engine (actor or ref) based on the allocation backend."""
         if alloc.backend == "fsdp":
@@ -1370,11 +1357,10 @@ class PPOTrainer:
                 f"Invalid backend: {alloc.backend}, expected fsdp, megatron or archon"
             )
         if is_single_controller():
-            actor = actor_cls.as_controller(actor_config, scheduler or self.scheduler)
+            actor = actor_cls.as_controller(actor_config, self.scheduler)
         else:
             actor = actor_cls(config=actor_config)
-        if create_process_group:
-            actor.create_process_group(parallel_strategy=alloc.parallel)
+        actor.create_process_group(parallel_strategy=alloc.parallel)
         return actor
 
     def _create_critic(

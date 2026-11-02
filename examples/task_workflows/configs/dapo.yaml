@@ -101,16 +101,14 @@ actor:
       env_vars:
         AREAL_ROLLOUT_TRACE_DIR: ${oc.env:AREAL_ROLLOUT_TRACE_DIR,""}
 
-# Local CPU coordinator; on_demand requires CUDA_VISIBLE_DEVICES="".
+# Local CPU coordinator; elastic.enabled requires CUDA_VISIBLE_DEVICES="".
 # Configure physical device indices within the current job allocation.
-actor_lifecycle:
-  mode: ${oc.env:AREAL_ACTOR_LIFECYCLE,resident}
+elastic:
+  enabled: ${oc.decode:${oc.env:AREAL_ELASTIC_ENABLED,false}}
   reconfigurator: basic
   state_root: ${oc.env:AREAL_TASK_STATE_ROOT}
   actor_devices: [0, 1, 2, 3]
   rollout_devices: [4]
-  idle_timeout: 60.0
-  min_ready_seconds: 120.0
   checkpoint_estimated_bytes: ${oc.env:AREAL_CHECKPOINT_ESTIMATED_BYTES}
   checkpoint_keep: 2
 

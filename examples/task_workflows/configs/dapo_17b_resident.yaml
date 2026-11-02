@@ -13,8 +13,8 @@ actor:
   optimizer:
     lr: 1e-6
 
-actor_lifecycle:
-  mode: resident
+elastic:
+  enabled: false
   state_root: ${cluster.fileroot}/state
   checkpoint_estimated_bytes: 0
 

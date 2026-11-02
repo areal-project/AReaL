@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-import copy
 import sys
 
 import pytest
-import torch
 
 from examples.autopilot.elastic.swe.agent_worker import validate_grading
 from examples.autopilot.elastic.swe.process_env import SandboxProcess
 from examples.autopilot.elastic.swe.sandbox_worker import call_tool
 from examples.autopilot.elastic.swe.trajectory import trajectory_payload
-
-from areal.elastic.infra.state.batch_queue import BatchQueue
 
 
 @pytest.fixture
@@ -35,29 +31,6 @@ def payload(trajectory):
         model_revision="pinned-revision",
         policy_version=0,
     )
-
-
-def test_materialized_trajectory_survives_producer_deletion(tmp_path, trajectory):
-    """Stored values and behavior logprobs have no inference-process dependency."""
-    original = copy.deepcopy(trajectory)
-    tensors = {key: torch.tensor(value) for key, value in trajectory.items()}
-    batch = payload(tensors)
-    queue = BatchQueue(tmp_path)
-    sequence = queue.enqueue("swe:session-1", batch, policy_version=0)
-    del tensors, batch, queue
-
-    reopened = BatchQueue(tmp_path)
-    with reopened.consumer() as consumer:
-        restored = consumer.claim()
-        assert restored.sequence == sequence
-        assert restored.payload["generated_tokens"] == 2
-        assert restored.payload["trajectory"]["input_ids"] == original["input_ids"]
-        torch.testing.assert_close(
-            torch.tensor(restored.payload["trajectory"]["logprobs"]),
-            torch.tensor(original["logprobs"]),
-            rtol=0,
-            atol=0,
-        )
 
 
 @pytest.mark.parametrize(

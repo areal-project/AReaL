@@ -202,11 +202,11 @@ def test_checkpoint_incompatible_config_rejected(tmp_path):
 
 
 def test_checkpoint_corrupted_progress_rejected(tmp_path):
-    """A changed manifest must not skip batches while loading older rank states."""
+    """The manifest version must match the saved rank states."""
     store = CheckpointStore(tmp_path, free_space_floor=0)
     path = commit(store, 1)
     manifest = json.loads((path / "manifest.json").read_text())
-    manifest.update(global_step=5, next_batch_id=5)
+    manifest.update(global_step=5)
     atomic_json(path / "manifest.json", manifest)
 
     with pytest.raises(ValueError, match="rank state"):
@@ -283,33 +283,6 @@ def test_checkpoint_directory_published_without_pointer_can_be_replayed(
     assert list(tmp_path.glob("step-*")) == [replacement]
 
 
-def test_checkpoint_queue_cursor_is_bound_to_optimizer_progress(tmp_path):
-    """A queue manifest uses an explicit cursor rather than step as batch ID."""
-    store = CheckpointStore(tmp_path, free_space_floor=0)
-    cursor = {
-        "format_version": 1,
-        "queue_id": "queue",
-        "applied_batches": 2,
-        "through_sequence": 3,
-        "chain_sha256": "a" * 64,
-    }
-    store.commit(
-        step=2,
-        world_size=2,
-        compatibility={},
-        estimated_bytes=0,
-        data_cursor=cursor,
-        write=lambda path: write_generation(path, step=2),
-    )
-    path, manifest = store.latest({})
-    assert manifest["data_cursor"] == cursor
-    assert "next_batch_id" not in manifest
-    manifest["data_cursor"]["applied_batches"] = 3
-    atomic_json(path / "manifest.json", manifest)
-    with pytest.raises(ValueError, match="data cursor"):
-        store.latest({})
-
-
 def test_checkpoint_retention_keeps_previous_commit_instead_of_newer_orphan(
     tmp_path, monkeypatch
 ):
@@ -342,585 +315,33 @@ def test_checkpoint_cannot_publish_older_step(tmp_path):
     assert store.latest({"backend": "d2"})[0] == current
 
 
-@pytest.fixture
-def native_lifecycle(tmp_path, monkeypatch, request):
-    """Protocol fixture: real inbox/checkpoint transactions, no GPU evidence."""
-    from types import SimpleNamespace
+@pytest.mark.parametrize("initial_dp,pool_size", [(1, 1), (2, 4)])
+@pytest.mark.parametrize("enable_control", [False, True])
+def test_native_trainer_owns_actor_initialization_and_standard_recover(
+    tmp_path, monkeypatch, enable_control, initial_dp, pool_size
+):
     from unittest.mock import MagicMock
 
-    from areal.api import FinetuneSpec, WeightUpdateMeta
-    from areal.api.cli_args import ActorLifecycleConfig, PPOConfig
-    from areal.elastic.infra import runtime as on_demand
+    from areal.api.cli_args import ElasticConfig, PPOConfig
+    from areal.trainer import rl_trainer
 
     config = PPOConfig()
     base = tmp_path / "base"
     base.mkdir()
     (base / "config.json").write_text("{}")
-    (base / "model.safetensors").write_bytes(b"protocol fixture")
+    (base / "model.safetensors").write_bytes(b"CPU protocol model placeholder")
     config.actor.path = str(base)
-    initial_dp, pool_size = getattr(request, "param", (1, 1))
     config.actor.backend = f"fsdp:d{initial_dp}"
-    config.rollout.backend = "sglang:d1"
     config.train_dataset.batch_size = config.rollout.consumer_batch_size = 4
     config.rollout.max_head_offpolicyness = 2
-    config.recover.mode = "on"
-    config.recover.freq_steps = 1
-    config.actor_lifecycle = ActorLifecycleConfig(
-        mode="on_demand",
-        state_root=str(tmp_path / "state"),
+    config.elastic = ElasticConfig(
+        enabled=True,
+        state_root=str(tmp_path / "trainer"),
         actor_devices=tuple(range(pool_size)),
         rollout_devices=(pool_size,),
         checkpoint_estimated_bytes=1,
         checkpoint_free_space_floor=0,
     )
-    monkeypatch.setattr(
-        on_demand,
-        "resolve_gpu_uuids",
-        lambda devices: [f"GPU-{device}" for device in devices],
-    )
-    monkeypatch.setattr(on_demand, "gpu_processes", lambda: {})
-    monkeypatch.setattr(on_demand, "owned_processes", lambda owner: [])
-    stopped = []
-    events = []
-    monkeypatch.setattr(on_demand, "stop_owned_processes", stopped.append)
-    rollout = SimpleNamespace(
-        version=0,
-        _ensure_initialized=lambda: None,
-        pause=MagicMock(side_effect=lambda: events.append("pause")),
-        resume=MagicMock(side_effect=lambda: events.append("resume")),
-        pause_generation=MagicMock(
-            side_effect=lambda: events.append("pause-generation")
-        ),
-        continue_generation=MagicMock(
-            side_effect=lambda: events.append("continue-generation")
-        ),
-    )
-    rollout.serving_versions = lambda: [rollout.version]
-    actors = []
-
-    class Actor:
-        def __init__(self, cfg):
-            from areal.api.alloc_mode import ModelAllocation
-
-            self.config = cfg
-            self.world_size = ModelAllocation.from_str(cfg.backend).parallel.world_size
-            self.version = self.updates = 0
-            self.create_process_group = MagicMock()
-            self.initialize = MagicMock()
-            self.config_perf_tracer = MagicMock()
-            self.save_perf_tracer = MagicMock()
-            self.quiesce_initialization = MagicMock()
-            self.connect_engine = MagicMock()
-            self.disconnect_engine = MagicMock(
-                side_effect=lambda: events.append("disconnect-weights")
-            )
-            self.destroy = MagicMock(
-                side_effect=lambda **kwargs: events.append("release")
-            )
-            self.fail_publication = False
-            actors.append(self)
-
-        def set_version(self, version):
-            self.version = version
-
-        def full_checkpoint(
-            self,
-            operation,
-            *,
-            path,
-            backend,
-            identity_sha256,
-            version,
-            restore_plan=None,
-        ):
-            root = Path(path)
-            events.append(f"{operation}-{version}")
-            if operation == "save":
-                (root / "dcp").mkdir()
-                (root / "dcp/.metadata").write_text("protocol")
-                atomic_json(root / "dcp/state.json", {"updates": self.updates})
-                for rank in range(self.world_size):
-                    atomic_json(
-                        root / f"runtime-{rank}.json",
-                        {
-                            "rank": rank,
-                            "world_size": self.world_size,
-                            "policy_version": version,
-                        },
-                    )
-            else:
-                source_size = json.loads((root / "manifest.json").read_text())[
-                    "world_size"
-                ]
-                if source_size != self.world_size:
-                    assert restore_plan["source_world_size"] == source_size
-                    assert restore_plan["target_world_size"] == self.world_size
-                else:
-                    assert restore_plan is None
-                self.restore_plan = restore_plan
-                self.updates = json.loads((root / "dcp/state.json").read_text())[
-                    "updates"
-                ]
-                self.version = version
-
-        def update_weights(self, meta, *, resume_generation=True):
-            events.append(f"publish-{meta.version}")
-            assert not resume_generation
-            rollout.version = meta.version
-            if self.fail_publication:
-                raise TimeoutError("lost publication response")
-
-    ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=48, train_batch_size=4)
-    coordinator = {"step": 0}
-
-    def create(reconfigurator_adapter=None, actor_pool_setter=None):
-        manager = on_demand.OnDemandActor(
-            config,
-            ft_spec,
-            Actor,
-            reconfigurator_adapter=reconfigurator_adapter,
-            actor_pool_setter=actor_pool_setter,
-        )
-        try:
-            manager.bind(
-                rollout,
-                WeightUpdateMeta.from_awex(),
-                capture_cpu=lambda: dict(coordinator),
-                restore_cpu=lambda state: coordinator.update(state),
-            )
-        except BaseException:
-            manager.close()
-            raise
-        return manager
-
-    manager = create()
-    yield SimpleNamespace(
-        manager=manager,
-        create=create,
-        actors=actors,
-        rollout=rollout,
-        coordinator=coordinator,
-        stopped=stopped,
-        config=config,
-        events=events,
-    )
-    manager.close()
-
-
-def _ready_native_episodes(manager, first, version):
-    from tests.test_elastic_batch_queue import _receive_episode
-
-    for number in range(first, first + 4):
-        _receive_episode(manager.inbox, number, version=version)
-
-
-def _complete_native_update(manager, version):
-    manager.publish_update(version)
-    manager.maybe_checkpoint(epoch_step=(version - 1) % manager.ft_spec.steps_per_epoch)
-    manager.finish_update()
-
-
-def test_native_online_keeps_actor_resident_after_a_ready_batch(native_lifecycle):
-    """A completed update keeps its Actor ready even when the inbox is idle."""
-    manager = native_lifecycle.manager
-    adapter = manager.reconfigurator_adapter
-    assert adapter.reconfigurator.implementation == "reference"
-    assert manager.revision_hooks is None
-    assert (manager.root / "native-profile.json").is_file()
-    assert not (manager.root / "reconfigurator-application").exists()
-    _ready_native_episodes(manager, 0, 0)
-    assert len(manager.next_batch()) == 4
-    manager.actor.updates += 1
-    _complete_native_update(manager, 1)
-    assert manager.monitor.completed_tokens == 8
-    actor = manager.actor
-    assert adapter.decide(None, now=manager.ready_since + 10000) == "keep"
-    assert manager._poll_batch() is None
-    assert manager.actor is actor
-    actor.destroy.assert_not_called()
-
-
-@pytest.mark.parametrize("implementation", ["basic", "reference"])
-def test_native_online_without_autopilot_restores_shared_monitor(
-    native_lifecycle, tmp_path, monkeypatch, implementation
-):
-    import builtins
-
-    from areal.elastic.infra.adapter import ReconfiguratorAdapter
-
-    fixture = native_lifecycle
-    fixture.manager.close()
-    fixture.config.actor_lifecycle.state_root = str(tmp_path / "online")
-    fixture.config.actor_lifecycle.reconfigurator = implementation
-    original_import = builtins.__import__
-
-    def without_autopilot(name, *args, **kwargs):
-        if name == "areal.autopilot" or name.startswith("areal.autopilot."):
-            raise AssertionError("Ordinary Online must not import AutoPilot")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", without_autopilot)
-    adapter = ReconfiguratorAdapter()
-    manager = fixture.create(adapter)
-    try:
-        assert adapter.reconfigurator.implementation == implementation
-        assert manager.revision_hooks is None
-        _ready_native_episodes(manager, 0, 0)
-        manager.next_batch()
-        manager.actor.updates += 1
-        _complete_native_update(manager, 1)
-        assert (manager.latest_path / "monitor-state.json").is_file()
-        assert manager.monitor.completed_tokens == 8
-        manager.close()
-        resumed = fixture.create(ReconfiguratorAdapter())
-        try:
-            assert resumed.applied_version == resumed.checkpoint_version == 1
-            assert (
-                resumed.reconfigurator_adapter.reconfigurator.implementation
-                == implementation
-            )
-            assert resumed.monitor.completed_tokens == 8
-        finally:
-            resumed.close()
-    finally:
-        manager.close()
-
-
-def test_native_explicit_restart_cycles_restore_cursor_and_actor_state(
-    native_lifecycle,
-):
-    fixture = native_lifecycle
-    manager = fixture.manager
-    assert manager.actor is None and fixture.actors == []
-    rollout = manager.rollout
-    for version in range(3):
-        _ready_native_episodes(manager, version * 4, version)
-        trajectories = manager.next_batch()
-        assert len(trajectories) == 4
-        assert manager.actor.updates == version
-        manager.actor.initialize.assert_called_once_with(
-            role="actor",
-            addr=None,
-            ft_spec=manager.ft_spec,
-            wait=True,
-            worker_seed=fixture.config.seed,
-        )
-        manager.actor.updates += 1
-        fixture.coordinator["step"] = version + 1
-        _complete_native_update(manager, version + 1)
-        assert manager.inbox.status()["active_credits"] == 0
-        manager.save_checkpoint(reason="reconfiguration")
-        manager._release()
-        assert manager.actor is None and manager.owner is None
-        assert manager.rollout is rollout
-    manager.close()
-    recovered = fixture.create()
-    try:
-        assert recovered.actor is None and recovered.applied_version == 3
-        assert recovered.consumer.cursor["applied_batches"] == 3
-        _ready_native_episodes(recovered, 12, 3)
-        recovered.next_batch()
-        assert recovered.actor.updates == 3
-    finally:
-        recovered.close()
-
-
-def test_native_lost_publication_ack_rolls_back_unsaved_update(native_lifecycle):
-    manager = native_lifecycle.manager
-    _ready_native_episodes(manager, 0, 0)
-    manager.next_batch()
-    old = manager.actor
-    old.updates = 1
-    old.fail_publication = True
-    with pytest.raises(TimeoutError):
-        manager.publish_update(1)
-    assert manager.latest_manifest is None
-    assert manager.inbox.status()["published_version"] == 0
-    state = manager.control_snapshot()
-    assert state.applied_version == 1
-    assert state.published_version == state.checkpoint_version == 0
-    manager.recover_uncertain(TimeoutError("lost response"))
-    assert manager.applied_version == manager.actor.updates == 0
-    assert manager.actor is not old
-    assert manager.active is None and manager.rollout.version == 0
-    manager.next_batch()
-    manager.actor.updates += 1
-    _complete_native_update(manager, 1)
-    assert manager.inbox.status()["active_credits"] == 0
-
-
-def test_native_uncertain_uncommitted_update_replays_original_batch(native_lifecycle):
-    manager = native_lifecycle.manager
-    _ready_native_episodes(manager, 0, 0)
-    manager.next_batch()
-    original_id = manager.active.batch_id
-    manager.actor.updates = 1
-    manager.recover_uncertain(RuntimeError("worker died during update"))
-    assert manager.applied_version == manager.actor.updates == 0
-    manager.next_batch()
-    assert manager.active.batch_id == original_id
-    assert manager.actor.updates == 0
-
-
-@pytest.mark.parametrize("lost_restore_ack", [False, True])
-def test_native_partial_publication_with_unchanged_version_requires_full_restore(
-    native_lifecycle, monkeypatch, lost_restore_ack
-):
-    """Version labels cannot certify tensors after a partially failed transfer."""
-    fixture, manager = native_lifecycle, native_lifecycle.manager
-    _ready_native_episodes(manager, 0, 0)
-    manager.next_batch()
-    manager.actor.updates = 1
-    _complete_native_update(manager, 1)
-    _ready_native_episodes(manager, 4, 1)
-    manager.next_batch()
-    batch_id = manager.active.batch_id
-    actor = manager.actor
-    actor.updates = 2
-    fixture.rollout.weights = [1, 1]
-
-    def partially_transfer(*args, **kwargs):
-        fixture.rollout.weights[0] = 2
-        raise TimeoutError("partial transfer before version acknowledgment")
-
-    actor.update_weights = partially_transfer
-    with pytest.raises(TimeoutError, match="partial transfer"):
-        manager.publish_update(2)
-    assert fixture.rollout.version == manager.checkpoint_version == 1
-    assert manager.inbox.status()["published_version"] == 1
-    resumes = fixture.rollout.resume.call_count
-    original = type(actor).update_weights
-
-    def restore_weights(restored, meta, **kwargs):
-        assert not manager.inbox.status()["admission_open"]
-        assert fixture.rollout.resume.call_count == resumes
-        original(restored, meta, **kwargs)
-        fixture.rollout.weights[:] = [restored.updates] * 2
-        if lost_restore_ack:
-            raise TimeoutError("restored publication acknowledgment lost")
-
-    monkeypatch.setattr(type(actor), "update_weights", restore_weights)
-    if lost_restore_ack:
-        with pytest.raises(TimeoutError, match="restored publication"):
-            manager.recover_uncertain(TimeoutError("AWEX failed"))
-        assert not manager.inbox.status()["admission_open"]
-        assert not manager.control_snapshot().boundary_ready
-        assert fixture.rollout.resume.call_count == resumes
-        manager._checkpoint_dirty = True
-        with pytest.raises(RuntimeError, match="fully published"):
-            manager.save_checkpoint(reason="uncertain")
-        manager._checkpoint_dirty = False
-        restored = manager.actor
-        manager.close()
-        restored.destroy.assert_called_with(training_stopped=True)
-    else:
-        manager.recover_uncertain(TimeoutError("AWEX failed"))
-        assert fixture.rollout.weights == [1, 1]
-        assert manager.inbox.status()["admission_open"]
-        assert fixture.rollout.resume.call_count == resumes + 1
-        manager.next_batch()
-        assert manager.active.batch_id == batch_id
-        assert manager.actor.updates == 1
-
-
-def test_native_publication_precedes_periodic_save_and_release_waits_for_finish(
-    native_lifecycle,
-):
-    """No control or release boundary opens between publication and CPU hooks."""
-    fixture = native_lifecycle
-    manager = fixture.manager
-    _ready_native_episodes(manager, 0, 0)
-    manager.next_batch()
-    manager.actor.updates += 1
-    manager.publish_update(1)
-    assert manager.latest_manifest is None
-    assert manager.inbox.status()["checkpoint_version"] == 0
-    assert manager.inbox.status()["published_version"] == 1
-    assert not manager.control_snapshot().boundary_ready
-    assert manager.maybe_checkpoint(epoch_step=0)
-    assert fixture.events[-2:] == ["publish-1", "save-1"]
-    manager.finish_update()
-    assert fixture.events[-2:] == ["continue-generation", "resume"]
-    assert manager.control_snapshot().boundary_ready
-
-
-def test_native_multiple_updates_only_save_at_configured_period(native_lifecycle):
-    """Published batches free admission without committing their checkpoint cursor."""
-    fixture = native_lifecycle
-    manager = fixture.manager
-    manager.checkpoint_frequency.step_ctl.frequency_steps = 3
-    for version in range(3):
-        _ready_native_episodes(manager, version * 4, version)
-        manager.next_batch()
-        manager.actor.updates += 1
-        _complete_native_update(manager, version + 1)
-        assert manager.inbox.status()["active_credits"] == 0
-        assert manager.inbox.status()["published_version"] == version + 1
-        checkpoint_version = 3 if version == 2 else 0
-        assert manager.inbox.status()["checkpoint_version"] == checkpoint_version
-        state = manager.control_snapshot()
-        assert state.applied_version == state.published_version == version + 1
-        assert state.checkpoint_version == checkpoint_version
-        assert state.boundary_ready
-        assert manager.reconfigurator_adapter.applied_version == state.applied_version
-        assert (
-            manager.reconfigurator_adapter.published_version == state.published_version
-        )
-        assert manager.reconfigurator_adapter.checkpoint_version == checkpoint_version
-    assert [event for event in fixture.events if event.startswith("save-")] == [
-        "save-3"
-    ]
-    assert manager.latest_manifest["data_cursor"] == manager.consumer.cursor
-
-
-def test_native_release_refreshes_cpu_state_after_periodic_checkpoint(native_lifecycle):
-    """A same-version periodic snapshot predates end-of-update CPU mutations."""
-    fixture = native_lifecycle
-    manager = fixture.manager
-    _ready_native_episodes(manager, 0, 0)
-    manager.next_batch()
-    manager.actor.updates += 1
-    manager.publish_update(1)
-    assert manager.maybe_checkpoint(epoch_step=0)
-    periodic = manager.latest_path
-    fixture.coordinator["step"] = 1
-    manager.finish_update()
-    manager.save_checkpoint(reason="reconfiguration")
-    manager._release()
-    assert manager.latest_path != periodic
-    assert json.loads((periodic / "coordinator.json").read_text()) == {"step": 0}
-    assert json.loads((manager.latest_path / "coordinator.json").read_text()) == {
-        "step": 1
-    }
-    manager.close()
-    fixture.coordinator["step"] = -1
-    recovered = fixture.create()
-    try:
-        assert fixture.coordinator["step"] == 1 and recovered.applied_version == 1
-    finally:
-        recovered.close()
-
-
-def test_native_explicit_release_saves_latest_state_and_does_not_duplicate_save(
-    native_lifecycle,
-):
-    """A release snapshot covers updates newer than the periodic checkpoint."""
-    fixture = native_lifecycle
-    manager = fixture.manager
-    manager.config.recover.mode = "off"
-    _ready_native_episodes(manager, 0, 0)
-    manager.next_batch()
-    manager.actor.updates += 1
-    _complete_native_update(manager, 1)
-    assert manager.latest_manifest is None
-    manager.save_checkpoint(reason="reconfiguration")
-    manager._release()
-    assert fixture.events[-2:] == ["save-1", "release"]
-    manager.close()
-    recovered = fixture.create()
-    try:
-        _ready_native_episodes(recovered, 4, 1)
-        recovered.next_batch()
-        assert recovered.actor.updates == 1
-    finally:
-        recovered.close()
-    assert fixture.events.count("save-1") == 1
-
-
-def test_native_failed_release_snapshot_retains_actor_and_consumer(
-    native_lifecycle,
-    monkeypatch,
-):
-    """A failed planned snapshot cannot turn into an unsaved release."""
-    manager = native_lifecycle.manager
-    manager.config.recover.mode = "off"
-    _ready_native_episodes(manager, 0, 0)
-    manager.next_batch()
-    manager.actor.updates += 1
-    _complete_native_update(manager, 1)
-    actor = manager.actor
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            manager.store,
-            "commit",
-            lambda **kwargs: (_ for _ in ()).throw(OSError("disk full")),
-        )
-        with pytest.raises(OSError, match="disk full"):
-            manager.save_checkpoint(reason="reconfiguration")
-        with pytest.raises(ExceptionGroup, match="Checkpoint incomplete"):
-            manager.close()
-        actor.destroy.assert_not_called()
-        with pytest.raises(BlockingIOError):
-            manager.inbox.queue.consumer()
-    manager.save_checkpoint(reason="reconfiguration")
-    manager._release()
-
-
-def test_native_fault_replays_unsaved_prefix_and_rejects_abandoned_episodes(
-    native_lifecycle,
-):
-    """Restore a periodic checkpoint, reconcile serving, then replay lost PPO work."""
-    from tests.test_elastic_batch_queue import _online_payload, _receive_episode
-
-    manager = native_lifecycle.manager
-    for version in range(3):
-        _ready_native_episodes(manager, version * 4, version)
-        manager.next_batch()
-        manager.actor.updates += 1
-        _complete_native_update(manager, version + 1)
-        manager.config.recover.mode = "off"
-    ready = _receive_episode(manager.inbox, 12, version=3)
-    admitted = manager.inbox.admit("source", "inflight", 0)
-    assert manager.latest_manifest["global_step"] == 1
-    manager.recover_uncertain(RuntimeError("Actor lost after v3 publication"))
-    assert (
-        manager.applied_version == manager.rollout.version == manager.actor.updates == 1
-    )
-    for episode in (ready, admitted):
-        assert (
-            manager.inbox.episode(episode["episode_id"])["rejection"]
-            == "recovery_rollback"
-        )
-    digest = manager.inbox.receive(
-        admitted["episode_id"], admitted["lease"], _online_payload(3)
-    )
-    assert digest
-    manager.inbox.acknowledge_source(admitted["episode_id"], admitted["lease"])
-    assert manager.inbox.episode(admitted["episode_id"])["status"] == "rejected"
-    for version in (1, 2):
-        manager.next_batch()
-        assert manager.active.policy_version == version
-        manager.actor.updates += 1
-        _complete_native_update(manager, version + 1)
-    assert manager.actor.updates == 3
-    assert manager.inbox.status()["active_credits"] == 0
-
-
-def test_native_checkpoint_seconds_schedule_works_in_cpu_coordinator(native_lifecycle):
-    """Wall-clock saving must not require a distributed coordinator process group."""
-    manager = native_lifecycle.manager
-    manager.checkpoint_frequency.step_ctl.frequency_steps = None
-    manager.checkpoint_frequency.time_ctl.frequency_seconds = 0
-    _ready_native_episodes(manager, 0, 0)
-    manager.next_batch()
-    manager.actor.updates += 1
-    _complete_native_update(manager, 1)
-    assert manager.latest_manifest["global_step"] == 1
-
-
-@pytest.mark.parametrize("native_lifecycle", [(1, 1), (2, 4)], indirect=True)
-@pytest.mark.parametrize("enable_control", [False, True])
-def test_native_trainer_owns_actor_initialization_and_standard_recover(
-    native_lifecycle, monkeypatch, enable_control
-):
-    from unittest.mock import MagicMock
-
-    from areal.trainer import rl_trainer
-
-    fixture = native_lifecycle
-    fixture.manager.close()
-    config = fixture.config
-    config.actor_lifecycle.state_root = str(fixture.manager.root.parent / "trainer")
     config.actor._version = config.rollout._version = "v2"
     config.rollout.backend = "sglang:d1"
     config.sglang.model_path = config.actor.path
@@ -968,7 +389,7 @@ def test_native_trainer_owns_actor_initialization_and_standard_recover(
     adapter = ReconfiguratorAdapter() if enable_control else None
     trainer = rl_trainer.PPOTrainer(config, elastic_reconfigurator=adapter)
     try:
-        assert trainer.actor is factory.return_value and fixture.actors == []
+        assert trainer.actor is factory.return_value
         factory.assert_called_once()
         trainer.actor.initialize.assert_called_once()
         trainer.actor.connect_engine.assert_called_once_with(
@@ -976,73 +397,11 @@ def test_native_trainer_owns_actor_initialization_and_standard_recover(
         )
         native_recover.return_value.load.assert_called_once()
         assert native_recover.return_value.load.call_args.args[0] is trainer.actor
-        serving.configure_online_training.assert_not_called()
         assert trainer.scheduler is not None and trainer.rollout_scheduler is not None
         assert trainer._reconfiguration.trainer is trainer
-        assert not (Path(config.actor_lifecycle.state_root) / "inbox").exists()
+        assert not (Path(config.elastic.state_root) / "inbox").exists()
         if enable_control:
             assert adapter.owner is trainer._reconfiguration
             assert serving.configure_control_callbacks.call_count == 1
     finally:
         trainer.close()
-
-
-def test_native_failed_teardown_preserves_fence_and_retries_same_generation(
-    native_lifecycle, monkeypatch
-):
-    from areal.elastic.infra import runtime as on_demand
-
-    manager = native_lifecycle.manager
-    manager.ensure_actor()
-    actor, owner = manager.actor, manager.owner
-    actor.destroy.side_effect = RuntimeError("inference teardown unknown")
-    actor.save_perf_tracer.side_effect = RuntimeError("worker unreachable")
-    monkeypatch.setattr(
-        manager,
-        "_event",
-        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
-    )
-    with pytest.raises(RuntimeError, match="teardown unknown"):
-        manager._release()
-    assert manager.actor is actor and manager.owner == owner
-    assert native_lifecycle.stopped == [owner]
-    assert actor.destroy.call_args.kwargs == {"training_stopped": True}
-    with pytest.raises(BlockingIOError):
-        manager.inbox.queue.consumer()
-    actor.destroy.side_effect = None
-    monkeypatch.setattr(on_demand, "gpu_processes", lambda: {"GPU-0": [123]})
-    with pytest.raises(RuntimeError, match="empty"):
-        manager._release()
-    assert manager.owner == owner
-    monkeypatch.setattr(on_demand, "gpu_processes", lambda: {})
-    manager._release()
-    assert manager.actor is None and manager.owner is None
-
-
-def test_native_failed_update_skips_blocked_worker_rpcs_and_retains_fence(
-    native_lifecycle,
-):
-    """A failed collective is stopped before any surviving inference teardown."""
-    fixture, manager = native_lifecycle, native_lifecycle.manager
-    _ready_native_episodes(manager, 0, 0)
-    manager.next_batch()
-    actor, owner = manager.actor, manager.owner
-    fixture.events.clear()
-
-    def disconnect(*, training_stopped=False):
-        assert training_stopped
-        assert owner in fixture.stopped
-        assert fixture.events == ["pause"]
-        raise RuntimeError("inference teardown unknown")
-
-    actor.destroy.side_effect = disconnect
-    with pytest.raises(RuntimeError, match="inference teardown unknown"):
-        manager.recover_uncertain(TimeoutError("AWEX collective timed out"))
-    actor.save_perf_tracer.assert_not_called()
-    assert manager.actor is actor and manager.owner == owner
-    assert not manager.inbox.status()["admission_open"]
-    with pytest.raises(BlockingIOError):
-        manager.inbox.queue.consumer()
-    actor.destroy.side_effect = None
-    manager.close()
-    actor.destroy.assert_called_with(training_stopped=True)

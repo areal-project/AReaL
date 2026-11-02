@@ -171,9 +171,7 @@ class NativeControlEnvironment:
 
     @property
     def publication(self):
-        pending = getattr(self.owner, "_publication_uncertain", False)
-        if hasattr(self.owner, "trainer"):
-            pending = pending or self.owner.trainer._control_phase == "publication"
+        pending = self.owner.trainer._control_phase == "publication"
         return "pending" if pending else "idle"
 
     def observe(self):
@@ -204,7 +202,7 @@ class NativeControlEnvironment:
         self.pending_handoff = target
         try:
             generation = owner.reconfiguration_application.state()["generation"]
-            receipt = getattr(owner, "trainer", owner).reconfigure(
+            receipt = owner.trainer.reconfigure(
                 target=target,
                 request_id=f"online-{self.reconfigurator.implementation}-{self._sequence}-{owner.applied_version}-{generation}",
                 expected_generation=generation,
@@ -296,10 +294,6 @@ class ReconfiguratorAdapter:
         self.last_receipt = None
         self.bundle_id = "builtin-online"
         self._polling = False
-
-    @property
-    def supports_actor_dp_resize(self):
-        return not self.closed
 
     def bind(self, owner):
         if self.owner is not None or self.closed:
@@ -470,20 +464,6 @@ class ReconfiguratorAdapter:
             return busy
         finally:
             self._polling = False
-
-    def decide(self, batch, *, now=None):
-        """Use the durable training gate and keep an initialized Actor resident."""
-        self._require_decision_boundary()
-        execution = self.owner.monitor.observe(batch, now=now)
-        action = "train" if batch is not None and execution.gate_available else "keep"
-        self.owner.monitor.record_decision(
-            batch,
-            execution,
-            action,
-            action,
-            reconfigurator=self.reconfigurator_metadata(),
-        )
-        return action
 
     def close(self):
         self.closed = True

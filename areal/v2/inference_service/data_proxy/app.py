@@ -56,8 +56,6 @@ from areal.v2.inference_service.data_proxy.resume_observation import (
     current_observation,
 )
 from areal.v2.inference_service.data_proxy.session import (
-    AbortEpisodeRequest,
-    EpisodeIdentity,
     ExportTrajectoriesRequest,
     ExportTrajectoriesResponse,
     ReadyNotification,
@@ -325,14 +323,6 @@ async def _post_online_ready_callback(
                 json={
                     "session_id": notification.session_id,
                     "trajectory_id": notification.trajectory_id,
-                    **(
-                        {
-                            "episode_id": notification.episode_id,
-                            "lease": notification.lease,
-                        }
-                        if notification.episode_id is not None
-                        else {}
-                    ),
                 },
                 headers={"Authorization": f"Bearer {admin_api_key}"},
                 timeout=timeout,
@@ -478,37 +468,6 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     app.state.generation_gate = GenerationGate()
     app.state.resume_observation = ResumeObservation()
     _registered_models: dict[str, dict[str, str | None]] = {}
-    source_id = uuid.uuid4().hex
-
-    async def _admit_episode(
-        session_id: str,
-        trajectory_id: int,
-        incarnation_id: str,
-    ) -> dict[str, Any]:
-        if not config.callback_server_addr:
-            raise HTTPException(503, "Online training admission is unavailable")
-        async with create_httpx_client(timeout=config.request_timeout) as client:
-            response = await client.post(
-                f"{config.callback_server_addr.rstrip('/')}/callback/online_admit",
-                json={
-                    "source_id": f"{source_id}:{incarnation_id}",
-                    "session_id": session_id,
-                    "trajectory_id": trajectory_id,
-                },
-                headers={"Authorization": f"Bearer {config.admin_api_key}"},
-            )
-        if response.status_code == 429:
-            raise HTTPException(
-                429, "Online training capacity exhausted", headers={"Retry-After": "1"}
-            )
-        if response.status_code >= 400:
-            raise HTTPException(503, "Online training admission was not confirmed")
-        episode = response.json()
-        if episode.get("status") in ("published", "rejected"):
-            raise HTTPException(409, "This episode has already finished")
-        if not episode.get("episode_id") or not episode.get("lease"):
-            raise HTTPException(503, "Invalid admission response")
-        return episode
 
     class GenerationStream:
         """Retain the episode cache until a streaming request closes."""
@@ -562,28 +521,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         is_streaming = bool(kwargs.get("stream", False))
         kwargs.setdefault("temperature", 1.0)
         kwargs.setdefault("top_p", 1.0)
-        try:
-            expected_episode = (
-                EpisodeIdentity.model_validate(episode)
-                if config.online_training_admission and session is not None
-                else None
-            )
-            areal_cache = (
-                await session.begin_generation(
-                    (lambda sid, tid: _admit_episode(sid, tid, session.incarnation_id))
-                    if config.online_training_admission
-                    else None,
-                    episode=expected_episode,
-                )
-                if session is not None
-                else None
-            )
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-        except httpx.HTTPError as exc:
-            raise HTTPException(
-                503, "Online training admission was not confirmed"
-            ) from exc
+        areal_cache = await session.begin_generation() if session is not None else None
 
         deterministic_sampling = session is not None and config.deterministic_sampling
         request_index = (
@@ -604,18 +542,18 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             )
         except ValueError as exc:
             if session is not None:
-                session.finish_generation(uncertain=True)
+                session.finish_generation()
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except Exception as exc:
             if session is not None:
-                session.finish_generation(uncertain=True)
+                session.finish_generation()
             raise HTTPException(
                 status_code=500,
                 detail=f"{type(exc).__name__}: {exc}",
             ) from exc
         except BaseException:
             if session is not None:
-                session.finish_generation(uncertain=True)
+                session.finish_generation()
             raise
         if session is not None:
             if is_streaming:
@@ -850,53 +788,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 SessionCredentials(
                     session_id=session_id,
                     session_api_key=session_api_key,
-                    areal_episode=EpisodeIdentity.model_validate(
-                        store.get_session(session_id).current_episode()
-                    )
-                    if config.online_training_admission
-                    else None,
                 )
             )
         return StartSessionResponse(group_id=group_id, sessions=credentials)
-
-    @app.post("/rl/current_episode")
-    async def current_episode(request: Request):
-        if not config.online_training_admission:
-            raise HTTPException(409, "Durable online training is not configured")
-        store: SessionStore = app.state.session_store
-        sid = _require_session_key(request, store)
-        session = store.get_session(sid)
-        if session is None:
-            raise HTTPException(401, "Session has expired")
-        return session.current_episode()
-
-    @app.post("/rl/abort_episode")
-    async def abort_episode(body: AbortEpisodeRequest, request: Request):
-        if not config.online_training_admission or not config.callback_server_addr:
-            raise HTTPException(409, "Durable online training is not configured")
-        store: SessionStore = app.state.session_store
-        session = store.get_session(_require_session_key(request, store))
-        if session is None:
-            raise HTTPException(401, "Session has expired")
-
-        async def cancel(intent: dict[str, Any]) -> dict[str, Any]:
-            payload = {**intent, "source_id": f"{source_id}:{session.incarnation_id}"}
-            async with create_httpx_client(timeout=config.request_timeout) as client:
-                response = await client.post(
-                    f"{config.callback_server_addr.rstrip('/')}/callback/online_abort",
-                    json=payload,
-                    headers={"Authorization": f"Bearer {config.admin_api_key}"},
-                )
-            if response.status_code >= 400:
-                raise HTTPException(503, "Episode abort was not durably confirmed")
-            return response.json()
-
-        try:
-            return await session.abort_episode(body, cancel)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-        except (httpx.HTTPError, RuntimeError) as exc:
-            raise HTTPException(503, "Episode abort was not durably confirmed") from exc
 
     @app.post("/rl/set_reward", response_model=SetRewardResponse)
     async def set_reward(body: SetRewardRequest, request: Request):
@@ -912,12 +806,10 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             reward_result = session.set_reward(
                 interaction_id=body.interaction_id,
                 reward=body.reward,
-                episode=body.areal_episode,
-                require_episode_identity=config.online_training_admission,
             )
         except ValueError as exc:
             raise HTTPException(
-                status_code=409 if config.online_training_admission else 400,
+                status_code=400,
                 detail=str(exc),
             ) from exc
 
@@ -959,10 +851,6 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         # -----------------------------------------------------------------
         ext_info = _registered_models.get(model_name) if model_name else None
         if ext_info is not None and ext_info.get("url"):
-            if config.online_training_admission and session is not None:
-                raise HTTPException(
-                    400, "Online training requires local token/logprob trajectories"
-                )
             ext_url = (ext_info["url"] or "").rstrip("/")
             ext_model = ext_info["model"]
             provider_api_key = ext_info.get("api_key")
@@ -1207,47 +1095,6 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 detail="session_ids must be a non-empty list",
             )
 
-        if config.online_training_admission and (
-            len(body.session_ids) != 1
-            or body.remove_session
-            or (body.consume and not body.acknowledge_only)
-        ):
-            raise HTTPException(
-                400,
-                "Durable online episodes require retained export followed by receipt acknowledgement",
-            )
-
-        if not body.consume and body.remove_session:
-            raise HTTPException(400, "Retained exports require remove_session=False")
-        if body.acknowledge_only:
-            if body.trajectory_id is None or body.remove_session:
-                raise HTTPException(
-                    400,
-                    "Acknowledgement requires an explicit trajectory and retained session",
-                )
-            for sid in body.session_ids:
-                session = store.get_session(sid)
-                if session is None:
-                    raise HTTPException(404, "Session not found")
-                try:
-                    session.validate_trajectory_identity(
-                        body.trajectory_id, body.episode_id, body.lease
-                    )
-                    session.acknowledge_trajectory(
-                        body.trajectory_id, body.handoff_digest
-                    )
-                except KeyError as error:
-                    raise HTTPException(404, str(error)) from error
-                except ValueError as error:
-                    raise HTTPException(409, str(error)) from error
-            return ExportTrajectoriesResponse(traj={})
-
-        if not body.consume and (body.trajectory_id is None or not body.inline_tensors):
-            raise HTTPException(
-                400,
-                "Retained exports require an explicit trajectory_id and inline_tensors=True",
-            )
-
         grouped_interactions: list[
             dict[str, InteractionWithTokenLogpReward] | None
         ] = []
@@ -1260,9 +1107,6 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 continue
 
             try:
-                session.validate_trajectory_identity(
-                    body.trajectory_id, body.episode_id, body.lease
-                )
                 trajectory_id, interactions = session.export_trajectory(
                     discount=body.discount,
                     style=body.style,
@@ -1318,26 +1162,14 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 trace_masks = {
                     key: traj[key] for key in ("attention_mask", "loss_mask")
                 }
-            if not body.inline_tensors:
-                traj = _remotize_trajectory(traj, node_addr=config.serving_addr)
+            traj = _remotize_trajectory(traj, node_addr=config.serving_addr)
         else:
             traj = concat_string_interactions(merged)
 
-        # Do not remove the source before tensor materialization and serialization
-        # succeed. On-demand consumers explicitly acknowledge only after their
-        # durable inbox contains the payload.
+        # Native exports retire source data only after serialization succeeds.
         serialized = serialize_value(traj)
-        if config.online_training_admission:
-            digest = hashlib.sha256(
-                json.dumps(
-                    serialized, sort_keys=True, separators=(",", ":"), allow_nan=False
-                ).encode()
-            ).hexdigest()
-            for session, trajectory_id in exported:
-                session.record_export_digest(trajectory_id, digest)
-        if body.consume:
-            for session, trajectory_id in exported:
-                session.acknowledge_trajectory(trajectory_id)
+        for session, trajectory_id in exported:
+            session.acknowledge_trajectory(trajectory_id)
         if body.remove_session:
             for sid in body.session_ids:
                 store.remove_session(sid)

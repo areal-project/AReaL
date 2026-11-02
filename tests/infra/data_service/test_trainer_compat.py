@@ -222,16 +222,15 @@ class TestEmptyDataLoaderCompat:
 
 
 class TestTrainerSignature:
-    def test_lifecycle_config_roundtrips_through_structured_yaml(self, tmp_path):
+    def test_elastic_config_roundtrips_through_structured_yaml(self, tmp_path):
         from omegaconf import OmegaConf
 
-        from areal.api.cli_args import ActorLifecycleConfig, PPOConfig
+        from areal.api.cli_args import ElasticConfig, PPOConfig
 
-        default = OmegaConf.structured(PPOConfig)
-        assert OmegaConf.to_object(default.actor_lifecycle).mode == "resident"
-        assert OmegaConf.to_object(default.actor_lifecycle).policy == "basic"
-        config = ActorLifecycleConfig(
-            mode="on_demand",
+        default = OmegaConf.to_object(OmegaConf.structured(PPOConfig).elastic)
+        assert default.enabled is False and default.reconfigurator == "reference"
+        config = ElasticConfig(
+            enabled=True,
             state_root=str(tmp_path),
             actor_devices=(0, 1),
             rollout_devices=(2,),
@@ -239,30 +238,18 @@ class TestTrainerSignature:
         )
         parsed = OmegaConf.to_object(
             OmegaConf.merge(
-                OmegaConf.structured(ActorLifecycleConfig),
+                OmegaConf.structured(ElasticConfig),
                 OmegaConf.create(OmegaConf.to_yaml(config)),
             )
         )
-        assert parsed.mode == config.mode and parsed.state_root == config.state_root
-        assert parsed.policy == "basic"
-        assert tuple(parsed.actor_devices) == config.actor_devices
+        assert OmegaConf.structured(parsed) == OmegaConf.structured(config)
         selected = OmegaConf.to_object(
             OmegaConf.merge(
-                OmegaConf.structured(ActorLifecycleConfig),
-                {"policy": "reference"},
+                OmegaConf.structured(ElasticConfig),
+                {"reconfigurator": "basic"},
             )
         )
-        assert selected.policy == "reference"
-        with pytest.raises(ValueError, match="policy must be basic or reference"):
-            ActorLifecycleConfig(policy="unknown")
-        with pytest.raises(ValueError, match="disjoint"):
-            ActorLifecycleConfig(
-                mode="on_demand",
-                state_root=str(tmp_path),
-                actor_devices=(0,),
-                rollout_devices=(0,),
-                checkpoint_estimated_bytes=1024,
-            )
+        assert selected.reconfigurator == "basic"
 
     def test_cpu_coordinator_assigns_exact_worker_cuda_masks(
         self, tmp_path, monkeypatch
@@ -406,7 +393,6 @@ class TestTrainerSignature:
         trainer.config.actor.use_decoupled_loss = False
         trainer.saver = MagicMock()
         # Legacy batch/publication coordination must not be used by Trainer.
-        trainer._on_demand = MagicMock()
         trainer._save_hf = MagicMock(side_effect=lambda **kwargs: events.append("hf"))
         trainer._save_training_state = MagicMock(
             side_effect=lambda **kwargs: events.append("resident-save")
@@ -433,9 +419,6 @@ class TestTrainerSignature:
         actor.compute_advantages.assert_called_once_with(batch)
         actor.ppo_update.assert_called_once_with(adv)
         assert events[:3] == ["advantage", "ppo", "lr"]
-        trainer._on_demand.next_batch.assert_not_called()
-        trainer._on_demand.publish_update.assert_not_called()
-        trainer._on_demand.finish_update.assert_not_called()
         assert events[3:] == ["publish", "resident-save", "eval", "stats", "trace"]
         rollout.pause.assert_called_once()
         rollout.resume.assert_called_once()
@@ -448,7 +431,6 @@ class TestTrainerSignature:
         from areal.trainer.rl_trainer import PPOTrainer
 
         trainer = PPOTrainer.__new__(PPOTrainer)
-        trainer._on_demand = None
         trainer.actor = MagicMock()
         trainer.rollout = MagicMock()
         monkeypatch.setattr("areal.trainer.rl_trainer.perf_tracer.save", MagicMock())

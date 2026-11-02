@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from areal.elastic.infra.reconfiguration import (
+from areal.infra.utils.process import (
     OWNER_ENV,
     owned_processes,
     stop_owned_processes,

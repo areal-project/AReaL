@@ -66,12 +66,10 @@ rollout:
         PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
         PYTORCH_ALLOC_CONF: expandable_segments:False
 
-# Keep the durable coordinator and exact consumption identity, with fixed layout.
-# No idle release occurs during this bounded run; no reconfiguration planner.
-actor_lifecycle:
-  mode: on_demand
+# Use native Trainer ownership with an explicit fixed GPU layout.
+elastic:
+  enabled: true
   rollout_devices: [4, 5, 6, 7]
-  idle_timeout: 86400.0
   checkpoint_keep: 1
   checkpoint_estimated_bytes: 68719476736
 

@@ -32,7 +32,6 @@ from areal.infra.utils.http import async_http_retry, create_httpx_client
 
 if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler, Worker
-    from areal.elastic.infra.state.episode_inbox import OnlineInbox
 
 from areal.api.cli_args import InferenceEngineConfig
 from areal.api.io_struct import LocalInfServerInfo
@@ -151,8 +150,6 @@ class RolloutControllerV2:
 
         # Staleness manager (created in initialize)
         self._staleness_manager = None
-        self._online_inbox: OnlineInbox | None = None
-        self._online_export_options: dict[str, Any] = {}
 
         # Online callback server / waiter state
         self._online_waiters: deque[_OnlineWaiter] = deque()
@@ -498,8 +495,6 @@ class RolloutControllerV2:
             ]
         if cfg.deterministic_sampling:
             data_proxy_base_cmd.append("--deterministic-sampling")
-        if self._online_inbox is not None:
-            data_proxy_base_cmd.append("--online-training-admission")
         for preprocessor_path in agent_cfg.message_preprocessors:
             data_proxy_base_cmd += [
                 "--message-preprocessor",
@@ -862,64 +857,6 @@ class RolloutControllerV2:
 
         app = Flask("online_rollout_callback")
 
-        @app.route("/callback/online_admit", methods=["POST"])
-        def online_admit():
-            from areal.elastic.infra.state.episode_inbox import (
-                AdmissionFull,
-                AdmissionPaused,
-            )
-
-            if (
-                request.headers.get("Authorization")
-                != f"Bearer {self.config.admin_api_key}"
-            ):
-                return jsonify({"error": "Invalid admin API key"}), 403
-            if self._online_inbox is None:
-                return jsonify(
-                    {"error": "Durable online admission is not configured"}
-                ), 409
-            payload = request.get_json() or {}
-            try:
-                return jsonify(
-                    self._online_inbox.admit(
-                        payload.get("source_id"),
-                        payload.get("session_id"),
-                        payload.get("trajectory_id"),
-                    )
-                )
-            except AdmissionFull as exc:
-                return jsonify({"error": str(exc)}), 429, {"Retry-After": "1"}
-            except AdmissionPaused as exc:
-                return jsonify({"error": str(exc)}), 503, {"Retry-After": "1"}
-            except ValueError as exc:
-                return jsonify({"error": str(exc)}), 400
-
-        @app.route("/callback/online_abort", methods=["POST"])
-        def online_abort():
-            if (
-                request.headers.get("Authorization")
-                != f"Bearer {self.config.admin_api_key}"
-            ):
-                return jsonify({"error": "Invalid admin API key"}), 403
-            if self._online_inbox is None:
-                return jsonify(
-                    {"error": "Durable online admission is not configured"}
-                ), 409
-            payload = request.get_json() or {}
-            try:
-                return jsonify(
-                    self._online_inbox.cancel_admission(
-                        payload.get("source_id"),
-                        payload.get("session_id"),
-                        payload.get("trajectory_id"),
-                        episode_id=payload.get("episode_id"),
-                        lease=payload.get("lease"),
-                        reason=payload.get("reason"),
-                    )
-                )
-            except ValueError as exc:
-                return jsonify({"error": str(exc)}), 409
-
         @app.route("/callback/online_ready", methods=["POST"])
         def online_ready():
             if request.headers.get("Authorization") != (
@@ -1030,9 +967,6 @@ class RolloutControllerV2:
         trajectory_id = payload.get("trajectory_id")
         if not session_id or trajectory_id is None:
             raise RuntimeError("Missing session_id or trajectory_id")
-
-        if self._online_inbox is not None:
-            return await self._receive_online_episode(payload)
 
         export_request = {
             "session_id": session_id,
@@ -1175,88 +1109,6 @@ class RolloutControllerV2:
             response.raise_for_status()
             rows.append({"proxy": address, **response.json()})
         return rows
-
-    def configure_online_training(
-        self,
-        inbox: OnlineInbox,
-        *,
-        discount: float = 1.0,
-        export_style: str = "individual",
-        drop_retry_orphans: bool = False,
-    ) -> None:
-        """Bind the CPU-owned pipeline before launching any inference service."""
-        if self._callback_server is not None or self._worker_role:
-            raise RuntimeError("Configure durable online training before initialize()")
-        if self.config.agent is None or self.config.agent.mode != "online":
-            raise ValueError("Durable online training requires agent.mode='online'")
-        if (self.config.consumer_batch_size, self.config.max_head_offpolicyness) != (
-            inbox.batch_size,
-            inbox.max_staleness,
-        ):
-            raise ValueError(
-                "Rollout batch size and staleness must match the durable inbox"
-            )
-        if export_style not in ("individual", "concat"):
-            raise ValueError("Unsupported online trajectory export style")
-        self._online_inbox = inbox
-        self._online_export_options = {
-            "discount": discount,
-            "style": export_style,
-            "drop_retry_orphans": drop_retry_orphans,
-        }
-
-    async def _receive_online_episode(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from areal.infra.rpc.serialization import deserialize_value
-
-        inbox = self._online_inbox
-        assert inbox is not None
-        episode_id, lease = payload.get("episode_id"), payload.get("lease")
-        episode = await asyncio.to_thread(inbox.episode, episode_id)
-        if (
-            episode["lease"] != lease
-            or episode["session_id"] != payload["session_id"]
-            or episode["trajectory_id"] != payload["trajectory_id"]
-        ):
-            raise ValueError("Ready notification does not match its admission lease")
-        request_body = {
-            **self._online_export_options,
-            "session_ids": [episode["session_id"]],
-            "trajectory_id": episode["trajectory_id"],
-            "episode_id": episode_id,
-            "lease": lease,
-            "consume": False,
-            "remove_session": False,
-            "inline_tensors": True,
-        }
-        headers = {"Authorization": f"Bearer {self.config.admin_api_key}"}
-        digest = episode["digest"]
-        # The callback loop has its own connections; version publication may
-        # concurrently use the controller's ordinary async client on another loop.
-        async with create_httpx_client(timeout=self.config.request_timeout) as client:
-            if episode["digest"] is None:
-                response = await client.post(
-                    f"{self._gateway_addr}/export_trajectories",
-                    json=request_body,
-                    headers=headers,
-                )
-                response.raise_for_status()
-                trajectory = deserialize_value(response.json()["traj"])
-                digest = await asyncio.to_thread(
-                    inbox.receive, episode_id, lease, trajectory
-                )
-            if not episode["source_acked"]:
-                response = await client.post(
-                    f"{self._gateway_addr}/export_trajectories",
-                    json={
-                        **request_body,
-                        "acknowledge_only": True,
-                        "handoff_digest": digest,
-                    },
-                    headers=headers,
-                )
-                response.raise_for_status()
-                await asyncio.to_thread(inbox.acknowledge_source, episode_id, lease)
-        return {"status": "ok", "episode_id": episode_id}
 
     # -- Destroy -----------------------------------------------------------
 

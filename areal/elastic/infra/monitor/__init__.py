@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared live observations, causal measurements and existing-log parsing."""
+"""Native training observations and existing-log parsing."""
 
-from areal.elastic.infra.monitor.collector import ElasticMonitor
+from areal.elastic.infra.monitor.collector import TrainerMonitor
 
-__all__ = ["ElasticMonitor"]
+__all__ = ["TrainerMonitor"]

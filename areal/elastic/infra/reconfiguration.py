@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import argparse
 import dataclasses
 import fcntl
 import json
@@ -16,35 +15,127 @@ from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
-from typing import Generic, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeVar
 
 from areal.elastic.contracts import ControlBusy, ControlSnapshot
-from areal.elastic.infra.monitor.collector import ElasticMonitor
 from areal.elastic.layout import ExecutionLayout as ExecutionLayout
 from areal.elastic.layout import ReconfigurationPlan, ReconfigurationPlanner
-
-# Keep legacy runtime and acceptance imports until their Step 5 cleanup.
-from areal.infra.utils.process import (
-    OWNER_ENV as OWNER_ENV,
-)
-from areal.infra.utils.process import (
-    gpu_processes as gpu_processes,
-)
-from areal.infra.utils.process import (
-    owned_processes as owned_processes,
-)
-from areal.infra.utils.process import (
-    resolve_gpu_uuids as resolve_gpu_uuids,
-)
-from areal.infra.utils.process import (
-    stop_owned_processes as stop_owned_processes,
-)
+from areal.elastic.reconfigurator import validate_reconfigurator
+from areal.infra.utils.process import gpu_processes, resolve_gpu_uuids
 from areal.utils.atomic import (
     artifact_manifest,
     atomic_json,
     json_digest,
     recovery_digest,
 )
+
+
+def validate_config(config: Any) -> None:
+    """Reject unsupported state/placement combinations before starting services."""
+    from areal.api.alloc_mode import ModelAllocation
+    from areal.utils.environ import is_single_controller
+
+    options = config.elastic
+    validate_reconfigurator(options.reconfigurator)
+    actor = ModelAllocation.from_str(config.actor.backend)
+    rollout = ModelAllocation.from_str(config.rollout.backend)
+    if not is_single_controller() or config.scheduler.type != "local":
+        raise ValueError(
+            "elastic reconfiguration currently requires a local single CPU coordinator"
+        )
+    if os.environ.get("CUDA_VISIBLE_DEVICES") != "":
+        raise ValueError(
+            "Start the elastic reconfiguration CPU coordinator with CUDA_VISIBLE_DEVICES empty"
+        )
+    if config.actor._version != "v2" or config.rollout._version != "v2":
+        raise ValueError(
+            "elastic reconfiguration requires native v2 Actor and Rollout controllers"
+        )
+    if actor.backend not in ("fsdp", "megatron") or rollout.backend != "sglang":
+        raise ValueError(
+            "elastic reconfiguration currently supports FSDP/Megatron with SGLang"
+        )
+    if config.rollout.agent is None or config.rollout.agent.mode != "online":
+        raise ValueError("elastic reconfiguration requires agent.mode='online'")
+    if (
+        config.critic is not None
+        or config.ref is not None
+        or config.teacher is not None
+        or config.actor.use_lora
+    ):
+        raise ValueError(
+            "elastic reconfiguration does not yet support critic/ref/teacher or LoRA state"
+        )
+    if (
+        config.enable_offload
+        or config.actor.offload
+        or config.rollout.api_url is not None
+    ):
+        raise ValueError(
+            "elastic reconfiguration requires local separated workers without offloading"
+        )
+    for engine in (config.actor, config.rollout):
+        strategy = engine.scheduling_strategy
+        if strategy is not None and strategy.type != "separation":
+            raise ValueError("elastic reconfiguration requires separation scheduling")
+        if any(
+            "CUDA_VISIBLE_DEVICES" in spec.env_vars for spec in engine.scheduling_spec
+        ):
+            raise ValueError(
+                "Configure elastic reconfiguration GPU pools instead of scheduling env CUDA_VISIBLE_DEVICES"
+            )
+        if len(engine.scheduling_spec) != 1:
+            raise ValueError(
+                "elastic reconfiguration requires exactly one scheduling spec per engine"
+            )
+    if (
+        config.actor.scheduling_spec[0].gpu != 1
+        or config.rollout.scheduling_spec[0].gpu <= 0
+    ):
+        raise ValueError(
+            "elastic reconfiguration requires one GPU per Actor guard and a positive Rollout GPU request"
+        )
+    actor_size = actor.parallel.world_size
+    actor_pool = len(options.actor_devices)
+    pure_fsdp_dp = actor.backend == "fsdp" and all(
+        getattr(actor.parallel, name) == 1
+        for name in ("tp_size", "pp_size", "cp_size", "ep_size", "etp_size")
+    )
+    if (
+        rollout.parallel.world_size != len(options.rollout_devices)
+        or actor_size > actor_pool
+        or actor_size != actor_pool
+        and not pure_fsdp_dp
+    ):
+        raise ValueError(
+            "GPU pools must match their layouts; pure FSDP DP may use a subset of its reserved pool"
+        )
+    if (
+        config.gconfig.n_samples != 1
+        or config.gconfig.reward_normalization
+        or config.dynamic_bs
+    ):
+        raise ValueError(
+            "elastic reconfiguration currently requires independent single-sample episodes and fixed batches"
+        )
+    if config.rollout.consumer_batch_size != config.train_dataset.batch_size:
+        raise ValueError(
+            "Rollout consumer_batch_size must equal the independent episode batch size"
+        )
+    for norm in (config.actor.adv_norm, config.actor.reward_norm):
+        if norm is not None and (
+            norm.mean_level == "group" or norm.std_level == "group"
+        ):
+            raise ValueError(
+                "Independent single-sample episodes cannot use group normalization"
+            )
+    if not Path(config.actor.path).is_dir():
+        raise ValueError(
+            "elastic reconfiguration requires a pinned, locally materialized base model"
+        )
+    if Path(config.sglang.model_path).resolve() != Path(config.actor.path).resolve():
+        raise ValueError("Actor and SGLang must start from the same pinned base model")
+
 
 ConfigT = TypeVar("ConfigT")
 
@@ -294,9 +385,7 @@ class ReconfigurationExecutor:
             {
                 "scope": "native-resources-v1",
                 "run": owner.identity,
-                "queue": owner.data_plane_id
-                if hasattr(owner, "data_plane_id")
-                else owner.inbox.queue.queue_id,
+                "data_plane": owner.data_plane_id,
                 "reservation": list(owner.resource_reservation),
             }
         )
@@ -352,18 +441,11 @@ class ReconfigurationExecutor:
         if self.owner.applied_version < 1:
             raise ValueError("Reconfiguration requires a completed training update")
         application = self.owner.reconfiguration_application
-        if request_id in application.state().get("legacy_receipts", {}):
-            raise ValueError("Request ID belongs to the immutable legacy Actor journal")
         application.preflight(request)
         if request_id in application.state()["receipts"]:
             return application.apply(request)
         plan = self.owner.plan_reconfiguration(target)
         self.owner.last_reconfiguration_plan = plan
-        state = application.state()
-        if self.owner.managed_rollout and (not state.get("managed_rollout", False)):
-            atomic_json(
-                application.root / "state.json", {**state, "managed_rollout": True}
-            )
         if plan.steps:
             with self.owner._reconfiguration_phase("checkpoint"):
                 self.owner.save_checkpoint(reason="resource-reconfigure")
@@ -375,24 +457,15 @@ class ReconfigurationExecutor:
             raise RuntimeError("Reconfiguration left an incomplete boundary")
         if receipt["status"] == "unchanged":
             return receipt
-        arm = getattr(self.owner, "_arm_post_reconfiguration", None)
-        if arm is not None:
-            arm()
         with self.owner._reconfiguration_phase("generation_resume"):
             self.owner.rollout.continue_generation()
         with self.owner._reconfiguration_phase("admission_open"):
-            self._set_admission(True)
+            self.owner.set_admission_open(True)
             if self.owner.managed_rollout:
                 self.owner.rollout.open_model_calls()
             else:
                 self.owner.rollout.resume()
         return receipt
-
-    def _set_admission(self, opened: bool) -> None:
-        if hasattr(self.owner, "set_admission_open"):
-            self.owner.set_admission_open(opened)
-        else:
-            self.owner.inbox.set_admission_open(opened)
 
     def execute(self, plan: ReconfigurationPlan) -> None:
         """Execute an already selected sequence; unchanged engines stay alive."""
@@ -418,7 +491,7 @@ class ReconfigurationExecutor:
                 with self.owner._reconfiguration_phase("drain"):
                     self.owner.rollout.drain_model_calls()
             elif step == "close_admission":
-                self._set_admission(False)
+                self.owner.set_admission_open(False)
             elif step == "release_actor":
                 with self.owner._reconfiguration_phase("actor_release"):
                     self.owner._release()
@@ -442,8 +515,6 @@ class ReconfigurationExecutor:
                 )
             elif step == "rebind_runtime":
                 if self.owner.reconfigurator_adapter is not None:
-                    if not hasattr(self.owner, "trainer"):
-                        self.owner.monitor = ElasticMonitor(self.owner)
                     self.owner.reconfigurator_adapter.rebind_actor_layout(self.owner)
             elif step == "restore_actor":
                 self.owner.ensure_actor(connect_weights=False)
@@ -460,7 +531,6 @@ class ReconfigurationExecutor:
             else:
                 raise ValueError(f"Unknown transition step: {step}")
         self.owner._reconfiguration_incomplete = False
-        self.owner._checkpoint_dirty = True
         self.owner._event(
             "RECONFIGURED", serving_versions=self.owner.rollout.serving_versions()
         )
@@ -490,7 +560,7 @@ class TrainerReconfiguration:
         self.trainer, self.ft_spec = trainer, ft_spec
         self.monitor = None
         self.config = trainer.config
-        self.options = self.config.actor_lifecycle
+        self.options = self.config.elastic
         self.root = Path(self.options.state_root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.actor_devices = tuple(self.options.actor_devices)
@@ -507,7 +577,6 @@ class TrainerReconfiguration:
         self.last_checkpoint_reports = self.last_restore_reports = None
         self.generation = 1
         self._reconfiguration_incomplete = False
-        self._checkpoint_dirty = False
         self._managed_rollout = (
             os.environ.get("AREAL_ELASTIC_RESOURCE_RECONFIGURATION") == "1"
         )
@@ -535,7 +604,9 @@ class TrainerReconfiguration:
             keep=self.options.checkpoint_keep,
             free_space_floor=self.options.checkpoint_free_space_floor,
         )
-        self.reconfiguration_application, _ = configuration_application(self)
+        self.reconfiguration_application = ConfigApplication(
+            ReconfigurationExecutor(self), self.root / "resource-reconfiguration"
+        )
 
     @property
     def actor(self):
@@ -758,165 +829,3 @@ class TrainerReconfiguration:
 
     def _reconfiguration_phase(self, name):
         return nullcontext()
-
-
-def configuration_application(owner):
-    """Open one journal, importing an earlier DP-only journal without changing it."""
-
-    application = ConfigApplication(
-        ReconfigurationExecutor(owner), owner.root / "resource-reconfiguration"
-    )
-    path = application.root / "state.json"
-    legacy_path = owner.root / "actor-reconfiguration" / "state.json"
-    existed = path.exists()
-    if not existed and legacy_path.exists():
-        state = json.loads(legacy_path.read_text())
-        expected = json_digest(
-            {
-                "scope": "native-fsdp-dp-v1",
-                "run": owner.identity,
-                "queue": owner.inbox.queue.queue_id,
-                "actor_gpu_pool": list(owner.options.actor_devices),
-                "rollout_gpu_pool": list(owner.options.rollout_devices),
-            }
-        )
-        if state["context_id"] != expected:
-            raise ValueError("Actor journal belongs to another execution context")
-
-        def layout(value):
-            return asdict(
-                ExecutionLayout(
-                    value["world_size"],
-                    tuple(owner.options.actor_devices),
-                    tuple(owner.options.rollout_devices),
-                )
-            )
-
-        def convert(row):
-            row["request"]["target"] = layout(row["request"]["target"])
-            for key in ("source", "actual"):
-                if key in row:
-                    row[key]["config"] = layout(row[key]["config"])
-
-        state["config"] = layout(state["config"])
-        for receipt in state["receipts"].values():
-            convert(receipt)
-        if state["pending"] is not None:
-            convert(state["pending"])
-        state["context_id"] = application.executor.context_id
-        state["migrated_from"] = "actor-reconfiguration"
-        state["managed_rollout"] = owner._managed_rollout
-        atomic_json(path, state)
-    if not path.exists():
-        # New journals initialize after bind reconciles checkpoint/publication state.
-        return application, {
-            "config": asdict(owner.execution_layout),
-            "pending": None,
-            "managed_rollout": owner._managed_rollout,
-        }
-    state = application.state()
-    if "managed_rollout" not in state:
-        state["managed_rollout"] = True if existed else owner._managed_rollout
-        atomic_json(path, state)
-    return application, state
-
-
-def submit_request(
-    state_root: Path,
-    *,
-    target: ExecutionLayout,
-    request_id: str,
-    expected_generation: int,
-    expected_weights_version: int,
-) -> Path:
-    if not (state_root / "state.json").is_file():
-        raise ValueError("State root does not belong to an initialized native runtime")
-    request = ConfigRequest(
-        request_id, target, expected_generation, expected_weights_version, "manual"
-    )
-    root = state_root / "resource-reconfiguration"
-    root.mkdir(exist_ok=True)
-    with (root / "request.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        path = root / "request.json"
-        if path.exists():
-            raise RuntimeError("A reconfiguration request is already pending")
-        atomic_json(path, asdict(request))
-    return path
-
-
-def poll_request(owner) -> None:
-    root = owner.root / "resource-reconfiguration"
-    if not (root / "request.json").is_file():
-        return
-    with (root / "request.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        request = json.loads((root / "request.json").read_text())
-        try:
-            if request.pop("reconfigurator_bundle_id") != "manual":
-                raise ValueError("Reconfiguration mailbox requires manual provenance")
-            target = ExecutionLayout.decode(request.pop("target"))
-            response = {
-                "request_id": request["request_id"],
-                "receipt": owner.reconfigure(target=target, **request),
-            }
-        except Exception as error:
-            response = {
-                "request_id": request.get("request_id"),
-                "error": f"{type(error).__name__}: {error}",
-            }
-            atomic_json(root / "response.json", response)
-            application = owner.reconfiguration_application
-            if (
-                application is not None
-                and application.state().get("pending") is not None
-            ):
-                raise
-        atomic_json(root / "response.json", response)
-        (root / "request.json").unlink()
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--state-root", required=True, type=Path)
-    sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("status")
-    request = sub.add_parser("request")
-    request.add_argument("--actor-devices", type=int, nargs="+", required=True)
-    request.add_argument("--rollout-devices", type=int, nargs="+", required=True)
-    request.add_argument("--world-size", type=int, required=True)
-    request.add_argument("--request-id", required=True)
-    request.add_argument("--expected-generation", type=int, required=True)
-    request.add_argument("--expected-weights-version", type=int, required=True)
-    args = parser.parse_args()
-    if args.command == "status":
-        status = {
-            name: json.loads(path.read_text()) if path.exists() else None
-            for name in ("state", "request", "response")
-            for path in [args.state_root / "resource-reconfiguration" / f"{name}.json"]
-        }
-        status["authority"] = "resource" if status["state"] is not None else "actor"
-        if status["state"] is None:
-            legacy = args.state_root / "actor-reconfiguration/state.json"
-            status["state"] = (
-                json.loads(legacy.read_text()) if legacy.exists() else {"generation": 0}
-            )
-        print(json.dumps(status, indent=2))
-    else:
-        print(
-            submit_request(
-                args.state_root,
-                target=ExecutionLayout(
-                    args.world_size,
-                    tuple(args.actor_devices),
-                    tuple(args.rollout_devices),
-                ),
-                request_id=args.request_id,
-                expected_generation=args.expected_generation,
-                expected_weights_version=args.expected_weights_version,
-            )
-        )
-
-
-if __name__ == "__main__":
-    main()

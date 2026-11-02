@@ -10,7 +10,6 @@ import hashlib
 import json
 import math
 import os
-import sqlite3
 import sys
 import time
 import uuid
@@ -24,65 +23,6 @@ from tqdm import tqdm
 from examples.task_workflows.types import Benchmark, TaskResult, get_benchmark
 
 
-class InboxAudit:
-    """Read-only observation of the existing coordinator inbox, never a new queue."""
-
-    def __init__(self, state_root: Path) -> None:
-        self.database = state_root / "inbox/queue.sqlite3"
-
-    def _read(self, query: str, params: tuple = ()) -> list[dict[str, Any]]:
-        with sqlite3.connect(
-            self.database.resolve().as_uri() + "?mode=ro", uri=True, timeout=5
-        ) as db:
-            db.row_factory = sqlite3.Row
-            return [dict(row) for row in db.execute(query, params)]
-
-    def episode(self, session_id: str, episode: dict) -> dict[str, Any] | None:
-        rows = self._read(
-            "SELECT episode_id,source_id,session_id,trajectory_id,status,digest,"
-            "source_acked,min_version,max_version,batch_id,rejection "
-            "FROM online_episodes WHERE session_id=? AND trajectory_id=?",
-            (session_id, episode["trajectory_id"]),
-        )
-        rows = [
-            row
-            for row in rows
-            if row["source_id"].endswith(":" + episode["incarnation_id"])
-        ]
-        if len(rows) > 1:
-            raise RuntimeError("Ambiguous durable episode identity")
-        return rows[0] if rows else None
-
-    def capacity(self, starting: list[dict]) -> bool:
-        rows = self._read(
-            "SELECT session_id,trajectory_id,source_id,status FROM online_episodes"
-        )
-        progress = self._read("SELECT * FROM online_progress")[0]
-        seen = {
-            (
-                row["session_id"],
-                row["trajectory_id"],
-                row["source_id"].rsplit(":", 1)[-1],
-            )
-            for row in rows
-        }
-        unseen = sum(
-            (
-                item["session_id"],
-                item["areal_episode"]["trajectory_id"],
-                item["areal_episode"]["incarnation_id"],
-            )
-            not in seen
-            for item in starting
-        )
-        active = sum(row["status"] not in ("published", "rejected") for row in rows)
-        return (
-            bool(progress["admission_open"])
-            and active + unseen
-            < (progress["max_staleness"] + 1) * progress["batch_size"]
-        )
-
-
 @dataclass(frozen=True)
 class ClientSettings:
     agent_url: str
@@ -92,23 +32,15 @@ class ClientSettings:
     model: str
     mode: str
     output: Path
-    state_root: Path | None = None
     concurrency: int = 4
     request_timeout: float = 900.0
-    handoff_timeout: float = 180.0
     benchmark: str = "dapo_math"
     arrival_offsets: tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
-        if self.mode not in ("on_demand", "resident", "eval"):
+        if self.mode not in ("resident", "eval"):
             raise ValueError("Unsupported client mode")
-        if self.mode == "on_demand" and (
-            self.state_root is None or not self.state_root.is_absolute()
-        ):
-            raise ValueError(
-                "on_demand requires the trainer's absolute state root on this host"
-            )
-        if min(self.concurrency, self.request_timeout, self.handoff_timeout) <= 0:
+        if min(self.concurrency, self.request_timeout) <= 0:
             raise ValueError("Concurrency and timeouts must be positive")
         if not self.agent_key or not self.inference_key:
             raise ValueError("Agent and inference API keys are required")
@@ -129,11 +61,6 @@ class EpisodeClient:
         self.settings, self.http = settings, http
         self.benchmark = benchmark or get_benchmark(settings.benchmark)
         self._write_lock = asyncio.Lock()
-        self.audit = (
-            InboxAudit(settings.state_root) if settings.mode == "on_demand" else None
-        )
-        self._admission_lock = asyncio.Lock()
-        self._starting: dict[str, dict] = {}
         self.run_id = os.environ.get("AREAL_TRACE_RUN_ID", settings.output.name)
 
     async def _post(
@@ -154,44 +81,6 @@ class EpisodeClient:
         response.raise_for_status()
         return response.json()
 
-    async def _admit(self, credentials: dict) -> None:
-        if self.audit is None:
-            return
-        deadline = time.monotonic() + self.settings.handoff_timeout
-        while time.monotonic() < deadline:
-            async with self._admission_lock:
-                available = await asyncio.to_thread(
-                    self.audit.capacity, list(self._starting.values())
-                )
-                if available:
-                    self._starting[credentials["session_id"]] = credentials
-                    return
-            await asyncio.sleep(0.2)
-        raise TimeoutError(
-            "Waiting for episode admission; check trainer progress and batch size"
-        )
-
-    async def _handoff(self, credentials: dict) -> dict:
-        if self.audit is None:
-            return {"verified": False, "reason": "resident_mode_has_no_durable_inbox"}
-        deadline = time.monotonic() + self.settings.handoff_timeout
-        while time.monotonic() < deadline:
-            row = await asyncio.to_thread(
-                self.audit.episode,
-                credentials["session_id"],
-                credentials["areal_episode"],
-            )
-            if row is not None and row["digest"] and row["source_acked"]:
-                return {"verified": True, **row}
-            if row is not None and row["status"] == "rejected":
-                raise RuntimeError(
-                    f"Episode rejected before handoff: {row['rejection']}"
-                )
-            await asyncio.sleep(0.2)
-        raise TimeoutError(
-            "Reward was submitted but durable export/source ACK was not confirmed"
-        )
-
     def _task_result(self, response: dict) -> TaskResult:
         return TaskResult.from_response(response)
 
@@ -203,7 +92,6 @@ class EpisodeClient:
         request_id = self.benchmark.request_prefix + "-" + uuid.uuid4().hex
         if credentials is not None and self.settings.mode == "eval":
             raise ValueError("Retained RL credentials require a training client")
-        rewarded = False
         agent_finished = False
         result: dict[str, Any] = {
             "run_id": self.run_id,
@@ -227,20 +115,11 @@ class EpisodeClient:
                             "Independent task requests require one session"
                         )
                     credentials = response["sessions"][0]
-                if settings.mode == "on_demand" and not credentials.get(
-                    "areal_episode"
-                ):
-                    raise RuntimeError(
-                        "Inference service did not return a durable episode identity"
-                    )
                 result.update(
                     session_id=credentials["session_id"],
                     episode=credentials.get("areal_episode"),
                     session_ready=time.time(),
                 )
-                result["client_admission_started"] = time.time()
-                await self._admit(credentials)
-                result["client_admitted"] = time.time()
             task_input = self.benchmark.prepare(task)
             result["submitted"] = time.time()
             payload = {
@@ -291,7 +170,6 @@ class EpisodeClient:
                     credentials["session_api_key"],
                     reward_body,
                 )
-                rewarded = True
                 if receipt.get("trajectory_id") is None or not receipt.get(
                     "trajectory_ready"
                 ):
@@ -305,38 +183,14 @@ class EpisodeClient:
                 ):
                     raise RuntimeError("Reward receipt targets a different trajectory")
                 result["reward_receipt"] = receipt
-                result["handoff"] = await self._handoff(credentials)
-                result["handed_off"] = time.time()
             result["status"] = "completed"
             return result
         except Exception as exc:
             result.update(
                 status="infrastructure_error", error=f"{type(exc).__name__}: {exc}"
             )
-            # No generation retries. A known-finished unscored episode may be
-            # explicitly aborted; uncertain in-flight work is left for inspection.
-            if (
-                credentials
-                and credentials.get("areal_episode")
-                and agent_finished
-                and not rewarded
-            ):
-                try:
-                    result["abort_receipt"] = await self._post(
-                        self.settings.inference_url,
-                        "/rl/abort_episode",
-                        credentials["session_api_key"],
-                        {
-                            **credentials["areal_episode"],
-                            "reason": "task_client_infrastructure_error",
-                        },
-                    )
-                except Exception as abort_error:
-                    result["abort_error"] = type(abort_error).__name__
             return result
         finally:
-            if credentials:
-                self._starting.pop(credentials["session_id"], None)
             if agent_finished:
                 try:
                     await self._post(
@@ -418,9 +272,6 @@ class EpisodeClient:
                 row["status"] == "infrastructure_error" for row in rows
             ),
             "not_submitted": sum(row["status"] == "not_submitted" for row in rows),
-            "durable_handoffs": sum(
-                row.get("handoff", {}).get("verified", False) for row in completed
-            ),
             "model_calls": sum(row["metadata"]["api_calls"] for row in completed),
             "tool_executions": sum(
                 len(row["metadata"]["environment"]["calls"]) for row in completed
@@ -462,10 +313,8 @@ async def _main(args: argparse.Namespace) -> int:
         model=args.model,
         mode=args.mode,
         output=args.output,
-        state_root=args.state_root,
         concurrency=args.concurrency,
         request_timeout=args.request_timeout,
-        handoff_timeout=args.handoff_timeout,
         benchmark=benchmark.name,
         arrival_offsets=offsets,
     )
@@ -515,10 +364,7 @@ def main() -> None:
         "--inference-url", required=True, help="Inference gateway origin, without /v1"
     )
     parser.add_argument("--model", required=True)
-    parser.add_argument(
-        "--mode", choices=("on_demand", "resident", "eval"), default="resident"
-    )
-    parser.add_argument("--state-root", type=Path)
+    parser.add_argument("--mode", choices=("resident", "eval"), default="resident")
     parser.add_argument("--limit", type=int)
     parser.add_argument(
         "--arrival-schedule",
@@ -527,7 +373,6 @@ def main() -> None:
     )
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--request-timeout", type=float, default=900)
-    parser.add_argument("--handoff-timeout", type=float, default=180)
     args = parser.parse_args()
     raise SystemExit(asyncio.run(_main(args)))
 

@@ -120,25 +120,19 @@ def test_hermes_math_sampling_keeps_episode_on_direct_and_recreated_clients(
 
 
 @pytest.mark.asyncio
-async def test_hermes_math_client_scores_and_confirms_durable_episode(tmp_path):
+async def test_hermes_math_client_scores_and_submits_native_reward(tmp_path):
     import httpx
 
     from examples.task_workflows.benchmarks.dapo_math import MathTask, question_id
     from examples.task_workflows.client import ClientSettings, EpisodeClient
 
-    from areal.elastic.infra.state.episode_inbox import OnlineInbox
-
-    state = tmp_path / "state"
-    inbox = OnlineInbox(state / "inbox", batch_size=1, max_staleness=2)
     output = tmp_path / "client"
     output.mkdir()
     identity = {"incarnation_id": "math-incarnation", "trajectory_id": 0}
     session_id = "math-session"
-    admission = None
     observed = []
 
     def respond(request):
-        nonlocal admission
         body = json.loads(request.content)
         observed.append((request.url.path, body))
         if request.url.path == "/rl/start_session":
@@ -158,7 +152,6 @@ async def test_hermes_math_client_scores_and_confirms_durable_episode(tmp_path):
             assert "gold_answer" not in request.content.decode()
             assert "42" not in body["input"][0]["content"]
             assert body["inf_episode"] == identity
-            admission = inbox.admit("worker:math-incarnation", session_id, 0)
             return httpx.Response(
                 200,
                 json={
@@ -178,19 +171,6 @@ async def test_hermes_math_client_scores_and_confirms_durable_episode(tmp_path):
             )
         if request.url.path == "/rl/set_reward":
             assert body == {"reward": 1.0, "areal_episode": identity}
-            inbox.receive(
-                admission["episode_id"],
-                admission["lease"],
-                {
-                    "input_ids": torch.tensor([[1, 2]]),
-                    "attention_mask": torch.tensor([[1, 1]]),
-                    "loss_mask": torch.tensor([[0, 1]]),
-                    "logprobs": torch.tensor([[0.0, -0.1]]),
-                    "versions": torch.tensor([[0, 0]]),
-                    "rewards": torch.tensor([1.0]),
-                },
-            )
-            inbox.acknowledge_source(admission["episode_id"], admission["lease"])
             return httpx.Response(
                 200,
                 json={
@@ -209,9 +189,8 @@ async def test_hermes_math_client_scores_and_confirms_durable_episode(tmp_path):
         agent_key="agent-secret",
         inference_key="inference-secret",
         model="test-model",
-        mode="on_demand",
+        mode="resident",
         output=output,
-        state_root=state,
         concurrency=1,
     )
     question = "Compute six times seven."
@@ -219,12 +198,9 @@ async def test_hermes_math_client_scores_and_confirms_durable_episode(tmp_path):
         summary = await EpisodeClient(settings, http).run(
             [MathTask(question_id(question), question, "42")]
         )
-    assert (
-        summary["completed"] == summary["durable_handoffs"] == summary["correct"] == 1
-    )
+    assert summary["completed"] == summary["correct"] == 1
     row = json.loads((output / "episodes.jsonl").read_text())
-    assert row["handoff"]["digest"]
-    assert row["handoff"]["source_acked"] == 1
+    assert row["reward_receipt"]["trajectory_ready"]
     assert "session-secret" not in json.dumps(row)
     assert [path for path, _ in observed] == [
         "/rl/start_session",
@@ -234,7 +210,7 @@ async def test_hermes_math_client_scores_and_confirms_durable_episode(tmp_path):
     ]
 
 
-def test_hermes_math_config_shares_training_settings_across_lifecycles(
+def test_hermes_math_config_shares_training_settings_with_elastic_enabled(
     monkeypatch, tmp_path
 ):
     from omegaconf import OmegaConf
@@ -250,10 +226,10 @@ def test_hermes_math_config_shares_training_settings_across_lifecycles(
     }.items():
         monkeypatch.setenv(key, value)
     configs = []
-    for mode in ("resident", "on_demand"):
-        monkeypatch.setenv("AREAL_ACTOR_LIFECYCLE", mode)
+    for enabled in (False, True):
+        monkeypatch.setenv("AREAL_ELASTIC_ENABLED", str(enabled).lower())
         config = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
-        assert config["actor_lifecycle"].pop("mode") == mode
+        assert config["elastic"].pop("enabled") is enabled
         assert config["train_dataset"]["batch_size"] == 4
         assert config["rollout"]["consumer_batch_size"] == 4
         assert config["rollout"]["agent"]["set_reward_finish_timeout"] == 0

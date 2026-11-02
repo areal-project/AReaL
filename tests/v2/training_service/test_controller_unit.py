@@ -656,7 +656,7 @@ def resident_online_pipeline(tmp_path, monkeypatch):
     from areal.api import FinetuneSpec, WeightUpdateMeta
     from areal.api.alloc_mode import ModelAllocation
     from areal.api.cli_args import (
-        ActorLifecycleConfig,
+        ElasticConfig,
         InferenceEngineConfig,
         PPOConfig,
     )
@@ -752,8 +752,8 @@ def resident_online_pipeline(tmp_path, monkeypatch):
     (model / "config.json").write_text("{}")
     (model / "model.safetensors").write_bytes(b"CPU protocol model placeholder")
     trainer.config.actor.path = str(model)
-    trainer.config.actor_lifecycle = ActorLifecycleConfig(
-        mode="on_demand",
+    trainer.config.elastic = ElasticConfig(
+        enabled=True,
         state_root=str(tmp_path / "state"),
         actor_devices=(0, 1, 2, 3),
         rollout_devices=(4,),
@@ -1098,7 +1098,6 @@ def test_resident_online_pipeline_continues_after_actor_rebuild(
             assert rollout.staleness_manager is manager
             assert rollout.workflow_executor is executor
             assert pipeline.proxy.state.session_store is original_store
-            assert rollout._online_inbox is None
             assert not (tmp_path / "state/inbox").exists()
             assert not executor.is_paused()
             assert trainer.actor.get_version() == rollout.get_version() == index
@@ -1312,7 +1311,6 @@ def test_native_reconfigurator_switches_during_standard_batch_wait(
         )
         assert rollout.workflow_executor is executor
         assert p.proxy.state.session_store is sessions
-        assert rollout._online_inbox is None
         for i in range(4, 8):
             p.reward(i)
         second.result(timeout=10)
