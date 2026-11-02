@@ -152,6 +152,31 @@ class TestGeometry3KRewardFn:
         )
         assert reward == 1.0, "Whitespace should be stripped from bracket"
 
+    def test_geometry3k_latex_ground_truth(self):
+        """LaTeX gold answers (as stored in Geometry3K) must not reduce to their last number."""
+        cases = [
+            (r"5 \sqrt { 3 }", r"[5\sqrt{3}]", "[3]"),
+            (r"4 \frac { 4 } { 11 }", r"[4\frac{4}{11}]", "[11]"),
+            (r"\sqrt { 21 }", r"[\sqrt{21}]", "[21]"),
+        ]
+        for answer, correct, wrong in cases:
+            reward = geometry3k_reward_fn(
+                prompt="What is x?",
+                completions=f"The answer is {correct}.",
+                prompt_ids=[],
+                completion_ids=[],
+                answer=answer,
+            )
+            assert reward == 1.0, f"{correct} should match {answer!r}"
+            reward = geometry3k_reward_fn(
+                prompt="What is x?",
+                completions=f"The answer is {wrong}.",
+                prompt_ids=[],
+                completion_ids=[],
+                answer=answer,
+            )
+            assert reward == 0.0, f"{wrong} should not match {answer!r}"
+
 
 class TestRewardEdgeCases:
     """Test edge cases for reward functions."""
