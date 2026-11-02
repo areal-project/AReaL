@@ -1063,6 +1063,8 @@ def test_core_context_budget_exhaustion_keeps_zero_with_matching_native_receipt(
         "core_turn_deadline",
         "runner_deadline",
         "abbreviated_deadline",
+        "redacted_deadline",
+        "redacted_missing_attempt",
     ],
 )
 def test_context_budget_failure_fetches_native_receipt_before_classification(
@@ -1095,11 +1097,17 @@ def test_context_budget_failure_fetches_native_receipt_before_classification(
             "core_turn_deadline",
             "runner_deadline",
             "abbreviated_deadline",
+            "redacted_deadline",
+            "redacted_missing_attempt",
         ):
             error = _native_deadline_error(
                 "runner_deadline" if failure != "core_turn_deadline" else failure,
                 abbreviated=failure == "abbreviated_deadline",
             )
+        if failure in ("redacted_deadline", "redacted_missing_attempt"):
+            error.result.raw["outcome"]["schema"] = "[REDACTED].envarena-outcome.v1"
+        if failure == "redacted_missing_attempt":
+            error.result = replace(error.result, artifacts_uri=None)
         receipt = error.harness_result
         error.harness_result = None
         fetch_method = "get_harness_result_async"
@@ -1137,12 +1145,13 @@ def test_context_budget_failure_fetches_native_receipt_before_classification(
             )
         )
 
-    assert fetched == [error.task_id]
-    assert (
-        workflow.classify_proxy_failure(
-            caught.value, context_overflow=False, interaction_count=2
-        )
-        == "model_failure_zero"
+    assert fetched == ([] if failure == "redacted_missing_attempt" else [error.task_id])
+    assert workflow.classify_proxy_failure(
+        caught.value, context_overflow=False, interaction_count=2
+    ) == (
+        "unknown_failure_reject"
+        if failure == "redacted_missing_attempt"
+        else "model_failure_zero"
     )
 
 
@@ -2237,7 +2246,9 @@ def _native_deadline_error(source="core_turn_deadline", abbreviated=False):
     }
     raw = dict(error.result.raw)
     raw["outcome"] = outcome
-    error.result = replace(error.result, raw=raw)
+    error.result = replace(
+        error.result, raw=raw, artifacts_uri="oss://bucket/task/attempts/2/"
+    )
     receipt = error.harness_result
     receipt["raw"] = {"outcome": outcome.copy()}
     receipt["error"][0]["outcome"] = {k: v for k, v in outcome.items() if k != "schema"}
@@ -2330,3 +2341,27 @@ def test_native_deadline_rejects_infrastructure_or_conflicting_receipts(source, 
         )
         == "unknown_failure_reject"
     )
+
+
+@pytest.mark.parametrize("source", ["core_turn_deadline", "runner_deadline"])
+@pytest.mark.parametrize(
+    "fault", [None, "receipt_schema", "receipt_missing", "source", "phase"]
+)
+def test_redacted_native_deadline_requires_original_receipt(source, fault):
+    """A redacted API schema is only a candidate; original evidence stays strict."""
+    error = _native_deadline_error(source)
+    error.result.raw["outcome"]["schema"] = "[REDACTED].envarena-outcome.v1"
+    if fault == "receipt_schema":
+        error.harness_result["raw"]["outcome"]["schema"] = (
+            "[REDACTED].envarena-outcome.v1"
+        )
+    elif fault == "receipt_missing":
+        error.harness_result = None
+    elif fault == "source":
+        error.result.raw["outcome"]["source"] = "provider_http"
+    elif fault == "phase":
+        error.result.raw["harness"]["phase"] = "setup"
+    assert ArenaStreamAgentWorkflow.classify_proxy_failure(
+        error, context_overflow=False, interaction_count=2
+    ) == ("model_failure_zero" if fault is None else "unknown_failure_reject")
+    assert error.result.raw["outcome"]["schema"] == "[REDACTED].envarena-outcome.v1"

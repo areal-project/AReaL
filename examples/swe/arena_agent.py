@@ -856,14 +856,15 @@ class ArenaStreamAgentWorkflow:
 
     @classmethod
     def _core_execution_timeout_outcome(cls, raw: Any) -> dict[str, Any] | None:
-        """Recognize an explicit native deadline, independently of log wording."""
+        """Identify a candidate deadline; admission still requires an original receipt."""
         if not isinstance(raw, dict):
             return None
         outcome, harness = raw.get("outcome"), raw.get("harness")
         if not isinstance(outcome, dict) or not isinstance(harness, dict):
             return None
         if (
-            outcome.get("schema") != "areal.envarena-outcome.v1"
+            outcome.get("schema")
+            not in ("areal.envarena-outcome.v1", "[REDACTED].envarena-outcome.v1")
             or outcome.get("code") != "AGENT_RUN_TIMEOUT"
             or outcome.get("class") != "agent"
             or cls._gameagent_outcome_code(raw) != "AGENT_RUN_TIMEOUT"
@@ -876,6 +877,9 @@ class ArenaStreamAgentWorkflow:
             or raw.get("failure") is not None
         ):
             return None
+        # Arena may redact the public schema. Never mutate the audited API result;
+        # require the unredacted schema and matching fields in the original receipt.
+        outcome = {**outcome, "schema": "areal.envarena-outcome.v1"}
         details = outcome.get("details")
         if not isinstance(details, dict):
             return None
@@ -2063,12 +2067,20 @@ class ArenaStreamAgentWorkflow:
                         or self._is_core_invalid_tool_json_failure(exc.result.raw)
                     ):
                         try:
+                            attempt = self._runtime_deadline_attempt(exc.result)
+                            outcome = self._core_execution_timeout_outcome(
+                                exc.result.raw
+                            )
+                            if outcome is not None and attempt is None:
+                                raise ArenaAPIError(
+                                    "Missing current task attempt for deadline receipt"
+                                )
                             exc.harness_result = (
                                 await self.client.get_harness_result_async(
                                     exc.task_id,
                                     client=client,
                                     timeout=min(self.request_timeout, 15.0),
-                                    attempt=self._runtime_deadline_attempt(exc.result),
+                                    attempt=attempt,
                                 )
                             )
                         except Exception:

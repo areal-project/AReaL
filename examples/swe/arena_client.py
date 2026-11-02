@@ -356,14 +356,20 @@ class ArenaOpenAPIClient:
         url = f"{self.base_url}/api/artifacts/{encoded_task_id}/{artifact}"
         if attempt is not None and (type(attempt) is not int or attempt < 1):
             raise ValueError("Artifact attempt must be a positive integer")
-        response = await self._async_request(
-            client,
-            "GET",
-            url,
-            headers=self._headers,
-            timeout=timeout,
-            params={"attempt": attempt} if attempt is not None else None,
-        )
+        # A terminal task may precede artifact registration. Poll only the pinned
+        # attempt, with a bounded wait; never fall back to a different attempt.
+        for lookup in range(3):
+            response = await self._async_request(
+                client,
+                "GET",
+                url,
+                headers=self._headers,
+                timeout=timeout,
+                params={"attempt": attempt} if attempt is not None else None,
+            )
+            if response.status_code != 404 or attempt is None or lookup == 2:
+                break
+            await asyncio.sleep(1.0 * (lookup + 1))
         response.raise_for_status()
         if len(response.content) > 65536:
             raise ArenaAPIError("Harness result artifact exceeds 64 KiB")

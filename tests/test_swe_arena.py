@@ -2559,3 +2559,36 @@ def test_terminal_failure_with_score_stops_without_repolling(
     assert exc.value.result.score == 0
     assert exc.value.result.raw == payload["raw"]
     assert calls == (["POST", "GET"] if via_poll else ["POST"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("statuses", [(404, 200), (404, 404, 404), (403,), (500,)])
+async def test_harness_receipt_registration_retry_keeps_attempt(monkeypatch, statuses):
+    """Only pinned, missing artifacts are polled, with bounded retries."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    calls = []
+    sleeps = []
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr("examples.swe.arena_client.asyncio.sleep", sleep)
+
+    def handler(request):
+        assert request.url.params["attempt"] == "2"
+        calls.append(request.url)
+        return httpx.Response(statuses[len(calls) - 1], json={"status": "ERROR"})
+
+    client = ArenaOpenAPIClient(base_url="https://arena.example", request_retries=0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        if statuses[-1] == 200:
+            assert await client.get_harness_result_async(
+                "task", client=http_client, timeout=5, attempt=2
+            ) == {"status": "ERROR"}
+        else:
+            with pytest.raises(httpx.HTTPStatusError):
+                await client.get_harness_result_async(
+                    "task", client=http_client, timeout=5, attempt=2
+                )
+    assert len(calls) == len(statuses)
+    assert sleeps == [float(i) for i in range(1, len(statuses))]
