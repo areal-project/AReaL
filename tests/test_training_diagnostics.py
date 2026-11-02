@@ -6,7 +6,11 @@ import pytest
 import torch
 
 from areal.api.cli_args import PPOActorConfig
-from areal.trainer.ppo.actor import PPOActor, _log_version_staleness_stats
+from areal.trainer.ppo.actor import (
+    PPOActor,
+    _log_policy_version_age_distribution,
+    _log_version_staleness_stats,
+)
 from areal.trainer.ppo.stats import log_train_inference_stats
 from areal.utils.stats_tracker import DistributedStatsTracker
 
@@ -40,6 +44,44 @@ def test_staleness_no_generated_tokens_has_no_fabricated_average():
     result = tracker.export()
     assert result["version_stats/n_valid_generated_tokens"] == 0
     assert "version_stats/sample_staleness_theta_avg" not in result
+
+
+def test_version_age_fractions_count_all_supervised_tokens_across_unequal_batches():
+    tracker = DistributedStatsTracker()
+    with patch("areal.trainer.ppo.actor.stats_tracker", tracker):
+        _log_policy_version_age_distribution(
+            torch.tensor([20, 19, -1, 21, 3]),
+            20,
+            torch.tensor([True, True, True, True, False]),
+        )
+        _log_policy_version_age_distribution(
+            torch.tensor([4, 3, 0, 20]),
+            20,
+            torch.tensor([True, True, True, False]),
+        )
+    result = tracker.export()
+    prefix = "version_stats/"
+    expected = {
+        "age_0_fraction": 1 / 7,
+        "age_1_fraction": 1 / 7,
+        "age_16_fraction": 1 / 7,
+        "age_gt_16_fraction": 2 / 7,
+        "invalid_version_fraction": 1 / 7,
+        "future_version_fraction": 1 / 7,
+    }
+    for key, fraction in expected.items():
+        assert result[prefix + key] == pytest.approx(fraction)
+    assert sum(result[prefix + key] for key in expected) == pytest.approx(1)
+    assert result[prefix + "age_2_fraction"] == 0
+
+
+def test_version_age_fractions_omit_empty_supervised_population():
+    tracker = DistributedStatsTracker()
+    with patch("areal.trainer.ppo.actor.stats_tracker", tracker):
+        _log_policy_version_age_distribution(
+            torch.tensor([-1, 2]), 2, torch.tensor([False, False])
+        )
+    assert tracker.export() == {}
 
 
 def test_train_infer_masks_nonfinite_padding_and_weights_unequal_batches():

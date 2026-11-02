@@ -543,6 +543,9 @@ class PPOActor:
                 _log_version_staleness_stats(
                     metric_versions, self.engine.get_version(), loss_mask.bool()
                 )
+                _log_policy_version_age_distribution(
+                    metric_versions, self.engine.get_version(), loss_mask.bool()
+                )
         if group_metrics is not None:
             group_starts, usable_group_sizes, group_loss_weights = group_metrics
             stats_tracker.stat(
@@ -1846,3 +1849,44 @@ def _log_version_staleness_stats(
             v_theta=v_theta,
             v_proximal=v_proximal,
         )
+
+
+_MAX_EXACT_POLICY_VERSION_AGE = 16
+
+
+def _log_policy_version_age_distribution(
+    versions: torch.Tensor,
+    current_version: int,
+    loss_mask: torch.Tensor,
+) -> None:
+    """Report pre-filter token fractions by checkpoint age across workers.
+
+    The supervised-token count is the common denominator, including tokens
+    with invalid or future versions. Fixed bins keep metric keys and the
+    distributed reduction order identical on every worker.
+    """
+    max_age = _MAX_EXACT_POLICY_VERSION_AGE
+    age = current_version - versions.to(torch.int64)
+    bins = torch.where(
+        versions < 0,
+        max_age + 2,
+        torch.where(
+            versions > current_version, max_age + 3, age.clamp(max=max_age + 1)
+        ),
+    )
+    counts = torch.zeros(max_age + 4, dtype=torch.int64, device=versions.device)
+    counts.scatter_add_(0, bins.reshape(-1), loss_mask.reshape(-1).to(torch.int64))
+    total = counts.sum().float()
+    fractions = counts.float() / total.clamp_min(1)
+
+    with stats_tracker.scope("version_stats"):
+        for age_bin in range(max_age + 1):
+            stats_tracker.weighted_mean(
+                f"age_{age_bin}_fraction", fractions[age_bin], total
+            )
+        for name, bin_index in (
+            (f"age_gt_{max_age}_fraction", max_age + 1),
+            ("invalid_version_fraction", max_age + 2),
+            ("future_version_fraction", max_age + 3),
+        ):
+            stats_tracker.weighted_mean(name, fractions[bin_index], total)

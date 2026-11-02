@@ -113,6 +113,11 @@ def test_actor_version_mask_is_opt_in_and_applied_before_packing(enabled):
     assert data["input_token_loss_mask"].tolist() == [[False, True, True, True]]
     metrics = tracker.export()
     assert metrics["update/version_stats/sample_staleness_theta_max"] == 5
+    for age in (0, 1, 5):
+        assert metrics[f"update/version_stats/age_{age}_fraction"] == pytest.approx(
+            1 / 3
+        )
+    assert "update/version_filtered/version_stats/age_0_fraction" not in metrics
     if not enabled:
         assert "policy_version_mask" not in data
         assert "mtp_version_mask" not in data
