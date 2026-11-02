@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from copy import deepcopy
@@ -35,6 +36,40 @@ from areal.utils import stats_tracker
 # ---------------------------------------------------------------------------
 
 _ADMIN_KEY = "test-admin-key"
+
+
+@pytest.mark.parametrize("warn_once", [True, False])
+def test_unsupported_argument_warnings_ignore_changing_user_values(
+    monkeypatch, warn_once
+):
+    monkeypatch.setattr(srv, "_warn_once_enabled", warn_once)
+    monkeypatch.setattr(srv, "_warned_messages", set())
+    warning = MagicMock()
+    monkeypatch.setattr(srv.logger, "warning", warning)
+    monkeypatch.setattr(srv, "_openai_client", object())
+    srv._session_cache["session"] = SessionData(session_id="session")
+
+    async def create_fn(messages=None, temperature=1.0, top_p=1.0, areal_cache=None):
+        return messages
+
+    async def exercise_requests():
+        request = {"messages": [], "temperature": 1.0, "top_p": 1.0}
+        for user in ("first-user", "second-user"):
+            result = await srv._call_client_create(
+                create_fn,
+                {**request, "user": user, "reasoning_effort": "high"},
+                "session",
+            )
+            assert result == []
+
+        assert warning.call_count == (1 if warn_once else 2)
+        assert "first-user" in warning.call_args_list[0].args[0]
+        await srv._call_client_create(
+            create_fn, {**request, "unsupported_option": "new-field"}, "session"
+        )
+        assert warning.call_count == (2 if warn_once else 3)
+
+    asyncio.run(exercise_requests())
 
 
 @pytest.mark.asyncio
@@ -174,6 +209,7 @@ def _reset_server_globals(monkeypatch):
     monkeypatch.setattr(srv, "_api_key_to_session", {})
     monkeypatch.setattr(srv, "_session_to_api_key", {})
     monkeypatch.setattr(srv, "_session_invalid_tool_errors", {})
+    monkeypatch.setattr(srv, "_session_creation_receipts", {})
     monkeypatch.setattr(srv, "_capacity", 0)
     monkeypatch.setattr(srv, "_admin_api_key", _ADMIN_KEY)
     monkeypatch.setattr(srv, "_lock", threading.Lock())
@@ -551,6 +587,200 @@ async def test_internal_generation_failure_is_reported_when_session_ends(monkeyp
 # ---------------------------------------------------------------------------
 # Tests: start_session with provided api_key
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_creation_concurrent_retries_consume_one_credit(monkeypatch):
+    """Concurrent duplicates recover the same credentials even at zero capacity."""
+    monkeypatch.setattr(srv, "_capacity", 1)
+    payload = {"task_id": "group:0", "idempotency_key": "creation-a"}
+    async with _client() as client:
+        responses = await asyncio.gather(
+            *[
+                client.post("/rl/start_session", headers=_admin_headers(), json=payload)
+                for _ in range(12)
+            ]
+        )
+    assert all(response.status_code == 200 for response in responses)
+    assert all(response.json() == responses[0].json() for response in responses)
+    assert len(srv._session_cache) == 1
+    assert srv._capacity == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expired", [False, True])
+async def test_session_creation_late_retry_does_not_revive_session(
+    monkeypatch, expired
+):
+    """Completion or TTL cleanup leaves a receipt that prevents another creation."""
+    monkeypatch.setattr(srv, "_capacity", 2)
+    payload = {"task_id": "group:0", "idempotency_key": "creation-a"}
+    async with _client() as client:
+        first = await client.post(
+            "/rl/start_session", headers=_admin_headers(), json=payload
+        )
+        session = srv._session_cache[first.json()["session_id"]]
+        if expired:
+            monkeypatch.setattr(session, "_last_access_time", 0)
+            monkeypatch.setattr(srv, "_last_cleanup_time", 0)
+        else:
+            session.finish()
+        late = await client.post(
+            "/rl/start_session", headers=_admin_headers(), json=payload
+        )
+    assert late.status_code == 410
+    assert srv._capacity == 1
+    assert len(srv._session_creation_receipts) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_creation_key_conflict_and_distinct_attempts(monkeypatch):
+    """Keys identify creation attempts, not task names, and cannot change parameters."""
+    monkeypatch.setattr(srv, "_capacity", 2)
+    payload = {"task_id": "group:0", "idempotency_key": "creation-a"}
+    async with _client() as client:
+        first = await client.post(
+            "/rl/start_session", headers=_admin_headers(), json=payload
+        )
+        conflict = await client.post(
+            "/rl/start_session",
+            headers=_admin_headers(),
+            json={**payload, "metadata": {"changed": True}},
+        )
+        second = await client.post(
+            "/rl/start_session",
+            headers=_admin_headers(),
+            json={**payload, "idempotency_key": "creation-b"},
+        )
+    assert conflict.status_code == 409
+    assert first.status_code == second.status_code == 200
+    assert first.json()["session_id"] != second.json()["session_id"]
+    assert srv._capacity == 0
+
+
+@pytest.mark.asyncio
+async def test_session_client_lost_response_retry_preserves_other_sample_credit(
+    monkeypatch,
+):
+    """Lose the first committed response, then exercise the actual client retry path."""
+    from tenacity import wait_none
+
+    from areal.experimental.openai.proxy import client_session
+
+    monkeypatch.setattr(srv, "_capacity", 2)
+    monkeypatch.setattr(client_session._start_session.retry, "wait", wait_none())
+    attempts = []
+    async with _client() as client:
+
+        async def post_with_lost_response(session, url, payload, headers):
+            attempts.append(payload.idempotency_key)
+            response = await client.post(
+                "/rl/start_session", headers=headers, json=payload.model_dump()
+            )
+            response.raise_for_status()
+            if len(attempts) == 1:
+                raise TimeoutError("Response lost after server committed")
+            return response.json()
+
+        monkeypatch.setattr(client_session, "post_json", post_with_lost_response)
+        proxy_client = client_session.OpenAIProxyClient(
+            session=None,
+            base_url="http://testserver",
+            task_id="group:0",
+            admin_api_key=_ADMIN_KEY,
+        )
+        await proxy_client.__aenter__()
+        sibling = await client.post(
+            "/rl/start_session",
+            headers=_admin_headers(),
+            json={"task_id": "group:1", "idempotency_key": "sibling"},
+        )
+    assert len(attempts) == 2
+    assert attempts[0] == attempts[1]
+    assert proxy_client.session_id == "group:0-0"
+    assert sibling.status_code == 200
+    assert len(srv._session_cache) == 2
+    assert srv._capacity == 0
+
+
+@pytest.mark.asyncio
+async def test_discard_failed_session_releases_only_its_own_resources(monkeypatch):
+    """Discard removes retained trajectories and keys without double-releasing siblings."""
+    monkeypatch.setattr(srv, "_capacity", 2)
+    payload = {
+        "task_id": "group:0",
+        "idempotency_key": "a",
+        "processor_cache_group_id": "train:group",
+        "processor_cache_group_size": 2,
+    }
+    async with _client() as client:
+        first = (
+            await client.post(
+                "/rl/start_session", headers=_admin_headers(), json=payload
+            )
+        ).json()
+        sibling = (
+            await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={**payload, "task_id": "group:1", "idempotency_key": "b"},
+            )
+        ).json()
+        session = srv._session_cache[first["session_id"]]
+        session.completions["turn"] = InteractionWithTokenLogpReward(reward=0.0)
+        await client.post(
+            "/rl/end_session", headers={"Authorization": f"Bearer {first['api_key']}"}
+        )
+        assert first["session_id"] in srv._session_cache
+        for _ in range(2):
+            response = await client.post(
+                "/rl/discard_session",
+                headers=_admin_headers(),
+                json={"session_id": first["session_id"], "idempotency_key": "a"},
+            )
+            assert response.status_code == 200
+        assert first["session_id"] not in srv._session_cache
+        assert first["api_key"] not in srv._api_key_to_session
+        assert sibling["session_id"] in srv._session_cache
+        assert srv._processor_cache_registry._entries["train:group"].active_users == 1
+        retry = await client.post(
+            "/rl/start_session", headers=_admin_headers(), json=payload
+        )
+        assert retry.status_code == 410
+    assert srv._capacity == 0
+
+
+@pytest.mark.asyncio
+async def test_discard_requires_admin_and_cannot_remove_newer_creation(monkeypatch):
+    """Session credentials lack discard authority; stale cleanup cannot hit a new session."""
+    monkeypatch.setattr(srv, "_capacity", 2)
+    async with _client() as client:
+        first = (
+            await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={"task_id": "task", "idempotency_key": "a"},
+            )
+        ).json()
+        cleanup = {"session_id": first["session_id"], "idempotency_key": "a"}
+        forbidden = await client.post(
+            "/rl/discard_session",
+            json=cleanup,
+            headers={"Authorization": f"Bearer {first['api_key']}"},
+        )
+        assert forbidden.status_code == 403
+        await client.post("/rl/discard_session", headers=_admin_headers(), json=cleanup)
+        second = (
+            await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={"task_id": "task", "idempotency_key": "b"},
+            )
+        ).json()
+        assert first["session_id"] == second["session_id"]
+        await client.post("/rl/discard_session", headers=_admin_headers(), json=cleanup)
+        assert srv._session_to_api_key[second["session_id"]] == second["api_key"]
+        assert second["session_id"] in srv._session_cache
 
 
 class TestStartSessionApiKey:

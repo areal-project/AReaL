@@ -1055,7 +1055,15 @@ def test_core_context_budget_exhaustion_keeps_zero_with_matching_native_receipt(
 
 @pytest.mark.parametrize(
     "failure",
-    ["legacy_context", "current_context", "provider_context", "whitebox_deadline"],
+    [
+        "legacy_context",
+        "current_context",
+        "provider_context",
+        "whitebox_deadline",
+        "core_turn_deadline",
+        "runner_deadline",
+        "abbreviated_deadline",
+    ],
 )
 def test_context_budget_failure_fetches_native_receipt_before_classification(
     monkeypatch,
@@ -1083,6 +1091,15 @@ def test_context_budget_failure_fetches_native_receipt_before_classification(
         )
         if failure == "provider_context":
             error = _provider_context_failure_error()
+        elif failure in (
+            "core_turn_deadline",
+            "runner_deadline",
+            "abbreviated_deadline",
+        ):
+            error = _native_deadline_error(
+                "runner_deadline" if failure != "core_turn_deadline" else failure,
+                abbreviated=failure == "abbreviated_deadline",
+            )
         receipt = error.harness_result
         error.harness_result = None
         fetch_method = "get_harness_result_async"
@@ -2203,3 +2220,113 @@ def _whitebox_deadline_error():
         "native_receipt_synthesized": False,
     }
     return error
+
+
+def _native_deadline_error(source="core_turn_deadline", abbreviated=False):
+    error = _core_model_failure_error(
+        "AGENT_RUN_TIMEOUT", "unused", "turn deadline exceeded"
+    )
+    outcome = {
+        "schema": "areal.envarena-outcome.v1",
+        "code": "AGENT_RUN_TIMEOUT",
+        "class": "agent",
+        "source": source,
+        "details": {"goalDeadlineReached": False}
+        if source == "core_turn_deadline"
+        else {"reason": "process_deadline"},
+    }
+    raw = dict(error.result.raw)
+    raw["outcome"] = outcome
+    error.result = replace(error.result, raw=raw)
+    receipt = error.harness_result
+    receipt["raw"] = {"outcome": outcome.copy()}
+    receipt["error"][0]["outcome"] = {k: v for k, v in outcome.items() if k != "schema"}
+    if source == "runner_deadline":
+        receipt["exit_code"] = -15
+        receipt["turn_statuses"] = ["running"]
+        receipt["error"] = [None]
+    if abbreviated:
+        error.result = replace(
+            error.result,
+            raw={
+                "error": "harness: harness agent phase exited with code 1: "
+                "harness: running task lifecycle (runner=/tmp/runner)\n"
+                "harness: running setup hook (timeout=10m0s)"
+            },
+        )
+    return error
+
+
+@pytest.mark.parametrize("source", ["core_turn_deadline", "runner_deadline"])
+@pytest.mark.parametrize("abbreviated", [False, True])
+def test_native_deadline_requires_verified_receipt(source, abbreviated):
+    error = _native_deadline_error(source, abbreviated)
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=0
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_receipt",
+        "external_signal",
+        "provider_timeout",
+        "schema",
+        "adapter_error",
+        "collection",
+        "receipt_conflict",
+        "phase",
+        "score",
+        "core_error",
+        "bare_code",
+        "exit",
+    ],
+)
+@pytest.mark.parametrize("source", ["core_turn_deadline", "runner_deadline"])
+def test_native_deadline_rejects_infrastructure_or_conflicting_receipts(source, fault):
+    error = _native_deadline_error(source)
+    raw, receipt = error.result.raw, error.harness_result
+    if fault == "missing_receipt":
+        error.harness_result = None
+    elif fault == "external_signal":
+        raw["outcome"]["code"] = "HARNESS_INTERRUPTED"
+    elif fault == "provider_timeout":
+        raw["outcome"]["source"] = "provider_http"
+    elif fault == "schema":
+        raw["outcome"]["schema"] = "other"
+    elif fault == "adapter_error":
+        receipt["raw"]["adapter_error"] = {"message": "collect failed"}
+    elif fault == "collection":
+        receipt["collection"] = {"status": "ERROR"}
+    elif fault == "receipt_conflict":
+        receipt["raw"]["outcome"]["source"] = "runner_signal"
+    elif fault == "phase":
+        raw["harness"]["phase"] = "setup"
+    elif fault == "score":
+        error.result = replace(error.result, score=1.0)
+    elif fault == "core_error":
+        if source == "core_turn_deadline":
+            receipt["error"][0]["outcome"]["code"] = "HARNESS_INTERNAL_ERROR"
+        else:
+            receipt["exit_code"] = 139
+    elif fault == "bare_code":
+        raw.pop("outcome")
+        raw["outcome_code"] = "AGENT_RUN_TIMEOUT"
+    elif fault == "exit":
+        receipt["exit_code"] = 0
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=True, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )

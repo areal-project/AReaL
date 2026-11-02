@@ -91,6 +91,9 @@ class _FakeProxyClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         return None
 
+    async def discard_session(self):
+        self.discarded = True
+
     async def set_last_reward(self, reward: float):
         self.last_reward = reward
         self.interaction.reward = reward
@@ -102,6 +105,51 @@ class _FakeProxyClient:
         if self.interaction_count == 0:
             return {}
         return {"completion-1": self.interaction}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exit_kind", ["cancel", "agent_error", "export_error", "empty"]
+)
+@pytest.mark.parametrize("cleanup_error", [False, True])
+async def test_proxy_workflow_discards_session_on_every_unexported_exit(
+    monkeypatch, exit_kind, cleanup_error
+):
+    """Cancellation and export failures release sessions without hiding the original error."""
+    client = _FakeProxyClient()
+    client.context_overflow = False
+    client.discard_session = AsyncMock(
+        side_effect=TimeoutError("cleanup unavailable") if cleanup_error else None
+    )
+    monkeypatch.setattr(workflow_module, "OpenAIProxyClient", lambda **_: client)
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=_SuccessfulAgent())
+    monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
+    original = None
+    if exit_kind in {"cancel", "agent_error"}:
+        original = (
+            asyncio.CancelledError()
+            if exit_kind == "cancel"
+            else RuntimeError("agent failed")
+        )
+        monkeypatch.setattr(workflow, "_run_agent", AsyncMock(side_effect=original))
+    elif exit_kind == "export_error":
+        original = RuntimeError("export failed")
+        client.export_interactions = AsyncMock(side_effect=original)
+    else:
+        client.export_interactions = AsyncMock(return_value={})
+    try:
+        if original is None:
+            assert await workflow.arun_episode(None, {}) is None
+        else:
+            with pytest.raises(type(original)) as caught:
+                await workflow.arun_episode(None, {})
+            assert caught.value is original
+        client.discard_session.assert_awaited_once()
+    finally:
+        stats_tracker.export_all(reset=True)
 
 
 @pytest.mark.parametrize("receipt", ["envelope", "full"])
@@ -290,6 +338,82 @@ def test_gameagent_metadata_does_not_change_receipt_family():
         )
         == "model_failure_zero"
     )
+
+
+def _claude_deadline_raw():
+    return {
+        "error": "harness: harness agent phase exited with code 1: "
+        "harness: running task lifecycle (claude=/tmp/claude, session=uuid)\n"
+        "harness: running setup hook (timeout=10m0s)",
+        "harness": {"phase": "agent", "exit_code": 1},
+        "areal_claude_deadline": {
+            "status": "ERROR",
+            "summary": "AGENT_RUN_TIMEOUT",
+            "raw": {
+                "schema": "areal-claude-deadline/v1",
+                "task_id": "task",
+                "attempt": 1,
+                "outcome_code": "AGENT_RUN_TIMEOUT",
+                "trigger": "RUNTIME_EXECUTION_DEADLINE",
+                "budget_seconds": 7170,
+                "elapsed_seconds": 7170.2,
+                "child_returncode": -15,
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "missing",
+        "task",
+        "early",
+        "nan",
+        "trigger",
+        "returncode",
+        "phase",
+        "attempt",
+        "native",
+    ],
+)
+def test_claude_deadline_requires_a_correlated_runtime_receipt(fault):
+    """Normal setup timeout text cannot veto a typed deadline; malformed receipts cannot rescue it."""
+    raw = _claude_deadline_raw()
+    detail = raw["areal_claude_deadline"]["raw"]
+    if fault == "missing":
+        raw.pop("areal_claude_deadline")
+    elif fault == "task":
+        detail["task_id"] = "another-task"
+    elif fault == "early":
+        detail["elapsed_seconds"] = 10
+    elif fault == "nan":
+        detail["budget_seconds"] = float("nan")
+    elif fault == "trigger":
+        detail["trigger"] = "EXTERNAL_CANCEL"
+    elif fault == "returncode":
+        detail["child_returncode"] = None
+    elif fault == "phase":
+        raw["harness"]["phase"] = "collect"
+    elif fault == "attempt":
+        detail["attempt"] = 2
+    elif fault == "native":
+        raw["nativeExportHealthy"] = False
+    error = ArenaTaskFailedError(
+        "task",
+        "HARNESS_FAILED",
+        result=ArenaTaskResult(
+            "task",
+            "HARNESS_FAILED",
+            0.0,
+            raw=raw,
+            artifacts_uri="task/task/workspace/attempts/1/",
+        ),
+    )
+    assert ArenaStreamAgentWorkflow.classify_proxy_failure(
+        error, context_overflow=False, interaction_count=1
+    ) == ("model_failure_zero" if fault is None else "unknown_failure_reject")
 
 
 @pytest.mark.asyncio
@@ -916,6 +1040,7 @@ async def test_arena_unhealthy_receipt_rejection_preserves_failure_scope(
     assert fake_client.last_reward is None
     fake_client.export_interactions.assert_not_awaited()
     agent.persist_episode_result.assert_awaited_once_with({}, None)
+    assert fake_client.discarded
 
 
 @pytest.mark.asyncio
@@ -923,6 +1048,7 @@ async def test_arena_unhealthy_receipt_rejection_preserves_failure_scope(
 @pytest.mark.parametrize(
     "raw,requires_overflow",
     [
+        (_claude_deadline_raw(), False),
         ({"outcome_code": "AGENT_MAX_TURNS_EXCEEDED"}, False),
         (
             {
@@ -976,7 +1102,11 @@ async def test_arena_legacy_model_failure_requires_usable_proxy_trajectory(
         task_id="task",
         status="HARNESS_FAILED",
         result=ArenaTaskResult(
-            task_id="task", status="HARNESS_FAILED", score=0.0, raw=raw
+            task_id="task",
+            status="HARNESS_FAILED",
+            score=0.0,
+            raw=raw,
+            artifacts_uri="task/task/workspace/attempts/1/",
         ),
     )
     workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
@@ -1014,4 +1144,85 @@ async def test_arena_legacy_model_failure_requires_usable_proxy_trajectory(
                 agent.persist_episode_result.assert_awaited_once_with({}, 0.0)
     finally:
         workflow_context.set(WorkflowContext())
+        stats_tracker.export_all(reset=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["core_turn_deadline", "runner_deadline"])
+@pytest.mark.parametrize(
+    "trajectory", ["usable", "system_error", "no_interactions", "failed_export"]
+)
+async def test_native_deadline_zero_requires_usable_proxy_export(
+    monkeypatch, source, trajectory
+):
+    monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    client = _FakeProxyClient(
+        interaction_count=0 if trajectory == "no_interactions" else 1
+    )
+    client.system_error = trajectory == "system_error"
+    client.export_interactions = AsyncMock(
+        return_value={"completion-1": client.interaction},
+        side_effect=RuntimeError("export failed")
+        if trajectory == "failed_export"
+        else None,
+    )
+    monkeypatch.setattr(workflow_module, "OpenAIProxyClient", lambda **_: client)
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    outcome = {
+        "schema": "areal.envarena-outcome.v1",
+        "code": "AGENT_RUN_TIMEOUT",
+        "class": "agent",
+        "source": source,
+        "details": {"goalDeadlineReached": False}
+        if source == "core_turn_deadline"
+        else {"reason": "process_deadline"},
+    }
+    summary = "GAMEAGENT_OUTCOME_CODE=AGENT_RUN_TIMEOUT GAMEAGENT_OUTCOME_CLASS=agent"
+    raw = {
+        "outcome": outcome,
+        "harness": {
+            "phase": "agent",
+            "result_status": "ERROR",
+            "exit_code": 1,
+            "summary": summary,
+        },
+    }
+    error = ArenaTaskFailedError(
+        "task",
+        "HARNESS_FAILED",
+        result=ArenaTaskResult("task", "HARNESS_FAILED", 0.0, raw=raw),
+    )
+    error.harness_result = {
+        "implementation": "rust-core-runtime",
+        "status": "ERROR",
+        "summary": summary,
+        "exit_code": 1 if source == "core_turn_deadline" else -15,
+        "turn_statuses": ["failed"],
+        "delivery": None,
+        "raw": {"outcome": outcome},
+        "error": [{"message": "turn deadline exceeded", "outcome": outcome}],
+    }
+    agent = ArenaStreamAgentWorkflow()
+    agent.persist_episode_result = AsyncMock()
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
+    monkeypatch.setattr(workflow, "_run_agent", AsyncMock(side_effect=error))
+    monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
+    monkeypatch.setattr(workflow, "_record_interaction_stats", lambda *_, **__: None)
+    monkeypatch.setattr(workflow, "record_episode_metrics", lambda *_, **__: None)
+    try:
+        if trajectory in ("system_error", "no_interactions"):
+            with pytest.raises(ArenaTaskFailedError):
+                await workflow.arun_episode(None, {})
+            client.export_interactions.assert_not_awaited()
+        elif trajectory == "failed_export":
+            with pytest.raises(RuntimeError, match="export failed"):
+                await workflow.arun_episode(None, {})
+            agent.persist_episode_result.assert_not_awaited()
+        else:
+            result = await workflow.arun_episode(None, {})
+            assert result["completion-1"].reward == 0.0
+    finally:
         stats_tracker.export_all(reset=True)

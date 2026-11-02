@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import runpy
+import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,6 +15,50 @@ def _cuda_device_namespace(monkeypatch):
     monkeypatch.setattr(
         sglang_remote.current_platform, "device_control_env_var", "CUDA_VISIBLE_DEVICES"
     )
+
+
+@pytest.mark.parametrize("log_requests", [False, True, None])
+def test_awex_request_logging_survives_different_sglang_defaults(
+    monkeypatch, log_requests
+):
+    child = {}
+    monkeypatch.setattr(
+        sglang_remote.subprocess,
+        "Popen",
+        lambda *args, **kwargs: child.update(kwargs) or MagicMock(),
+    )
+    args = {
+        "model_path": "model",
+        "port": 19000,
+        "nccl_port": 19001,
+        "awex_meta_server_addr": "127.0.0.1:1234",
+    }
+    if log_requests is not None:
+        args["log_requests"] = log_requests
+    sglang_remote.SGLangBackend().launch_server(args)
+    monkeypatch.setenv(
+        "AREAL_SGLANG_LOG_REQUESTS", child["env"]["AREAL_SGLANG_LOG_REQUESTS"]
+    )
+
+    # Simulate a SGLang parser that defaults logging to true even though
+    # AReaL's command omitted the false flag. Exercise the real AWEX entry.
+    parsed = SimpleNamespace(skip_server_warmup=True, log_requests=True)
+    launch = MagicMock()
+    cleanup = MagicMock()
+    for name, module in {
+        "sglang.srt.entrypoints.http_server": SimpleNamespace(launch_server=launch),
+        "sglang.srt.server_args": SimpleNamespace(
+            prepare_server_args=lambda argv: parsed
+        ),
+        "sglang.srt.utils": SimpleNamespace(kill_process_tree=cleanup),
+        "sglang.srt.plugins": SimpleNamespace(),
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(sys, "argv", ["sglang_plugin"])
+    runpy.run_module("areal.engine.awex.plugins.sglang_plugin", run_name="__main__")
+
+    assert launch.call_args.args[0].log_requests is (log_requests is True)
+    cleanup.assert_called_once()
 
 
 @pytest.mark.parametrize(

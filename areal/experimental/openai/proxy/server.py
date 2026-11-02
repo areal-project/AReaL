@@ -56,13 +56,18 @@ def derive_session_gateway_token(admin_api_key: str, session_id: str) -> str:
 
 
 class StartSessionRequest(BaseModel):
-    """Request to start a new RL session."""
+    """Request to start a new RL session.
+
+    Reuse ``idempotency_key`` only for retries of the same creation attempt.
+    New attempts, including those with the same task ID, need a fresh key.
+    """
 
     task_id: str
     api_key: str | None = None  # Reuse a previously-issued key (refresh)
     processor_cache_group_id: str | None = None
     processor_cache_group_size: int = 1
     metadata: dict[str, Any] | None = None
+    idempotency_key: str | None = Field(default=None, min_length=1)
 
 
 class StartSessionResponse(BaseModel):
@@ -70,6 +75,13 @@ class StartSessionResponse(BaseModel):
 
     session_id: str
     api_key: str
+
+
+class DiscardSessionRequest(BaseModel):
+    """Release an abandoned session without exporting its trajectories."""
+
+    session_id: str
+    idempotency_key: str | None = None
 
 
 class ProcessorCacheGroupRequest(BaseModel):
@@ -328,6 +340,7 @@ def deserialize_interactions(
 
 RL_START_SESSION_PATHNAME = "rl/start_session"
 RL_END_SESSION_PATHNAME = "rl/end_session"
+RL_DISCARD_SESSION_PATHNAME = "rl/discard_session"
 RL_END_PROCESSOR_CACHE_GROUP_PATHNAME = "rl/end_processor_cache_group"
 RL_FETCH_SHARED_TENSORS_PATHNAME = "rl/fetch_shared_tensors"
 RL_SET_REWARD_PATHNAME = "rl/set_reward"

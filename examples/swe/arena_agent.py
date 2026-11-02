@@ -13,7 +13,7 @@ import stat
 import uuid
 from contextlib import suppress
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Real
 from pathlib import Path
 from typing import Any, Literal
@@ -855,6 +855,96 @@ class ArenaStreamAgentWorkflow:
         )
 
     @classmethod
+    def _core_execution_timeout_outcome(cls, raw: Any) -> dict[str, Any] | None:
+        """Recognize an explicit native deadline, independently of log wording."""
+        if not isinstance(raw, dict):
+            return None
+        outcome, harness = raw.get("outcome"), raw.get("harness")
+        if not isinstance(outcome, dict) or not isinstance(harness, dict):
+            return None
+        if (
+            outcome.get("schema") != "areal.envarena-outcome.v1"
+            or outcome.get("code") != "AGENT_RUN_TIMEOUT"
+            or outcome.get("class") != "agent"
+            or cls._gameagent_outcome_code(raw) != "AGENT_RUN_TIMEOUT"
+            or harness.get("phase") != "agent"
+            or harness.get("result_status") != "ERROR"
+            or type(harness.get("exit_code")) is not int
+            or harness["exit_code"] != 1
+            or harness.get("summary")
+            != "GAMEAGENT_OUTCOME_CODE=AGENT_RUN_TIMEOUT GAMEAGENT_OUTCOME_CLASS=agent"
+            or raw.get("failure") is not None
+        ):
+            return None
+        details = outcome.get("details")
+        if not isinstance(details, dict):
+            return None
+        if outcome.get("source") == "runner_deadline":
+            return outcome if details == {"reason": "process_deadline"} else None
+        if outcome.get("source") == "core_turn_deadline" and (
+            set(details) == {"goalDeadlineReached"}
+            and type(details["goalDeadlineReached"]) is bool
+        ):
+            return outcome
+        return None
+
+    @classmethod
+    def _is_core_execution_timeout(cls, raw: Any, receipt: Any) -> bool:
+        """Require the native receipt to corroborate the Arena deadline envelope."""
+        if cls._is_abbreviated_runner_failure(raw) and isinstance(receipt, dict):
+            native_raw = receipt.get("raw")
+            raw = {
+                "outcome": native_raw.get("outcome")
+                if isinstance(native_raw, dict)
+                else None,
+                "harness": {
+                    "phase": "agent",
+                    "result_status": "ERROR",
+                    "exit_code": 1,
+                    "summary": receipt.get("summary"),
+                },
+            }
+        expected = cls._core_execution_timeout_outcome(raw)
+        if expected is None or not isinstance(receipt, dict):
+            return False
+        native_raw = receipt.get("raw")
+        if (
+            receipt.get("implementation") != "rust-core-runtime"
+            or receipt.get("status") != "ERROR"
+            or receipt.get("delivery") is not None
+            or receipt.get("failure") is not None
+            or receipt.get("summary") != raw["harness"]["summary"]
+            or not isinstance(native_raw, dict)
+            or native_raw.get("outcome") != expected
+            or "adapter_error" in native_raw
+            or (
+                receipt.get("collection") is not None
+                and (
+                    not isinstance(receipt["collection"], dict)
+                    or receipt["collection"].get("status") != "OK"
+                )
+            )
+            or type(receipt.get("exit_code")) is not int
+        ):
+            return False
+        if expected["source"] == "runner_deadline":
+            return receipt["exit_code"] in (-9, -15)
+        errors = receipt.get("error")
+        if receipt["exit_code"] != 1 or receipt.get("turn_statuses") != ["failed"]:
+            return False
+        if (
+            not isinstance(errors, list)
+            or len(errors) != 1
+            or not isinstance(errors[0], dict)
+        ):
+            return False
+        core_outcome = errors[0].get("outcome")
+        return isinstance(core_outcome, dict) and all(
+            core_outcome.get(key) == expected[key]
+            for key in ("code", "class", "source", "details")
+        )
+
+    @classmethod
     def _is_core_agent_zero_failure(
         cls, raw: Any, receipt: Any, *, invalid_tool_json: bool = False
     ) -> bool:
@@ -1181,8 +1271,84 @@ class ArenaStreamAgentWorkflow:
     def _gameagent_outcome_metric_code(cls, raw: Any) -> str:
         """Normalize Harness outcomes to the bounded metric cardinality."""
 
+        if isinstance(raw, dict) and isinstance(raw.get("areal_claude_deadline"), dict):
+            # This field is attached only after retrieving a runtime receipt.
+            receipt = raw["areal_claude_deadline"]
+            detail = receipt.get("raw")
+            if (
+                receipt.get("status") == "ERROR"
+                and isinstance(detail, dict)
+                and detail.get("schema") == "areal-claude-deadline/v1"
+                and detail.get("outcome_code") == "AGENT_RUN_TIMEOUT"
+            ):
+                return "AGENT_RUN_TIMEOUT"
         code = cls._gameagent_outcome_code(raw)
         return code if code in HARNESS_OUTCOME_METRIC_CODES else "OTHER"
+
+    @staticmethod
+    def _runtime_deadline_attempt(result: ArenaTaskResult | None) -> int | None:
+        uri = result.artifacts_uri if result is not None else None
+        if not isinstance(uri, str):
+            return None
+        match = re.search(r"(?:^|/)attempts/([1-9]\d*)/?$", urlparse(uri).path)
+        return int(match[1]) if match else None
+
+    @staticmethod
+    def _is_claude_runtime_deadline(error: ArenaTaskFailedError) -> bool:
+        """Accept a correlated runtime deadline receipt, never a killed-process guess."""
+        result = error.result
+        raw = result.raw if result is not None else None
+        if (
+            error.status != "HARNESS_FAILED"
+            or result is None
+            or result.score not in (None, 0.0)
+            or not isinstance(raw, dict)
+        ):
+            return False
+        if any(isinstance(key, str) and key.startswith("native") for key in raw) or any(
+            key in raw
+            for key in (
+                "runTerminals",
+                "runFailures",
+                "exportedRunCount",
+                "implementation",
+                "outcome",
+                "outcome_code",
+            )
+        ):
+            return False
+        envelope = raw.get("harness")
+        if envelope is not None and (
+            not isinstance(envelope, dict)
+            or envelope.get("phase") != "agent"
+            or type(envelope.get("exit_code")) is not int
+            or envelope["exit_code"] != 1
+        ):
+            return False
+        receipt = raw.get("areal_claude_deadline")
+        if not isinstance(receipt, dict) or receipt.get("status") != "ERROR":
+            return False
+        detail = receipt.get("raw")
+        if not isinstance(detail, dict) or (
+            detail.get("schema") != "areal-claude-deadline/v1"
+            or detail.get("task_id") != error.task_id
+            or type(detail.get("attempt")) is not int
+            or detail["attempt"]
+            != ArenaStreamAgentWorkflow._runtime_deadline_attempt(result)
+            or detail.get("outcome_code") != "AGENT_RUN_TIMEOUT"
+            or detail.get("trigger") != "RUNTIME_EXECUTION_DEADLINE"
+            or type(detail.get("child_returncode")) is not int
+        ):
+            return False
+        budget = detail.get("budget_seconds")
+        elapsed = detail.get("elapsed_seconds")
+        return (
+            type(budget) in (int, float)
+            and type(elapsed) in (int, float)
+            and math.isfinite(budget)
+            and math.isfinite(elapsed)
+            and 0 < budget <= elapsed
+        )
 
     @staticmethod
     def _is_abbreviated_whitebox_failure(raw: Any) -> bool:
@@ -1258,7 +1424,7 @@ class ArenaStreamAgentWorkflow:
         if cls._is_whitebox_execution_timeout(error):
             return True
         result_format = cls._harness_result_format(raw)
-        if result_format is None:
+        if not isinstance(raw, dict):
             return False
         if "trajectoryHealth" in raw and raw["trajectoryHealth"] != "healthy":
             return False
@@ -1266,12 +1432,29 @@ class ArenaStreamAgentWorkflow:
             return False
         if "status" in raw and raw["status"] != "ERROR":
             return False
+        if result_format in (None, "legacy-claude") and cls._is_claude_runtime_deadline(
+            error
+        ):
+            return True
+        if result_format is None:
+            return False
         if result_format == "native-runner":
+            if result.score in (None, 0.0) and cls._is_core_execution_timeout(
+                raw, error.harness_result
+            ):
+                return True
             if cls._is_abbreviated_runner_failure(raw) and result.score != 0.0:
                 return False
             return (
                 context_overflow and cls._is_runner_context_failure(raw)
             ) or cls._is_runner_model_failure(raw, error.harness_result)
+        if (
+            result_format == "gameagent"
+            and result is not None
+            and result.score in (None, 0.0)
+            and cls._is_core_execution_timeout(raw, error.harness_result)
+        ):
+            return True
         if (
             result_format == "gameagent"
             and result is not None
@@ -1839,9 +2022,41 @@ class ArenaStreamAgentWorkflow:
                 _record_arena_metrics(**{"arena/call_success": 0.0})
                 if exc.result is not None:
                     self._task_result.set(exc.result)
+                    if (
+                        exc.status == "HARNESS_FAILED"
+                        and launch_task_envs.get("AREAL_CLAUDE_DEADLINE_RECEIPT") == "1"
+                        and self._harness_result_format(exc.result.raw)
+                        in (None, "legacy-claude")
+                        and (exc.result.raw is None or isinstance(exc.result.raw, dict))
+                    ):
+                        try:
+                            attempt = self._runtime_deadline_attempt(exc.result)
+                            if attempt is None:
+                                raise ArenaAPIError(
+                                    "Missing current task attempt for deadline receipt"
+                                )
+                            receipt = await self.client.get_harness_result_async(
+                                exc.task_id,
+                                client=client,
+                                timeout=min(self.request_timeout, 15.0),
+                                attempt=attempt,
+                            )
+                            raw = dict(exc.result.raw or {})
+                            raw["areal_claude_deadline"] = receipt
+                            exc.result = replace(exc.result, raw=raw)
+                            self._task_result.set(exc.result)
+                        except Exception:
+                            logger.warning(
+                                "Failed to fetch Claude runtime receipt for task %s; "
+                                "keeping the failure unscored.",
+                                exc.task_id,
+                                exc_info=True,
+                            )
                     if exc.status == "HARNESS_FAILED" and (
                         self._harness_result_format(exc.result.raw) == "native-runner"
                         or self._is_abbreviated_whitebox_failure(exc.result.raw)
+                        or self._core_execution_timeout_outcome(exc.result.raw)
+                        is not None
                         or self._core_model_zero_failure_message(exc.result.raw)
                         is not None
                         or self._is_structured_context_failure(exc.result.raw)
@@ -1853,6 +2068,7 @@ class ArenaStreamAgentWorkflow:
                                     exc.task_id,
                                     client=client,
                                     timeout=min(self.request_timeout, 15.0),
+                                    attempt=self._runtime_deadline_attempt(exc.result),
                                 )
                             )
                         except Exception:

@@ -13,6 +13,7 @@ from examples.swe.arena_client import (
     ArenaAPIError,
     ArenaOpenAPIClient,
     ArenaTaskFailedError,
+    ArenaTaskResult,
     infer_llm_protocol,
     resolve_llm_protocol,
 )
@@ -40,6 +41,143 @@ class FakeWorkerRuntime:
 
 def _reset_stats() -> None:
     stats_tracker.export_all(reset=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "enabled,missing", [(True, False), (False, False), (True, True)]
+)
+async def test_claude_deadline_fetch_is_opt_in_and_missing_receipt_stays_unscored(
+    monkeypatch, enabled, missing
+):
+    """Fetch the configured runtime's artifact, retaining task correlation for recovery."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    monkeypatch.setenv("ARENA_LLM_API_KEY", "test-key")
+    agent = ArenaStreamAgentWorkflow(
+        econfig={
+            "arena_base_url": "https://arena.example",
+            "arena_streams": [
+                {
+                    "name": "test",
+                    "stream_id": "stream",
+                    "harness": "claude-code-with-skills@deadline-test",
+                    "task_envs": {"AREAL_CLAUDE_DEADLINE_RECEIPT": "1"}
+                    if enabled
+                    else {},
+                }
+            ],
+        }
+    )
+    raw = {
+        "error": "harness: harness agent phase exited with code 1: "
+        "harness: running task lifecycle (claude=/tmp/claude, session=uuid)"
+    }
+    error = ArenaTaskFailedError(
+        "task",
+        "HARNESS_FAILED",
+        result=ArenaTaskResult(
+            "task",
+            "HARNESS_FAILED",
+            0.0,
+            raw=raw,
+            artifacts_uri="task/task/workspace/attempts/1/",
+        ),
+    )
+    receipt = {
+        "status": "ERROR",
+        "raw": {
+            "schema": "areal-claude-deadline/v1",
+            "task_id": "task",
+            "attempt": 1,
+            "outcome_code": "AGENT_RUN_TIMEOUT",
+            "trigger": "RUNTIME_EXECUTION_DEADLINE",
+            "budget_seconds": 7170,
+            "elapsed_seconds": 7170.2,
+            "child_returncode": -15,
+        },
+    }
+    agent.client.get_harness_result_async = AsyncMock(
+        return_value=receipt,
+        side_effect=ArenaAPIError("artifact missing") if missing else None,
+    )
+    agent.client.register_llm_proxy_async = AsyncMock(
+        return_value=("https://arena.example/api", "model")
+    )
+    agent.client.delete_llm_proxy_async = AsyncMock()
+    agent.client.launch_one_task_result = AsyncMock(side_effect=error)
+    monkeypatch.setattr(agent, "_validate_live_reward_ref", AsyncMock())
+    try:
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(ArenaTaskFailedError) as caught:
+                await agent.run(
+                    {
+                        "arena_stream_name": "test",
+                        "stream_id": "stream",
+                        "data_id": "env",
+                    },
+                    base_url="http://proxy",
+                    api_key="session-key",
+                    arena_http_client=client,
+                )
+        assert caught.value is error
+        assert agent.client.get_harness_result_async.await_count == int(enabled)
+        assert agent.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=1
+        ) == (
+            "model_failure_zero"
+            if enabled and not missing
+            else "unknown_failure_reject"
+        )
+    finally:
+        _reset_stats()
+
+
+@pytest.mark.parametrize("dataset_source", ["arena", "jsonl"])
+def test_training_entry_isolates_arena_failures_only_during_training(
+    monkeypatch, dataset_source
+):
+    """Wire sample rejection for Arena training without weakening evaluation."""
+    from examples.swe import train_swe_rl
+    from examples.swe.utils import SWEPPOConfig
+
+    import areal
+
+    config = SWEPPOConfig()
+    config.scheduler.type = "slurm"
+    config.econfig.dataset_source = dataset_source
+    config.train_dataset.path = "train.jsonl"
+    config.valid_dataset = SimpleNamespace(path="valid.jsonl")
+    monkeypatch.setattr(train_swe_rl, "load_expr_config", lambda *_: (config, None))
+    monkeypatch.setattr(
+        train_swe_rl, "get_arena_mixture_dataset", lambda *_, **__: ([], [])
+    )
+    monkeypatch.setattr(train_swe_rl, "get_swe_dataset", lambda **_: [])
+    captured = {}
+
+    class CaptureTrainer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def train(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(areal, "PPOTrainer", CaptureTrainer)
+    train_swe_rl.main([])
+
+    if dataset_source == "arena":
+        assert captured["workflow_kwargs"]["reject_terminal_task_failures"] is True
+        assert (
+            captured["eval_workflow_kwargs"]["reject_terminal_task_failures"] is False
+        )
+    else:
+        assert "reject_terminal_task_failures" not in captured["workflow_kwargs"]
+        assert "reject_terminal_task_failures" not in captured["eval_workflow_kwargs"]
 
 
 @pytest.mark.asyncio
@@ -74,6 +212,23 @@ async def test_get_harness_result_fetches_authenticated_terminal_artifact(
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
         actual = await getattr(client, method)(task_id, client=http_client, timeout=5.0)
     assert actual == receipt
+
+
+@pytest.mark.asyncio
+async def test_harness_receipt_download_is_pinned_to_current_attempt(monkeypatch):
+    """Artifact lookup must not fall back to an older task attempt."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+
+    def handler(request):
+        assert request.url.params["attempt"] == "2"
+        return httpx.Response(200, json={"status": "ERROR"})
+
+    client = ArenaOpenAPIClient(base_url="https://arena.example")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        result = await client.get_harness_result_async(
+            "task", client=http_client, timeout=5, attempt=2
+        )
+    assert result == {"status": "ERROR"}
 
 
 def test_resolve_stream_id_when_unspecified_returns_first_active(monkeypatch):

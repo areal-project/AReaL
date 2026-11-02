@@ -323,11 +323,16 @@ class ArenaOpenAPIClient:
         *,
         client: httpx.AsyncClient,
         timeout: float,
+        attempt: int | None = None,
     ) -> dict[str, Any]:
         """Fetch the terminal Harness receipt for one failed task."""
 
         return await self._get_failure_artifact_async(
-            task_id, "harness_result.json", client=client, timeout=timeout
+            task_id,
+            "harness_result.json",
+            client=client,
+            timeout=timeout,
+            attempt=attempt,
         )
 
     async def get_whitebox_lifecycle_async(
@@ -345,11 +350,19 @@ class ArenaOpenAPIClient:
         *,
         client: httpx.AsyncClient,
         timeout: float,
+        attempt: int | None = None,
     ) -> dict[str, Any]:
         encoded_task_id = quote(task_id, safe="")
         url = f"{self.base_url}/api/artifacts/{encoded_task_id}/{artifact}"
+        if attempt is not None and (type(attempt) is not int or attempt < 1):
+            raise ValueError("Artifact attempt must be a positive integer")
         response = await self._async_request(
-            client, "GET", url, headers=self._headers, timeout=timeout
+            client,
+            "GET",
+            url,
+            headers=self._headers,
+            timeout=timeout,
+            params={"attempt": attempt} if attempt is not None else None,
         )
         response.raise_for_status()
         if len(response.content) > 65536:

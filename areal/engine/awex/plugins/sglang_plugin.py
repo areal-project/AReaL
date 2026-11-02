@@ -1253,6 +1253,8 @@ if __name__ == "__main__":
 
     _load_sglang_plugins_if_available()
     server_args = prepare_server_args(sys.argv[1:])
+    if "AREAL_SGLANG_LOG_REQUESTS" in os.environ:
+        server_args.log_requests = os.environ["AREAL_SGLANG_LOG_REQUESTS"] == "1"
     # In AWEX colocated mode the scheduler may not be able to serve requests
     # until the first weight sync (actor holds GPUs / writer version not yet
     # published). SGLang's warmup request would then hang for 600s

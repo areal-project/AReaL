@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
@@ -23,10 +24,12 @@ from areal.utils.logging import getLogger
 
 from .server import (
     EXPORT_TRAJECTORIES_PATHNAME,
+    RL_DISCARD_SESSION_PATHNAME,
     RL_END_SESSION_PATHNAME,
     RL_FETCH_SHARED_TENSORS_PATHNAME,
     RL_SET_REWARD_PATHNAME,
     RL_START_SESSION_PATHNAME,
+    DiscardSessionRequest,
     FetchSharedTensorsRequest,
     SetRewardRequest,
     StartSessionRequest,
@@ -108,6 +111,8 @@ class OpenAIProxyClient:
         self._processor_cache_group_size = processor_cache_group_size
         self._shared_tensor_resolver = shared_tensor_resolver
         self._metadata = metadata
+        self._creation_request_id = uuid.uuid4().hex
+        self._session_released = False
         if processor_cache_group_id is not None and shared_tensor_resolver is None:
             self._shared_tensor_resolver = SharedTensorResolver()
         self.session_id: str | None = None
@@ -148,6 +153,21 @@ class OpenAIProxyClient:
             url=f"{self.base_url}{RL_SET_REWARD_PATHNAME}",
             headers=self._session_auth_headers(),
         )
+
+    async def discard_session(self) -> None:
+        """Release an unexported session using its explicit ID and admin auth."""
+        if self.session_id is None or self._session_released:
+            return
+        await post_json(
+            self._session,
+            url=f"{self.base_url}{RL_DISCARD_SESSION_PATHNAME}",
+            payload=DiscardSessionRequest(
+                session_id=self.session_id,
+                idempotency_key=self._creation_request_id,
+            ),
+            headers=self._admin_auth_headers(),
+        )
+        self._session_released = True
 
     async def set_last_reward(self, reward: float):
         """Set reward for the most recent completion/response."""
@@ -229,6 +249,7 @@ class OpenAIProxyClient:
             resp.raise_for_status()
             data = await resp.json()
 
+        self._session_released = True
         serialized_interactions = data["interactions"]
         tensor_group_id = data.get("tensor_reference_group_id")
         if tensor_group_id is not None:
@@ -266,6 +287,7 @@ class OpenAIProxyClient:
             url=f"{self.base_url}{RL_START_SESSION_PATHNAME}",
             payload=StartSessionRequest(
                 task_id=self.task_id,
+                idempotency_key=self._creation_request_id,
                 processor_cache_group_id=self._processor_cache_group_id,
                 processor_cache_group_size=self._processor_cache_group_size,
                 metadata=self._metadata,
