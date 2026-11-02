@@ -1,30 +1,3 @@
-# AReaL AutoPilot: Elastic Training
-
-Elastic training infrastructure and offline policy revision for agentic RL, built on
-AReaL. Current research scope: configuration cost efficiency for nine Tau2 trials.
-
-- [Current progress](PROGRESS.md) and
-  [Tau2 plan / company handoff](examples/autopilot/PLAN.md)
-- [AReaL Elastic capabilities](areal/elastic/README.md)
-- [Basic planning](areal/elastic/reconfigurator/basic/README.md) and
-  [independent Expert](areal/elastic/reconfigurator/reference/README.md)
-- [AutoPilot revision](areal/autopilot/revision/README.md) and
-  [Elastic adapter](areal/autopilot/domains/elastic/README.md)
-- [Execution architecture and validation](examples/autopilot/elastic/README.md)
-
-Native `PPOTrainer` now owns on-demand Actor lifecycle, durable episode handoff, full
-checkpoint/cursor commit and checked weight publication. Elastic capabilities live in
-`areal.elastic`; domain-independent revision lives in `areal.autopilot.revision`.
-Optional policy, history and accepted revisions attach through
-`areal.autopilot.domains.elastic.native.NativePolicyRuntime`; the former serial executor
-and fixture runner have been removed. Basic and independent Expert cost models, offline
-joint search and historical evidence are retained. Native execution currently uses a
-fixed layout; GPU recovery, asynchronous overlap and GSM8K/Hermes online RL acceptance
-remain pending. Historical M1/M2 runs do not validate this new path. Real Tau2 data
-stays on the company computer; repository scenarios are not those measurements.
-
-______________________________________________________________________
-
 <h1 align="center">
 <em>AReaL</em>: A Large-Scale Asynchronous Reinforcement Learning System
 </h1>

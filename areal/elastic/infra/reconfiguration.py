@@ -8,20 +8,29 @@ import argparse
 import dataclasses
 import fcntl
 import json
+import os
 import re
 import subprocess
 import time
+import uuid
+from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Generic, Protocol, TypeVar
 
 import psutil
 
-from areal.elastic.contracts import ControlBusy
+from areal.elastic.contracts import ControlBusy, ControlSnapshot
 from areal.elastic.infra.monitor.collector import ElasticMonitor
 from areal.elastic.layout import ExecutionLayout as ExecutionLayout
-from areal.elastic.layout import ReconfigurationPlan
-from areal.utils.atomic import atomic_json, json_digest
+from areal.elastic.layout import ReconfigurationPlan, ReconfigurationPlanner
+from areal.utils.atomic import (
+    artifact_manifest,
+    atomic_json,
+    json_digest,
+    recovery_digest,
+)
 
 OWNER_ENV = "AREAL_ELASTIC_PROCESS_OWNER"
 
@@ -354,7 +363,9 @@ class ReconfigurationExecutor:
             {
                 "scope": "native-resources-v1",
                 "run": owner.identity,
-                "queue": owner.inbox.queue.queue_id,
+                "queue": owner.data_plane_id
+                if hasattr(owner, "data_plane_id")
+                else owner.inbox.queue.queue_id,
                 "reservation": list(owner.resource_reservation),
             }
         )
@@ -418,7 +429,7 @@ class ReconfigurationExecutor:
         plan = self.owner.plan_reconfiguration(target)
         self.owner.last_reconfiguration_plan = plan
         state = application.state()
-        if self.owner.managed_rollout and (not state["managed_rollout"]):
+        if self.owner.managed_rollout and (not state.get("managed_rollout", False)):
             atomic_json(
                 application.root / "state.json", {**state, "managed_rollout": True}
             )
@@ -433,16 +444,24 @@ class ReconfigurationExecutor:
             raise RuntimeError("Reconfiguration left an incomplete boundary")
         if receipt["status"] == "unchanged":
             return receipt
-        self.owner._arm_post_reconfiguration()
+        arm = getattr(self.owner, "_arm_post_reconfiguration", None)
+        if arm is not None:
+            arm()
         with self.owner._reconfiguration_phase("generation_resume"):
             self.owner.rollout.continue_generation()
         with self.owner._reconfiguration_phase("admission_open"):
-            self.owner.inbox.set_admission_open(True)
+            self._set_admission(True)
             if self.owner.managed_rollout:
                 self.owner.rollout.open_model_calls()
             else:
                 self.owner.rollout.resume()
         return receipt
+
+    def _set_admission(self, opened: bool) -> None:
+        if hasattr(self.owner, "set_admission_open"):
+            self.owner.set_admission_open(opened)
+        else:
+            self.owner.inbox.set_admission_open(opened)
 
     def execute(self, plan: ReconfigurationPlan) -> None:
         """Execute an already selected sequence; unchanged engines stay alive."""
@@ -468,18 +487,20 @@ class ReconfigurationExecutor:
                 with self.owner._reconfiguration_phase("drain"):
                     self.owner.rollout.drain_model_calls()
             elif step == "close_admission":
-                self.owner.inbox.set_admission_open(False)
+                self._set_admission(False)
             elif step == "release_actor":
                 with self.owner._reconfiguration_phase("actor_release"):
                     self.owner._release()
-                    self.owner.reconfigurator_adapter.role_released("actor")
+                    if self.owner.reconfigurator_adapter is not None:
+                        self.owner.reconfigurator_adapter.role_released("actor")
             elif step == "disconnect_weights":
                 with self.owner._reconfiguration_phase("awex_disconnect"):
                     self.owner.actor.disconnect_engine()
             elif step == "stop_rollout":
                 with self.owner._reconfiguration_phase("rollout_stop"):
                     self.owner.rollout.stop_inference_replicas()
-                    self.owner.reconfigurator_adapter.role_released("rollout")
+                    if self.owner.reconfigurator_adapter is not None:
+                        self.owner.reconfigurator_adapter.role_released("rollout")
             elif step == "set_layout":
                 with self.owner._reconfiguration_phase("placement"):
                     self.owner._set_execution_layout(plan.target)
@@ -489,8 +510,9 @@ class ReconfigurationExecutor:
                     timing=self.owner._reconfiguration_phase,
                 )
             elif step == "rebind_runtime":
-                self.owner.monitor = ElasticMonitor(self.owner)
-                self.owner.reconfigurator_adapter.rebind_actor_layout(self.owner)
+                if self.owner.reconfigurator_adapter is not None:
+                    self.owner.monitor = ElasticMonitor(self.owner)
+                    self.owner.reconfigurator_adapter.rebind_actor_layout(self.owner)
             elif step == "restore_actor":
                 self.owner.ensure_actor(connect_weights=False)
             elif step == "connect_weights":
@@ -520,6 +542,310 @@ class ReconfigurationExecutor:
             force_rollout=self.owner.managed_rollout,
         )
         self.execute(plan)
+
+
+class TrainerReconfiguration:
+    """Execute layout changes against Trainer-owned engines and live data services.
+
+    This object owns the transition journal and full switch checkpoints only.
+    It neither consumes batches nor advances training, publication or save schedules.
+    CPU coordinator restart/replay is outside this execution contract.
+    """
+
+    reconfigurator_adapter = None
+
+    def __init__(self, trainer, ft_spec):
+        self.trainer, self.ft_spec = trainer, ft_spec
+        self.config = trainer.config
+        self.options = self.config.actor_lifecycle
+        self.root = Path(self.options.state_root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.actor_devices = tuple(self.options.actor_devices)
+        self.rollout_devices = tuple(self.options.rollout_devices)
+        self.resource_reservation = self.actor_devices + self.rollout_devices
+        uuids = resolve_gpu_uuids(list(self.resource_reservation))
+        processes = gpu_processes()
+        if any(processes.get(gpu) for gpu in uuids):
+            raise RuntimeError("The explicitly assigned GPU pools are not empty")
+        self.data_plane_id = uuid.uuid4().hex
+        self.reconfiguration_planner = ReconfigurationPlanner()
+        self.last_reconfiguration_plan = None
+        self.last_checkpoint_reports = self.last_restore_reports = (
+            self.last_restore_plan
+        ) = None
+        self.generation = 1
+        self._reconfiguration_incomplete = False
+        self._checkpoint_dirty = False
+        self._managed_rollout = (
+            os.environ.get("AREAL_ELASTIC_RESOURCE_RECONFIGURATION") == "1"
+        )
+        self.latest_path = self.latest_manifest = None
+        self.base_manifest = artifact_manifest(Path(self.config.actor.path))
+        self.compatibility = json.loads(
+            json.dumps(
+                {
+                    "native_full_state": 1,
+                    "backend": trainer.actor_alloc.backend,
+                    "actor": asdict(self.config.actor),
+                    "base_files": self.base_manifest,
+                    "ft_spec": asdict(ft_spec),
+                    "seed": self.config.seed,
+                    "batch_size": self.config.train_dataset.batch_size,
+                    "max_staleness": self.config.rollout.max_head_offpolicyness,
+                }
+            )
+        )
+        self.identity = recovery_digest(self.compatibility)
+        from areal.elastic.infra.state.checkpoint_store import CheckpointStore
+
+        self.store = CheckpointStore(
+            self.root / "checkpoints",
+            keep=self.options.checkpoint_keep,
+            free_space_floor=self.options.checkpoint_free_space_floor,
+        )
+        self.reconfiguration_application, _ = configuration_application(self)
+
+    @property
+    def actor(self):
+        return self.trainer.actor
+
+    @property
+    def rollout(self):
+        return self.trainer.rollout
+
+    @property
+    def allocation(self):
+        return self.trainer.actor_alloc
+
+    @property
+    def actor_world_size(self):
+        return self.allocation.parallel.world_size
+
+    @property
+    def actor_backend(self):
+        return self.actor.config.backend
+
+    @property
+    def weight_meta(self):
+        return self.trainer.weight_update_meta
+
+    @property
+    def applied_version(self):
+        return (
+            self.actor.get_version()
+            if self.actor is not None
+            else self.checkpoint_version
+        )
+
+    @property
+    def published_version(self):
+        return self.rollout.get_version()
+
+    @property
+    def checkpoint_version(self):
+        return self.latest_manifest["global_step"] if self.latest_manifest else 0
+
+    @property
+    def active(self):
+        return True if self.trainer._training_active else None
+
+    @property
+    def execution_layout(self):
+        return ExecutionLayout(
+            self.actor_world_size, self.actor_devices, self.rollout_devices
+        )
+
+    @property
+    def managed_rollout(self):
+        return self._managed_rollout or (
+            self.rollout is not None and self.rollout.resource_reconfiguration_enabled
+        )
+
+    @property
+    def supports_resource_reconfiguration(self):
+        from areal.api.alloc_mode import ModelAllocation
+
+        actor = self.allocation.parallel
+        rollout = ModelAllocation.from_str(self.config.rollout.backend)
+        return (
+            self.allocation.backend == "fsdp"
+            and all(
+                getattr(actor, key) == 1
+                for key in ("tp_size", "pp_size", "cp_size", "ep_size", "etp_size")
+            )
+            and rollout.backend == "sglang"
+            and rollout.parallel.tp_size == rollout.parallel.pp_size == 1
+        )
+
+    def control_snapshot(self):
+        failed = self.trainer._training_failed
+        version, published = self.applied_version, self.published_version
+        return ControlSnapshot(
+            False,
+            not failed
+            and self.active is None
+            and not self._reconfiguration_incomplete
+            and version == published,
+            self.generation,
+            version,
+            published,
+            json_digest({"data_plane": self.data_plane_id, "version": version}),
+            checkpoint_version=self.checkpoint_version,
+        )
+
+    def validate_execution_layout(self, target):
+        if target == self.execution_layout:
+            return
+        if not self.supports_resource_reconfiguration:
+            raise ValueError(
+                "Native layout changes require pure FSDP DP and SGLang TP1"
+            )
+        if not set(target.actor_devices + target.rollout_devices) <= set(
+            self.resource_reservation
+        ):
+            raise ValueError("Target exceeds the original GPU reservation")
+        if self.config.train_dataset.batch_size % target.world_size:
+            raise ValueError("Actor DP must divide the logical training batch")
+        if (
+            target.actor_devices != self.actor_devices
+            or target.rollout_devices != self.rollout_devices
+        ) and not self.managed_rollout:
+            raise ValueError("GPU pool changes require managed replicas")
+
+    def plan_reconfiguration(self, target):
+        self.validate_execution_layout(target)
+        return self.reconfiguration_planner.plan(
+            self.execution_layout, target, actor_running=self.actor is not None
+        )
+
+    def set_admission_open(self, opened):
+        # Existing workflows and sessions retain their data throughout the switch.
+        # Only new workflow submission is paused; model-call draining is a separate
+        # layout-plan step when Rollout engines themselves are replaced.
+        if opened:
+            self.rollout.resume()
+        else:
+            self.rollout.pause()
+
+    def _set_execution_layout(self, target):
+        from areal.api.alloc_mode import ModelAllocation
+
+        self.validate_execution_layout(target)
+        if target.actor_devices != self.actor_devices:
+            self.trainer.scheduler.set_gpu_pool(list(target.actor_devices))
+        self.actor_devices, self.rollout_devices = (
+            target.actor_devices,
+            target.rollout_devices,
+        )
+        self.trainer.actor_alloc = ModelAllocation.from_str(
+            f"fsdp:d{target.world_size}", name="actor"
+        )
+
+    def save_checkpoint(self, *, reason):
+        version = self.applied_version
+        if not self.control_snapshot().boundary_ready:
+            raise ControlBusy(
+                "A switch checkpoint requires a completed published update"
+            )
+        backend = self.actor_backend
+
+        def write(path):
+            self.last_checkpoint_reports = self.actor.full_checkpoint(
+                "save",
+                path=str(path),
+                backend=self.allocation.backend,
+                identity_sha256=self.identity,
+                version=version,
+            )
+            atomic_json(
+                path / "actor-layout.json",
+                {
+                    "backend": backend,
+                    "world_size": self.actor_world_size,
+                    "format_version": 2,
+                    "gpu_pool": list(self.actor_devices),
+                    "rollout_devices": list(self.rollout_devices),
+                    "reservation": list(self.resource_reservation),
+                },
+            )
+
+        self.latest_path = self.store.commit(
+            step=version,
+            world_size=self.actor_world_size,
+            compatibility=self.compatibility,
+            write=write,
+            estimated_bytes=self.options.checkpoint_estimated_bytes,
+        )
+        self.latest_path, self.latest_manifest = self.store.latest(self.compatibility)
+        return True
+
+    def _release(self):
+        self.trainer.actor.destroy()
+        uuids = resolve_gpu_uuids(list(self.actor_devices))
+        processes = gpu_processes()
+        if any(processes.get(gpu) for gpu in uuids):
+            raise RuntimeError("Actor GPU release is not confirmed")
+        self.trainer.actor = None
+
+    def ensure_actor(self, *, connect_weights=True):
+        if self.actor is not None:
+            return self.actor
+        from areal.v2.training_service.dp_restore import DPStateRestorePlan
+
+        config = deepcopy(self.config.actor)
+        config.backend = f"fsdp:d{self.actor_world_size}"
+        self.trainer._initialize_reconfigured_actor(config, self.ft_spec)
+        source_dp = self.latest_manifest["world_size"]
+        restore = {}
+        self.last_restore_plan = None
+        if source_dp != self.actor_world_size:
+            self.last_restore_plan = asdict(
+                DPStateRestorePlan(
+                    identity_sha256=self.identity,
+                    checkpoint_generation=self.latest_path.name,
+                    policy_version=self.checkpoint_version,
+                    source_world_size=source_dp,
+                    target_world_size=self.actor_world_size,
+                    transition_id=uuid.uuid4().hex + uuid.uuid4().hex,
+                )
+            )
+            restore["restore_plan"] = self.last_restore_plan
+        self.last_restore_reports = self.actor.full_checkpoint(
+            "load",
+            path=str(self.latest_path),
+            backend=self.allocation.backend,
+            identity_sha256=self.identity,
+            version=self.checkpoint_version,
+            **restore,
+        )
+        self.generation += 1
+        if connect_weights:
+            self.actor.connect_engine(self.rollout, self.weight_meta)
+        return self.actor
+
+    def _publish(self):
+        version = self.applied_version
+        self.actor.update_weights(
+            self.weight_meta.with_version(version), resume_generation=False
+        )
+        versions = self.rollout.serving_versions()
+        if not versions or any(value != version for value in versions):
+            raise RuntimeError("Serving peers did not acknowledge the restored version")
+
+    def _event(self, state, **details):
+        atomic_json(
+            self.root / "state.json",
+            {
+                "state": state,
+                "generation": self.generation,
+                "weights_version": self.published_version,
+                "layout": asdict(self.execution_layout),
+                **details,
+            },
+        )
+
+    def _reconfiguration_phase(self, name):
+        return nullcontext()
 
 
 def configuration_application(owner):

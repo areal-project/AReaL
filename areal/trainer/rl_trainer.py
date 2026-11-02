@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import os
+import threading
 from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
@@ -115,7 +116,9 @@ class PPOTrainer:
     ):
         validate_unbound_adapter(elastic_reconfigurator)
         self._elastic_reconfigurator = elastic_reconfigurator
-        self._on_demand = None
+        self._reconfiguration = None
+        self._training_lock = threading.RLock()
+        self._training_active = self._training_failed = False
         self.actor = None
         self.rollout = None
         try:
@@ -144,12 +147,14 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
-        self._on_demand_mode = config.actor_lifecycle.mode == "on_demand"
-        if self._elastic_reconfigurator is not None and not self._on_demand_mode:
-            raise ValueError(
-                "elastic_reconfigurator requires actor_lifecycle.mode='on_demand'"
+        self._elastic_mode = config.actor_lifecycle.mode == "on_demand"
+        if self._elastic_reconfigurator is not None:
+            raise NotImplementedError(
+                "Native automatic Reconfigurator/revision integration is being migrated "
+                "to Trainer control boundaries; use manual Trainer.reconfigure() "
+                "for this stage. Online simulation remains available."
             )
-        if self._on_demand_mode:
+        if self._elastic_mode:
             from areal.elastic.infra.runtime import validate_on_demand
 
             validate_on_demand(config)
@@ -160,7 +165,7 @@ class PPOTrainer:
         self.scheduler = None
         self.rollout_scheduler = None
         if is_single_controller():
-            if self._on_demand_mode:
+            if self._elastic_mode:
                 # Construct both before launching any worker: LocalScheduler
                 # clears trial name-resolve entries during construction.
                 self.scheduler = LocalScheduler(
@@ -230,8 +235,7 @@ class PPOTrainer:
             )
 
         # Create models: actor, critic, ref — each with its own allocation.
-        if not self._on_demand_mode:
-            self.actor = self._create_train_engine(config.actor, self.actor_alloc)
+        self.actor = self._create_train_engine(config.actor, self.actor_alloc)
         self.critic = None
         if config.critic is not None:
             critic_alloc = ModelAllocation.from_str(
@@ -348,21 +352,11 @@ class PPOTrainer:
         # Initialize engines first — the scheduler must know about roles
         # before the data controller can colocate with them.
         engine_init_kwargs = {"addr": None, "ft_spec": ft_spec}
-        if self._on_demand_mode:
-            from areal.elastic.infra.runtime import OnDemandActor
+        if self._elastic_mode:
+            from areal.elastic.infra.reconfiguration import TrainerReconfiguration
 
-            self._on_demand = OnDemandActor(
-                config,
-                ft_spec,
-                functools.partial(
-                    self._create_lifecycle_actor,
-                    scheduler=self.scheduler,
-                ),
-                reconfigurator_adapter=self._elastic_reconfigurator,
-                actor_pool_setter=self.scheduler.set_gpu_pool,
-            )
-        else:
-            self.actor.initialize(**engine_init_kwargs, role="actor")
+            self._reconfiguration = TrainerReconfiguration(self, ft_spec)
+        self.actor.initialize(**engine_init_kwargs, role="actor")
         if self.critic is not None:
             self.critic.initialize(**engine_init_kwargs, role="critic")
         if self.ref is not None:
@@ -500,8 +494,7 @@ class PPOTrainer:
                 f"Invalid weight update mode: {self.config.actor.weight_update_mode}"
             )
 
-        if not self._on_demand_mode:
-            self.actor.connect_engine(self.rollout, self.weight_update_meta)
+        self.actor.connect_engine(self.rollout, self.weight_update_meta)
 
         # Set up evaluation (skip in online mode)
         self.evaluator = Evaluator(config.evaluator, ft_spec)
@@ -515,27 +508,18 @@ class PPOTrainer:
 
         # Set up checkpointing for recover
         self.recover_info = None
-        if self._on_demand_mode:
-            self._on_demand.bind(
-                self.rollout,
-                self.weight_update_meta,
-                capture_cpu=self._capture_coordinator_state,
-                restore_cpu=self._restore_coordinator_state,
-            )
-            self.actor = self._on_demand.actor
-        else:
-            self.recover_info = self.recover_handler.load(
-                self.actor,
-                self.saver,
-                self.evaluator,
-                self.stats_logger,
-                self.train_dataloader,
-                inference_engine=self.rollout,
-                weight_update_meta=self.weight_update_meta,
-                # Recompute placement instead of reusing _should_offload_rollout:
-                # AWEX clears that flag because it drives the handover itself.
-                colocated_rollout=self._is_actor_rollout_colocated(config),
-            )
+        self.recover_info = self.recover_handler.load(
+            self.actor,
+            self.saver,
+            self.evaluator,
+            self.stats_logger,
+            self.train_dataloader,
+            inference_engine=self.rollout,
+            weight_update_meta=self.weight_update_meta,
+            # Recompute placement instead of reusing _should_offload_rollout:
+            # AWEX clears that flag because it drives the handover itself.
+            colocated_rollout=self._is_actor_rollout_colocated(config),
+        )
 
         # After recovery, sync the staleness manager so its capacity formula
         # stays bounded despite the version jumping from 0 to recovery_version.
@@ -736,47 +720,36 @@ class PPOTrainer:
         elif self._requires_proxy_workflow(workflow):
             self._ensure_proxy_started()
 
-        if self._on_demand is not None:
-            if workflow is not None or dynamic_filter_fn is not None:
-                raise ValueError("on_demand consumes rewarded online episodes directly")
-            start_step = self._on_demand.applied_version
-
         global_step = start_step
-        failures = 0
         while global_step < max_steps:
             if (
                 config.total_train_steps is not None
                 and global_step >= config.total_train_steps
             ):
                 break
-            try:
-                self._train_step(
-                    global_step=global_step,
-                    steps_per_epoch=steps_per_epoch,
-                    workflow=workflow,
-                    workflow_kwargs=workflow_kwargs,
-                    dynamic_filter_fn=dynamic_filter_fn,
-                    eval_workflow=eval_workflow,
-                    eval_workflow_kwargs=eval_workflow_kwargs,
-                )
-            except Exception as error:
-                if (
-                    self._on_demand is None
-                    or failures >= config.actor_lifecycle.max_recovery_attempts
-                ):
-                    raise
-                failures += 1
-                logger.exception(
-                    "Recovering uncertain native PPO update %d", global_step
-                )
-                self._on_demand.recover_uncertain(error)
-                self.actor = self._on_demand.actor
-                global_step = self._on_demand.applied_version
-                continue
+            self._train_step(
+                global_step=global_step,
+                steps_per_epoch=steps_per_epoch,
+                workflow=workflow,
+                workflow_kwargs=workflow_kwargs,
+                dynamic_filter_fn=dynamic_filter_fn,
+                eval_workflow=eval_workflow,
+                eval_workflow_kwargs=eval_workflow_kwargs,
+            )
             global_step += 1
-            failures = 0
 
-    def _train_step(
+    def _train_step(self, **kwargs) -> None:
+        # The lock also serializes explicit reconfiguration with batch reads,
+        # GPU updates, publication, checkpointing and CPU cleanup.
+        if not hasattr(self, "_training_lock"):
+            self._training_lock = threading.RLock()
+        with self._training_lock:
+            self._training_active = True
+            self._training_failed = True
+            self._train_step_impl(**kwargs)
+            self._training_active = self._training_failed = False
+
+    def _train_step_impl(
         self,
         *,
         global_step: int,
@@ -787,7 +760,7 @@ class PPOTrainer:
         eval_workflow: WorkflowLike | None,
         eval_workflow_kwargs: dict[str, Any] | None,
     ) -> None:
-        """One native PPO update shared by resident and on-demand Actors."""
+        """One native PPO update using the standard workflow data pipeline."""
         config = self.config
         epoch, step = divmod(global_step, steps_per_epoch)
         if self._should_offload_rollout:
@@ -803,20 +776,16 @@ class PPOTrainer:
                 },
             ),
         ):
-            if self._on_demand is not None:
-                rollout_batch = self._on_demand.next_batch()
-                self.actor = self._on_demand.actor
-            else:
-                rollout_batch = self.actor.prepare_batch(
-                    self.train_dataloader,
-                    workflow=workflow,
-                    workflow_kwargs=workflow_kwargs,
-                    should_accept_fn=dynamic_filter_fn,
-                    group_size=config.gconfig.n_samples,
-                    dynamic_bs=self.config.dynamic_bs,
-                    reward_normalization=config.gconfig.reward_normalization,
-                    drop_incomplete_group=config.gconfig.drop_incomplete_group,
-                )
+            rollout_batch = self.actor.prepare_batch(
+                self.train_dataloader,
+                workflow=workflow,
+                workflow_kwargs=workflow_kwargs,
+                should_accept_fn=dynamic_filter_fn,
+                group_size=config.gconfig.n_samples,
+                dynamic_bs=self.config.dynamic_bs,
+                reward_normalization=config.gconfig.reward_normalization,
+                drop_incomplete_group=config.gconfig.drop_incomplete_group,
+            )
         if self._should_offload_rollout:
             self._offload_rollout()
 
@@ -981,46 +950,37 @@ class PPOTrainer:
                 global_step=global_step,
             )
 
-        # On-demand rollout continues through computation and checkpointing;
-        # the native v2 update_weights() owns its short publication pause.
-        if self._on_demand is None:
-            self.rollout.pause()
+        self.rollout.pause()
 
         # Actor already onloaded; engine-internal _offload_aware_context
         # calls in update_weights/save are no-ops.
 
-        if self._on_demand is not None:
-            self._on_demand.publish_update(global_step + 1)
-            self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
-            self.saver.maybe_wait_for_staging()
-            self._on_demand.maybe_checkpoint(epoch_step=step)
-        else:
-            with (
-                stats_tracker.record_timing("update_weights"),
-                perf_tracer.trace_scope(
-                    "train.update_weights",
-                    category=Category.COMM,
-                    args={"global_step": global_step},
-                ),
-            ):
-                # Use versioned path for weight updates
-                new_version = global_step + 1
-                versioned_meta = self.weight_update_meta.with_version(new_version)
-                self.actor.update_weights(versioned_meta)
+        with (
+            stats_tracker.record_timing("update_weights"),
+            perf_tracer.trace_scope(
+                "train.update_weights",
+                category=Category.COMM,
+                args={"global_step": global_step},
+            ),
+        ):
+            # Use versioned path for weight updates
+            new_version = global_step + 1
+            versioned_meta = self.weight_update_meta.with_version(new_version)
+            self.actor.update_weights(versioned_meta)
 
-                self.actor.set_version(new_version)
-                if self.critic is not None:
-                    self.critic.set_version(new_version)
-                self.rollout.set_version(new_version)
-                if self.eval_rollout is not None:
-                    self.eval_rollout.set_version(new_version)
+            self.actor.set_version(new_version)
+            if self.critic is not None:
+                self.critic.set_version(new_version)
+            self.rollout.set_version(new_version)
+            if self.eval_rollout is not None:
+                self.eval_rollout.set_version(new_version)
 
-            if not self._is_v1_awex_colocate(config):
-                self._save_training_state(
-                    epoch=epoch,
-                    epoch_step=step,
-                    global_step=global_step,
-                )
+        if not self._is_v1_awex_colocate(config):
+            self._save_training_state(
+                epoch=epoch,
+                epoch_step=step,
+                global_step=global_step,
+            )
 
         # Offload actor before eval
         if self._should_offload_actor:
@@ -1079,12 +1039,8 @@ class PPOTrainer:
                 epoch=epoch, epoch_step=step, global_step=global_step
             )
 
-        if self._on_demand is None:
-            self.rollout.resume()
-
+        self.rollout.resume()
         self._save_perf_tracer(step=global_step)
-        if self._on_demand is not None:
-            self._on_demand.finish_update()
 
     def _save_training_state(
         self,
@@ -1144,20 +1100,11 @@ class PPOTrainer:
             finish(name, "close")
         finish("data_controller", "destroy")
         # Keep serving peers alive until Actor's AWEX release is confirmed.
-        if getattr(self, "_on_demand", None) is not None:
-            finish("_on_demand", "close")
-            actor_released = (
-                self._on_demand.actor is None and self._on_demand.owner is None
-            )
-        else:
-            if (
-                getattr(getattr(self, "_elastic_reconfigurator", None), "owner", None)
-                is None
-            ):
-                finish("_elastic_reconfigurator", "close")
-            before = len(errors)
-            finish("actor", "destroy")
-            actor_released = len(errors) == before
+        finish("_elastic_reconfigurator", "close")
+        before = len(errors)
+        finish("actor", "destroy")
+        actor_released = len(errors) == before
+
         if actor_released:
             for name in ("eval_rollout", "rollout"):
                 finish(name, "destroy")
@@ -1273,6 +1220,46 @@ class PPOTrainer:
             # launch is the only ordering safe for all of them.
             for spec in engine_cfg.scheduling_spec:
                 spec.env_vars["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+
+    def _initialize_reconfigured_actor(self, actor_config, ft_spec) -> None:
+        self.actor = self._create_train_engine(actor_config, self.actor_alloc)
+        self.actor.initialize(
+            role="actor",
+            addr=None,
+            ft_spec=ft_spec,
+            wait=True,
+            worker_seed=self.config.seed,
+        )
+        if self.config.perf_tracer is not None:
+            self.actor.config_perf_tracer(self.config.perf_tracer, role="actor")
+
+    def reconfigure(
+        self,
+        *,
+        target,
+        request_id: str,
+        expected_generation: int,
+        expected_weights_version: int,
+    ):
+        """Apply a layout change at a completed Trainer update boundary."""
+        execution = self._reconfiguration
+        if execution is None:
+            raise ValueError(
+                "Manual reconfiguration requires explicit native GPU pools"
+            )
+        if not self._training_lock.acquire(blocking=False):
+            from areal.elastic.contracts import ControlBusy
+
+            raise ControlBusy("Trainer is reading or updating a batch")
+        try:
+            return execution.reconfiguration_application.executor.reconfigure(
+                target=target,
+                request_id=request_id,
+                expected_generation=expected_generation,
+                expected_weights_version=expected_weights_version,
+            )
+        finally:
+            self._training_lock.release()
 
     def _create_lifecycle_actor(
         self, actor_config: PPOActorConfig, *, scheduler: Scheduler
@@ -1421,21 +1408,12 @@ class PPOTrainer:
             controller = RolloutControllerV2(
                 config=config, scheduler=cast(Scheduler, self.rollout_scheduler)
             )
-            if self._on_demand is not None:
-                if self._on_demand.supports_resource_reconfiguration and (
-                    os.environ.get("AREAL_ELASTIC_RESOURCE_RECONFIGURATION") == "1"
-                    or self._on_demand.managed_rollout
-                ):
-                    controller.configure_resource_pool(
-                        self._on_demand.resource_reservation,
-                        self._on_demand.rollout_devices,
-                        self._on_demand.root,
-                    )
-                controller.configure_online_training(
-                    self._on_demand.inbox,
-                    discount=self.config.rollout.agent.turn_discount,
-                    export_style=self.config.rollout.agent.export_style,
-                    drop_retry_orphans=self.config.rollout.agent.drop_retry_orphans,
+            execution = self._reconfiguration
+            if execution is not None and execution.managed_rollout:
+                controller.configure_resource_pool(
+                    execution.resource_reservation,
+                    execution.rollout_devices,
+                    execution.root,
                 )
         else:
             controller = engine_cls.as_controller(config, self.scheduler)

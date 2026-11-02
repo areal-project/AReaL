@@ -909,7 +909,7 @@ def test_native_checkpoint_seconds_schedule_works_in_cpu_coordinator(native_life
 
 
 @pytest.mark.parametrize("native_lifecycle", [(1, 1), (2, 4)], indirect=True)
-def test_native_trainer_defers_actor_initialization_and_legacy_recover(
+def test_native_trainer_owns_actor_initialization_and_standard_recover(
     native_lifecycle, monkeypatch
 ):
     from unittest.mock import MagicMock
@@ -941,23 +941,38 @@ def test_native_trainer_defers_actor_initialization_and_legacy_recover(
         instance = MagicMock()
         instance.state_dict.return_value = {}
         monkeypatch.setattr(rl_trainer, name, MagicMock(return_value=instance))
-    legacy_recover = MagicMock()
-    monkeypatch.setattr(rl_trainer, "RecoverHandler", legacy_recover)
+    native_recover = MagicMock()
+    native_recover.return_value.load.return_value = None
+    monkeypatch.setattr(rl_trainer, "RecoverHandler", native_recover)
     serving = MagicMock()
     serving.resource_reconfiguration_enabled = False
     serving.serving_versions.return_value = [0]
     monkeypatch.setattr(
-        rl_trainer.PPOTrainer, "_init_rollout", MagicMock(return_value=serving)
+        rl_trainer, "RolloutControllerV2", MagicMock(return_value=serving)
     )
+    monkeypatch.setattr(
+        rl_trainer.SGLangConfig, "build_args", MagicMock(return_value={})
+    )
+    monkeypatch.setattr(
+        "areal.elastic.infra.reconfiguration.resolve_gpu_uuids", lambda devices: []
+    )
+    monkeypatch.setattr("areal.elastic.infra.reconfiguration.gpu_processes", lambda: {})
     factory = MagicMock()
     monkeypatch.setattr(rl_trainer.PPOTrainer, "_create_train_engine", factory)
     trainer = rl_trainer.PPOTrainer(config)
     try:
-        assert trainer.actor is None and fixture.actors == []
-        factory.assert_not_called()
-        legacy_recover.return_value.load.assert_not_called()
+        assert trainer.actor is factory.return_value and fixture.actors == []
+        factory.assert_called_once()
+        trainer.actor.initialize.assert_called_once()
+        trainer.actor.connect_engine.assert_called_once_with(
+            serving, trainer.weight_update_meta
+        )
+        native_recover.return_value.load.assert_called_once()
+        assert native_recover.return_value.load.call_args.args[0] is trainer.actor
+        serving.configure_online_training.assert_not_called()
         assert trainer.scheduler is not None and trainer.rollout_scheduler is not None
-        assert trainer._on_demand.inbox.status()["active_credits"] == 0
+        assert trainer._reconfiguration.trainer is trainer
+        assert not (Path(config.actor_lifecycle.state_root) / "inbox").exists()
     finally:
         trainer.close()
 

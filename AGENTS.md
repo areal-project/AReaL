@@ -4,9 +4,16 @@
 
 ## Quick reference
 
-For AutoPilot work, read [PROGRESS.md](PROGRESS.md) and the
-[Tau2 plan](examples/autopilot/PLAN.md) first. Update `PROGRESS.md` after project
-advancement; keep it concise and distinguish verified results from planned work.
+For AutoPilot work, read the workspace [progress](../PROGRESS.md) and
+[plan](../docs/plan.md) first. Update the workspace `PROGRESS.md` after project
+advancement; distinguish verified results from planned work. Maintain project plans,
+implementation writeups, experiment reports and machine runbooks in the workspace
+`docs/` directory. Keep only concise usage READMEs beside examples.
+
+For Reference work, read the [implementation](../docs/implementation/reference.md). Keep
+Reference independent of Basic; freeze source, calibration and NumPy identities for
+comparisons, preserve coefficients and coverage, and do not refit to hide migration
+differences. Record new conclusions with their version, evidence and assumptions.
 
 **Tech stack**: Python 3.12+ | PyTorch | FSDP2 / Megatron / Archon | SGLang / vLLM
 

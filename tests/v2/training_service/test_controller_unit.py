@@ -540,3 +540,519 @@ def test_full_checkpoint_excludes_training_mutations_until_all_ranks_complete():
         checkpoint.result(timeout=5)
         mutation.result(timeout=5)
     assert events == ["checkpoint", "checkpoint", "training"]
+
+
+@pytest.fixture
+def resident_online_pipeline(tmp_path, monkeypatch):
+    """Real CPU data plane; substitute only training/inference GPU execution.
+
+    The DataProxy HTTP server, sessions, RTensor storage, callbacks, workflow
+    dispatcher and Trainer step run normally. The CPU worker below is a protocol
+    substitute, not an implementation of FSDP or cross-DP tensor resharding.
+    """
+    import json
+    import socket
+    import threading
+    import time
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    import torch
+    import uvicorn
+
+    from areal.api import FinetuneSpec, WeightUpdateMeta
+    from areal.api.alloc_mode import ModelAllocation
+    from areal.api.cli_args import (
+        ActorLifecycleConfig,
+        InferenceEngineConfig,
+        PPOConfig,
+    )
+    from areal.elastic.infra import reconfiguration
+    from areal.experimental.openai.types import InteractionWithTokenLogpReward
+    from areal.infra.rpc.rtensor import RTensor, clear_fetch_buffer
+    from areal.infra.rpc.serialization import deserialize_value, serialize_value
+    from areal.infra.staleness_manager import StalenessManager
+    from areal.infra.workflow_executor import WorkflowExecutor
+    from areal.trainer.ppo.actor import PPOActorControllerV2
+    from areal.trainer.rl_trainer import PPOTrainer, _EmptyDataLoader
+    from areal.v2.inference_service.controller.controller import RolloutControllerV2
+    from areal.v2.inference_service.data_proxy.app import create_app
+    from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+    from areal.v2.weight_update.gateway.config import WeightUpdateResult
+
+    monkeypatch.setenv("AREAL_SPMD_MODE", "0")
+    monkeypatch.setattr("areal.utils.network.gethostip", lambda: "127.0.0.1")
+    rollout = RolloutControllerV2(
+        config=InferenceEngineConfig(
+            backend="sglang:d1",
+            consumer_batch_size=4,
+            max_concurrent_rollouts=8,
+            max_head_offpolicyness=2,
+            deterministic_sampling=True,
+            dump_to_file=False,
+            request_timeout=5,
+        ),
+        scheduler=MagicMock(n_gpus_per_node=8),
+    )
+    rollout._start_online_callback_server()
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    proxy_config = DataProxyConfig(
+        host="127.0.0.1",
+        port=port,
+        serving_addr=f"127.0.0.1:{port}",
+        backend_addr="",
+        callback_server_addr=f"http://{rollout.callback_addr}",
+    )
+    proxy = create_app(proxy_config)
+    server = uvicorn.Server(uvicorn.Config(proxy, log_level="error", lifespan="on"))
+    server_thread = threading.Thread(
+        target=lambda: server.run(sockets=[sock]), daemon=True
+    )
+    server_thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started and server_thread.is_alive():
+        assert time.monotonic() < deadline, "DataProxy startup timed out"
+        time.sleep(0.01)
+    assert server.started
+    # There is no inference GPU in this test. Keep the proxy/session/storage
+    # implementation intact and replace its calls into the inference backend.
+    proxy.state.inf_bridge = MagicMock(
+        pause=AsyncMock(), resume=AsyncMock(), aclose=AsyncMock()
+    )
+    address = f"http://127.0.0.1:{port}"
+    rollout._gateway_addr = address
+    rollout._data_proxy_addrs = [address]
+    rollout._inf_addrs = ["http://inference-gpu"]
+    rollout._staleness_manager = StalenessManager(rollout, 8, 4, 2)
+    executor = rollout._workflow_executor = WorkflowExecutor(
+        rollout.config, rollout, rollout.staleness_manager
+    )
+    executor.initialize()
+    stop_waiting = threading.Event()
+    wait_results = executor.dispatcher.wait_results
+
+    def bounded_wait(*args, **kwargs):
+        if stop_waiting.is_set():
+            raise RuntimeError("Resident pipeline verification stopped")
+        return wait_results(*args, **kwargs)
+
+    monkeypatch.setattr(executor.dispatcher, "wait_results", bounded_wait)
+
+    trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer.config = PPOConfig()
+    trainer.config.rollout = rollout.config
+    trainer.config.actor._version = "v2"
+    trainer.config.actor.backend = "fsdp:d2"
+    trainer.config.actor.recompute_logprob = False
+    trainer.config.actor.use_decoupled_loss = False
+    trainer.config.gconfig.n_samples = 1
+    trainer._should_offload_rollout = trainer._should_offload_actor = False
+    trainer._reconfiguration = None
+    trainer._training_lock = threading.RLock()
+    trainer._training_active = trainer._training_failed = False
+    trainer.actor_alloc = ModelAllocation.from_str("fsdp:d2", name="actor")
+    trainer.config.train_dataset.batch_size = 4
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors").write_bytes(b"CPU protocol model placeholder")
+    trainer.config.actor.path = str(model)
+    trainer.config.actor_lifecycle = ActorLifecycleConfig(
+        mode="on_demand",
+        state_root=str(tmp_path / "state"),
+        actor_devices=(0, 1, 2, 3),
+        rollout_devices=(4,),
+        checkpoint_estimated_bytes=1,
+        checkpoint_free_space_floor=0,
+    )
+    ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=12, train_batch_size=4)
+    monkeypatch.setattr(
+        reconfiguration, "resolve_gpu_uuids", lambda devices: list(devices)
+    )
+    monkeypatch.setattr(reconfiguration, "gpu_processes", lambda: {})
+    trainer.critic = trainer.ref = trainer.teacher = trainer.eval_rollout = None
+    trainer.data_controller = None
+    trainer.rollout = rollout
+    trainer.train_dataloader = _EmptyDataLoader(batch_size=4, steps_per_epoch=3)
+    trainer.weight_update_meta = WeightUpdateMeta(
+        type="disk", path=str(tmp_path / "weights")
+    )
+    trainer.saver = MagicMock()
+    # These CPU hooks are outside the data/Actor-rebuild operation under test.
+    for name in (
+        "_save_training_state",
+        "_evaluate",
+        "_export_and_commit_stats",
+        "_save_perf_tracer",
+    ):
+        monkeypatch.setattr(trainer, name, MagicMock())
+
+    actors, workers, links, consumed = [], {}, [], []
+
+    def snapshot(worker):
+        return deepcopy(
+            {
+                "weight": worker.weight.detach(),
+                "optimizer": worker.optimizer.state_dict(),
+                "scheduler": worker.scheduler.state_dict(),
+                "rng": worker.rng.get_state(),
+                "updates": worker.updates,
+            }
+        )
+
+    def restore(worker, state):
+        with torch.no_grad():
+            worker.weight.copy_(state["weight"])
+        worker.optimizer.load_state_dict(state["optimizer"])
+        worker.scheduler.load_state_dict(state["scheduler"])
+        worker.rng.set_state(state["rng"])
+        worker.updates = state["updates"]
+
+    def create_actor(dp):
+        assert not any(worker.running for worker in workers.values())
+        config = deepcopy(trainer.config.actor)
+        config.backend = f"fsdp:d{dp}"
+        actor = PPOActorControllerV2(
+            "areal.engine.FSDPPPOActor", config, scheduler=MagicMock()
+        )
+        weight = torch.nn.Parameter(torch.tensor([0.25]))
+        optimizer = torch.optim.Adam([weight], lr=0.01)
+        worker = workers[actor] = SimpleNamespace(
+            weight=weight,
+            optimizer=optimizer,
+            scheduler=torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.9),
+            rng=torch.Generator().manual_seed(123),
+            updates=0,
+            running=True,
+        )
+
+        async def initialize(role, ft_spec=None, **kwargs):
+            actor._worker_addrs = [
+                f"http://actor-{len(actors)}-rank-{r}" for r in range(dp)
+            ]
+            actor._service_roles = [f"actor-{len(actors)}-guard"]
+            actor._workers_ready.set()
+
+        def gateway(path, payload=None, **kwargs):
+            assert worker.running
+            args = deserialize_value(payload["args"]) if payload else []
+            if path == "/ppo/actor/compute_advantages":
+                return {"result": serialize_value(args[0])}
+            if path == "/ppo/actor/update":
+                batch = RTensor.localize(args[0])
+                ids = [int(traj["input_ids"][0, 0]) - 100 for traj in batch]
+                versions = [
+                    int(traj["versions"][traj["loss_mask"].bool()].min())
+                    for traj in batch
+                ]
+                assert len(ids) == 4
+                assert all(0 <= actor.get_version() - v <= 2 for v in versions)
+                consumed.extend(zip(ids, versions, [actor.get_version()] * 4))
+                worker.optimizer.zero_grad()
+                target = torch.tensor(ids, dtype=torch.float32).mean() / 10
+                target += torch.rand((), generator=worker.rng)
+                (worker.weight - target).square().sum().backward()
+                worker.optimizer.step()
+                worker.updates += 1
+            elif path == "/step_lr_scheduler":
+                worker.scheduler.step()
+            elif path == "/clear_batches":
+                clear_fetch_buffer(args[0])
+            else:
+                assert path == "/set_version", path
+            return {"status": "ok"}
+
+        async def checkpoint(addr, endpoint, **kwargs):
+            parameters = kwargs["kwargs"]
+            rank = actor._worker_addrs.index(addr)
+            path = tmp_path / parameters["path"]
+            if endpoint == "/checkpoint/save" and rank == 0:
+                path.mkdir(exist_ok=True)
+                (path / "dcp").mkdir(exist_ok=True)
+                (path / "dcp/.metadata").write_bytes(b"CPU worker protocol checkpoint")
+                torch.save(snapshot(worker), path / "cpu-worker.pt")
+            elif endpoint == "/checkpoint/load":
+                restore(worker, torch.load(path / "cpu-worker.pt", weights_only=True))
+                plan = parameters["restore_plan"]
+                assert plan["target_world_size"] == dp
+            if endpoint == "/checkpoint/save":
+                (path / f"runtime-{rank}.json").write_text(
+                    json.dumps(
+                        {
+                            "rank": rank,
+                            "world_size": dp,
+                            "policy_version": parameters["version"],
+                        }
+                    )
+                )
+            return {
+                "rank": rank,
+                "world_size": dp,
+                "policy_version": parameters["version"],
+                "backend": parameters["backend"],
+                "identity_sha256": parameters["identity_sha256"],
+                "state_sha256": str(rank) * 64,
+            }
+
+        monkeypatch.setattr(actor, "_async_initialize", initialize)
+        monkeypatch.setattr(actor, "_gateway_post", gateway)
+        monkeypatch.setattr(actor, "_call_worker_engine_endpoint", checkpoint)
+        monkeypatch.setattr(actor, "get_device_stats", MagicMock())
+        monkeypatch.setattr(
+            actor,
+            "_graceful_shutdown_workers",
+            lambda: setattr(worker, "running", False),
+        )
+        actors.append(actor)
+        return actor
+
+    def weight_link(_config):
+        link = MagicMock()
+        link.update_weights.side_effect = lambda *, version: WeightUpdateResult(
+            status="ok", version=version, duration_ms=0
+        )
+        links.append(link)
+        return link
+
+    monkeypatch.setattr(
+        "areal.v2.weight_update.controller.controller.WeightUpdateController",
+        weight_link,
+    )
+
+    client = httpx.Client(base_url=address, timeout=5)
+    sessions = {}
+
+    def generate(number):
+        # Inject a completed GPU response into the real session cache. Session
+        # creation, reward sealing, callback, export and RTensor reads use HTTP.
+        credentials = client.post(
+            "/rl/start_session",
+            json={"task_id": f"sample-{number}"},
+            headers={"Authorization": f"Bearer {proxy_config.admin_api_key}"},
+        )
+        credentials.raise_for_status()
+        credentials = credentials.json()["sessions"][0]
+        session = proxy.state.session_store.get_session(credentials["session_id"])
+        interaction = InteractionWithTokenLogpReward(
+            _interaction_id=f"sample-{number}",
+            messages=[{"role": "user", "content": f"sample-{number}"}],
+            output_message_list=[{"role": "assistant", "content": "2"}],
+            _cache={
+                "input_ids": torch.tensor([[number + 100, 2]]),
+                "attention_mask": torch.ones((1, 2), dtype=torch.bool),
+                "loss_mask": torch.tensor([[0, 1]]),
+                "logprobs": torch.tensor([[0.0, -0.5]]),
+                "versions": torch.tensor([[-1, rollout.get_version()]]),
+            },
+        )
+        session.active_completions[f"sample-{number}"] = interaction
+        sessions[number] = credentials
+        return credentials
+
+    def reward(number):
+        response = client.post(
+            "/rl/set_reward",
+            json={"reward": 1.0},
+            headers={"Authorization": f"Bearer {sessions[number]['session_api_key']}"},
+        )
+        response.raise_for_status()
+        assert response.json()["trajectory_ready"]
+
+    monkeypatch.setattr(
+        trainer,
+        "_create_train_engine",
+        lambda config, allocation: create_actor(allocation.parallel.world_size),
+    )
+    trainer._initialize_reconfigured_actor(trainer.config.actor, ft_spec)
+    trainer.actor.connect_engine(rollout, trainer.weight_update_meta)
+    trainer._reconfiguration = reconfiguration.TrainerReconfiguration(trainer, ft_spec)
+    try:
+        yield SimpleNamespace(
+            trainer=trainer,
+            rollout=rollout,
+            proxy=proxy,
+            executor=executor,
+            actors=actors,
+            workers=workers,
+            links=links,
+            consumed=consumed,
+            create_actor=create_actor,
+            generate=generate,
+            reward=reward,
+            snapshot=snapshot,
+            stop_waiting=stop_waiting,
+        )
+    finally:
+        for actor in actors:
+            if workers[actor].running:
+                actor.destroy()
+        rollout.destroy()
+        client.close()
+        server.should_exit = True
+        server_thread.join(timeout=5)
+        sock.close()
+        assert not server_thread.is_alive()
+
+
+@pytest.mark.parametrize(
+    "actor_dps", [(2, 2, 2), (2, 4, 2)], ids=["fixed", "dp-roundtrip"]
+)
+def test_resident_online_pipeline_continues_after_actor_rebuild(
+    resident_online_pipeline, tmp_path, actor_dps, record_property
+):
+    """Standard Trainer/WFE batches survive 2→4→2 without an Elastic inbox."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import torch
+
+    from areal.elastic.layout import ExecutionLayout
+    from areal.infra.rpc.serialization import serialize_value
+    from areal.utils.atomic import json_digest
+
+    pipeline = resident_online_pipeline
+    trainer, rollout, executor = pipeline.trainer, pipeline.rollout, pipeline.executor
+    manager, dispatcher = rollout.staleness_manager, executor.dispatcher
+    original_threads = (
+        dispatcher._commit_thread,
+        dispatcher._fetch_thread,
+        executor.runner.thread,
+    )
+    original_store = pipeline.proxy.state.session_store
+
+    def wait_until(predicate):
+        deadline = time.monotonic() + 5
+        while not predicate():
+            assert time.monotonic() < deadline, (
+                "Resident pipeline did not make progress"
+            )
+            threading.Event().wait(0.01)
+
+    def step(index):
+        trainer._train_step(
+            global_step=index,
+            steps_per_epoch=3,
+            workflow=None,
+            workflow_kwargs=None,
+            dynamic_filter_fn=None,
+            eval_workflow=None,
+            eval_workflow_kwargs=None,
+        )
+
+    # Allow prepare_batch's normal overlap loop to prefetch the second batch.
+    # Six completed trajectories then leave two results buffered and two tasks
+    # waiting for a reward while the Trainer finishes its first update.
+    thread = ThreadPoolExecutor(max_workers=1)
+    try:
+        first = thread.submit(step, 0)
+        wait_until(lambda: len(rollout._online_waiters) == 8)
+        for number in range(8):
+            pipeline.generate(number)
+            if number < 6:
+                pipeline.reward(number)
+        first.result(timeout=5)
+        wait_until(lambda: len(dispatcher._pending_results) == 2)
+        assert manager.get_stats().accepted == 6
+        assert manager.get_stats().running == 2
+        assert trainer.actor.get_version() == rollout.get_version() == 1
+        generator = executor.data_generator
+
+        for index, dp in enumerate(actor_dps[1:], start=1):
+            actor = trainer.actor
+            pending_ids = set(dispatcher._pending_results)
+            waiters = tuple(rollout._online_waiters)
+            statistics = manager.get_stats()
+            capacity = manager.get_capacity()
+            previous_state = pipeline.snapshot(pipeline.workers[actor])
+            if dp != actor.train_alloc.parallel.world_size:
+                receipt = trainer.reconfigure(
+                    target=ExecutionLayout(dp, (0, 1, 2, 3), (4,)),
+                    request_id=f"step-{index}",
+                    expected_generation=index - 1,
+                    expected_weights_version=index,
+                )
+                assert receipt["status"] == "applied"
+                assert receipt["generation"] == index
+                assert trainer.actor is not actor
+                assert not pipeline.workers[actor].running
+                replacement = trainer.actor
+
+                torch.testing.assert_close(
+                    pipeline.snapshot(pipeline.workers[replacement]),
+                    previous_state,
+                    rtol=0,
+                    atol=0,
+                )
+                pipeline.links[-2].disconnect.assert_called_once_with()
+                pipeline.links[-2].destroy.assert_called_once_with()
+                assert (
+                    len(
+                        pipeline.links[-1].connect.call_args.kwargs["train_worker_urls"]
+                    )
+                    == dp
+                )
+            assert executor.data_generator is generator
+            assert set(dispatcher._pending_results) == pending_ids
+            assert tuple(rollout._online_waiters) == waiters
+            assert manager.get_stats() == statistics
+            assert manager.get_capacity() == capacity
+            assert rollout.staleness_manager is manager
+            assert rollout.workflow_executor is executor
+            assert pipeline.proxy.state.session_store is original_store
+            assert rollout._online_inbox is None
+            assert not (tmp_path / "state/inbox").exists()
+            assert not executor.is_paused()
+            assert trainer.actor.get_version() == rollout.get_version() == index
+
+            current = thread.submit(step, index)
+            for number in range(index * 4 + 2, index * 4 + 4):
+                pipeline.reward(number)
+            if index == 1:
+                wait_until(lambda: len(rollout._online_waiters) >= 2)
+                for number in range(8, 12):
+                    pipeline.generate(number)
+                    if number < 10:
+                        pipeline.reward(number)
+            current.result(timeout=5)
+            if index == 1:
+                wait_until(lambda: len(dispatcher._pending_results) == 2)
+
+        assert [item[0] for item in pipeline.consumed] == list(range(12))
+        assert all(
+            0 <= version - generated <= 2 for _, generated, version in pipeline.consumed
+        )
+        assert (
+            trainer.actor.get_version()
+            == rollout.get_version()
+            == pipeline.proxy.state.version
+            == 3
+        )
+        assert pipeline.workers[trainer.actor].updates == 3
+        assert pipeline.workers[trainer.actor].scheduler.last_epoch == 3
+        assert manager.get_stats().accepted == 12
+        assert manager.get_stats().rejected == 0
+        assert all(t.is_alive() for t in original_threads)
+        assert (
+            dispatcher._commit_thread,
+            dispatcher._fetch_thread,
+            executor.runner.thread,
+        ) == original_threads
+        assert len(pipeline.actors) == (3 if actor_dps[1] == 4 else 1)
+        record_property("actor_dps", str(actor_dps))
+        record_property("consumed_ids", str([item[0] for item in pipeline.consumed]))
+        record_property("updates", 3)
+        record_property(
+            "cpu_worker_state_sha256",
+            json_digest(
+                serialize_value(pipeline.snapshot(pipeline.workers[trainer.actor]))
+            ),
+        )
+    finally:
+        pipeline.stop_waiting.set()
+        # Release any waiting workflows before tearing down the real dispatcher.
+        for waiter in tuple(rollout._online_waiters):
+            waiter.future.get_loop().call_soon_threadsafe(waiter.future.cancel)
+        thread.shutdown(wait=True, cancel_futures=True)
