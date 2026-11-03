@@ -178,6 +178,7 @@ def run_case(mode, per_token, split, scenario, check, prepared=False, optimizer_
     }
     train, compute, build = load_engine_callbacks(namespace)
     engine = SimpleNamespace(
+        mcore_config=SimpleNamespace(enable_mtp_training=False),
         _ensure_ready=lambda: None,
         optimizer_zero_grad=model.zero_grad_buffer,
         optimizer_step=lambda: {},

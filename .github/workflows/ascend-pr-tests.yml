@@ -369,6 +369,10 @@ jobs:
             -m skipif tests/test_reassemble_cp_logprobs.py
           collect_base_tests npu-weight-reload-native \
             tests/test_npu_weight_reload_native.py
+          collect_base_tests vllm-mtp-weights \
+            tests/test_vllm_mtp_weights.py
+          collect_base_tests mtp-loss-distributed \
+            tests/test_mtp_loss_distributed.py
           collect_base_tests npu-weight-reload-graph \
             tests/test_npu_weight_reload_graph.py
           collect_base_tests megatron-distributed \
@@ -471,6 +475,8 @@ jobs:
             -m skipif tests/test_reassemble_cp_logprobs.py
           pytest -q -p scripts.ci_test_report \
             tests/test_npu_weight_reload_native.py
+          pytest -q -p scripts.ci_test_report \
+            tests/test_vllm_mtp_weights.py
 
       - name: Run chunked LM-head single-device tests
         env:
@@ -789,7 +795,7 @@ jobs:
               wait_for_normal_wave
             done
 
-            # The remaining four single-device loss cases share the final wave.
+            # The remaining four single-device loss cases share one wave.
             start_normal_test \
               megatron-loss-aggregation-legacy-main-d1c1 \
               0 \
@@ -820,6 +826,12 @@ jobs:
               grad-norm-tp \
               5,6 \
               tests/megatron/test_grad_norm_tp_invariance.py::test_grad_norm_is_tp_invariant
+            wait_for_normal_wave
+
+            start_normal_test \
+              mtp-loss-distributed \
+              5,6 \
+              tests/test_mtp_loss_distributed.py
             wait_for_normal_wave
 
             return "${failed}"

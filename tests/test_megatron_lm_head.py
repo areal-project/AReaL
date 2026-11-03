@@ -92,12 +92,12 @@ def test_chunked_lm_head_config_validation():
             entropy_requires_grad=True,
             lm_head_loss_chunk_size=128,
         )
-    with pytest.raises(ValueError, match="does not support enable_mtp"):
+    with pytest.raises(ValueError, match="does not support enable_mtp_training"):
         MegatronEngineConfig(
             enable_chunked_logits=True,
             entropy_requires_grad=False,
             lm_head_loss_chunk_size=128,
-            enable_mtp=True,
+            enable_mtp_training=True,
         )
 
     config = MegatronEngineConfig(

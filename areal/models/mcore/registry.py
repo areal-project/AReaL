@@ -741,15 +741,22 @@ def make_mcore_model(
                     setattr(provider, attr, getattr(tf_config, attr))
 
         has_mtp = bool(getattr(provider, "mtp_num_layers", None))
-        if mcore_config.enable_mtp:
+        if mcore_config.enable_mtp_training:
             if not has_mtp:
                 raise ValueError(
-                    "megatron.enable_mtp=True but the model has no MTP layers."
+                    "megatron.enable_mtp_training=True but the model has no MTP layers."
                 )
+            if provider.mtp_num_layers != 1:
+                raise ValueError("MTP training supports exactly one prediction layer")
+            if use_lora or is_critic:
+                raise ValueError("MTP training requires full policy/SFT training")
+            from areal.engine.megatron_utils.mtp import patch_mtp_training
+
+            patch_mtp_training()
+            provider.mtp_loss_scaling_factor = mcore_config.mtp_loss_scaling_factor
         elif has_mtp:
-            logger.warning(
-                "Dropping MTP head (mtp_num_layers=%s -> None); not used in RL and not "
-                "exportable for Qwen3.6. Set megatron.enable_mtp=True to keep it.",
+            logger.info(
+                "Preserving %s frozen MTP layer(s) outside the training model.",
                 provider.mtp_num_layers,
             )
             provider.mtp_num_layers = None
@@ -819,6 +826,11 @@ def make_mcore_model(
             ddp_config.use_distributed_optimizer = False
             ddp_config.overlap_grad_reduce = False
             ddp_config.overlap_param_gather = False
+
+        if mcore_config.enable_mtp_training:
+            from areal.engine.megatron_utils.mtp import prepare_mtp_models_for_ddp
+
+            provider.register_pre_wrap_hook(prepare_mtp_models_for_ddp)
 
         models = provider.provide_distributed_model(
             ddp_config=ddp_config,
