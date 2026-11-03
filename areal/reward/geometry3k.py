@@ -73,8 +73,10 @@ def _extract_gold_answer(answer) -> str:
     if answer is None:
         return ""
     text = str(answer).strip()
-    boxed = _extract_boxed_answer(text)
-    if boxed == "":
+    # Validate boxes without selecting one: gold is already the full answer.
+    # Returning boxed content would turn 5 + \boxed{2} into 2. Leave valid
+    # boxes intact for the grouping-preserving normalization before verify.
+    if _extract_boxed_answer(text) == "":
         return ""
 
     # Do not mistake the index in \sqrt[3]{8} for a bracketed gold answer.
@@ -95,10 +97,14 @@ def _extract_gold_answer(answer) -> str:
 
 
 def geometry3k_reward_fn(
-    prompt, completions, prompt_ids, completion_ids, answer, **kwargs
+    prompt, completions: str, prompt_ids, completion_ids, answer, **kwargs
 ) -> float:
+    """Grade a decoded completion string against a complete gold expression."""
     try:
-        sol = extract_answer(str(completions))
+        # Container reprs escape backslashes and can hide boxes from extraction.
+        if not isinstance(completions, str):
+            return 0.0
+        sol = extract_answer(completions)
         ans = _extract_gold_answer(answer)
 
         if not sol or not ans:

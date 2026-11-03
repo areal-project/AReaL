@@ -1,3 +1,5 @@
+"""Shared math-verifier integration and legacy GSM8K/Geometry3K reward cases."""
+
 from areal.reward import geometry3k_reward_fn, get_math_verify_worker, gsm8k_reward_fn
 
 
