@@ -306,6 +306,12 @@ sglang:
   ep_size: 1
   log_level: info
   enable_multimodal: true
+  # 取消下面四行的注释，即可设置每次推理请求的多模态数量上限。
+  # 图片数量包含对话历史中的图片；不配置时沿用 SGLang 默认上限。
+  # limit_mm_data_per_request:
+  #   image: 64
+  #   video: 1
+  #   audio: 5
 train_dataset:
   batch_size: 16
   shuffle: true
