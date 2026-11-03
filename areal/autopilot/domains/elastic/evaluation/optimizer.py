@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reference Online search revisions scored by parent-owned candidate simulation."""
+"""Evaluate Optimizer revisions with parent-owned configuration predictions."""
 
 from __future__ import annotations
 
@@ -9,10 +9,13 @@ import math
 import time
 from dataclasses import asdict, dataclass
 
-from areal.autopilot.domains.elastic.adapter import ElasticEvaluator, candidate_runner
 from areal.autopilot.domains.elastic.contracts import OnlineProblem, decode
-from areal.autopilot.domains.elastic.identity import AREAL_ROOT, protected_files
-from areal.autopilot.revision.contracts import EvaluationReport, digest, source_digest
+from areal.autopilot.domains.elastic.cycle import (
+    ElasticRevisionBenchmark,
+    candidate_runner,
+)
+from areal.autopilot.domains.elastic.versions import AREAL_ROOT, protected_files
+from areal.autopilot.revision.contracts import RevisionReport, digest, source_digest
 from areal.autopilot.revision.execution import load_source
 from areal.elastic.reconfigurator.reference.optimizer import (
     OnlineOptimizer,
@@ -24,7 +27,7 @@ from areal.elastic.reconfigurator.reference.optimizer import (
 
 
 @dataclass(frozen=True)
-class OnlineOptimizerCriteria:
+class OptimizerRevisionCriteria:
     min_relative_improvement: float = 0.005
     max_cost_regression: float = 0.0
 
@@ -38,16 +41,16 @@ class OnlineOptimizerCriteria:
 
 
 class SearchPort:
-    """Restrict search to one immutable problem and model-produced predictions."""
+    """Restrict search to one immutable problem and Evaluator-produced predictions."""
 
-    def __init__(self, model, problem, *, max_queries, max_seconds):
-        self.model, self.problem = model, problem
+    def __init__(self, evaluator, problem, *, max_queries, max_seconds):
+        self.evaluator, self.problem = evaluator, problem
         self.max_queries, self.max_seconds = max_queries, max_seconds
         self.queries = 0
         self.issued = []
         self.violations = []
         self.started = time.monotonic()
-        self.model.prepare_context(problem.observation, problem.forecasts)
+        self.evaluator.prepare_context(problem.observation, problem.forecasts)
 
     def reject(self, reason):
         self.violations.append(reason)
@@ -64,23 +67,23 @@ class SearchPort:
 
     @property
     def historical(self):
-        return self.model.historical
+        return self.evaluator.historical
 
     @property
     def context_id(self):
-        return self.model.context_id
+        return self.evaluator.context_id
 
     @property
     def slo(self):
-        return self.model.slo
+        return self.evaluator.slo
 
     @property
     def parallel_available(self):
-        return self.model.parallel_available
+        return self.evaluator.parallel_available
 
     @property
     def execution_stats(self):
-        return self.model.execution_stats
+        return self.evaluator.execution_stats
 
     @execution_stats.setter
     def execution_stats(self, value):
@@ -93,7 +96,7 @@ class SearchPort:
             layouts
         ):
             self.reject("Search changed its candidate catalog")
-        return self.model.order_candidates(view, forecasts, layouts, preferred)
+        return self.evaluator.order_candidates(view, forecasts, layouts, preferred)
 
     def evaluate_wave(self, view, forecasts, indexed, *, bound=None, chunk_size=2):
         self.check(view, forecasts)
@@ -101,20 +104,20 @@ class SearchPort:
         if any(c not in self.problem.candidates for _, c in indexed):
             self.reject("Search queried a layout outside the frozen catalog")
         if self.queries + len(indexed) > self.max_queries:
-            self.reject("Search exceeded its model-query budget")
+            self.reject("Search exceeded its Evaluator-query budget")
         if bound is not None:
             if (
                 bound.best not in self.issued
                 or bound.target != self.slo.minimum_request_fraction
             ):
                 self.reject(
-                    "Pruning requires a model-issued incumbent and the fixed SLO target"
+                    "Pruning requires an Evaluator-issued incumbent and the fixed SLO target"
                 )
             bound = SearchBound(
                 self.context_id, bound.target, bound.best, bound.fraction_pruning
             )
         self.queries += len(indexed)
-        result = self.model.evaluate_wave(
+        result = self.evaluator.evaluate_wave(
             view, forecasts, indexed, bound=bound, chunk_size=chunk_size
         )
         self.issued.extend(result.predictions)
@@ -136,7 +139,7 @@ class SearchPort:
         if self.violations:
             raise ValueError("; ".join(self.violations))
         if not predictions or len({p.layout for p in predictions}) != len(predictions):
-            raise ValueError("Search must return unique model-issued predictions")
+            raise ValueError("Search must return unique Evaluator-issued predictions")
         if any(
             p not in self.issued for p in predictions
         ) or self.problem.observation.layout not in {p.layout for p in predictions}:
@@ -194,14 +197,14 @@ class VerifiedOnlineOptimizer:
         return OnlineOptimizer().evaluate_many(evaluator, view, forecasts, layouts)
 
 
-class OnlineOptimizerEvaluator(ElasticEvaluator):
+class OptimizerRevisionBenchmark(ElasticRevisionBenchmark):
     target = "optimizer"
 
     def __init__(
         self,
         cases,
         *,
-        model_factory,
+        evaluator_factory,
         context,
         settings=None,
         criteria=None,
@@ -225,10 +228,10 @@ class OnlineOptimizerEvaluator(ElasticEvaluator):
         )
         if not self.cases:
             raise ValueError("Freeze at least one Online optimization problem")
-        self.model_factory = model_factory
+        self.evaluator_factory = evaluator_factory
         self.context = copy.deepcopy(context)
         self.settings = copy.deepcopy(settings or {})
-        self.criteria = criteria or OnlineOptimizerCriteria()
+        self.criteria = criteria or OptimizerRevisionCriteria()
         self.runner = candidate_runner(runner)
         self.max_queries, self.max_seconds, self.overhead_weight = (
             max_queries,
@@ -257,15 +260,15 @@ class OnlineOptimizerEvaluator(ElasticEvaluator):
         self._reports = set()
         self._oracle = []
         for case in self.cases:
-            model = self.model_factory()
+            evaluator = self.evaluator_factory()
             predictions = tuple(
-                model.evaluate(case.observation, case.forecasts, c)
+                evaluator.evaluate(case.observation, case.forecasts, c)
                 for c in case.candidates
             )
             chosen = select_prediction(
                 predictions,
                 case.observation.layout,
-                model.slo.minimum_request_fraction,
+                evaluator.slo.minimum_request_fraction,
                 trigger=case.trigger,
             )
             if chosen is None:
@@ -288,7 +291,7 @@ class OnlineOptimizerEvaluator(ElasticEvaluator):
         errors, rows = [], []
         ports = [
             SearchPort(
-                self.model_factory(),
+                self.evaluator_factory(),
                 c,
                 max_queries=self.max_queries,
                 max_seconds=self.max_seconds,
@@ -364,7 +367,7 @@ class OnlineOptimizerEvaluator(ElasticEvaluator):
                     )
                 )
                 return {"finished": True}
-            return port.reject("Unknown Online model operation")
+            return port.reject("Unknown configuration Evaluator operation")
 
         try:
             self.assert_unchanged()
@@ -407,7 +410,7 @@ class OnlineOptimizerEvaluator(ElasticEvaluator):
                 if selected is None:
                     raise ValueError("Search returned no runnable layout")
                 # Cost/feasibility are recomputed without candidate pruning or self-reported values.
-                actual = self.model_factory().evaluate(
+                actual = self.evaluator_factory().evaluate(
                     case.observation, case.forecasts, selected.layout
                 )
                 if not actual.supported or actual.mean_gpu_seconds is None:
@@ -461,7 +464,7 @@ class OnlineOptimizerEvaluator(ElasticEvaluator):
 
         metrics = dict(
             mean_gpu_seconds=mean("cost"),
-            mean_model_queries=mean("queries"),
+            mean_evaluator_queries=mean("queries"),
             selection_sha256=digest([r["layout"] for r in rows]),
         )
         score = (
@@ -470,7 +473,7 @@ class OnlineOptimizerEvaluator(ElasticEvaluator):
             else mean("relative_cost")
             + self.overhead_weight * mean("queries") / self.max_queries
         )
-        report = EvaluationReport(
+        report = RevisionReport(
             self.target,
             source_digest(source),
             self.benchmark_sha256,

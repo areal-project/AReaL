@@ -35,12 +35,13 @@ python examples/autopilot/elastic/simulate_online.py \
 ## CPU 修订示例
 
 ```bash
-python -m examples.autopilot.revising --demo --target model --output /tmp/online-model-revision
+python -m examples.autopilot.revising --demo --target evaluator --output /tmp/online-evaluator-revision
 python -m examples.autopilot.revising --demo --target optimizer --output /tmp/online-optimizer-revision
 ```
 
-非 demo 还需 `--profile`、`--cases`，以及 `--agent-command` 或 `--llm-model`。profile／cases 的
-factory 契约见外层[Elastic Revision](../../../../docs/implementation/elastic-revision.md)。
+Evaluator 当前修订其内部 CostModels，外层 Revision Benchmark 评测代码修改。 非 demo 还需
+`--profile`、`--cases`，以及 `--agent-command` 或 `--llm-model`。profile／cases 的 factory
+契约见外层[Elastic Revision](../../../../docs/implementation/elastic-revision.md)。
 
 ## 原生训练
 

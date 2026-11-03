@@ -9,7 +9,7 @@ from areal.elastic.reconfigurator.reference.forecast import HistoricalReplay
 from areal.elastic.serving import rolling_slo
 
 
-def search_state(owner, view, model):
+def search_state(owner, view, evaluator):
     active = [r for r in view.requests if r.completed_at is None]
     recent = [
         t
@@ -22,7 +22,7 @@ def search_state(owner, view, model):
     return (
         view.layout,
         view.leases,
-        getattr(model, "source_ids", ()),
+        getattr(evaluator, "source_ids", ()),
         view.actor.waiting,
         owner.forecaster.regime_index,
         owner.forecaster.features,
@@ -31,7 +31,7 @@ def search_state(owner, view, model):
             sum(max(0, r.input_tokens - r.prefilled) for r in active),
             sum(t.output_tokens for t in recent) / max(1, len(recent)),
             sum(t.tool_seconds or 0 for t in recent) / max(1, len(recent)),
-            getattr(model, "delay", 0.0),
+            getattr(evaluator, "delay", 0.0),
             statistics.ttft_quantile_seconds,
             statistics.tpot_quantile_seconds,
         ),
@@ -43,13 +43,13 @@ def search_state(owner, view, model):
     )
 
 
-def redundant_search(owner, view, model):
+def redundant_search(owner, view, evaluator):
     if owner.config.independent_role_history and owner.allowed_roles(
         view.now
     ) != owner.allowed_roles(owner.last_search):
         return False
     old = owner._last_search_state
-    state = owner.search_state(view, model)
+    state = owner.search_state(view, evaluator)
     if old is None or state[:5] != old[:5] or state[7] != old[7]:
         return False
     if view.now - owner.last_search >= owner.config.slo_window_seconds:

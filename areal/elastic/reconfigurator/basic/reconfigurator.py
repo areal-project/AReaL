@@ -11,9 +11,9 @@ from dataclasses import dataclass, field
 from areal.elastic.contracts import nonnegative, positive_int
 
 from ...contracts import (
+    ConfigurationEvaluator,
     OnlineDecision,
     OnlineLayout,
-    OnlineModel,
     OnlineObservation,
     RollingSLO,
 )
@@ -94,7 +94,7 @@ class OnlineReconfigurator:
     def search_invalidated(self):
         self._last_search_state = None
 
-    def search_state(self, view, model):
+    def search_state(self, view, evaluator):
         active = [r for r in view.requests if r.completed_at is None]
         recent = [
             t
@@ -107,7 +107,7 @@ class OnlineReconfigurator:
         return (
             view.layout,
             view.leases,
-            getattr(model, "source_ids", ()),
+            getattr(evaluator, "source_ids", ()),
             view.actor.waiting,
             self.forecaster.regime_index,
             self.forecaster.features,
@@ -116,7 +116,7 @@ class OnlineReconfigurator:
                 sum(max(0, r.input_tokens - r.prefilled) for r in active),
                 sum(t.output_tokens for t in recent) / max(1, len(recent)),
                 sum(t.tool_seconds or 0 for t in recent) / max(1, len(recent)),
-                getattr(model, "delay", 0.0),
+                getattr(evaluator, "delay", 0.0),
                 statistics.ttft_quantile_seconds,
                 statistics.tpot_quantile_seconds,
             ),
@@ -127,9 +127,9 @@ class OnlineReconfigurator:
             ),
         )
 
-    def redundant_search(self, view, model):
+    def redundant_search(self, view, evaluator):
         old = self._last_search_state
-        state = self.search_state(view, model)
+        state = self.search_state(view, evaluator)
         if old is None or state[:5] != old[:5] or state[7] != old[7]:
             return False
         if view.now - self.last_search >= self.config.slo_window_seconds:
@@ -159,7 +159,9 @@ class OnlineReconfigurator:
             return "slack"
         return "none"
 
-    def decide(self, view: OnlineObservation, model: OnlineModel) -> OnlineDecision:
+    def decide(
+        self, view: OnlineObservation, evaluator: ConfigurationEvaluator
+    ) -> OnlineDecision:
         cfg, slo = self.config, self.slo
         historical = isinstance(self.forecaster, HistoricalReplay)
         if historical:
@@ -198,7 +200,7 @@ class OnlineReconfigurator:
         if (
             historical
             and cfg.deduplicate_searches
-            and self.redundant_search(view, model)
+            and self.redundant_search(view, evaluator)
         ):
             return keep("Unchanged recent search evidence; retain deployment", trigger)
         forecasts = self.forecaster.predict(view, self.decision_index)
@@ -211,16 +213,16 @@ class OnlineReconfigurator:
         evidence = forecasts[0].replay
         if historical:
             self.last_search = view.now
-            self._last_search_state = self.search_state(view, model)
+            self._last_search_state = self.search_state(view, evaluator)
         seeds = () if historical else tuple(f.seed for f in forecasts)
         candidates = (view.layout,) + tuple(
             c for c in self.candidates if c != view.layout
         )
         layouts = candidates[: cfg.max_evaluations]
-        evaluate_many = getattr(model, "evaluate_many", None)
-        if hasattr(model, "optimizer"):
-            model.optimizer = self.optimizer
-        search = getattr(model, "search", None)
+        evaluate_many = getattr(evaluator, "evaluate_many", None)
+        if hasattr(evaluator, "optimizer"):
+            evaluator.optimizer = self.optimizer
+        search = getattr(evaluator, "search", None)
         preferred = ()
         if historical and self._winners and self.forecaster.features is not None:
             preferred = (
@@ -237,7 +239,7 @@ class OnlineReconfigurator:
             else (
                 tuple(evaluate_many(view, forecasts, layouts))
                 if evaluate_many is not None
-                else tuple(model.evaluate(view, forecasts, c) for c in layouts)
+                else tuple(evaluator.evaluate(view, forecasts, c) for c in layouts)
             )
         )
         expected = predictions[0].work_ids
@@ -332,14 +334,14 @@ class OnlineReconfigurator:
             "Minimum predicted GPU seconds among SLO-feasible sampled continuations",
         )
 
-    def make_model(self, *args, **kwargs):
-        from .prediction import OnlineForecastModel
+    def make_evaluator(self, *args, **kwargs):
+        from .prediction import JointEvaluator
 
         reserve = kwargs.pop("actor_memory_reserve_fraction", 0.0)
         kwargs.pop("actor_memory_scope", None)
         if reserve:
             raise ValueError("Basic v1 has no Actor memory-reserve policy")
-        return OnlineForecastModel(*args, optimizer=self.optimizer, **kwargs)
+        return JointEvaluator(*args, optimizer=self.optimizer, **kwargs)
 
     def bind(self, environment, clock=None):
         from .controller import OnlineControl

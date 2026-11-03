@@ -120,7 +120,7 @@ class SimulationExecution:
     def service(self, local_services: set[tuple[int, int]] | None = None):
         sim = self.sim
         target = sim.deployments[sim.rollout_id]
-        cfg = sim.models.rollout_config(target.layout)
+        cfg = sim.cost_models.rollout_config(target.layout)
         unassigned = sim._unassigned.values() if local_services is None else ()
         for request in sorted(unassigned, key=lambda r: r.order):
             view = request.view
@@ -145,7 +145,7 @@ class SimulationExecution:
                 "draining",
             }:
                 continue
-            cfg = sim.models.rollout_config(deployment.layout)
+            cfg = sim.cost_models.rollout_config(deployment.layout)
             for replica in range(cfg.replicas):
                 if (
                     local_services is not None
@@ -187,7 +187,7 @@ class SimulationExecution:
                     slices, _ = scheduler_for(cfg.backend).batch(
                         cfg, list(group.rows.values())
                     )
-                    duration = sim.models.service(
+                    duration = sim.cost_models.service(
                         deployment.layout, group.kv_tokens, slices
                     )
                     rows = tuple(
@@ -399,7 +399,7 @@ class SimulationExecution:
             sim.reconfiguration.reject_unrepairable_forecast_wait()
             return
         try:
-            stages = sim.models.actor(
+            stages = sim.cost_models.actor(
                 sim.layout, tuple(tuple(sim.episodes[e].past) for e in batch)
             )
         except ActorMemoryRejected as exc:
@@ -489,7 +489,7 @@ class SimulationExecution:
             for d in sim.deployments.values()
             if d.role == "rollout" and d.status in {"active", "draining"}
         )
-        seconds = sim.models.publication(
+        seconds = sim.cost_models.publication(
             sim.layout, tuple(d.layout for d in recipients)
         )
         start, end = sim.link.reserve(sim.now, fitted_seconds=seconds)

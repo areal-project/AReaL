@@ -27,7 +27,7 @@ from areal.elastic.reconfigurator.basic.history import (
     HistoryReplayConfig,
 )
 from areal.elastic.reconfigurator.basic.optimizer import SearchBound, select_prediction
-from areal.elastic.reconfigurator.basic.prediction import OnlineForecastModel
+from areal.elastic.reconfigurator.basic.prediction import JointEvaluator
 from areal.elastic.reconfigurator.basic.reconfigurator import (
     OnlineReconfigurator,
     OnlineReconfiguratorConfig,
@@ -222,7 +222,7 @@ def test_mutable_requests_keep_observations_and_candidate_forks_independent():
     """Later token updates in either branch cannot mutate a captured observation."""
     workload = episodes(8, spacing=0, output=300)
     sim = simulation(workload)
-    sim.models = _AffineCosts()
+    sim.cost_models = _AffineCosts()
     sim.coalesce_decode = True
     sim.run(until=0.2)
     view = sim.observe()
@@ -231,7 +231,7 @@ def test_mutable_requests_keep_observations_and_candidate_forks_independent():
     fork = OnlineSimulation.from_forecast(
         view,
         forecast,
-        sim.models,
+        sim.cost_models,
         sim.config,
         sim.handoff,
         sim.slo,
@@ -299,13 +299,13 @@ def test_shared_forecast_templates_keep_candidate_state_and_observations_indepen
     """Reuse static inputs while rebuilding all mutable state and view bindings."""
     workload = episodes(8, spacing=0, output=300)
     main = simulation(workload)
-    main.models = _AffineCosts()
+    main.cost_models = _AffineCosts()
     main.run(until=0.12)
     view = main.observe()
     forecasts = (Forecast(42, workload, 5),)
     identity = fingerprint(view, forecasts)
-    evaluator = OnlineForecastModel(
-        main.models, main.config, main.handoff, SLO, prune_irreversible_slo=False
+    evaluator = JointEvaluator(
+        main.cost_models, main.config, main.handoff, SLO, prune_irreversible_slo=False
     )
     for layout in (view.layout, SMALL):
         assert evaluator.evaluate(view, forecasts, layout).supported
@@ -315,7 +315,7 @@ def test_shared_forecast_templates_keep_candidate_state_and_observations_indepen
         OnlineSimulation.from_forecast(
             view,
             forecasts[0],
-            main.models,
+            main.cost_models,
             main.config,
             main.handoff,
             SLO,
@@ -338,8 +338,8 @@ def test_shared_forecast_templates_keep_candidate_state_and_observations_indepen
     main.run(until=0.3)
     later = main.observe()
     actual = evaluator.evaluate(later, forecasts, later.layout)
-    expected = OnlineForecastModel(
-        main.models, main.config, main.handoff, SLO, prune_irreversible_slo=False
+    expected = JointEvaluator(
+        main.cost_models, main.config, main.handoff, SLO, prune_irreversible_slo=False
     ).evaluate(later, forecasts, later.layout)
     assert actual == expected
     assert evaluator.input_preparations == 2
@@ -359,7 +359,7 @@ def test_deferred_decode_preserves_token_versions_and_publication_gaps():
     runs = []
     for fast in (False, True):
         run = simulation(workload)
-        run.models = _AffineCosts()
+        run.cost_models = _AffineCosts()
         run.coalesce_decode = fast
         assert run.run()["status"] == "complete"
         runs.append(run)
@@ -389,7 +389,7 @@ def test_decode_intervals_preserve_detailed_gpu_trace():
     """An attached per-batch trace keeps the reference token execution path."""
     events = []
     sim = simulation(episodes(output=100), event_sink=events.append)
-    sim.models = _AffineCosts()
+    sim.cost_models = _AffineCosts()
     sim.coalesce_decode = True
     assert sim.run()["status"] == "complete"
     assert sim.decode_steps_skipped == 0
@@ -548,13 +548,13 @@ def test_actor_wait_restores_and_allows_a_delayed_repair_decision():
     assert view.consumed_episodes == view.training_version == view.provider_version == 0
     assert not sim.training_records
     forecasts = (Forecast(42, workload, 2),)
-    evaluator = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO, 1)
+    evaluator = JointEvaluator(sim.cost_models, sim.config, sim.handoff, SLO, 1)
     keep = evaluator.evaluate(view, forecasts, view.layout)
     repair = evaluator.evaluate(view, forecasts, INITIAL)
     assert not keep.supported and "footprint" in keep.reason
     assert repair.supported and repair.mean_gpu_seconds is not None
     branch = OnlineSimulation.from_forecast(
-        view, forecasts[0], sim.models, sim.config, sim.handoff, SLO
+        view, forecasts[0], sim.cost_models, sim.config, sim.handoff, SLO
     )
     assert branch.actor_wait == view.actor.waiting
     for run in (sim, branch):
@@ -586,7 +586,7 @@ def test_forecast_restore_continues_current_gpu_tool_and_actor_work():
     # forecast is separately checked below and never receives this true suffix.
     forecast = Forecast(1, workload, 2)
     branch = OnlineSimulation.from_forecast(
-        view, forecast, main.models, main.config, main.handoff, SLO
+        view, forecast, main.cost_models, main.config, main.handoff, SLO
     )
     spent = sum(main.pool.gpu_seconds.values())
     expected, actual = main.run(), branch.run()
@@ -700,11 +700,11 @@ def test_irreversible_slo_bound_matches_complete_sampled_prediction():
     sim.run(until=6)
     view = sim.observe()
     forecasts = (Forecast(42, workload, 6),)
-    pruned = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO).evaluate(
+    pruned = JointEvaluator(sim.cost_models, sim.config, sim.handoff, SLO).evaluate(
         view, forecasts, INITIAL
     )
-    full = OnlineForecastModel(
-        sim.models, sim.config, sim.handoff, SLO, prune_irreversible_slo=False
+    full = JointEvaluator(
+        sim.cost_models, sim.config, sim.handoff, SLO, prune_irreversible_slo=False
     ).evaluate(view, forecasts, INITIAL)
     assert not pruned.supported and pruned.mean_gpu_seconds is None
     assert "joint_fraction_upper_bound=0.25" in pruned.reason
@@ -736,10 +736,10 @@ def test_joint_sampled_prediction_ignores_token_pruning_flag():
     sim.run(until=0)
     view, forecasts = sim.observe(), (Forecast(42, workload, 0),)
     pruned_costs, full_costs = CountedCosts(), CountedCosts()
-    pruned = OnlineForecastModel(pruned_costs, sim.config, sim.handoff, SLO).evaluate(
+    pruned = JointEvaluator(pruned_costs, sim.config, sim.handoff, SLO).evaluate(
         view, forecasts, INITIAL
     )
-    full = OnlineForecastModel(
+    full = JointEvaluator(
         full_costs, sim.config, sim.handoff, SLO, prune_irreversible_slo=False
     ).evaluate(view, forecasts, INITIAL)
     assert pruned.supported and full.supported
@@ -811,7 +811,7 @@ def test_forecast_keeps_actual_node_placement_after_two_hot_changes():
     forecasts = HistoricalForecaster(
         ForecastConfig(120, 60, 1, 1, 42, 4096, 1)
     ).predict(view, 0)
-    prediction = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO).evaluate(
+    prediction = JointEvaluator(sim.cost_models, sim.config, sim.handoff, SLO).evaluate(
         view, forecasts, INITIAL
     )
     assert not prediction.supported
@@ -1212,7 +1212,7 @@ def test_window_cost_separates_old_rollout_overlap_from_target_residency(horizon
         HistoryReplayConfig(history_seconds=horizon, max_new_tokens=4096)
     ).predict(view, 0)
     target = OnlineLayout(4, 2, 4, 1)
-    model = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO)
+    model = JointEvaluator(sim.cost_models, sim.config, sim.handoff, SLO)
     keep, change = model.evaluate_many(view, forecasts, (INITIAL, target))
     assert keep.supported and change.supported
     assert keep.switching_gpu_seconds == 0
@@ -1267,7 +1267,7 @@ def test_fixed_serving_window_does_not_drain_late_requests(tail_output):
         )
         + (EpisodeSample("late", "math", 24.999, (Turn(16, tail_output),)),),
     )
-    score = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO).evaluate(
+    score = JointEvaluator(sim.cost_models, sim.config, sim.handoff, SLO).evaluate(
         view, (forecast,), INITIAL
     )
     assert score.supported
@@ -1306,7 +1306,7 @@ def test_fixed_serving_window_counts_overdue_pending_admission_as_failure():
             EpisodeSample("queued", "math", 5.2, (Turn(16, 1),)),
         ),
     )
-    score = OnlineForecastModel(sim.models, sim.config, sim.handoff, SLO).evaluate(
+    score = JointEvaluator(sim.cost_models, sim.config, sim.handoff, SLO).evaluate(
         view, (forecast,), INITIAL
     )
     assert score.supported and score.pending_requests == 2
@@ -1335,8 +1335,8 @@ def test_history_evaluation_retains_slo_failures_and_checks_actor_capacity():
     replay = HistoricalReplay(HistoryReplayConfig(max_new_tokens=4096)).predict(
         sim.observe(), 0
     )
-    score = OnlineForecastModel(
-        sim.models, sim.config, sim.handoff, ServingSLO(5, 0.1, 0.8)
+    score = JointEvaluator(
+        sim.cost_models, sim.config, sim.handoff, ServingSLO(5, 0.1, 0.8)
     ).evaluate(sim.observe(), replay, INITIAL)
     assert score.supported and score.worst_request_fraction < 0.8
     assert score.mean_gpu_seconds == pytest.approx(
@@ -1359,8 +1359,8 @@ def test_history_evaluation_retains_slo_failures_and_checks_actor_capacity():
             history_seconds=1, initial_regime_seconds=1, max_new_tokens=4096
         )
     ).predict(view, 0)
-    evaluator = OnlineForecastModel(
-        blocked.models, blocked.config, blocked.handoff, ServingSLO(5, 0.1, 0.8)
+    evaluator = JointEvaluator(
+        blocked.cost_models, blocked.config, blocked.handoff, ServingSLO(5, 0.1, 0.8)
     )
     old, repair = (
         evaluator.evaluate(view, replay, target) for target in (view.layout, INITIAL)
@@ -1444,7 +1444,7 @@ def test_bounded_search_matches_exhaustive_historical_selection(ttft, trigger):
     forecasts = forecasts + (replace(forecasts[0], seed=1),)
     layouts = (INITIAL, SMALL, OnlineLayout(2, 2, 4, 1), OnlineLayout(1, 1, 1, 1))
     slo = ServingSLO(ttft, 0.1, 0.8)
-    model = OnlineForecastModel(sim.models, sim.config, sim.handoff, slo)
+    model = JointEvaluator(sim.cost_models, sim.config, sim.handoff, slo)
     exhaustive = model.evaluate_many(view, forecasts, layouts)
     bounded = model.search(view, forecasts, layouts, trigger=trigger)
     assert select_prediction(
@@ -1745,7 +1745,7 @@ def test_cross_node_snapshot_restore_retains_placement_and_complete_work():
     view = sim.observe()
     forecast = Forecast(0, work, work[-1].available_at)
     clone = OnlineSimulation.from_forecast(
-        view, forecast, sim.models, cfg, sim.handoff, SLO
+        view, forecast, sim.cost_models, cfg, sim.handoff, SLO
     )
     assert sorted(
         (role, devices) for role, devices in clone.pool.leases.values()

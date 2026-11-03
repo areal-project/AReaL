@@ -303,7 +303,7 @@ class WorkloadStats:
 
 class Reconfigurator(Protocol):
     def decide(
-        self, observation: OnlineObservation, model: OnlineModel
+        self, observation: OnlineObservation, evaluator: ConfigurationEvaluator
     ) -> OnlineDecision: ...
 
 
@@ -609,7 +609,7 @@ class CandidateWave:
     chunks: int = 0
 
 
-class OnlineModel(Protocol):
+class ConfigurationEvaluator(Protocol):
     def evaluate(
         self,
         view: OnlineObservation,
@@ -655,7 +655,7 @@ class ControlSnapshot:
     checkpoint_version: int = 0
 
 
-class SimulationModels(Protocol):
+class CostModels(Protocol):
     source_ids: tuple[str, ...]
 
     def rollout_config(self, layout: OnlineLayout) -> RolloutConfig: ...

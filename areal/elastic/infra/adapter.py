@@ -7,7 +7,7 @@ from __future__ import annotations
 import heapq
 import json
 from dataclasses import asdict, replace
-from typing import Any, Protocol
+from typing import Any
 
 from areal.elastic.contracts import ControlBusy, OnlineLayout
 from areal.elastic.infra.monitor.identity import measurement_identity
@@ -24,12 +24,6 @@ def validate_unbound_adapter(adapter: Any) -> None:
         raise ValueError(
             "Reconfigurator adapter is already bound or closed; create a new instance"
         )
-
-
-class RevisionHooks(Protocol):
-    def poll(self) -> None: ...
-
-    def recover(self) -> None: ...
 
 
 class NativePlacements:
@@ -143,7 +137,7 @@ class NativeControlEnvironment:
         self.adapter = adapter
         self.owner = adapter.owner
         self.reconfigurator = adapter.reconfigurator
-        self.models = adapter.models
+        self.cost_models = adapter.cost_models
         self.config = adapter.run_config
         self.slo = adapter.reconfigurator.slo
         self.candidate_executor = None
@@ -253,12 +247,9 @@ class NativeControlEnvironment:
 class ReconfiguratorAdapter:
     """Supply native facts/capabilities, drive the selected version, execute its intent.
 
-    models/run_config/handoff may be supplied for candidate prediction. Missing
+    cost_models/run_config/handoff may be supplied for candidate prediction. Missing
     native token timing stays unknown; no second timeout or joint optimizer is assembled.
     """
-
-    supports_reconfigurator_activation = False
-    hooks: RevisionHooks | None = None
 
     def __init__(
         self,
@@ -269,7 +260,7 @@ class ReconfiguratorAdapter:
         forecast=None,
         slo=None,
         candidates=None,
-        models=None,
+        cost_models=None,
         run_config=None,
         handoff=None,
         observation_provider=None,
@@ -281,7 +272,7 @@ class ReconfiguratorAdapter:
         self.forecast = forecast
         self.slo = slo
         self.proposed = None if candidates is None else tuple(candidates)
-        self.models = models
+        self.cost_models = cost_models
         self.run_config = run_config
         self.handoff = handoff
         self.observation_provider = observation_provider
@@ -337,16 +328,16 @@ class ReconfiguratorAdapter:
             atomic_json(owner.root / "native-profile.json", self.profile)
         except OSError as error:
             owner.monitor.mark_unavailable(error)
-        if self.models is None and profile.get("model"):
+        cost_model_config = profile.get("cost_models", profile.get("model"))
+        if self.cost_models is None and cost_model_config:
             from pathlib import Path
 
-            model = profile["model"]
-            self.models = component_module(
-                self.implementation, "models"
-            ).CalibratedOnlineModels(
-                Path(model["bundle"]),
-                Path(model["mechanism_fits"]),
-                Path(model["publication_metadata"]),
+            self.cost_models = component_module(
+                self.implementation, "cost_models"
+            ).CalibratedCostModels(
+                Path(cost_model_config["bundle"]),
+                Path(cost_model_config["mechanism_fits"]),
+                Path(cost_model_config["publication_metadata"]),
                 float(profile["handoff"]["effective_bandwidth_GBps"]),
             )
         if self.run_config is None and profile.get("run"):
@@ -363,8 +354,8 @@ class ReconfiguratorAdapter:
             self.handoff = HandoffConfig.from_dict(
                 {"mode": "cold", **profile["handoff"]}
             )
-        if self.models is not None:
-            actor_template = getattr(self.models, "actor_template", None)
+        if self.cost_models is not None:
+            actor_template = getattr(self.cost_models, "actor_template", None)
             if (
                 actor_template is not None
                 and actor_template.backend != owner.allocation.backend

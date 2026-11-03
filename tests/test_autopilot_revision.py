@@ -23,12 +23,12 @@ def test_revision_core_runs_an_unrelated_domain_without_elastic_imports(tmp_path
                     raise AssertionError("Unexpected domain dependency: " + fullname)
         sys.meta_path.insert(0, BlockDomain())
         from areal.autopilot.revision import RevisionLoop, Proposal, LLMRevisionAgent
-        from areal.autopilot.revision.contracts import EvaluationReport, source_digest
+        from areal.autopilot.revision.contracts import RevisionReport, source_digest
         @dataclass(frozen=True)
         class Criteria:
             def compare(self, candidate, incumbent):
                 return candidate.score < incumbent.score, "measured error"
-        class Evaluator:
+        class Benchmark:
             target = "text-normalizer"
             benchmark_sha256 = "fixed-text-corpus"
             initial_source = "error = 2"
@@ -39,7 +39,7 @@ def test_revision_core_runs_an_unrelated_domain_without_elastic_imports(tmp_path
             def evaluate(self, source, directory):
                 directory.mkdir(parents=True, exist_ok=True)
                 (directory / "candidate.py").write_text(source)
-                return EvaluationReport(self.target, source_digest(source), self.benchmark_sha256,
+                return RevisionReport(self.target, source_digest(source), self.benchmark_sha256,
                                         True, int(source[-1]), {})
         class Agent:
             calls = 0
@@ -48,10 +48,10 @@ def test_revision_core_runs_an_unrelated_domain_without_elastic_imports(tmp_path
                 assert request.to_dict()["api"] == "normalize(text) -> str"
                 assert "reference_sources" in LLMRevisionAgent("test").messages(request)[1]["content"]
                 return Proposal("error = 1")
-        agent, evaluator = Agent(), Evaluator()
-        result = RevisionLoop(agent, evaluator, store).run(max_rounds=1)
+        agent, benchmark = Agent(), Benchmark()
+        result = RevisionLoop(agent, benchmark, store).run(max_rounds=1)
         assert result["accepted"] == 1 and agent.calls == 1
-        result = RevisionLoop(agent, evaluator, store).run(max_rounds=1)
+        result = RevisionLoop(agent, benchmark, store).run(max_rounds=1)
         assert result["accepted"] == 0 and result["final_score"] == 1
         assert not any(n.startswith(("areal.elastic", "areal.autopilot.domains")) for n in sys.modules)
     """)

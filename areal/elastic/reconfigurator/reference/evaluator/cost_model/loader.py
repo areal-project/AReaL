@@ -371,7 +371,7 @@ def digest(path: Path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-class CalibratedOnlineModels:
+class CalibratedCostModels:
     def __init__(
         self,
         bundle: Path,

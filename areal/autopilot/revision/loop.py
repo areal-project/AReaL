@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Propose, evaluate, accept or retry immutable simulator/optimizer revisions."""
+"""Propose code revisions, run the Revision Benchmark and store accepted versions."""
 
 import fcntl
 import json
@@ -10,8 +10,12 @@ from dataclasses import asdict
 from pathlib import Path
 
 from areal.autopilot.revision.agent import RevisionAgent
-from areal.autopilot.revision.contracts import ProposalRequest, digest, source_digest
-from areal.autopilot.revision.interfaces import RevisionEvaluator
+from areal.autopilot.revision.contracts import (
+    ProposalRequest,
+    RevisionBenchmark,
+    digest,
+    source_digest,
+)
 from areal.utils.atomic import atomic_json
 
 
@@ -97,31 +101,33 @@ class RevisionLoop:
     def __init__(
         self,
         agent: RevisionAgent,
-        evaluator: RevisionEvaluator,
+        benchmark: RevisionBenchmark,
         root: Path,
         *,
         criteria=None,
         initial_source: str | None = None,
     ):
-        self.agent, self.evaluator = agent, evaluator
+        self.agent, self.benchmark = agent, benchmark
         self.store = RevisionStore(root)
         self.initial_source = (
-            initial_source if initial_source is not None else evaluator.initial_source
+            initial_source if initial_source is not None else benchmark.initial_source
         )
         if not isinstance(self.initial_source, str) or not self.initial_source.strip():
             raise ValueError(
                 "Component revisions require an explicit initial_source factory"
             )
-        self._evaluator_owns_acceptance = evaluator.owns_acceptance
-        if self._evaluator_owns_acceptance:
-            if criteria is not None and criteria != evaluator.criteria:
-                raise ValueError("Acceptance criteria are frozen by the evaluator")
-            self.criteria = evaluator.criteria
+        self._benchmark_owns_acceptance = benchmark.owns_acceptance
+        if self._benchmark_owns_acceptance:
+            if criteria is not None and criteria != benchmark.criteria:
+                raise ValueError(
+                    "Acceptance criteria are frozen by the Revision Benchmark"
+                )
+            self.criteria = benchmark.criteria
         else:
-            self.criteria = criteria or evaluator.criteria
+            self.criteria = criteria or benchmark.criteria
 
     def _public_feedback(self, outcome: dict) -> dict:
-        if not self._evaluator_owns_acceptance:
+        if not self._benchmark_owns_acceptance:
             return outcome
         return {
             **outcome.get("feedback", {}),
@@ -149,16 +155,16 @@ class RevisionLoop:
     def context(self) -> dict:
         context = {
             "format_version": 1,
-            "target": self.evaluator.target,
-            "benchmark_sha256": self.evaluator.benchmark_sha256,
-            "deployment_context": self.evaluator.context,
+            "target": self.benchmark.target,
+            "benchmark_sha256": self.benchmark.benchmark_sha256,
+            "deployment_context": self.benchmark.context,
             "criteria": asdict(self.criteria),
         }
-        if self._evaluator_owns_acceptance:
+        if self._benchmark_owns_acceptance:
             context["initial_sha256"] = source_digest(
                 self.initial_source
                 if self.initial_source is not None
-                else self.evaluator.initial_source
+                else self.benchmark.initial_source
             )
         return context
 
@@ -180,11 +186,11 @@ class RevisionLoop:
             else (
                 self.initial_source
                 if self.initial_source is not None
-                else self.evaluator.initial_source
+                else self.benchmark.initial_source
             )
         )
         initial_sha256 = source_digest(source)
-        baseline = self.evaluator.evaluate(
+        baseline = self.benchmark.evaluate(
             source, root / f"baseline-{uuid.uuid4().hex}"
         )
         previous_report = (
@@ -192,9 +198,9 @@ class RevisionLoop:
             if active is not None
             else root / "baseline.json"
         )
-        if self._evaluator_owns_acceptance and previous_report.exists():
+        if self._benchmark_owns_acceptance and previous_report.exists():
             accepted_report = json.loads(previous_report.read_text())
-            fingerprints = self.evaluator.replay_fingerprints
+            fingerprints = self.benchmark.replay_fingerprints
             if accepted_report["valid"] and (
                 not baseline.valid
                 or baseline.candidate_sha256 != accepted_report["candidate_sha256"]
@@ -223,8 +229,8 @@ class RevisionLoop:
                     )["source"]
         seen = {initial_sha256, *(item.get("candidate_sha256") for item in previous)}
         baseline_feedback = (
-            self.evaluator.feedback(baseline)
-            if self._evaluator_owns_acceptance
+            self.benchmark.feedback(baseline)
+            if self._benchmark_owns_acceptance
             else {"score": baseline.score, "metrics": baseline.metrics}
         )
         feedback = [
@@ -237,15 +243,15 @@ class RevisionLoop:
             directory = attempts / f"round-{round_number:04d}-{uuid.uuid4().hex[:8]}"
             directory.mkdir()
             request = ProposalRequest(
-                self.evaluator.target,
+                self.benchmark.target,
                 round_number,
                 source,
                 source_digest(source),
-                self.evaluator.calibration,
-                json.loads(json.dumps(self.evaluator.settings)),
+                self.benchmark.calibration,
+                json.loads(json.dumps(self.benchmark.settings)),
                 tuple(feedback[-4:]),
                 previous_source=previous_source if previous_source != source else None,
-                context=self.evaluator.proposal_context,
+                context=self.benchmark.proposal_context,
             )
             atomic_json(directory / "proposal-request.json", request.to_dict())
             outcome = {
@@ -267,11 +273,11 @@ class RevisionLoop:
                         outcome["reason"] = "Duplicate candidate"
                     else:
                         seen.add(candidate_sha)
-                        report = self.evaluator.evaluate(proposal.source, directory)
+                        report = self.benchmark.evaluate(proposal.source, directory)
                         atomic_json(directory / "evaluation.json", asdict(report))
                         accepted, reason = (
-                            self.evaluator.compare(report, baseline)
-                            if self._evaluator_owns_acceptance
+                            self.benchmark.compare(report, baseline)
+                            if self._benchmark_owns_acceptance
                             else self.criteria.compare(report, baseline)
                         )
                         outcome.update(
@@ -280,8 +286,8 @@ class RevisionLoop:
                             metrics=report.metrics,
                             errors=list(report.errors),
                         )
-                        if self._evaluator_owns_acceptance:
-                            outcome["feedback"] = self.evaluator.feedback(report)
+                        if self._benchmark_owns_acceptance:
+                            outcome["feedback"] = self.benchmark.feedback(report)
                         if accepted:
                             path = directory / "candidate.py"
                             # Runner materializes the exact source that was evaluated.
@@ -314,8 +320,8 @@ class RevisionLoop:
                 break
         active = self.store.active()
         result = {
-            "target": self.evaluator.target,
-            "benchmark_sha256": self.evaluator.benchmark_sha256,
+            "target": self.benchmark.target,
+            "benchmark_sha256": self.benchmark.benchmark_sha256,
             "initial_sha256": initial_sha256,
             "incumbent_sha256": source_digest(source),
             "active_source": None if active is None else str(active[0]),

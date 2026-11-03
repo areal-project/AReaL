@@ -133,7 +133,7 @@ class OnlineOptimizer:
                         sum(
                             (
                                 s
-                                for _, s in evaluator.models.actor(
+                                for _, s in evaluator.cost_models.actor(
                                     layout, evaluator._known_batch
                                 )
                             )
@@ -142,11 +142,11 @@ class OnlineOptimizer:
                         else 0.0
                     )
                 if rollout_key not in rollout_scores:
-                    cfg = evaluator.models.rollout_config(layout)
+                    cfg = evaluator.cost_models.rollout_config(layout)
                     seconds = 0.0
                     for t in turns:
                         q = min(t.input_tokens, cfg.max_batch_tokens)
-                        prefill = evaluator.models.service(
+                        prefill = evaluator.cost_models.service(
                             layout,
                             0,
                             (
@@ -155,7 +155,7 @@ class OnlineOptimizer:
                                 ),
                             ),
                         )
-                        decode = evaluator.models.service(
+                        decode = evaluator.cost_models.service(
                             layout,
                             t.input_tokens,
                             (ServiceSlice("rank", t.input_tokens, 1, "decode", True),),
@@ -180,11 +180,11 @@ class OnlineOptimizer:
         work, cpus, preparations, pids = ([], 0.0, 0, set())
         parallel = (
             evaluator.executor is not None
-            and getattr(evaluator.models, "worker_spec", None) is not None
+            and getattr(evaluator.cost_models, "worker_spec", None) is not None
         )
         payload = (
             "basic",
-            getattr(evaluator.models, "worker_spec", None),
+            getattr(evaluator.cost_models, "worker_spec", None),
             evaluator.source_ids,
             evaluator.config,
             evaluator.handoff,
@@ -254,7 +254,7 @@ class OnlineOptimizer:
         return tuple(ordered)
 
     def evaluate_many(self, evaluator, view, forecasts, layouts):
-        spec = getattr(evaluator.models, "worker_spec", None)
+        spec = getattr(evaluator.cost_models, "worker_spec", None)
         if evaluator.executor is None or spec is None:
             return tuple(
                 evaluator.evaluate(view, forecasts, layout) for layout in layouts
@@ -265,7 +265,7 @@ class OnlineOptimizer:
         payload = (
             "basic",
             spec,
-            evaluator.models.source_ids,
+            evaluator.cost_models.source_ids,
             evaluator.config,
             evaluator.handoff,
             evaluator.slo,

@@ -9,9 +9,9 @@ import time
 from dataclasses import asdict, dataclass, field
 
 from areal.elastic.contracts import (
+    ConfigurationEvaluator,
     OnlineDecision,
     OnlineLayout,
-    OnlineModel,
     OnlineObservation,
     RollingSLO,
     nonnegative,
@@ -114,11 +114,11 @@ class OnlineReconfigurator:
     def search_invalidated(self):
         self._last_search_state = None
 
-    def search_state(self, view, model):
-        return trigger_rules.search_state(self, view, model)
+    def search_state(self, view, evaluator):
+        return trigger_rules.search_state(self, view, evaluator)
 
-    def redundant_search(self, view, model):
-        return trigger_rules.redundant_search(self, view, model)
+    def redundant_search(self, view, evaluator):
+        return trigger_rules.redundant_search(self, view, evaluator)
 
     def switched(self, when: float):
         """Called after handoff completion, including old-deployment release."""
@@ -147,7 +147,9 @@ class OnlineReconfigurator:
     def _trigger(self, stats: RollingSLO) -> str:
         return trigger_rules.trigger(self, stats)
 
-    def decide(self, view: OnlineObservation, model: OnlineModel) -> OnlineDecision:
+    def decide(
+        self, view: OnlineObservation, evaluator: ConfigurationEvaluator
+    ) -> OnlineDecision:
         cfg, slo = (self.config, self.slo)
         historical = isinstance(self.forecaster, HistoricalReplay)
         if historical:
@@ -195,7 +197,7 @@ class OnlineReconfigurator:
         if (
             historical
             and cfg.deduplicate_searches
-            and self.redundant_search(view, model)
+            and self.redundant_search(view, evaluator)
         ):
             return keep("Unchanged recent search evidence; retain deployment", trigger)
         forecasts = self.forecaster.predict(view, self.decision_index)
@@ -208,7 +210,7 @@ class OnlineReconfigurator:
         evidence = forecasts[0].replay
         if historical:
             self.last_search = view.now
-            self._last_search_state = self.search_state(view, model)
+            self._last_search_state = self.search_state(view, evaluator)
         seeds = () if historical else tuple(f.seed for f in forecasts)
         candidates = (view.layout,) + tuple(
             c for c in self.candidates if c != view.layout
@@ -231,10 +233,10 @@ class OnlineReconfigurator:
         layouts = candidates[: cfg.max_evaluations]
         if cfg.independent_role_history and len(layouts) == 1:
             return keep("No alternative layout under role history constraints", trigger)
-        evaluate_many = getattr(model, "evaluate_many", None)
-        if hasattr(model, "optimizer"):
-            model.optimizer = self.optimizer
-        search = getattr(model, "search", None)
+        evaluate_many = getattr(evaluator, "evaluate_many", None)
+        if hasattr(evaluator, "optimizer"):
+            evaluator.optimizer = self.optimizer
+        search = getattr(evaluator, "search", None)
         preferred = ()
         if historical and self._winners and (self.forecaster.features is not None):
             preferred = (
@@ -250,7 +252,7 @@ class OnlineReconfigurator:
             if historical and cfg.optimize_search and (search is not None)
             else tuple(evaluate_many(view, forecasts, layouts))
             if evaluate_many is not None
-            else tuple(model.evaluate(view, forecasts, c) for c in layouts)
+            else tuple(evaluator.evaluate(view, forecasts, c) for c in layouts)
         )
         expected = predictions[0].work_ids
         runnable = [
@@ -342,7 +344,7 @@ class OnlineReconfigurator:
             "Minimum predicted GPU seconds among SLO-feasible sampled continuations",
         )
 
-    def make_model(self, *args, **kwargs):
+    def make_evaluator(self, *args, **kwargs):
         from areal.elastic.reconfigurator.reference.evaluator import Evaluator
 
         return Evaluator(*args, optimizer=self.optimizer, **kwargs)
@@ -369,10 +371,10 @@ class OnlineReconfigurator:
         )
         return self
 
-    def model(self, delay):
+    def evaluator(self, delay):
         sim = self.environment
-        return self.make_model(
-            getattr(sim, "prediction_models", sim.models),
+        return self.make_evaluator(
+            getattr(sim, "prediction_cost_models", sim.cost_models),
             sim.config,
             sim.handoff,
             sim.slo,
@@ -405,13 +407,13 @@ class OnlineReconfigurator:
             sim.emit("search_pending", search=self.pending.identity)
         else:
             started = self.clock()
-            model = self.model(self.delay_estimate)
-            decision = self.decide(view, model)
+            evaluator = self.evaluator(self.delay_estimate)
+            decision = self.decide(view, evaluator)
             elapsed = max(0.0, self.clock() - started)
             record = dict(
                 **asdict(decision),
                 observation_id=fingerprint(view),
-                evaluation=dict(model.execution_stats),
+                evaluation=dict(evaluator.execution_stats),
                 search_wall_seconds=elapsed,
                 delay_estimate_seconds=self.delay_estimate,
                 actor_running=view.actor.running,
@@ -491,8 +493,8 @@ class OnlineReconfigurator:
             )
             return
         started = self.clock()
-        model = self.model(self.verification_estimate)
-        job.validation = model.evaluate_many(
+        evaluator = self.evaluator(self.verification_estimate)
+        job.validation = evaluator.evaluate_many(
             view, forecasts, (view.layout, job.decision.target)
         )
         job.elapsed = max(0.0, self.clock() - started)
@@ -510,7 +512,7 @@ class OnlineReconfigurator:
             if job.validation_features is not None
             else None
         )
-        job.record["verification_evaluation"] = dict(model.execution_stats)
+        job.record["verification_evaluation"] = dict(evaluator.execution_stats)
         job.record["validation_predictions"] = tuple(asdict(p) for p in job.validation)
         self.stats["verifications"] += 1
         self.stats["verification_wall_seconds"] += job.elapsed

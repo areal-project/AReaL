@@ -40,10 +40,10 @@ class JointSimulator:
         self.actors, self.rollout, self.transitions = actors, rollout, transitions
 
     @classmethod
-    def from_forecast(cls, view, forecast, models, config, handoff, slo, **kwargs):
+    def from_forecast(cls, view, forecast, cost_models, config, handoff, slo, **kwargs):
         from .joint_online import JointWindow
 
-        return JointWindow(view, forecast, models, config, handoff, slo, **kwargs)
+        return JointWindow(view, forecast, cost_models, config, handoff, slo, **kwargs)
 
     def evaluate(self, scenario: JointScenario, config: JointConfig) -> JointPrediction:
         return _JointRun(self, scenario, config).run()

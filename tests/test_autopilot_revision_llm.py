@@ -10,8 +10,10 @@ import httpx
 import openai
 import pytest
 
-from examples.autopilot.elastic.revision_demo import GOOD_MODEL_SOURCE as AFFINE_SOURCE
-from examples.autopilot.elastic.revision_demo import demo_evaluator
+from examples.autopilot.elastic.revision_demo import (
+    GOOD_EVALUATOR_SOURCE as AFFINE_SOURCE,
+)
+from examples.autopilot.elastic.revision_demo import demo_benchmark
 
 from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE
 from areal.autopilot.domains.elastic.contracts import (
@@ -79,11 +81,11 @@ def proposer(**kwargs):
 
 
 def proposal_request():
-    profile = demo_evaluator("model").calibration
+    profile = demo_benchmark("evaluator").calibration
     return ProposalRequest(
-        "model",
+        "evaluator",
         2,
-        BASELINE_SOURCE["model"],
+        BASELINE_SOURCE["evaluator"],
         "incumbent-hash",
         profile,
         {},
@@ -110,13 +112,13 @@ def test_llm_sends_public_api_calibration_and_feedback_and_records_usage(
     assert (
         "class HistoricalInput"
         in context["reference_sources"][
-            "areal/autopilot/domains/elastic/model_evaluator.py"
+            "areal/autopilot/domains/elastic/evaluation/evaluator.py"
         ]
     )
     assert (
-        "class OnlineHistoryPredictor"
+        "class CostModelHistoryPredictor"
         in context["reference_sources"][
-            "areal/autopilot/domains/elastic/model_adapters.py"
+            "areal/autopilot/domains/elastic/evaluation/evaluator.py"
         ]
     )
     assert "observed" not in context["request"]["calibration"]
@@ -142,8 +144,8 @@ def test_llm_repairs_rejected_source_after_loop_resume(model_endpoint, tmp_path)
         ]
     )
     root = str(Path(__file__).resolve().parents[1])
-    bootstrap = f"import sys,types,runpy; p=types.ModuleType('areal'); p.__path__=[{root!r}+'/areal']; sys.modules['areal']=p; runpy.run_module('areal.autopilot.domains.elastic.worker',run_name='__main__')"
-    evaluation = demo_evaluator(
+    bootstrap = f"import sys,types,runpy; p=types.ModuleType('areal'); p.__path__=[{root!r}+'/areal']; sys.modules['areal']=p; runpy.run_module('areal.autopilot.domains.elastic.evaluation.worker',run_name='__main__')"
+    evaluation = demo_benchmark(
         "model", CandidateRunner(command=(sys.executable, "-c", bootstrap))
     )
     store = tmp_path / "revision"
@@ -243,8 +245,8 @@ def test_llm_timeout_is_feedback_and_does_not_abort_revision(model_endpoint, tmp
         ]
     )
     root = str(Path(__file__).resolve().parents[1])
-    bootstrap = f"import sys,types,runpy; p=types.ModuleType('areal'); p.__path__=[{root!r}+'/areal']; sys.modules['areal']=p; runpy.run_module('areal.autopilot.domains.elastic.worker',run_name='__main__')"
-    evaluation = demo_evaluator(
+    bootstrap = f"import sys,types,runpy; p=types.ModuleType('areal'); p.__path__=[{root!r}+'/areal']; sys.modules['areal']=p; runpy.run_module('areal.autopilot.domains.elastic.evaluation.worker',run_name='__main__')"
+    evaluation = demo_benchmark(
         "model", CandidateRunner(command=(sys.executable, "-c", bootstrap))
     )
     result = RevisionLoop(proposer(), evaluation, tmp_path).run(max_rounds=2)
@@ -267,7 +269,7 @@ def test_cli_selects_llm_command_without_exposing_api_key(monkeypatch, tmp_path)
             return {"active_source": None, "accepted": 0}
 
     monkeypatch.setattr(cli, "RevisionLoop", Loop)
-    monkeypatch.setattr(cli, "demo_evaluator", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "demo_benchmark", lambda *a, **k: None)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -295,26 +297,29 @@ def test_cli_selects_llm_command_without_exposing_api_key(monkeypatch, tmp_path)
     assert "test-credential" not in " ".join(seen[0].command)
 
 
-def test_historical_model_proposal_supplies_matching_factory_and_reference_api():
+def test_evaluator_proposal_supplies_matching_factory_and_benchmark_api():
     """The existing proposer gets historical predictor APIs without a network call."""
     request = ProposalRequest(
-        "model", 1, "def build_model(c, s): pass", "source-hash", {"cases": []}, {}, ()
+        "evaluator",
+        1,
+        "def build_cost_models(c, s): pass",
+        "source-hash",
+        {"cases": []},
+        {},
+        (),
     )
     messages = proposer().messages(request)
     data = json.loads(messages[1]["content"])
-    assert "build_model" in data["request"]["factory"]
+    assert "build_cost_models" in data["request"]["factory"]
     assert "calibration_cases" in data["request"]["factory"]
     assert (
-        "areal/autopilot/domains/elastic/model_evaluator.py"
+        "areal/autopilot/domains/elastic/evaluation/evaluator.py"
         in data["reference_sources"]
-    )
-    assert (
-        "areal/autopilot/domains/elastic/model_adapters.py" in data["reference_sources"]
     )
     assert (
         "final_holdout"
         in data["reference_sources"][
-            "areal/autopilot/domains/elastic/model_evaluator.py"
+            "areal/autopilot/domains/elastic/evaluation/evaluator.py"
         ]
     )
 
@@ -332,7 +337,7 @@ def test_online_optimizer_proposal_supplies_the_reference_search_port():
     assert (
         "SearchPort"
         in data["reference_sources"][
-            "areal/autopilot/domains/elastic/optimizer_evaluator.py"
+            "areal/autopilot/domains/elastic/evaluation/optimizer.py"
         ]
     )
 

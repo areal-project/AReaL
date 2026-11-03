@@ -5,14 +5,16 @@
 from dataclasses import asdict
 
 from areal.autopilot.domains.elastic.contracts import OnlineProblem
-from areal.autopilot.domains.elastic.model_evaluator import (
+from areal.autopilot.domains.elastic.evaluation.evaluator import (
+    CostModelHistoryBenchmark,
+    EvaluatorRevisionBenchmark,
     HistoricalCase,
     HistoricalInput,
-    HistoricalModelEvaluator,
     HistorySpan,
 )
-from areal.autopilot.domains.elastic.model_execution import HistoricalSourceEvaluator
-from areal.autopilot.domains.elastic.optimizer_evaluator import OnlineOptimizerEvaluator
+from areal.autopilot.domains.elastic.evaluation.optimizer import (
+    OptimizerRevisionBenchmark,
+)
 from areal.autopilot.revision.execution import load_source
 from areal.elastic.contracts import (
     EpisodeSample,
@@ -39,11 +41,11 @@ class Components:
                 ("train",self.scale*sum(t.input_tokens+t.output_tokens for e in batch for t in e)/100/layout.actor_gpus))
     def publication(self, layout, recipients):
         return 0.001*sum(r.rollout_gpus for r in recipients)
-def build_model(calibration_cases, settings):
+def build_cost_models(calibration_cases, settings):
     return Components(SCALE)
 """
-GOOD_MODEL_SOURCE = MODEL_SOURCE.replace("SCALE", "1.0")
-BIASED_MODEL_SOURCE = MODEL_SOURCE.replace("SCALE", "1.3")
+GOOD_EVALUATOR_SOURCE = MODEL_SOURCE.replace("SCALE", "1.0")
+BIASED_EVALUATOR_SOURCE = MODEL_SOURCE.replace("SCALE", "1.3")
 REDUNDANT_OPTIMIZER_SOURCE = """from areal.elastic.reconfigurator.reference.optimizer import OnlineOptimizer
 class Redundant(OnlineOptimizer):
     def search(self, evaluator, view, forecasts, layouts, **kwargs):
@@ -71,12 +73,12 @@ def demo_inputs():
         "Synthetic CPU-only zero startup / explicit transfer prior",
     )
     slo = ServingSLO(5, 0.1, 0.8)
-    models = load_source(GOOD_MODEL_SOURCE).build_model((), {})
+    cost_models = load_source(GOOD_EVALUATOR_SOURCE).build_cost_models((), {})
     workload = tuple(
         EpisodeSample(f"demo-{i}", "math", i, (Turn(16, 4),)) for i in range(8)
     )
     simulation = OnlineSimulation(
-        workload, initial, models, run, handoff, slo, input_closes_at=20
+        workload, initial, cost_models, run, handoff, slo, input_closes_at=20
     )
     problem = OnlineProblem(
         simulation.observe(), (Forecast(0, workload, 20),), candidates
@@ -125,25 +127,25 @@ def demo_inputs():
     return cases, (problem,), assembly
 
 
-def demo_evaluator(target, runner=None):
+def demo_benchmark(target, runner=None):
     cases, problems, assembly = demo_inputs()
-    if target == "model":
-        history = HistoricalModelEvaluator(
+    if target == "evaluator":
+        history = CostModelHistoryBenchmark(
             tuple(cases), primary_metrics=("actor_total_seconds",)
         )
-        return HistoricalSourceEvaluator(
+        return EvaluatorRevisionBenchmark(
             history,
             settings={"fixture": "synthetic-online"},
             runner=runner,
-            initial_source=BIASED_MODEL_SOURCE,
+            initial_source=BIASED_EVALUATOR_SOURCE,
         )
-    models = load_source(GOOD_MODEL_SOURCE).build_model((), {})
+    cost_models = load_source(GOOD_EVALUATOR_SOURCE).build_cost_models((), {})
     from areal.autopilot.domains.elastic.contracts import decode
 
-    return OnlineOptimizerEvaluator(
+    return OptimizerRevisionBenchmark(
         problems,
-        model_factory=lambda: Evaluator(
-            models,
+        evaluator_factory=lambda: Evaluator(
+            cost_models,
             decode(SimulationConfig, assembly["run"]),
             decode(HandoffConfig, assembly["handoff"]),
             decode(ServingSLO, assembly["slo"]),

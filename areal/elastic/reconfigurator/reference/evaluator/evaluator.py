@@ -19,6 +19,7 @@ from areal.elastic.contracts import (
     ActorView,
     ActorWaitView,
     CandidatePrediction,
+    CostModels,
     EpisodeSample,
     EpisodeView,
     Forecast,
@@ -28,7 +29,6 @@ from areal.elastic.contracts import (
     RequestView,
     ServiceView,
     SimulationConfig,
-    SimulationModels,
     ToolView,
     Turn,
 )
@@ -150,9 +150,9 @@ class _CandidateGuard:
     fixed_running_cost: float | None = None
 
 
-class EvaluationMemoryModels:
-    def __init__(self, models, target, reserve, observed_at):
-        self.models, self.target, self.reserve = (models, target, reserve)
+class MemoryCheckedCostModels:
+    def __init__(self, cost_models, target, reserve, observed_at):
+        self.cost_models, self.target, self.reserve = (cost_models, target, reserve)
         self.checked = set()
         self.report = ActorMemorySafety(
             True,
@@ -168,7 +168,7 @@ class EvaluationMemoryModels:
         )
 
     def __getattr__(self, name):
-        return getattr(self.models, name)
+        return getattr(self.cost_models, name)
 
     def actor(self, layout, batch):
         if (layout.actor_dp, layout.actor_tp) == (
@@ -176,7 +176,7 @@ class EvaluationMemoryModels:
             self.target.actor_tp,
         ) and batch not in self.checked:
             try:
-                estimate = getattr(self.models, "actor_memory", None)
+                estimate = getattr(self.cost_models, "actor_memory", None)
                 if estimate is None:
                     raise ValueError("Actor memory estimate unavailable")
                 used, limit, measured_oom = estimate(layout, batch)
@@ -205,7 +205,7 @@ class EvaluationMemoryModels:
                 self.report = replace(self.report, admissible=False, reason=str(exc))
         if not self.report.admissible:
             raise ValueError(self.report.reason)
-        return self.models.actor(layout, batch)
+        return self.cost_models.actor(layout, batch)
 
 
 class Evaluator:
@@ -215,7 +215,7 @@ class Evaluator:
 
     def __init__(
         self,
-        models: SimulationModels,
+        cost_models: CostModels,
         config: SimulationConfig,
         handoff: HandoffConfig,
         slo: ServingSLO,
@@ -228,8 +228,8 @@ class Evaluator:
         actor_memory_reserve_fraction: float = 0.0,
         actor_memory_scope: str = "all_completed",
     ):
-        self.models, self.config, self.handoff, self.slo = (
-            models,
+        self.cost_models, self.config, self.handoff, self.slo = (
+            cost_models,
             config,
             handoff,
             slo,
@@ -254,7 +254,7 @@ class Evaluator:
 
     @property
     def source_ids(self):
-        return self.models.source_ids
+        return self.cost_models.source_ids
 
     def prepare_context(self, view, forecasts):
         if self._view is view and self._forecasts is forecasts:
@@ -333,7 +333,7 @@ class Evaluator:
         peak = capacity = allowed = None
         worst, count, admissible = ((), 0, True)
         reason = "All completed historical batches retain the configured memory reserve"
-        estimate = getattr(self.models, "actor_memory", None)
+        estimate = getattr(self.cost_models, "actor_memory", None)
         if estimate is None or not self._memory_batches:
             admissible = False
             reason = "Actor memory safety unknown: need memory estimates and a completed observed batch"
@@ -368,14 +368,14 @@ class Evaluator:
         self._memory_checks[key] = result
         return result
 
-    def actor_supply(self, view, forecast, layout, *, models=None):
+    def actor_supply(self, view, forecast, layout, *, cost_models=None):
         """Estimate ongoing demand from offered arrivals and causal turn templates.
 
         Incomplete final batches wrap to the start of the same historical sequence
         and carry fractional batch weight. This estimates a repeated workload's
         capacity, not extra training in the serving window or an exact queue bound.
         """
-        models = models or self.models
+        cost_models = cost_models or self.cost_models
         replay = forecast.replay
         recent = sorted(
             (
@@ -411,7 +411,7 @@ class Evaluator:
                     batch = tuple(
                         rows[(offset + i) % len(rows)] for i in range(batch_size)
                     )
-                    stages = models.actor(layout, batch)
+                    stages = cost_models.actor(layout, batch)
                     if not stages:
                         raise ValueError("Actor model supplied no capacity stages")
                     seconds = sum((seconds for _, seconds in stages))
@@ -424,7 +424,7 @@ class Evaluator:
                     batches += 1
                     padded += batch_size - count
                 actor_seconds = weighted_seconds / weight
-                publication_seconds = models.publication(layout, (layout,))
+                publication_seconds = cost_models.publication(layout, (layout,))
                 if not math.isfinite(publication_seconds) or publication_seconds < 0:
                     raise ValueError("Publication capacity requires a finite duration")
                 capacity = batch_size / (actor_seconds + publication_seconds)
@@ -462,13 +462,13 @@ class Evaluator:
             self.actor_memory_reserve_fraction
             and self.actor_memory_scope == "evaluation"
         ):
-            models = EvaluationMemoryModels(
-                self.models, layout, self.actor_memory_reserve_fraction, view.now
+            cost_models = MemoryCheckedCostModels(
+                self.cost_models, layout, self.actor_memory_reserve_fraction, view.now
             )
             prediction = self._evaluate(
-                view, forecasts, layout, bound=bound, models=models
+                view, forecasts, layout, bound=bound, cost_models=cost_models
             )
-            memory = models.report
+            memory = cost_models.report
             if not memory.admissible:
                 prediction = replace(
                     prediction,
@@ -500,8 +500,8 @@ class Evaluator:
             else prediction
         )
 
-    def _evaluate(self, view, forecasts, layout, *, bound=None, models=None):
-        models = models or self.models
+    def _evaluate(self, view, forecasts, layout, *, bound=None, cost_models=None):
+        cost_models = cost_models or self.cost_models
         self.prepare_context(view, forecasts)
         work_ids = self._work_ids
         if bound is not None and bound.context_id != self._context_id:
@@ -515,14 +515,17 @@ class Evaluator:
         coverage = "legacy_sampled_execution"
         known_batch = self._known_batch
         supply = (
-            tuple(self.actor_supply(view, f, layout, models=models) for f in forecasts)
+            tuple(
+                self.actor_supply(view, f, layout, cost_models=cost_models)
+                for f in forecasts
+            )
             if historical
             else ()
         )
         if historical:
             if known_batch:
                 try:
-                    if not models.actor(layout, known_batch):
+                    if not cost_models.actor(layout, known_batch):
                         raise ValueError("Actor model supplied no update stages")
                 except ValueError as exc:
                     return CandidatePrediction(
@@ -532,7 +535,7 @@ class Evaluator:
                         None,
                         work_ids,
                         str(exc),
-                        self.models.source_ids,
+                        self.cost_models.source_ids,
                         actor_coverage="known_batch_rejected",
                         actor_supply=supply,
                     )
@@ -554,7 +557,7 @@ class Evaluator:
                         None,
                         work_ids,
                         f"Observed irreversible SLO failures: {failed}; sampled future scope: {remaining}; joint_fraction_upper_bound={upper:.12g}; no cost simulation performed",
-                        self.models.source_ids,
+                        self.cost_models.source_ids,
                     )
         for index, forecast in enumerate(forecasts):
             horizon = forecast.input_closes_at - view.now
@@ -573,7 +576,7 @@ class Evaluator:
                 simulation = self._from_forecast(
                     view,
                     forecast,
-                    models,
+                    cost_models,
                     self.config,
                     self.handoff,
                     self.slo,
@@ -639,7 +642,7 @@ class Evaluator:
                     None,
                     work_ids,
                     str(exc),
-                    self.models.source_ids,
+                    self.cost_models.source_ids,
                     actor_supply=supply,
                 )
             if result["status"] == "candidate_pruned":
@@ -681,7 +684,7 @@ class Evaluator:
                     result["reason"]
                     if result["status"] not in ("complete", "running")
                     else "No spare GPUs for TP-local overlap",
-                    self.models.source_ids,
+                    self.cost_models.source_ids,
                     actor_supply=supply,
                 )
             if historical and (not known_batch):
@@ -713,7 +716,7 @@ class Evaluator:
                         None,
                         work_ids,
                         "Actor capacity unknown: no observed full batch or post-cutover complete update",
-                        self.models.source_ids,
+                        self.cost_models.source_ids,
                         actor_coverage="unknown_no_complete_batch",
                         actor_supply=supply,
                     )
@@ -751,7 +754,7 @@ class Evaluator:
             else "Fixed serving window; score = switching GPU seconds + window seconds * target GPU count; target tail not scored"
             if historical
             else "Sampled arrivals close at horizon; all sampled serving and full training batches drain afterwards",
-            self.models.source_ids,
+            self.cost_models.source_ids,
             sum(window_costs) / len(window_costs) if historical else None,
             0.0 if historical else None,
             coverage,
@@ -819,7 +822,7 @@ class Evaluator:
     def parallel_available(self):
         return (
             self.executor is not None
-            and getattr(self.models, "worker_spec", None) is not None
+            and getattr(self.cost_models, "worker_spec", None) is not None
         )
 
     def order_candidates(self, view, forecasts, layouts, preferred=()):
@@ -834,17 +837,22 @@ class Evaluator:
                 if actor_key not in actor_scores:
                     actor_scores[actor_key] = (
                         sum(
-                            (s for _, s in self.models.actor(layout, self._known_batch))
+                            (
+                                s
+                                for _, s in self.cost_models.actor(
+                                    layout, self._known_batch
+                                )
+                            )
                         )
                         if self._known_batch
                         else 0.0
                     )
                 if rollout_key not in rollout_scores:
-                    cfg = self.models.rollout_config(layout)
+                    cfg = self.cost_models.rollout_config(layout)
                     seconds = 0.0
                     for t in turns:
                         q = min(t.input_tokens, cfg.max_batch_tokens)
-                        prefill = self.models.service(
+                        prefill = self.cost_models.service(
                             layout,
                             0,
                             (
@@ -853,7 +861,7 @@ class Evaluator:
                                 ),
                             ),
                         )
-                        decode = self.models.service(
+                        decode = self.cost_models.service(
                             layout,
                             t.input_tokens,
                             (ServiceSlice("rank", t.input_tokens, 1, "decode", True),),
@@ -891,7 +899,7 @@ class Evaluator:
 
         payload = (
             "reference",
-            self.models.worker_spec,
+            self.cost_models.worker_spec,
             self.source_ids,
             self.config,
             self.handoff,
@@ -929,7 +937,7 @@ class Evaluator:
         self,
         episodes: tuple[EpisodeSample, ...],
         initial: OnlineLayout,
-        models: SimulationModels,
+        cost_models: CostModels,
         config: SimulationConfig,
         handoff: HandoffConfig,
         slo=None,
@@ -952,8 +960,8 @@ class Evaluator:
             raise ValueError("Actor DP must divide the episode batch")
         work = _work or WorkInputs.prepare(episodes, input_closes_at, start_time)
         self._truth = work.truth
-        self.models, self.config, self.handoff, self.slo = (
-            models,
+        self.cost_models, self.config, self.handoff, self.slo = (
+            cost_models,
             config,
             handoff,
             slo,
@@ -1075,7 +1083,7 @@ class Evaluator:
         cls,
         view: OnlineObservation,
         forecast: Forecast,
-        models: SimulationModels,
+        cost_models: CostModels,
         config: SimulationConfig,
         handoff: HandoffConfig,
         slo=None,
@@ -1099,7 +1107,7 @@ class Evaluator:
         simulation._initialize(
             forecast.episodes,
             view.layout,
-            models,
+            cost_models,
             config,
             handoff,
             slo,
@@ -1211,7 +1219,7 @@ class Evaluator:
         for service in view.services:
             group = simulation.deployments[1].replicas[service.replica]
             slices = tuple(ServiceSlice(*s) for s in service.slices)
-            seconds = models.service(view.layout, group.kv_tokens, slices)
+            seconds = cost_models.service(view.layout, group.kv_tokens, slices)
             simulation.deployments[1].busy[service.replica] = service
             simulation.schedule_at(
                 max(view.now, service.started_at + seconds),
@@ -1230,7 +1238,7 @@ class Evaluator:
                 )
         if view.actor.batch:
             simulation.actor_batch = view.actor.batch
-            simulation.actor_stages = models.actor(
+            simulation.actor_stages = cost_models.actor(
                 view.layout,
                 tuple(tuple(simulation.episodes[e].past) for e in view.actor.batch),
             )
@@ -1285,7 +1293,7 @@ class Evaluator:
             peak_gpus=self.pool.peak_gpus,
             remaining_leases=dict(self.pool.leases),
             counters=dict(self.counters),
-            source_ids=self.models.source_ids,
+            source_ids=self.cost_models.source_ids,
             assumptions=(
                 "GPU-token timing; HTTP/network response tails not measured",
                 "Decode-first batches; declared generation-budget KV reservation; no prefix reuse",
@@ -1293,7 +1301,7 @@ class Evaluator:
                 "Immutable published snapshots assumed; complete Actor state handoff at a single-writer boundary",
                 "Startup/state/publication transfers serialize on one assumed effective shared link",
                 self.handoff.provenance,
-                *getattr(self.models, "scenario_notes", ()),
+                *getattr(self.cost_models, "scenario_notes", ()),
             ),
         )
         if self.control is not None:
@@ -1546,7 +1554,7 @@ class Evaluator:
 
     def _base_service(self, local_services: set[tuple[int, int]] | None = None):
         target = self.deployments[self.rollout_id]
-        cfg = self.models.rollout_config(target.layout)
+        cfg = self.cost_models.rollout_config(target.layout)
         unassigned = self._unassigned.values() if local_services is None else ()
         for request in sorted(unassigned, key=lambda r: r.order):
             view = request.view
@@ -1571,7 +1579,7 @@ class Evaluator:
                 "draining",
             }:
                 continue
-            cfg = self.models.rollout_config(deployment.layout)
+            cfg = self.cost_models.rollout_config(deployment.layout)
             for replica in range(cfg.replicas):
                 if (
                     local_services is not None
@@ -1613,7 +1621,7 @@ class Evaluator:
                     slices, _ = scheduler_for(cfg.backend).batch(
                         cfg, list(group.rows.values())
                     )
-                    duration = self.models.service(
+                    duration = self.cost_models.service(
                         deployment.layout, group.kv_tokens, slices
                     )
                     rows = tuple(
@@ -1845,7 +1853,7 @@ class Evaluator:
             self.reject_unrepairable_forecast_wait()
             return
         try:
-            stages = self.models.actor(
+            stages = self.cost_models.actor(
                 self.layout, tuple(tuple(self.episodes[e].past) for e in batch)
             )
         except ActorMemoryRejected as exc:
@@ -1941,7 +1949,7 @@ class Evaluator:
             for d in self.deployments.values()
             if d.role == "rollout" and d.status in {"active", "draining"}
         )
-        seconds = self.models.publication(
+        seconds = self.cost_models.publication(
             self.layout, tuple(d.layout for d in recipients)
         )
         start, end = self.link.reserve(self.now, fitted_seconds=seconds)

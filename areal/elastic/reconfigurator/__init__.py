@@ -22,13 +22,13 @@ def component_module(name: str, component: str):
         "forecast",
         "history",
         "simulator",
-        "models",
+        "cost_models",
         "evaluator",
     }:
         raise ValueError("Unknown reconfigurator component")
     module = {
         ("reference", "history"): "forecast",
-        ("reference", "models"): "evaluator.cost_model.loader",
+        ("reference", "cost_models"): "evaluator.cost_model.loader",
         ("basic", "evaluator"): "prediction",
     }.get((name, component), component)
     return import_module(f"{__name__}.{name}.{module}")

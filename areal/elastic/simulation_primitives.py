@@ -431,7 +431,7 @@ def advance_decode(sim: Any, until: float | None) -> None:
     completions need not wake the other replicas, but any request completion,
     prefill, arrival, tool, Actor/publication or handoff event does.
     """
-    affine = getattr(sim.models, "decode_affine", None)
+    affine = getattr(sim.cost_models, "decode_affine", None)
     if (
         affine is None
         or sim.sink is not None
@@ -469,7 +469,7 @@ def advance_decode(sim: Any, until: float | None) -> None:
             sim.decode_plan_builds += 1
             plan = _Plan(batch, group.revision, deployment.version)
             group.decode_plan = plan
-            cfg = sim.models.rollout_config(deployment.layout)
+            cfg = sim.cost_models.rollout_config(deployment.layout)
             # If this pure-decode batch contains every assigned row, no row
             # can enter or change priority before a membership revision.
             same_members = len(batch.slices) == len(group.rows)

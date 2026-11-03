@@ -390,15 +390,17 @@ class TrialArchive:
         _validate_placement(execution, host, manifest["profiles"]["hardware"]["name"])
         return execution
 
-    def models(self, *, calibrated: bool = True) -> AssembledTrial:
+    def cost_models(self, *, calibrated: bool = True) -> AssembledTrial:
         """Rebind frozen coefficients only for explicitly reviewed implementations.
 
         The complete profile contents, execution and formula version are checked.
         No coefficients, feature bounds or sample IDs are fitted while loading.
         """
-        return self._models(self.manifest(), calibrated=calibrated)
+        return self._cost_models(self.manifest(), calibrated=calibrated)
 
-    def _models(self, manifest: dict, *, calibrated: bool = True) -> AssembledTrial:
+    def _cost_models(
+        self, manifest: dict, *, calibrated: bool = True
+    ) -> AssembledTrial:
         p = self._profiles(manifest)
         config = self._configuration(manifest, p)
         binding = fingerprint(manifest["profiles"], manifest["execution"])

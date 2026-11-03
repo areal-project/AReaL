@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""One resumable offline cycle: Online component model followed by Online optimizer."""
+"""Elastic revision context and the Evaluator-to-Optimizer revision cycle."""
 
 from __future__ import annotations
 
@@ -8,13 +8,47 @@ import fcntl
 import json
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE
+from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE, proposal_context
 from areal.autopilot.revision.contracts import digest, source_digest
+from areal.autopilot.revision.execution import CandidateRunner
 from areal.autopilot.revision.loop import RevisionLoop
 from areal.utils.atomic import atomic_json
+
+
+def candidate_runner(runner=None):
+    runner = runner or CandidateRunner()
+    if (
+        not isinstance(runner, CandidateRunner)
+        or runner.command
+        or runner.worker_module is not None
+    ):
+        return runner
+    return replace(
+        runner, worker_module="areal.autopilot.domains.elastic.evaluation.worker"
+    )
+
+
+class ElasticRevisionBenchmark:
+    owns_acceptance = True
+
+    @property
+    def initial_source(self):
+        return BASELINE_SOURCE.get(self.target)
+
+    @property
+    def proposal_context(self):
+        return proposal_context(self.target)
+
+    @property
+    def replay_fingerprints(self):
+        return (
+            ("prediction_sha256",)
+            if self.target == "evaluator"
+            else ("selection_sha256",)
+        )
 
 
 def _fixed_json(path: Path, value: dict) -> None:
@@ -66,8 +100,8 @@ class _Stage:
 
 def _stage(loop: RevisionLoop, budget: int) -> _Stage:
     """Recover durable child results; count started attempts against the total cap."""
-    root, evaluator = loop.store.root, loop.evaluator
-    initial = loop.initial_source or BASELINE_SOURCE[evaluator.target]
+    root, benchmark = loop.store.root, loop.benchmark
+    initial = loop.initial_source or BASELINE_SOURCE[benchmark.target]
     initial_path = root / "initial.py"
     receipt_path = root / "stage.json"
     with (root / "revision.lock").open("a") as lock:
@@ -118,8 +152,8 @@ def _stage(loop: RevisionLoop, budget: int) -> _Stage:
         if (root / "run.json").exists():
             run = json.loads((root / "run.json").read_text())
             if (
-                run["target"] != evaluator.target
-                or run["benchmark_sha256"] != evaluator.benchmark_sha256
+                run["target"] != benchmark.target
+                or run["benchmark_sha256"] != benchmark.benchmark_sha256
             ):
                 raise ValueError(
                     "Child run result belongs to another evaluation context"
@@ -135,7 +169,7 @@ def _stage(loop: RevisionLoop, budget: int) -> _Stage:
         report = json.loads(report_path.read_text())
         baseline_path = root / "baseline.json"
         record = {
-            "target": evaluator.target,
+            "target": benchmark.target,
             "context_sha256": digest(loop.context),
             "source": str(source.relative_to(root)),
             "source_sha256": source_digest(source.read_text()),
@@ -148,19 +182,19 @@ def _stage(loop: RevisionLoop, budget: int) -> _Stage:
             raise ValueError("Completed stage source/receipt changed after handoff")
         if (
             not report["valid"]
-            or report["target"] != evaluator.target
-            or report["benchmark_sha256"] != evaluator.benchmark_sha256
+            or report["target"] != benchmark.target
+            or report["benchmark_sha256"] != benchmark.benchmark_sha256
             or report["candidate_sha256"] != record["source_sha256"]
         ):
             raise ValueError("Effective stage source has no matching valid evaluation")
-        checked = evaluator.evaluate(
+        checked = benchmark.evaluate(
             source.read_text(), root / f"verify-{uuid.uuid4().hex}"
         )
         keys = (
             ("prediction_sha256",)
-            if evaluator.target == "model"
+            if benchmark.target == "evaluator"
             else ("prediction_sha256",)
-            if evaluator.target in {"simulator", "serial_model"}
+            if benchmark.target in {"simulator", "serial_model"}
             else ("selection_sha256",)
         )
         if not checked.valid or any(
@@ -174,29 +208,28 @@ def _stage(loop: RevisionLoop, budget: int) -> _Stage:
 
 
 class ReconfiguratorRevisionCycle:
-    """Freeze a model revision, then evaluate Online search against that same model."""
+    """Revise Evaluator CostModels, then benchmark Optimizer with those CostModels."""
 
     def __init__(
         self,
-        model_evaluator,
+        evaluator_benchmark,
         optimizer_cases,
         root,
         *,
         assembly,
-        initial_model_source=None,
+        initial_evaluator_source=None,
         initial_optimizer_source=None,
         optimizer_settings=None,
         optimizer_limits=None,
         parent_bundle=None,
     ):
-        self.model = model_evaluator
+        self.evaluator_benchmark = evaluator_benchmark
         self.cases = tuple(optimizer_cases)
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.assembly = json.loads(json.dumps(assembly, allow_nan=False))
+        from areal.autopilot.domains.elastic.contracts import OnlineProblem, decode
         from areal.elastic.contracts import OnlineLayout
-
-        from .contracts import OnlineProblem, decode
 
         catalog = tuple(decode(OnlineLayout, c) for c in self.assembly["candidates"])
         if any(
@@ -207,7 +240,9 @@ class ReconfiguratorRevisionCycle:
             raise ValueError(
                 "Optimizer problems must use the assembly's frozen candidate catalog"
             )
-        self.model_source = initial_model_source or model_evaluator.initial_source
+        self.evaluator_source = (
+            initial_evaluator_source or evaluator_benchmark.initial_source
+        )
         self.optimizer_source = initial_optimizer_source or BASELINE_SOURCE["optimizer"]
         self.optimizer_settings = optimizer_settings or {}
         self.optimizer_limits = optimizer_limits or {}
@@ -215,69 +250,72 @@ class ReconfiguratorRevisionCycle:
 
     def run(
         self,
-        model_agent,
+        evaluator_agent,
         optimizer_agent,
         *,
-        max_model_rounds=3,
+        max_evaluator_rounds=3,
         max_optimizer_rounds=3,
     ):
         from dataclasses import asdict
 
+        from areal.autopilot.domains.elastic.contracts import decode
+        from areal.autopilot.domains.elastic.evaluation.optimizer import (
+            OptimizerRevisionBenchmark,
+        )
+        from areal.autopilot.domains.elastic.versions import export_accepted_bundle
         from areal.elastic.contracts import HandoffConfig, SimulationConfig
         from areal.elastic.reconfigurator import build_reconfigurator
         from areal.elastic.serving import ServingSLO
-
-        from .bundle import export_accepted_bundle
-        from .contracts import decode
-        from .optimizer_evaluator import OnlineOptimizerEvaluator
 
         with (self.root / "cycle.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             _fixed_json(
                 self.root / "context.json",
                 dict(
-                    model=self.model.benchmark_sha256,
+                    evaluator_benchmark=self.evaluator_benchmark.benchmark_sha256,
                     cases=[
                         asdict(c) if hasattr(c, "__dataclass_fields__") else c
                         for c in self.cases
                     ],
                     assembly=self.assembly,
-                    model_source=source_digest(self.model_source),
+                    evaluator_source=source_digest(self.evaluator_source),
                     optimizer_source=source_digest(self.optimizer_source),
                     settings=self.optimizer_settings,
                     limits=self.optimizer_limits,
-                    budgets=[max_model_rounds, max_optimizer_rounds],
+                    budgets=[max_evaluator_rounds, max_optimizer_rounds],
                     parent_bundle_id=self.parent_bundle,
                 ),
             )
-            model_stage = _stage(
+            evaluator_stage = _stage(
                 RevisionLoop(
-                    model_agent,
-                    self.model,
-                    self.root / "model",
-                    initial_source=self.model_source,
+                    evaluator_agent,
+                    self.evaluator_benchmark,
+                    self.root / "evaluator",
+                    initial_source=self.evaluator_source,
                 ),
-                max_model_rounds,
+                max_evaluator_rounds,
             )
-            model_source = model_stage.source.read_text()
-            model_report = json.loads(
-                (model_stage.root / model_stage.record["report"]).read_text()
+            evaluator_source = evaluator_stage.source.read_text()
+            evaluator_report = json.loads(
+                (evaluator_stage.root / evaluator_stage.record["report"]).read_text()
             )
-            models = self.model.build(model_source)
-            self.model.verify_loaded(
-                models,
-                model_report["metrics"]["prediction_sha256"],
-                model_report["metrics"]["source_ids"],
+            cost_models = self.evaluator_benchmark.build_cost_models(evaluator_source)
+            self.evaluator_benchmark.verify_cost_models(
+                cost_models,
+                evaluator_report["metrics"]["prediction_sha256"],
+                evaluator_report["metrics"]["source_ids"],
             )
             run = decode(SimulationConfig, self.assembly["run"])
             handoff = decode(HandoffConfig, self.assembly["handoff"])
             slo = decode(ServingSLO, self.assembly["slo"])
             context = dict(
-                api_version="online-reference-optimizer-v1",
+                api_version="online-reference-optimizer-v2",
                 assembly_sha256=digest(self.assembly),
-                model_source_sha256=source_digest(model_source),
-                model_prediction_sha256=model_report["metrics"]["prediction_sha256"],
-                model_settings_sha256=digest(self.model.settings),
+                evaluator_source_sha256=source_digest(evaluator_source),
+                evaluator_prediction_sha256=evaluator_report["metrics"][
+                    "prediction_sha256"
+                ],
+                cost_model_settings_sha256=digest(self.evaluator_benchmark.settings),
             )
             from areal.elastic.contracts import OnlineLayout
 
@@ -292,9 +330,9 @@ class ReconfiguratorRevisionCycle:
                 slo=slo,
             )
 
-            def make_model():
-                return prototype.make_model(
-                    models,
+            def make_evaluator():
+                return prototype.make_evaluator(
+                    cost_models,
                     run,
                     handoff,
                     slo,
@@ -303,18 +341,18 @@ class ReconfiguratorRevisionCycle:
                     actor_memory_scope=prototype.config.actor_memory_scope,
                 )
 
-            evaluator = OnlineOptimizerEvaluator(
+            benchmark = OptimizerRevisionBenchmark(
                 self.cases,
-                model_factory=make_model,
+                evaluator_factory=make_evaluator,
                 context=context,
                 settings=self.optimizer_settings,
-                runner=self.model.runner,
+                runner=self.evaluator_benchmark.runner,
                 **self.optimizer_limits,
             )
             optimizer_stage = _stage(
                 RevisionLoop(
                     optimizer_agent,
-                    evaluator,
+                    benchmark,
                     self.root / "optimizer",
                     initial_source=self.optimizer_source,
                 ),
@@ -322,18 +360,18 @@ class ReconfiguratorRevisionCycle:
             )
             path = export_accepted_bundle(
                 self.root / "bundles",
-                model_evaluator=self.model,
-                model_stage=model_stage,
-                optimizer_evaluator=evaluator,
+                evaluator_benchmark=self.evaluator_benchmark,
+                evaluator_stage=evaluator_stage,
+                optimizer_benchmark=benchmark,
                 optimizer_stage=optimizer_stage,
                 assembly=self.assembly,
                 parent_bundle_id=self.parent_bundle,
             )
             result = dict(
-                model_accepted=model_stage.record["accepted"],
+                evaluator_accepted=evaluator_stage.record["accepted"],
                 optimizer_accepted=optimizer_stage.record["accepted"],
                 bundle=None if path is None else str(path),
-                model_source=str(model_stage.source),
+                evaluator_source=str(evaluator_stage.source),
                 optimizer_source=str(optimizer_stage.source),
             )
             _fixed_json(self.root / "result.json", result)

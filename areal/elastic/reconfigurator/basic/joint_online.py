@@ -85,7 +85,7 @@ class JointWindow(_JointRun):
         self,
         view,
         forecast,
-        models,
+        cost_models,
         config,
         handoff,
         slo,
@@ -96,7 +96,12 @@ class JointWindow(_JointRun):
         if view.busy:
             raise ValueError("Joint prediction requires a stable deployment boundary")
         self.view, self.forecast = view, forecast
-        self.models, self.config, self.handoff, self.slo = models, config, handoff, slo
+        self.cost_models, self.config, self.handoff, self.slo = (
+            cost_models,
+            config,
+            handoff,
+            slo,
+        )
         self.samples = (
             dict(_prepared.work.truth)
             if _prepared is not None
@@ -211,7 +216,7 @@ class JointWindow(_JointRun):
                 + max(0, self.requests[k].view.generated - 1)
                 for k in keys
             )
-            seconds = models.service(view.layout, kv, slices)
+            seconds = cost_models.service(view.layout, kv, slices)
             self.gpu_busy += 1
             self._inflight.update(keys)
             self.schedule(
@@ -220,7 +225,9 @@ class JointWindow(_JointRun):
                 service,
             )
         if self.actor_batch:
-            self.actor_stages = models.actor(view.layout, self._batch(self.actor_batch))
+            self.actor_stages = cost_models.actor(
+                view.layout, self._batch(self.actor_batch)
+            )
             if self.actor_phase >= len(self.actor_stages):
                 raise ValueError("Observed Actor phase is outside the model")
             self.training_records.append(
@@ -440,7 +447,7 @@ class JointWindow(_JointRun):
     def _rates(self, rows):
         prefill_tokens = decode_tokens = 0
         prefill_seconds = decode_seconds = 0.0
-        cfg = self.models.rollout_config(self.layout)
+        cfg = self.cost_models.rollout_config(self.layout)
         for row in rows:
             r = row.view
             turn = self.samples[r.episode_id].turns[r.turn]
@@ -449,7 +456,7 @@ class JointWindow(_JointRun):
             pending = r.input_tokens - context
             while pending:
                 query = min(cfg.max_batch_tokens, pending)
-                prefill_seconds += self.models.service(
+                prefill_seconds += self.cost_models.service(
                     self.layout,
                     context,
                     (ServiceSlice("joint", context, query, "prefill", False),),
@@ -459,7 +466,7 @@ class JointWindow(_JointRun):
                 prefill_tokens += query
             if remaining:
                 context = r.input_tokens + max(0, r.generated - 1)
-                seconds = self.models.service(
+                seconds = self.cost_models.service(
                     self.layout,
                     context,
                     (ServiceSlice("joint", context, 1, "decode", True),),
@@ -496,7 +503,7 @@ class JointWindow(_JointRun):
             max(1, tokens),
             max_request,
             fingerprint(
-                self.models.source_ids,
+                self.cost_models.source_ids,
                 self.layout,
                 tuple(r.view.snapshot() for r in rows),
             ),
@@ -527,7 +534,7 @@ class JointWindow(_JointRun):
             rows = [r for r in rows if r.view.request_id in self._drain]
         if not rows:
             return
-        cfg = self.models.rollout_config(self.layout)
+        cfg = self.cost_models.rollout_config(self.layout)
         reservations = [0] * self.layout.rollout_replicas
         selected = []
         for r in sorted(rows, key=lambda r: (r.view.ready_at, r.view.request_id)):
@@ -590,7 +597,7 @@ class JointWindow(_JointRun):
             self.episodes[key].completed_at is None for key in ids
         ):
             return
-        stages = self.models.actor(self.layout, self._batch(ids))
+        stages = self.cost_models.actor(self.layout, self._batch(ids))
         if not stages:
             raise ValueError("Actor supplied no update stages")
         if not self.actor_running:
@@ -653,7 +660,7 @@ class JointWindow(_JointRun):
             if step == "restore_actor":
                 actor = target.actor_gpus
             if step == "publish_weights":
-                seconds = self.models.publication(target, (target,))
+                seconds = self.cost_models.publication(target, (target,))
             elif step in {
                 "close_admission",
                 "set_layout",
@@ -756,7 +763,7 @@ class JointWindow(_JointRun):
             return
         if self.pending_publish:
             if not self.gpu_busy:
-                seconds = self.models.publication(self.layout, (self.layout,))
+                seconds = self.cost_models.publication(self.layout, (self.layout,))
                 self.profiles["publish"] = _Profile(
                     (TransitionPhase(seconds, *self.allocation),)
                 )

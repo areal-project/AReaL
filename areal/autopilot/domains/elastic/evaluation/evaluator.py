@@ -1,25 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fixed historical measurements for offline cost-model revision acceptance.
-
-Prediction receives only HistoricalInput. Calibration/validation/final partitions,
-labels, scoring and acceptance belong to the evaluator, not the candidate.
-"""
+"""Evaluate the Evaluator's CostModels revisions against historical measurements."""
 
 from __future__ import annotations
 
 import copy
+import json
 import math
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Protocol
 
-from areal.autopilot.domains.elastic.identity import protected_files
-from areal.autopilot.revision.contracts import digest, source_digest
+from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE, decode
+from areal.autopilot.domains.elastic.cycle import (
+    ElasticRevisionBenchmark,
+    candidate_runner,
+)
+from areal.autopilot.domains.elastic.versions import protected_files
+from areal.autopilot.revision.contracts import RevisionReport, digest, source_digest
+from areal.autopilot.revision.execution import load_source
 from areal.elastic.contracts import OnlineLayout, Turn
 from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import (
     ServiceSlice,
 )
+from areal.elastic.reconfigurator.reference.evaluator.cost_model.loader import (
+    CalibratedCostModels,
+)
+from areal.utils.atomic import atomic_json
 
 METRICS = {
     "actor": frozenset(
@@ -268,7 +276,7 @@ def _score(
 
 
 @dataclass(frozen=True)
-class ModelAcceptanceCriteria:
+class CostModelAcceptanceCriteria:
     min_relative_improvement: float = 0.005
     max_metric_regression: float = 0.0
     max_slice_regression: float = 0.0
@@ -332,7 +340,7 @@ class HistoryReport:
 
 
 @dataclass(frozen=True)
-class ModelComparison:
+class CostModelComparison:
     accepted: bool
     reason: str
     incumbent_score: float | None
@@ -342,8 +350,8 @@ class ModelComparison:
     lost_cells: int
 
 
-class HistoricalModelEvaluator:
-    """Frozen offline evaluator; repeated validation feedback is development data.
+class CostModelHistoryBenchmark:
+    """Frozen history benchmark; repeated validation feedback is development data.
 
     final_holdout is fingerprinted and protected from fitting but never predicted
     or scored here. Supplied fitted_on provenance is a trusted caller declaration,
@@ -355,11 +363,11 @@ class HistoricalModelEvaluator:
         cases: tuple[HistoricalCase, ...],
         *,
         primary_metrics: tuple[str, ...],
-        criteria: ModelAcceptanceCriteria | None = None,
+        criteria: CostModelAcceptanceCriteria | None = None,
     ):
         self._cases = copy.deepcopy(tuple(sorted(cases, key=lambda c: c.sample_id)))
         self._primary_metrics = tuple(primary_metrics)
-        self._criteria = criteria or ModelAcceptanceCriteria()
+        self._criteria = criteria or CostModelAcceptanceCriteria()
         if not self._cases or len({c.sample_id for c in self._cases}) != len(
             self._cases
         ):
@@ -423,7 +431,7 @@ class HistoricalModelEvaluator:
             }
             if len(scopes) > 1:
                 raise ValueError(
-                    "Use separate evaluators for timing boundaries/input modes"
+                    "Use separate benchmarks for timing boundaries/input modes"
                 )
         self._reference_files = protected_files()
         self._code = self._code_fingerprint()
@@ -445,7 +453,7 @@ class HistoricalModelEvaluator:
         return self._primary_metrics
 
     @property
-    def criteria(self) -> ModelAcceptanceCriteria:
+    def criteria(self) -> CostModelAcceptanceCriteria:
         return self._criteria
 
     @property
@@ -458,7 +466,7 @@ class HistoricalModelEvaluator:
 
     @property
     def prediction_inputs(self) -> tuple[HistoricalInput, ...]:
-        """Ordered prediction requests; evaluator-owned unsupported traces stay out."""
+        """Ordered prediction requests; benchmark-owned unsupported traces stay out."""
         return copy.deepcopy(
             tuple(
                 c.inputs
@@ -477,7 +485,7 @@ class HistoricalModelEvaluator:
     def assert_unchanged(self) -> None:
         if self._code_fingerprint() != self._code:
             raise ValueError(
-                "Historical evaluator/reference code changed; create a new evaluation context"
+                "History benchmark/reference code changed; create a new benchmark context"
             )
 
     def evaluate(
@@ -542,9 +550,7 @@ class HistoricalModelEvaluator:
                 )
         rows = tuple(rows)
         if self._code_fingerprint() != self._code:
-            errors.append(
-                "Historical evaluator/reference code changed during prediction"
-            )
+            errors.append("History benchmark/reference code changed during prediction")
         metrics = _summaries(rows)
         report = HistoryReport(
             version,
@@ -563,21 +569,21 @@ class HistoricalModelEvaluator:
 
     def compare(
         self, candidate: HistoryReport, incumbent: HistoryReport
-    ) -> ModelComparison:
+    ) -> CostModelComparison:
         if any(
             r.benchmark_sha256 != self.benchmark_sha256 for r in (candidate, incumbent)
         ):
             raise ValueError("Cannot compare different historical evaluation contexts")
         if self._code_fingerprint() != self._code:
             raise ValueError(
-                "Historical evaluator/reference code changed before comparison"
+                "History benchmark/reference code changed before comparison"
             )
         if any(
             digest(asdict(r)) not in self._issued_reports
             for r in (candidate, incumbent)
         ):
             raise ValueError(
-                "Comparison requires unchanged reports issued by this evaluator"
+                "Comparison requires unchanged reports issued by this benchmark"
             )
         if not incumbent.valid:
             raise ValueError("Incumbent execution must be valid before comparison")
@@ -594,7 +600,7 @@ class HistoricalModelEvaluator:
         )
 
         def decision(accepted, reason):
-            return ModelComparison(
+            return CostModelComparison(
                 accepted, reason, before, after, len(retained), len(added), len(lost)
             )
 
@@ -654,3 +660,294 @@ class HistoricalModelEvaluator:
         return decision(
             True, "Historical prediction error improved without coverage loss"
         )
+
+
+def calibrated_cost_models(settings):
+    cost_model_config = settings.get("cost_models", settings.get("model"))
+    return CalibratedCostModels(
+        Path(cost_model_config["bundle"]),
+        Path(cost_model_config["mechanism_fits"]),
+        Path(cost_model_config["publication_metadata"]),
+        float(cost_model_config["effective_bandwidth_GBps"]),
+        inter_node_dp_GBps=cost_model_config.get("inter_node_dp_GBps"),
+    )
+
+
+def validate_cost_models(cost_models):
+    if not getattr(cost_models, "source_ids", ()) or not all(
+        callable(getattr(cost_models, name, None))
+        for name in ("rollout_config", "service", "actor", "publication")
+    ):
+        raise ValueError(
+            "build_cost_models must return the complete CostModels interface"
+        )
+    return (
+        cost_models
+        if isinstance(cost_models, FrozenCostModels)
+        else FrozenCostModels(cost_models)
+    )
+
+
+class FrozenCostModels:
+    """Keep factory behavior when evaluating accepted CostModels.
+
+    A baseline bundle worker_spec reloads baseline code, not the revised factory.
+    An inherited decode-affine shortcut may likewise bypass a revised service().
+    Until those exports have factory-aware reconstruction/probes, use the actual
+    component callbacks for both historical and candidate execution.
+    """
+
+    def __init__(self, cost_models):
+        self._cost_models = cost_models
+
+    def __getattr__(self, name):
+        if name in {"worker_spec", "decode_affine"}:
+            raise AttributeError(name)
+        return getattr(self._cost_models, name)
+
+
+class CostModelHistoryPredictor:
+    def __init__(self, cost_models):
+        self.cost_models = validate_cost_models(cost_models)
+
+    def predict(self, inputs):
+        try:
+            return self._predict(inputs)
+        except ValueError as error:
+            return HistoricalPrediction(reason=str(error))
+
+    def _predict(self, inputs):
+        if inputs.kind == "actor":
+            stages = tuple(self.cost_models.actor(inputs.layout, inputs.batch))
+            names = {
+                "logp": "recompute_logp_seconds",
+                "advantage": "compute_advantage_seconds",
+                "train": "train_step_seconds",
+                "recompute_logp": "recompute_logp_seconds",
+                "compute_advantage": "compute_advantage_seconds",
+                "train_step": "train_step_seconds",
+            }
+            values = tuple(
+                (
+                    names.get(
+                        name, name if name.endswith("_seconds") else name + "_seconds"
+                    ),
+                    seconds,
+                )
+                for name, seconds in stages
+            )
+            return HistoricalPrediction(
+                values + (("actor_total_seconds", sum(t for _, t in stages)),)
+            )
+        if inputs.kind == "service":
+            return HistoricalPrediction(
+                (
+                    (
+                        "service_seconds",
+                        self.cost_models.service(
+                            inputs.layout, inputs.kv_tokens, inputs.slices
+                        ),
+                    ),
+                )
+            )
+        return HistoricalPrediction(
+            (
+                (
+                    "publication_seconds",
+                    self.cost_models.publication(inputs.layout, inputs.rollout_layouts),
+                ),
+            )
+        )
+
+
+def historical_input_from_dict(data):
+    return decode(HistoricalInput, data)
+
+
+def historical_case_from_dict(data):
+    return decode(HistoricalCase, data)
+
+
+def prediction_fingerprint(rows):
+    return digest(
+        [
+            sorted(dict(HistoricalPrediction(**r["prediction"]).values).items())
+            for r in rows
+        ]
+    )
+
+
+class EvaluatorRevisionBenchmark(ElasticRevisionBenchmark):
+    """Benchmark Evaluator revisions that currently replace only its CostModels.
+
+    build_cost_models(calibration_cases, settings) returns the CostModels interface.
+    Only calibration labels enter the worker. Historical probes and the Reference
+    configuration Evaluator use the same returned object.
+    """
+
+    target = "evaluator"
+
+    def __init__(
+        self, history, *, settings, fitted_on=(), runner=None, initial_source=None
+    ):
+        self.history = history
+        self.runner = candidate_runner(runner)
+        self._settings_json = json.dumps(settings, sort_keys=True, allow_nan=False)
+        self._fitted_on = tuple(
+            sorted(
+                set(fitted_on) | {c.span for c in history.calibration},
+                key=lambda s: (s.run_id, s.first_step, s.last_step),
+            )
+        )
+        history.validate_fit(self._fitted_on)
+        self._initial = initial_source or BASELINE_SOURCE["evaluator"]
+        self._reports = {}
+        self.context = {
+            "api_version": "online-evaluator-cost-models-v2",
+            "history_sha256": history.benchmark_sha256,
+            "settings": self.settings,
+            "fitted_on": [asdict(s) for s in self._fitted_on],
+            "worker_limits": {
+                "timeout_seconds": self.runner.timeout_seconds,
+                "max_output_bytes": self.runner.max_output_bytes,
+            },
+        }
+        self.benchmark_sha256 = digest(self.context)
+
+    @property
+    def initial_source(self):
+        return self._initial
+
+    @property
+    def settings(self):
+        return json.loads(self._settings_json)
+
+    @property
+    def criteria(self):
+        return self.history.criteria
+
+    @property
+    def calibration(self):
+        return {"cases": [asdict(c) for c in self.history.calibration]}
+
+    def assert_unchanged(self):
+        self.history.assert_unchanged()
+
+    def evaluate(self, source, directory):
+        errors, metrics, raw = [], {}, None
+        violations = []
+
+        def no_reference(message):
+            violations.append(
+                "CostModel history benchmark cannot query reference labels"
+            )
+            raise ValueError(violations[-1])
+
+        try:
+            self.assert_unchanged()
+            request = dict(
+                target=self.target,
+                settings=self.settings,
+                calibration=self.calibration,
+                cases=[asdict(i) for i in self.history.prediction_inputs],
+            )
+            output = self.runner.run(source, request, directory, no_reference)
+            if output.get("error") or violations:
+                raise ValueError(output.get("error") or violations[0])
+            rows = output["rows"]
+            if len(rows) != len(request["cases"]):
+                raise ValueError("Model must predict every historical input")
+            fingerprint = prediction_fingerprint(rows)
+            repeated = self.runner.run(
+                source, request, directory / "reproduce", no_reference
+            )
+            if (
+                repeated.get("error")
+                or violations
+                or prediction_fingerprint(repeated["rows"]) != fingerprint
+                or repeated.get("source_ids") != output.get("source_ids")
+            ):
+                raise ValueError("Model factory predictions are not reproducible")
+            self.assert_unchanged()
+
+            class Predictions:
+                def __init__(self):
+                    self.rows = iter(rows)
+
+                def predict(self, inputs):
+                    return HistoricalPrediction(**next(self.rows)["prediction"])
+
+            raw = self.history.evaluate(
+                Predictions(), source_digest(source), fitted_on=self._fitted_on
+            )
+            atomic_json(directory / "history-evaluation.json", asdict(raw))
+            metrics = {
+                **raw.feedback(),
+                "prediction_sha256": fingerprint,
+                "source_ids": output["source_ids"],
+            }
+            errors.extend(raw.errors)
+        except Exception as error:
+            errors.append(f"{type(error).__name__}: {error}")
+        report = RevisionReport(
+            self.target,
+            source_digest(source),
+            self.benchmark_sha256,
+            not errors,
+            None if raw is None else raw.score,
+            metrics,
+            tuple(errors),
+        )
+        self._reports[digest(asdict(report))] = raw
+        return report
+
+    def _verified(self, report):
+        self.assert_unchanged()
+        key = digest(asdict(report))
+        if report.benchmark_sha256 != self.benchmark_sha256 or key not in self._reports:
+            raise ValueError("Comparison requires an unchanged issued report")
+        return self._reports[key]
+
+    def compare(self, candidate, incumbent):
+        old, new = self._verified(incumbent), self._verified(candidate)
+        if not incumbent.valid or old is None:
+            raise ValueError("Incumbent Evaluator revision must benchmark successfully")
+        if not candidate.valid or new is None:
+            return False, "Candidate Evaluator revision benchmark failed"
+        result = self.history.compare(new, old)
+        return result.accepted, result.reason
+
+    def feedback(self, report):
+        self._verified(report)
+        metrics = {k: v for k, v in report.metrics.items() if k != "prediction_sha256"}
+        return {
+            "score": metrics.get("score"),
+            "metrics": metrics,
+            "errors": report.errors,
+        }
+
+    def build_cost_models(self, source):
+        self.assert_unchanged()
+        cost_models = validate_cost_models(
+            load_source(source).build_cost_models(
+                self.history.calibration, self.settings
+            )
+        )
+        self.assert_unchanged()
+        return cost_models
+
+    def verify_cost_models(self, cost_models, expected_sha, expected_source_ids=None):
+        self.assert_unchanged()
+        if expected_source_ids is not None and tuple(cost_models.source_ids) != tuple(
+            expected_source_ids
+        ):
+            raise ValueError("Loaded CostModel data identities changed")
+        for _ in range(2):
+            predictor = CostModelHistoryPredictor(cost_models)
+            rows = [
+                {"prediction": asdict(predictor.predict(copy.deepcopy(i)))}
+                for i in self.history.prediction_inputs
+            ]
+            if not expected_sha or prediction_fingerprint(rows) != expected_sha:
+                raise ValueError("Deployed CostModels differ from accepted predictions")
+        self.assert_unchanged()

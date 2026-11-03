@@ -2,28 +2,34 @@
 
 """Online Reference revision; generic revision machinery lives outside this domain."""
 
-from .cycle import ReconfiguratorRevisionCycle
-from .loaders import load_accepted_model, load_accepted_optimizer
-from .model_evaluator import (
+from areal.autopilot.domains.elastic.cycle import ReconfiguratorRevisionCycle
+from areal.autopilot.domains.elastic.evaluation.evaluator import (
+    CostModelAcceptanceCriteria,
+    CostModelHistoryBenchmark,
+    EvaluatorRevisionBenchmark,
     HistoricalCase,
     HistoricalInput,
-    HistoricalModelEvaluator,
     HistorySpan,
-    ModelAcceptanceCriteria,
 )
-from .model_execution import HistoricalSourceEvaluator
-from .optimizer_evaluator import OnlineOptimizerCriteria, OnlineOptimizerEvaluator
+from areal.autopilot.domains.elastic.evaluation.optimizer import (
+    OptimizerRevisionBenchmark,
+    OptimizerRevisionCriteria,
+)
+from areal.autopilot.domains.elastic.versions import (
+    load_accepted_cost_models,
+    load_accepted_optimizer,
+)
 
 __all__ = [
     "ReconfiguratorRevisionCycle",
-    "load_accepted_model",
+    "load_accepted_cost_models",
     "load_accepted_optimizer",
     "HistoricalCase",
     "HistoricalInput",
-    "HistoricalModelEvaluator",
+    "CostModelHistoryBenchmark",
     "HistorySpan",
-    "ModelAcceptanceCriteria",
-    "HistoricalSourceEvaluator",
-    "OnlineOptimizerCriteria",
-    "OnlineOptimizerEvaluator",
+    "CostModelAcceptanceCriteria",
+    "EvaluatorRevisionBenchmark",
+    "OptimizerRevisionCriteria",
+    "OptimizerRevisionBenchmark",
 ]

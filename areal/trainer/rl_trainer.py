@@ -152,14 +152,6 @@ class PPOTrainer:
         self.config = config
         self._elastic_mode = config.elastic.enabled
         if self._elastic_reconfigurator is not None:
-            if getattr(
-                self._elastic_reconfigurator,
-                "supports_reconfigurator_activation",
-                False,
-            ):
-                raise NotImplementedError(
-                    "Native Revision integration is deferred; use a ReconfiguratorAdapter"
-                )
             if not self._elastic_mode:
                 raise ValueError(
                     "Native Reconfigurator requires explicit elastic GPU pools"

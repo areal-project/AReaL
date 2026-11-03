@@ -44,10 +44,10 @@ class OnlineControl:
             cancelled=0,
         )
 
-    def model(self, delay):
+    def evaluator(self, delay):
         sim = self.sim
-        return sim.reconfigurator.make_model(
-            getattr(sim, "prediction_models", sim.models),
+        return sim.reconfigurator.make_evaluator(
+            getattr(sim, "prediction_cost_models", sim.cost_models),
             sim.config,
             sim.handoff,
             sim.slo,
@@ -78,13 +78,13 @@ class OnlineControl:
             sim.emit("search_pending", search=self.pending.identity)
         else:
             started = self.clock()
-            model = self.model(self.delay_estimate)
-            decision = reconfigurator.decide(view, model)
+            evaluator = self.evaluator(self.delay_estimate)
+            decision = reconfigurator.decide(view, evaluator)
             elapsed = max(0.0, self.clock() - started)
             record = dict(
                 **asdict(decision),
                 observation_id=fingerprint(view),
-                evaluation=dict(model.execution_stats),
+                evaluation=dict(evaluator.execution_stats),
                 search_wall_seconds=elapsed,
                 delay_estimate_seconds=self.delay_estimate,
             )
@@ -157,8 +157,8 @@ class OnlineControl:
             )
             return
         started = self.clock()
-        model = self.model(self.verification_estimate)
-        job.validation = model.evaluate_many(
+        evaluator = self.evaluator(self.verification_estimate)
+        job.validation = evaluator.evaluate_many(
             view, forecasts, (view.layout, job.decision.target)
         )
         job.elapsed = max(0.0, self.clock() - started)
@@ -176,7 +176,7 @@ class OnlineControl:
             if job.validation_features is not None
             else None
         )
-        job.record["verification_evaluation"] = dict(model.execution_stats)
+        job.record["verification_evaluation"] = dict(evaluator.execution_stats)
         job.record["validation_predictions"] = tuple(asdict(p) for p in job.validation)
         self.stats["verifications"] += 1
         self.stats["verification_wall_seconds"] += job.elapsed

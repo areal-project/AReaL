@@ -185,17 +185,17 @@ def test_prediction_routes_through_owned_simulator_without_experiment_kernel(
 ):
     view, forecast, config, handoff, slo = inputs()
     own = JointSimulator if implementation == "basic" else Evaluator
-    model = build_reconfigurator(implementation, candidates=(view.layout,)).make_model(
-        Seconds(), config, handoff, slo
-    )
+    evaluator = build_reconfigurator(
+        implementation, candidates=(view.layout,)
+    ).make_evaluator(Seconds(), config, handoff, slo)
     if implementation == "reference":
-        assert isinstance(model, Evaluator)
+        assert isinstance(evaluator, Evaluator)
     entry = "from_forecast" if implementation == "basic" else "_from_forecast"
     with patch.object(own, entry, wraps=getattr(own, entry)) as own_call:
         with patch.object(
             OnlineSimulation, "from_forecast", wraps=OnlineSimulation.from_forecast
         ) as experiment_call:
-            prediction = model.evaluate(view, (forecast,), view.layout)
+            prediction = evaluator.evaluate(view, (forecast,), view.layout)
     assert prediction.supported and own_call.call_count == 1
     experiment_call.assert_not_called()
     candidate = window(implementation)
@@ -216,10 +216,10 @@ def test_candidate_queries_leave_observed_experiment_unchanged(implementation):
     )
     experiment.run(until=0.5)
     before = experiment.observe()
-    model = build_reconfigurator(
+    evaluator = build_reconfigurator(
         implementation, candidates=(before.layout,)
-    ).make_model(Seconds(), config, handoff, slo)
-    prediction = model.evaluate(
+    ).make_evaluator(Seconds(), config, handoff, slo)
+    prediction = evaluator.evaluate(
         before, (replace(forecast, input_closes_at=10),), before.layout
     )
     assert prediction.supported
@@ -346,11 +346,11 @@ def test_changing_prediction_model_does_not_change_experiment_timing(implementat
         slo,
         input_closes_at=0,
         reconfigurator=reconfigurator,
-        prediction_models=predicted,
+        prediction_cost_models=predicted,
     )
-    model = reconfigurator.bind(experiment).model(0)
-    assert model.models is predicted and experiment.models is truth
-    result = model.evaluate(experiment.observe(), (forecast,), view.layout)
+    evaluator = reconfigurator.bind(experiment).evaluator(0)
+    assert evaluator.cost_models is predicted and experiment.cost_models is truth
+    result = evaluator.evaluate(experiment.observe(), (forecast,), view.layout)
     actual = experiment.run()
     assert actual["status"] == "complete" and actual["seconds"] == pytest.approx(3.6)
     assert result.supported and result.mean_gpu_seconds > actual["total_gpu_seconds"]

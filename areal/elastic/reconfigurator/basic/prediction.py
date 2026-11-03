@@ -14,8 +14,8 @@ from areal.elastic.contracts import (
     OnlineLayout,
     OnlineObservation,
 )
+from areal.elastic.contracts import CostModels as CostModels
 from areal.elastic.contracts import SimulationConfig as OnlineRunConfig
-from areal.elastic.contracts import SimulationModels as OnlineModels
 from areal.elastic.reconfigurator.basic.core import fingerprint
 from areal.elastic.reconfigurator.basic.optimizer import (
     SearchBound,
@@ -27,12 +27,12 @@ from .optimizer import OnlineOptimizer
 from .simulator import JointSimulator
 
 
-class OnlineForecastModel:
+class JointEvaluator:
     """A candidate evaluator whose only workload input is the sampled forecast."""
 
     def __init__(
         self,
-        models: OnlineModels,
+        cost_models: CostModels,
         config: OnlineRunConfig,
         handoff: HandoffConfig,
         slo: ServingSLO,
@@ -43,7 +43,12 @@ class OnlineForecastModel:
         executor: Executor | None = None,
         optimizer=None,
     ):
-        self.models, self.config, self.handoff, self.slo = models, config, handoff, slo
+        self.cost_models, self.config, self.handoff, self.slo = (
+            cost_models,
+            config,
+            handoff,
+            slo,
+        )
         self.delay = decision_delay_seconds
         self.prune_irreversible_slo = prune_irreversible_slo
         self.coalesce_decode = coalesce_decode
@@ -58,7 +63,7 @@ class OnlineForecastModel:
 
     @property
     def source_ids(self):
-        return self.models.source_ids
+        return self.cost_models.source_ids
 
     def prepare_context(self, view, forecasts):
         if self._view is view and self._forecasts is forecasts:
@@ -120,7 +125,7 @@ class OnlineForecastModel:
         if historical:
             if known_batch:
                 try:
-                    if not self.models.actor(layout, known_batch):
+                    if not self.cost_models.actor(layout, known_batch):
                         raise ValueError("Actor model supplied no update stages")
                 except ValueError as exc:
                     return CandidatePrediction(
@@ -130,7 +135,7 @@ class OnlineForecastModel:
                         None,
                         work_ids,
                         str(exc),
-                        self.models.source_ids,
+                        self.cost_models.source_ids,
                         actor_coverage="known_batch_rejected",
                     )
                 coverage = "known_complete_batch_capacity_checked"
@@ -151,7 +156,7 @@ class OnlineForecastModel:
                         None,
                         work_ids,
                         f"Observed irreversible SLO failures: {failed}; sampled future scope: {remaining}; joint_fraction_upper_bound={upper:.12g}; no cost simulation performed",
-                        self.models.source_ids,
+                        self.cost_models.source_ids,
                     )
         for index, forecast in enumerate(forecasts):
             horizon = forecast.input_closes_at - view.now
@@ -170,7 +175,7 @@ class OnlineForecastModel:
                 simulation = JointSimulator.from_forecast(
                     view,
                     forecast,
-                    self.models,
+                    self.cost_models,
                     self.config,
                     self.handoff,
                     self.slo,
@@ -225,7 +230,7 @@ class OnlineForecastModel:
                     None,
                     work_ids,
                     str(exc),
-                    self.models.source_ids,
+                    self.cost_models.source_ids,
                 )
             if (
                 result["status"]
@@ -245,7 +250,7 @@ class OnlineForecastModel:
                     result["reason"]
                     if result["status"] not in ("complete", "running")
                     else "No spare GPUs for TP-local overlap",
-                    self.models.source_ids,
+                    self.cost_models.source_ids,
                 )
             if historical and not known_batch:
                 changes_actor = (layout.actor_dp, layout.actor_tp) != (
@@ -276,7 +281,7 @@ class OnlineForecastModel:
                         None,
                         work_ids,
                         "Actor capacity unknown: no observed full batch or post-cutover complete update",
-                        self.models.source_ids,
+                        self.cost_models.source_ids,
                         actor_coverage="unknown_no_complete_batch",
                     )
                 coverage = (
@@ -312,7 +317,7 @@ class OnlineForecastModel:
             else "Basic v1 Joint aggregate forecast; score = switching GPU seconds + window seconds * target GPU count; target tail not scored"
             if historical
             else "Sampled arrivals close at horizon; all sampled serving and full training batches drain afterwards",
-            self.models.source_ids,
+            self.cost_models.source_ids,
             sum(window_costs) / len(window_costs) if historical else None,
             0.0 if historical else None,
             coverage,

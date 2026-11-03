@@ -84,10 +84,10 @@ class OnlineProblem:
 
 
 BASELINE_SOURCE = {
-    "model": """from areal.autopilot.domains.elastic.model_adapters import calibrated_components
+    "evaluator": """from areal.autopilot.domains.elastic.evaluation.evaluator import calibrated_cost_models
 
-def build_model(calibration_cases, settings):
-    return calibrated_components(settings)
+def build_cost_models(calibration_cases, settings):
+    return calibrated_cost_models(settings)
 """,
     "optimizer": """from areal.elastic.reconfigurator.reference.optimizer import OnlineOptimizer
 
@@ -99,36 +99,36 @@ def build_optimizer(settings):
 
 def proposal_context(target):
     if target not in BASELINE_SOURCE:
-        raise ValueError("Online revision target must be model or optimizer")
+        raise ValueError("Online revision target must be evaluator or optimizer")
     base = Path(__file__).resolve().parents[3]
     names = ["elastic/contracts.py", "autopilot/domains/elastic/contracts.py"]
     names += (
         [
-            "autopilot/domains/elastic/model_evaluator.py",
-            "autopilot/domains/elastic/model_adapters.py",
+            "autopilot/domains/elastic/evaluation/evaluator.py",
         ]
-        if target == "model"
+        if target == "evaluator"
         else [
             "elastic/reconfigurator/reference/optimizer.py",
-            "autopilot/domains/elastic/optimizer_evaluator.py",
+            "autopilot/domains/elastic/evaluation/optimizer.py",
         ]
     )
     return {
-        "api_version": "online-reference-revision-v1",
-        "factory": "build_model(calibration_cases, settings)"
-        if target == "model"
+        "api_version": "online-reference-revision-v2",
+        "factory": "build_cost_models(calibration_cases, settings)"
+        if target == "evaluator"
         else "build_optimizer(settings)",
         "instructions": (
-            "Return a complete frozen Online component model: source_ids, rollout_config(layout), "
+            "Revise the Evaluator's CostModels subcomponent. Return frozen CostModels with "
+            "source_ids, rollout_config(layout), "
             "service(layout, kv_tokens, slices), actor(layout, batch), publication(actor_layout, rollout_layouts). "
             "Calibration labels are public; validation and final-holdout labels are private. "
             "Preserve unknown coverage and fixed training semantics."
-            if target == "model"
+            if target == "evaluator"
             else "Implement search(evaluator, view, forecasts, layouts, preferred=(), trigger='pressure'). "
             "Use only the supplied evaluate-only port: prepare_context, historical, context_id, slo, "
             "order_candidates, evaluate, evaluate_wave, parallel_available and execution_stats. "
             "Return predictions supplied by that port. The parent owns SLO/Actor-supply selection, "
-            "costs, query limits and acceptance; reduce cost and model queries at the fixed horizon."
+            "costs, query limits and acceptance; reduce cost and Evaluator queries at the fixed horizon."
         ),
         "reference_sources": {"areal/" + n: (base / n).read_text() for n in names},
     }

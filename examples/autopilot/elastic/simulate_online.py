@@ -144,9 +144,9 @@ def main():
 
     raw = json.loads(args.config.read_text())
     implementation = args.reconfigurator or raw.get("implementation", "reference")
-    CalibratedOnlineModels = component_module(
-        implementation, "models"
-    ).CalibratedOnlineModels
+    CalibratedCostModels = component_module(
+        implementation, "cost_models"
+    ).CalibratedCostModels
     run_raw = dict(raw["run"])
     run_raw["tool_capacities"] = tuple(tuple(row) for row in run_raw["tool_capacities"])
     run = OnlineRunConfig(**run_raw)
@@ -158,21 +158,21 @@ def main():
         parser.error("Supply an explicit replay configuration")
     if workload_config["max_new_tokens"] != run.max_new_tokens:
         parser.error("Forecast and serving must share the declared generation budget")
-    models = CalibratedOnlineModels(
+    cost_models = CalibratedCostModels(
         args.bundle,
         args.mechanism_fits,
         args.publication_metadata,
         handoff.effective_bandwidth_GBps,
         inter_node_dp_GBps=raw.get("model_assumptions", {}).get("inter_node_dp_GBps"),
     )
-    prediction_models = CalibratedOnlineModels(
+    prediction_cost_models = CalibratedCostModels(
         args.bundle,
         args.mechanism_fits,
         args.publication_metadata,
         handoff.effective_bandwidth_GBps,
         inter_node_dp_GBps=raw.get("model_assumptions", {}).get("inter_node_dp_GBps"),
     )
-    if models.weight_bytes != handoff.weight_bytes:
+    if cost_models.weight_bytes != handoff.weight_bytes:
         parser.error(
             "Explicit handoff weight_bytes differs from model publication metadata"
         )
@@ -210,8 +210,8 @@ def main():
             str(p.relative_to(repo)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sources
         },
-        models=models.source_ids,
-        prediction_models=prediction_models.source_ids,
+        cost_models=cost_models.source_ids,
+        prediction_cost_models=prediction_cost_models.source_ids,
         prediction_simulator="JointSimulator"
         if implementation == "basic"
         else "Evaluator",
@@ -254,13 +254,13 @@ def main():
             simulation = OnlineSimulation.create(
                 workload,
                 initial,
-                models,
+                cost_models,
                 run,
                 handoff,
                 slo,
                 input_closes_at=raw["input_closes_at"],
                 reconfigurator=reconfigurator,
-                prediction_models=prediction_models,
+                prediction_cost_models=prediction_cost_models,
                 candidate_executor=candidate_executor,
                 measured_search_time=args.decision_clock == "measured",
                 event_sink=(

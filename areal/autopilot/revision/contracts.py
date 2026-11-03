@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Domain-independent, JSON-compatible code revision boundaries."""
+"""Proposal requests, revision reports and the Revision Benchmark contract."""
 
 import hashlib
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Protocol
 
 from areal.utils.atomic import json_digest as digest
 
@@ -55,7 +57,7 @@ class ProposalRequest:
 
 
 @dataclass(frozen=True)
-class EvaluationReport:
+class RevisionReport:
     target: Target
     candidate_sha256: str
     benchmark_sha256: str
@@ -70,6 +72,26 @@ __all__ = [
     "source_digest",
     "Proposal",
     "ProposalRequest",
-    "EvaluationReport",
+    "RevisionReport",
+    "RevisionBenchmark",
     "Target",
 ]
+
+
+class RevisionBenchmark(Protocol):
+    target: str
+    benchmark_sha256: str
+    initial_source: str | None
+    owns_acceptance: bool
+    replay_fingerprints: tuple[str, ...]
+    criteria: Any
+    context: dict
+    settings: dict
+    calibration: dict
+    proposal_context: dict
+
+    def evaluate(self, source: str, directory: Path) -> RevisionReport: ...
+    def compare(
+        self, candidate: RevisionReport, incumbent: RevisionReport
+    ) -> tuple[bool, str]: ...
+    def feedback(self, report: RevisionReport) -> dict: ...

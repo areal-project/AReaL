@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Online revision subprocess: public inputs only, bounded by CandidateRunner."""
+"""Candidate execution worker for Elastic revision evaluation."""
 
 import json
 import os
@@ -8,17 +8,17 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from areal.autopilot.revision.execution import load_module
-from areal.elastic.contracts import CandidateWave
-from areal.elastic.serving import ServingSLO
-
-from .contracts import OnlineProblem, decode
-from .model_adapters import OnlineHistoryPredictor, validate_components
-from .model_execution import (
+from areal.autopilot.domains.elastic.contracts import OnlineProblem, decode
+from areal.autopilot.domains.elastic.evaluation.evaluator import (
+    CostModelHistoryPredictor,
     historical_case_from_dict,
     historical_input_from_dict,
     prediction_fingerprint,
+    validate_cost_models,
 )
+from areal.autopilot.revision.execution import load_module
+from areal.elastic.contracts import CandidateWave
+from areal.elastic.serving import ServingSLO
 
 
 def main():
@@ -36,7 +36,7 @@ def main():
             raise ValueError(response["error"])
         return response
 
-    class ReferenceProxy:
+    class EvaluatorProxy:
         def __init__(self, index, case):
             self.index, self.case = index, case
             metadata = rpc(index, "start")
@@ -87,9 +87,9 @@ def main():
 
     try:
         module = load_module(Path(request["source_path"]))
-        if request["target"] == "model":
-            models = validate_components(
-                module.build_model(
+        if request["target"] == "evaluator":
+            cost_models = validate_cost_models(
+                module.build_cost_models(
                     tuple(
                         historical_case_from_dict(c)
                         for c in request["calibration"]["cases"]
@@ -97,18 +97,20 @@ def main():
                     request["settings"],
                 )
             )
-            predictor = OnlineHistoryPredictor(models)
+            predictor = CostModelHistoryPredictor(cost_models)
             cases = tuple(historical_input_from_dict(c) for c in request["cases"])
             rows = [{"prediction": asdict(predictor.predict(c))} for c in cases]
             repeated = [{"prediction": asdict(predictor.predict(c))} for c in cases]
             if prediction_fingerprint(rows) != prediction_fingerprint(repeated):
                 raise ValueError("Frozen Online components must predict repeatably")
-            send(dict(type="result", rows=rows, source_ids=tuple(models.source_ids)))
+            send(
+                dict(type="result", rows=rows, source_ids=tuple(cost_models.source_ids))
+            )
         elif request["target"] == "optimizer":
             predictions = []
             for index, data in enumerate(request["cases"]):
                 case = decode(OnlineProblem, data)
-                proxy = ReferenceProxy(index, case)
+                proxy = EvaluatorProxy(index, case)
                 search = module.build_optimizer(dict(request["settings"]))
                 result = tuple(
                     search.search(
@@ -125,7 +127,7 @@ def main():
                 predictions.append(raw)
             send(dict(type="result", predictions=predictions))
         else:
-            raise ValueError("Online revision target must be model or optimizer")
+            raise ValueError("Online revision target must be evaluator or optimizer")
     except Exception as error:
         send(dict(type="result", error=f"{type(error).__name__}: {error}"))
 

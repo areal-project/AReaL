@@ -3,18 +3,38 @@
 """Task entrypoint wiring without starting training workers."""
 
 import json
+import sys
+import types
+from importlib.util import find_spec, module_from_spec
 
 import pytest
 
-from areal.autopilot.domains.elastic.native import RevisionAdapter
+import areal
+from areal.elastic.infra.adapter import ReconfiguratorAdapter
+
+
+def load_entrypoint(name):
+    """Execute a fresh entrypoint module without caching its patched dependencies."""
+    spec = find_spec(name)
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def config_api(monkeypatch):
+    """Replace the config-reader boundary before importing the training entrypoint."""
+    module = types.ModuleType("areal.api.cli_args")
+    module.PPOConfig = object
+    module.load_expr_config = lambda *args: (object(), None)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return module
 
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_hermes_entry_preserves_config_arguments_and_optionally_attaches_native_reconfigurator(
-    monkeypatch, enabled
+    monkeypatch, tmp_path, config_api, enabled
 ):
-    from examples.hermes import train
-
     config = object()
     seen = {}
 
@@ -37,6 +57,10 @@ def test_hermes_entry_preserves_config_arguments_and_optionally_attaches_native_
             if "elastic_reconfigurator" in seen:
                 seen["elastic_reconfigurator"].close()
 
+    monkeypatch.setattr(areal, "PPOTrainer", Trainer, raising=False)
+    config_api.load_expr_config = load
+    train = load_entrypoint("examples.hermes.train")
+
     monkeypatch.setattr(train, "load_expr_config", load)
     monkeypatch.setattr(train, "PPOTrainer", Trainer)
     config_args = [
@@ -44,23 +68,25 @@ def test_hermes_entry_preserves_config_arguments_and_optionally_attaches_native_
         "examples/hermes/config.yaml",
         "elastic.enabled=true",
     ]
-    train.main([*(["--elastic-revision"] if enabled else []), *config_args])
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({"reconfigurator": {}}))
+    elastic_args = ["--elastic-profile", str(profile)] if enabled else []
+    train.main([*elastic_args, *config_args])
     assert seen["args"] == config_args and seen["trained"]
     assert ("elastic_reconfigurator" in seen) == enabled
     if enabled:
-        assert isinstance(seen["elastic_reconfigurator"], RevisionAdapter)
+        assert type(seen["elastic_reconfigurator"]) is ReconfiguratorAdapter
         assert seen["elastic_reconfigurator"].closed
 
 
-def test_hermes_measured_profile_selects_areal_adapter_without_autopilot(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    "entrypoint", ["examples.hermes.train", "examples.task_workflows.train"]
+)
+def test_measured_profile_selects_areal_adapter_without_autopilot(
+    monkeypatch, tmp_path, config_api, entrypoint
 ):
     """Profile-only runs use the ordinary adapter and default Monitor."""
     import builtins
-
-    from examples.hermes import train
-
-    from areal.elastic.infra.adapter import ReconfiguratorAdapter
 
     profile = tmp_path / "profile.json"
     profile.write_text(json.dumps({"reconfigurator": {}}))
@@ -79,6 +105,8 @@ def test_hermes_measured_profile_selects_areal_adapter_without_autopilot(
         def __exit__(self, *args):
             seen["elastic_reconfigurator"].close()
 
+    monkeypatch.setattr(areal, "PPOTrainer", Trainer, raising=False)
+    train = load_entrypoint(entrypoint)
     original_import = builtins.__import__
 
     def without_autopilot(name, *args, **kwargs):
@@ -91,4 +119,4 @@ def test_hermes_measured_profile_selects_areal_adapter_without_autopilot(
     monkeypatch.setattr(builtins, "__import__", without_autopilot)
     train.main(["--elastic-profile", str(profile), "elastic.enabled=true"])
     assert type(seen["elastic_reconfigurator"]) is ReconfiguratorAdapter
-    assert seen["elastic_reconfigurator"].hooks is None and seen["trained"]
+    assert seen["trained"]

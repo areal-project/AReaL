@@ -13,6 +13,7 @@ from dataclasses import asdict, replace
 from areal.elastic.contracts import (
     ActorView,
     ActorWaitView,
+    CostModels,
     EpisodeSample,
     EpisodeView,
     Forecast,
@@ -20,7 +21,6 @@ from areal.elastic.contracts import (
     OnlineLayout,
     OnlineObservation,
     SimulationConfig,
-    SimulationModels,
 )
 from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import (
     ServiceSlice,
@@ -84,9 +84,9 @@ class OnlineSimulation:
         return False
 
     @classmethod
-    def from_forecast(cls, view, forecast, models, config, handoff, slo, **kwargs):
+    def from_forecast(cls, view, forecast, cost_models, config, handoff, slo, **kwargs):
         """Replay an observed snapshot against supplied work for independent checks."""
-        sim = cls.restore(view, forecast, models, config, handoff, slo, **kwargs)
+        sim = cls.restore(view, forecast, cost_models, config, handoff, slo, **kwargs)
         if handoff.mode == "cold":
             sim.execution_layout = (
                 handoff.native_source or sim.reconfiguration._physical_source()
@@ -97,14 +97,14 @@ class OnlineSimulation:
         self,
         episodes: tuple[EpisodeSample, ...],
         initial: OnlineLayout,
-        models: SimulationModels,
+        cost_models: CostModels,
         config: SimulationConfig,
         handoff: HandoffConfig,
         slo=None,
         *,
         input_closes_at: float,
         reconfigurator: object | None = None,
-        prediction_models=None,
+        prediction_cost_models=None,
         measured_search_time=False,
         search_clock=None,
         event_sink: Callable[[dict], None] | None = None,
@@ -117,8 +117,8 @@ class OnlineSimulation:
             raise ValueError("Actor DP must divide the episode batch")
         work = _work or WorkInputs.prepare(episodes, input_closes_at, start_time)
         self._truth = work.truth
-        self.models, self.config, self.handoff, self.slo = (
-            models,
+        self.cost_models, self.config, self.handoff, self.slo = (
+            cost_models,
             config,
             handoff,
             slo,
@@ -194,8 +194,10 @@ class OnlineSimulation:
         self.execution = SimulationExecution(self)
         self.reconfiguration = SimulationReconfiguration(self)
         self.reconfiguration.initialize(initial)
-        self.prediction_models = (
-            self.models if prediction_models is None else prediction_models
+        self.prediction_cost_models = (
+            self.cost_models
+            if prediction_cost_models is None
+            else prediction_cost_models
         )
         self.measured_search_time = measured_search_time
         if reconfigurator is not None:
@@ -442,7 +444,7 @@ class OnlineSimulation:
             peak_gpus=self.pool.peak_gpus,
             remaining_leases=dict(self.pool.leases),
             counters=dict(self.counters),
-            source_ids=self.models.source_ids,
+            source_ids=self.cost_models.source_ids,
             assumptions=(
                 "GPU-token timing; HTTP/network response tails not measured",
                 "Decode-first batches; declared generation-budget KV reservation; no prefix reuse",
@@ -450,7 +452,7 @@ class OnlineSimulation:
                 "Immutable published snapshots assumed; complete Actor state handoff at a single-writer boundary",
                 "Startup/state/publication transfers serialize on one assumed effective shared link",
                 self.handoff.provenance,
-                *getattr(self.models, "scenario_notes", ()),
+                *getattr(self.cost_models, "scenario_notes", ()),
             ),
         )
         if self.control is not None:
@@ -476,7 +478,7 @@ class OnlineSimulation:
         cls,
         view: OnlineObservation,
         forecast: Forecast,
-        models: SimulationModels,
+        cost_models: CostModels,
         config: SimulationConfig,
         handoff: HandoffConfig,
         slo=None,
@@ -499,7 +501,7 @@ class OnlineSimulation:
         simulation = cls(
             forecast.episodes,
             view.layout,
-            models,
+            cost_models,
             config,
             handoff,
             slo,
@@ -611,7 +613,7 @@ class OnlineSimulation:
         for service in view.services:
             group = simulation.deployments[1].replicas[service.replica]
             slices = tuple(ServiceSlice(*s) for s in service.slices)
-            seconds = models.service(view.layout, group.kv_tokens, slices)
+            seconds = cost_models.service(view.layout, group.kv_tokens, slices)
             simulation.deployments[1].busy[service.replica] = service
             simulation.schedule_at(
                 max(view.now, service.started_at + seconds),
@@ -630,7 +632,7 @@ class OnlineSimulation:
                 )
         if view.actor.batch:
             simulation.actor_batch = view.actor.batch
-            simulation.actor_stages = models.actor(
+            simulation.actor_stages = cost_models.actor(
                 view.layout,
                 tuple(tuple(simulation.episodes[e].past) for e in view.actor.batch),
             )

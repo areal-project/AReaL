@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-_models = None
+_cost_models = None
 _identity = None
 _search = None
 
@@ -27,34 +27,32 @@ def evaluate_chunk(job):
     started = time.process_time()
     from areal.elastic.reconfigurator import component_module
 
-    global _models, _identity, _search
+    global _cost_models, _identity, _search
     payload, indexed = job
     implementation, payload = payload[0], payload[1:]
     if implementation not in {"basic", "reference"}:
         raise ValueError("Unknown reconfigurator implementation")
     module = component_module(implementation, "evaluator")
     Evaluator = (
-        module.Evaluator
-        if implementation == "reference"
-        else module.OnlineForecastModel
+        module.Evaluator if implementation == "reference" else module.JointEvaluator
     )
-    CalibratedOnlineModels = component_module(
-        implementation, "models"
-    ).CalibratedOnlineModels
+    CalibratedCostModels = component_module(
+        implementation, "cost_models"
+    ).CalibratedCostModels
     spec, expected, config, handoff, slo, delay, prune, coalesce, view, forecasts = (
         payload[:10]
     )
     identity = implementation, spec, expected
     if identity != _identity:
         bundle, mechanism, publication, bandwidth, *cross_node = spec
-        _models = CalibratedOnlineModels(
+        _cost_models = CalibratedCostModels(
             Path(bundle),
             Path(mechanism),
             Path(publication),
             bandwidth,
             inter_node_dp_GBps=cross_node[0] if cross_node else None,
         )
-        if _models.source_ids != expected:
+        if _cost_models.source_ids != expected:
             raise ValueError("CPU worker loaded a different frozen calibration")
         _identity = identity
         _search = None
@@ -75,7 +73,7 @@ def evaluate_chunk(job):
     )
     if context is None or _search is None or _search[0] != key:
         evaluator = Evaluator(
-            _models,
+            _cost_models,
             config,
             handoff,
             slo,

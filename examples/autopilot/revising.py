@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run Online Reference model/optimizer revisions or a synthetic CPU demonstration."""
+"""Run Reference Evaluator/Optimizer revisions or a synthetic CPU demonstration."""
 
 import argparse
 import json
@@ -8,24 +8,26 @@ import sys
 from pathlib import Path
 
 from examples.autopilot.elastic.revision_demo import (
-    GOOD_MODEL_SOURCE,
+    GOOD_EVALUATOR_SOURCE,
     REDUNDANT_OPTIMIZER_SOURCE,
-    demo_evaluator,
+    demo_benchmark,
 )
 
 from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE
-from areal.autopilot.domains.elastic.model_evaluator import HistoricalModelEvaluator
-from areal.autopilot.domains.elastic.model_execution import (
-    HistoricalSourceEvaluator,
+from areal.autopilot.domains.elastic.evaluation.evaluator import (
+    CostModelHistoryBenchmark,
+    EvaluatorRevisionBenchmark,
     historical_case_from_dict,
 )
-from areal.autopilot.domains.elastic.optimizer_evaluator import OnlineOptimizerEvaluator
+from areal.autopilot.domains.elastic.evaluation.optimizer import (
+    OptimizerRevisionBenchmark,
+)
 from areal.autopilot.revision import CommandRevisionAgent, RevisionLoop
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", choices=["model", "optimizer"])
+    parser.add_argument("--target", choices=["evaluator", "optimizer"])
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--cases", type=Path)
     parser.add_argument("--settings", type=Path)
@@ -55,15 +57,15 @@ def main():
     if args.demo_agent:
         request = json.load(sys.stdin)
         source = (
-            GOOD_MODEL_SOURCE
-            if request["target"] == "model"
+            GOOD_EVALUATOR_SOURCE
+            if request["target"] == "evaluator"
             else BASELINE_SOURCE["optimizer"]
         )
         sys.stdout.write(
             json.dumps(
                 {
                     "source": source,
-                    "rationale": "Controlled CPU example: improve model timing or remove redundant model queries",
+                    "rationale": "Controlled CPU example: improve CostModel timing or remove redundant Evaluator queries",
                 }
             )
         )
@@ -71,7 +73,7 @@ def main():
     if args.target is None or args.output is None:
         parser.error("--target and --output are required")
     if args.demo:
-        evaluator = demo_evaluator(args.target)
+        benchmark = demo_benchmark(args.target)
     else:
         if (
             args.profile is None
@@ -120,15 +122,19 @@ def main():
         settings = (
             {} if args.settings is None else json.loads(args.settings.read_text())
         )
-        if args.target == "model":
-            history = HistoricalModelEvaluator(
+        if args.target == "evaluator":
+            history = CostModelHistoryBenchmark(
                 tuple(historical_case_from_dict(c) for c in cases),
                 primary_metrics=tuple(profile["primary_metrics"]),
             )
-            evaluator = HistoricalSourceEvaluator(
+            benchmark = EvaluatorRevisionBenchmark(
                 history,
-                settings=profile["model_settings"],
-                initial_source=profile.get("initial_model_source"),
+                settings=profile.get(
+                    "cost_model_settings", profile.get("model_settings")
+                ),
+                initial_source=profile.get(
+                    "initial_evaluator_source", profile.get("initial_model_source")
+                ),
             )
         else:
             from areal.autopilot.domains.elastic.contracts import decode
@@ -138,17 +144,19 @@ def main():
             from areal.elastic.serving import ServingSLO
 
             assembly = profile["assembly"]
-            models = load_source(profile["model_source"]).build_model(
+            cost_models = load_source(
+                profile.get("evaluator_source", profile.get("model_source"))
+            ).build_cost_models(
                 tuple(
                     historical_case_from_dict(c)
                     for c in profile.get("calibration_cases", ())
                 ),
-                profile["model_settings"],
+                profile.get("cost_model_settings", profile.get("model_settings")),
             )
-            evaluator = OnlineOptimizerEvaluator(
+            benchmark = OptimizerRevisionBenchmark(
                 cases,
-                model_factory=lambda: Evaluator(
-                    models,
+                evaluator_factory=lambda: Evaluator(
+                    cost_models,
                     decode(SimulationConfig, assembly["run"]),
                     decode(HandoffConfig, assembly["handoff"]),
                     decode(ServingSLO, assembly["slo"]),
@@ -159,7 +167,7 @@ def main():
     initial_source = (
         REDUNDANT_OPTIMIZER_SOURCE if args.demo and args.target == "optimizer" else None
     )
-    loop = RevisionLoop(agent, evaluator, args.output, initial_source=initial_source)
+    loop = RevisionLoop(agent, benchmark, args.output, initial_source=initial_source)
     result = loop.run(max_rounds=args.max_rounds)
     if (
         args.demo
