@@ -92,6 +92,86 @@ def test_chunked_model_thd_forward_accepts_qwen35_multimodal(
     assert forward.call_count == int(supported)
 
 
+@pytest.mark.parametrize(
+    ("mtp_enabled", "forward_only"),
+    [(False, False), (True, True), (True, False)],
+)
+def test_version_mask_reaches_packed_forward_only_for_mtp_training(
+    monkeypatch, mtp_enabled, forward_only
+):
+    """Stale-token filtering must also work in non-MTP Megatron updates."""
+    from areal.engine import megatron_engine as module
+    from areal.utils.data import MicroBatchList, MicroBatchSpec
+
+    row = {
+        "input_ids": torch.tensor([10, 11, 12, 13]),
+        "loss_mask": torch.tensor([False, True, True, False]),
+        "policy_version_mask": torch.tensor([False, False, True, False]),
+        "mtp_version_mask": torch.tensor([False, False, True, True]),
+        "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
+        "max_seqlen": 4,
+    }
+    batch = MicroBatchList(
+        data={},
+        mb_spec=MicroBatchSpec(),
+        mbs=[row],
+        padded_mbs=[dict(row)],
+        group_lens=[4],
+        padding_lengths=[0],
+        padded_to_lengths=[4],
+    )
+    engine = module.MegatronEngine.__new__(module.MegatronEngine)
+    engine._ensure_ready = lambda: None
+    engine._r3_enabled = False
+    engine._r3_pending_routed_experts = None
+    engine._r3_pending_valid = None
+    engine.tf_config = SimpleNamespace(num_moe_experts=None)
+    engine.mcore_config = SimpleNamespace(
+        enable_mtp_training=mtp_enabled,
+        enable_chunked_logits=False,
+        lm_head_loss_chunk_size=0,
+    )
+    engine.config = SimpleNamespace(is_critic=False)
+    engine.process_group_initialized = True
+    engine._cpu_group = object()
+    engine.is_vision_model = False
+    engine.enable_tree_training = False
+    engine.device = "cpu"
+    engine.dtype = torch.bfloat16
+    engine.model = [object()]
+    engine.bridge_cls = "megatron-bridge"
+    engine.use_padded_seq = False
+    engine.use_model_packed_seq = False
+
+    class ForwardReached(Exception):
+        pass
+
+    def schedule(**kwargs):
+        kwargs["forward_step_func"](kwargs["data_iterator"], kwargs["model"])
+
+    def forward(_model, input_, **_kwargs):
+        active_mtp = mtp_enabled and not forward_only
+        assert ("mtp_version_mask" in input_) is active_mtp
+        assert ("mtp_loss_mask" in input_) is active_mtp
+        assert "policy_version_mask" in input_
+        raise ForwardReached
+
+    monkeypatch.setattr(module, "get_forward_backward_func", lambda: schedule)
+    monkeypatch.setattr(
+        module, "validate_transport_padding", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(module, "packed_context_parallel_forward", forward)
+    monkeypatch.setattr(module.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(module.mpu, "is_pipeline_last_stage", lambda **_kwargs: True)
+
+    with pytest.raises(ForwardReached):
+        engine.forward_backward_batch(
+            batch, lambda *args: None, forward_only=forward_only
+        )
+    assert "mtp_version_mask" in batch.padded_mbs[0]
+    assert "mtp_loss_mask" not in batch.padded_mbs[0]
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize(
     ("cp_size", "cp_rank"), [(1, 0), (4, 0), (4, 1), (4, 2), (4, 3)]

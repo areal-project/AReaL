@@ -2137,6 +2137,10 @@ class MegatronEngine(TrainEngine):
                         "MTP version mask must match input_ids before layout "
                         f"conversion, got {mtp_version_mask.shape} and {input_ids.shape}."
                     )
+            else:
+                # The actor carries this mask with policy-version filtering,
+                # but it only applies to an active MTP training objective.
+                mb_input.padded_mb.pop("mtp_version_mask", None)
 
             output = packed_context_parallel_forward(
                 model,
