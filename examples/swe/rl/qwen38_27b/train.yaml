@@ -308,6 +308,10 @@ sglang:
   ep_size: 1
   log_level: info
   enable_multimodal: true
+  limit_mm_data_per_request:
+    image: 64
+    video: 1
+    audio: 5
 train_dataset:
   batch_size: 16
   shuffle: true

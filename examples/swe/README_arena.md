@@ -116,6 +116,48 @@ are retained for audit, not parsed for training rewards. Model-attributed failur
 retain interactions with zero reward; system and ambiguous failures are rejected. Result
 shards are written under `arena_result_dump_dir` when configured.
 
+### Multimodal request limits
+
+Configure SGLang's item-count limits through the training YAML:
+
+```yaml
+sglang:
+  limit_mm_data_per_request:
+    image: 64
+    video: 1
+    audio: 5
+```
+
+The values apply to each inference request, including images retained in conversation
+history. Omit the field (or set it to `null`) to use the installed SGLang defaults. An
+empty mapping `{}` disables item-count validation; a zero value disallows that modality.
+Only the specified modalities are limited. Larger limits allow larger multimodal inputs
+and can increase preprocessing memory use.
+
+### Task failure metrics in W&B
+
+Arena task outcomes are recorded once when each agent call finishes, before proxy
+export, zero-reward recovery, or group filtering. Rejected attempts are included when
+their rollout results are consumed to form a training batch; pending attempts belong to
+a later batch's metric window.
+
+- `rollout/task_attempt_count`: all finished agent calls, including local errors and
+  cancellation. `rollout/task_attempt/{success,error,cancelled}` are fractions of these
+  calls. Success here means the Arena call returned a reward, not that the trajectory
+  was accepted for training.
+- `rollout/task_result_count`: calls with an observed Arena terminal status.
+  `rollout/harness_success` counts `DONE`/`OK`; `rollout/harness_error` counts
+  `HARNESS_FAILED`. `rollout/task_error` includes all failed terminal statuses, such as
+  `EVAL_FAILED`, `COLLECT_FAILED`, and `SETUP_FAILED`. These fractions and
+  `rollout/task_status/<status>` share the terminal-result denominator.
+- `rollout/harness_error/<code>` also uses the terminal-result denominator, with `OTHER`
+  for unrecognized or missing Harness outcome codes. A model failure recovered as zero
+  reward still counts once as its original task failure.
+
+Local timeouts and cancellations without a remote terminal result contribute only to the
+call metrics. Reward metrics retain their valid-export denominator, exposed as
+`rollout/reward_sample_count`; they must not be used as the task-failure denominator.
+
 ### Reward components in W&B
 
 The client preserves the result envelope's `sub_scores`. Finite named entries are logged
