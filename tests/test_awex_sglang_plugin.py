@@ -161,15 +161,17 @@ def test_memory_transitions_are_idempotent(monkeypatch):
 
 @pytest.mark.parametrize("separate_updater", [False, True])
 @pytest.mark.parametrize("frozen_visual", [False, True])
+@pytest.mark.parametrize("cache_module", ["mm_utils", "mm_schedule"])
 def test_successful_flush_reencodes_images_after_weight_update(
-    monkeypatch, separate_updater, frozen_visual
+    monkeypatch, separate_updater, frozen_visual, cache_module
 ):
     import sys
 
     embeddings = {}
+    monkeypatch.setitem(sys.modules, "sglang.srt.managers.mm_utils", SimpleNamespace())
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.managers.mm_utils",
+        f"sglang.srt.managers.{cache_module}",
         SimpleNamespace(embedding_cache=embeddings),
     )
     flush_calls = []
@@ -258,12 +260,14 @@ def test_unsuccessful_flush_preserves_image_embeddings(monkeypatch, raises):
     assert embeddings == before
 
 
-def test_successful_flush_accepts_uninitialized_image_cache(monkeypatch):
+@pytest.mark.parametrize("cache_module", ["mm_utils", "mm_schedule"])
+def test_successful_flush_accepts_uninitialized_image_cache(monkeypatch, cache_module):
     import sys
 
+    monkeypatch.setitem(sys.modules, "sglang.srt.managers.mm_utils", SimpleNamespace())
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.managers.mm_utils",
+        f"sglang.srt.managers.{cache_module}",
         SimpleNamespace(embedding_cache=None),
     )
     scheduler = SimpleNamespace(

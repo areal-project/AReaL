@@ -416,8 +416,15 @@ class AwexSchedulerPlugin:
                         mm_utils = importlib.import_module(
                             "sglang.srt.managers.mm_utils"
                         )
-                        if mm_utils.embedding_cache is not None:
-                            mm_utils.embedding_cache.clear()
+                        # Newer SGLang moved ownership to mm_schedule;
+                        # mm_utils only re-exports its initialization helper.
+                        cache_owner = mm_utils
+                        if not hasattr(cache_owner, "embedding_cache"):
+                            cache_owner = importlib.import_module(
+                                "sglang.srt.managers.mm_schedule"
+                            )
+                        if cache_owner.embedding_cache is not None:
+                            cache_owner.embedding_cache.clear()
                         self._visual_embeddings_initialized = (
                             self._visual_embeddings_frozen
                         )
