@@ -599,7 +599,11 @@ class GPUStagedMuon(torch.optim.Optimizer):
                 proxy = native_group["params"][0]
                 proxy.grad = grad_matrix
                 native.step()
-                unit.param.copy_(proxy)
+                writer = getattr(unit.param, "_weftmoe_fp8_writer", None)
+                if writer is None:
+                    unit.param.copy_(proxy)
+                else:
+                    writer(unit.param, proxy)
             slot.compute_done.record(slot.compute_stream)
 
         with torch.cuda.stream(slot.d2h_stream):
@@ -2774,7 +2778,15 @@ def _make_staged_layerwise_class():
                                 ),
                                 (
                                     "storage_nbytes",
-                                    frozen.storage_nbytes,
+                                    (
+                                        0
+                                        if getattr(param, "_weftmoe_fp8_writer", None)
+                                        is not None
+                                        and getattr(param, "_weftmoe_fp8_storage", None)
+                                        is storage
+                                        and storage.nbytes() == 0
+                                        else frozen.storage_nbytes
+                                    ),
                                     int(storage.nbytes()),
                                 ),
                                 (
@@ -2891,6 +2903,10 @@ def _make_staged_layerwise_class():
             ):
                 flat_sizes, first_param, group_rank = validated[domain]
                 if params_list is None or first_param is None or max(flat_sizes) == 0:
+                    continue
+                if len(params_list) == 1:
+                    # Expert DP=1 already owns every complete expert. In FP8
+                    # primary mode BF16 Parameter storage is intentionally absent.
                     continue
                 device = first_param.device
                 dtype = first_param.dtype

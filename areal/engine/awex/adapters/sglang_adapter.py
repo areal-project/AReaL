@@ -75,6 +75,13 @@ from areal.utils import logging  # noqa: E402
 logger = logging.getLogger("AwexSGLangAdapter")
 
 
+def _use_weftmoe_fp8() -> bool:
+    return (
+        os.environ.get("AREAL_USE_WEFTMOE") == "1"
+        and os.environ.get("WEFTMOE_FP8") == "1"
+    )
+
+
 class _DeviceBoundWeightsReader(NCCLWorkerWeightsReader):
     """Bind colocate communication to the model's logical CUDA device."""
 
@@ -93,6 +100,20 @@ class _DeviceBoundWeightsReader(NCCLWorkerWeightsReader):
         return BoundedMemoryNcclColocateStreamBatchTransport(
             self.transfer_rank, self.infer_world_size
         )
+
+    def initialize(self):
+        provider = getattr(self, "wire_parameter_provider", None)
+        if provider is None:
+            return super().initialize()
+        from areal.engine.awex.adapters.weftmoe_fp8 import WireConverter, WireModel
+
+        original_model, original_converter = self.model, self.weight_converter
+        try:
+            self.model = WireModel(original_model, provider())
+            self.weight_converter = WireConverter()
+            return super().initialize()
+        finally:
+            self.model, self.weight_converter = original_model, original_converter
 
     def _set_device(self) -> None:
         torch.cuda.set_device(self._model_device)
@@ -525,6 +546,15 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
     def _iter_hf_params(self, rank_info: RankInfo):
         """Yield parameters in the canonical layout selected by training."""
+        fp8_parameters = {}
+        if _use_weftmoe_fp8():
+            from weftmoe.sglang import fp8_parameter_map
+
+            fp8_parameters = fp8_parameter_map(self._get_model())
+            if self._parameter_layout == "hf":
+                raise ValueError(
+                    "WeftMoE FP8 requires the AWEX canonical converter layout"
+                )
         if self._parameter_layout == "hf":
             for name, param in self._get_model().named_parameters():
                 yield from self._unfuse_params(name, param.data)
@@ -535,6 +565,11 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         embed_tensor: torch.Tensor | None = None
 
         for name, param in self._get_model().named_parameters():
+            if id(param) in fp8_parameters:
+                from areal.engine.awex.adapters.weftmoe_fp8 import convert_fp8
+
+                yield from convert_fp8(converter, name, *fp8_parameters[id(param)])
+                continue
             for hf_name, hf_tensor in converter.convert_param(name, param.data):
                 converted_names.add(hf_name)
                 if hf_name == "model.embed_tokens.weight":
@@ -551,6 +586,24 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             yield "lm_head.weight", embed_tensor
 
     def _compute_legacy_local_raw_meta(self) -> dict:
+        if _use_weftmoe_fp8():
+            rank_info = get_sglang_rank_info(
+                self._get_model_context(), engine_rank=self._legacy_engine_rank or 0
+            )
+            params = [
+                dict(
+                    name=name,
+                    numel=t.numel(),
+                    shape=tuple(t.shape),
+                    dtype=str(t.dtype).replace("torch.", ""),
+                )
+                for name, t in self._iter_hf_params(rank_info)
+            ]
+            return dict(
+                rank_info=rank_info,
+                params_meta=params,
+                model_arch_name=self._get_model_arch_name(),
+            )
         return InferParamMetaResolver._get_model_param_info(
             "sglang",
             self._scheduler.server_args,
@@ -1064,6 +1117,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             "infer_world_size": infer_world_size,
             "hf_config": awex_hf_config,
             "router_dtype": _get_router_dtype(awex_hf_config),
+            "weftmoe_fp8_primary": _use_weftmoe_fp8(),
         }
         if self._qwen4_frozen_contract is not None:
             infer_conf["qwen4_exp_frozen_contract"] = (
@@ -1113,6 +1167,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         reader.meta_server_client = _PhysicalDeviceMetaServerClient(
             reader.meta_server_client, self._legacy_local_gpu_id
         )
+        if _use_weftmoe_fp8():
+            reader.wire_parameter_provider = self.get_local_shard_parameters
         reader.initialize()
         if self._qwen4_frozen_contract is not None:
             self._qwen4_parameter_identity = tuple(
@@ -1122,12 +1178,24 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._legacy_reader = reader
         return reader
 
+    def release_fp8_bindings(self) -> None:
+        """Drop receive views before FP8 allocations are moved to host."""
+        if _use_weftmoe_fp8():
+            if self._legacy_reader is not None:
+                self._legacy_reader.parameters.clear()
+            if self._parameters is not None:
+                self._parameters.clear()
+
     @torch.no_grad()
     def update_weights(self, version: int) -> None:
         """Execute one v1 native AWEX colocate reader update."""
         if not self._initialized:
             raise RuntimeError("Legacy SGLang AWEX adapter is not initialized")
         reader = self._ensure_reader()
+        if getattr(reader, "wire_parameter_provider", None) is not None:
+            # Offload/onload replaces FP8 allocations. Rebind every weight and
+            # scale view before transport uses them; plans contain only metadata.
+            reader.parameters = reader.wire_parameter_provider()
         if self._qwen4_frozen_contract is not None:
             identity = tuple(
                 (name, id(parameter))
@@ -1139,6 +1207,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 )
             reader.weight_converter.refresh_frozen_contract()
         reader.update_weights(step_id=version)
+        if getattr(reader, "wire_parameter_provider", None) is not None:
+            from weftmoe.sglang import commit_fp8_weights
+
+            commit_fp8_weights(version)
         self._rebuild_derived_weights()
         logger.info("Legacy SGLang weight update completed: version=%d", version)
 

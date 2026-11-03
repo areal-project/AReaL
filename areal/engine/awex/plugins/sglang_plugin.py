@@ -383,6 +383,8 @@ class AwexSchedulerPlugin:
             if os.environ.get("AREAL_USE_WEFTMOE") == "1":
                 from weftmoe.sglang import suspend
 
+                if self._receiver is not None:
+                    self._receiver.release_fp8_bindings()
                 suspend(scheduler.tp_worker.model_runner)
             with _retract_memory_idle(scheduler, owner):
                 return original_release(filtered, *args, **kwargs)
