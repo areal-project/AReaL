@@ -48,7 +48,7 @@ def wrap_server_command(command: list[str]) -> list[str]:
 
 
 def apply_model_patches(server_args: Sequence[str]) -> None:
-    """Prepare Qwen GDN and Flash Next sources before importing SGLang workers."""
+    """Prepare validated GDN, Flash Next and optional CPU processor patches."""
     if "--help" in server_args or "-h" in server_args:
         return
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
@@ -81,6 +81,15 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
             )
         except (OSError, ValueError):
             return  # Let the original entry point handle other config formats.
+    from areal.engine import sglang_qwen_vl_cpu
+
+    # The optional processor integration and default GDN protection are
+    # independent: opting out of one must not suppress the other.
+    cpu_processor_enabled = (
+        config.get("model_type") in sglang_qwen_vl_cpu.MODEL_TYPES
+        and os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE")
+        == "areal.engine.sglang_processors"
+    )
     patches = []
     if config.get("model_type") == "qwen4_exp":
         from areal.engine import (
@@ -103,12 +112,28 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
 
         sglang_gdn_decode_padding.validate_flashinfer_version()
         patches.append(sglang_gdn_decode_padding)
-    if not patches:
+    if not patches and not cpu_processor_enabled:
         return
 
     root = installed_sglang_root()
+    source_patches = [
+        (root / patch.TARGET_RELATIVE, patch.patched_source) for patch in patches
+    ]
+    if cpu_processor_enabled:
+        source_patches.extend(
+            [
+                (
+                    root / sglang_qwen_vl_cpu.TARGET_RELATIVE,
+                    sglang_qwen_vl_cpu.patched_source,
+                ),
+                (
+                    root / sglang_qwen_vl_cpu.BASE_RELATIVE,
+                    sglang_qwen_vl_cpu.patched_base_source,
+                ),
+            ]
+        )
     install_source_patches(
-        [(root / patch.TARGET_RELATIVE, patch.patched_source) for patch in patches],
+        source_patches,
         lock_path=root / ".areal-sglang-patches.lock",
     )
     for patch in patches:

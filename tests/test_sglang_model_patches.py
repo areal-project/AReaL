@@ -118,7 +118,9 @@ def test_flash_next_startup_patches_all_sources_and_repeated_start_is_write_free
     assert all(target.stat().st_mtime_ns == mtime for target, mtime in mtimes.items())
 
 
-@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen3_vl_moe", "llama", None])
+@pytest.mark.parametrize(
+    "model_type", ["qwen2_vl", "qwen3_vl", "qwen3_vl_moe", "llama", None]
+)
 def test_other_model_types_skip_sglang_even_with_flash_next_directory_name(
     tmp_path, monkeypatch, model_type
 ):

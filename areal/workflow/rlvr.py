@@ -185,6 +185,10 @@ class RLVRWorkflow(RolloutWorkflow):
                 resp.stop_reason == "length", dtype=torch.bool
             ),
         }
+        if self.gconfig.score_centering_top_k:
+            from areal.utils.score_centering import trajectory_heads
+
+            res.update(trajectory_heads(resp, self.gconfig.score_centering_top_k))
         batched = {k: v.unsqueeze(0) for k, v in res.items()}
         if resp.routed_experts is not None:
             if self.r3_num_moe_layers is None or self.r3_topk is None:

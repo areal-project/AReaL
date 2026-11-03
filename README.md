@@ -93,8 +93,8 @@ and the [announcement on X](https://x.com/guohao_li/status/2009678513574408636).
 
 **\[2026/01/01\]** Happy New Year! Thanks to the outstanding contribution from
 @HwVanICI, we are excited to officially announce stable support for AReaL training on
-**Ascend NPU devices**! The code is actively maintained and continuously updated in the
-[`ascend` branch](https://github.com/areal-project/AReaL/tree/ascend). Check out
+**Huawei Ascend NPU devices**! The code is actively maintained and continuously updated
+in the [`ascend` branch](https://github.com/areal-project/AReaL/tree/ascend). Check out
 [our documentation](https://areal-project.github.io/AReaL/en/tutorial/installation_npu.html)
 to get started, and feel free to report any issues!
 
