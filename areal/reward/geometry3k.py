@@ -8,6 +8,21 @@ from . import get_math_verify_worker
 
 logger = logging.getLogger("Geometry3KReward")
 
+# Only explicit, separated geometry-unit suffixes are annotations. Do not
+# remove arbitrary words or symbols, which may be part of the answer.
+_GEOMETRY_UNIT_SUFFIX = re.compile(
+    # An annotation must follow a quantity, not an operator such as `5 + in`.
+    r"(?:(?<=[\d})\]])|(?<=\\pi))"
+    r"(?:\s|\\[,; ]|\\(?:quad|qquad)\b)+"
+    r"(?:(?:square|cubic|sq\.?|cu\.?)\s+)?"
+    r"(?:mm|cm|dm|km|m|(?:milli|centi|deci|kilo)?met(?:er|re)s?"
+    r"|inches|inch|in|feet|foot|ft|yards?|yd|miles?|mi"
+    r"|degrees?|deg|radians?|rad|units?)"
+    r"(?:\s*\^\s*(?:[23]|\{\s*[23]\s*\})|[²³]|\s+(?:squared|cubed))?"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
 
 def _extract_boxed_answer(text: str) -> str | None:
     """Return the last outer box, empty for an unfinished box, or None if absent."""
@@ -94,6 +109,11 @@ def geometry3k_reward_fn(
         # the surrounding fraction or sum.
         sol = re.sub(r"\\boxed\s*(?=\{)", "", sol)
         ans = re.sub(r"\\boxed\s*(?=\{)", "", ans)
+
+        # Bare unit letters would otherwise become LaTeX variables. Keep the
+        # entire quantity: a raw-text fallback could accept its last number.
+        sol = _GEOMETRY_UNIT_SUFFIX.sub("", sol).strip()
+        ans = _GEOMETRY_UNIT_SUFFIX.sub("", ans).strip()
 
         worker = get_math_verify_worker()
         # Wrap in $...$ so math-verify parses bare LaTeX as one expression
