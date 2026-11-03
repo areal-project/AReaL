@@ -1,8 +1,60 @@
 # SPDX-License-Identifier: Apache-2.0
 
+"""Focused Geometry3K extraction, grading, and input-contract regressions."""
+
 import pytest
 
 from areal.reward.geometry3k import extract_answer, geometry3k_reward_fn
+
+
+@pytest.mark.parametrize(
+    "gold,correct,wrong",
+    [
+        (r"\boxed{5}", "5", "6"),
+        (r"5 + \boxed{2}", "7", "2"),
+        (r"\frac{\boxed{3}}{4}", "0.75", "3"),
+    ],
+)
+def test_geometry3k_gold_boxes_preserve_surrounding_expression(gold, correct, wrong):
+    """A gold box is formatting, not permission to discard surrounding math."""
+    assert geometry3k_reward_fn("", r"\boxed{" + correct + "}", [], [], gold) == 1.0
+    assert geometry3k_reward_fn("", r"\boxed{" + wrong + "}", [], [], gold) == 0.0
+
+
+@pytest.mark.parametrize(
+    "completion",
+    [
+        r"[$\sqrt{4}$]",
+        r"[$$\sqrt{4}$$]",
+        r"\boxed{$\sqrt{4}$}",
+        r"\boxed{$$\sqrt{4}$$}",
+    ],
+)
+@pytest.mark.parametrize("gold", ["2", "$2$", "$$2$$", r"\(2\)", r"\[2\]"])
+def test_geometry3k_math_delimiters_on_both_sides(completion, gold):
+    """Outer math delimiters must preserve the quantity on either side."""
+    assert geometry3k_reward_fn("", completion, [], [], gold) == 1.0
+    assert geometry3k_reward_fn("", completion, [], [], "4") == 0.0
+
+
+@pytest.mark.parametrize(
+    "completion",
+    [
+        [r"\boxed{2\sqrt{3}}"],
+        {"content": r"\boxed{2\sqrt{3}}"},
+        (r"\boxed{2\sqrt{3}}",),
+    ],
+)
+def test_geometry3k_does_not_grade_container_representations(completion):
+    """Structured inputs must not become escaped repr strings and earn credit."""
+    assert geometry3k_reward_fn("", completion, [], [], "3") == 0.0
+    assert geometry3k_reward_fn("", completion, [], [], r"2\sqrt{3}") == 0.0
+
+
+def test_geometry3k_literal_backslash_pair_does_not_introduce_box():
+    """Distinguish a LaTeX box from an escaped backslash without unescaping."""
+    assert extract_answer(r"\boxed{2\sqrt{3}}", use_last_number=False) == r"2\sqrt{3}"
+    assert extract_answer(r"\\boxed{2\sqrt{3}}", use_last_number=False) == ""
 
 
 @pytest.mark.parametrize(

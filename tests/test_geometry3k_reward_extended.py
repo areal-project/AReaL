@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+"""Geometry3K equivalence matrices, generated nesting, and malformed-answer cases."""
+
 import random
 
 import pytest

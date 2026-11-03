@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+"""Geometry3K unit-suffix compatibility and partial-number false-positive controls."""
+
 import pytest
 
 from areal.reward.geometry3k import geometry3k_reward_fn
