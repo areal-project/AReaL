@@ -159,6 +159,55 @@ def test_memory_transitions_are_idempotent(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("tags", [["weights"], ["kv_cache"], None])
+@pytest.mark.parametrize("direct", [False, True])
+def test_weftmoe_release_discards_only_fp8_receive_buffers(
+    monkeypatch, fp8, tags, direct
+):
+    import sys
+
+    calls = []
+    runner = object()
+    monkeypatch.setenv("AREAL_USE_WEFTMOE", "1")
+    monkeypatch.setenv("WEFTMOE_FP8", "1" if fp8 else "0")
+    monkeypatch.setitem(
+        sys.modules,
+        "weftmoe.sglang",
+        SimpleNamespace(
+            suspend=lambda model, **kwargs: calls.append((model, kwargs)),
+        ),
+    )
+    scheduler = SimpleNamespace(
+        tp_worker=SimpleNamespace(model_runner=runner),
+        release_memory_occupation=lambda request: calls.append("release"),
+        resume_memory_occupation=lambda request: None,
+    )
+    if direct:
+        from areal.engine.awex.adapters.sglang_adapter import AwexSGLangAdapter
+
+        monkeypatch.setitem(
+            sys.modules,
+            "sglang.srt.managers.io_struct",
+            SimpleNamespace(ReleaseMemoryOccupationReqInput=SimpleNamespace),
+        )
+        receiver = object.__new__(AwexSGLangAdapter)
+        receiver._scheduler = scheduler
+        receiver._released_tags = set()
+        receiver.release_fp8_bindings = lambda: calls.append("unbind")
+        receiver.release_memory(tags)
+        discard = fp8 and "weights" in (tags or ["kv_cache"])
+    else:
+        plugin = AwexSchedulerPlugin(scheduler)
+        plugin._receiver = SimpleNamespace(
+            release_fp8_bindings=lambda: calls.append("unbind"),
+        )
+        plugin._patch_memory_transitions()
+        scheduler.release_memory_occupation(SimpleNamespace(tags=tags))
+        discard = fp8 and (tags is None or "weights" in tags)
+    assert calls == ["unbind", (runner, {"discard_fp8": discard}), "release"]
+
+
 def test_tms_hook_mode_stays_preload_after_initialization(monkeypatch):
     import sys
 

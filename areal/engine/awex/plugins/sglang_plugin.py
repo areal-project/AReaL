@@ -385,7 +385,11 @@ class AwexSchedulerPlugin:
 
                 if self._receiver is not None:
                     self._receiver.release_fp8_bindings()
-                suspend(scheduler.tp_worker.model_runner)
+                suspend(
+                    scheduler.tp_worker.model_runner,
+                    discard_fp8=os.environ.get("WEFTMOE_FP8") == "1"
+                    and "weights" in (getattr(filtered, "tags", None) or ["weights"]),
+                )
             with _retract_memory_idle(scheduler, owner):
                 return original_release(filtered, *args, **kwargs)
 

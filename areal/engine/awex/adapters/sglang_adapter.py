@@ -1441,7 +1441,12 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             ):
                 from weftmoe.sglang import suspend
 
-                suspend(self._scheduler.tp_worker.model_runner)
+                self.release_fp8_bindings()
+                suspend(
+                    self._scheduler.tp_worker.model_runner,
+                    discard_fp8=os.environ.get("WEFTMOE_FP8") == "1"
+                    and "weights" in tags_to_release,
+                )
             req = ReleaseMemoryOccupationReqInput(tags=tags_to_release)
             self._scheduler.release_memory_occupation(req)
             self._released_tags.update(tags_to_release)
