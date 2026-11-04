@@ -78,7 +78,11 @@ Countdown game:
 
 The core of the reinforcement learning loop is the reward function in `reward_score.py`.
 The `compute_score` function evaluates the correctness of a model-generated solution
-string against the ground truth.
+string against the ground truth. Each supplied integer must appear exactly once, using
+only `+`, `-`, `*`, `/`, and parentheses. Fractional intermediate results from division
+are allowed; decimal literals, exponentiation (`**`), and floor division (`//`) are not.
+The verifier parses restricted arithmetic without `eval`. Invalid expressions receive
+the format reward (0.1 by default); a missing answer receives 0.
 
 ```python
 def compute_score(solution_str, ground_truth, method='strict', format_score=0.1, score=1.):
