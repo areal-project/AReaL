@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import math
@@ -85,6 +86,12 @@ _HARNESS_SYSTEM_ERROR_PATTERN = re.compile(
 _GAMEAGENT_OUTCOME_METRIC_CODES = tuple(sorted(HARNESS_OUTCOME_METRIC_CODES))
 _WORKER_GATEWAY_REGISTRY_ATTR = "_arena_session_gateway_registry_v1"
 _WORKER_GATEWAY_CLEANUP_KEY = "arena-session-gateway-registrations"
+_PROXY_INVALID_TOOL_JSON_MESSAGE = (
+    b"invalid_tool_json: model emitted a malformed tool call"
+)
+_PROXY_INVALID_TOOL_JSON_SHA256 = hashlib.sha256(
+    _PROXY_INVALID_TOOL_JSON_MESSAGE
+).hexdigest()
 
 
 def _record_arena_metrics(**metrics: float) -> None:
@@ -858,7 +865,7 @@ class ArenaStreamAgentWorkflow:
     def _is_core_agent_zero_failure(
         cls, raw: Any, receipt: Any, *, invalid_tool_json: bool = False
     ) -> bool:
-        """Require a matching native receipt for model or context exhaustion."""
+        """Match the terminal model failure, including audited TW continuations."""
         message = cls._core_model_zero_failure_message(raw)
         if message is None:
             message = cls._core_context_zero_failure_message(raw)
@@ -873,34 +880,81 @@ class ArenaStreamAgentWorkflow:
             or receipt.get("status") != "ERROR"
             or type(receipt.get("exit_code")) is not int
             or receipt["exit_code"] != 1
-            or receipt.get("turn_statuses") != ["failed"]
-            or receipt.get("delivery") is not None
             or receipt.get("summary") != raw["harness"]["summary"]
         ):
             return False
+        turns = receipt.get("turn_statuses")
         errors = receipt.get("error")
         if (
-            not isinstance(errors, list)
-            or len(errors) != 1
-            or not isinstance(errors[0], dict)
-            or not isinstance(errors[0].get("message"), str)
-            or not errors[0]["message"]
+            not isinstance(turns, list)
+            or not 1 <= len(turns) <= 3
+            or turns[-1] != "failed"
+            or any(turn != "completed" for turn in turns[:-1])
+            or not isinstance(errors, list)
+            or len(errors) != len(turns)
+            or any(error is not None for error in errors[:-1])
+        ):
+            return False
+        # The audited TW runner permits at most two continuations. Completed
+        # turns have no error; its final failed turn owns the episode outcome.
+        multiple_turns = len(turns) > 1
+        if multiple_turns or "continuations" in receipt:
+            continuations = receipt.get("continuations")
+            if type(continuations) is not int or continuations != len(turns) - 1:
+                return False
+        delivery = receipt.get("delivery")
+        if not multiple_turns:
+            if delivery is not None:
+                return False
+        elif (
+            "delivery" not in receipt
+            or (
+                delivery is not None
+                and (
+                    not isinstance(delivery, dict)
+                    or delivery.get("status") != "incomplete"
+                )
+            )
+            or receipt.get("failure") is not None
+            or any(
+                receipt.get(flag, False) is not False
+                for flag in (
+                    "observed_runner_timeout",
+                    "observed_external_interruption",
+                )
+            )
+            or (
+                "collection" in receipt
+                and (
+                    not isinstance(receipt["collection"], dict)
+                    or receipt["collection"].get("status") != "OK"
+                )
+            )
+        ):
+            return False
+        terminal_error = errors[-1]
+        if (
+            not isinstance(terminal_error, dict)
+            or not isinstance(terminal_error.get("message"), str)
+            or not terminal_error["message"]
             or (
                 message is not None
-                and errors[0]["message"] != message
+                and terminal_error["message"] != message
                 and not (
                     message == "model stopped with reason: length"
-                    and errors[0]["message"]
+                    and terminal_error["message"]
                     == "provider terminal response includes final usage"
                 )
             )
         ):
             return False
-        if tool_failure and _HARNESS_SYSTEM_ERROR_PATTERN.search(errors[0]["message"]):
+        if (tool_failure or multiple_turns) and _HARNESS_SYSTEM_ERROR_PATTERN.search(
+            terminal_error["message"]
+        ):
             return False
         expected = raw["outcome"]
         for outcome in (
-            errors[0].get("outcome"),
+            terminal_error.get("outcome"),
             receipt.get("raw", {}).get("outcome")
             if isinstance(receipt.get("raw"), dict)
             else None,
@@ -910,6 +964,36 @@ class ArenaStreamAgentWorkflow:
                 for field in ("code", "class", "source", "details")
             ):
                 return False
+        if multiple_turns:
+            details = expected.get("details")
+            if not isinstance(details, dict):
+                return False
+            signals = details.get("diagnosticSignals")
+            if signals is not None and (
+                not isinstance(signals, dict)
+                or any(
+                    signals.get(hint, False) is not False
+                    for hint in ("authenticationHint", "overloadHint", "rateLimitHint")
+                )
+            ):
+                return False
+            if tool_failure and not (
+                details.get("code") == "invalid_tool_json"
+                or details.get("reason") == "invalid_tool_json"
+            ):
+                # A session flag may refer to an earlier, completed turn. The
+                # legacy Core drops our code, so bind its terminal diagnostic
+                # to the exact typed proxy error instead of guessing from it.
+                if (
+                    not isinstance(signals, dict)
+                    or signals.get("messageSha256") != _PROXY_INVALID_TOOL_JSON_SHA256
+                    or any(
+                        type(signals.get(field)) is not int
+                        or signals[field] != len(_PROXY_INVALID_TOOL_JSON_MESSAGE)
+                        for field in ("messageBytes", "messageScannedChars")
+                    )
+                ):
+                    return False
         return True
 
     @staticmethod
