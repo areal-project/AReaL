@@ -80,6 +80,54 @@ Arena and Slurm cleanup remain scoped to this trial. Native SGLang logs rotate u
 trial's `native/` log directory. Existing NUMA settings in `train.yaml` are preserved,
 including `SGLANG_NUMA_BIND_V2=0`.
 
+## Opt-in v1 rollout timing
+
+Copy the selected training YAML to a new recipe-local name, such as
+`train_trace.yaml`, set `QWEN_TRAIN_CONFIG=train_trace.yaml` in `site.env`, and add this
+block under `rollout.agent` in the copied YAML:
+
+```yaml
+    rollout_trace:
+      enabled: true
+      collect_interval_seconds: 60
+      log_interval_seconds: 600
+      long_tail_seconds: 300
+      top_n: 20
+```
+
+The controller appends one bounded `Rollout long tails` snapshot to `main.log` each
+`log_interval_seconds` while eligible sessions are active. It shows Arena task and
+attempt IDs, elapsed time, current phase and phase age, completed plus ongoing
+generation time, reward, pause, other, last progress, request count, and Arena retry
+count. `collect_interval_seconds` controls how often the controller reads proxy
+events; live log time resolution is therefore bounded by that interval. A phase
+change between polls is still reconstructed from timestamped events.
+
+Each completed training step emits `timeperf/rollout/generate`, `reward`,
+`pause_wait`, and `other`; `toolcall` appears only if an explicit tool interval is
+available. The child values add to the existing `timeperf/rollout` step wall time.
+Concurrent sessions share each wall-clock slice in proportion to active session
+counts. `generate` is the proxy's full model request interval, including request
+setup and streaming; it is not SGLang kernel time. Arena reward includes waiting for
+the reward sandbox, creating it, and evaluating, using the Task event timestamps.
+Unobserved time, including tool execution and pause without explicit timestamps,
+stays in `other`. The current Arena Task trace exposes no dedicated tool spans, so
+this recipe does not produce `toolcall`; it also has no session-level pause signal.
+Cross-node clocks must be synchronized for accurate attribution.
+
+For a small local one-step proxy smoke run, use
+`bash examples/agent_workflow/verify_rollout_trace_minimal.sh` on a configured CUDA
+host. The expected result is a completed step with additive
+`timeperf/rollout/*` values; a `Rollout long tails` line appears only if the
+step stays active past the short smoke script's log interval.
+For this Qwen/Arena chain, use
+`bash examples/swe/rl/qwen38_27b/verify_rollout_trace_e2e.sh` after preparing the
+opt-in YAML and site profile. The expected log contains the joined Arena
+`task_id / attempt_id`; after a completed reward trace, the step's `reward` time
+reflects its explicit reward interval. The end-to-end script submits the job and
+waits up to five hours for the first step's timing fields; the submitted training
+job continues after that check. These scripts have not been run locally.
+
 ## Recovery
 
 Reuse the same profile, trial, run directory and source snapshot. For an explicit

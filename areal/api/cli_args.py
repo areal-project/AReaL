@@ -2939,6 +2939,48 @@ class PRMConfig:
 
 
 @dataclass
+class RolloutTraceConfig:
+    """Opt-in v1 proxy session timing and long-tail rollout reporting."""
+
+    enabled: bool = field(
+        default=False,
+        metadata={"help": "Track v1 agent sessions for rollout timing and live logs."},
+    )
+    collect_interval_seconds: float = field(
+        default=60.0,
+        metadata={"help": "Seconds between controller reads of proxy timing events."},
+    )
+    log_interval_seconds: float = field(
+        default=600.0,
+        metadata={"help": "Seconds between long-tail snapshots in main.log."},
+    )
+    long_tail_seconds: float = field(
+        default=300.0,
+        metadata={"help": "Only log active sessions older than this many seconds."},
+    )
+    top_n: int = field(
+        default=20,
+        metadata={"help": "Maximum long-tail sessions in each main.log snapshot."},
+    )
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.collect_interval_seconds)
+            or self.collect_interval_seconds <= 0
+        ):
+            raise ValueError("rollout_trace.collect_interval_seconds must be positive")
+        if (
+            not math.isfinite(self.log_interval_seconds)
+            or self.log_interval_seconds <= 0
+        ):
+            raise ValueError("rollout_trace.log_interval_seconds must be positive")
+        if not math.isfinite(self.long_tail_seconds) or self.long_tail_seconds < 0:
+            raise ValueError("rollout_trace.long_tail_seconds must be non-negative")
+        if self.top_n < 1:
+            raise ValueError("rollout_trace.top_n must be positive")
+
+
+@dataclass
 class AgentConfig:
     """Configuration for agent workflows and the experimental agent service controller.
 
@@ -3103,6 +3145,10 @@ class AgentConfig:
             "help": "Process-reward shaping applied by the v1 or v2 proxy on concat "
             "trajectory export, before interactions are serialized."
         },
+    )
+    rollout_trace: RolloutTraceConfig = field(
+        default_factory=RolloutTraceConfig,
+        metadata={"help": "Optional v1 session timing and long-tail reporting."},
     )
 
     def __post_init__(self) -> None:
