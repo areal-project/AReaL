@@ -15,6 +15,7 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.http import async_http_retry
 from areal.utils import logging, stats_tracker
+from areal.utils.rollout_metrics import mark_group_discard
 
 if TYPE_CHECKING:
     from areal.api.engine_api import InferenceEngine
@@ -147,6 +148,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         if export_session_ids is not None:
             payload["export_session_ids"] = export_session_ids
         data = await self._request_export(session, payload)
+        if data.get("discard_reason") == "below_min":
+            mark_group_discard("below_min")
         traj = deserialize_value(data["traj"])
         if data.get("prm_stats") is not None:
             from pydantic import TypeAdapter
@@ -327,6 +330,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             **export_kwargs,
         )
         if discard_group:
+            if n_succeeded < self.min_usable_group_size:
+                mark_group_discard("below_min")
             logger.warning(
                 "Abandoning group %s: %d/%d sessions succeeded "
                 "(drop_incomplete_group=%s, min_usable_group_size=%d)",

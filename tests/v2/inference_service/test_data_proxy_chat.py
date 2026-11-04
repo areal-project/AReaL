@@ -1265,6 +1265,44 @@ async def test_export_trajectories_normalizes_selected_sessions_and_cleans_group
         assert response.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_export_trajectories_reports_below_min_discard(client):
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "below-min-group", "group_size": 2},
+        headers=admin_headers(),
+    )
+    sessions = start.json()["sessions"]
+    ready = sessions[0]
+    await client.post(
+        "/chat/completions",
+        json={
+            "model": "sglang",
+            "messages": [{"role": "user", "content": "q"}],
+        },
+        headers=session_headers(ready["session_api_key"]),
+    )
+    reward = await client.post(
+        "/rl/set_reward",
+        json={"reward": 1.0},
+        headers=session_headers(ready["session_api_key"]),
+    )
+    assert reward.status_code == 200
+
+    response = await client.post(
+        "/export_trajectories",
+        json={
+            "session_ids": [session["session_id"] for session in sessions],
+            "min_usable_group_size": 2,
+        },
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["traj"] == {}
+    assert response.json()["discard_reason"] == "below_min"
+
+
 # =============================================================================
 # Coexistence tests — HITL and batch running simultaneously
 # =============================================================================

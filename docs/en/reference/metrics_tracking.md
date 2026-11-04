@@ -187,6 +187,24 @@ with stats_tracker.record_timing("rollout"):
 # Key: "timeperf/rollout"
 ```
 
+For training rollouts, `timeperf/rollout_group_attempt_seconds` sums the elapsed time of
+all **consumed** group attempts in the logging step. Each attempt starts when its
+workflow begins and ends after the accept/reject path completes. This includes group
+generation, export, filter evaluation, and rejected trajectory cleanup. Prefetched
+attempts still pending at export are counted when consumed.
+
+| Metric suffix under `timeperf/rollout_group_`      | Meaning                                                                                                                                    |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `filter_rejected_seconds`, `filter_rejected_share` | A completed group rejected by `should_accept_fn`.                                                                                          |
+| `below_min_seconds`, `below_min_share`             | A group discarded because usable samples fell below `min_usable_group_size`, including failed agent or harness sessions.                   |
+| `other_discarded_seconds`, `other_discarded_share` | Other rejected or failed groups, including `drop_incomplete_group` when the minimum is met, empty exports, and workflow/filter exceptions. |
+
+Each share is its category's seconds divided by `timeperf/rollout_group_attempt_seconds`
+(a fraction from 0 to 1). Categories are exclusive; accepted groups contribute only to
+the denominator. These are **sampling cost shares**, not fractions of `timeperf/rollout`
+trainer wall time: group attempts can overlap each other and the training step. The same
+metrics apply to v1 and v2 training rollouts.
+
 ### Named Trackers
 
 Isolate metrics for different components:

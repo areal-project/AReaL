@@ -11,7 +11,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -94,6 +94,7 @@ class ExportTrajectoriesResponse(BaseModel):
 
     traj: dict[str, Any]
     prm_stats: PRMExportStats | None = None
+    discard_reason: Literal["below_min"] | None = None
 
 
 @dataclass(frozen=True)

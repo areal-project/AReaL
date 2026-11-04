@@ -8,7 +8,7 @@ import json
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from anthropic.types.message import Message
@@ -990,6 +990,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     grouped_interactions.append(None)
 
             prm_stats = None
+            discard_reason: Literal["below_min"] | None = None
             if body.discard_trajectory:
                 grouped_interactions = []
             elif prm_runner is not None:
@@ -1056,6 +1057,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     len(usable_interactions),
                     body.min_usable_group_size,
                 )
+                discard_reason = "below_min"
                 grouped_interactions = []
 
             # Scorers see original outcome rewards, just as in v1. Keep v2's
@@ -1099,9 +1101,12 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 traj = concat_string_interactions(merged)
 
             serialized = serialize_value(traj)
+            response_kwargs: dict[str, Any] = {"traj": serialized}
             if prm_stats is not None:
-                return ExportTrajectoriesResponse(traj=serialized, prm_stats=prm_stats)
-            return ExportTrajectoriesResponse(traj=serialized)
+                response_kwargs["prm_stats"] = prm_stats
+            if discard_reason is not None:
+                response_kwargs["discard_reason"] = discard_reason
+            return ExportTrajectoriesResponse(**response_kwargs)
         finally:
             if body.remove_session:
                 for sid, session in owned_sessions.items():

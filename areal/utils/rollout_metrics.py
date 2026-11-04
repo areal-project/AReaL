@@ -11,10 +11,23 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import Lock
-from typing import Any, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar
 
 Metrics = dict[str, list[float]]
 _CAPTURE: ContextVar[Metrics | None] = ContextVar("rollout_metrics", default=None)
+_ATTEMPT_SECONDS = "__rollout_group_attempt_seconds"
+_DISCARD_SECONDS = {
+    "filter_rejected": "__rollout_group_filter_rejected_seconds",
+    "below_min": "__rollout_group_below_min_seconds",
+    "other_discarded": "__rollout_group_other_discarded_seconds",
+}
+
+
+def mark_group_discard(reason: Literal["filter_rejected", "below_min"]) -> None:
+    """Mark a task-local discard reason without publishing an incomplete metric."""
+    metrics = _CAPTURE.get()
+    if metrics is not None:
+        metrics[f"__rollout_group_discard_{reason}"] = [1.0]
 
 
 def capture_scalar(key: str, value: float) -> bool:
@@ -67,9 +80,18 @@ class ConsumedMetrics:
             metrics, self._metrics = self._metrics, {}
         result = {}
         for key, values in metrics.items():
-            if values:
+            if values and not key.startswith("__rollout_group_"):
                 result[key] = sum(values) / len(values)
                 result[f"{key}__count"] = len(values)
+        attempt_seconds = sum(metrics.get(_ATTEMPT_SECONDS, ()))
+        if attempt_seconds:
+            result["timeperf/rollout_group_attempt_seconds"] = attempt_seconds
+            for reason, key in _DISCARD_SECONDS.items():
+                seconds = sum(metrics.get(key, ()))
+                result[f"timeperf/rollout_group_{reason}_seconds"] = seconds
+                result[f"timeperf/rollout_group_{reason}_share"] = (
+                    seconds / attempt_seconds
+                )
         # StatsLogger hides internal __count companions. Publish the two main
         # denominators explicitly so dashboards can distinguish episodes/groups.
         if "rollout/reward" in metrics:

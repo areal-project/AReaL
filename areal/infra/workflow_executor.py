@@ -30,7 +30,12 @@ from .async_task_runner import (
     TimedResult,
 )
 from .staleness_manager import StalenessManager
-from areal.utils.rollout_metrics import ConsumedMetrics, Metrics, capture_metrics
+from areal.utils.rollout_metrics import (
+    ConsumedMetrics,
+    Metrics,
+    capture_metrics,
+    mark_group_discard,
+)
 from areal.infra import workflow_context
 from .workflow_context import WorkflowContext
 from areal.experimental.openai.types import (
@@ -1426,6 +1431,7 @@ class WorkflowExecutor:
                     should_accept_traj = bool(should_accept)
                     if not should_accept_traj and should_accept_fn is not None:
                         reason = "rejected"
+                        mark_group_discard("filter_rejected")
 
                 # Dump trajectory to file
                 if self.config.dump_to_file:
@@ -1507,8 +1513,20 @@ class WorkflowExecutor:
                 return None
 
         async def _execute_with_metrics() -> WorkflowTaskResult:
+            started_at = time.perf_counter()
             with capture_metrics() as metrics:
                 result = await _execute_workflow()
+            if not isinstance(result, WorkflowContractFailure):
+                elapsed = time.perf_counter() - started_at
+                metrics["__rollout_group_attempt_seconds"] = [elapsed]
+                if result is None:
+                    if metrics.pop("__rollout_group_discard_filter_rejected", None):
+                        category = "filter_rejected"
+                    elif metrics.pop("__rollout_group_discard_below_min", None):
+                        category = "below_min"
+                    else:
+                        category = "other_discarded"
+                    metrics[f"__rollout_group_{category}_seconds"] = [elapsed]
             if result is None:
                 return _RolloutResult(pending_task.task_id, None, metrics)
             if isinstance(result, WorkflowContractFailure):

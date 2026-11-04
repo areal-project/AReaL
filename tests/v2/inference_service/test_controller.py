@@ -11,7 +11,7 @@ import pytest
 
 from areal.api.cli_args import AgentConfig, InferenceEngineConfig
 from areal.utils import stats_tracker
-from areal.utils.rollout_metrics import ConsumedMetrics
+from areal.utils.rollout_metrics import ConsumedMetrics, capture_metrics
 from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
 )
@@ -499,6 +499,29 @@ class TestRolloutControllerV2Construction:
             assert stats["rollout/group_attempt_count"] == 2
             assert controller.export_stats() == {}
 
+    def test_consumed_group_time_shares_use_all_attempt_seconds(self):
+        consumed = ConsumedMetrics()
+        for trajectory, category, seconds in (
+            (None, "filter_rejected", 2.0),
+            (None, "below_min", 3.0),
+            ({"accepted": True}, None, 5.0),
+        ):
+            metrics = {"__rollout_group_attempt_seconds": [seconds]}
+            if category is not None:
+                metrics[f"__rollout_group_{category}_seconds"] = [seconds]
+            consumed.consume(SimpleNamespace(trajectory=trajectory, metrics=metrics))
+
+        stats = consumed.export()
+
+        assert stats["timeperf/rollout_group_attempt_seconds"] == 10.0
+        assert stats["timeperf/rollout_group_filter_rejected_seconds"] == 2.0
+        assert stats["timeperf/rollout_group_below_min_seconds"] == 3.0
+        assert stats["timeperf/rollout_group_other_discarded_seconds"] == 0.0
+        assert stats["timeperf/rollout_group_filter_rejected_share"] == 0.2
+        assert stats["timeperf/rollout_group_below_min_share"] == 0.3
+        assert stats["timeperf/rollout_group_other_discarded_share"] == 0.0
+        assert consumed.export() == {}
+
     def test_proxy_gateway_addr(self):
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
         scheduler = MagicMock(n_gpus_per_node=8)
@@ -852,6 +875,18 @@ class TestInferenceServiceWorkflow:
         return result, max_active, start_order, tracker, workflow
 
     @pytest.mark.asyncio
+    async def test_below_min_group_marks_discard_reason(self):
+        with capture_metrics() as metrics:
+            result, *_ = await self._run_offline_group(
+                serialize_group_samples=True,
+                failing_member=0,
+                min_usable_group_size=4,
+            )
+
+        assert result is None
+        assert metrics["__rollout_group_discard_below_min"] == [1.0]
+
+    @pytest.mark.asyncio
     async def test_export_interactions_forwards_drop_retry_orphans(self):
         workflow = InferenceServiceWorkflow(
             controller=MagicMock(),
@@ -894,6 +929,24 @@ class TestInferenceServiceWorkflow:
 
         assert result == {}
         assert session.post.call_args.kwargs["json"]["reward_normalization"] is True
+
+    @pytest.mark.asyncio
+    async def test_export_interactions_marks_proxy_below_min_discard(self):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+        )
+        workflow._request_export = AsyncMock(
+            return_value={"traj": {}, "discard_reason": "below_min"}
+        )
+
+        with capture_metrics() as metrics:
+            result = await workflow._export_interactions(
+                MagicMock(), ["session-1", "session-2"]
+            )
+
+        assert result == {}
+        assert metrics["__rollout_group_discard_below_min"] == [1.0]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("session_id", ["sess-1", "__hitl__"])

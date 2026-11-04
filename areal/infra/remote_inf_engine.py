@@ -56,6 +56,7 @@ from areal.utils.network import (
     split_hostport,
 )
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.rollout_metrics import mark_group_discard
 
 from .workflow_executor import (
     WorkflowContractError,
@@ -230,6 +231,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
 
         if not valid_results:
             self._record_group_stats(usable_slot_count, trainable=False)
+            mark_group_discard("below_min")
             return None
 
         # Some results None -> drop entire group if requested.
@@ -243,6 +245,8 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                     "with a new prompt from the dataloader."
                 )
                 self._record_group_stats(usable_slot_count, trainable=False)
+                if usable_slot_count < self.min_usable_group_size:
+                    mark_group_discard("below_min")
                 return None
             if not self.reward_normalization:
                 action = (
@@ -257,6 +261,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
 
         if usable_slot_count < self.min_usable_group_size:
             self._record_group_stats(usable_slot_count, trainable=False)
+            mark_group_discard("below_min")
             return None
 
         # Check if results are InteractionWithTokenLogpReward dicts

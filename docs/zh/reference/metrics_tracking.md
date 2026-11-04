@@ -182,6 +182,20 @@ with stats_tracker.record_timing("rollout"):
 # 键："timeperf/rollout"
 ```
 
+训练 rollout 的 `timeperf/rollout_group_attempt_seconds` 是本次日志步骤中所有 **已消费** group attempt
+的耗时之和。每次 attempt 从 workflow 开始执行计时， 到接受或拒绝路径结束为止，包含 group 采样、导出、filter 判断和被拒轨迹的清理。
+导出指标时仍在预取的 attempt，会在被消费后计入。
+
+| `timeperf/rollout_group_` 下的指标后缀             | 含义                                                                                                                 |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `filter_rejected_seconds`、`filter_rejected_share` | 完成后被 `should_accept_fn` 拒绝的 group。                                                                           |
+| `below_min_seconds`、`below_min_share`             | 可用样本数低于 `min_usable_group_size` 而丢弃的 group，包括 agent 或 harness session 失败。                          |
+| `other_discarded_seconds`、`other_discarded_share` | 其他被丢弃或失败的 group，包括已达到最低可用数但因 `drop_incomplete_group` 丢弃、空导出，以及 workflow/filter 异常。 |
+
+每个 `share` 等于对应类别耗时除以 `timeperf/rollout_group_attempt_seconds`， 取值为 0 到 1。类别互斥；被接受的
+group 只进入分母。这是**采样成本占比**， 不是 `timeperf/rollout` 的 trainer 墙钟时间占比：group attempt 之间以及与训练步骤
+之间可能并行。v1 和 v2 的训练 rollout 使用同一组指标。
+
 ### 命名跟踪器
 
 为不同组件隔离指标：

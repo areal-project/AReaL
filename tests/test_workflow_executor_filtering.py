@@ -111,6 +111,11 @@ async def test_filter_accepts_local_rewards_without_clearing_remote_payload(
     assert result.trajectory["input_ids"] is trajectory["input_ids"]
     assert result.trajectory["rollout_group"].row_counts == (2,)
     assert isinstance(result.trajectory["input_ids"], RTensor)
+    assert result.metrics["__rollout_group_attempt_seconds"][0] > 0
+    assert not any(
+        key.endswith("_seconds") and key != "__rollout_group_attempt_seconds"
+        for key in result.metrics
+    )
     manager.on_rollout_accepted.assert_called_once_with()
     clear_node.assert_not_awaited()
 
@@ -146,6 +151,11 @@ async def test_filter_rejection_or_failure_clears_remote_payload(
     assert result is not None
     assert result.trajectory is None
     assert result.metrics["rollout/rejected"] == [1.0]
+    category = "filter_rejected" if predicate is _reject else "other_discarded"
+    assert (
+        result.metrics[f"__rollout_group_{category}_seconds"]
+        == result.metrics["__rollout_group_attempt_seconds"]
+    )
     manager.on_rollout_rejected.assert_called_once_with()
     clear_node.assert_has_awaits(
         [
@@ -153,6 +163,23 @@ async def test_filter_rejection_or_failure_clears_remote_payload(
             call("node-b:1234", ["mask"]),
         ],
         any_order=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_returned_none_counts_as_other_discard():
+    executor, _ = _executor()
+    task = executor._create_workflow_task(
+        _RolloutTaskInput(task_id=2, data={}, workflow=_TrajectoryWorkflow(None))
+    )
+
+    result = await task()
+
+    assert result is not None
+    assert result.trajectory is None
+    assert (
+        result.metrics["__rollout_group_other_discarded_seconds"]
+        == result.metrics["__rollout_group_attempt_seconds"]
     )
 
 

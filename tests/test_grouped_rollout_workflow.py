@@ -13,6 +13,7 @@ from areal.infra import dist_rollout, workflow_context
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
 from areal.utils import stats_tracker
+from areal.utils.rollout_metrics import capture_metrics
 
 
 class _ListWorkflow(RolloutWorkflow):
@@ -172,7 +173,12 @@ async def test_grouped_rollout_reward_normalization_preserves_group_filters(
         reward_normalization=True,
     )
 
-    assert await workflow.arun_episode(engine=None, data={}) is None
+    with capture_metrics() as metrics:
+        assert await workflow.arun_episode(engine=None, data={}) is None
+    if minimum == 3:
+        assert metrics["__rollout_group_discard_below_min"] == [1.0]
+    else:
+        assert "__rollout_group_discard_below_min" not in metrics
     assert first.reward == 1.0
     assert second.reward == 3.0
 
