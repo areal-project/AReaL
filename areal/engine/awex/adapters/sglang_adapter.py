@@ -312,6 +312,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._legacy_instance_local_rank: int | None = None
         self._legacy_infer_params_meta = None
         self._legacy_infer_conf: dict | None = None
+        self._qwen35_fp8_receiver = None
         self._qwen4_frozen_contract = None
         self._qwen4_frozen_binder = None
         self._qwen4_parameter_identity = None
@@ -558,7 +559,13 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             )
         return self._weight_converter
 
-    def _iter_hf_params(self, rank_info: RankInfo):
+    def _iter_hf_params(
+        self,
+        rank_info: RankInfo,
+        *,
+        metadata_only: bool = False,
+        for_export: bool = False,
+    ):
         """Yield parameters in the canonical layout selected by training."""
         if self._parameter_layout == "hf":
             for name, param in self._get_model().named_parameters():
@@ -569,7 +576,17 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         converted_names: set[str] = set()
         embed_tensor: torch.Tensor | None = None
 
-        for name, param in self._get_model().named_parameters():
+        parameters = self._get_model().named_parameters()
+        if self._qwen35_fp8_receiver is not None:
+            self._qwen35_fp8_receiver.validate_storage(self._get_model())
+            parameters = (
+                self._qwen35_fp8_receiver.export_parameters()
+                if for_export
+                else self._qwen35_fp8_receiver.named_parameters(
+                    metadata_only=metadata_only
+                )
+            )
+        for name, param in parameters:
             for hf_name, hf_tensor in converter.convert_param(name, param.data):
                 converted_names.add(hf_name)
                 if hf_name == "model.embed_tokens.weight":
@@ -586,6 +603,27 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             yield "lm_head.weight", embed_tensor
 
     def _compute_legacy_local_raw_meta(self) -> dict:
+        if self._qwen35_fp8_receiver is not None:
+            # AWEX's resolver discovers parameters from the runtime model. Packed
+            # DeepGEMM scales instead describe plain receive buffers on the wire.
+            rank_info = get_sglang_rank_info(
+                self._get_model_context(), engine_rank=self._legacy_engine_rank or 0
+            )
+            return {
+                "rank_info": rank_info,
+                "model_arch_name": self._get_model_arch_name(),
+                "params_meta": [
+                    {
+                        "name": name,
+                        "numel": param.numel(),
+                        "shape": tuple(param.shape),
+                        "dtype": str(param.dtype).removeprefix("torch."),
+                    }
+                    for name, param in self._iter_hf_params(
+                        rank_info, metadata_only=True
+                    )
+                ],
+            }
         return InferParamMetaResolver._get_model_param_info(
             "sglang",
             self._scheduler.server_args,
@@ -693,7 +731,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         return self._legacy_infer_params_meta
 
     def _configure_qwen35_fp8(self):
-        from areal.engine.awex.qwen3_5_fp8 import Qwen35FP8Policy
+        from areal.engine.awex.qwen3_5_fp8 import Qwen35FP8Policy, Qwen35FP8Receiver
 
         if self._get_model_arch_name() not in Qwen35FP8Policy.architectures:
             return None
@@ -706,7 +744,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             policy.validate_runtime(self._get_model(), self._scheduler.server_args)
             policy.register_awex()
             converter = self._get_weight_converter(self._build_rank_info())
+            weight_names: set[str] = set()
             for name, parameter in self._get_model().named_parameters():
+                if name.endswith("_scale_inv"):
+                    continue
                 for canonical, tensor in converter.convert_param(name, parameter.data):
                     if canonical.endswith("_scale_inv"):
                         continue
@@ -715,6 +756,13 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                         raise ValueError(
                             f"Qwen3.5 AWEX precision mismatch for {canonical}: got {tensor.dtype}, FP8 expected={expected_fp8}"
                         )
+                    if expected_fp8:
+                        weight_names.add(name)
+            if self._qwen35_fp8_receiver is None:
+                self._qwen35_fp8_receiver = Qwen35FP8Receiver(
+                    self._get_model(), weight_names
+                )
+            self._qwen35_fp8_receiver.validate_storage(self._get_model())
         return policy
 
     def get_weight_metadata(self, parameter_layout: str = "hf") -> list[ParameterMeta]:
@@ -737,7 +785,9 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
         metadata: list[ParameterMeta] = []
 
-        for hf_name, local_tensor in self._iter_hf_params(rank_info):
+        for hf_name, local_tensor in self._iter_hf_params(
+            rank_info, metadata_only=True
+        ):
             local_shape = tuple(local_tensor.shape)
             sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(
                 hf_name
@@ -823,8 +873,13 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         return local_params
 
     def save_parameters(self, save_path: str, names: list[str] | None = None) -> None:
-        params = self.get_local_shard_parameters(names)
-        cpu_params = {k: v.detach().cpu().clone() for k, v in params.items()}
+        required = set(names) if names else None
+        rank_info = self._rank_info or self._build_rank_info()
+        cpu_params = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in self._iter_hf_params(rank_info, for_export=True)
+            if required is None or name in required
+        }
         torch.save(cpu_params, save_path)
 
     def randomize_parameters(self) -> None:
@@ -922,6 +977,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         if self._weights_update_group_gloo is None:
             raise RuntimeError("Gloo weight update group is not initialized")
 
+        if self._qwen35_fp8_receiver is not None:
+            self._qwen35_fp8_receiver.validate_storage(self._get_model())
         params = self.get_local_shard_parameters()
         recv_ops, non_contiguous_pairs, _ = nccl_build_recv_ops(
             params,
@@ -938,6 +995,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         for original, contiguous in non_contiguous_pairs:
             original.copy_(contiguous)
 
+        self._finish_qwen35_fp8_update(version)
         current_platform.synchronize()
         dist.barrier(group=self._weights_update_group_gloo)
 
@@ -1167,7 +1225,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         )
         reader = _DeviceBoundWeightsReader(
             engine_name="sglang",
-            model=self._get_model(),
+            model=self._qwen35_fp8_receiver or self._get_model(),
             model_context=self._get_model_context(),
             infer_conf=self._legacy_infer_conf,
             engine_rank=self._legacy_engine_rank,
@@ -1196,6 +1254,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         """Execute one v1 native AWEX colocate reader update."""
         if not self._initialized:
             raise RuntimeError("Legacy SGLang AWEX adapter is not initialized")
+        if self._qwen35_fp8_receiver is not None:
+            self._qwen35_fp8_receiver.validate_storage(self._get_model())
         reader = self._ensure_reader()
         if self._qwen4_frozen_contract is not None:
             identity = tuple(
@@ -1208,8 +1268,19 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 )
             reader.weight_converter.refresh_frozen_contract()
         reader.update_weights(step_id=version)
+        self._finish_qwen35_fp8_update(version)
         self._rebuild_derived_weights()
         logger.info("Legacy SGLang weight update completed: version=%d", version)
+
+    def _finish_qwen35_fp8_update(self, version: int) -> None:
+        if self._qwen35_fp8_receiver is None:
+            return
+        self._qwen35_fp8_receiver.finish_update()
+        logger.info(
+            "Qwen3.5 FP8 runtime ready: version=%d backend=%s",
+            version,
+            self._scheduler.server_args.fp8_gemm_runner_backend,
+        )
 
     def _rebuild_derived_weights(self) -> None:
         model = self._get_model()
@@ -1391,6 +1462,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         torch.cuda.synchronize()
         deserialized_weights = dict(zip(names, tensors))
 
+        if self._qwen35_fp8_receiver is not None:
+            self._qwen35_fp8_receiver.validate_storage(self._get_model())
         recv_parameters = self.get_local_shard_parameters()
 
         rank_info = self._build_rank_info()
@@ -1411,6 +1484,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             step_id=version,
         )
 
+        self._finish_qwen35_fp8_update(version)
         done_key = f"colocate_done_rank{paired_train_rank}_{version}"
         client.put(
             f"{kv_store_url}/weight_meta/{pair_name}/{done_key}",

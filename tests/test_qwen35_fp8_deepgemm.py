@@ -191,6 +191,107 @@ def test_deepgemm_frozen_mtp_scales_are_not_staged_or_converted(monkeypatch):
     torch.testing.assert_close(model.mtp.weight_scale_inv, original, rtol=0, atol=0)
 
 
+def test_deepgemm_adapter_metadata_and_export_use_matching_scale_views(
+    monkeypatch, tmp_path
+):
+    """Metadata describes wire FP32, while snapshots unpack the current runtime scale."""
+    awex = pytest.importorskip("awex.models.qwen3_5")
+    from areal.engine.awex.adapters import sglang_adapter as adapter_module
+
+    layer = _runtime(True)
+    model = torch.nn.Module()
+    model.config = layer.config
+    model.add_module("model", torch.nn.Module())
+    model.model.add_module("layers", torch.nn.ModuleList([torch.nn.Module()]))
+    model.model.layers[0].add_module("mlp", torch.nn.Module())
+    model.model.layers[0].mlp.add_module("gate_up_proj", layer)
+    weight_name = "model.layers.0.mlp.gate_up_proj.weight"
+    rank = SimpleNamespace(tp_rank=0, ep_rank=0, engine_rank=3)
+    converter = awex.SGlangToHFWeightConverterQwen3_5(
+        layer.config, SimpleNamespace(tp_size=1, ep_size=1, device_backend="cpu"), rank
+    )
+    instance = adapter_module.AwexSGLangAdapter(SimpleNamespace())
+    instance._get_model = lambda: model
+    instance._get_model_arch_name = lambda: "Qwen3_5ForConditionalGeneration"
+    instance._get_model_context = lambda: {}
+    instance._get_weight_converter = lambda rank_info: converter
+    instance._rank_info = rank
+    instance._parameter_layout = "awex"
+    instance._legacy_engine_rank = 3
+    instance._qwen35_fp8_receiver = Qwen35FP8Receiver(model, {weight_name})
+
+    def extract_rank(context, engine_rank):
+        assert engine_rank == 3
+        return rank
+
+    monkeypatch.setattr(adapter_module, "get_sglang_rank_info", extract_rank)
+    metadata = instance._compute_legacy_local_raw_meta()
+    assert metadata["rank_info"] is rank
+    scale_name = "model.layers.0.mlp.up_proj.weight_scale_inv"
+    scale_meta = next(p for p in metadata["params_meta"] if p["name"] == scale_name)
+    assert (scale_meta["shape"], scale_meta["dtype"]) == ((1, 8), "float32")
+    wire = instance.get_local_shard_parameters()
+    wire[scale_name].fill_(3)
+
+    def unpack(scale, shape, block):
+        assert scale is layer.weight_scale_inv
+        assert shape == (256, 1024) and block == [128, 128]
+        return torch.full((2, 8), 7.0)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.quantization.fp8_utils",
+        SimpleNamespace(_unpack_ue8m0_scale_for_triton=unpack),
+    )
+    path = tmp_path / "runtime.pt"
+    instance.save_parameters(str(path), [scale_name])
+    snapshot = torch.load(path, weights_only=True)
+    torch.testing.assert_close(
+        snapshot[scale_name], torch.full((1, 8), 7.0), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        wire[scale_name], torch.full((1, 8), 3.0), rtol=0, atol=0
+    )
+    assert instance._parameters is wire
+
+
+def test_deepgemm_legacy_conversion_completes_after_receive(monkeypatch):
+    """Every version must convert before update_weights returns to the ready signal."""
+    pytest.importorskip("awex.models.qwen3_5")
+    from areal.engine.awex.adapters import sglang_adapter as adapter_module
+
+    events = []
+    model = _runtime(False)
+    instance = adapter_module.AwexSGLangAdapter(
+        SimpleNamespace(
+            server_args=SimpleNamespace(fp8_gemm_runner_backend="deep_gemm")
+        )
+    )
+    instance._initialized = True
+    instance._get_model = lambda: model
+    instance._qwen35_fp8_receiver = SimpleNamespace(
+        validate_storage=lambda current: events.append("validate"),
+        finish_update=lambda: events.append("convert"),
+    )
+    instance._ensure_reader = lambda: SimpleNamespace(
+        update_weights=lambda step_id: events.append(("receive", step_id)),
+    )
+    monkeypatch.setattr(adapter_module, "_reapply_aiter_moe_layout", lambda model: 0)
+    for version in (1, 2):
+        instance.update_weights(version)
+        events.append("ready")
+    assert events == [
+        "validate",
+        ("receive", 1),
+        "convert",
+        "ready",
+        "validate",
+        ("receive", 2),
+        "convert",
+        "ready",
+    ]
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="DeepGEMM requires CUDA")
 def test_deepgemm_repeated_updates_match_fresh_load_with_cuda_graph():
