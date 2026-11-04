@@ -2665,7 +2665,7 @@ class SGLangConfig:
     fp8_gemm_runner_backend: str | None = field(
         default=None,
         metadata={
-            "help": "SGLang FP8 GEMM backend. Qwen3.5 AWEX block-FP8 requires 'triton' for writable FP32 scale grids."
+            "help": "SGLang FP8 GEMM backend. Qwen3.5 AWEX block-FP8 supports 'triton' or 'deep_gemm'; packed DeepGEMM scales are rebuilt after each weight update."
         },
     )
     enable_nan_detection: bool = False
