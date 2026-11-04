@@ -67,7 +67,13 @@ class VLLMBackend:
                 "The AReaL vLLM adapter does not transport this field yet."
             )
         if gconfig.score_centering_top_k:
-            raise ValueError("Score-centering sampler heads currently require SGLang.")
+            from areal.utils.score_centering import validate_sampling
+
+            validate_sampling(gconfig)
+            if req.vision_msg_vllm:
+                raise ValueError(
+                    "vLLM score centering requires native text completions."
+                )
         stop_token_ids = gconfig.stop_token_ids
 
         # NOTE: vLLM uses flat payload structure, not nested sampling_params
@@ -89,6 +95,15 @@ class VLLMBackend:
             payload["stop"] = gconfig.stop
         if gconfig.seed is not None:
             payload["seed"] = gconfig.seed
+        if gconfig.score_centering_top_k:
+            payload.update(
+                logprobs=gconfig.score_centering_top_k,
+                top_k=-1,
+                min_p=0.0,
+                repetition_penalty=1.0,
+                presence_penalty=0.0,
+                min_tokens=0,
+            )
 
         if with_lora:
             lora_name = gconfig.lora_name
@@ -125,10 +140,12 @@ class VLLMBackend:
             return HttpRequest(endpoint="/v1/completions", payload=payload)
 
     def parse_generation_response(
-        self, response: dict[str, Any]
+        self, response: dict[str, Any], *, score_centering_top_k: int = 0
     ) -> HttpGenerationResult:
         """Parse vLLM generation response."""
-        return parse_vllm_generation_response(response)
+        return parse_vllm_generation_response(
+            response, score_centering_top_k=score_centering_top_k
+        )
 
     def build_score_request(
         self, input_ids: list[int], target_len: int, with_lora: bool, version: int

@@ -281,7 +281,7 @@ class GenerationHyperparameters:
     score_centering_top_k: int = field(
         default=0,
         metadata={
-            "help": "SGLang sampler head width for score centering; 0 disables collection. Requires temperature=1 and untruncated sampling."
+            "help": "Native SGLang/vLLM sampler head width for score centering; 0 disables collection. Requires temperature=1 and untruncated sampling."
         },
     )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
@@ -348,7 +348,7 @@ class GenerationHyperparameters:
         """Convert the generation hyperparameters to a dictionary of arguments for OpenAI client."""
         if self.score_centering_top_k:
             raise ValueError(
-                "Score centering requires the native SGLang RLVR workflow, not OpenAI clients."
+                "Score centering requires the native SGLang or vLLM RLVR workflow, not OpenAI clients."
             )
         final_exclude_args = set(exclude_args) if exclude_args is not None else set()
         final_exclude_args.update(self._OPENAI_UNSUPPORTED_ARGS)
@@ -2214,7 +2214,7 @@ class PPOActorConfig(TrainEngineConfig):
     use_score_centering: bool = field(
         default=False,
         metadata={
-            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Support: SGLang, FSDP (TP/CP) or Megatron (TP/CP/PP), temperature=1, no sampling truncation."
+            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Support: native SGLang/vLLM, FSDP (TP/CP) or Megatron (TP/CP/PP), temperature=1, no sampling truncation."
         },
     )
 
@@ -2562,7 +2562,16 @@ class vLLMConfig:
         dist_init_addr: str | None = None,
         n_nodes: int = 1,
         node_rank: int = 0,
+        score_centering_top_k: int = 0,
     ):
+        if (
+            isinstance(score_centering_top_k, bool)
+            or not isinstance(score_centering_top_k, int)
+            or not 0 <= score_centering_top_k <= 1024
+        ):
+            raise ValueError(
+                "Score-centering head width must be an integer in [0, 1024]."
+            )
         args: dict = conf_as_dict(vllm_config)
         args = dict(
             # Model and tokenizer
@@ -2573,6 +2582,13 @@ class vLLMConfig:
             pipeline_parallel_size=pp_size,
             **args,
         )
+        if score_centering_top_k:
+            # Preserve the actual sampling distribution in returned probabilities.
+            args.update(
+                max_logprobs=max(20, score_centering_top_k),
+                logprobs_mode="raw_logprobs",
+                generation_config="vllm",
+            )
         if port is not None:
             args["port"] = port
         if host is not None:
@@ -2605,6 +2621,7 @@ class vLLMConfig:
         dist_init_addr: str | None = None,
         n_nodes: int = 1,
         node_rank: int = 0,
+        score_centering_top_k: int = 0,
     ):
         args = vLLMConfig.build_args(
             vllm_config=vllm_config,
@@ -2615,6 +2632,7 @@ class vLLMConfig:
             dist_init_addr=dist_init_addr,
             n_nodes=n_nodes,
             node_rank=node_rank,
+            score_centering_top_k=score_centering_top_k,
         )
         return vLLMConfig.build_cmd_from_args(args)
 
@@ -4469,6 +4487,17 @@ class PPOConfig(BaseExperimentConfig):
 
     def __post_init__(self):
         """Validate the eval generation config."""
+        if (
+            (
+                self.gconfig.score_centering_top_k
+                or getattr(self.eval_gconfig, "score_centering_top_k", 0)
+            )
+            and self.rollout.backend.startswith("vllm:")
+            and self.rollout._version != "v1"
+        ):
+            raise ValueError(
+                "vLLM score centering currently requires rollout._version=v1."
+            )
         if self.teacher is not None and self.mopd is not None:
             raise ValueError("teacher and mopd cannot be configured at the same time")
         if self.mopd is not None:

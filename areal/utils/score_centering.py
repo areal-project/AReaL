@@ -37,7 +37,7 @@ def validate_sampling(config) -> None:
 def validate_heads(ids, logprobs, count: int, width: int) -> None:
     """Validate CPU transport metadata before it reaches the training hot path."""
     if ids is None or logprobs is None or len(ids) != count or len(logprobs) != count:
-        raise ValueError("Missing or misaligned SGLang sampler heads.")
+        raise ValueError("Missing or misaligned sampler heads.")
     for row_ids, row_logprobs in zip(ids, logprobs):
         if len(row_ids) != width or len(row_logprobs) != width:
             raise ValueError("Sampler head width differs from the requested width.")
