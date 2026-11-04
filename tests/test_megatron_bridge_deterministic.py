@@ -7,7 +7,7 @@ from unittest import mock
 import pytest
 import torch
 
-from areal.api.cli_args import MegatronEngineConfig
+from areal.api.cli_args import FP8EngineConfig, MegatronEngineConfig
 
 
 class _FinalizeReached(RuntimeError):
@@ -15,6 +15,9 @@ class _FinalizeReached(RuntimeError):
 
 
 class _FakeProvider(SimpleNamespace):
+    def register_pre_wrap_hook(self, hook) -> None:
+        self.pre_wrap_hook = hook
+
     def finalize(self) -> None:
         self.vision_flags_at_finalize = {
             name: getattr(self, name, None)
@@ -79,6 +82,7 @@ def _run_until_provider_finalize(
     freeze_vision_model: bool | None = None,
     freeze_vision_projection: bool | None = None,
     model_type: str | None = None,
+    fp8_config: FP8EngineConfig | None = None,
 ) -> None:
     pytest.importorskip("mbridge")
     pytest.importorskip("megatron.core")
@@ -88,6 +92,7 @@ def _run_until_provider_finalize(
     mcore_config = _make_mcore_config(deterministic=deterministic)
     mcore_config.freeze_vision_model = freeze_vision_model
     mcore_config.freeze_vision_projection = freeze_vision_projection
+    mcore_config.fp8_config = fp8_config
 
     with (
         mock.patch.multiple(
@@ -204,6 +209,51 @@ def test_megatron_bridge_provider_applies_fusion_config_when_nondeterministic():
         True,
         True,
     )
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_text"])
+def test_megatron_bridge_bf16_does_not_import_fp8_training_hook(
+    monkeypatch, model_type
+):
+    """BF16 training must not depend on the optional GDN FP8 recipe APIs."""
+    monkeypatch.setitem(sys.modules, "areal.engine.megatron_utils.qwen3_5_fp8", None)
+    provider = _make_provider(attention_backend=object())
+    provider.fp8 = None
+    provider.freeze_vision_model = False
+    provider.freeze_vision_projection = False
+
+    _run_until_provider_finalize(
+        provider,
+        deterministic=False,
+        model_type=model_type,
+        fp8_config=None,
+    )
+
+    assert provider.fp8 is None
+    assert not hasattr(provider, "pre_wrap_hook")
+
+
+def test_megatron_bridge_fp8_reaches_provider_before_finalize():
+    """FP8 must reach the fresh provider used to build the actual TE modules."""
+    provider = _make_provider(attention_backend=object())
+    provider.fp8 = None
+    provider.fp8_recipe = "delayed"
+    provider.fp8_param = True
+    provider.freeze_vision_model = False
+    provider.freeze_vision_projection = False
+    _run_until_provider_finalize(
+        provider,
+        deterministic=False,
+        fp8_config=FP8EngineConfig(recipe="blockwise", param=False),
+        model_type="qwen3_5",
+    )
+    assert provider.fp8 == "e4m3"
+    assert provider.fp8_recipe == "blockwise"
+    assert provider.fp8_param is False
+    assert all(provider.vision_flags_at_finalize.values())
+    from areal.engine.megatron_utils.qwen3_5_fp8 import Qwen35FP8Training
+
+    assert provider.pre_wrap_hook is Qwen35FP8Training.prepare_model
 
 
 @pytest.mark.parametrize("fusion_enabled", [False, True])
