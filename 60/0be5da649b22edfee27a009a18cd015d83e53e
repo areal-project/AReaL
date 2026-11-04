@@ -1,0 +1,19 @@
+.github/workflows/pre-commit.yml
+  s_bb8c2422dbabf4::t_95f36a70baeb44 37-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "600be5da649b22edfee27a009a18cd015d83e53e",
+  "prompts": {},
+  "sessions": {
+    "s_bb8c2422dbabf4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a18adf-00b4-7b13-a543-d950a4629c3f",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
