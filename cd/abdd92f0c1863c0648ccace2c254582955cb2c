@@ -1,0 +1,19 @@
+.github/workflows/tag-release-image.yml
+  s_e3766b82edfdba::t_ebe0fa72233dd9 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cdabdd92f0c1863c0648ccace2c254582955cb2c",
+  "prompts": {},
+  "sessions": {
+    "s_e3766b82edfdba": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a464-6fe6-7f30-a7df-8a139deb0f01",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
