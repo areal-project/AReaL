@@ -2214,7 +2214,7 @@ class PPOActorConfig(TrainEngineConfig):
     use_score_centering: bool = field(
         default=False,
         metadata={
-            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Initial support: SGLang, FSDP (TP/CP), temperature=1, no sampling truncation."
+            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Support: SGLang, FSDP (TP/CP) or Megatron (TP/CP/PP), temperature=1, no sampling truncation."
         },
     )
 
@@ -2427,11 +2427,21 @@ class PPOActorConfig(TrainEngineConfig):
         super().__post_init__()
         if self.use_score_centering:
             if (
-                not self.backend.startswith("fsdp:")
+                not self.backend.startswith(("fsdp:", "megatron:"))
                 or self.enable_tree_training
                 or self.is_critic
             ):
-                raise ValueError("Score centering requires an ordinary FSDP actor.")
+                raise ValueError(
+                    "Score centering requires an ordinary FSDP or Megatron actor."
+                )
+            if self.backend.startswith("megatron:") and (
+                self.megatron.lm_head_loss_chunk_size > 0
+                or self.megatron.enable_mtp_training
+                or self.megatron.entropy_requires_grad
+            ):
+                raise ValueError(
+                    "Megatron score centering requires ordinary logits, no MTP, and diagnostic-only entropy."
+                )
             if self.temperature != 1.0 or self.recompute_logprob:
                 raise ValueError(
                     "Score centering requires temperature=1 and recompute_logprob=False to preserve sampler probabilities."
