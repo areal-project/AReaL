@@ -28,6 +28,14 @@ from areal.utils.score_centering import (
 )
 
 
+@pytest.fixture
+def isolated_actor_stats_tracker(monkeypatch):
+    from areal.trainer.ppo import actor
+    from areal.utils.stats_tracker import DistributedStatsTracker
+
+    monkeypatch.setattr(actor, "stats_tracker", DistributedStatsTracker())
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_selected_backward_matches_dense_rounding_with_peaked_logits(device, dtype):
@@ -377,6 +385,7 @@ async def test_interrupted_generation_accumulates_heads_and_versions(monkeypatch
 
 @pytest.mark.parametrize("width", [1, 12])
 @pytest.mark.parametrize("tis_cap", [None, 2.0])
+@pytest.mark.usefixtures("isolated_actor_stats_tracker")
 def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width, tis_cap):
     """Exercise real actor alignment and FSDP loss hooks without mocking DTensor."""
     from functools import partial
@@ -484,6 +493,7 @@ def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width, tis_cap):
 
 
 @pytest.mark.parametrize("mode", ["token", "sequence"])
+@pytest.mark.usefixtures("isolated_actor_stats_tracker")
 def test_score_centering_respects_prepared_loss_reduction(mode):
     """Unequal response lengths retain the upstream engine's reduction contract."""
     from areal.trainer.ppo.actor import grpo_loss_fn
