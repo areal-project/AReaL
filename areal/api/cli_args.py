@@ -278,6 +278,12 @@ class GenerationHyperparameters:
             )
         },
     )
+    score_centering_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "SGLang sampler head width for score centering; 0 disables collection. Requires temperature=1 and untruncated sampling."
+        },
+    )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
 
     def new(self, **kwargs):
@@ -316,6 +322,7 @@ class GenerationHyperparameters:
         )
 
     _OPENAI_UNSUPPORTED_ARGS: ClassVar[set[str]] = {
+        "score_centering_top_k",
         "min_new_tokens",  # Not supported by OpenAI
         "greedy",  # Not directly supported by OpenAI
         "top_k",  # Not supported by OpenAI
@@ -339,6 +346,10 @@ class GenerationHyperparameters:
         self, exclude_args: list[str] | None = None, api_format: str = "completions"
     ) -> dict[str, Any]:
         """Convert the generation hyperparameters to a dictionary of arguments for OpenAI client."""
+        if self.score_centering_top_k:
+            raise ValueError(
+                "Score centering requires the native SGLang RLVR workflow, not OpenAI clients."
+            )
         final_exclude_args = set(exclude_args) if exclude_args is not None else set()
         final_exclude_args.update(self._OPENAI_UNSUPPORTED_ARGS)
         # TODO: move the excluded args into extra body, so they can be passed through the client request
@@ -1807,7 +1818,7 @@ class RejectionSamplingConfig:
             "help": "Lower bound for filtering (optional). "
             "None means no lower bound. "
             "For 'ratio' metric: typical value is 0.5 (filter out tokens where policy "
-            "probability dropped significantly). Must be > 0. "
+            "probability dropped significantly). Must be > 0 for masking; clamp also allows 0. "
             "For 'kl_k1' metric: can be used to filter negative KL estimates."
         },
     )
@@ -1850,9 +1861,11 @@ class RejectionSamplingConfig:
                     f"upper must be > 1.0 for 'ratio' metric (otherwise all non-identical "
                     f"policy tokens will be filtered), got {self.upper}"
                 )
-            if self.lower is not None and self.lower <= 0:
+            if self.lower is not None and (
+                self.lower < 0 or (self.lower == 0 and self.action != "clamp")
+            ):
                 raise ValueError(
-                    f"lower must be positive for 'ratio' metric, got {self.lower}"
+                    f"lower must be positive for 'ratio' metric (zero is allowed for clamp), got {self.lower}"
                 )
         # For KL metrics, upper must be > 0.
         # Note: kl_k1 is excluded because it is a forward KL unbiased estimator that
@@ -2158,7 +2171,7 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={
             "help": "Rejection sampling configuration for filtering stale samples. "
             "None disables filtering (equivalent to old behave_imp_weight_mode='disabled'). "
-            "Only effective when use_decoupled_loss=True."
+            "Effective with use_decoupled_loss=True, or with score centering for token-wise ratio clamping (no lower bound)."
         },
     )
     importance_sampling_level: str = field(
@@ -2196,6 +2209,13 @@ class PPOActorConfig(TrainEngineConfig):
     max_new_tokens: int = field(
         default=1024,
         metadata={"help": "Maximum number of new tokens to generate"},
+    )
+
+    use_score_centering: bool = field(
+        default=False,
+        metadata={
+            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Initial support: SGLang, FSDP (TP/CP), temperature=1, no sampling truncation."
+        },
     )
 
     def _uses_group_statistics(self) -> bool:
@@ -2315,7 +2335,11 @@ class PPOActorConfig(TrainEngineConfig):
                 f"got ppo_n_minibatches={self.ppo_n_minibatches}"
             )
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
-        if not self.use_decoupled_loss and self.rejection_sampling is not None:
+        if (
+            not self.use_decoupled_loss
+            and not self.use_score_centering
+            and self.rejection_sampling is not None
+        ):
             logger.warning(
                 "rejection_sampling is configured but use_decoupled_loss=False. "
                 "Filtering will be ignored. Set use_decoupled_loss=True to enable."
@@ -2401,6 +2425,30 @@ class PPOActorConfig(TrainEngineConfig):
                 )
 
         super().__post_init__()
+        if self.use_score_centering:
+            if (
+                not self.backend.startswith("fsdp:")
+                or self.enable_tree_training
+                or self.is_critic
+            ):
+                raise ValueError("Score centering requires an ordinary FSDP actor.")
+            if self.temperature != 1.0 or self.recompute_logprob:
+                raise ValueError(
+                    "Score centering requires temperature=1 and recompute_logprob=False to preserve sampler probabilities."
+                )
+            if (
+                self.use_sapo_loss
+                or self.use_cispo_loss
+                or self.use_decoupled_loss
+                or self.m2_threshold is not None
+                or self.importance_sampling_level != "token"
+            ):
+                raise ValueError(
+                    "Score centering selects token-wise REINFORCE with optional TIS; other policy surrogates are unsupported."
+                )
+            from areal.utils.score_centering import resolve_score_centering_tis_cap
+
+            resolve_score_centering_tis_cap(self.rejection_sampling)
 
 
 @dataclass

@@ -8,8 +8,12 @@ import pytest
 from areal.api import ModelRequest
 from areal.api.cli_args import GenerationHyperparameters
 from areal.engine import sglang_remote
+from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 
 
+@pytest.mark.parametrize(
+    "backend_cls", [sglang_remote.SGLangBackend, SGLangBridgeBackend]
+)
 @pytest.mark.parametrize(
     ("input_ids", "image_count", "image_token_id", "expected"),
     [
@@ -25,7 +29,7 @@ from areal.engine import sglang_remote
     ],
 )
 def test_sglang_image_request_preserves_expanded_training_tokens_and_budget(
-    input_ids, image_count, image_token_id, expected
+    backend_cls, input_ids, image_count, image_token_id, expected
 ):
     original = input_ids.copy()
     images = [f"image-{index}" for index in range(image_count)]
@@ -37,9 +41,7 @@ def test_sglang_image_request_preserves_expanded_training_tokens_and_budget(
         gconfig=GenerationHyperparameters(max_new_tokens=budget),
     )
 
-    request = sglang_remote.SGLangBackend().build_generation_request(
-        req, with_lora=False, version=0
-    )
+    request = backend_cls().build_generation_request(req, with_lora=False, version=0)
 
     assert request.payload["input_ids"] == expected
     assert request.payload["input_ids"] is not req.input_ids
@@ -48,6 +50,9 @@ def test_sglang_image_request_preserves_expanded_training_tokens_and_budget(
     assert request.payload["sampling_params"]["max_new_tokens"] == budget
 
 
+@pytest.mark.parametrize(
+    "backend_cls", [sglang_remote.SGLangBackend, SGLangBridgeBackend]
+)
 @pytest.mark.parametrize(
     ("images", "processor", "input_ids"),
     [
@@ -63,16 +68,39 @@ def test_sglang_image_request_preserves_expanded_training_tokens_and_budget(
     ],
 )
 def test_sglang_image_request_keeps_tokens_when_placeholder_contract_is_unknown(
-    images, processor, input_ids
+    backend_cls, images, processor, input_ids
 ):
     req = ModelRequest(input_ids=input_ids, image_data=images, processor=processor)
 
-    request = sglang_remote.SGLangBackend().build_generation_request(
-        req, with_lora=False, version=0
-    )
+    request = backend_cls().build_generation_request(req, with_lora=False, version=0)
 
     assert request.payload["input_ids"] == input_ids
     assert request.payload["input_ids"] is not input_ids
+
+
+@pytest.mark.parametrize("accumulated", [[], [71, 72, 72, 73]])
+def test_sglang_bridge_resume_preserves_sampled_tokens_and_image_placeholders(
+    accumulated,
+):
+    """The bridge patches even the first request, and must not expand images twice."""
+    original = [10, 99, 99, 99, 11, 20, 21]
+    req = ModelRequest(
+        input_ids=original.copy(),
+        image_data=["image"],
+        processor=SimpleNamespace(image_token_id=99),
+        gconfig=GenerationHyperparameters(max_tokens=12, max_new_tokens=10),
+    )
+    backend = SGLangBridgeBackend()
+    request = backend.build_generation_request(req, with_lora=False)
+    # Context budgeting must use the expanded training prompt, not the wire IDs.
+    assert request.payload["sampling_params"]["max_new_tokens"] == 5
+
+    backend.patch_generation_request(request, req, accumulated, 5 - len(accumulated))
+
+    assert request.payload["input_ids"] == [10, 99, 11, 20, 21] + accumulated
+    assert request.payload["sampling_params"]["max_new_tokens"] == 5 - len(accumulated)
+    assert req.input_ids == original
+    assert request.payload["image_data"] == ["image"]
 
 
 @pytest.mark.parametrize(

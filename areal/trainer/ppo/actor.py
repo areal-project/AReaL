@@ -66,6 +66,7 @@ from areal.utils.functional.loss_aggregation import (
     TokenMean,
 )
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.score_centering import resolve_score_centering_tis_cap
 from areal.utils.stats_tracker import ReduceType
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -146,6 +147,8 @@ class PPOActor:
 
     def configure_mopd_loss(self, config: MOPDLossConfig) -> None:
         """Bind static MOPD loss settings once on each actor worker."""
+        if self.config.use_score_centering:
+            raise ValueError("Score centering with distillation is not supported.")
         if (
             config.distillation_coefficient != 0
             and self.config.loss_aggregation != "token_mean"
@@ -167,7 +170,14 @@ class PPOActor:
         logger.info("=" * 70)
 
         # Log PPO mode and proximal policy computation
-        if not config.use_decoupled_loss:
+        if config.use_score_centering:
+            logger.info(
+                "Mode: REINFORCE with score centering (sampler behavior probabilities)"
+            )
+            tis_cap = resolve_score_centering_tis_cap(config.rejection_sampling)
+            if tis_cap is not None:
+                logger.info(f"  TIS weighted-score centering, cap={tis_cap}")
+        elif not config.use_decoupled_loss:
             logger.info("Mode: Standard PPO (on-policy)")
             if config.recompute_logprob:
                 logger.info("  old_logp (π_old): RECOMPUTED from current policy")
@@ -405,6 +415,20 @@ class PPOActor:
             )
         )
         data.update(validate_advantage_result(result, data))
+        if self.config.use_score_centering:
+            for key in ("sampler_head_ids", "sampler_head_logprobs"):
+                if key not in data:
+                    raise ValueError(
+                        "Score centering requires SGLang sampler heads on every trajectory."
+                    )
+                if (
+                    data[key].ndim != 3
+                    or data[key].shape[:2] != data["input_ids"].shape
+                ):
+                    raise ValueError(
+                        "Sampler heads must have shape [batch, sequence, head_width]."
+                    )
+                data[key] = torch.roll(data[key], shifts=-1, dims=1)
         return data
 
     @trace_perf("ppo_actor.ppo_update", category="compute")
@@ -611,6 +635,7 @@ class PPOActor:
             ):
                 loss_fn = functools.partial(
                     grpo_loss_fn,
+                    use_score_centering=self.config.use_score_centering,
                     eps_clip=self.config.eps_clip,
                     eps_clip_higher=self.config.eps_clip_higher,
                     c_clip=self.config.c_clip,
@@ -877,8 +902,16 @@ def grpo_loss_fn(
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
+    use_score_centering: bool = False,
+    sc_correction: torch.Tensor | None = None,
 ):
     """Compute loss and logging stats using the actor's assembled reduction."""
+    if use_score_centering and (
+        mopd_loss_config is not None
+        or input_data.get("mopd_teacher_logp_sum") is not None
+        or input_data.get("teacher_logp") is not None
+    ):
+        raise ValueError("Score centering with distillation is not supported.")
     denominator_mask = input_data["loss_mask"].bool()
     pg_reduction = (
         TokenMean(denominator_mask) if loss_step is None else loss_step.bind(input_data)
@@ -972,8 +1005,36 @@ def grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
-    # Use CISPO, SAPO, or PPO loss
-    if use_cispo_loss:
+    # Score centering uses the explicit REINFORCE surrogate, not clipped PPO.
+    if use_score_centering:
+        if sc_correction is None:
+            raise ValueError("Score centering requires a score-centering logprob path.")
+        if input_data.get("teacher_logp") is not None:
+            raise ValueError("Score centering with distillation is not supported.")
+        tis_cap = resolve_score_centering_tis_cap(rejection_sampling)
+        if tis_cap is None:
+            sc_weight = torch.ones_like(logprobs)
+            sc_clipped = torch.zeros_like(loss_mask)
+        else:
+            from areal.utils.score_centering import score_centering_tis_weights
+
+            # Original sampler logprobs, never the proximal policy. The correction
+            # already centers weighted scores; do not multiply it by sc_weight.
+            behavior_logp = torch.where(loss_mask.bool(), old_logp, logprobs.detach())
+            sc_weight = score_centering_tis_weights(logprobs, behavior_logp, tis_cap)
+            sc_clipped = (
+                logprobs.detach() - behavior_logp > math.log(tis_cap)
+            ) & loss_mask.bool()
+        token_loss = advantages.detach() * (sc_correction - sc_weight * logprobs)
+        loss = pg_reduction.aggregate(token_loss, loss_mask)
+        stat = dict(
+            loss=token_loss.detach(),
+            importance_weight=sc_weight,
+            approx_kl=old_logp - logprobs.detach(),
+            clip_mask=sc_clipped,
+            dual_clip_mask=torch.zeros_like(loss_mask),
+        )
+    elif use_cispo_loss:
         if use_sapo_loss:
             raise ValueError(
                 "CISPO and SAPO are mutually exclusive surrogates. "
@@ -1123,6 +1184,11 @@ def grpo_loss_fn(
                 rkl_loss=rkl_stat,
                 denominator="n_valid_tokens",
             )
+
+    if use_score_centering:
+        stats_tracker.stat(
+            sc_correction=sc_correction.detach(), denominator="n_valid_tokens"
+        )
 
     logp_diff = (old_logp - logprobs.detach()) * loss_mask
     stats_tracker.stat(

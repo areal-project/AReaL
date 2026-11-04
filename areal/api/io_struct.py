@@ -83,6 +83,9 @@ class ModelResponse:
     # MoE routing (only populated when return_routed_experts=True)
     routed_experts: np.ndarray | None = None
 
+    sampler_head_ids: list[list[int]] | None = None
+    sampler_head_logprobs: list[list[float]] | None = None
+
     @property
     def input_len(self) -> int:
         return len(self.input_tokens)
@@ -330,6 +333,8 @@ class HttpGenerationResult:
     # speculative_algorithm is enabled; read from response meta_info).
     spec_accept_rate: float | None = None
     spec_accept_length: float | None = None
+    sampler_head_ids: list[list[int]] | None = None
+    sampler_head_logprobs: list[list[float]] | None = None
 
     def __post_init__(self) -> None:
         if len(self.output_tokens) != len(self.output_logprobs):

@@ -349,6 +349,8 @@ def concat_padded_tensors(
         values = [td[key] for td in tensor_dicts]
         if isinstance(values[0], torch.Tensor):
             pv = 0.0 if key == "attention_mask" else pad_value
+            if key == "sampler_head_logprobs":
+                pv = -float("inf")
             result[key] = _pad_cat_dim0(values, pad_value=pv)
         elif isinstance(values[0], list):
             result[key] = [item for v in values for item in v]
@@ -411,7 +413,10 @@ def split_and_unpad_tensor(
                 splits = _unpad_splits(
                     list(value.split(traj_group_sizes, dim=0)),
                     traj_seqlens,
-                    seq_dim=1 if key == "routed_experts" else -1,
+                    seq_dim=1
+                    if key
+                    in ("routed_experts", "sampler_head_ids", "sampler_head_logprobs")
+                    else -1,
                 )
                 for i, s in enumerate(splits):
                     split_result[i][key] = s
@@ -1040,7 +1045,7 @@ def split_padded_tensor_dict_into_mb_list(
     for key, value in data.items():
         if key in multimodal_keys:
             continue
-        if key == "position_ids" or (
+        if key in ("position_ids", "sampler_head_ids", "sampler_head_logprobs") or (
             torch.is_tensor(value) and value.numel() == bs * max_seqlen
         ):
             # NOTE: qwen2.5-vl position_ids.numel() == bs * max_seqlen * 3

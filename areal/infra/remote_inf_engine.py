@@ -1113,6 +1113,8 @@ class RemoteInfEngine(InferenceEngine):
         start_time = time.perf_counter()
         accumulated_output_tokens = []
         accumulated_output_logprobs = []
+        accumulated_head_ids = []
+        accumulated_head_logprobs = []
         accumulated_versions = []
         final_routed_experts: np.ndarray | None = None
 
@@ -1187,6 +1189,18 @@ class RemoteInfEngine(InferenceEngine):
                         "This usually means the model is not a MoE (Mixture of Experts) model. "
                         "Please use a MoE model to get routed_experts information."
                     )
+
+            if gconfig.score_centering_top_k and gen_result.output_tokens:
+                from areal.utils.score_centering import validate_heads
+
+                validate_heads(
+                    gen_result.sampler_head_ids,
+                    gen_result.sampler_head_logprobs,
+                    len(gen_result.output_tokens),
+                    gconfig.score_centering_top_k,
+                )
+                accumulated_head_ids.extend(gen_result.sampler_head_ids)
+                accumulated_head_logprobs.extend(gen_result.sampler_head_logprobs)
 
             # Update accumulated outputs
             accumulated_output_tokens.extend(gen_result.output_tokens)
@@ -1264,6 +1278,12 @@ class RemoteInfEngine(InferenceEngine):
                 : len(req.input_ids) - len(accumulated_output_tokens)
             ],
             input_images=req.image_data,
+            sampler_head_ids=accumulated_head_ids
+            if gconfig.score_centering_top_k
+            else None,
+            sampler_head_logprobs=accumulated_head_logprobs
+            if gconfig.score_centering_top_k
+            else None,
             output_tokens=accumulated_output_tokens,
             output_logprobs=accumulated_output_logprobs,
             output_versions=accumulated_versions,

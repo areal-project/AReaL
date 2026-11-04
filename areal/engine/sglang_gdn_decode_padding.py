@@ -6,7 +6,10 @@ pool API. Python gather/scatter instead aliases the last allocatable slot.
 Padded lanes can corrupt live or cached recurrent state and affect subsequent
 generation.
 
-AReaL applies this patch before starting SGLang for Qwen GDN models. The
+AReaL applies this patch before starting SGLang for Qwen GDN models using
+FlashInfer decode. Decode inherits ``--linear-attn-backend`` unless explicitly
+overridden; the supported SM90 runtimes default to Triton and skip this patch
+and its FlashInfer dependency guard. The
 standalone command can also prepare a writable SGLang installation::
 
     python -m areal.engine.sglang_gdn_decode_padding

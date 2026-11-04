@@ -53,7 +53,7 @@ def setup_distributed():
     master_addr = os.environ.get("MASTER_ADDR", "localhost")
     master_port = os.environ.get("MASTER_PORT", "29500")
     dist.init_process_group(
-        backend="nccl",
+        backend=current_platform.communication_backend,
         init_method=f"tcp://{master_addr}:{master_port}",
         world_size=world_size,
         rank=rank,
