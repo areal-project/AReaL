@@ -1,0 +1,25 @@
+docs/en/reference/metrics_tracking.md
+  s_8b116507ffaf63::t_8f1a7fec5606ec 190-207
+docs/zh/reference/metrics_tracking.md
+  s_8b116507ffaf63::t_7555d817970a88 185-198
+scripts/check_rollout_filter_timeperf_minimal.py
+  s_8b116507ffaf63::t_dc818312b270e5 1-80
+tests/test_workflow_executor_filtering.py
+  s_8b116507ffaf63::t_258aae174c26e0 114-118,154-158,169-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "21a8a069fd49a092b38b37d4fd3aedb94a076c49",
+  "prompts": {},
+  "sessions": {
+    "s_8b116507ffaf63": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a0ef-1f5b-7352-ba87-542b3e940349",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
