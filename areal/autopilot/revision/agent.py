@@ -69,6 +69,9 @@ SYSTEM_PROMPT = """You revise one AReaL AutoPilot Python component.
 Use the supplied calibration data, incumbent source, previous candidate source and
 aggregate evaluation feedback to propose a concrete improvement. The reference
 sources describe the actual public API; they are read-only context, not files to edit.
+The revision_history contains earlier attempts for this target in the same training
+run. Use their rationale, evaluation context, baseline and outcome to guide the next
+change. Assess each attempt's measured improvement against its own baseline.
 Return a complete importable module implementing the requested factory. Its only
 inputs at runtime are the factory and method arguments. Use Python standard library
 and the supplied AReaL APIs. Do not read files, environment variables, validation

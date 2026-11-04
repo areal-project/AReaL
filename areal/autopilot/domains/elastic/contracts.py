@@ -8,10 +8,8 @@ import dataclasses
 import json
 import types
 from functools import cache
-from pathlib import Path
 from typing import Literal, Union, get_args, get_origin, get_type_hints
 
-from areal.autopilot.revision.contracts import ProposalRequest
 from areal.elastic.contracts import Forecast, OnlineLayout, OnlineObservation
 
 
@@ -95,48 +93,6 @@ def build_optimizer(settings):
     return OnlineOptimizer()
 """,
 }
-
-
-def proposal_context(target):
-    if target not in BASELINE_SOURCE:
-        raise ValueError("Online revision target must be evaluator or optimizer")
-    base = Path(__file__).resolve().parents[3]
-    names = ["elastic/contracts.py", "autopilot/domains/elastic/contracts.py"]
-    names += (
-        [
-            "autopilot/domains/elastic/evaluation/evaluator.py",
-        ]
-        if target == "evaluator"
-        else [
-            "elastic/reconfigurator/reference/optimizer.py",
-            "autopilot/domains/elastic/evaluation/optimizer.py",
-        ]
-    )
-    return {
-        "api_version": "online-reference-revision-v2",
-        "factory": "build_cost_models(calibration_cases, settings)"
-        if target == "evaluator"
-        else "build_optimizer(settings)",
-        "instructions": (
-            "Revise the Evaluator's CostModels subcomponent. Return frozen CostModels with "
-            "source_ids, rollout_config(layout), "
-            "service(layout, kv_tokens, slices), actor(layout, batch), publication(actor_layout, rollout_layouts). "
-            "Calibration labels are public; validation and final-holdout labels are private. "
-            "Preserve unknown coverage and fixed training semantics."
-            if target == "evaluator"
-            else "Implement search(evaluator, view, forecasts, layouts, preferred=(), trigger='pressure'). "
-            "Use only the supplied evaluate-only port: prepare_context, historical, context_id, slo, "
-            "order_candidates, evaluate, evaluate_wave, parallel_available and execution_stats. "
-            "Return predictions supplied by that port. The parent owns SLO/Actor-supply selection, "
-            "costs, query limits and acceptance; reduce cost and Evaluator queries at the fixed horizon."
-        ),
-        "reference_sources": {"areal/" + n: (base / n).read_text() for n in names},
-    }
-
-
-def elastic_proposal_request(*args, **kwargs):
-    target = args[0] if args else kwargs["target"]
-    return ProposalRequest(*args, **{**kwargs, "context": proposal_context(target)})
 
 
 def deployment_contract(assembly):

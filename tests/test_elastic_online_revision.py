@@ -20,9 +20,9 @@ from areal.autopilot.domains.elastic.contracts import (
     BASELINE_SOURCE,
     OnlineProblem,
     decode,
-    proposal_context,
 )
 from areal.autopilot.domains.elastic.cycle import ReconfiguratorRevisionCycle
+from areal.autopilot.domains.elastic.prompt import proposal_context
 from areal.autopilot.domains.elastic.versions import (
     load_accepted_cost_models,
     load_accepted_optimizer,
@@ -44,6 +44,11 @@ def runner():
 
 class Agent:
     def propose(self, request):
+        assert request.context["factory"] == (
+            "build_cost_models(calibration_cases, settings)"
+            if request.target == "evaluator"
+            else "build_optimizer(settings)"
+        )
         return Proposal(
             GOOD_EVALUATOR_SOURCE
             if request.target == "evaluator"
@@ -66,7 +71,12 @@ def test_evaluator_revision_scores_private_history_and_loads_same_cost_models(
     runner, tmp_path
 ):
     benchmark = demo_benchmark("evaluator", runner)
-    result = RevisionLoop(Agent(), benchmark, tmp_path / "evaluator").run(max_rounds=1)
+    result = RevisionLoop(
+        Agent(),
+        benchmark,
+        tmp_path / "evaluator",
+        proposal_context=proposal_context("evaluator"),
+    ).run(max_rounds=1)
     assert result["active_source"] is not None
     cost_models = load_accepted_cost_models(tmp_path / "evaluator", benchmark)
     case = benchmark.history.prediction_inputs[0]
@@ -90,6 +100,7 @@ def test_optimizer_revision_reduces_parent_counted_queries_and_loads_same_search
         benchmark,
         tmp_path / "optimizer",
         initial_source=REDUNDANT_OPTIMIZER_SOURCE,
+        proposal_context=proposal_context("optimizer"),
     ).run(max_rounds=1)
     assert result["active_source"] is not None
     baseline = json.loads((tmp_path / "optimizer/baseline.json").read_text())
@@ -107,18 +118,116 @@ def test_optimizer_revision_reduces_parent_counted_queries_and_loads_same_search
     assert asdict(target.layout) == benchmark._oracle[0].layout.__dict__
 
 
+def test_revision_history_reaches_next_round_and_resumed_observation(runner, tmp_path):
+    """A measured rejection and acceptance both return to the next Agent call."""
+    history_root = tmp_path / "training-001" / "revision"
+    output = history_root / "cycle-001" / "optimizer"
+    benchmark = demo_benchmark("optimizer", runner)
+    requests = []
+    sources = iter(
+        (
+            REDUNDANT_OPTIMIZER_SOURCE + "\n# Same search order.\n",
+            BASELINE_SOURCE["optimizer"],
+            BASELINE_SOURCE["optimizer"] + "\n# Same accepted search.\n",
+        )
+    )
+
+    class HistoryAgent:
+        def propose(self, request):
+            requests.append(request)
+            return Proposal(next(sources), "Try fewer Evaluator queries")
+
+    def loop():
+        return RevisionLoop(
+            HistoryAgent(),
+            benchmark,
+            output,
+            initial_source=REDUNDANT_OPTIMIZER_SOURCE,
+            proposal_context=proposal_context("optimizer"),
+            history_root=history_root,
+        )
+
+    first = loop().run(max_rounds=2)
+    assert first["accepted"] == 1
+    assert requests[0].revision_history == ()
+    previous = requests[1].revision_history
+    assert len(previous) == 1
+    assert previous[0]["rationale"] == "Try fewer Evaluator queries"
+    assert previous[0]["baseline"]["metrics"]["mean_evaluator_queries"] == 6
+    assert previous[0]["outcome"]["metrics"]["mean_evaluator_queries"] == 6
+    assert previous[0]["outcome"]["status"] == "rejected"
+
+    second = loop().run(max_rounds=1)
+    assert second["accepted"] == 0
+    assert requests[2].round == 3
+    assert len(requests[2].revision_history) == 2
+    accepted = requests[2].revision_history[1]
+    assert accepted["baseline"]["metrics"]["mean_evaluator_queries"] == 6
+    assert accepted["outcome"]["metrics"]["mean_evaluator_queries"] == 3
+    assert accepted["outcome"]["status"] == "accepted"
+    assert requests[2].feedback[0]["metrics"]["mean_evaluator_queries"] == 3
+    history = json.loads((history_root / "history.json").read_text())["attempts"]
+    assert len(history) == 3
+    assert len({item["attempt"] for item in history}) == 3
+    assert all("reference_sources" not in item["context"] for item in history)
+    assert all("selection_sha256" not in item["outcome"]["metrics"] for item in history)
+    saved = json.loads(
+        (history_root / history[-1]["attempt"] / "proposal-request.json").read_text()
+    )
+    assert saved["revision_history"] == history[:2]
+
+
+def test_revision_history_is_shared_by_cycles_within_one_training(runner, tmp_path):
+    """Explicit training roots accumulate cycle records and keep new runs separate."""
+    benchmark = demo_benchmark("optimizer", runner)
+    requests = []
+
+    class HistoryAgent:
+        def propose(self, request):
+            requests.append(request)
+            return Proposal(BASELINE_SOURCE["optimizer"], "Remove repeated evaluation")
+
+    for training, cycle in (
+        ("training-001", "cycle-001"),
+        ("training-001", "cycle-002"),
+        ("training-002", "cycle-001"),
+    ):
+        history_root = tmp_path / training / "revision"
+        result = RevisionLoop(
+            HistoryAgent(),
+            benchmark,
+            history_root / cycle / "optimizer",
+            initial_source=REDUNDANT_OPTIMIZER_SOURCE,
+            history_root=history_root,
+        ).run(max_rounds=1)
+        assert result["accepted"] == 1
+
+    assert [len(r.revision_history) for r in requests] == [0, 1, 0]
+    first = json.loads((tmp_path / "training-001/revision/history.json").read_text())[
+        "attempts"
+    ]
+    second = json.loads((tmp_path / "training-002/revision/history.json").read_text())[
+        "attempts"
+    ]
+    assert len(first) == 2 and len(second) == 1
+    assert first[0]["attempt"].startswith("cycle-001/optimizer/")
+    assert first[1]["attempt"].startswith("cycle-002/optimizer/")
+
+
 def test_evaluator_optimizer_cycle_loads_full_reference_and_simulates_same_work(
     runner, tmp_path
 ):
     evaluator_benchmark = demo_benchmark("evaluator", runner)
     _, problems, assembly = demo_inputs()
+    history_root = tmp_path / "training" / "revision"
     cycle = ReconfiguratorRevisionCycle(
         evaluator_benchmark,
         problems,
-        tmp_path / "cycle",
+        history_root / "cycle-001",
         assembly=assembly,
         initial_optimizer_source=REDUNDANT_OPTIMIZER_SOURCE,
         optimizer_limits=dict(max_queries=12, overhead_weight=0.5),
+        history_root=history_root,
     )
     result = cycle.run(Agent(), Agent(), max_evaluator_rounds=1, max_optimizer_rounds=1)
     assert (
@@ -126,6 +235,13 @@ def test_evaluator_optimizer_cycle_loads_full_reference_and_simulates_same_work(
         and result["optimizer_accepted"]
         and result["bundle"]
     )
+    history = json.loads((history_root / "history.json").read_text())["attempts"]
+    assert [item["target"] for item in history] == ["evaluator", "optimizer"]
+    for item in history:
+        request = json.loads(
+            (history_root / item["attempt"] / "proposal-request.json").read_text()
+        )
+        assert request["revision_history"] == []
     loaded = load_bundle(Path(result["bundle"]))
     bundle = json.loads(Path(result["bundle"]).read_text())
     assert bundle["format_version"] == 2
@@ -164,4 +280,7 @@ def test_evaluator_optimizer_cycle_loads_full_reference_and_simulates_same_work(
     assert (
         cycle.run(Agent(), Agent(), max_evaluator_rounds=1, max_optimizer_rounds=1)
         == result
+    )
+    assert (
+        json.loads((history_root / "history.json").read_text())["attempts"] == history
     )

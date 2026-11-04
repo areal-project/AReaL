@@ -11,7 +11,8 @@ import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE, proposal_context
+from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE
+from areal.autopilot.domains.elastic.prompt import proposal_context
 from areal.autopilot.revision.contracts import digest, source_digest
 from areal.autopilot.revision.execution import CandidateRunner
 from areal.autopilot.revision.loop import RevisionLoop
@@ -37,10 +38,6 @@ class ElasticRevisionBenchmark:
     @property
     def initial_source(self):
         return BASELINE_SOURCE.get(self.target)
-
-    @property
-    def proposal_context(self):
-        return proposal_context(self.target)
 
     @property
     def replay_fingerprints(self):
@@ -203,6 +200,7 @@ def _stage(loop: RevisionLoop, budget: int) -> _Stage:
             raise ValueError(
                 "Effective stage predictions/selections changed since evaluation"
             )
+        loop.restore_history()
         _fixed_json(receipt_path, record)
         return _Stage(root, source, record)
 
@@ -222,11 +220,19 @@ class ReconfiguratorRevisionCycle:
         optimizer_settings=None,
         optimizer_limits=None,
         parent_bundle=None,
+        history_root=None,
     ):
         self.evaluator_benchmark = evaluator_benchmark
         self.cases = tuple(optimizer_cases)
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.history_root = (
+            self.root if history_root is None else Path(history_root).resolve()
+        )
+        if not self.root.is_relative_to(self.history_root):
+            raise ValueError(
+                "Revision cycle must belong to its training history directory"
+            )
         self.assembly = json.loads(json.dumps(assembly, allow_nan=False))
         from areal.autopilot.domains.elastic.contracts import OnlineProblem, decode
         from areal.elastic.contracts import OnlineLayout
@@ -292,6 +298,8 @@ class ReconfiguratorRevisionCycle:
                     self.evaluator_benchmark,
                     self.root / "evaluator",
                     initial_source=self.evaluator_source,
+                    proposal_context=proposal_context("evaluator"),
+                    history_root=self.history_root,
                 ),
                 max_evaluator_rounds,
             )
@@ -355,6 +363,8 @@ class ReconfiguratorRevisionCycle:
                     benchmark,
                     self.root / "optimizer",
                     initial_source=self.optimizer_source,
+                    proposal_context=proposal_context("optimizer"),
+                    history_root=self.history_root,
                 ),
                 max_optimizer_rounds,
             )

@@ -39,9 +39,30 @@ python -m examples.autopilot.revising --demo --target evaluator --output /tmp/on
 python -m examples.autopilot.revising --demo --target optimizer --output /tmp/online-optimizer-revision
 ```
 
+每次训练使用独立输出目录。多个修订 Cycle 共用本次训练的历史时，传入
+`--history-root /tmp/training-001/revision --output /tmp/training-001/revision/cycle-001/optimizer`。
+`history.json` 保存各轮摘要，下一轮 Observation 自动带入同一修订对象的历史。
+
 Evaluator 当前修订其内部 CostModels，外层 Revision Benchmark 评测代码修改。 非 demo 还需
 `--profile`、`--cases`，以及 `--agent-command` 或 `--llm-model`。profile／cases 的 factory
 契约见外层[Elastic Revision](../../../../docs/implementation/elastic-revision.md)。
+
+### DeepSeek API
+
+在运行终端设置 `DEEPSEEK_API_KEY` 后，调用现有 Model API 入口。
+
+```bash
+python -m examples.autopilot.revising --demo --target optimizer \
+  --output /tmp/deepseek-training-001/revision/cycle-001/optimizer \
+  --history-root /tmp/deepseek-training-001/revision --max-rounds 2 \
+  --llm-model deepseek-flash --llm-base-url https://api.deepseek.com \
+  --llm-api-key-env DEEPSEEK_API_KEY --llm-response-format json_object \
+  --llm-token-parameter max_tokens --llm-reasoning-effort none
+```
+
+此命令用公式场景验证提案与评测链路。实际搜索案例使用 `--profile` 和 `--cases` 替换 `--demo`。 参数依据
+[DeepSeek 接口](https://api-docs.deepseek.com/)与
+[JSON Output](https://api-docs.deepseek.com/guides/json_mode/)。
 
 ## 原生训练
 

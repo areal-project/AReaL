@@ -16,11 +16,9 @@ from examples.autopilot.elastic.revision_demo import (
 from examples.autopilot.elastic.revision_demo import demo_benchmark
 
 from areal.autopilot.domains.elastic.contracts import BASELINE_SOURCE
-from areal.autopilot.domains.elastic.contracts import (
-    elastic_proposal_request as ProposalRequest,
-)
+from areal.autopilot.domains.elastic.prompt import proposal_context
 from areal.autopilot.revision import LLMRevisionAgent, RevisionLoop
-from areal.autopilot.revision.contracts import digest
+from areal.autopilot.revision.contracts import ProposalRequest, digest
 from areal.autopilot.revision.execution import CandidateRunner
 
 
@@ -91,6 +89,15 @@ def proposal_request():
         {},
         ({"status": "rejected", "errors": ["SyntaxError"]},),
         previous_source="broken python !",
+        context=proposal_context("evaluator"),
+        revision_history=(
+            {
+                "target": "evaluator",
+                "rationale": "Calibrate the train stage",
+                "baseline": {"score": 0.3},
+                "outcome": {"status": "rejected", "score": 0.3},
+            },
+        ),
     )
 
 
@@ -109,6 +116,9 @@ def test_llm_sends_public_api_calibration_and_feedback_and_records_usage(
     expected.pop("context")
     assert context["request"] == expected
     assert context["request"]["previous_source"] == "broken python !"
+    assert context["request"]["revision_history"][0]["rationale"] == (
+        "Calibrate the train stage"
+    )
     assert (
         "class HistoricalInput"
         in context["reference_sources"][
@@ -149,9 +159,19 @@ def test_llm_repairs_rejected_source_after_loop_resume(model_endpoint, tmp_path)
         "model", CandidateRunner(command=(sys.executable, "-c", bootstrap))
     )
     store = tmp_path / "revision"
-    first = RevisionLoop(proposer(), evaluation, store).run(max_rounds=1)
+    first = RevisionLoop(
+        proposer(),
+        evaluation,
+        store,
+        proposal_context=proposal_context(evaluation.target),
+    ).run(max_rounds=1)
     assert first["accepted"] == 0 and not (store / "active.json").exists()
-    second = RevisionLoop(proposer(), evaluation, store).run(max_rounds=1)
+    second = RevisionLoop(
+        proposer(),
+        evaluation,
+        store,
+        proposal_context=proposal_context(evaluation.target),
+    ).run(max_rounds=1)
     assert second["accepted"] == 1
     context = json.loads(requests[1]["messages"][1]["content"])["request"]
     assert context["previous_source"] == "invalid python !"
@@ -235,6 +255,45 @@ def test_llm_compatible_endpoint_uses_explicit_max_tokens(model_endpoint):
     assert result.metadata["token_parameter"] == "max_tokens"
 
 
+def test_deepseek_proposal_uses_documented_chat_parameters(model_endpoint, monkeypatch):
+    """The existing SDK client sends DeepSeek JSON mode and returns an Optimizer."""
+    requests, replies, configurations = model_endpoint
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-credential")
+    replies.append(
+        httpx.Response(
+            200,
+            json=model_response(BASELINE_SOURCE["optimizer"], model="deepseek-flash"),
+        )
+    )
+    agent = LLMRevisionAgent(
+        model="deepseek-flash",
+        base_url="https://api.deepseek.com",
+        api_key_env="DEEPSEEK_API_KEY",
+        response_format="json_object",
+        token_parameter="max_tokens",
+        reasoning_effort="none",
+    )
+    request = ProposalRequest(
+        "optimizer",
+        1,
+        BASELINE_SOURCE["optimizer"],
+        "initial-hash",
+        {},
+        {},
+        (),
+        context=proposal_context("optimizer"),
+    )
+    result = agent.propose(request)
+    sent = requests[0]
+    assert configurations[0]["base_url"] == "https://api.deepseek.com"
+    assert sent["model"] == "deepseek-flash"
+    assert sent["response_format"] == {"type": "json_object"}
+    assert sent["max_tokens"] == 8192 and sent["reasoning_effort"] == "none"
+    assert "max_completion_tokens" not in sent
+    assert result.source == BASELINE_SOURCE["optimizer"]
+    assert "deepseek-test-credential" not in json.dumps(result.metadata)
+
+
 def test_llm_timeout_is_feedback_and_does_not_abort_revision(model_endpoint, tmp_path):
     """Provider timeouts retry; filesystem failures retain their fail-stop behavior."""
     requests, replies, _ = model_endpoint
@@ -249,7 +308,12 @@ def test_llm_timeout_is_feedback_and_does_not_abort_revision(model_endpoint, tmp
     evaluation = demo_benchmark(
         "model", CandidateRunner(command=(sys.executable, "-c", bootstrap))
     )
-    result = RevisionLoop(proposer(), evaluation, tmp_path).run(max_rounds=2)
+    result = RevisionLoop(
+        proposer(),
+        evaluation,
+        tmp_path,
+        proposal_context=proposal_context(evaluation.target),
+    ).run(max_rounds=2)
     assert [item["status"] for item in result["rounds"]] == ["rejected", "accepted"]
     feedback = json.loads(requests[1]["messages"][1]["content"])["request"]["feedback"]
     assert "LLM proposal request timed out" in json.dumps(feedback)
@@ -263,7 +327,7 @@ def test_cli_selects_llm_command_without_exposing_api_key(monkeypatch, tmp_path)
 
     class Loop:
         def __init__(self, agent, evaluation, root, **kwargs):
-            seen.append(agent)
+            seen.append((agent, kwargs))
 
         def run(self, **kwargs):
             return {"active_source": None, "accepted": 0}
@@ -279,6 +343,8 @@ def test_cli_selects_llm_command_without_exposing_api_key(monkeypatch, tmp_path)
             "optimizer",
             "--demo",
             "--output",
+            str(tmp_path / "cycle-001"),
+            "--history-root",
             str(tmp_path),
             "--llm-model",
             "test-model",
@@ -291,10 +357,13 @@ def test_cli_selects_llm_command_without_exposing_api_key(monkeypatch, tmp_path)
         ],
     )
     cli.main()
-    assert seen[0].command[1:3] == ("-m", "areal.autopilot.revision")
-    assert "test-model" in seen[0].command and "REVISION_TEST_KEY" in seen[0].command
-    assert seen[0].timeout_seconds == 30
-    assert "test-credential" not in " ".join(seen[0].command)
+    agent, options = seen[0]
+    assert agent.command[1:3] == ("-m", "areal.autopilot.revision")
+    assert "test-model" in agent.command and "REVISION_TEST_KEY" in agent.command
+    assert agent.timeout_seconds == 30
+    assert "test-credential" not in " ".join(agent.command)
+    assert options["proposal_context"]["factory"] == "build_optimizer(settings)"
+    assert options["history_root"] == tmp_path
 
 
 def test_evaluator_proposal_supplies_matching_factory_and_benchmark_api():
@@ -307,6 +376,7 @@ def test_evaluator_proposal_supplies_matching_factory_and_benchmark_api():
         {"cases": []},
         {},
         (),
+        context=proposal_context("evaluator"),
     )
     messages = proposer().messages(request)
     data = json.loads(messages[1]["content"])
@@ -326,7 +396,14 @@ def test_evaluator_proposal_supplies_matching_factory_and_benchmark_api():
 
 def test_online_optimizer_proposal_supplies_the_reference_search_port():
     request = ProposalRequest(
-        "optimizer", 1, BASELINE_SOURCE["optimizer"], "hash", {}, {}, ()
+        "optimizer",
+        1,
+        BASELINE_SOURCE["optimizer"],
+        "hash",
+        {},
+        {},
+        (),
+        context=proposal_context("optimizer"),
     )
     data = json.loads(proposer().messages(request)[1]["content"])
     assert "build_optimizer" in data["request"]["factory"]

@@ -40,6 +40,7 @@ class ProposalRequest:
     feedback: tuple[dict, ...]
     previous_source: str | None = None
     context: dict = field(default_factory=dict)
+    revision_history: tuple[dict, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -88,7 +89,6 @@ class RevisionBenchmark(Protocol):
     context: dict
     settings: dict
     calibration: dict
-    proposal_context: dict
 
     def evaluate(self, source: str, directory: Path) -> RevisionReport: ...
     def compare(

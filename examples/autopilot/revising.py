@@ -22,6 +22,7 @@ from areal.autopilot.domains.elastic.evaluation.evaluator import (
 from areal.autopilot.domains.elastic.evaluation.optimizer import (
     OptimizerRevisionBenchmark,
 )
+from areal.autopilot.domains.elastic.prompt import proposal_context
 from areal.autopilot.revision import CommandRevisionAgent, RevisionLoop
 
 
@@ -32,6 +33,11 @@ def main():
     parser.add_argument("--cases", type=Path)
     parser.add_argument("--settings", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--history-root",
+        type=Path,
+        help="This training's revision directory containing --output; defaults to --output",
+    )
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument("--demo", action="store_true")
     proposer = parser.add_mutually_exclusive_group()
@@ -167,7 +173,14 @@ def main():
     initial_source = (
         REDUNDANT_OPTIMIZER_SOURCE if args.demo and args.target == "optimizer" else None
     )
-    loop = RevisionLoop(agent, benchmark, args.output, initial_source=initial_source)
+    loop = RevisionLoop(
+        agent,
+        benchmark,
+        args.output,
+        initial_source=initial_source,
+        proposal_context=proposal_context(args.target),
+        history_root=args.history_root,
+    )
     result = loop.run(max_rounds=args.max_rounds)
     if (
         args.demo

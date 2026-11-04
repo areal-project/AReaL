@@ -35,7 +35,6 @@ def test_revision_core_runs_an_unrelated_domain_without_elastic_imports(tmp_path
             owns_acceptance = False
             criteria = Criteria()
             context = settings = calibration = {}
-            proposal_context = {"api": "normalize(text) -> str", "reference_sources": {}}
             def evaluate(self, source, directory):
                 directory.mkdir(parents=True, exist_ok=True)
                 (directory / "candidate.py").write_text(source)
@@ -47,11 +46,19 @@ def test_revision_core_runs_an_unrelated_domain_without_elastic_imports(tmp_path
                 self.calls += 1
                 assert request.to_dict()["api"] == "normalize(text) -> str"
                 assert "reference_sources" in LLMRevisionAgent("test").messages(request)[1]["content"]
+                assert len(request.revision_history) == self.calls - 1
+                if request.revision_history:
+                    assert request.revision_history[0]["outcome"]["status"] == "accepted"
                 return Proposal("error = 1")
         agent, benchmark = Agent(), Benchmark()
-        result = RevisionLoop(agent, benchmark, store).run(max_rounds=1)
+        agent_context = {"api": "normalize(text) -> str", "reference_sources": {}}
+        result = RevisionLoop(
+            agent, benchmark, store, proposal_context=agent_context
+        ).run(max_rounds=1)
         assert result["accepted"] == 1 and agent.calls == 1
-        result = RevisionLoop(agent, benchmark, store).run(max_rounds=1)
+        result = RevisionLoop(
+            agent, benchmark, store, proposal_context=agent_context
+        ).run(max_rounds=1)
         assert result["accepted"] == 0 and result["final_score"] == 1
         assert not any(n.startswith(("areal.elastic", "areal.autopilot.domains")) for n in sys.modules)
     """)
