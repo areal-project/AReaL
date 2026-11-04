@@ -9,7 +9,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from areal.trainer.ppo.actor import _log_version_staleness_stats
+from areal.trainer.ppo.actor import (
+    _log_policy_version_age_distribution,
+    _log_version_staleness_stats,
+)
 from areal.trainer.ppo.stats import log_train_inference_stats
 from areal.utils.stats_tracker import DistributedStatsTracker
 
@@ -49,6 +52,25 @@ def _check_distributed_diagnostics(rank: int, rendezvous: str) -> None:
         assert result["version_stats/stale_token_fraction"] == 0.5
         assert result["ppo_actor/train_infer/logp_diff/avg"] == 0.5
         assert result["ppo_actor/train_infer/ratio_outside_2"] == 0.25
+
+        tracker = DistributedStatsTracker()
+        with patch("areal.trainer.ppo.actor.stats_tracker", tracker):
+            if rank == 0:
+                _log_policy_version_age_distribution(
+                    torch.tensor([5, -1, 6]), 5, torch.ones(3, dtype=torch.bool)
+                )
+            else:
+                _log_policy_version_age_distribution(
+                    torch.tensor([4, 0]), 5, torch.tensor([True, False])
+                )
+        result = tracker.export(reduce_group=group)
+        for key in (
+            "age_0_fraction",
+            "age_1_fraction",
+            "invalid_version_fraction",
+            "future_version_fraction",
+        ):
+            assert result["version_stats/" + key] == 0.25
 
         # A DP shard can have no recomputed logprob statistics at all. It must
         # still participate in collectives learned through metadata exchange.

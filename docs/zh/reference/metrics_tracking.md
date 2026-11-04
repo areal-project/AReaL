@@ -348,6 +348,12 @@ checkpoint 版本：actor 和 rollout 在 PPO 更新后一起升版， 这不是
 `n_valid_generated_tokens` 累加这部分 token 观测；不同 update 重用同一轨迹仍会重复计数。 没有有效 token
 时省略均值和极值，不填充为零。
 
+`ppo_actor/update/version_stats/age_{0..16}_fraction` 统计各 policy version 年龄的监督 token
+比例；年龄等于当前 actor 版本减去该 token 对齐到预测位置后的生成版本。`age_gt_16_fraction` 汇总年龄大于 16 的
+token，`invalid_version_fraction` 统计负版本，`future_version_fraction` 统计比当前 actor 更新的版本。分母是
+**过滤前**的全部监督 token，不含 prompt 和 padding；各桶互斥，分母非零时比例之和为 1。先跨 worker 汇总 token
+计数，再计算比例，不平均各 worker 的比例。没有监督 token 时省略这些指标。
+
 新增诊断使用 `stat_compact`：每个指标在每个 batch 仅保留四个 float64 标量（掩码和、数量、最小、最大） 直到 export，避免原先约 106
 字节/padded token 的诊断张量长期留存。已有 PPO 指标仍有自身的全量张量， 诊断计算过程中也会临时分配逐 token
 张量。长上下文的峰值内存和运行时间仍需按实际 workload 验证。
