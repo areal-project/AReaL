@@ -1,0 +1,21 @@
+.github/workflows/bake-gcp-image.yml
+  s_e3766b82edfdba::t_31556aed42e11d 39
+.github/workflows/test-areal.yml
+  s_e3766b82edfdba::t_97c66052ebf2aa 43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c053ef52ff8d772ada1d0d5bf8c49c99c9f584ce",
+  "prompts": {},
+  "sessions": {
+    "s_e3766b82edfdba": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a464-6fe6-7f30-a7df-8a139deb0f01",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
