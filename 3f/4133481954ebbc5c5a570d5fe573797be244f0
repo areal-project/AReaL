@@ -1,0 +1,31 @@
+.github/workflows/tag-release-image.yml
+  s_e3766b82edfdba::t_632a4540af4d15 9
+docs/en/tutorial/installation.md
+  s_e3766b82edfdba::t_e77d6e8ff1f18d 27,45,49,57
+docs/zh/tutorial/installation.md
+  s_e3766b82edfdba::t_50459b0ef25feb 27,40,44,51
+examples/skypilot/README.md
+  s_e3766b82edfdba::t_f9f4fb85f617e6 28,81
+examples/skypilot/ray_cluster.sky.yaml
+  s_e3766b82edfdba::t_93f0e2ad185c23 4
+examples/skypilot/single_node.sky.yaml
+  s_e3766b82edfdba::t_29b282b296dca3 11
+pyproject.vllm.toml
+  s_e3766b82edfdba::t_175e5f16e8223a 27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3f4133481954ebbc5c5a570d5fe573797be244f0",
+  "prompts": {},
+  "sessions": {
+    "s_e3766b82edfdba": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a464-6fe6-7f30-a7df-8a139deb0f01",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
