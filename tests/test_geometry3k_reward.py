@@ -58,6 +58,18 @@ def test_geometry3k_literal_backslash_pair_does_not_introduce_box():
 
 
 @pytest.mark.parametrize(
+    "completion,gold",
+    [
+        (r"\boxed{\angle 108 \cong \angle 2}", r"\angle 8 \cong \angle 2"),
+        (r"\boxed{\angle 101 \cong \angle 4}", r"\angle 1 \cong \angle 4"),
+    ],
+)
+def test_geometry3k_angle_relation_does_not_fall_back_to_last_label(completion, gold):
+    """A shared last label must not hide an incorrect earlier angle label."""
+    assert geometry3k_reward_fn("", completion, [], [], gold) == 0.0
+
+
+@pytest.mark.parametrize(
     "completion, expected",
     [
         (r"\boxed{90}", "90"),
