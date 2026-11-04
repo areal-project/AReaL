@@ -1,0 +1,19 @@
+tests/test_score_centering.py
+  s_d4ac5fd4ca85e6::t_f7d53aa1b39b78 31-38,388,496
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8f05c72cc3d4d7f2abc6c23f2ac6e26163c460ad",
+  "prompts": {},
+  "sessions": {
+    "s_d4ac5fd4ca85e6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a4a5-0a3a-78d0-b12b-241acdb99f9c",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
