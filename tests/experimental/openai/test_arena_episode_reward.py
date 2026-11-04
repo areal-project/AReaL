@@ -106,6 +106,9 @@ async def test_arena_compacted_episode_scores_all_actions_once(
         async def __aexit__(self, *args):
             return None
 
+        async def discard_session(self):
+            return None
+
         async def set_last_reward(self, value):
             cache.set_last_reward(value)
 

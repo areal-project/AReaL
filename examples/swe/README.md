@@ -263,6 +263,14 @@ native validation can never fall through to GameAgent or Claude handling.
 - GameAgent accepts `AGENT_MAX_TURNS_EXCEEDED` and `AUTONOMOUS_INCOMPLETE_NO_SHIP`.
   Structured outcomes and log markers must agree; malformed fields cannot fall back to
   text. Response failures and run/response timeouts do not establish model attribution.
+- Native Rust Core deadlines (`AGENT_RUN_TIMEOUT` from `core_turn_deadline` or
+  `runner_deadline`) require a matching original `harness_result.json` from the current
+  task attempt. Arena may redact the API schema to `[REDACTED].envarena-outcome.v1`;
+  this only identifies a candidate. The original receipt must retain
+  `areal.envarena-outcome.v1` and corroborate the outcome, exit status and collection
+  health. Missing attempt identity, missing receipts, conflicting outcomes and provider
+  timeouts remain rejected. Pinned artifact lookups retry HTTP 404 up to three total
+  queries without changing attempts.
 - Legacy Claude requires its explicit agent-phase error envelope and a recognized
   context-limit or turn-limit error. If its error detail is empty, a typed context
   overflow recorded by the AReaL proxy may provide the missing attribution. Unknown

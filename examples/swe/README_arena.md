@@ -223,6 +223,13 @@ kills, and missing or invalid receipts remain rejected. Both recovery paths stil
 require usable interactions and are vetoed by proxy system errors; they do not turn
 setup or evaluation failures into zero rewards.
 
+The native AReaL runner also supports deadline recovery through
+`areal.envarena-outcome.v1 / AGENT_RUN_TIMEOUT`. Both `core_turn_deadline` and
+`runner_deadline` require a corroborating `harness_result.json` receipt; external
+signals, adapter/collection failures, bare timeout text, and conflicting receipts remain
+rejected. A valid deadline with usable exported interactions gets training reward zero
+while Arena retains its original terminal failure status.
+
 ## Per-task reward mappings
 
 For a Stream whose tasks use different original graders, set `reward_mapping_file` in

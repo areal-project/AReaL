@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in backport of https://github.com/sgl-project/sglang/pull/44014.
+"""Backport of https://github.com/sgl-project/sglang/pull/44014.
 
 SM90 decode must pass CUDA Graph padding (-1) to FlashInfer's indexed state
 pool API. Python gather/scatter instead aliases the last allocatable slot.
 Padded lanes can corrupt live or cached recurrent state and affect subsequent
 generation.
 
-This patch is not applied automatically. It must be run explicitly in the
-SGLang interpreter before starting SGLang servers::
+AReaL applies this patch before starting SGLang for Qwen GDN models. The
+standalone command can also prepare a writable SGLang installation::
 
     python -m areal.engine.sglang_gdn_decode_padding
 
-Requires a separately provisioned FlashInfer >= 0.6.18 runtime. The default
+Requires a separately provisioned FlashInfer >= 0.6.17 runtime. The default
 AReaL dependency pins are unchanged; their FlashInfer 0.6.7.post3 is rejected.
-Validated source profiles: SGLang 0.5.10.post1, 0.5.20, and the upstream PR
-base module. Unknown and locally modified sources are rejected before writing.
+Validated source profiles: SGLang 0.5.10.post1, 0.5.19.dev125+g119b5ffe4,
+0.5.20, and the upstream PR base module. Unknown and locally modified sources
+are rejected before writing. Read-only containers need a writable overlay
+(AReaL's Slurm workers already use ``--writable-tmpfs``).
 Use ``--target PATH`` to patch a disposable source copy without importing or
 checking the local GPU dependencies. Repeated application is write-free.
 """
@@ -32,7 +34,7 @@ from areal.engine._sglang_source_patch import (
 )
 
 TARGET_RELATIVE = Path("srt/layers/attention/linear/kernels/gdn_flashinfer.py")
-MIN_FLASHINFER_VERSION = (0, 6, 18)
+MIN_FLASHINFER_VERSION = (0, 6, 17)
 
 PINNED_OLD = """\
         else:
@@ -118,6 +120,12 @@ DYNAMIC_NEW = """\
 """
 
 _PATCHES = {
+    # SGLang 0.5.19.dev125+g119b5ffe4, FlashInfer 0.6.17.
+    "bf788d1a19d71cdb5ff05909a5725a47b7c487d6d06fd4ec1a1c4e551efd984a": (
+        PINNED_OLD,
+        PINNED_NEW,
+        "46dfb28361b837ae476ddfb4ab0424a803860857ab04c36dda2362749d47be6a",
+    ),
     "9534205439e1408129e9bfb38a2e2b963d030c08d287a493517531a5d2e6b749": (
         PINNED_OLD,
         PINNED_NEW,
@@ -159,11 +167,11 @@ def validate_flashinfer_version() -> None:
     try:
         installed = version("flashinfer-python")
     except PackageNotFoundError as exc:
-        raise RuntimeError("FlashInfer >= 0.6.18 is required for this patch") from exc
+        raise RuntimeError("FlashInfer >= 0.6.17 is required for this patch") from exc
     match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\.post\d+)?", installed)
     if match is None or tuple(map(int, match.groups())) < MIN_FLASHINFER_VERSION:
         raise RuntimeError(
-            f"FlashInfer >= 0.6.18 is required for this patch; found {installed}. "
+            f"FlashInfer >= 0.6.17 is required for this patch; found {installed}. "
             "Use a separately provisioned runtime before applying this backport."
         )
 

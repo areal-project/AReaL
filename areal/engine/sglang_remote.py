@@ -607,6 +607,12 @@ class SGLangBackend:
             )
 
         if awex_colocate or awex_meta_addr:
+            # Boolean false is omitted by the CLI serializer. Some SGLang
+            # builds default request logging to true, so carry the exact value
+            # to our entry point independently of SGLang's CLI defaults.
+            _env["AREAL_SGLANG_LOG_REQUESTS"] = (
+                "1" if server_args.get("log_requests", False) else "0"
+            )
             sglang_entrypoints = (
                 "sglang.launch_server",
                 "areal.v2.inference_service.sglang.launch_server",

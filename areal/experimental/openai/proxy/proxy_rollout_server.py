@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import hmac
 import inspect
 import json
@@ -53,11 +54,13 @@ from .server import (
     GRANT_CAPACITY_PATHNAME,
     OPENAI_CHAT_COMPLETIONS_PATHNAME,
     RESPONSES_PATHNAME,
+    RL_DISCARD_SESSION_PATHNAME,
     RL_END_PROCESSOR_CACHE_GROUP_PATHNAME,
     RL_END_SESSION_PATHNAME,
     RL_FETCH_SHARED_TENSORS_PATHNAME,
     RL_SET_REWARD_PATHNAME,
     RL_START_SESSION_PATHNAME,
+    DiscardSessionRequest,
     ExportTrajectoriesRequest,
     ExportTrajectoriesResponse,
     FetchSharedTensorsRequest,
@@ -98,15 +101,16 @@ def _deterministic_sampling_seed(session_id: str, request_index: int) -> int:
     return seeding.derive_deterministic_seed(session_id, request_index)
 
 
-def _warn_once(msg: str) -> None:
+def _warn_once(msg: str, *, key: str | None = None) -> None:
     """Log a warning message, optionally only once if AREAL_PROXY_WARN_ONCE=1."""
     if not _warn_once_enabled:
         logger.warning(msg)
         return
 
+    warning_key = msg if key is None else key
     with _warn_lock:
-        if msg not in _warned_messages:
-            _warned_messages.add(msg)
+        if warning_key not in _warned_messages:
+            _warned_messages.add(warning_key)
             logger.warning(msg)
 
 
@@ -123,6 +127,9 @@ _prm_runner = None
 # Session management
 _session_cache: dict[str, SessionData] = {}
 _session_invalid_tool_errors: dict[str, str] = {}
+# Retain creation receipts for the worker lifetime, including after session cleanup.
+# A late retry must never consume another admission credit or revive an old session.
+_session_creation_receipts: dict[str, tuple[str, StartSessionResponse]] = {}
 _lock = threading.Lock()
 _capacity = 0
 _last_cleanup_time: float = 0
@@ -619,9 +626,17 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
     a new one.  When the key already maps to a *finished* session on this
     worker, the stale mapping is cleaned up first.  If it maps to an
     *active* (unfinished) session, the request is rejected with HTTP 409.
+
+    An identical ``idempotency_key`` retry returns the original credentials
+    without consuming capacity. Changed parameters return 409; a completed,
+    expired, or rebound session returns 410. Creation receipts last for this
+    worker's lifetime so late retries cannot recreate cleaned-up sessions.
     """
     global _capacity
     task_id = request.task_id
+    request_fingerprint = hashlib.sha256(
+        json.dumps(request.model_dump(), sort_keys=True).encode()
+    ).hexdigest()
 
     if (
         request.processor_cache_group_id is not None
@@ -635,6 +650,27 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
     with _lock:
         # Periodically cleanup stale sessions
         _cleanup_stale_sessions()
+
+        if request.idempotency_key is not None:
+            receipt = _session_creation_receipts.get(request.idempotency_key)
+            if receipt is not None:
+                fingerprint, response = receipt
+                if fingerprint != request_fingerprint:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Session creation request ID was reused with different parameters",
+                    )
+                session = _session_cache.get(response.session_id)
+                if (
+                    session is None
+                    or session.is_completed
+                    or _session_to_api_key.get(response.session_id) != response.api_key
+                ):
+                    raise HTTPException(
+                        status_code=410,
+                        detail="Session creation request has already ended or expired",
+                    )
+                return response
 
         if _capacity <= 0:
             raise HTTPException(
@@ -694,8 +730,14 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
         _session_invalid_tool_errors.pop(session_id, None)
         _api_key_to_session[session_api_key] = session_id
         _session_to_api_key[session_id] = session_api_key
+        response = StartSessionResponse(session_id=session_id, api_key=session_api_key)
+        if request.idempotency_key is not None:
+            _session_creation_receipts[request.idempotency_key] = (
+                request_fingerprint,
+                response,
+            )
 
-    return StartSessionResponse(session_id=session_id, api_key=session_api_key)
+    return response
 
 
 @app.post(f"/{RL_END_SESSION_PATHNAME}")
@@ -730,6 +772,30 @@ def end_session(session_id: str = Depends(_require_session_key)):
         "system_error": session.system_error,
         "system_error_message": session.system_error_message,
     }
+
+
+@app.post(f"/{RL_DISCARD_SESSION_PATHNAME}", dependencies=[Depends(_require_admin_key)])
+def discard_session(request: DiscardSessionRequest):
+    """Idempotently release a session; creation receipts and credits stay unchanged."""
+    with _lock:
+        if request.idempotency_key is not None:
+            receipt = _session_creation_receipts.get(request.idempotency_key)
+            if (
+                receipt is None
+                or receipt[1].session_id != request.session_id
+                or _session_to_api_key.get(request.session_id) != receipt[1].api_key
+            ):
+                # A late cleanup must not remove a newer creation reusing the ID.
+                return {"message": "success"}
+        session = _session_cache.pop(request.session_id, None)
+        _session_invalid_tool_errors.pop(request.session_id, None)
+        _remove_api_keys_for_session(request.session_id)
+    if session is not None:
+        session.finish()
+        cache_group_id = session.take_processor_cache_group_id()
+        if cache_group_id is not None:
+            _processor_cache_registry.release(cache_group_id)
+    return {"message": "success"}
 
 
 @app.post(
@@ -1077,7 +1143,11 @@ async def _call_client_create(
         )
         _warn_once(
             f"dropped unsupported non-default arguments for areal client:\n"
-            f"{dropped_args_str}"
+            f"{dropped_args_str}",
+            # Request IDs and user values change every call. Deduplicate by the
+            # unsupported field names while retaining the first values in logs.
+            key="unsupported-client-args:"
+            + ",".join(sorted(k for k, _ in dropped_non_default_args)),
         )
 
     if "temperature" not in kwargs:

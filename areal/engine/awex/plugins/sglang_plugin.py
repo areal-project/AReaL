@@ -416,8 +416,15 @@ class AwexSchedulerPlugin:
                         mm_utils = importlib.import_module(
                             "sglang.srt.managers.mm_utils"
                         )
-                        if mm_utils.embedding_cache is not None:
-                            mm_utils.embedding_cache.clear()
+                        # Newer SGLang moved ownership to mm_schedule;
+                        # mm_utils only re-exports its initialization helper.
+                        cache_owner = mm_utils
+                        if not hasattr(cache_owner, "embedding_cache"):
+                            cache_owner = importlib.import_module(
+                                "sglang.srt.managers.mm_schedule"
+                            )
+                        if cache_owner.embedding_cache is not None:
+                            cache_owner.embedding_cache.clear()
                         self._visual_embeddings_initialized = (
                             self._visual_embeddings_frozen
                         )
@@ -1253,6 +1260,8 @@ if __name__ == "__main__":
 
     _load_sglang_plugins_if_available()
     server_args = prepare_server_args(sys.argv[1:])
+    if "AREAL_SGLANG_LOG_REQUESTS" in os.environ:
+        server_args.log_requests = os.environ["AREAL_SGLANG_LOG_REQUESTS"] == "1"
     # In AWEX colocated mode the scheduler may not be able to serve requests
     # until the first weight sync (actor holds GPUs / writer version not yet
     # published). SGLang's warmup request would then hang for 600s

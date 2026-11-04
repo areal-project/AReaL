@@ -573,6 +573,27 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             shared_tensor_resolver=self._shared_tensor_resolver,
             metadata=await self._get_agent_session_metadata(data),
         )
+        try:
+            return await self._arun_proxy_episode(proxy_client, engine, data)
+        finally:
+            # end_session preserves trajectories for export. Every other exit
+            # must discard them, including sample rejection and cancellation.
+            try:
+                await proxy_client.discard_session()
+            except Exception:
+                logger.warning(
+                    "Failed to discard proxy session %s; falling back to stale cleanup.",
+                    proxy_client.session_id,
+                    exc_info=True,
+                )
+
+    async def _arun_proxy_episode(
+        self,
+        proxy_client: OpenAIProxyClient,
+        engine: TRolloutEngine,
+        data: dict[str, Any],
+    ) -> dict[str, InteractionWithTokenLogpReward] | None:
+        task_id = workflow_context.get().task_id
         agent_error: Exception | None = None
         async with proxy_client:
             # Run the user code.
