@@ -1152,7 +1152,12 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                self.actor.ppo_update(adv_batch)
+                update_kwargs = (
+                    {"max_head_offpolicyness": config.rollout.max_head_offpolicyness}
+                    if config.rollout.mask_stale_tokens
+                    else {}
+                )
+                self.actor.ppo_update(adv_batch, **update_kwargs)
                 self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("ppo update")
 
