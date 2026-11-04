@@ -8,6 +8,7 @@ so scales describe the same final-layout shards as the transmitted weights.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from typing import Any
 
 import torch
@@ -199,35 +200,60 @@ class Qwen35FP8Policy:
                     "Qwen3.5 FP8 AWEX with PP>1 requires uniform projection exclusions across layers"
                 )
 
+    @staticmethod
+    def _uses_packed_deepgemm_scale(layer: torch.nn.Module) -> bool:
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.quantization.fp8_utils import (
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
+        )
+
+        method = getattr(layer, "quant_method", None)
+        return (
+            getattr(method, "w8a8_block_fp8_linear", None)
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and getattr(
+                getattr(method, "quant_config", None), "weight_block_size", None
+            )
+            == [128, 128]
+            and getattr(layer, "orig_dtype", None) == torch.bfloat16
+        )
+
     def validate_runtime(self, model: torch.nn.Module, server_args: Any) -> None:
-        if self.value(server_args, "fp8_gemm_runner_backend") != "triton":
+        backend = self.value(server_args, "fp8_gemm_runner_backend")
+        if backend not in ("triton", "deep_gemm"):
             raise ValueError(
-                "Qwen3.5 AWEX FP8 requires sglang.fp8_gemm_runner_backend=triton "
-                "to retain writable FP32 scale grids."
+                "Qwen3.5 AWEX FP8 requires an explicit "
+                "sglang.fp8_gemm_runner_backend=triton or deep_gemm."
             )
         params = dict(model.named_parameters())
         for name, tensor in params.items():
             if tensor.dtype != torch.float8_e4m3fn:
                 continue
-            if tensor.ndim < 2:
+            if tensor.ndim != 2 or any(size % 128 for size in tensor.shape):
                 raise ValueError(
-                    f"Unsupported FP8 tensor shape for {name}: {tensor.shape}"
+                    f"FP8 weight {name} must be a 2D matrix aligned to 128x128 blocks"
                 )
             scale = params.get(name + "_scale_inv")
+            packed = backend == "deep_gemm" and self._uses_packed_deepgemm_scale(
+                model.get_submodule(name.rpartition(".")[0])
+            )
             expected = (
-                *tensor.shape[:-2],
-                tensor.shape[-2] // 128,
-                tensor.shape[-1] // 128,
+                (tensor.shape[0], (tensor.shape[1] // 128 + 3) // 4)
+                if packed
+                else (tensor.shape[0] // 128, tensor.shape[1] // 128)
             )
             if (
-                any(size % 128 for size in tensor.shape[-2:])
-                or scale is None
-                or scale.dtype != torch.float32
+                scale is None
+                or scale.dtype != (torch.int32 if packed else torch.float32)
                 or tuple(scale.shape) != expected
-                or getattr(scale, "format_ue8m0", False)
+                or bool(getattr(scale, "format_ue8m0", False)) != packed
+                or scale.device != tensor.device
             ):
+                storage = "packed UE8M0 scales" if packed else "FP32 block grid"
                 raise ValueError(
-                    f"Unsupported FP8 weight/scale storage for {name}; expected an aligned weight and FP32 block grid"
+                    f"Unsupported FP8 weight/scale storage for {name}; expected {storage}. "
+                    "SGLang must finish processing checkpoint weights before AWEX initialization."
                 )
 
     @classmethod
@@ -286,6 +312,144 @@ class Qwen35FP8Policy:
                     f"A different Qwen3.5 AWEX adapter is already registered: {config['model_name']}"
                 )
             ModelRegistry.models[config["model_name"]] = entry
+
+
+class Qwen35FP8Receiver:
+    """Receive plain block scales without rebinding DeepGEMM runtime parameters.
+
+    Inference is paused while AWEX writes FP8 weights into their existing buffers.
+    Only packed scales need separate FP32 receive storage. Metadata discovery can
+    run while weights are offloaded, so allocate these small buffers lazily after
+    resume, then keep them alive with the reader's cached tensor views.
+    """
+
+    def __init__(self, model: torch.nn.Module, weight_names: set[str]):
+        self.model = model
+        params = dict(model.named_parameters())
+        self._targets = {
+            name: (weight, params[name + "_scale_inv"])
+            for name, weight in params.items()
+            if name in weight_names
+            and weight.dtype == torch.float8_e4m3fn
+            and params[name + "_scale_inv"].dtype == torch.int32
+        }
+        self._scales: dict[str, torch.Tensor] = {}
+        self._storage = {
+            name: (
+                parameter,
+                parameter.data_ptr(),
+                parameter.shape,
+                parameter.stride(),
+                parameter.dtype,
+                parameter.device,
+            )
+            for name, parameter in params.items()
+            if name in self._targets or name.removesuffix("_scale_inv") in self._targets
+        }
+
+    @property
+    def config(self) -> Any:
+        return self.model.config
+
+    def parameters(self) -> Iterator[torch.nn.Parameter]:
+        # The device-bound reader must inspect real parameters, never meta scales.
+        return self.model.parameters()
+
+    def named_parameters(
+        self, *, metadata_only: bool = False
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        for name, parameter in self.model.named_parameters():
+            target = self._targets.get(name.removesuffix("_scale_inv"))
+            if name.endswith("_scale_inv") and target is not None:
+                weight, _ = target
+                shape = (weight.shape[0] // 128, weight.shape[1] // 128)
+                if metadata_only:
+                    parameter = torch.empty(shape, dtype=torch.float32, device="meta")
+                else:
+                    if name not in self._scales:
+                        self._scales[name] = torch.empty(
+                            shape, dtype=torch.float32, device=weight.device
+                        )
+                    parameter = self._scales[name]
+            yield name, parameter
+
+    def export_parameters(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """Export runtime weights with matching block scales, never stale wire scales."""
+        self.validate_storage()
+        for name, parameter in self.model.named_parameters():
+            target = self._targets.get(name.removesuffix("_scale_inv"))
+            if name.endswith("_scale_inv") and target is not None:
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    _unpack_ue8m0_scale_for_triton,
+                )
+
+                parameter = _unpack_ue8m0_scale_for_triton(
+                    parameter, target[0].shape, [128, 128]
+                )
+            yield name, parameter
+
+    def validate_storage(self, model: torch.nn.Module | None = None) -> None:
+        if model is not None and model is not self.model:
+            raise RuntimeError(
+                "SGLang model changed; reinitialize AWEX after replacing the model."
+            )
+        params = dict(self.model.named_parameters())
+        for name, (
+            parameter,
+            pointer,
+            shape,
+            stride,
+            dtype,
+            device,
+        ) in self._storage.items():
+            current = params.get(name)
+            if (
+                current is not parameter
+                or current.data_ptr() != pointer
+                or current.shape != shape
+                or current.stride() != stride
+                or current.dtype != dtype
+                or current.device != device
+            ):
+                raise RuntimeError(
+                    f"DeepGEMM parameter storage changed for {name}; "
+                    "reinitialize AWEX and recapture CUDA graphs after replacing weights."
+                )
+
+    @torch.no_grad()
+    def finish_update(self) -> None:
+        if not self._targets:
+            return
+        from sglang.srt.layers.quantization.fp8_utils import requant_weight_ue8m0
+
+        self.validate_storage()
+        for name, (weight, packed_scale) in self._targets.items():
+            scale = self._scales.get(name + "_scale_inv")
+            if scale is None:
+                raise RuntimeError(f"No received FP32 scale buffer for {name}")
+            # Do not call the *_inplace helper: it rebinds parameter storage and
+            # invalidates both the AWEX views and captured CUDA graph addresses.
+            converted_weight, converted_scale = requant_weight_ue8m0(
+                weight, scale, [128, 128]
+            )
+            for target, converted in (
+                (weight, converted_weight),
+                (packed_scale, converted_scale),
+            ):
+                if (
+                    converted.shape != target.shape
+                    or converted.dtype != target.dtype
+                    or converted.device != target.device
+                ):
+                    raise RuntimeError(
+                        f"DeepGEMM converted storage mismatch for {name}"
+                    )
+            weight.copy_(converted_weight)
+            packed_scale.copy_(converted_scale)
+            del converted_weight, converted_scale, converted
+        # Some Qwen models have no post_load_weights hook. Completion must still
+        # precede the AWEX ready signal and resumption of inference on any stream.
+        torch.cuda.synchronize(weight.device)
 
 
 class _Qwen35FP8TrainConverter:
