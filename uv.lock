@@ -39,11 +39,6 @@ overrides = [
     { name = "transformers", specifier = ">=5.0.0,<=5.3.0" },
 ]
 
-[[manifest.dependency-metadata]]
-name = "megatron-bridge"
-version = "0.6.0"
-requires-dist = ["accelerate", "comet-ml>=3.50.0", "datasets>=2.20.0", "diffusers>=0.36.0", "einops", "fast-hadamard-transform>=1.1.0", "flash-linear-attention", "flashinfer-cubin==0.6.8.post1", "flashinfer-python==0.6.8.post1", "hydra-core>1.3,<=1.3.2", "megatron-core[dev,mlm]", "mistral-common>=1.10.0", "mlflow>=3.15.1", "nvidia-resiliency-ext", "omegaconf>=2.3.0", "open-clip-torch>=3.2.0", "peft>=0.18.1", "pyyaml>=6.0.2", "qwen-vl-utils", "regex>=2024.11.6", "rich", "six>=1.17.0", "tensorboard>=2.19.0", "timm", "torch>=2.6.0", "tqdm>=4.67.1", "transformers>=5.8,<=5.12.1", "typing-extensions", "wandb==0.27.2"]
-
 [[package]]
 name = "absl-py"
 version = "2.4.0"
@@ -368,7 +363,7 @@ wheels = [
 
 [[package]]
 name = "areal"
-version = "2.1.0"
+version = "2.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -3741,6 +3736,7 @@ wheels = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate" },
+    { name = "causal-conv1d", marker = "extra == 'ssm'" },
     { name = "comet-ml", specifier = ">=3.50.0" },
     { name = "datasets", specifier = ">=2.20.0" },
     { name = "diffusers", specifier = ">=0.36.0" },
@@ -3750,13 +3746,19 @@ requires-dist = [
     { name = "flashinfer-cubin", specifier = "==0.6.8.post1" },
     { name = "flashinfer-python", specifier = "==0.6.8.post1" },
     { name = "hydra-core", specifier = ">1.3,<=1.3.2" },
+    { name = "librosa", marker = "extra == 'audio'" },
+    { name = "mamba-ssm", marker = "extra == 'ssm'" },
     { name = "megatron-core", extras = ["dev", "mlm"] },
     { name = "mistral-common", specifier = ">=1.10.0" },
     { name = "mlflow", specifier = ">=3.15.1" },
+    { name = "nemo-run", marker = "extra == 'recipes'" },
+    { name = "nvdlfw-inspect", marker = "extra == 'tensor-inspect'", specifier = "==0.2.1" },
     { name = "nvidia-resiliency-ext" },
     { name = "omegaconf", specifier = ">=2.3.0" },
     { name = "open-clip-torch", specifier = ">=3.2.0" },
+    { name = "peft", specifier = ">=0.18.0" },
     { name = "peft", specifier = ">=0.18.1" },
+    { name = "pyarrow", marker = "extra == 'parquet'", specifier = ">=14.0.0" },
     { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "qwen-vl-utils" },
     { name = "regex", specifier = ">=2024.11.6" },
@@ -3766,10 +3768,12 @@ requires-dist = [
     { name = "timm" },
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'" },
     { name = "transformers", specifier = ">=5.8,<=5.12.1" },
     { name = "typing-extensions" },
     { name = "wandb", specifier = "==0.27.2" },
 ]
+provides-extras = ["recipes", "parquet", "tensor-inspect", "te", "ssm", "audio"]
 
 [[package]]
 name = "megatron-core"
