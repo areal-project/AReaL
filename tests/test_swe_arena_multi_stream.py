@@ -699,26 +699,35 @@ def test_workflow_routes_harness_transform_and_raw_metrics(
     assert stats["rollout/training_score"] == pytest.approx(0.75)
     assert stats["rollout/arena_raw_present"] == 1.0
     assert stats["rollout/stream/b/arena_score"] == pytest.approx(0.5)
-    assert stats["rollout/reward_sub_score/quality"] == pytest.approx(0.25)
-    assert stats["rollout/stream/b/reward_sub_score/quality"] == pytest.approx(0.25)
-    assert stats["rollout/reward_sub_score/invalid_entries"] == 0.0
-    assert stats["rollout/reward_observation/present"] == float(with_observation)
-    if with_observation:
-        for prefix in ("rollout", "rollout/stream/b"):
-            assert stats[f"{prefix}/reward_observation/valid"] == 1.0
-            for field, expected in (
-                ("value", 0.25),
-                ("weight", 0.8),
-                ("contribution", 0.2),
-                ("share", 0.4),
-            ):
-                assert stats[
-                    f"{prefix}/reward_observation/components/quality/{field}"
-                ] == pytest.approx(expected)
-            assert (
-                stats[f"{prefix}/reward_observation/diagnostics/output_length"]
-                == 1234.0
+    prefix = "rollout/stream/b"
+    assert stats[f"{prefix}/reward_sub_score/quality"] == pytest.approx(0.25)
+    assert stats[f"{prefix}/reward_sub_score/invalid_entries"] == 0.0
+    assert stats[f"{prefix}/reward_observation/present"] == float(with_observation)
+    assert stats[f"{prefix}/reward_breakdown/present"] == 0.0
+    assert stats[f"{prefix}/reward_breakdown/valid"] == 0.0
+    assert not any(
+        key.startswith(
+            (
+                "rollout/reward_sub_score/",
+                "rollout/reward_observation/",
+                "rollout/reward_breakdown/",
+                "rollout/stream/a/reward_",
             )
+        )
+        for key in stats
+    )
+    if with_observation:
+        assert stats[f"{prefix}/reward_observation/valid"] == 1.0
+        for field, expected in (
+            ("value", 0.25),
+            ("weight", 0.8),
+            ("contribution", 0.2),
+            ("share", 0.4),
+        ):
+            assert stats[
+                f"{prefix}/reward_observation/components/quality/{field}"
+            ] == pytest.approx(expected)
+        assert stats[f"{prefix}/reward_observation/diagnostics/output_length"] == 1234.0
     dump_files = list((tmp_path / "arena-results").glob("arena_results_*.jsonl"))
     assert len(dump_files) == 1
     dump_record = json.loads(dump_files[0].read_text(encoding="utf-8"))
