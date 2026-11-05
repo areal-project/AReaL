@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import math
@@ -35,6 +36,7 @@ from examples.swe.arena_reward_mapping import load_harness_mapping, load_reward_
 from examples.swe.arena_types import ArenaRewardRefConfig, ArenaStreamConfig
 
 from areal.experimental.openai.proxy.workflow import HARNESS_OUTCOME_METRIC_CODES
+from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.infra import workflow_context
 from areal.utils import logging, stats_tracker
 from areal.utils.dynamic_import import import_from_string
@@ -85,6 +87,10 @@ _HARNESS_SYSTEM_ERROR_PATTERN = re.compile(
 _GAMEAGENT_OUTCOME_METRIC_CODES = tuple(sorted(HARNESS_OUTCOME_METRIC_CODES))
 _WORKER_GATEWAY_REGISTRY_ATTR = "_arena_session_gateway_registry_v1"
 _WORKER_GATEWAY_CLEANUP_KEY = "arena-session-gateway-registrations"
+_PROXY_INVALID_TOOL_JSON_MESSAGE = InvalidToolCallError.message.encode("utf-8")
+_PROXY_INVALID_TOOL_JSON_SHA256 = hashlib.sha256(
+    _PROXY_INVALID_TOOL_JSON_MESSAGE
+).hexdigest()
 
 
 def _record_arena_metrics(**metrics: float) -> None:
@@ -854,11 +860,105 @@ class ArenaStreamAgentWorkflow:
             and raw.get("failure") is None
         )
 
+    @staticmethod
+    def _core_terminal_failure_error(receipt: dict[str, Any]) -> dict[str, Any] | None:
+        """Validate a completed prefix followed by one failed Core turn."""
+        turns = receipt.get("turn_statuses")
+        errors = receipt.get("error")
+        if (
+            not isinstance(turns, list)
+            or not turns
+            or turns[-1] != "failed"
+            or any(turn != "completed" for turn in turns[:-1])
+            or not isinstance(errors, list)
+            or len(errors) != len(turns)
+            or any(error is not None for error in errors[:-1])
+        ):
+            return None
+        # Completed turns have no error; the final failed turn owns the outcome.
+        # The continuation budget belongs to the runner, not failure attribution.
+        multiple_turns = len(turns) > 1
+        if multiple_turns or "continuations" in receipt:
+            continuations = receipt.get("continuations")
+            if type(continuations) is not int or continuations != len(turns) - 1:
+                return None
+        delivery = receipt.get("delivery")
+        if not multiple_turns:
+            if delivery is not None:
+                return None
+        elif (
+            "delivery" not in receipt
+            or (
+                delivery is not None
+                and (
+                    not isinstance(delivery, dict)
+                    or delivery.get("status") != "incomplete"
+                )
+            )
+            or receipt.get("failure") is not None
+            or any(
+                receipt.get(flag, False) is not False
+                for flag in (
+                    "observed_runner_timeout",
+                    "observed_external_interruption",
+                )
+            )
+            or (
+                "collection" in receipt
+                and (
+                    not isinstance(receipt["collection"], dict)
+                    or receipt["collection"].get("status") != "OK"
+                )
+            )
+        ):
+            return None
+        terminal_error = errors[-1]
+        if (
+            not isinstance(terminal_error, dict)
+            or not isinstance(terminal_error.get("message"), str)
+            or not terminal_error["message"]
+        ):
+            return None
+        return terminal_error
+
+    @staticmethod
+    def _core_terminal_diagnostics_match(details: Any, *, tool_failure: bool) -> bool:
+        """Reject service hints and bind legacy tool failures to the last turn."""
+        if not isinstance(details, dict):
+            return False
+        signals = details.get("diagnosticSignals")
+        if signals is not None and (
+            not isinstance(signals, dict)
+            or any(
+                signals.get(hint, False) is not False
+                for hint in ("authenticationHint", "overloadHint", "rateLimitHint")
+            )
+        ):
+            return False
+        if tool_failure and not (
+            details.get("code") == "invalid_tool_json"
+            or details.get("reason") == "invalid_tool_json"
+        ):
+            # A session flag may refer to an earlier, completed turn. The
+            # legacy Core drops our code, so bind its terminal diagnostic
+            # to the exact typed proxy error instead of guessing from it.
+            if (
+                not isinstance(signals, dict)
+                or signals.get("messageSha256") != _PROXY_INVALID_TOOL_JSON_SHA256
+                or any(
+                    type(signals.get(field)) is not int
+                    or signals[field] != len(_PROXY_INVALID_TOOL_JSON_MESSAGE)
+                    for field in ("messageBytes", "messageScannedChars")
+                )
+            ):
+                return False
+        return True
+
     @classmethod
     def _is_core_agent_zero_failure(
         cls, raw: Any, receipt: Any, *, invalid_tool_json: bool = False
     ) -> bool:
-        """Require a matching native receipt for model or context exhaustion."""
+        """Match the terminal model failure, including completed continuations."""
         message = cls._core_model_zero_failure_message(raw)
         if message is None:
             message = cls._core_context_zero_failure_message(raw)
@@ -873,34 +973,30 @@ class ArenaStreamAgentWorkflow:
             or receipt.get("status") != "ERROR"
             or type(receipt.get("exit_code")) is not int
             or receipt["exit_code"] != 1
-            or receipt.get("turn_statuses") != ["failed"]
-            or receipt.get("delivery") is not None
             or receipt.get("summary") != raw["harness"]["summary"]
         ):
             return False
-        errors = receipt.get("error")
+        terminal_error = cls._core_terminal_failure_error(receipt)
+        if terminal_error is None:
+            return False
+        multiple_turns = len(receipt["turn_statuses"]) > 1
         if (
-            not isinstance(errors, list)
-            or len(errors) != 1
-            or not isinstance(errors[0], dict)
-            or not isinstance(errors[0].get("message"), str)
-            or not errors[0]["message"]
-            or (
-                message is not None
-                and errors[0]["message"] != message
-                and not (
-                    message == "model stopped with reason: length"
-                    and errors[0]["message"]
-                    == "provider terminal response includes final usage"
-                )
+            message is not None
+            and terminal_error["message"] != message
+            and not (
+                message == "model stopped with reason: length"
+                and terminal_error["message"]
+                == "provider terminal response includes final usage"
             )
         ):
             return False
-        if tool_failure and _HARNESS_SYSTEM_ERROR_PATTERN.search(errors[0]["message"]):
+        if (tool_failure or multiple_turns) and _HARNESS_SYSTEM_ERROR_PATTERN.search(
+            terminal_error["message"]
+        ):
             return False
         expected = raw["outcome"]
         for outcome in (
-            errors[0].get("outcome"),
+            terminal_error.get("outcome"),
             receipt.get("raw", {}).get("outcome")
             if isinstance(receipt.get("raw"), dict)
             else None,
@@ -910,7 +1006,9 @@ class ArenaStreamAgentWorkflow:
                 for field in ("code", "class", "source", "details")
             ):
                 return False
-        return True
+        return not multiple_turns or cls._core_terminal_diagnostics_match(
+            expected.get("details"), tool_failure=tool_failure
+        )
 
     @staticmethod
     def _is_abbreviated_runner_failure(raw: Any) -> bool:
@@ -1404,7 +1502,7 @@ class ArenaStreamAgentWorkflow:
         data: dict[str, Any],
         reward: float,
     ) -> None:
-        """Record terminal result metrics after a valid interaction export."""
+        """Record reward metrics after a valid interaction export."""
         result = self._task_result.get()
         stream_config = self._stream_config_for_data(data)
         arena_task_type = _arena_task_type(data)
@@ -1412,20 +1510,6 @@ class ArenaStreamAgentWorkflow:
             "training_score": float(reward),
             f"stream/{stream_config.name}/training_score": float(reward),
         }
-        is_harness_error = result is not None and result.status == "HARNESS_FAILED"
-        is_harness_success = result is not None and result.status in {"DONE", "OK"}
-        outcome_code = (
-            self._gameagent_outcome_metric_code(result.raw)
-            if is_harness_error and result is not None
-            else None
-        )
-        metrics["harness_success"] = float(is_harness_success)
-        metrics["harness_error"] = float(is_harness_error)
-        for code in _GAMEAGENT_OUTCOME_METRIC_CODES:
-            metrics[f"harness_error/{code}"] = float(outcome_code == code)
-        metrics["harness_error/OTHER"] = float(
-            is_harness_error and outcome_code not in _GAMEAGENT_OUTCOME_METRIC_CODES
-        )
         if result is not None and result.score is not None:
             metrics.update(
                 {
@@ -1578,6 +1662,60 @@ class ArenaStreamAgentWorkflow:
         self._task_result.set(None)
         self._task_result_dumped.set(False)
         self._proxy_session_id.set("")
+        error: BaseException | None = None
+        try:
+            return await self._run_task(data, **extra_kwargs)
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            self._record_attempt_metrics(error)
+
+    def _record_attempt_metrics(self, error: BaseException | None) -> None:
+        """Count calls and observed terminal results before trajectory filtering.
+
+        Local cancellation/timeouts do not establish the remote task's outcome.
+        Keep them in the call denominator, outside the terminal-result denominator.
+        """
+        cancelled = isinstance(error, asyncio.CancelledError)
+        metrics = {
+            "task_attempt/success": float(error is None),
+            "task_attempt/error": float(error is not None and not cancelled),
+            "task_attempt/cancelled": float(cancelled),
+        }
+        result = self._task_result.get()
+        status = result.status if result is not None else None
+        if isinstance(error, ArenaTaskFailedError):
+            status = error.status
+            result = error.result or result
+        terminal_statuses = ArenaOpenAPIClient.FAILED_TASK_STATUSES | {"DONE", "OK"}
+        if status in terminal_statuses:
+            is_harness_error = status == "HARNESS_FAILED"
+            success = status in {"DONE", "OK"}
+            outcome_code = (
+                self._gameagent_outcome_metric_code(result.raw)
+                if is_harness_error and result is not None
+                else None
+            )
+            metrics["harness_success"] = float(success)
+            metrics["harness_error"] = float(is_harness_error)
+            metrics["task_error"] = float(not success)
+            for terminal_status in sorted(terminal_statuses):
+                metrics[f"task_status/{terminal_status}"] = float(
+                    status == terminal_status
+                )
+            for code in _GAMEAGENT_OUTCOME_METRIC_CODES:
+                metrics[f"harness_error/{code}"] = float(outcome_code == code)
+            metrics["harness_error/OTHER"] = float(
+                is_harness_error and outcome_code not in _GAMEAGENT_OUTCOME_METRIC_CODES
+            )
+        _record_arena_metrics(**metrics)
+
+    async def _run_task(
+        self,
+        data: dict[str, Any],
+        **extra_kwargs: Any,
+    ) -> float:
         stream_config = self._stream_config_for_data(data)
         stream_id = str(data.get("stream_id") or stream_config.stream_id or "")
         data_id = str(data.get("data_id") or "")
