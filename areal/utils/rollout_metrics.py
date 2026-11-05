@@ -70,10 +70,18 @@ class ConsumedMetrics:
             if values:
                 result[key] = sum(values) / len(values)
                 result[f"{key}__count"] = len(values)
-        # StatsLogger hides internal __count companions. Publish the two main
-        # denominators explicitly so dashboards can distinguish episodes/groups.
+        # StatsLogger hides internal __count companions. Publish denominators
+        # explicitly so dashboards can distinguish episodes, groups and Arena calls.
         if "rollout/reward" in metrics:
             result["rollout/reward_sample_count"] = len(metrics["rollout/reward"])
         if "rollout/accepted" in metrics:
             result["rollout/group_attempt_count"] = len(metrics["rollout/accepted"])
+        if "rollout/task_attempt/success" in metrics:
+            result["rollout/task_attempt_count"] = len(
+                metrics["rollout/task_attempt/success"]
+            )
+        if "rollout/harness_success" in metrics:
+            result["rollout/task_result_count"] = len(
+                metrics["rollout/harness_success"]
+            )
         return result

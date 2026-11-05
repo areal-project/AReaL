@@ -1502,7 +1502,7 @@ class ArenaStreamAgentWorkflow:
         data: dict[str, Any],
         reward: float,
     ) -> None:
-        """Record terminal result metrics after a valid interaction export."""
+        """Record reward metrics after a valid interaction export."""
         result = self._task_result.get()
         stream_config = self._stream_config_for_data(data)
         arena_task_type = _arena_task_type(data)
@@ -1510,20 +1510,6 @@ class ArenaStreamAgentWorkflow:
             "training_score": float(reward),
             f"stream/{stream_config.name}/training_score": float(reward),
         }
-        is_harness_error = result is not None and result.status == "HARNESS_FAILED"
-        is_harness_success = result is not None and result.status in {"DONE", "OK"}
-        outcome_code = (
-            self._gameagent_outcome_metric_code(result.raw)
-            if is_harness_error and result is not None
-            else None
-        )
-        metrics["harness_success"] = float(is_harness_success)
-        metrics["harness_error"] = float(is_harness_error)
-        for code in _GAMEAGENT_OUTCOME_METRIC_CODES:
-            metrics[f"harness_error/{code}"] = float(outcome_code == code)
-        metrics["harness_error/OTHER"] = float(
-            is_harness_error and outcome_code not in _GAMEAGENT_OUTCOME_METRIC_CODES
-        )
         if result is not None and result.score is not None:
             metrics.update(
                 {
@@ -1676,6 +1662,60 @@ class ArenaStreamAgentWorkflow:
         self._task_result.set(None)
         self._task_result_dumped.set(False)
         self._proxy_session_id.set("")
+        error: BaseException | None = None
+        try:
+            return await self._run_task(data, **extra_kwargs)
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            self._record_attempt_metrics(error)
+
+    def _record_attempt_metrics(self, error: BaseException | None) -> None:
+        """Count calls and observed terminal results before trajectory filtering.
+
+        Local cancellation/timeouts do not establish the remote task's outcome.
+        Keep them in the call denominator, outside the terminal-result denominator.
+        """
+        cancelled = isinstance(error, asyncio.CancelledError)
+        metrics = {
+            "task_attempt/success": float(error is None),
+            "task_attempt/error": float(error is not None and not cancelled),
+            "task_attempt/cancelled": float(cancelled),
+        }
+        result = self._task_result.get()
+        status = result.status if result is not None else None
+        if isinstance(error, ArenaTaskFailedError):
+            status = error.status
+            result = error.result or result
+        terminal_statuses = ArenaOpenAPIClient.FAILED_TASK_STATUSES | {"DONE", "OK"}
+        if status in terminal_statuses:
+            is_harness_error = status == "HARNESS_FAILED"
+            success = status in {"DONE", "OK"}
+            outcome_code = (
+                self._gameagent_outcome_metric_code(result.raw)
+                if is_harness_error and result is not None
+                else None
+            )
+            metrics["harness_success"] = float(success)
+            metrics["harness_error"] = float(is_harness_error)
+            metrics["task_error"] = float(not success)
+            for terminal_status in sorted(terminal_statuses):
+                metrics[f"task_status/{terminal_status}"] = float(
+                    status == terminal_status
+                )
+            for code in _GAMEAGENT_OUTCOME_METRIC_CODES:
+                metrics[f"harness_error/{code}"] = float(outcome_code == code)
+            metrics["harness_error/OTHER"] = float(
+                is_harness_error and outcome_code not in _GAMEAGENT_OUTCOME_METRIC_CODES
+            )
+        _record_arena_metrics(**metrics)
+
+    async def _run_task(
+        self,
+        data: dict[str, Any],
+        **extra_kwargs: Any,
+    ) -> float:
         stream_config = self._stream_config_for_data(data)
         stream_id = str(data.get("stream_id") or stream_config.stream_id or "")
         data_id = str(data.get("data_id") or "")
