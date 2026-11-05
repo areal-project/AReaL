@@ -38,17 +38,19 @@ class ProxLogpMethod(str, Enum):
 
     Attributes:
         RECOMPUTE: Standard decoupled PPO - recompute via forward pass.
+        REUSE: Reuse detached logprobs from the training forward pass.
         LOGLINEAR: Use log-linear approximation (skip forward pass).
         METRICS: Recompute + compute approximation metrics for evaluation.
     """
 
     RECOMPUTE = "recompute"
+    REUSE = "reuse"
     LOGLINEAR = "loglinear"
     METRICS = "metrics"
 
     def skips_forward_pass(self) -> bool:
         """Return True if this method skips the forward pass (optimization enabled)."""
-        return self == ProxLogpMethod.LOGLINEAR
+        return self in (ProxLogpMethod.REUSE, ProxLogpMethod.LOGLINEAR)
 
 
 class ProxApproxMethod(str, Enum):
@@ -72,6 +74,7 @@ class ProxApproxMethod(str, Enum):
 
 # Proximal log-probability computation methods for decoupled PPO
 PROX_LOGP_METHOD_RECOMPUTE = ProxLogpMethod.RECOMPUTE.value
+PROX_LOGP_METHOD_REUSE = ProxLogpMethod.REUSE.value
 PROX_LOGP_METHOD_LOGLINEAR = ProxLogpMethod.LOGLINEAR.value
 PROX_LOGP_METHOD_METRICS = ProxLogpMethod.METRICS.value
 

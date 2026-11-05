@@ -13,7 +13,7 @@ from areal.experimental.training_service.controller.controller import (
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.trainer.ppo.loss_reduction import prepare_policy_gradient_batch
-from areal.trainer.ppo.stats import infer_token_denominator
+from areal.trainer.ppo.stats import infer_token_denominator, log_train_inference_stats
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
     PROX_APPROX_METHOD_LINEAR,
@@ -23,6 +23,7 @@ from areal.utils.constants import (
     PROX_LOGP_METHOD_LOGLINEAR,
     PROX_LOGP_METHOD_METRICS,
     PROX_LOGP_METHOD_RECOMPUTE,
+    PROX_LOGP_METHOD_REUSE,
     ProxLogpMethod,
 )
 from areal.utils.data import (
@@ -43,6 +44,7 @@ from areal.utils.functional import (
 )
 from areal.utils.functional.loss_aggregation import PolicyGradientReduction
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.stats_tracker import ReduceType
 
 logger = logging.getLogger("PPOActor")
 
@@ -115,6 +117,7 @@ class PPOActor:
             # Log proximal policy computation method
             method_descriptions = {
                 PROX_LOGP_METHOD_RECOMPUTE: "RECOMPUTED via forward pass (standard decoupled PPO)",
+                PROX_LOGP_METHOD_REUSE: "REUSE TRAINING FORWARD PASS (detached, no extra forward)",
                 PROX_LOGP_METHOD_LOGLINEAR: "LOG-LINEAR APPROXIMATION (no forward pass)",
                 PROX_LOGP_METHOD_METRICS: "RECOMPUTED + APPROXIMATION METRICS (for evaluation)",
             }
@@ -231,7 +234,14 @@ class PPOActor:
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
+        behavior_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
         # Apply the mask to log probabilities.
+        if data.get("prox_logp") is not None:
+            log_train_inference_stats(
+                data["prox_logp"],
+                behavior_logp,
+                loss_mask.bool(),
+            )
         if not self.config.use_decoupled_loss and self.config.recompute_logprob:
             # Overwrite logprobs produced by the inference engine
             prox_logp_value = data["prox_logp"]
@@ -240,9 +250,13 @@ class PPOActor:
                     "prox_logp is None but recompute_logprob=True. "
                     "This indicates compute_logp() was skipped incorrectly."
                 )
+            # Preserve the inference-engine log probabilities before standard PPO
+            # replaces them with the trainer-side recomputation.
+            behavior_logp *= loss_mask
+            data["behavior_logp"] = behavior_logp
             old_logp = data["logprobs"] = prox_logp_value
         else:
-            old_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
+            old_logp = behavior_logp
             if not self.config.use_decoupled_loss:
                 # prox logp not available, use inferenced logp
                 data["prox_logp"] = old_logp
@@ -372,6 +386,13 @@ class PPOActor:
             final_reward=data["tot_rewards"],
         )
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
+        stats_tracker.stat_compact(
+            loss_mask.bool(),
+            ReduceType.AVG,
+            advantage_positive_fraction=(data["advantages"] > 0).float(),
+            advantage_negative_fraction=(data["advantages"] < 0).float(),
+            advantage_zero_fraction=(data["advantages"] == 0).float(),
+        )
 
         prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
         seq_stats = dict(
@@ -381,6 +402,16 @@ class PPOActor:
             seq_len=seqlens.float(),
         )
         stats_tracker.stat(**seq_stats, denominator="n_seqs")
+        if "versions" in data:
+            # Regular advantage preprocessing retains raw
+            # token-position versions. Align only the diagnostic copy here;
+            # changing proximal approximation requires separate validation.
+            metric_versions = torch.roll(data["versions"], shifts=-1, dims=-1)
+            metric_versions[..., -1] = -1
+            with stats_tracker.scope("update"):
+                _log_version_staleness_stats(
+                    metric_versions, self.engine.get_version(), loss_mask.bool()
+                )
         scalars = dict(
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
             eps_clip=self.config.eps_clip,
@@ -616,6 +647,8 @@ def grpo_loss_fn(
     pg_reduction: PolicyGradientReduction | None = None,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
+    vocab_mean_logits: torch.Tensor | None = None,
+    vocab_norm_logits: torch.Tensor | None = None,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -636,6 +669,27 @@ def grpo_loss_fn(
         versions=input_data.get("versions"),
         current_version=current_version,
     )
+
+    if prox_logp_method == PROX_LOGP_METHOD_REUSE:
+        with stats_tracker.disable_scope():
+            log_train_inference_stats(prox_logp, old_logp, denominator_mask)
+
+    # Compare sampled-token probabilities from the rollout behavior policy and
+    # the exact proximal policy before M2PO or rollout correction changes the
+    # valid mask. Reuse obtains the proximal value from the detached training
+    # forward rather than from prox_logp_gt.
+    behavior_logp = input_data.get("behavior_logp")
+    if behavior_logp is None and use_decoupled_loss:
+        behavior_logp = old_logp
+    metric_prox_logp = prox_logp_gt
+    if prox_logp_method == PROX_LOGP_METHOD_REUSE:
+        metric_prox_logp = prox_logp
+    rollout_probs_diff = None
+    if behavior_logp is not None and metric_prox_logp is not None:
+        rollout_probs_diff = torch.abs(
+            torch.exp(metric_prox_logp.detach().float())
+            - torch.exp(behavior_logp.detach().float())
+        )
 
     # Apply M2PO masking if threshold is set
     if m2_threshold is not None:
@@ -756,6 +810,15 @@ def grpo_loss_fn(
         dual_clipped_tokens=stat["dual_clip_mask"],
     )
 
+    if rollout_probs_diff is not None:
+        stats_tracker.denominator(
+            rollout_probs_diff_tokens=denominator_mask,
+        )
+        stats_tracker.stat(
+            rollout_probs_diff=rollout_probs_diff,
+            denominator="rollout_probs_diff_tokens",
+        )
+
     if rkl_stat is not None:
         stats_tracker.stat(
             rkl_loss=rkl_stat,
@@ -838,15 +901,6 @@ def grpo_loss_fn(
         current_version=current_version,
         compute_logp_mask=compute_logp_mask,
     )
-
-    # Log version staleness metrics
-    if "versions" in input_data and current_version is not None:
-        version_metrics_mask = stat.get("behave_mask", loss_mask)
-        _log_version_staleness_stats(
-            versions=input_data["versions"],
-            current_version=current_version,
-            version_metrics_mask=version_metrics_mask,
-        )
 
     return loss
 
@@ -1006,7 +1060,7 @@ def _resolve_proximal_logp(
 
     Args:
         prox_logp_gt: Ground truth proximal logp (from forward pass), or None if skipped.
-        prox_logp_method: Method to use (recompute, loglinear, metrics).
+        prox_logp_method: Method to use (recompute, reuse, loglinear, metrics).
         old_logp: Behavior policy log-probabilities.
         logprobs: Current policy log-probabilities (should be detached).
         versions: Per-token policy versions, or None.
@@ -1028,7 +1082,7 @@ def _resolve_proximal_logp(
                 f"prox_logp is None but prox_logp_method='{prox_logp_method}'. "
                 "This indicates compute_logp() was skipped incorrectly."
             )
-        if versions is None:
+        if prox_logp_method != PROX_LOGP_METHOD_REUSE and versions is None:
             raise ValueError(
                 f"prox_logp is None with prox_logp_method='{prox_logp_method}' "
                 "but versions not available. "
@@ -1038,7 +1092,10 @@ def _resolve_proximal_logp(
     # Determine prox_logp based on method
     prox_logp = prox_logp_gt  # Default to ground truth (could be None)
 
-    if prox_logp_method == PROX_LOGP_METHOD_LOGLINEAR:
+    if prox_logp_method == PROX_LOGP_METHOD_REUSE:
+        # With one PPO minibatch, the training policy is also the proximal policy.
+        prox_logp = logprobs.detach()
+    elif prox_logp_method == PROX_LOGP_METHOD_LOGLINEAR:
         # Use loglinear approximation (must compute if prox_logp is None)
         if prox_logp_is_none and versions is not None and current_version is not None:
             approximations = compute_prox_logp_approximations(
@@ -1377,39 +1434,48 @@ def _log_version_staleness_stats(
     Log sample staleness metrics based on policy versions.
 
     Args:
-        versions: Per-token policy versions from rollout.
-        current_version: Current training version.
-        version_metrics_mask: Mask for valid tokens.
+        versions: Rollout versions aligned to next-token prediction positions.
+        current_version: Last published policy version, before the PPO update.
+        version_metrics_mask: Batch loss mask before M2/rejection filtering.
     """
     with stats_tracker.scope("version_stats"):
-        stats_tracker.denominator(n_valid_tokens=version_metrics_mask.bool())
+        valid_generated_mask = version_metrics_mask.bool() & (versions >= 0)
 
-        v_proximal = current_version - 1
+        # The trainer publishes actor and rollout versions together AFTER an
+        # update. Before the next update, proximal uses that published version.
+        # Retain theta/proximal keys as aliases for checkpoint age, not an
+        # optimizer-minibatch counter.
+        v_proximal = current_version
         v_theta = current_version
         v_behave = versions.float()
 
-        # Filter to generated tokens only (version >= 0)
-        valid_generated_mask = version_metrics_mask & (versions >= 0)
-
-        if not valid_generated_mask.any():
-            return
-
-        # Compute staleness for valid tokens
-        staleness_proximal = (v_proximal - v_behave)[valid_generated_mask]
-        staleness_theta = (v_theta - v_behave)[valid_generated_mask]
-
-        # Compute and log statistics
-        proximal_stats = _tensor_scalar_stats(staleness_proximal)
-        theta_stats = _tensor_scalar_stats(staleness_theta)
-
+        # Retain full shapes and reduce by token count, not microbatch count.
+        # In particular, extrema must not be averaged across workers.
+        for suffix, reduction in (
+            ("avg", ReduceType.AVG),
+            ("min", ReduceType.MIN),
+            ("max", ReduceType.MAX),
+        ):
+            stats_tracker.stat_compact(
+                valid_generated_mask,
+                reduction,
+                **{
+                    f"sample_staleness_proximal_{suffix}": v_proximal - v_behave,
+                    f"sample_staleness_theta_{suffix}": v_theta - v_behave,
+                },
+            )
+        stats_tracker.stat_compact(
+            valid_generated_mask,
+            ReduceType.SUM,
+            n_valid_generated_tokens=torch.ones_like(v_behave),
+        )
+        stats_tracker.stat_compact(
+            valid_generated_mask,
+            ReduceType.AVG,
+            stale_token_fraction=(v_behave < v_proximal).float(),
+            future_token_fraction=(v_behave > v_theta).float(),
+        )
         stats_tracker.scalar(
-            sample_staleness_proximal_avg=proximal_stats["avg"],
-            sample_staleness_proximal_max=proximal_stats["max"],
-            sample_staleness_proximal_min=proximal_stats["min"],
-            sample_staleness_theta_avg=theta_stats["avg"],
-            sample_staleness_theta_max=theta_stats["max"],
-            sample_staleness_theta_min=theta_stats["min"],
             v_theta=v_theta,
             v_proximal=v_proximal,
-            n_valid_generated_tokens=valid_generated_mask.sum().item(),
         )

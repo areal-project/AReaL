@@ -8,11 +8,9 @@ import dataclasses
 import functools
 import gc
 import importlib.util
-import json
 import math
 import os
 import re
-import struct
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
@@ -120,7 +118,15 @@ from areal.models.mcore.hf_save import (
     save_critic_value_head,
     save_weights_to_hf_with_mbridge_fast,
 )
-from areal.models.mcore.registry import make_hf_and_mcore_config, make_mcore_model
+from areal.models.mcore.registry import (
+    make_hf_and_mcore_config,
+    make_mcore_model,
+    unwrap_to_gpt_model,
+)
+from areal.models.mcore.vocab_parallel_head import (
+    ChunkedLMHeadOutput,
+    chunked_lm_head_logprobs_entropy,
+)
 from areal.models.tree_attn.functional import (
     _gather_packed_tree_logprobs,
     gather_packed_tree_logprobs_entropy,
@@ -182,6 +188,146 @@ def _normalize_glu_param_name(name: str) -> str:
     return name
 
 
+def _float16_wrapper_fp32_output(
+    enable_chunked_logits: bool,
+    model_dtype: torch.dtype,
+) -> bool | None:
+    if enable_chunked_logits and model_dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        # The AReaL LM Head already produced FP32 logits. Bypass Megatron's
+        # output cast so the fused loss can reuse the original GEMM storage.
+        return False
+    # Omitting the override preserves Float16Module's default FP32 output.
+    return None
+
+
+def _reuse_chunked_logits_storage(
+    enable_chunked_logits: bool,
+    entropy_requires_grad: bool,
+) -> bool:
+    # Storage reuse makes entropy non-differentiable, so only enable it when
+    # entropy gradients are disabled.
+    return enable_chunked_logits and not entropy_requires_grad
+
+
+def _warn_if_areal_lm_head_entropy_is_nondifferentiable(
+    logger: Any,
+    *,
+    global_rank: int,
+    is_critic: bool,
+    enable_chunked_logits: bool,
+    entropy_requires_grad: bool,
+) -> None:
+    if (
+        global_rank != 0
+        or is_critic
+        or not enable_chunked_logits
+        or entropy_requires_grad
+    ):
+        return
+    logger.warning(
+        "AReaL LM Head destructive logits-storage reuse is enabled; entropy is "
+        "non-differentiable and will not contribute gradients. Set "
+        "megatron.entropy_requires_grad=true to use the differentiable fallback."
+    )
+
+
+def _validate_areal_lm_head_compatibility(
+    enable_chunked_logits: bool,
+    *,
+    enable_tree_training: bool,
+    npu_available: bool,
+) -> None:
+    del npu_available
+    if not enable_chunked_logits:
+        return
+    if enable_tree_training:
+        raise NotImplementedError("AReaL LM Head does not support tree training")
+
+
+def _supports_chunked_lm_head_layout(
+    *,
+    model_type: str,
+    is_vision_model: bool,
+    use_padded_seq: bool,
+    use_model_packed_seq: bool,
+    has_vision_inputs: bool,
+) -> bool:
+    if has_vision_inputs:
+        return False
+    if not is_vision_model or use_padded_seq:
+        return True
+    # Qwen3.5/Qwen3.6 checkpoints use the Qwen3.5 model types. Their
+    # model-owned THD output remains token-aligned for text-only batches.
+    return use_model_packed_seq and is_qwen3_5_model(model_type)
+
+
+def _map_chunked_lm_head_output(
+    output: ChunkedLMHeadOutput,
+    fn: Callable[[torch.Tensor], torch.Tensor],
+) -> ChunkedLMHeadOutput:
+    return ChunkedLMHeadOutput(*(fn(tensor) for tensor in output))
+
+
+def _padded_lm_head_labels(
+    input_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+) -> torch.Tensor:
+    """Build next-token labels matching Megatron's padded ``[S, B, H]`` layout."""
+    if input_ids.ndim != 1:
+        raise ValueError(
+            "padded LM Head expects packed 1D input_ids before BSHD reconstruction, "
+            f"got shape {tuple(input_ids.shape)}"
+        )
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    mask = (
+        torch.arange(max_seqlen, device=input_ids.device)[None, :] < seq_lens[:, None]
+    )
+    padded_ids = torch.zeros(
+        (seq_lens.numel(), max_seqlen),
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+    padded_ids[mask] = input_ids
+    return torch.roll(padded_ids, shifts=-1, dims=-1).transpose(0, 1).contiguous()
+
+
+def _repack_padded_lm_head_output(
+    tensor: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+) -> torch.Tensor:
+    """Restore flattened padded LM Head values to packed sequence order."""
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    batch_size = seq_lens.numel()
+    expected_tokens = batch_size * max_seqlen
+    if tensor.shape[0] != expected_tokens:
+        raise ValueError(
+            "padded LM Head output does not match the BSHD token layout: "
+            f"got shape {tuple(tensor.shape)}, expected first dimension "
+            f"{batch_size} * {max_seqlen} = {expected_tokens}"
+        )
+    mask = torch.arange(max_seqlen, device=tensor.device)[None, :] < seq_lens[:, None]
+    padded = tensor.reshape(max_seqlen, batch_size, *tensor.shape[1:])
+    return padded.transpose(0, 1)[mask]
+
+
+def _mbridge_precision_args(
+    enable_chunked_logits: bool,
+    enable_fp32_lm_head: bool,
+    cross_entropy_loss_fusion: bool,
+) -> dict[str, bool]:
+    args = {}
+    if not enable_chunked_logits and enable_fp32_lm_head:
+        args["enable_fp32_lm_head"] = True
+    if cross_entropy_loss_fusion:
+        args["cross_entropy_loss_fusion"] = True
+    return args
+
+
 class _MegatronModelList(list):
     """List wrapper that exposes module-like helpers for Megatron model chunks."""
 
@@ -216,6 +362,7 @@ class MegatronEngine(TrainEngine):
         self.optimizer = None
         self.lr_scheduler = None
         self.bridge = None
+        self._frozen_mtp_state = None
         self.process_group_initialized = False
         self._initialized = False
         self.rollout_engine: InferenceEngine | None = None
@@ -236,6 +383,11 @@ class MegatronEngine(TrainEngine):
         self.is_offload: bool = False
         self._offload_depth: int = 0
         self.enable_tree_training: bool = self.config.enable_tree_training
+        _validate_areal_lm_head_compatibility(
+            self.mcore_config.enable_chunked_logits,
+            enable_tree_training=self.enable_tree_training,
+            npu_available=is_npu_available,
+        )
         # FP8 configuration
         self.fp8_config = self.mcore_config.fp8_config
         self.enable_fp8: bool = self.fp8_config is not None
@@ -466,6 +618,11 @@ class MegatronEngine(TrainEngine):
 
     def _configure_pipeline_layer_splits(self) -> None:
         """Select an explicit layout, automatic splitting, or legacy split options."""
+        if (
+            self.bridge_cls == "megatron-bridge"
+            and not self.mcore_config.enable_mtp_training
+        ):
+            self.tf_config.mtp_num_layers = None
         if self.mcore_config.pipeline_model_parallel_layout is not None:
             self._apply_explicit_pipeline_layout()
             return
@@ -511,7 +668,7 @@ class MegatronEngine(TrainEngine):
             layout = OmegaConf.to_container(layout, resolve=True)
         mtp_num_layers = (
             (getattr(self.tf_config, "mtp_num_layers", 0) or 0)
-            if config.enable_mtp
+            if config.enable_mtp_training
             else 0
         )
         vpp_size = self.parallel_strategy.virtual_pipeline_parallel_size or 1
@@ -724,11 +881,22 @@ class MegatronEngine(TrainEngine):
                 )
 
         self.model = _MegatronModelList(models)
+        _warn_if_areal_lm_head_entropy_is_nondifferentiable(
+            self.logger,
+            global_rank=self.rank,
+            is_critic=self.config.is_critic,
+            enable_chunked_logits=self.mcore_config.enable_chunked_logits,
+            entropy_requires_grad=self.mcore_config.entropy_requires_grad,
+        )
 
         if self.config.use_merged_lora and self.bridge_cls == "mbridge":
             self._apply_merged_lora()
 
         if self.config.init_from_scratch:
+            if self._mtp_head_dropped:
+                raise ValueError(
+                    "Frozen MTP preservation requires loading an HF checkpoint"
+                )
             self.logger.info("init_from_scratch=True; skipping HF weight loading.")
         else:
             with self.device:
@@ -825,6 +993,7 @@ class MegatronEngine(TrainEngine):
             if len(self.model) == 1:
                 model_config.param_sync_func = model_config.param_sync_func[0]
         model_config.finalize_model_grads_func = finalize_model_grads
+        self._mark_duplicated_params()
         self._create_optimizer(ft_spec)
         self._set_optimizer_grad_scale_func()
         self._initialized = True
@@ -914,6 +1083,55 @@ class MegatronEngine(TrainEngine):
                 )
             if extra_args:
                 self.bridge.set_extra_args(**extra_args)
+
+            # Set MoE configuration overrides (aux-loss-free balancing, z-loss).
+            moe_extra_args: dict = {
+                "moe_token_dispatcher_type": self.moe_token_dispatcher_type,
+                "moe_permute_fusion": (
+                    self.mindspeed_config.moe_permute_fusion
+                    if is_npu_available
+                    else self.mcore_config.moe_permute_fusion
+                ),
+                "moe_router_fusion": self.mcore_config.moe_router_fusion,
+                "moe_shared_expert_overlap": self.mcore_config.moe_shared_expert_overlap,
+                "moe_router_bias_update_rate": self.mcore_config.moe_router_bias_update_rate,
+            }
+            if self.mcore_config.moe_router_dtype is not None:
+                moe_extra_args["moe_router_dtype"] = self.mcore_config.moe_router_dtype
+            if self.mcore_config.moe_z_loss_coeff is not None:
+                moe_extra_args["moe_z_loss_coeff"] = self.mcore_config.moe_z_loss_coeff
+            if self.mcore_config.moe_enable_deepep:
+                moe_extra_args["moe_enable_deepep"] = True
+            # Filter out args not accepted by the target TransformerConfig class.
+            accepted = {
+                f.name for f in dataclasses.fields(self.bridge.TransformerConfigClass)
+            }
+            moe_extra_args = {k: v for k, v in moe_extra_args.items() if k in accepted}
+            self.bridge.set_extra_args(**moe_extra_args)
+
+            # AReaL handles FP32 output itself when its LM Head is enabled.
+            # Otherwise, preserve mbridge's native FP32 LM Head option.
+            precision_args = _mbridge_precision_args(
+                self.mcore_config.enable_chunked_logits,
+                self.mcore_config.enable_fp32_lm_head,
+                self.mcore_config.cross_entropy_loss_fusion,
+            )
+            if precision_args:
+                skipped_precision_args = [
+                    k for k in precision_args if k not in accepted
+                ]
+                precision_args = {
+                    k: v for k, v in precision_args.items() if k in accepted
+                }
+                if skipped_precision_args:
+                    self.logger.warning(
+                        "Some precision/loss args are not supported by this model "
+                        f"config ({self.bridge.TransformerConfigClass.__name__}); "
+                        f"skipping: {skipped_precision_args}"
+                    )
+                if precision_args:
+                    self.bridge.set_extra_args(**precision_args)
+
             self.logger.info(
                 "Using mbridge to create models and hf model save/load in MegatronEngine."
             )
@@ -1048,6 +1266,19 @@ class MegatronEngine(TrainEngine):
             rollout_engine=engine, train_engine=self
         )
 
+        if self.mcore_config.enable_mtp_training:
+            if meta.type == "awex":
+                raise ValueError(
+                    "AWEX does not exchange trained Qwen MTP weights; use disk or "
+                    "XCCL with use_bridge_for_update_weights=True."
+                )
+            if (
+                meta.type == "xccl"
+                and not self.mcore_config.use_bridge_for_update_weights
+            ):
+                raise ValueError(
+                    "MTP XCCL updates require use_bridge_for_update_weights=True"
+                )
         if meta.type == "awex":
             if not meta.meta_server_addr:
                 raise ValueError("meta_server_addr must be set for awex weight update.")
@@ -1213,10 +1444,11 @@ class MegatronEngine(TrainEngine):
         self,
         mb_list: MicroBatchList,
         process_output_fn: Callable[
-            [torch.Tensor, dict[str, Any]],
+            [torch.Tensor | ChunkedLMHeadOutput, dict[str, Any]],
             torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
         ],
         forward_only: bool = False,
+        gather_cp_output: bool = False,
     ) -> None:
         self._ensure_ready()
 
@@ -1248,7 +1480,37 @@ class MegatronEngine(TrainEngine):
                     tree_attn_keys = list(tree_kwargs.keys())
 
             cp_size = mpu.get_context_parallel_world_size()
-            cp_local = cp_size > 1
+            # CP-local forward keeps the vocabulary logits sharded by sequence.
+            # Consumers reconstruct token scalars only; gathering logits here
+            # creates the full-vocabulary CP memory spike MOPD must avoid.
+            cp_local = cp_size > 1 and not gather_cp_output
+
+            model_vp_stage = getattr(model, "vp_stage", 0)
+            is_pipeline_last_stage = mpu.is_pipeline_last_stage(
+                ignore_virtual=False, vp_stage=model_vp_stage
+            )
+            use_chunked_lm_head = (
+                self.mcore_config.lm_head_loss_chunk_size > 0
+                and self.mcore_config.enable_chunked_logits
+                and not self.config.is_critic
+                and not self.enable_tree_training
+                and is_pipeline_last_stage
+            )
+            has_vision_inputs = any(
+                _is_multi_modal_payload_key(key) for key in mb_input.padded_mb
+            )
+            if use_chunked_lm_head and not _supports_chunked_lm_head_layout(
+                model_type=self.hf_config.model_type,
+                is_vision_model=self.is_vision_model,
+                use_padded_seq=self.use_padded_seq,
+                use_model_packed_seq=self.use_model_packed_seq,
+                has_vision_inputs=has_vision_inputs,
+            ):
+                raise NotImplementedError(
+                    "chunked LM Head loss does not support vision inputs or this "
+                    "VLM sequence layout; text-only Qwen3.5/Qwen3.6 model-owned "
+                    "THD is supported"
+                )
 
             output = packed_context_parallel_forward(
                 model,
@@ -1257,7 +1519,82 @@ class MegatronEngine(TrainEngine):
                 is_vision_model=self.is_vision_model,
                 use_padded_seq=self.use_padded_seq,
                 use_model_packed_seq=self.use_model_packed_seq,
+                fp32_output=_float16_wrapper_fp32_output(
+                    self.mcore_config.enable_chunked_logits,
+                    self.dtype,
+                ),
+                return_hidden_states=use_chunked_lm_head,
             )
+
+            if use_chunked_lm_head:
+                padded_lm_head = self.use_padded_seq and cu_seqlens is not None
+                if padded_lm_head:
+                    labels = _padded_lm_head_labels(
+                        mb_input.padded_mb["input_ids"],
+                        cu_seqlens,
+                        mb_input.padded_mb["max_seqlen"],
+                    )
+                else:
+                    rolled_ids = torch.roll(
+                        mb_input.padded_mb["input_ids"], shifts=-1, dims=-1
+                    )
+                if not padded_lm_head and cp_size > 1 and cu_seqlens is not None:
+                    labels = split_packed_seqs_for_context_parallel(
+                        rolled_ids, mb_input.padded_mb["cu_seqlens"]
+                    )
+                elif not padded_lm_head and rolled_ids.ndim == 2:
+                    labels = rolled_ids.transpose(0, 1).contiguous()
+                elif not padded_lm_head:
+                    labels = rolled_ids
+
+                gpt_model = unwrap_to_gpt_model(model)
+                output_layer = gpt_model.output_layer
+                if gpt_model.share_embeddings_and_output_weights:
+                    output_weight = gpt_model.shared_embedding_or_output_weight()
+                else:
+                    output_weight = output_layer.weight
+                logit_scale = (
+                    gpt_model.config.mup_output_mult
+                    if gpt_model.config.use_mup
+                    else 1.0
+                )
+                output = chunked_lm_head_logprobs_entropy(
+                    output_layer,
+                    output,
+                    output_weight,
+                    labels,
+                    temperature=self.config.temperature,
+                    chunk_size=self.mcore_config.lm_head_loss_chunk_size,
+                    logit_scale=logit_scale,
+                )
+
+                if padded_lm_head:
+                    output = _map_chunked_lm_head_output(
+                        output,
+                        lambda tensor: _repack_padded_lm_head_output(
+                            tensor,
+                            cu_seqlens,
+                            mb_input.padded_mb["max_seqlen"],
+                        ),
+                    )
+                if cp_size > 1 and cu_seqlens is not None and not cp_local:
+                    padded_cu_seqlens = mb_input.padded_mb["cu_seqlens"]
+                    output = _map_chunked_lm_head_output(
+                        output,
+                        lambda tensor: reassemble_cp_packed_logprobs(
+                            tensor, padded_cu_seqlens
+                        ),
+                    )
+                if not cp_local:
+                    output = _map_chunked_lm_head_output(
+                        output,
+                        lambda tensor: unpad_logits(
+                            tensor,
+                            padding_length=mb_input.padding_length,
+                            cu_seqlens=cu_seqlens,
+                            old_cu_seqlens=mb_input.old_cu_seqlens,
+                        ),
+                    )
 
             # Release tree attention metadata after forward pass
             for key in tree_attn_keys:
@@ -1269,14 +1606,25 @@ class MegatronEngine(TrainEngine):
                     loss, num_tokens = loss
                     return loss, num_tokens, {}
                 if loss is None:
-                    loss = torch.tensor(1.0, device=output_.device)
+                    device = (
+                        output_.logprobs.device
+                        if isinstance(output_, ChunkedLMHeadOutput)
+                        else output_.device
+                    )
+                    loss = torch.tensor(1.0, device=device)
                 return loss, {}
 
-            model_vp_stage = getattr(model, "vp_stage", 0)
-            is_last_stage = mpu.is_pipeline_last_stage(
-                ignore_virtual=False, vp_stage=model_vp_stage
-            )
-            if is_last_stage:
+            if is_pipeline_last_stage:
+                if use_chunked_lm_head:
+                    if cp_local and cu_seqlens is not None:
+                        cp_inputs = dict(mb_input.orig_mb)
+                        cp_inputs["_cp_padded_cu_seqlens"] = mb_input.padded_mb[
+                            "cu_seqlens"
+                        ]
+                        cp_inputs["_cp_padding_length"] = mb_input.padding_length
+                        cp_inputs["_cp_old_cu_seqlens"] = mb_input.old_cu_seqlens
+                        return output, functools.partial(_process_output, cp_inputs)
+                    return output, functools.partial(_process_output, mb_input.orig_mb)
                 if cp_local and cu_seqlens is not None:
                     padded_cu_seqlens = mb_input.padded_mb["cu_seqlens"]
                     rolled_ids = torch.roll(
@@ -1344,6 +1692,46 @@ class MegatronEngine(TrainEngine):
         # that does not explicitly enable calculate_per_token_loss.
         model_config = get_model_config(self.model[0])
         per_token_loss = model_config.calculate_per_token_loss
+
+        mtp_batch = None
+        if self.mcore_config.enable_mtp_training:
+            from areal.engine.megatron_utils.mtp import (
+                mtp_backward_scale,
+                prepare_mtp_mask,
+            )
+
+            if self.enable_tree_training:
+                raise ValueError("MTP training does not support tree attention")
+            mtp_batch = {
+                "metrics": torch.zeros(2, dtype=torch.float32, device=self.device),
+            }
+            target_counts = []
+            for mb in mb_list:
+                mask = mb.padded_mb.get("loss_mask")
+                if mask is None or mask.shape != mb.padded_mb["input_ids"].shape:
+                    raise ValueError(
+                        "MTP training requires loss_mask matching input_ids"
+                    )
+                mask, count = prepare_mtp_mask(
+                    mask, mb.padded_mb.get("cu_seqlens"), mb.old_cu_seqlens
+                )
+                mb.padded_mb["mtp_kwargs"] = {
+                    "mtp_labels": mb.padded_mb["input_ids"],
+                    "mtp_loss_mask": mask,
+                    "batch": mtp_batch,
+                }
+                target_counts.append(count)
+            mtp_tokens = torch.stack(target_counts).sum()
+            dist.all_reduce(mtp_tokens, group=mpu.get_data_parallel_group())
+            mtp_batch["scale"] = mtp_backward_scale(
+                total_tokens,
+                mtp_tokens,
+                cp_size=mpu.get_context_parallel_world_size(),
+                dp_cp_size=mpu.get_data_parallel_world_size(with_context_parallel=True),
+                num_microbatches=len(mb_list),
+                per_token=per_token_loss,
+            )
+
         if per_token_loss:
             # MCore normalizes auxiliary gradients by original tokens. Convert
             # the external objective's weight units to that same denominator.
@@ -1377,6 +1765,13 @@ class MegatronEngine(TrainEngine):
         # Step 4: Optimizer step
         stats = self.optimizer_step()
         stats["num_micro_batches"] = len(mb_list.mbs)
+        if mtp_batch is not None:
+            metrics = mtp_batch["metrics"]
+            dist.all_reduce(
+                metrics, group=mpu.get_data_parallel_group(with_context_parallel=True)
+            )
+            dist.all_reduce(metrics, group=mpu.get_pipeline_model_parallel_group())
+            stats["mtp_loss"] = (metrics[0] / metrics[1].clamp(min=1)).item()
         return stats
 
     def _compute_loss_totals(
@@ -1493,7 +1888,9 @@ class MegatronEngine(TrainEngine):
             outputs.append(result)
             return None
 
-        self.forward_backward_batch(mb_list, process_output, forward_only=True)
+        self.forward_backward_batch(
+            mb_list, process_output, forward_only=True, gather_cp_output=False
+        )
 
         # Step 4: Aggregate, reorder, and broadcast outputs
         res = None
@@ -1514,10 +1911,19 @@ class MegatronEngine(TrainEngine):
         return split_batch(res, meta)
 
     def export_stats(self) -> dict[str, float]:
+        key_sync_group = None
+        key_sync_gloo_group = None
+        if self.parallel_strategy.context_parallel_size > 1:
+            key_sync_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            key_sync_gloo_group = mpu.get_data_parallel_group_gloo(
+                with_context_parallel=True
+            )
         with self._offload_aware_context():
             data = stats_tracker.export_all(
                 reduce_group=self.data_parallel_group,
                 gloo_group=self.data_parallel_group_gloo,
+                key_sync_group=key_sync_group,
+                key_sync_gloo_group=key_sync_gloo_group,
             )
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             # Some log info only exist in last pipeline rank
@@ -2133,22 +2539,17 @@ class MegatronEngine(TrainEngine):
             use_distributed_optimizer=use_distributed_optimizer,
             params_dtype=self.dtype,
             clip_grad=self.optimizer_config.gradient_clipping,
-        )
-        mcore_opt_config.overlap_param_gather_with_optimizer_step = (
-            self.mcore_config.overlap_param_gather_with_optimizer_step
-        )
-        mcore_opt_config.use_precision_aware_optimizer = (
-            self.mcore_config.use_precision_aware_optimizer
-        )
-        mcore_opt_config.main_grads_dtype = getattr(
-            torch, self.mcore_config.main_grads_dtype
-        )
-        mcore_opt_config.main_params_dtype = getattr(
-            torch, self.mcore_config.main_params_dtype
-        )
-        mcore_opt_config.exp_avg_dtype = getattr(torch, self.mcore_config.exp_avg_dtype)
-        mcore_opt_config.exp_avg_sq_dtype = getattr(
-            torch, self.mcore_config.exp_avg_sq_dtype
+            fp8_recipe=(self.fp8_config.recipe if self.enable_fp8 else None),
+            overlap_param_gather_with_optimizer_step=(
+                self.mcore_config.overlap_param_gather_with_optimizer_step
+            ),
+            use_precision_aware_optimizer=(
+                self.mcore_config.use_precision_aware_optimizer
+            ),
+            main_grads_dtype=getattr(torch, self.mcore_config.main_grads_dtype),
+            main_params_dtype=getattr(torch, self.mcore_config.main_params_dtype),
+            exp_avg_dtype=getattr(torch, self.mcore_config.exp_avg_dtype),
+            exp_avg_sq_dtype=getattr(torch, self.mcore_config.exp_avg_sq_dtype),
         )
 
         self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
@@ -2291,6 +2692,39 @@ class MegatronEngine(TrainEngine):
                                 duplicated.add(full)
             self._cached_duplicated_param_names = duplicated
         return self._cached_duplicated_param_names
+
+    def _mark_duplicated_params(self) -> None:
+        """Fix TP metadata for params whose parent module is duplicated.
+
+        These params are replicated (not TP-sharded), but TE can mark them with
+        ``tensor_model_parallel=True``. Megatron's optimizer uses that attribute
+        to decide which TP ranks contribute to grad norm/clipping, so leaving it
+        true double-counts duplicated params when TP > 1. We also keep
+        ``_is_duplicated`` for weight collection code that needs the same signal.
+
+        Detection uses module.tp_size == 1 instead of module.parallel_mode ==
+        'duplicated', because Megatron's TELinear converts 'duplicated' to
+        te_parallel_mode=None before calling the TE base class, so
+        module.parallel_mode ends up as None.  tp_size=1 is reliably set for
+        duplicated mode while TP-sharded modules have tp_size > 1.
+
+        Expert modules with explicit TP communication also have tp_size=1
+        (Megatron pre-divides sizes), but their weights ARE TP-sharded.
+        These are excluded by checking the module name for "expert".
+        """
+        if getattr(self, "_duplicated_params_marked", False):
+            return
+        if self.model is not None:
+            for model in self.model:
+                for mod_name, module in model.named_modules():
+                    if getattr(module, "tp_size", None) == 1:
+                        if "expert" in mod_name:
+                            continue
+                        for _, param in module.named_parameters(recurse=False):
+                            if getattr(param, "tensor_model_parallel", False):
+                                param._is_duplicated = True
+                                param.tensor_model_parallel = False
+        self._duplicated_params_marked = True
 
     def _collect_param(
         self,
@@ -2947,12 +3381,8 @@ class MegatronEngine(TrainEngine):
                     base_model_name_or_path=base_model_path or self.config.path,
                 )
             else:
-                # When the MTP head was dropped (enable_mtp=False), the export
-                # yields no mtp.* tensors and strict=True would silently skip
-                # every source shard containing an MTP key -- discarding the
-                # non-MTP weights packed in those shards (e.g. lm_head).
-                # strict=False writes such shards with all present keys, so the
-                # export loses only the intentionally dropped MTP weights.
+                # Frozen MTP tensors are merged after Bridge writes the backbone.
+                # Mixed backbone/MTP shards must be written even when incomplete.
                 self.bridge.save_hf_pretrained(
                     self.model,
                     path,
@@ -2997,24 +3427,30 @@ class MegatronEngine(TrainEngine):
             if self.config.is_critic:
                 save_critic_value_head(self.model, path)
 
-        if dist.get_rank() == 0:
+        def finish_export():
             if tokenizer is not None:
                 tokenizer.save_pretrained(path)
             if processor is not None:
                 processor.save_pretrained(path)
-            if self._mtp_head_dropped:
-                # The MTP head is not trained in RL, so always keep the frozen
-                # source head in the export (falls back to scrubbing it out when
-                # the source is unavailable).
-                self._splice_mtp_from_source(path, base_model_path or self.config.path)
+            if self._mtp_head_dropped and not self.config.use_lora:
+                if self._frozen_mtp_state is None:
+                    raise ValueError(
+                        "Full HF export requires frozen MTP state from a loaded checkpoint"
+                    )
+                self._frozen_mtp_state.export(path)
+
+        self._run_hf_rank_zero(finish_export)
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
 
     @property
     def _mtp_head_dropped(self) -> bool:
-        """True when the model declares an MTP head but enable_mtp left it unbuilt."""
-        if self.bridge_cls != "megatron-bridge" or self.mcore_config.enable_mtp:
+        """Whether the model preserves its MTP head outside training parameters."""
+        if (
+            self.bridge_cls != "megatron-bridge"
+            or self.mcore_config.enable_mtp_training
+        ):
             return False
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         return any(
@@ -3022,261 +3458,23 @@ class MegatronEngine(TrainEngine):
             for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers")
         )
 
-    def _scrub_mtp_from_saved_config(self, path: str) -> None:
-        """Zero MTP layer counts in an exported config.json so it matches the
-        MTP-stripped weights (the head is dropped when enable_mtp=False)."""
-        cfg_path = os.path.join(path, "config.json")
-        if not os.path.exists(cfg_path):
-            return
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-
-        def _walk(node: Any) -> bool:
-            changed = False
-            if isinstance(node, dict):
-                for key, value in node.items():
-                    if (
-                        key in ("mtp_num_hidden_layers", "num_nextn_predict_layers")
-                        and value
-                    ):
-                        node[key] = 0
-                        changed = True
-                    else:
-                        changed |= _walk(value)
-            elif isinstance(node, list):
-                for item in node:
-                    changed |= _walk(item)
-            return changed
-
-        if _walk(cfg):
-            with open(cfg_path, "w") as f:
-                json.dump(cfg, f, indent=2, sort_keys=True)
-            self.logger.info(
-                "Exported checkpoint is MTP-stripped (enable_mtp=False); "
-                "zeroed MTP layer counts in %s.",
-                cfg_path,
-            )
-
-    def _rebuild_index_from_saved_shards(self, path: str) -> None:
-        """Rewrite model.safetensors.index.json from the shard files' actual
-        contents. megatron-bridge's strict=False save marks each shard's full
-        expected key set as saved, leaving ghost entries for the dropped mtp.*
-        tensors and a stale metadata.total_size."""
-        index_path = os.path.join(path, "model.safetensors.index.json")
-        if not os.path.exists(index_path):
-            return
-        weight_map: dict[str, str] = {}
-        total_size = 0
-        for filename in sorted(os.listdir(path)):
-            if not filename.endswith(".safetensors"):
-                continue
-            with open(os.path.join(path, filename), "rb") as f:
-                header_len = struct.unpack("<Q", f.read(8))[0]
-                header = json.loads(f.read(header_len))
-            for key, meta in header.items():
-                if key == "__metadata__":
-                    continue
-                weight_map[key] = filename
-                begin, end = meta["data_offsets"]
-                total_size += end - begin
-        with open(index_path) as f:
-            index = json.load(f)
-        ghosts = set(index.get("weight_map", {})) - set(weight_map)
-        index["weight_map"] = weight_map
-        index.setdefault("metadata", {})["total_size"] = total_size
-        with open(index_path, "w") as f:
-            json.dump(index, f, indent=2, sort_keys=True)
-        if ghosts:
-            self.logger.info(
-                "Rebuilt safetensors index from shard contents; removed %d ghost "
-                "entries (e.g. %s).",
-                len(ghosts),
-                sorted(ghosts)[:3],
-            )
-
-    @staticmethod
-    def _is_mtp_key(key: str) -> bool:
-        lowered = key.lower()
-        return "mtp" in lowered or "nextn" in lowered
-
-    def _read_source_mtp_by_shard(
-        self, source_path: str
-    ) -> dict[str, dict[str, torch.Tensor]]:
-        """Load the frozen MTP tensors (mtp.*/nextn.*) from the source checkpoint,
-        grouped by the shard file that held them, so each tensor can be written
-        back into the same shard on export. Handles both sharded (index.json)
-        and single-file layouts."""
-        from safetensors import safe_open
-
-        index_path = os.path.join(source_path, "model.safetensors.index.json")
-        file_to_keys: dict[str, list[str]] = {}
-        if os.path.exists(index_path):
-            with open(index_path) as f:
-                weight_map = json.load(f)["weight_map"]
-            for key, filename in weight_map.items():
-                if self._is_mtp_key(key):
-                    file_to_keys.setdefault(filename, []).append(key)
-        else:
-            single = os.path.join(source_path, "model.safetensors")
-            if os.path.exists(single):
-                with safe_open(single, framework="pt", device="cpu") as f:
-                    for key in f.keys():
-                        if self._is_mtp_key(key):
-                            file_to_keys.setdefault("model.safetensors", []).append(key)
-
-        by_shard: dict[str, dict[str, torch.Tensor]] = {}
-        for filename, keys in file_to_keys.items():
-            file_path = os.path.join(source_path, filename)
-            if not os.path.exists(file_path):
-                continue
-            with safe_open(file_path, framework="pt", device="cpu") as f:
-                by_shard[filename] = {key: f.get_tensor(key) for key in keys}
-        return by_shard
-
-    def _write_safetensors_index(self, path: str) -> None:
-        """Create or rewrite model.safetensors.index.json to cover every shard
-        file present in ``path`` (base shards plus the spliced MTP shard)."""
-        weight_map: dict[str, str] = {}
-        total_size = 0
-        for filename in sorted(os.listdir(path)):
-            if not filename.endswith(".safetensors"):
-                continue
-            with open(os.path.join(path, filename), "rb") as f:
-                header_len = struct.unpack("<Q", f.read(8))[0]
-                header = json.loads(f.read(header_len))
-            for key, meta in header.items():
-                if key == "__metadata__":
-                    continue
-                weight_map[key] = filename
-                begin, end = meta["data_offsets"]
-                total_size += end - begin
-        index_path = os.path.join(path, "model.safetensors.index.json")
-        index: dict[str, Any] = {}
-        if os.path.exists(index_path):
-            with open(index_path) as f:
-                index = json.load(f)
-        index["weight_map"] = weight_map
-        index.setdefault("metadata", {})["total_size"] = total_size
-        with open(index_path, "w") as f:
-            json.dump(index, f, indent=2, sort_keys=True)
-
-    def _restore_mtp_config_from_source(self, path: str, source_path: str) -> None:
-        """Ensure the exported config.json keeps non-zero MTP layer counts,
-        restoring them from the source config when needed."""
-        exported = os.path.join(path, "config.json")
-        source = os.path.join(source_path, "config.json")
-        if not (os.path.exists(exported) and os.path.exists(source)):
-            return
-        with open(source) as f:
-            src_cfg = json.load(f)
-
-        wanted: dict[str, Any] = {}
-
-        def _collect(node: Any) -> None:
-            if isinstance(node, dict):
-                for key, value in node.items():
-                    if (
-                        key in ("mtp_num_hidden_layers", "num_nextn_predict_layers")
-                        and value
-                    ):
-                        wanted[key] = value
-                    else:
-                        _collect(value)
-            elif isinstance(node, list):
-                for item in node:
-                    _collect(item)
-
-        _collect(src_cfg)
-        if not wanted:
-            return
-
-        with open(exported) as f:
-            exp_cfg = json.load(f)
-
-        def _restore(node: Any) -> bool:
-            changed = False
-            if isinstance(node, dict):
-                for key, value in node.items():
-                    if key in wanted and not value:
-                        node[key] = wanted[key]
-                        changed = True
-                    else:
-                        changed |= _restore(value)
-            elif isinstance(node, list):
-                for item in node:
-                    changed |= _restore(item)
-            return changed
-
-        if _restore(exp_cfg):
-            with open(exported, "w") as f:
-                json.dump(exp_cfg, f, indent=2, sort_keys=True)
-
-    def _splice_mtp_from_source(self, path: str, source_path: str | None) -> None:
-        """Copy the frozen MTP head from the source checkpoint into the exported
-        checkpoint so it stays complete when the MTP head was not trained.
-
-        The bridge mirrors the source sharding, so each MTP tensor is written
-        back into the same shard file the source kept it in -- the export ends
-        up structurally identical to the source, with no extra sidecar file. If
-        the export re-sharded and a source shard is absent, those leftover MTP
-        tensors fall back to a dedicated ``model-mtp.safetensors``."""
-        from safetensors import safe_open
-        from safetensors.torch import save_file
-
-        if not source_path or not os.path.isdir(source_path):
-            self.logger.warning(
-                "MTP passthrough: source path %s unavailable; dropping MTP head "
-                "from export instead.",
-                source_path,
-            )
-            self._scrub_mtp_from_saved_config(path)
-            self._rebuild_index_from_saved_shards(path)
-            return
-
-        by_shard = self._read_source_mtp_by_shard(source_path)
-        if not by_shard:
-            self.logger.warning(
-                "MTP passthrough: no MTP tensors found in %s; dropping MTP head "
-                "from export instead.",
-                source_path,
-            )
-            self._scrub_mtp_from_saved_config(path)
-            self._rebuild_index_from_saved_shards(path)
-            return
-
-        spliced = 0
-        leftover: dict[str, torch.Tensor] = {}
-        for shard_name, mtp_tensors in by_shard.items():
-            dst = os.path.join(path, shard_name)
-            if not os.path.exists(dst):
-                leftover.update(mtp_tensors)
-                continue
-            # Clone the mmap-backed destination tensors before overwriting the
-            # same shard in place. This avoids rename and chmod operations.
-            merged: dict[str, torch.Tensor] = {}
-            with safe_open(dst, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    merged[key] = f.get_tensor(key).clone()
-            merged.update({k: v.contiguous() for k, v in mtp_tensors.items()})
-            save_file(merged, dst, metadata={"format": "pt"})
-            spliced += len(mtp_tensors)
-
-        if leftover:
-            save_file(
-                {k: v.contiguous() for k, v in leftover.items()},
-                os.path.join(path, "model-mtp.safetensors"),
-                metadata={"format": "pt"},
-            )
-
-        self._write_safetensors_index(path)
-        self._restore_mtp_config_from_source(path, source_path)
-        self.logger.info(
-            "Spliced %d frozen MTP tensors into matching shards (%d in sidecar) "
-            "from %s.",
-            spliced,
-            len(leftover),
-            source_path,
-        )
+    def _run_hf_rank_zero(self, operation: Callable[[], None]) -> None:
+        """Propagate checkpoint IO failures before other ranks enter barriers."""
+        error = None
+        failure = [None]
+        try:
+            if dist.get_rank(self.cpu_group) == 0:
+                operation()
+        except BaseException as exc:
+            error = exc
+            failure[0] = str(exc).strip() or type(exc).__name__
+        try:
+            dist.broadcast_object_list(failure, group=self.cpu_group, group_src=0)
+        finally:
+            if error is not None:
+                raise error
+        if failure[0] is not None:
+            raise RuntimeError(f"Operation failed on rank 0: {failure[0]}")
 
     def _load_model_from_hf(self, path: str) -> None:
         assert self.model is not None, "Model is not initialized."
@@ -3286,6 +3484,21 @@ class MegatronEngine(TrainEngine):
                 raise ValueError(
                     "Loading critic model is not supported with megatron-bridge."
                 )
+            frozen = None
+            if self._mtp_head_dropped:
+                from areal.engine.megatron_utils.frozen_mtp import FrozenMTPState
+
+                def capture_mtp():
+                    nonlocal frozen
+                    frozen = FrozenMTPState.load(path)
+
+                self._run_hf_rank_zero(capture_mtp)
+            elif self.mcore_config.enable_mtp_training:
+                from areal.engine.megatron_utils.frozen_mtp import (
+                    validate_mtp_checkpoint,
+                )
+
+                self._run_hf_rank_zero(lambda: validate_mtp_checkpoint(path))
             # megatron-bridge's load path builds shard-index tensors via
             # ``torch.arange(...)`` to index HF weights that live on CPU. Under
             # the caller's ``with self.device:`` (CUDA) context, those indices
@@ -3297,6 +3510,7 @@ class MegatronEngine(TrainEngine):
             # to GPU model params is unaffected (handled by .copy_()).
             with torch.device("cpu"):
                 self.bridge.load_hf_weights(self.model, hf_path=path)
+            self._frozen_mtp_state = frozen
         else:
             load_weights_from_hf_with_mbridge_fast(
                 bridge=self.bridge,
@@ -3412,7 +3626,7 @@ class MegatronEngine(TrainEngine):
 
     def _compute_logprobs_and_loss(
         self,
-        output: torch.Tensor,
+        output: torch.Tensor | ChunkedLMHeadOutput,
         inputs: dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
@@ -3424,7 +3638,10 @@ class MegatronEngine(TrainEngine):
         if per_token_loss:
             token_count = self._per_token_count(inputs, local_weight)
         if local_weight == 0:
-            loss = output.mean() * 0.0
+            connected_output = (
+                output.logprobs if isinstance(output, ChunkedLMHeadOutput) else output
+            )
+            loss = connected_output.mean() * 0.0
             if per_token_loss:
                 return self._build_per_token_loss_output(
                     loss, local_weight, loss_multiplier, token_count=token_count
@@ -3457,6 +3674,10 @@ class MegatronEngine(TrainEngine):
                 vocab_min_logits, vocab_max_logits = gather_packed_tree_vocab_stats(
                     output, trie_node
                 )
+                # Tree training only supports packed min/max vocab stats; mean/norm
+                # would need per-sequence unpacking, so leave them unset.
+                vocab_mean_logits = None
+                vocab_norm_logits = None
                 logprobs, entropy = gather_packed_tree_logprobs_entropy(
                     output,
                     trie_node,
@@ -3465,24 +3686,46 @@ class MegatronEngine(TrainEngine):
                     tp_group=mpu.get_tensor_model_parallel_group()
                     if mpu.get_tensor_model_parallel_world_size() > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
             else:
-                cp_local_labels = inputs.get("_cp_local_labels")
                 cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
-                if cp_local_labels is not None:
-                    labels = cp_local_labels
+                if isinstance(output, ChunkedLMHeadOutput):
+                    (
+                        logprobs,
+                        entropy,
+                        vocab_min_logits,
+                        vocab_max_logits,
+                        vocab_mean_logits,
+                        vocab_norm_logits,
+                    ) = output
                 else:
-                    labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
-                logprobs, entropy = gather_logprobs_entropy(
-                    output,
-                    labels,
-                    temperature=self.config.temperature,
-                    tp_group=mpu.get_tensor_model_parallel_group()
-                    if mpu.get_tensor_model_parallel_world_size() > 1
-                    else None,
-                )
-                vocab_min_logits = output.detach().min(-1).values.float()
-                vocab_max_logits = output.detach().max(-1).values.float()
+                    cp_local_labels = inputs.get("_cp_local_labels")
+                    if cp_local_labels is not None:
+                        labels = cp_local_labels
+                    else:
+                        labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
+                    # The fused Megatron loss path destructively reuses FP32 logits as
+                    # softmax/dlogits storage, so diagnostics must consume logits first.
+                    vocab_min_logits = output.detach().min(-1).values.float()
+                    vocab_max_logits = output.detach().max(-1).values.float()
+                    vocab_mean_logits = output.detach().mean(-1, dtype=torch.float32)
+                    vocab_norm_logits = torch.linalg.vector_norm(
+                        output.detach(), dim=-1, dtype=torch.float32
+                    )
+                    logprobs, entropy = gather_logprobs_entropy(
+                        output,
+                        labels,
+                        temperature=self.config.temperature,
+                        tp_group=mpu.get_tensor_model_parallel_group()
+                        if mpu.get_tensor_model_parallel_world_size() > 1
+                        else None,
+                        chunk_size=self.config.logprobs_chunk_size,
+                        reuse_logits=_reuse_chunked_logits_storage(
+                            self.mcore_config.enable_chunked_logits,
+                            self.mcore_config.entropy_requires_grad,
+                        ),
+                    )
                 if cp_padded_cu_seqlens is not None:
                     logprobs = reassemble_cp_packed_logprobs(
                         logprobs, cp_padded_cu_seqlens
@@ -3495,6 +3738,12 @@ class MegatronEngine(TrainEngine):
                     )
                     vocab_max_logits = reassemble_cp_packed_logprobs(
                         vocab_max_logits, cp_padded_cu_seqlens
+                    )
+                    vocab_mean_logits = reassemble_cp_packed_logprobs(
+                        vocab_mean_logits, cp_padded_cu_seqlens
+                    )
+                    vocab_norm_logits = reassemble_cp_packed_logprobs(
+                        vocab_norm_logits, cp_padded_cu_seqlens
                     )
                     cp_padding_length = inputs.get("_cp_padding_length", 0)
                     cp_old_cu_seqlens = inputs.get("_cp_old_cu_seqlens")
@@ -3522,6 +3771,18 @@ class MegatronEngine(TrainEngine):
                         cp_padded_cu_seqlens,
                         cp_old_cu_seqlens,
                     )
+                    vocab_mean_logits = unpad_logits(
+                        vocab_mean_logits,
+                        cp_padding_length,
+                        cp_padded_cu_seqlens,
+                        cp_old_cu_seqlens,
+                    )
+                    vocab_norm_logits = unpad_logits(
+                        vocab_norm_logits,
+                        cp_padding_length,
+                        cp_padded_cu_seqlens,
+                        cp_old_cu_seqlens,
+                    )
                     inputs = {
                         k: v for k, v in inputs.items() if not k.startswith("_cp_")
                     }
@@ -3531,6 +3792,8 @@ class MegatronEngine(TrainEngine):
                 inputs,
                 vocab_min_logits=vocab_min_logits,
                 vocab_max_logits=vocab_max_logits,
+                vocab_mean_logits=vocab_mean_logits,
+                vocab_norm_logits=vocab_norm_logits,
             )
         else:
             values = output.squeeze(-1)
@@ -3571,7 +3834,7 @@ class MegatronEngine(TrainEngine):
 
     def _compute_forward_result(
         self,
-        output: torch.Tensor,
+        output: torch.Tensor | ChunkedLMHeadOutput,
         inputs: dict[str, Any],
     ) -> torch.Tensor | dict[int, torch.Tensor]:
         if self.config.is_critic and self.enable_tree_training:
@@ -3579,6 +3842,8 @@ class MegatronEngine(TrainEngine):
                 "Tree training with critic model is not supported yet."
             )
         if not self.config.is_critic:
+            if isinstance(output, ChunkedLMHeadOutput):
+                return self._reassemble_cp_forward_scalars(output.logprobs, inputs)
             if self.enable_tree_training:
                 logprobs = _gather_packed_tree_logprobs(
                     output,
@@ -3588,10 +3853,10 @@ class MegatronEngine(TrainEngine):
                     tp_group=mpu.get_tensor_model_parallel_group()
                     if mpu.get_tensor_model_parallel_world_size() > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
                 return logprobs
             cp_local_labels = inputs.get("_cp_local_labels")
-            cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
             if cp_local_labels is not None:
                 labels = cp_local_labels
             else:
@@ -3603,28 +3868,28 @@ class MegatronEngine(TrainEngine):
                 tp_group=mpu.get_tensor_model_parallel_group()
                 if mpu.get_tensor_model_parallel_world_size() > 1
                 else None,
+                chunk_size=self.config.logprobs_chunk_size,
             )
-            if cp_padded_cu_seqlens is not None:
-                logprobs = reassemble_cp_packed_logprobs(logprobs, cp_padded_cu_seqlens)
-                logprobs = unpad_logits(
-                    logprobs,
-                    inputs.get("_cp_padding_length", 0),
-                    cp_padded_cu_seqlens,
-                    inputs.get("_cp_old_cu_seqlens"),
-                )
-            return logprobs
+            return self._reassemble_cp_forward_scalars(logprobs, inputs)
         else:
             values = output.squeeze(-1)
-            cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
-            if cp_padded_cu_seqlens is not None:
-                values = reassemble_cp_packed_logprobs(values, cp_padded_cu_seqlens)
-                values = unpad_logits(
-                    values,
-                    inputs.get("_cp_padding_length", 0),
-                    cp_padded_cu_seqlens,
-                    inputs.get("_cp_old_cu_seqlens"),
-                )
-            return values
+            return self._reassemble_cp_forward_scalars(values, inputs)
+
+    @staticmethod
+    def _reassemble_cp_forward_scalars(
+        local_values: torch.Tensor, inputs: dict[str, Any]
+    ) -> torch.Tensor:
+        """Reassemble CP token scalars without ever gathering vocabulary logits."""
+        padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
+        if padded_cu_seqlens is None:
+            return local_values
+        values = reassemble_cp_packed_logprobs(local_values, padded_cu_seqlens)
+        return unpad_logits(
+            values,
+            inputs.get("_cp_padding_length", 0),
+            padded_cu_seqlens,
+            inputs.get("_cp_old_cu_seqlens"),
+        )
 
 
 # =============================================================================

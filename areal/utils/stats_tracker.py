@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, auto
 from threading import Lock
 
@@ -25,6 +27,14 @@ class ReduceType(Enum):
     SCALAR = auto()
 
 
+@dataclass(frozen=True)
+class _StatMetadata:
+    reduce_type: ReduceType
+    denominator: str | None
+    has_reduce_group: bool
+    compact: bool = False
+
+
 MOE_AUX_LOSSES = {}
 
 
@@ -36,6 +46,12 @@ class DistributedStatsTracker:
             self.scope_stack.append(name.strip("/"))
         self.denominators = {}  # key -> denominator key
         self.reduce_types = {}  # key -> ReduceType
+        # Per-key override of the reduce_group. If set, its value takes
+        # precedence over the `reduce_group` passed to `export`. This is used,
+        # e.g., to make CP-local SFT stats (loss/entropy/vocab_*) reduce across
+        # DP + CP so the reported numbers are CP-invariant (#1242 follow-up).
+        self.reduce_groups = {}  # key -> dist.ProcessGroup
+        self.compact_keys = set()
 
         self.stats = defaultdict(list)
 
@@ -93,7 +109,7 @@ class DistributedStatsTracker:
                 self._set_reduce_type(full_key, ReduceType.SCALAR)
                 self.stats[full_key].append(time.perf_counter() - start_time)
 
-    def denominator(self, **kwargs):
+    def denominator(self, *, reduce_group=None, **kwargs):
         with self.lock:
             for key, value in kwargs.items():
                 if not isinstance(value, torch.Tensor) or value.dtype != torch.bool:
@@ -105,21 +121,34 @@ class DistributedStatsTracker:
                 full_key = self._get_full_key(key)
                 self._set_reduce_type(full_key, ReduceType.SUM)
                 self.stats[full_key].append(value.detach().clone())
+                if reduce_group is not None:
+                    self.reduce_groups[full_key] = reduce_group
 
-    def scalar(self, **kwargs):
+    def scalar(self, *, reduce_group=None, **kwargs):
         with self.lock:
             for key, value in kwargs.items():
                 full_key = self._get_full_key(key)
                 self._set_reduce_type(full_key, ReduceType.SCALAR)
                 self.stats[full_key].append(float(value))
+                if reduce_group is not None:
+                    self.reduce_groups[full_key] = reduce_group
 
     def stat(
         self,
         denominator: str,
         reduce_type: ReduceType | None = None,
+        *,
+        reduce_group=None,
         **kwargs,
     ):
-        """Record multiple values from a dictionary"""
+        """Record multiple values from a dictionary.
+
+        If `reduce_group` is provided, it overrides the `reduce_group` passed
+        to `export` for these specific keys. This enables recording stats that
+        must be reduced across a different topology than the default (e.g.,
+        loss/vocab_* under CP-local loss need DP+CP reduce while n_seqs stays
+        DP-only).
+        """
         with self.lock:
             for key, value in kwargs.items():
                 if not isinstance(value, torch.Tensor) or value.dtype != torch.float:
@@ -131,6 +160,8 @@ class DistributedStatsTracker:
                 if reduce_type == ReduceType.SCALAR:
                     raise ValueError("Cannot use the scalar reduce type for a tensor")
                 full_key = self._get_full_key(key)
+                if full_key in self.compact_keys:
+                    raise ValueError(f"`{full_key}` already uses compact stats")
 
                 denorm = self._get_full_key(denominator)
                 if denorm not in self.stats or not self.stats[denorm]:
@@ -143,14 +174,204 @@ class DistributedStatsTracker:
                     reduce_type = ReduceType.AVG_MIN_MAX
                 self._set_reduce_type(full_key, reduce_type)
                 self.stats[full_key].append(value.detach().clone())
+                if reduce_group is not None:
+                    self.reduce_groups[full_key] = reduce_group
+
+    def stat_compact(
+        self,
+        mask: torch.Tensor,
+        reduce_type: ReduceType,
+        *,
+        reduce_group=None,
+        **kwargs,
+    ):
+        """Retain only masked sufficient statistics for large diagnostic tensors.
+
+        Unlike ``stat``, this API does not store a copy of each input tensor.
+        The four per-call scalars are sum, count, minimum, and maximum; export
+        reduces them across ranks using the usual reduce group.
+        """
+        if mask.dtype != torch.bool or mask.numel() == 0:
+            raise ValueError("mask must be a nonempty bool tensor")
+        if reduce_type not in {
+            ReduceType.AVG_MIN_MAX,
+            ReduceType.AVG,
+            ReduceType.SUM,
+            ReduceType.MIN,
+            ReduceType.MAX,
+        }:
+            raise ValueError("stat_compact requires a tensor reduction type")
+        with self.lock:
+            count = mask.sum(dtype=torch.float64)
+            for key, value in kwargs.items():
+                if not isinstance(value, torch.Tensor) or value.shape != mask.shape:
+                    raise ValueError(f"`{key}` must match the mask shape")
+                if value.dtype not in (torch.float32, torch.float64):
+                    raise ValueError(f"`{key}` must be a float32 or float64 tensor")
+                full_key = self._get_full_key(key)
+                if full_key in self.stats and full_key not in self.compact_keys:
+                    raise ValueError(f"`{full_key}` already uses non-compact stats")
+                total = (
+                    torch.where(mask, value.detach(), 0.0).sum(dtype=torch.float64)
+                    if reduce_type
+                    in (
+                        ReduceType.AVG_MIN_MAX,
+                        ReduceType.AVG,
+                        ReduceType.SUM,
+                    )
+                    else count.new_zeros(())
+                )
+                minimum = (
+                    torch.where(mask, value.detach(), float("inf")).min().double()
+                    if reduce_type in (ReduceType.AVG_MIN_MAX, ReduceType.MIN)
+                    else count.new_full((), float("inf"))
+                )
+                maximum = (
+                    torch.where(mask, value.detach(), float("-inf")).max().double()
+                    if reduce_type in (ReduceType.AVG_MIN_MAX, ReduceType.MAX)
+                    else count.new_full((), float("-inf"))
+                )
+                self._set_reduce_type(full_key, reduce_type)
+                self.compact_keys.add(full_key)
+                self.stats[full_key].append(
+                    torch.stack((total, count, minimum, maximum))
+                )
+                if reduce_group is not None:
+                    self.reduce_groups[full_key] = reduce_group
 
     def _set_reduce_type(self, key, reduce_type):
         if not isinstance(reduce_type, ReduceType):
             raise ValueError("reduce_type must be a ReduceType enum")
         self.reduce_types[key] = reduce_type
 
+    def _effective_reduce_group(
+        self,
+        key,
+        default_reduce_group,
+        sync_metadata: dict[str, _StatMetadata] | None = None,
+        key_sync_group=None,
+    ):
+        """Return the per-key reduce_group override if any, else the default."""
+        if sync_metadata is not None:
+            metadata = sync_metadata.get(key)
+            if metadata is not None and metadata.has_reduce_group:
+                if key_sync_group is not None:
+                    return key_sync_group
+                if key in self.reduce_groups:
+                    return self.reduce_groups[key]
+                raise RuntimeError(
+                    f"Key `{key}` has a per-key reduce_group on another rank, "
+                    "but no key_sync_group was provided for this rank."
+                )
+        if key in self.reduce_groups:
+            return self.reduce_groups[key]
+        return default_reduce_group
+
+    def _device_for_placeholder_tensor(self, group=None):
+        if group is not None:
+            try:
+                backend = str(dist.get_backend(group)).lower()
+                platform_backend = current_platform.communication_backend
+                if backend == platform_backend:
+                    return current_platform.device_type
+            except (AttributeError, RuntimeError, ValueError):
+                pass
+        try:
+            if current_platform.is_initialized():
+                return current_platform.device_type
+        except AttributeError:
+            pass
+        return "cpu"
+
+    def _placeholder_scalar(
+        self,
+        fill: float = 0.0,
+        like: torch.Tensor | None = None,
+        group=None,
+    ):
+        """Scalar identity tensor for reductions (0.0 for SUM/AVG, +/-inf for
+        MIN/MAX). Placed on ``like``'s device if given, else on the device
+        matching ``group``."""
+        device = (
+            like.device
+            if like is not None
+            else self._device_for_placeholder_tensor(group)
+        )
+        return torch.tensor(
+            fill,
+            dtype=torch.float32,
+            device=device,
+        )
+
+    def _all_reduce(
+        self,
+        tensor: torch.Tensor,
+        *,
+        group,
+        op: dist.ReduceOp | None = None,
+    ) -> torch.Tensor:
+        """Reduce a scalar on a device supported by the process-group backend."""
+        backend = None
+        try:
+            backend = str(dist.get_backend(group)).lower()
+            if backend == "gloo":
+                device = "cpu"
+            elif backend == current_platform.communication_backend:
+                device = current_platform.device_type
+            else:
+                device = None
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            # Unit-test process-group stand-ins and third-party backends may not
+            # expose backend metadata. Preserve the existing tensor in that case.
+            device = None
+        if device is not None and tensor.device.type != device:
+            tensor = tensor.to(device)
+        # MegatronAdaptor's global double bypass does not write its copy back.
+        if tensor.dtype == torch.float64 and (
+            backend == "hccl" or "megatron_adaptor" in sys.modules
+        ):
+            tensor = tensor.float()
+        if op is None:
+            dist.all_reduce(tensor, group=group)
+        else:
+            dist.all_reduce(tensor, group=group, op=op)
+        return tensor
+
+    def _local_metadata(self, keys: list[str]) -> dict[str, _StatMetadata]:
+        return {
+            key: _StatMetadata(
+                reduce_type=self.reduce_types.get(key, ReduceType.SCALAR),
+                denominator=self.denominators.get(key),
+                has_reduce_group=key in self.reduce_groups,
+                compact=key in self.compact_keys,
+            )
+            for key in keys
+        }
+
+    @staticmethod
+    def _merge_metadata(
+        all_metadata: list[dict[str, _StatMetadata]],
+    ) -> dict[str, _StatMetadata]:
+        metadata: dict[str, _StatMetadata] = {}
+        for rank_metadata in all_metadata:
+            for key, key_metadata in rank_metadata.items():
+                if key not in metadata:
+                    metadata[key] = key_metadata
+                elif metadata[key] != key_metadata:
+                    raise ValueError(
+                        f"Inconsistent stats metadata for key `{key}`: "
+                        f"{metadata[key]} vs {key_metadata}"
+                    )
+        return metadata
+
     def export(
-        self, key=None, reduce_group=None, reset=True, gloo_group=None
+        self,
+        key=None,
+        reduce_group=None,
+        reset=True,
+        gloo_group=None,
+        key_sync_group=None,
+        key_sync_gloo_group=None,
     ) -> dict[str, float]:
         """Get aggregated statistics"""
         with self.lock:
@@ -161,23 +382,69 @@ class DistributedStatsTracker:
                     if full_key in self.denominators:
                         self.denominators.pop(full_key)
                     if full_key in self.reduce_types:
-                        self.denominators.pop(full_key)
+                        self.reduce_types.pop(full_key)
+                    if full_key in self.reduce_groups:
+                        self.reduce_groups.pop(full_key)
+                    self.compact_keys.discard(full_key)
                     self.stats.pop(full_key)
                 return result
 
             # synchronize keys across ranks
             keys = list(self.stats.keys())
+            sync_metadata = self._local_metadata(keys)
             if reduce_group is not None:
-                all_keys = [None for _ in range(dist.get_world_size(reduce_group))]
-                dist.all_gather_object(all_keys, keys, group=gloo_group or reduce_group)
+                all_metadata = [None for _ in range(dist.get_world_size(reduce_group))]
+                dist.all_gather_object(
+                    all_metadata,
+                    self._local_metadata(keys),
+                    group=gloo_group or reduce_group,
+                )
+                sync_metadata = self._merge_metadata(all_metadata)
+
+            # Per-key reduce groups may be wider than the default export group
+            # (for example DP+CP vs DP). Only those override keys need the
+            # wider key/metadata sync; default keys keep the original
+            # reduce_group alignment.
+            if key_sync_group is not None:
+                override_keys = list(self.reduce_groups.keys())
+                all_override_metadata = [
+                    None for _ in range(dist.get_world_size(key_sync_group))
+                ]
+                dist.all_gather_object(
+                    all_override_metadata,
+                    self._local_metadata(override_keys),
+                    group=key_sync_gloo_group or key_sync_group,
+                )
+                override_metadata = self._merge_metadata(all_override_metadata)
+                for override_key, override_value in override_metadata.items():
+                    if (
+                        override_key in sync_metadata
+                        and sync_metadata[override_key] != override_value
+                    ):
+                        raise ValueError(
+                            f"Inconsistent stats metadata for key `{override_key}`: "
+                            f"{sync_metadata[override_key]} vs {override_value}"
+                        )
+                    sync_metadata[override_key] = override_value
+
+            if reduce_group is not None or key_sync_group is not None:
                 # Should ensure that the orders are the same
-                keys = sorted(list(set(flat2d(all_keys))))
+                keys = sorted(sync_metadata)
             results = {}
             for key in keys:
-                results.update(self._aggregate(key, reduce_group))
+                results.update(
+                    self._aggregate(
+                        key,
+                        reduce_group,
+                        sync_metadata=sync_metadata,
+                        key_sync_group=key_sync_group,
+                    )
+                )
             if reset:
                 self.denominators = {}
                 self.reduce_types = {}
+                self.reduce_groups = {}
+                self.compact_keys = set()
                 self.stats = defaultdict(list)
             results = {
                 k: v.cpu().item() if torch.is_tensor(v) else v
@@ -185,35 +452,60 @@ class DistributedStatsTracker:
             }
             return results
 
-    def _aggregate(self, key, reduce_group):
-        reduce_type = self.reduce_types.get(key, ReduceType.SCALAR)
+    def _aggregate(
+        self,
+        key,
+        reduce_group,
+        sync_metadata: dict[str, _StatMetadata] | None = None,
+        key_sync_group=None,
+    ):
+        metadata = sync_metadata.get(key) if sync_metadata is not None else None
+        reduce_type = self.reduce_types.get(
+            key,
+            metadata.reduce_type if metadata is not None else ReduceType.SCALAR,
+        )
+
+        if key in self.compact_keys or (metadata is not None and metadata.compact):
+            return self._aggregate_compact(
+                key, reduce_type, reduce_group, sync_metadata, key_sync_group
+            )
 
         result = {}
         if reduce_type == ReduceType.AVG_MIN_MAX:
-            result["/".join([key, "avg"])] = self._avg_of(key, reduce_group)
-            result["/".join([key, "min"])] = self._min_of(key, reduce_group)
-            result["/".join([key, "max"])] = self._max_of(key, reduce_group)
-        elif reduce_type == ReduceType.AVG:
-            result[key] = self._avg_of(key, reduce_group)
-        elif reduce_type == ReduceType.SUM:
-            result[key] = self._sum_of(key, reduce_group)
-        elif reduce_type == ReduceType.MIN:
-            result[key] = self._min_of(key, reduce_group)
-        elif reduce_type == ReduceType.MAX:
-            result[key] = self._max_of(key, reduce_group)
-        elif reduce_type == ReduceType.SCALAR:
-            if current_platform.is_initialized():
-                device = current_platform.device_type
-            else:
-                device = "cpu"
-            value = torch.tensor(
-                sum(self.stats[key]), dtype=torch.float32, device=device
+            result["/".join([key, "avg"])] = self._avg_of(
+                key, reduce_group, sync_metadata, key_sync_group
             )
-            cnt = torch.tensor(len(self.stats[key]), dtype=torch.float32, device=device)
-            if reduce_group is not None:
-                dist.all_reduce(value, group=reduce_group)
-                dist.all_reduce(cnt, group=reduce_group)
-            result[key] = float(value / cnt)
+            result["/".join([key, "min"])] = self._min_of(
+                key, reduce_group, sync_metadata, key_sync_group
+            )
+            result["/".join([key, "max"])] = self._max_of(
+                key, reduce_group, sync_metadata, key_sync_group
+            )
+        elif reduce_type == ReduceType.AVG:
+            result[key] = self._avg_of(key, reduce_group, sync_metadata, key_sync_group)
+        elif reduce_type == ReduceType.SUM:
+            result[key] = self._sum_of(key, reduce_group, sync_metadata, key_sync_group)
+        elif reduce_type == ReduceType.MIN:
+            result[key] = self._min_of(key, reduce_group, sync_metadata, key_sync_group)
+        elif reduce_type == ReduceType.MAX:
+            result[key] = self._max_of(key, reduce_group, sync_metadata, key_sync_group)
+        elif reduce_type == ReduceType.SCALAR:
+            effective_group = self._effective_reduce_group(
+                key, reduce_group, sync_metadata, key_sync_group
+            )
+            # `.get`: a rank may learn about this key via key/metadata sync
+            # without holding any local values for it.
+            stats = self.stats.get(key, [])
+            value = self._placeholder_scalar(
+                fill=float(sum(stats)), group=effective_group
+            )
+            cnt = self._placeholder_scalar(
+                fill=float(len(stats)), group=effective_group
+            )
+            if effective_group is not None:
+                dist.all_reduce(value, group=effective_group)
+                dist.all_reduce(cnt, group=effective_group)
+            result[key] = float(value / cnt) if float(cnt) > 0 else 0.0
             result[key + "__count"] = int(cnt)
         else:
             raise ValueError(f"Unknown reduce type: {reduce_type}")
@@ -223,14 +515,81 @@ class DistributedStatsTracker:
             result.pop(k)
         return result
 
-    def _sum_of(self, key, reduce_group):
-        values = self.stats[key]
-        if key not in self.denominators:
-            x = sum([x.sum() for x in values])
-            if reduce_group is not None:
-                dist.all_reduce(x, group=reduce_group)
+    def _aggregate_compact(
+        self, key, reduce_type, reduce_group, sync_metadata, key_sync_group
+    ):
+        values = self.stats.get(key, [])
+        group = self._effective_reduce_group(
+            key, reduce_group, sync_metadata, key_sync_group
+        )
+        if values:
+            local = torch.stack(values)
+            total = local[:, 0].sum()
+            count = local[:, 1].sum()
+            minimum = local[:, 2].min()
+            maximum = local[:, 3].max()
         else:
-            denominator = self.denominators[key]
+            total = self._placeholder_scalar(group=group).double()
+            count = self._placeholder_scalar(group=group).double()
+            minimum = self._placeholder_scalar(fill=float("inf"), group=group).double()
+            maximum = self._placeholder_scalar(fill=float("-inf"), group=group).double()
+        if group is not None:
+            if reduce_type in (ReduceType.AVG_MIN_MAX, ReduceType.AVG):
+                both = self._all_reduce(torch.stack((total, count)), group=group)
+                total, count = both.unbind()
+            elif reduce_type == ReduceType.SUM:
+                total = self._all_reduce(total, group=group)
+            else:
+                count = self._all_reduce(count, group=group)
+            if reduce_type in (ReduceType.AVG_MIN_MAX, ReduceType.MIN):
+                minimum = self._all_reduce(minimum, group=group, op=dist.ReduceOp.MIN)
+            if reduce_type in (ReduceType.AVG_MIN_MAX, ReduceType.MAX):
+                maximum = self._all_reduce(maximum, group=group, op=dist.ReduceOp.MAX)
+        if reduce_type == ReduceType.SUM:
+            return {key: float(total)}
+        if count == 0:
+            return {}
+        if reduce_type == ReduceType.AVG_MIN_MAX:
+            return {
+                f"{key}/avg": float(total / count),
+                f"{key}/min": float(minimum),
+                f"{key}/max": float(maximum),
+            }
+        if reduce_type == ReduceType.AVG:
+            return {key: float(total / count)}
+        if reduce_type == ReduceType.MIN:
+            return {key: float(minimum)}
+        if reduce_type == ReduceType.MAX:
+            return {key: float(maximum)}
+        raise ValueError(f"Unknown compact reduce type: {reduce_type}")
+
+    def _sum_of(
+        self,
+        key,
+        reduce_group,
+        sync_metadata: dict[str, _StatMetadata] | None = None,
+        key_sync_group=None,
+    ):
+        values = self.stats.get(key, [])
+        effective_group = self._effective_reduce_group(
+            key, reduce_group, sync_metadata, key_sync_group
+        )
+        if not values:
+            x = self._placeholder_scalar(group=effective_group)
+            if effective_group is not None:
+                dist.all_reduce(x, group=effective_group)
+            return float(x)
+
+        metadata = sync_metadata.get(key) if sync_metadata is not None else None
+        denominator = self.denominators.get(
+            key,
+            metadata.denominator if metadata is not None else None,
+        )
+        if denominator is None:
+            x = sum([x.sum() for x in values], self._placeholder_scalar(like=values[0]))
+            if effective_group is not None:
+                dist.all_reduce(x, group=effective_group)
+        else:
             if denominator not in self.stats:
                 raise ValueError(
                     f"Denominator `{denominator}` not set for key `{key}`."
@@ -238,14 +597,45 @@ class DistributedStatsTracker:
             xs = []
             for v, d in zip(values, self.stats[denominator]):
                 xs.append(torch.where(d, v, 0.0).sum())
-            x = sum(xs)
-            if reduce_group is not None:
-                dist.all_reduce(x, group=reduce_group)
+            x = sum(xs, self._placeholder_scalar(like=values[0]))
+            if effective_group is not None:
+                dist.all_reduce(x, group=effective_group)
         return float(x)
 
-    def _avg_of(self, key, reduce_group):
-        values = self.stats[key]
-        denominator = self.denominators[key]
+    def _denominator_of(
+        self,
+        key,
+        sync_metadata: dict[str, _StatMetadata] | None = None,
+    ):
+        if key in self.denominators:
+            return self.denominators[key]
+        metadata = sync_metadata.get(key) if sync_metadata is not None else None
+        if metadata is not None and metadata.denominator is not None:
+            return metadata.denominator
+        raise ValueError(f"Denominator not set for key `{key}`.")
+
+    def _avg_of(
+        self,
+        key,
+        reduce_group,
+        sync_metadata: dict[str, _StatMetadata] | None = None,
+        key_sync_group=None,
+    ):
+        values = self.stats.get(key, [])
+        if not values:
+            effective_group = self._effective_reduce_group(
+                key, reduce_group, sync_metadata, key_sync_group
+            )
+            x = self._placeholder_scalar(group=effective_group)
+            d = self._placeholder_scalar(group=effective_group)
+            if effective_group is not None:
+                dist.all_reduce(x, group=effective_group)
+                dist.all_reduce(d, group=effective_group)
+            if d == 0:
+                return None
+            return x / d
+
+        denominator = self._denominator_of(key, sync_metadata)
         if denominator not in self.stats:
             raise ValueError(f"Denominator `{denominator}` not set for key `{key}`.")
         xs = []
@@ -253,41 +643,84 @@ class DistributedStatsTracker:
         for v, d in zip(values, self.stats[denominator]):
             xs.append(torch.where(d, v, 0.0).sum())
             ds.append(d.sum())
-        x = sum(xs)
-        d = sum(ds)
-        if reduce_group is not None:
-            dist.all_reduce(x, group=reduce_group)
-            dist.all_reduce(d, group=reduce_group)
+        x = sum(xs, self._placeholder_scalar(like=values[0]))
+        d = sum(ds, self._placeholder_scalar(like=values[0]))
+        effective_group = self._effective_reduce_group(
+            key, reduce_group, sync_metadata, key_sync_group
+        )
+        if effective_group is not None:
+            dist.all_reduce(x, group=effective_group)
+            dist.all_reduce(d, group=effective_group)
         if d == 0:
             return None
         return x / d
 
-    def _min_of(self, key, reduce_group):
-        values = self.stats[key]
-        denominator = self.denominators[key]
+    def _min_of(
+        self,
+        key,
+        reduce_group,
+        sync_metadata: dict[str, _StatMetadata] | None = None,
+        key_sync_group=None,
+    ):
+        values = self.stats.get(key, [])
+        if not values:
+            effective_group = self._effective_reduce_group(
+                key, reduce_group, sync_metadata, key_sync_group
+            )
+            x = self._placeholder_scalar(fill=float("inf"), group=effective_group)
+            if effective_group is not None:
+                dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MIN)
+            if torch.isinf(x):
+                return None
+            return float(x)
+
+        denominator = self._denominator_of(key, sync_metadata)
         if denominator not in self.stats:
             raise ValueError(f"Denominator `{denominator}` not set for key `{key}`.")
         xs = []
         for v, d in zip(values, self.stats[denominator]):
             xs.append(torch.where(d, v, float("inf")).min())
-        x = min(xs)
-        if reduce_group is not None:
-            dist.all_reduce(x, group=reduce_group, op=dist.ReduceOp.MIN)
+        x = torch.stack(xs).min()
+        effective_group = self._effective_reduce_group(
+            key, reduce_group, sync_metadata, key_sync_group
+        )
+        if effective_group is not None:
+            dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MIN)
         if torch.isinf(x):
             return None
         return float(x)
 
-    def _max_of(self, key, reduce_group):
-        values = self.stats[key]
-        denominator = self.denominators[key]
+    def _max_of(
+        self,
+        key,
+        reduce_group,
+        sync_metadata: dict[str, _StatMetadata] | None = None,
+        key_sync_group=None,
+    ):
+        values = self.stats.get(key, [])
+        if not values:
+            effective_group = self._effective_reduce_group(
+                key, reduce_group, sync_metadata, key_sync_group
+            )
+            x = self._placeholder_scalar(fill=-float("inf"), group=effective_group)
+            if effective_group is not None:
+                dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MAX)
+            if torch.isinf(x):
+                return None
+            return float(x)
+
+        denominator = self._denominator_of(key, sync_metadata)
         if denominator not in self.stats:
             raise ValueError(f"Denominator `{denominator}` not set for key `{key}`.")
         xs = []
         for v, d in zip(values, self.stats[denominator]):
             xs.append(torch.where(d, v, -float("inf")).max())
-        x = max(xs)
-        if reduce_group is not None:
-            dist.all_reduce(x, group=reduce_group, op=dist.ReduceOp.MAX)
+        x = torch.stack(xs).max()
+        effective_group = self._effective_reduce_group(
+            key, reduce_group, sync_metadata, key_sync_group
+        )
+        if effective_group is not None:
+            dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MAX)
         if torch.isinf(x):
             return None
         return float(x)
@@ -295,7 +728,9 @@ class DistributedStatsTracker:
 
 DEFAULT_TRACKER = DistributedStatsTracker()
 stat = DEFAULT_TRACKER.stat
+stat_compact = DEFAULT_TRACKER.stat_compact
 denominator = DEFAULT_TRACKER.denominator
+disable_scope = DEFAULT_TRACKER.disable_scope
 export = DEFAULT_TRACKER.export
 scope = DEFAULT_TRACKER.scope
 scalar = DEFAULT_TRACKER.scalar
@@ -314,20 +749,38 @@ def get(name: str = ""):
         return TRACKERS[name]
 
 
-def export_all(reduce_group=None, reset=True, gloo_group=None) -> dict[str, float]:
+def export_all(
+    reduce_group=None,
+    reset=True,
+    gloo_group=None,
+    key_sync_group=None,
+    key_sync_gloo_group=None,
+) -> dict[str, float]:
     stat = {}
     duplicate_keys = set()
     tracker_keys = list(TRACKERS.keys())
-    if reduce_group is not None or gloo_group is not None:
-        all_trackers = [None for _ in range(dist.get_world_size(reduce_group))]
+    if key_sync_group is not None:
+        reduce_sync_group = key_sync_group
+        object_sync_group = key_sync_gloo_group or key_sync_group
+    else:
+        reduce_sync_group = reduce_group
+        object_sync_group = gloo_group or reduce_group
+    if object_sync_group is not None:
+        all_trackers = [None for _ in range(dist.get_world_size(reduce_sync_group))]
         dist.all_gather_object(
-            all_trackers, list(TRACKERS.keys()), group=gloo_group or reduce_group
+            all_trackers,
+            list(TRACKERS.keys()),
+            group=object_sync_group,
         )
         tracker_keys = sorted(list(set(flat2d(all_trackers))))
     for tracker_key in tracker_keys:
         tracker = get(tracker_key)
         x = tracker.export(
-            reduce_group=reduce_group, reset=reset, gloo_group=gloo_group
+            reduce_group=reduce_group,
+            reset=reset,
+            gloo_group=gloo_group,
+            key_sync_group=key_sync_group,
+            key_sync_gloo_group=key_sync_gloo_group,
         )
         for k in x.keys():
             if k in stat:

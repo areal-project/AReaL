@@ -25,6 +25,7 @@ class _MicroBatches(list):
 
 def _bind_per_token_loss_methods(engine, namespace):
     """Bind the scalar normalization helpers on the lightweight engine fixture."""
+    namespace.setdefault("ChunkedLMHeadOutput", type("ChunkedLMHeadOutput", (), {}))
     engine._per_token_count = _load_function(
         ENGINE_SOURCE, "_per_token_count", namespace
     ).__func__
@@ -119,6 +120,7 @@ def test_train_gradient_matches_global_mean(
                 ENGINE_SOURCE, "_set_optimizer_grad_scale_func", namespace
             )
             engine = SimpleNamespace(
+                mcore_config=SimpleNamespace(enable_mtp_training=False),
                 _ensure_ready=lambda: None,
                 optimizer_zero_grad=lambda: None,
                 optimizer_step=lambda: {},
@@ -239,6 +241,7 @@ def test_optimizer_scale_hook_handles_shared_configs_and_dynamic_scale():
     scale = torch.tensor(128.0)
     optimizer = SimpleNamespace(scale_loss=lambda loss: loss * scale)
     engine = SimpleNamespace(
+        mcore_config=SimpleNamespace(enable_mtp_training=False),
         optimizer=optimizer,
         model=[SimpleNamespace(config=c) for c in [configs[0], configs[1], configs[0]]],
     )
@@ -283,6 +286,7 @@ def test_main_and_auxiliary_gradients_share_optimizer_scale(per_token, loss_scal
     """MCore seeds auxiliary gradients independently of the main-loss backward."""
     config = SimpleNamespace(grad_scale_func=None)
     engine = SimpleNamespace(
+        mcore_config=SimpleNamespace(enable_mtp_training=False),
         optimizer=SimpleNamespace(scale_loss=lambda loss: loss * loss_scale),
         model=[SimpleNamespace(config=config)],
     )
@@ -320,6 +324,7 @@ def test_train_all_zero_weight_batch_is_rejected(per_token):
     }
     train = _load_function(ENGINE_SOURCE, "train_batch", namespace)
     engine = SimpleNamespace(
+        mcore_config=SimpleNamespace(enable_mtp_training=False),
         _ensure_ready=lambda: None,
         optimizer_zero_grad=lambda: None,
         _normalize_batch_input=lambda inputs: (inputs, None),
@@ -372,6 +377,7 @@ def test_train_all_masked_rank_uses_global_valid_token_guard(
     }
     train = _load_function(ENGINE_SOURCE, "train_batch", namespace)
     engine = SimpleNamespace(
+        mcore_config=SimpleNamespace(enable_mtp_training=False),
         _ensure_ready=lambda: None,
         optimizer_zero_grad=lambda: None,
         _normalize_batch_input=lambda inputs: (inputs, None),
@@ -445,6 +451,9 @@ def test_forward_callback_preserves_loss_contract(with_count):
             "unpad_logits": lambda output, **kw: output,
             "get_forward_backward_func": lambda: schedule,
             "trace_scope": lambda *args: nullcontext(),
+            "_float16_wrapper_fp32_output": _load_function(
+                ENGINE_SOURCE, "_float16_wrapper_fp32_output", {"torch": torch}
+            ),
         },
     )
     engine = SimpleNamespace(
@@ -453,6 +462,13 @@ def test_forward_callback_preserves_loss_contract(with_count):
         is_vision_model=False,
         use_padded_seq=False,
         use_model_packed_seq=False,
+        mcore_config=SimpleNamespace(
+            enable_mtp_training=False,
+            lm_head_loss_chunk_size=0,
+            enable_chunked_logits=False,
+        ),
+        config=SimpleNamespace(is_critic=False),
+        dtype=torch.float32,
         model=[SimpleNamespace()],
     )
     count = torch.tensor(3)
@@ -468,3 +484,97 @@ def test_forward_callback_preserves_loss_contract(with_count):
     torch.testing.assert_close(result[0], output.sum(), rtol=0, atol=0)
     if with_count:
         assert result[1] is count
+
+
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize("vpp_size", [1, 2])
+def test_mtp_scale_uses_physical_tokens_with_sequence_loss(cp_size, vpp_size):
+    """Every VPP chunk retains MTP targets and physical-token normalization."""
+    captured = []
+
+    def packed_forward(model, inputs, **kwargs):
+        captured.append(inputs["mtp_kwargs"])
+        return torch.ones(1, 5)
+
+    def schedule(*, forward_step_func, data_iterator, model, **kwargs):
+        iterators = data_iterator if vpp_size > 1 else [data_iterator]
+        models = model if vpp_size > 1 else [model]
+        for iterator, chunk in zip(iterators, models):
+            forward_step_func(iterator, chunk)
+
+    namespace = {
+        "torch": torch,
+        "functools": functools,
+        "dist": SimpleNamespace(all_reduce=lambda *args, **kwargs: None),
+        "mpu": SimpleNamespace(
+            get_data_parallel_group=lambda **kwargs: None,
+            get_pipeline_model_parallel_group=lambda: None,
+            get_context_parallel_world_size=lambda: cp_size,
+            get_data_parallel_world_size=lambda **kwargs: cp_size,
+            is_pipeline_last_stage=lambda **kwargs: True,
+        ),
+        "get_model_config": lambda model: model.config,
+        "packed_context_parallel_forward": packed_forward,
+        "_is_multi_modal_payload_key": lambda key: False,
+        "unpad_logits": lambda output, **kwargs: output,
+        "get_forward_backward_func": lambda: schedule,
+        "trace_scope": lambda *args: nullcontext(),
+        "_float16_wrapper_fp32_output": _load_function(
+            ENGINE_SOURCE, "_float16_wrapper_fp32_output", {"torch": torch}
+        ),
+    }
+    train = _load_function(ENGINE_SOURCE, "train_batch", namespace)
+    batch = {
+        "input_ids": torch.ones(1, 5, dtype=torch.long),
+        "loss_mask": torch.ones(1, 5),
+    }
+    batches = _MicroBatches(
+        [
+            SimpleNamespace(
+                padded_mb=batch, orig_mb=batch, old_cu_seqlens=None, padding_length=0
+            )
+        ]
+    )
+    batches.max_seqlen = 5
+
+    engine = SimpleNamespace(
+        mcore_config=SimpleNamespace(
+            enable_mtp_training=True,
+            lm_head_loss_chunk_size=0,
+            enable_chunked_logits=False,
+        ),
+        config=SimpleNamespace(is_critic=False),
+        dtype=torch.float32,
+        _ensure_ready=lambda: None,
+        optimizer_zero_grad=lambda: None,
+        optimizer_step=lambda: {},
+        _normalize_batch_input=lambda inputs: (inputs, None),
+        _prepare_mb_list=lambda inputs: batches,
+        _compute_loss_totals=lambda *args: (
+            torch.tensor(float(cp_size)),
+            torch.tensor(5.0 * cp_size),
+        ),
+        model=[
+            SimpleNamespace(config=SimpleNamespace(calculate_per_token_loss=True))
+            for _ in range(vpp_size)
+        ],
+        enable_tree_training=False,
+        is_vision_model=False,
+        use_padded_seq=False,
+        use_model_packed_seq=False,
+        device="cpu",
+    )
+    engine.forward_backward_batch = functools.partial(
+        _load_function(ENGINE_SOURCE, "forward_backward_batch", namespace), engine
+    )
+    train(engine, {}, None, None)
+    assert len(captured) == vpp_size
+    assert all(kwargs is batch["mtp_kwargs"] for kwargs in captured)
+    assert captured[0]["mtp_labels"] is batch["input_ids"]
+    torch.testing.assert_close(
+        captured[0]["mtp_loss_mask"], torch.tensor([[1, 1, 1, 1, 0.0]]), rtol=0, atol=0
+    )
+    # Three valid two-token-ahead targets, normalized by five physical tokens.
+    torch.testing.assert_close(
+        captured[0]["batch"]["scale"], torch.tensor(5.0 / 3), rtol=1e-6, atol=1e-7
+    )

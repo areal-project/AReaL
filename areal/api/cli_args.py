@@ -927,6 +927,74 @@ class MegatronEngineConfig:
             "Ignored on NPU; use mindspeed.moe_permute_fusion."
         },
     )
+    moe_router_fusion: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable fusion for MoE TopK routing and aux-loss computation. "
+            "Requires TransformerEngine >= 2.7.0.",
+        },
+    )
+    moe_router_bias_update_rate: float = field(
+        default=0.0,
+        metadata={
+            "help": "Update rate for auxiliary-loss-free MoE load balancing "
+            "(DeepSeek V3 style). Controls how fast expert_bias adjusts. "
+            "Default 0.0 disables bias updates; set a positive value such as "
+            "1e-3 to enable.",
+        },
+    )
+    moe_z_loss_coeff: float | None = field(
+        default=None,
+        metadata={
+            "help": "Scaling coefficient for router z-loss. Complements "
+            "auxiliary-loss-free load balancing for router stability. A starting "
+            "value of 1e-3 is recommended. None disables z-loss.",
+        },
+    )
+
+    # Precision & Loss
+    enable_chunked_logits: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable AReaL's accelerator chunked-logits path by replacing "
+            "Megatron's native output layer with the vocab-parallel LM Head. "
+            "Tree training is unsupported."
+        },
+    )
+    entropy_requires_grad: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether the training loss requires entropy gradients. "
+            "Defaults to False. With AReaL LM Head enabled, False permits "
+            "destructive logits-storage reuse, so entropy is non-differentiable. "
+            "Set True to use the differentiable fallback."
+        },
+    )
+    lm_head_loss_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": "Sequence chunk size for AReaL's chunked LM Head loss. A "
+            "positive value requires enable_chunked_logits=True and "
+            "entropy_requires_grad=False, and computes LM Head logits and their "
+            "backward one chunk at a time. The chunked path only supports packed "
+            "text actor models without MTP; 0 disables it."
+        },
+    )
+    enable_fp32_lm_head: bool = field(
+        default=False,
+        metadata={
+            "help": "Compute the lm_head projection with FP32 input and weight "
+            "operands for numerical stability. With enable_chunked_logits=True, "
+            "the local vocab-parallel weight is converted once per microbatch "
+            "LM-head forward and reused across sequence chunks."
+        },
+    )
+    cross_entropy_loss_fusion: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable fused cross-entropy loss kernel for better performance."
+        },
+    )
 
     # FP8 Training Configuration
     fp8_config: FP8EngineConfig | None = None
@@ -984,14 +1052,20 @@ class MegatronEngineConfig:
         },
     )
 
-    enable_mtp: bool = field(
+    enable_mtp_training: bool = field(
         default=False,
         metadata={
-            "help": "Build and train the model's Multi-Token-Prediction (MTP) head "
-            "(bridge_type=megatron-bridge only). Default False leaves it unbuilt; "
-            "the frozen head is still copied from the source into exports so they "
-            "stay complete for MTP speculative decoding.",
+            "help": "Train the MTP head with an isolated auxiliary loss "
+            "(megatron-bridge only). MTP loss gradients do not flow into policy "
+            "parameters; MTP and policy gradients share global grad-norm clipping. "
+            "Full HF checkpoints preserve MTP weights whether training is "
+            "enabled or disabled.",
         },
+    )
+
+    mtp_loss_scaling_factor: float = field(
+        default=0.1,
+        metadata={"help": "Non-negative finite weight of the auxiliary MTP loss."},
     )
 
     vision_dp_when_cp: bool = field(
@@ -1012,6 +1086,34 @@ class MegatronEngineConfig:
     freeze_vision_projection: bool = field(
         default=False, metadata={"help": "Freeze the vision projection layer"}
     )
+
+    def __post_init__(self) -> None:
+        if self.lm_head_loss_chunk_size < 0:
+            raise ValueError(
+                "lm_head_loss_chunk_size must be non-negative, got "
+                f"{self.lm_head_loss_chunk_size}"
+            )
+        if self.lm_head_loss_chunk_size > 0 and not self.enable_chunked_logits:
+            raise ValueError(
+                "lm_head_loss_chunk_size requires enable_chunked_logits=True"
+            )
+        if self.lm_head_loss_chunk_size > 0 and self.entropy_requires_grad:
+            raise ValueError(
+                "lm_head_loss_chunk_size requires entropy_requires_grad=False"
+            )
+        if self.lm_head_loss_chunk_size > 0 and self.enable_mtp_training:
+            raise ValueError(
+                "lm_head_loss_chunk_size does not support enable_mtp_training=True"
+            )
+        if (
+            not math.isfinite(self.mtp_loss_scaling_factor)
+            or self.mtp_loss_scaling_factor < 0
+        ):
+            raise ValueError("mtp_loss_scaling_factor must be finite and non-negative")
+        if self.enable_mtp_training and self.bridge_type != "megatron-bridge":
+            raise ValueError(
+                "enable_mtp_training requires bridge_type='megatron-bridge'"
+            )
 
 
 @dataclass
@@ -1213,6 +1315,13 @@ class TrainEngineConfig:
     temperature: float = field(
         default=1.0, metadata={"help": "Temperature during generation."}
     )
+    logprobs_chunk_size: int = field(
+        default=1024,
+        metadata={
+            "help": "Maximum sequence chunk size used to compute log probabilities "
+            "and entropy. Must be positive."
+        },
+    )
     # Runtime microbatch limit
     mb_spec: MicroBatchSpec = field(default_factory=MicroBatchSpec)
     pad_to_maximum: bool = field(
@@ -1376,6 +1485,10 @@ class TrainEngineConfig:
 
     def __post_init__(self):
         """Validate scheduling_spec length and config combinations."""
+        if self.logprobs_chunk_size <= 0:
+            raise ValueError(
+                f"logprobs_chunk_size must be positive, got {self.logprobs_chunk_size}"
+            )
         if self.use_lora and self.use_merged_lora:
             raise ValueError("use_lora and use_merged_lora are mutually exclusive")
         if len(self.scheduling_spec) not in (1, 2):
@@ -1685,7 +1798,8 @@ class PPOActorConfig(TrainEngineConfig):
     use_decoupled_loss: bool = field(
         default=False,
         metadata={
-            "help": "Use the decoupled loss. Implicitly enables recompute_logprob."
+            "help": "Use the decoupled loss. prox_logp_method controls how the "
+            "proximal log-probability is obtained."
         },
     )
     rejection_sampling: RejectionSamplingConfig | None = field(
@@ -1723,6 +1837,7 @@ class PPOActorConfig(TrainEngineConfig):
             "help": "Method for computing proximal policy log-probabilities in decoupled PPO. "
             "Only effective when use_decoupled_loss=True. Options: "
             "'recompute' (default): Standard decoupled PPO, recompute proximal policy via forward pass. "
+            "'reuse': Reuse detached log-probabilities from the current training forward pass; requires use_decoupled_loss=True and ppo_n_minibatches=1. "
             "'loglinear': Use log-linear interpolation to approximate proximal policy (skip forward pass). "
             "'metrics': Like 'recompute', but also compute approximation metrics for evaluation.",
             "choices": PROX_LOGP_METHODS_ALL,
@@ -1790,6 +1905,20 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        from areal.utils.constants import ProxLogpMethod
+
+        method = ProxLogpMethod(self.prox_logp_method)
+        if method == ProxLogpMethod.REUSE:
+            if not self.use_decoupled_loss:
+                raise ValueError(
+                    "prox_logp_method='reuse' requires use_decoupled_loss=True."
+                )
+            if self.ppo_n_minibatches != 1:
+                raise ValueError(
+                    "prox_logp_method='reuse' requires ppo_n_minibatches=1, "
+                    f"got {self.ppo_n_minibatches}."
+                )
+
         if self.loss_aggregation not in (
             "token-mean",
             "seq-mean",

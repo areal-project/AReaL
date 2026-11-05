@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -10,6 +11,31 @@ from megatron.core.packed_seq_params import PackedSeqParams
 
 from areal.infra.platforms import is_npu_available
 from areal.utils.data import is_multi_modal_key
+
+
+def _unwrap_language_model(model: torch.nn.Module) -> torch.nn.Module:
+    current = model
+    while hasattr(current, "module"):
+        current = current.module
+    return getattr(current, "language_model", current)
+
+
+@contextmanager
+def _hidden_states_output(model: torch.nn.Module, enabled: bool):
+    if not enabled:
+        yield
+        return
+    language_model = _unwrap_language_model(model)
+    if not hasattr(language_model, "post_process"):
+        raise TypeError(
+            "chunked LM Head loss requires a model with a post_process attribute"
+        )
+    original = language_model.post_process
+    language_model.post_process = False
+    try:
+        yield
+    finally:
+        language_model.post_process = original
 
 
 def preprocess_packed_seqs_context_parallel(
@@ -338,6 +364,82 @@ def _build_thd_packed_seq_params(cu_seqlens: torch.Tensor) -> PackedSeqParams:
     )
 
 
+def _prepare_mtp_forward_kwargs(
+    mtp_kwargs: dict[str, Any],
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    packed_num_tokens: int,
+    uses_padded_form: bool,
+    uses_model_packed_seq: bool,
+) -> dict[str, Any]:
+    """Align packed MTP labels and masks with the model's execution layout."""
+    labels = mtp_kwargs.get("mtp_labels")
+    loss_mask = mtp_kwargs.get("mtp_loss_mask")
+    if labels is None or loss_mask is None:
+        raise ValueError("MTP training requires both mtp_labels and mtp_loss_mask.")
+    if labels.shape != loss_mask.shape:
+        raise ValueError(
+            "MTP labels and loss mask must have identical shapes, got "
+            f"{labels.shape} and {loss_mask.shape}."
+        )
+
+    if cu_seqlens is None:
+        if labels.numel() != input_ids.numel():
+            raise ValueError(
+                "MTP labels must contain one value per input token, got "
+                f"{labels.numel()} labels for {input_ids.numel()} tokens."
+            )
+        return {
+            **mtp_kwargs,
+            "mtp_labels": labels.reshape(input_ids.shape).contiguous(),
+            "mtp_loss_mask": loss_mask.reshape(input_ids.shape).contiguous(),
+        }
+
+    if labels.ndim != 1:
+        raise ValueError(
+            "MTP labels and loss mask must enter packed sequence-layout conversion "
+            f"as 1-D tensors, got {labels.shape=} and {loss_mask.shape=}."
+        )
+
+    if labels.numel() != packed_num_tokens:
+        raise ValueError(
+            "MTP labels must match the packed sequence length, got "
+            f"{labels.numel()} labels for {packed_num_tokens} tokens."
+        )
+
+    if uses_padded_form and not uses_model_packed_seq:
+        if attention_mask is None:
+            raise ValueError("Padded MTP training requires a 2-D validity mask.")
+        padded_labels = torch.zeros_like(input_ids)
+        padded_loss_mask = torch.zeros(
+            input_ids.shape,
+            dtype=loss_mask.dtype,
+            device=loss_mask.device,
+        )
+        padded_labels[attention_mask] = labels
+        padded_loss_mask[attention_mask] = loss_mask
+        return {
+            **mtp_kwargs,
+            "mtp_labels": padded_labels,
+            "mtp_loss_mask": padded_loss_mask,
+        }
+
+    # Packed context parallelism assigns each rank two zigzag chunks per
+    # sequence. Apply the exact same mapping used for input_ids so every local
+    # hidden state keeps its token-aligned MTP target and validity mask. MCore's
+    # roll_tensor subsequently uses cp_group and packed_seq_params to exchange
+    # future-token boundaries across CP ranks.
+    labels = split_packed_seqs_for_context_parallel(labels, cu_seqlens)
+    loss_mask = split_packed_seqs_for_context_parallel(loss_mask, cu_seqlens)
+    return {
+        **mtp_kwargs,
+        "mtp_labels": labels.unsqueeze(0).contiguous(),
+        "mtp_loss_mask": loss_mask.unsqueeze(0).contiguous(),
+    }
+
+
 def packed_context_parallel_forward(
     model: torch.nn.Module,
     input_: dict[str, Any],
@@ -345,8 +447,11 @@ def packed_context_parallel_forward(
     is_vision_model: bool = False,
     use_padded_seq: bool = False,
     use_model_packed_seq: bool = False,
+    fp32_output: bool | None = None,
+    return_hidden_states: bool = False,
 ):
     input_ids = input_["input_ids"]
+    packed_num_tokens = input_ids.numel()
     position_ids = input_.get("position_ids", None)
     cu_seqlens = input_.get("cu_seqlens", None)
     # `attention_mask`: dense torch.Tensor (flex attention with Megatron) or None.
@@ -453,19 +558,39 @@ def packed_context_parallel_forward(
     if dense_mask_text_forward:
         position_ids = None
 
-    try:
-        output = model(
-            input_ids=input_ids,
-            attention_mask=final_attention_mask,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
-            **vlm_kwargs,
+    extra_forward_kwargs = {}
+    if input_.get("mtp_kwargs") is not None:
+        extra_forward_kwargs["mtp_kwargs"] = _prepare_mtp_forward_kwargs(
+            input_["mtp_kwargs"],
+            input_ids,
+            attention_mask,
+            cu_seqlens=cu_seqlens,
+            packed_num_tokens=packed_num_tokens,
+            uses_padded_form=needs_padded_form,
+            uses_model_packed_seq=use_model_packed_seq,
         )
+
+    try:
+        model_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": final_attention_mask,
+            "position_ids": position_ids,
+            "packed_seq_params": packed_seq_params,
+            **vlm_kwargs,
+            **extra_forward_kwargs,
+        }
+        if fp32_output is not None:
+            model_kwargs["fp32_output"] = fp32_output
+        with _hidden_states_output(model, return_hidden_states):
+            output = model(**model_kwargs)
     except Exception as e:
         raise RuntimeError(
             f"Error occurred in packed context parallel forward pass on model {model} "
             f"with input_ids shape {input_ids.shape} and packed_seq_params {packed_seq_params}."
         ) from e
+
+    if return_hidden_states:
+        return output
 
     model_vp_stage = getattr(model, "vp_stage", None)
     is_pipeline_last_stage = mpu.is_pipeline_last_stage(

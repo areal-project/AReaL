@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from areal.tools.perf_trace_converter import convert_jsonl_to_chrome_trace, main
+from areal.tools.perf_trace_converter import (
+    convert_jsonl_to_chrome_trace,
+    convert_jsonl_to_split_trace,
+    main,
+    write_kernel_profile_trace_views,
+)
 
 
 def _write_jsonl(path: Path, events: list[dict]) -> None:
@@ -258,3 +263,149 @@ def test_main_default_output_multiple_files(tmp_path: Path) -> None:
     with output_path.open("r", encoding="utf-8") as fin:
         payload = json.load(fin)
     assert len([e for e in payload["traceEvents"] if e.get("ph") != "M"]) == 2
+
+
+def test_convert_split_trace_keeps_cpu_to_gpu_flow(tmp_path: Path) -> None:
+    source = tmp_path / "traces-r0.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {
+                "ph": "X",
+                "cat": "cpu_op",
+                "name": "_GroupedLinear",
+                "pid": 10,
+                "tid": 11,
+                "ts": 1,
+                "dur": 20,
+                "args": {"rank": 0, "role": "master"},
+            },
+            {
+                "ph": "X",
+                "cat": "cuda_runtime",
+                "name": "cudaLaunchKernel",
+                "pid": 10,
+                "tid": -2,
+                "ts": 2,
+                "dur": 1,
+                "args": {"rank": 0, "role": "master", "correlation": 42},
+            },
+            {
+                "ph": "s",
+                "cat": "ac2g",
+                "name": "ac2g",
+                "id": 42,
+                "pid": 10,
+                "tid": -2,
+                "ts": 2,
+                "args": {"rank": 0, "role": "master"},
+            },
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "name": "nvjet_qqtst",
+                "pid": 10,
+                "tid": -3,
+                "ts": 5,
+                "dur": 7,
+                "args": {
+                    "rank": 0,
+                    "role": "master",
+                    "correlation": 42,
+                    "stream": 7,
+                },
+            },
+            {
+                "ph": "f",
+                "cat": "ac2g",
+                "name": "ac2g",
+                "id": 42,
+                "pid": 10,
+                "tid": -3,
+                "ts": 5,
+                "bp": "e",
+                "args": {"rank": 0, "role": "master"},
+            },
+        ],
+    )
+
+    result = convert_jsonl_to_split_trace(source)
+    events = result["traceEvents"]
+    process_names = {
+        event["pid"]: event["args"]["name"]
+        for event in events
+        if event.get("ph") == "M" and event.get("name") == "process_name"
+    }
+    flows = [event for event in events if event.get("cat") == "ac2g"]
+
+    assert len(flows) == 2
+    assert {event["id"] for event in flows} == {flows[0]["id"]}
+    start = next(event for event in flows if event["ph"] == "s")
+    finish = next(event for event in flows if event["ph"] == "f")
+    assert "CUDA API" in process_names[start["pid"]]
+    assert "GPU kernels/memcpy" in process_names[finish["pid"]]
+    assert finish["tid"] == "stream 7"
+
+
+def test_write_kernel_profile_trace_views(tmp_path: Path) -> None:
+    source = tmp_path / "traces-r0.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {
+                "ph": "X",
+                "cat": "cuda_runtime",
+                "name": "cudaLaunchKernel",
+                "pid": 1,
+                "tid": -2,
+                "ts": 1,
+                "dur": 1,
+                "args": {"rank": 0, "correlation": 9},
+            },
+            {
+                "ph": "s",
+                "cat": "ac2g",
+                "name": "ac2g",
+                "id": 9,
+                "pid": 1,
+                "tid": -2,
+                "ts": 1,
+                "args": {"rank": 0},
+            },
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "name": "kernel",
+                "pid": 1,
+                "tid": -3,
+                "ts": 3,
+                "dur": 2,
+                "args": {"rank": 0, "correlation": 9, "stream": 0},
+            },
+            {
+                "ph": "f",
+                "cat": "ac2g",
+                "name": "ac2g",
+                "id": 9,
+                "pid": 1,
+                "tid": -3,
+                "ts": 3,
+                "args": {"rank": 0},
+            },
+        ],
+    )
+
+    outputs = write_kernel_profile_trace_views(source)
+
+    assert set(outputs) == {
+        "chrome",
+        "split_clean",
+        "gpu_only",
+        "cpu_only",
+        "cuda_api_only",
+    }
+    assert outputs["split_clean"] == tmp_path / "traces-r0.split_clean.chrome.json"
+    assert all(path.exists() for path in outputs.values())
+    with outputs["split_clean"].open("r", encoding="utf-8") as fin:
+        split_payload = json.load(fin)
+    assert any(event.get("cat") == "ac2g" for event in split_payload["traceEvents"])

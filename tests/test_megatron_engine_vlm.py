@@ -12,6 +12,17 @@ import pytest
 import torch
 
 
+@pytest.fixture(scope="module")
+def megatron_engine_dependencies():
+    from areal.infra.platforms import current_platform
+
+    if (
+        current_platform.device_type not in ("cuda", "npu")
+        or current_platform.device_count() < 1
+    ):
+        pytest.skip("Requires one GPU or Ascend NPU")
+
+
 class TestUnwrapToGptModel:
     """Test unwrap_to_gpt_model with VLM model structures."""
 
@@ -204,6 +215,430 @@ class TestExtractVisionFromMultiModal:
         assert "multi_modal_input" not in padded_mb
         assert "pixel_values" not in mb
         assert torch.equal(padded_mb["pixel_values"], torch.cat(pixel_values, dim=0))
+
+
+class TestPackedContextParallelForward:
+    pytestmark = [
+        pytest.mark.gpu,
+        pytest.mark.npu,
+        pytest.mark.usefixtures("megatron_engine_dependencies"),
+    ]
+
+    def test_hidden_state_mode_bypasses_post_process_and_restores_model(self):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        class HiddenModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.post_process = True
+                self.seen_post_process = True
+
+            def forward(self, **_kwargs):
+                self.seen_post_process = self.post_process
+                return torch.ones(2, 1, 3)
+
+        model = HiddenModel()
+        output = packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {"input_ids": torch.ones(2, dtype=torch.long)},
+            return_hidden_states=True,
+        )
+
+        assert output.shape == (2, 1, 3)
+        assert model.seen_post_process is False
+        assert model.post_process is True
+
+    def test_padded_lm_head_labels_and_outputs_preserve_sequence_order(self):
+        from areal.engine.megatron_engine import (
+            _padded_lm_head_labels,
+            _repack_padded_lm_head_output,
+        )
+
+        input_ids = torch.tensor([10, 11, 12, 20, 21])
+        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+
+        labels = _padded_lm_head_labels(input_ids, cu_seqlens, max_seqlen=3)
+        assert labels.tolist() == [[11, 21], [12, 0], [10, 20]]
+
+        # Chunked LM Head flattens [S, B] token outputs. Repacking must remove
+        # the padded slot and restore sequence-major packed order.
+        padded_outputs = torch.tensor([100, 200, 101, 201, 102, 0])
+        repacked = _repack_padded_lm_head_output(
+            padded_outputs, cu_seqlens, max_seqlen=3
+        )
+        assert repacked.tolist() == [100, 101, 102, 200, 201]
+
+    def test_repack_padded_lm_head_output_rejects_wrong_token_count(self):
+        from areal.engine.megatron_engine import _repack_padded_lm_head_output
+
+        with pytest.raises(ValueError, match="does not match the BSHD token layout"):
+            _repack_padded_lm_head_output(
+                torch.ones(5),
+                torch.tensor([0, 3, 5], dtype=torch.int32),
+                max_seqlen=3,
+            )
+
+    @pytest.mark.parametrize(
+        (
+            "enable_chunked_logits",
+            "model_dtype",
+            "expected",
+        ),
+        [
+            (True, torch.bfloat16, False),
+            (True, torch.float16, False),
+            (True, torch.float32, None),
+            (False, torch.bfloat16, None),
+        ],
+    )
+    def test_float16_wrapper_override_follows_areal_lm_head(
+        self,
+        enable_chunked_logits,
+        model_dtype,
+        expected,
+    ):
+        from areal.engine.megatron_engine import _float16_wrapper_fp32_output
+
+        assert (
+            _float16_wrapper_fp32_output(
+                enable_chunked_logits,
+                model_dtype,
+            )
+            is expected
+        )
+
+    @pytest.mark.parametrize(
+        (
+            "enable_chunked_logits",
+            "enable_fp32_lm_head",
+            "cross_entropy_loss_fusion",
+            "expected",
+        ),
+        [
+            (True, True, False, {}),
+            (False, False, False, {}),
+            (False, True, False, {"enable_fp32_lm_head": True}),
+            (True, False, True, {"cross_entropy_loss_fusion": True}),
+            (True, True, True, {"cross_entropy_loss_fusion": True}),
+            (
+                False,
+                True,
+                True,
+                {
+                    "enable_fp32_lm_head": True,
+                    "cross_entropy_loss_fusion": True,
+                },
+            ),
+        ],
+    )
+    def test_mbridge_precision_args_preserve_native_fallback(
+        self,
+        enable_chunked_logits,
+        enable_fp32_lm_head,
+        cross_entropy_loss_fusion,
+        expected,
+    ):
+        from areal.engine.megatron_engine import _mbridge_precision_args
+
+        assert (
+            _mbridge_precision_args(
+                enable_chunked_logits,
+                enable_fp32_lm_head,
+                cross_entropy_loss_fusion,
+            )
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        ("enable_chunked_logits", "entropy_requires_grad", "expected"),
+        [
+            (False, True, False),
+            (False, False, False),
+            (True, True, False),
+            (True, False, True),
+        ],
+    )
+    def test_logits_reuse_respects_entropy_gradient_setting(
+        self,
+        enable_chunked_logits,
+        entropy_requires_grad,
+        expected,
+    ):
+        from areal.engine.megatron_engine import _reuse_chunked_logits_storage
+
+        assert (
+            _reuse_chunked_logits_storage(
+                enable_chunked_logits,
+                entropy_requires_grad,
+            )
+            is expected
+        )
+
+    @pytest.mark.parametrize(
+        (
+            "global_rank",
+            "is_critic",
+            "enable_chunked_logits",
+            "entropy_requires_grad",
+            "warns",
+        ),
+        [
+            (0, False, True, False, True),
+            (1, False, True, False, False),
+            (0, True, True, False, False),
+            (0, False, False, False, False),
+            (0, False, True, True, False),
+        ],
+    )
+    def test_areal_lm_head_warns_when_entropy_is_nondifferentiable(
+        self,
+        global_rank,
+        is_critic,
+        enable_chunked_logits,
+        entropy_requires_grad,
+        warns,
+    ):
+        from areal.engine.megatron_engine import (
+            _warn_if_areal_lm_head_entropy_is_nondifferentiable,
+        )
+
+        logger = MagicMock()
+        _warn_if_areal_lm_head_entropy_is_nondifferentiable(
+            logger,
+            global_rank=global_rank,
+            is_critic=is_critic,
+            enable_chunked_logits=enable_chunked_logits,
+            entropy_requires_grad=entropy_requires_grad,
+        )
+
+        if warns:
+            logger.warning.assert_called_once()
+            assert "entropy is non-differentiable" in logger.warning.call_args.args[0]
+        else:
+            logger.warning.assert_not_called()
+
+    @pytest.mark.parametrize(
+        (
+            "enable_chunked_logits",
+            "enable_tree_training",
+            "npu_available",
+            "error_match",
+        ),
+        [
+            (False, True, True, None),
+            (True, False, False, None),
+            (True, False, True, None),
+            (True, True, False, "tree training"),
+        ],
+    )
+    def test_areal_lm_head_rejects_unsupported_training_modes(
+        self,
+        enable_chunked_logits,
+        enable_tree_training,
+        npu_available,
+        error_match,
+    ):
+        from areal.engine.megatron_engine import (
+            _validate_areal_lm_head_compatibility,
+        )
+
+        if error_match is None:
+            _validate_areal_lm_head_compatibility(
+                enable_chunked_logits,
+                enable_tree_training=enable_tree_training,
+                npu_available=npu_available,
+            )
+            return
+
+        with pytest.raises(NotImplementedError, match=error_match):
+            _validate_areal_lm_head_compatibility(
+                enable_chunked_logits,
+                enable_tree_training=enable_tree_training,
+                npu_available=npu_available,
+            )
+
+    @pytest.mark.parametrize(
+        (
+            "model_type",
+            "is_vision_model",
+            "use_padded_seq",
+            "use_model_packed_seq",
+            "has_vision_inputs",
+            "expected",
+        ),
+        [
+            ("qwen3", False, False, False, False, True),
+            ("qwen3_5", True, False, True, False, True),
+            ("qwen3_5_moe", True, False, True, False, True),
+            ("qwen3_5", True, True, False, False, True),
+            ("qwen3_5", True, False, True, True, False),
+            ("qwen3_5", True, False, False, False, False),
+            ("qwen3_vl", True, False, True, False, False),
+        ],
+    )
+    def test_chunked_lm_head_layout_support_is_payload_and_family_specific(
+        self,
+        model_type,
+        is_vision_model,
+        use_padded_seq,
+        use_model_packed_seq,
+        has_vision_inputs,
+        expected,
+    ):
+        """Only text-only Qwen3.5-family model-owned THD bypasses VLM rejection."""
+        from areal.engine.megatron_engine import _supports_chunked_lm_head_layout
+
+        assert (
+            _supports_chunked_lm_head_layout(
+                model_type=model_type,
+                is_vision_model=is_vision_model,
+                use_padded_seq=use_padded_seq,
+                use_model_packed_seq=use_model_packed_seq,
+                has_vision_inputs=has_vision_inputs,
+            )
+            is expected
+        )
+
+    @pytest.mark.parametrize("fp32_output", [False, True])
+    def test_forwards_explicit_fp32_output(self, monkeypatch, fp32_output):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        model = MagicMock(return_value=torch.ones(1, 2, 3))
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 1,
+        )
+
+        packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {"input_ids": torch.ones(2, dtype=torch.long)},
+            fp32_output=fp32_output,
+        )
+
+        assert model.call_args.kwargs["fp32_output"] is fp32_output
+
+    def test_omits_unspecified_fp32_output(self, monkeypatch):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        model = MagicMock(return_value=torch.ones(1, 2, 3))
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 1,
+        )
+
+        packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {"input_ids": torch.ones(2, dtype=torch.long)},
+        )
+
+        assert "fp32_output" not in model.call_args.kwargs
+
+
+class TestMegatronForwardBatchContextParallel:
+    pytestmark = [
+        pytest.mark.gpu,
+        pytest.mark.npu,
+        pytest.mark.usefixtures("megatron_engine_dependencies"),
+    ]
+
+    def test_forward_batch_keeps_cp_logits_local(self, monkeypatch):
+        from areal.engine import megatron_engine
+        from areal.engine.megatron_engine import MegatronEngine
+
+        engine = MagicMock(spec=MegatronEngine)
+        input_batched = {
+            "input_ids": torch.tensor([[1, 2]]),
+            "attention_mask": torch.tensor([[1, 1]]),
+        }
+        engine._normalize_batch_input.return_value = (input_batched, None)
+        mb_list = MagicMock()
+        mb_list.to.return_value = mb_list
+        engine._prepare_mb_list.return_value = mb_list
+        engine.device = torch.device("cpu")
+        call_kwargs = {}
+
+        def capture_forward_backward(*_args, **kwargs):
+            call_kwargs.update(kwargs)
+
+        engine.forward_backward_batch.side_effect = capture_forward_backward
+        monkeypatch.setattr(
+            megatron_engine,
+            "pack_tensor_dict",
+            lambda _input: {"cu_seqlens": torch.tensor([0, 2])},
+        )
+        monkeypatch.setattr(
+            megatron_engine.mpu, "is_pipeline_last_stage", lambda: False
+        )
+        monkeypatch.setattr(
+            megatron_engine.mpu, "get_pipeline_model_parallel_last_rank", lambda: 0
+        )
+        monkeypatch.setattr(
+            megatron_engine.mpu, "get_pipeline_model_parallel_group", lambda: None
+        )
+        monkeypatch.setattr(
+            megatron_engine, "broadcast_tensor", lambda value, **_kwargs: value
+        )
+
+        MegatronEngine.forward_batch(engine, input_batched)
+
+        assert call_kwargs["forward_only"] is True
+        assert call_kwargs["gather_cp_output"] is False
+
+    def test_chunked_forward_result_reassembles_cp_scalars(self, monkeypatch):
+        from areal.engine import megatron_engine
+        from areal.engine.megatron_engine import MegatronEngine
+        from areal.models.mcore.vocab_parallel_head import ChunkedLMHeadOutput
+
+        engine = object.__new__(MegatronEngine)
+        engine.config = MagicMock(is_critic=False)
+        engine.enable_tree_training = False
+        local_logprobs = torch.tensor([1.0, 2.0])
+        output = ChunkedLMHeadOutput(
+            local_logprobs,
+            *(torch.zeros_like(local_logprobs) for _ in range(5)),
+        )
+        padded_cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+        old_cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
+        inputs = {
+            "_cp_padded_cu_seqlens": padded_cu_seqlens,
+            "_cp_padding_length": 1,
+            "_cp_old_cu_seqlens": old_cu_seqlens,
+        }
+        reassembled = torch.tensor([10.0, 11.0, 12.0, 13.0])
+        expected = torch.tensor([10.0, 11.0, 12.0])
+
+        def fake_reassemble(values, cu_seqlens):
+            assert values is local_logprobs
+            assert cu_seqlens is padded_cu_seqlens
+            return reassembled
+
+        def fake_unpad(values, padding_length, cu_seqlens, original_cu_seqlens):
+            assert values is reassembled
+            assert padding_length == 1
+            assert cu_seqlens is padded_cu_seqlens
+            assert original_cu_seqlens is old_cu_seqlens
+            return expected
+
+        monkeypatch.setattr(
+            megatron_engine, "reassemble_cp_packed_logprobs", fake_reassemble
+        )
+        monkeypatch.setattr(megatron_engine, "unpad_logits", fake_unpad)
+
+        result = MegatronEngine._compute_forward_result(engine, output, inputs)
+
+        assert result is expected
 
 
 class TestPrepareMbListRebindCallerSafety:

@@ -369,12 +369,21 @@ jobs:
             -m skipif tests/test_reassemble_cp_logprobs.py
           collect_base_tests npu-weight-reload-native \
             tests/test_npu_weight_reload_native.py
+          collect_base_tests vllm-mtp-weights \
+            tests/test_vllm_mtp_weights.py
+          collect_base_tests mtp-loss-distributed \
+            tests/test_mtp_loss_distributed.py
           collect_base_tests npu-weight-reload-graph \
             tests/test_npu_weight_reload_graph.py
           collect_base_tests megatron-distributed \
             tests/test_megatron_engine_distributed.py
           collect_base_tests megatron-loss-aggregation \
             tests/test_megatron_loss_aggregation.py
+          collect_base_tests megatron-lm-head tests/test_megatron_lm_head.py
+          collect_base_tests mcore-fp32-lm-head tests/test_mcore_fp32_lm_head.py
+          collect_base_tests megatron-optimizer-config tests/test_megatron_optimizer_config.py
+          collect_base_tests all-gather-param tests/test_all_gather_param.py
+          collect_base_tests grad-norm-tp tests/megatron/test_grad_norm_tp_invariance.py
           collect_base_tests ppo-advantages tests/test_ppo_advantages.py
           collect_base_tests lock tests/test_lock.py
           collect_base_tests perf-tracer tests/test_perf_tracer.py
@@ -466,6 +475,21 @@ jobs:
             -m skipif tests/test_reassemble_cp_logprobs.py
           pytest -q -p scripts.ci_test_report \
             tests/test_npu_weight_reload_native.py
+          pytest -q -p scripts.ci_test_report \
+            tests/test_vllm_mtp_weights.py
+
+      - name: Run chunked LM-head single-device tests
+        env:
+          AREAL_TEST_REPORT_DIR: /tmp/current-npu-test-reports
+          ASCEND_RT_VISIBLE_DEVICES: "0"
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          pytest -q -p scripts.ci_test_report -m npu \
+            tests/test_megatron_lm_head.py \
+            tests/test_mcore_fp32_lm_head.py \
+            tests/test_megatron_optimizer_config.py \
+            tests/test_all_gather_param.py
 
       - name: Run NPU weight-reload graph regression
         timeout-minutes: 5
@@ -771,7 +795,7 @@ jobs:
               wait_for_normal_wave
             done
 
-            # The remaining four single-device loss cases share the final wave.
+            # The remaining four single-device loss cases share one wave.
             start_normal_test \
               megatron-loss-aggregation-legacy-main-d1c1 \
               0 \
@@ -798,6 +822,16 @@ jobs:
               'tests/test_ppo_advantages.py::test_critic_or_discounted_gae_keeps_original_recurrence[accelerator-False-0.9-1.0]' \
               'tests/test_ppo_advantages.py::test_critic_or_discounted_gae_keeps_original_recurrence[accelerator-False-1.0-0.8]' \
               'tests/test_ppo_advantages.py::test_fastpath_single_token_sequence_has_zero_advantage[accelerator]'
+            start_normal_test \
+              grad-norm-tp \
+              5,6 \
+              tests/megatron/test_grad_norm_tp_invariance.py::test_grad_norm_is_tp_invariant
+            wait_for_normal_wave
+
+            start_normal_test \
+              mtp-loss-distributed \
+              5,6 \
+              tests/test_mtp_loss_distributed.py
             wait_for_normal_wave
 
             return "${failed}"
