@@ -49,6 +49,9 @@ def finalize_interactions(
     This must run before discounting, shaping, normalization, or serialization.
     Explicit discounting through ArealOpenAI also uses this entry point; later
     exports preserve its discounted returns instead of applying the gate again.
+    An explicit episode return also supplies the normalization reference when
+    row scores already exist or cannot safely be filled. Existing references
+    and branch-local returns retain their own semantics.
     """
     if episode_reward is not None and style != "concat":
         raise ValueError("Episode reward assignment requires concat export")
@@ -57,9 +60,18 @@ def finalize_interactions(
         style=style, drop_retry_orphans=drop_retry_orphans
     )
     if cache.reward_discount_applied:
+        if (
+            episode_reward is not None
+            and interactions
+            and all(value.rollout_reward is None for value in interactions.values())
+        ):
+            raise ValueError(
+                "Episode rollout_reward must be established before reward discounting"
+            )
         return interactions
 
     episode_scope = False
+    episode_reference = episode_reward
     if episode_reward is not None and interactions:
         # One explicit task return may span independent compaction segments.
         # Identify its terminal response from reward assignment, not leaf order.
@@ -74,11 +86,11 @@ def finalize_interactions(
                 if len(scored) == 1
                 else None
             )
+        if terminal_id is None and response_validator is not None:
+            raise ValueError("Episode response validation requires a final response ID")
         cache = InteractionCache.from_dict(interactions)
         episode_scope = cache._can_assign_episode_reward(episode_reward)
         cache.assign_episode_reward(episode_reward)
-        if episode_scope and terminal_id is None and response_validator is not None:
-            raise ValueError("Episode response validation requires a final response ID")
 
     if response_validator is not None:
         if episode_scope:
@@ -95,6 +107,8 @@ def finalize_interactions(
                 if error is not None:
                     failures.append((interaction_id, interaction, error))
         for interaction_id, interaction, error in failures:
+            if episode_reward is not None and interaction_id == terminal_id:
+                episode_reference = 0.0
             metadata = dict(interaction.metadata or {})
             metadata["reward_validation_error"] = error
             metadata.setdefault(
@@ -118,6 +132,15 @@ def finalize_interactions(
                         interaction._cache["original_rewards"]
                     ),
                 }
+
+    # Filling unscored segments requires a safe disjoint graph; carrying the
+    # caller's episode reference does not. Keep missing/explicit row rewards
+    # intact, and use the terminal response policy rather than the raw score.
+    if episode_reference is not None and all(
+        value.rollout_reward is None for value in interactions.values()
+    ):
+        for interaction in interactions.values():
+            interaction.rollout_reward = episode_reference
 
     if style == "individual" and reward_discount is not None:
         cache.apply_reward_discount(turn_discount=reward_discount)
