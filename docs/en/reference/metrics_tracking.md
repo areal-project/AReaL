@@ -373,6 +373,16 @@ filtering**, counted once per `_ppo_update`, independently of minibatch forwards
 updates are counted again. Empty populations omit averages and extrema rather than
 reporting a fabricated zero.
 
+`ppo_actor/update/version_stats/age_{0..16}_fraction` reports the fraction of all
+supervised tokens generated at each policy-version age, where age is the current actor
+version minus the token's aligned generation version. `age_gt_16_fraction` groups older
+tokens; `invalid_version_fraction` counts negative versions, and
+`future_version_fraction` counts versions newer than the actor. Prompt and padding
+positions are excluded. These disjoint fractions use the same pre-filter supervised
+token denominator, sum to one when that denominator is nonzero, and are calculated from
+token counts aggregated across workers rather than averaged worker fractions. Empty
+populations omit the fractions.
+
 New diagnostics use `stat_compact`: each metric stores only four float64 scalars (masked
 sum, count, minimum, maximum) per batch until export. This avoids the former
 approximately 106 bytes of retained diagnostic tensors per padded token. Existing PPO

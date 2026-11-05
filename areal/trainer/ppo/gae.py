@@ -231,6 +231,8 @@ def compute_gae_lambda(
     if isinstance(gae_lambda, (int, float)) and not isinstance(gae_lambda, bool):
         if not math.isfinite(gae_lambda):
             raise ValueError(f"Static gae_lambda must be finite, got {gae_lambda}")
+        if not 0.0 <= gae_lambda <= 1.0:
+            raise ValueError(f"Static gae_lambda must be in [0, 1], got {gae_lambda}")
         return float(gae_lambda)
     if callable(gae_lambda):
         context = _build_gae_lambda_context(
@@ -263,5 +265,9 @@ def compute_gae_lambda(
     torch._assert_async(
         torch.all(torch.isfinite(gae_lambda)),
         "gae_lambda function returned a non-finite value",
+    )
+    torch._assert_async(
+        torch.all((gae_lambda >= 0.0) & (gae_lambda <= 1.0)),
+        "gae_lambda function values must be in [0, 1]",
     )
     return gae_lambda.detach().float()

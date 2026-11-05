@@ -25,7 +25,8 @@ repos:
       - id: check-added-large-files
         name: Check for large files
         args: ['--maxkb=1000']
-        exclude: uv.lock
+        # Preserve the supplied experiment plot without resizing or recompression.
+        exclude: ^(uv\.lock|examples/math/score_centering_tis_countdown_noise002\.png)$
       - id: check-json
         name: Check JSON files
 
