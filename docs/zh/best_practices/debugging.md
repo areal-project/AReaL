@@ -70,6 +70,9 @@ asyncio.run(MyAgent().run(data, base_url=f"http://127.0.0.1:{port}/v1", api_key=
 
 # If you use the official model provider
 asyncio.run(MyAgent().run(data, base_url="https://api.openai.com/v1", api_key="YOUR_API_KEY"))
+
+# Or route through OrcaRouter, an OpenAI-compatible AI gateway (https://www.orcarouter.ai)
+asyncio.run(MyAgent().run(data, base_url="https://api.orcarouter.ai/v1", api_key="YOUR_ORCAROUTER_API_KEY"))
 ```
 
 使用数据集中的随机样本测试您的代码。如果它能无错误运行，则您的 Agent 逻辑是正确的。
