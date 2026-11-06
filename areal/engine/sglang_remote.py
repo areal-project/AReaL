@@ -150,6 +150,9 @@ class SGLangBackend:
             "stream": False,
         }
 
+        if req.video_data is not None:
+            payload["video_data"] = req.video_data
+
         if gconfig.score_centering_top_k:
             from areal.utils.score_centering import validate_sampling
 
