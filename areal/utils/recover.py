@@ -545,6 +545,11 @@ class RecoverHandler:
                     # Do not admit work to partially restored colocated workers.
                     if can_resume_inference:
                         inference_engine.resume()
+            else:
+                # No weight-transfer handshake runs in training-only recovery.
+                # Version-dependent PPO logic still needs the restored policy.
+                for engine_ in normalized_engine.values():
+                    engine_.set_version(recovery_version)
             return recover_info
         except (FileNotFoundError, InValidRecoverInfo) as e:
             if source.transactional:
