@@ -1219,7 +1219,9 @@ class PPOTrainer:
                     ),
                 ):
                     update_kwargs = (
-                        {"max_head_offpolicyness": config.rollout.max_head_offpolicyness}
+                        {
+                            "max_head_offpolicyness": config.rollout.max_head_offpolicyness
+                        }
                         if config.rollout.mask_stale_tokens
                         else {}
                     )
