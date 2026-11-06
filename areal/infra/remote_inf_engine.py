@@ -1548,6 +1548,15 @@ class RemoteInfEngine(InferenceEngine):
         """Wait for a specific submitted task to complete."""
         return self.workflow_executor.wait_for_task(task_id, timeout, raise_timeout)
 
+    def abandon_rollout_task(self, task_id: int) -> bool:
+        """Drop a rollout result the controller will never fetch.
+
+        The controller calls this after it stops waiting for a task, so the
+        worker does not retain the trajectory (and its shards) for the
+        lifetime of the process.
+        """
+        return self.workflow_executor.dispatcher.abandon_task(task_id)
+
     def _wait_for_task_result(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | WorkflowContractFailure | None:

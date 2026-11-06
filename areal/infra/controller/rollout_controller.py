@@ -1091,6 +1091,31 @@ class RolloutController:
             f"rejected: {stats.rejected}."
         )
 
+    async def _abandon_rollout_task(
+        self, worker: Worker, engine_name: str, task_id: int
+    ) -> None:
+        """Tell a worker to drop a result this controller stopped waiting for.
+
+        Without this the worker keeps the trajectory in
+        ``BatchTaskDispatcher._pending_results`` until the process exits,
+        because the controller never fetches it after a timeout.
+        """
+        try:
+            await self.scheduler.async_call_engine(
+                worker.id,
+                "abandon_rollout_task",
+                engine_name=engine_name,
+                task_id=task_id,
+                http_timeout=60.0,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to abandon rollout task %s on worker %s",
+                task_id,
+                worker.id,
+                exc_info=True,
+            )
+
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
         async def _submit_then_wait() -> WorkflowTaskResult | None:
             # Choose worker via round-robin
@@ -1176,6 +1201,7 @@ class RolloutController:
                 if task_id is not None:
                     with self._futures_lock:
                         self._pending_futures.pop(task_id, None)
+                    await self._abandon_rollout_task(worker, engine_name, task_id)
                 manager.on_rollout_rejected()
                 logger.error(f"Rollout timed out after {self.config.request_timeout}s")
                 return None
@@ -1183,6 +1209,7 @@ class RolloutController:
                 if task_id is not None:
                     with self._futures_lock:
                         self._pending_futures.pop(task_id, None)
+                    await self._abandon_rollout_task(worker, engine_name, task_id)
                 manager.on_rollout_rejected()
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
                 return None
