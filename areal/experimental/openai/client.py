@@ -57,7 +57,13 @@ from pydantic import BaseModel
 from areal.api import ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai.cache import InteractionCache
+from areal.experimental.openai.finalization import (
+    ResponseValidator,
+    final_response_error,
+    finalize_interactions,
+)
 from areal.experimental.openai.tool_call_parser import (
+    InvalidToolCallError,
     process_tool_calls,
     split_reasoning,
 )
@@ -65,6 +71,11 @@ from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCallCache
 from areal.utils import logging
 from areal.utils.hf_utils import apply_chat_template
+from areal.utils.qwen_vl_image import (
+    prepare_sglang_qwen_images,
+    sglang_image_alignment_enabled,
+    sglang_qwen_image_kwargs,
+)
 
 if TYPE_CHECKING:
     from transformers.processing_utils import ProcessorMixin
@@ -90,6 +101,23 @@ def _force_reasoning_from_chat_template_kwargs(
     return str(chat_template_kwargs.get("thinking_option", "")).lower() == "on"
 
 
+def _prompt_prefills_reasoning(
+    tokenizer: "PreTrainedTokenizerFast", prompt_token_ids: list[int]
+) -> bool:
+    """Read the actual generation prefix, including default-enabled thinking."""
+    if not prompt_token_ids:
+        return False
+    marker = "<think>"
+    suffix_len = len(marker)
+    while True:
+        suffix = tokenizer.decode(prompt_token_ids[-suffix_len:]).rstrip()
+        if len(suffix) >= len(marker) or suffix_len >= len(prompt_token_ids):
+            return suffix.endswith(marker)
+        # Usually only a few tokens are decoded. Expand only when trailing
+        # whitespace or a split marker prevents identifying the prefix yet.
+        suffix_len *= 2
+
+
 # reset OpenAI keys when using the wrapped client.
 os.environ["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY", "none")
 os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "none")
@@ -106,6 +134,7 @@ class _PreparedPrompt:
     input_ids: list[int]
     mm_token_type_ids: list[int] | None = None
     multi_modal_input: dict[str, torch.Tensor] | None = None
+    image_data: list[str] | None = None
 
     def copy_for_consumer(self) -> "_PreparedPrompt":
         """Copy mutable containers while sharing immutable processor tensors."""
@@ -121,6 +150,7 @@ class _PreparedPrompt:
                 if self.multi_modal_input is not None
                 else None
             ),
+            image_data=list(self.image_data) if self.image_data is not None else None,
         )
 
 
@@ -162,6 +192,9 @@ def _process_multimodal_prompt(
     image_data: list[str],
     tools: Iterable[ChatCompletionToolParam] | None,
     chat_template_kwargs: dict[str, Any],
+    *,
+    align_sglang_images: bool = False,
+    processor_cache: ProcessorCallCache | None = None,
 ) -> _PreparedPrompt:
     """Build prompt tokens and vision tensors from inline base64 images only.
 
@@ -175,6 +208,7 @@ def _process_multimodal_prompt(
     from PIL import Image
     from transformers.image_utils import load_image
 
+    image_kwargs = sglang_qwen_image_kwargs(processor) if align_sglang_images else None
     images = []
     for encoded_image in image_data:
         match = _DATA_URI_RE.match(encoded_image)
@@ -189,11 +223,25 @@ def _process_multimodal_prompt(
         try:
             image_bytes = base64.b64decode(payload, validate=True)
             with Image.open(BytesIO(image_bytes)) as image:
-                images.append(load_image(image))
+                # Match SGLang's PIL branch, including retaining raw EXIF
+                # orientation. HF load_image would transpose EXIF here.
+                images.append(
+                    image.convert("RGB")
+                    if image_kwargs is not None
+                    else load_image(image)
+                )
         except (binascii.Error, OSError, ValueError) as exc:
             raise ValueError(
                 "Local multimodal processing requires valid base64-encoded image data."
             ) from exc
+
+    wire_image_data = None
+    if align_sglang_images:
+        aligned_images = prepare_sglang_qwen_images(
+            processor, images, cache=processor_cache, image_keys=image_data
+        )
+        if aligned_images is not None:
+            images, wire_image_data = aligned_images
 
     prompt_text = apply_chat_template(
         tokenizer,
@@ -208,11 +256,17 @@ def _process_multimodal_prompt(
             "The tokenizer chat template must return text before VLM processing."
         )
 
-    processed = processor(
+    from areal.experimental.openai.vision_tokens import protect_vision_tokens
+
+    text_processor, prompt_text, restore_ids = protect_vision_tokens(
+        processor, tokenizer, messages, tools, chat_template_kwargs, prompt_text
+    )
+    processed = text_processor(
         text=[prompt_text],
         images=images,
         padding=False,
         return_tensors="pt",
+        **({"images_kwargs": image_kwargs} if image_kwargs is not None else {}),
     )
     input_ids_tensor = processed.get("input_ids")
     if not torch.is_tensor(input_ids_tensor) or input_ids_tensor.ndim != 2:
@@ -228,7 +282,8 @@ def _process_multimodal_prompt(
     if token_type_ids is None:
         token_type_ids = processed.get("token_type_ids")
     if token_type_ids is None:
-        mm_token_type_ids = [0] * len(input_ids)
+        image_id = getattr(processor, "image_token_id", None)
+        mm_token_type_ids = [int(token == image_id) for token in input_ids]
     else:
         if not torch.is_tensor(token_type_ids) or token_type_ids.ndim != 2:
             raise ValueError("The VLM processor token type IDs must be 2D.")
@@ -238,6 +293,17 @@ def _process_multimodal_prompt(
                 "The VLM processor returned token type IDs that do not align "
                 f"with input_ids: {len(mm_token_type_ids)} != {len(input_ids)}."
             )
+
+    # Temporary escape IDs exist only inside HF preprocessing. They never enter
+    # the model context, sampled trajectory, or training tensors.
+    for marker_id in restore_ids:
+        marker = str(text_processor.tokenizer.added_tokens_decoder[marker_id])
+        if input_ids.count(marker_id) != prompt_text.count(marker):
+            raise ValueError("VLM processor did not preserve visual text escapes")
+    for index, token in enumerate(input_ids):
+        if token in restore_ids:
+            input_ids[index] = restore_ids[token]
+            mm_token_type_ids[index] = 0
 
     multi_modal_input = {
         key: processed[key].detach().cpu()
@@ -252,7 +318,26 @@ def _process_multimodal_prompt(
         input_ids=input_ids,
         mm_token_type_ids=mm_token_type_ids,
         multi_modal_input=multi_modal_input,
+        image_data=wire_image_data,
     )
+
+
+def _record_response_parse(
+    interaction: InteractionWithTokenLogpReward,
+    *,
+    output_text: str,
+    tool_calls: list | None,
+    tool_call_parse_failed: bool,
+) -> None:
+    """Record parser facts independently of the rollout's reward policy."""
+    interaction.metadata = {
+        **(interaction.metadata or {}),
+        "response_parse": {
+            "tool_call_parse_failed": tool_call_parse_failed,
+            "has_content": bool(output_text.strip()),
+            "has_tool_calls": bool(tool_calls),
+        },
+    }
 
 
 def _align_tools_with_sglang(tools_list: list) -> list[dict]:
@@ -509,6 +594,17 @@ def _extract_images_from_messages(
     return image_data, messages_for_tokenizer, vision_messages_for_vllm
 
 
+def _is_sglang_backend(engine: TRolloutEngine) -> bool:
+    """Recognize configured engines, legacy SGLang engines, and v2 bridges."""
+    backend = getattr(getattr(engine, "config", None), "backend", "")
+    if isinstance(backend, str) and backend:
+        return backend.split(":", maxsplit=1)[0].lower() == "sglang"
+    return any(
+        "sglang" in type(impl).__name__.lower()
+        for impl in (engine, getattr(engine, "backend", None))
+    )
+
+
 def _validate_multimodal_agent_backend(
     engine: TRolloutEngine,
     image_data: list[str],
@@ -724,33 +820,48 @@ def _concat_prompt_token_ids_with_parent(
     parent_tokens: list[int] = []
     all_message_list: list[dict] = []
     eos_token_id = tokenizer.eos_token_id
+    # Parent and child templates must see the same tools, including iterators.
+    tools = list(tools) if tools is not None else None
 
-    # To ensure compatibility across different models, we adopted the following padding scheme:
-    # Apply the chat template to the full-text message_list of the new input, then count the number of eos tokens
-    # in the parent tokens. Locate the final index where the same number of eos tokens appears in the child_all_tokens,
-    # all tokens after this index correspond to the newly input tokens for the current round.
-
+    parent_eos_num = 0
     if parent is not None:
         if parent.model_response is None:
             raise ValueError("Parent interaction has no model_response.")
-        # TODO: (yulangz) how to handle here when stop is set?
+        # Preserve every sampled action, including PAD and repeated stop tokens:
+        # the parent's logprobs and loss mask will be inherited at these indices.
         parent_tokens = (
-            parent.model_response.input_tokens
-            + parent.model_response.output_tokens_without_stop  # without stop tokens
+            parent.model_response.input_tokens + parent.model_response.output_tokens
         )
         all_message_list += parent.messages if parent.messages is not None else []
         all_message_list += (
             parent.output_message_list if parent.output_message_list is not None else []
         )
 
-        # If the parent terminates due to output exceeding length limits or being aborted, it will not have an EOS token.
-        # We will add an extra EOS token to align with the chat template. During training, this added EOS will be treated
-        # as part of the child message's prompt rather than the parent message's output, and therefore will be masked out
-        # by the loss_mask.
-        # If the parent terminated with an EOS token, it will be removed by parent.model_response.output_tokens_without_stop, and
-        # we add it here.
-        # TODO: should we mask this extra eos token in loss_mask during training?
-        parent_tokens += [eos_token_id]
+        # Close a PAD-ended, truncated, aborted, or empty assistant turn. This
+        # synthetic token belongs to the child's prompt and receives loss_mask=0.
+        if (
+            not parent.model_response.output_tokens
+            or parent.model_response.output_tokens[-1] != eos_token_id
+        ):
+            parent_tokens.append(eos_token_id)
+
+        # Locate the new messages using canonical template boundaries, rather
+        # than raw sampled EOS counts. Multiple sampled stop tokens must not
+        # consume a later message's boundary, including in subsequent turns.
+        parent_template_tokens = apply_chat_template(
+            tokenizer,
+            _parse_tool_call_arguments(all_message_list),
+            tools=tools,
+            add_generation_prompt=False,
+            tokenize=True,
+            **extra_body.get("chat_template_kwargs", {}),
+        )
+        parent_eos_num = parent_template_tokens.count(eos_token_id)
+        if parent_eos_num == 0:
+            raise RuntimeError(
+                "Failed to align child tokens with parent tokens in concat prompt: "
+                "the parent chat template contains no EOS boundaries."
+            )
 
     all_message_list += message_list
     all_message_list = _parse_tool_call_arguments(all_message_list)
@@ -766,7 +877,6 @@ def _concat_prompt_token_ids_with_parent(
         )
     else:
         all_tokens = full_prompt_token_ids
-    parent_eos_num = parent_tokens.count(eos_token_id)
     if parent_eos_num > 0:
         child_tokens_truncate_idx = _find_kth(all_tokens, eos_token_id, parent_eos_num)
         if child_tokens_truncate_idx == -1 or child_tokens_truncate_idx + 1 >= len(
@@ -798,6 +908,7 @@ async def _prepare_prompt(
     extra_body: Body,
     require_multimodal_processor: bool = False,
     processor_cache: ProcessorCallCache | None = None,
+    align_sglang_images: bool = False,
 ) -> _PreparedPrompt:
     """Prepare text or multimodal prompt data for one agent interaction."""
     chat_template_kwargs = extra_body.get("chat_template_kwargs", {})
@@ -808,6 +919,9 @@ async def _prepare_prompt(
             "available for this rollout model."
         )
     if image_data and processor is not None:
+        # Resolve the switch before looking up cached prompts so disabling
+        # alignment cannot reuse tensors produced by the SGLang policy.
+        align_sglang_images = align_sglang_images and sglang_image_alignment_enabled()
 
         def process_prompt() -> _PreparedPrompt:
             prompt = _process_multimodal_prompt(
@@ -817,6 +931,8 @@ async def _prepare_prompt(
                 image_data,
                 tools,
                 chat_template_kwargs,
+                align_sglang_images=align_sglang_images,
+                processor_cache=processor_cache,
             )
             if processor_cache is not None:
                 prompt = _share_multimodal_tensors(
@@ -829,6 +945,13 @@ async def _prepare_prompt(
         else:
             cache_key = processor_cache.make_key(
                 "openai_multimodal",
+                align_sglang_images,
+                (
+                    os.environ.get("SGLANG_VLM_QWEN_LIMIT_PIXEL", "true"),
+                    os.environ.get("SGLANG_RESIZE_RESAMPLE", ""),
+                )
+                if align_sglang_images
+                else None,
                 id(processor),
                 id(tokenizer),
                 tokenizer_messages,
@@ -868,6 +991,9 @@ async def _prepare_prompt(
                 processed_prompt.multi_modal_input
                 if processed_prompt is not None
                 else {}
+            ),
+            image_data=(
+                processed_prompt.image_data if processed_prompt is not None else None
             ),
         )
 
@@ -921,6 +1047,7 @@ async def _prepare_prompt(
         input_ids=input_ids,
         mm_token_type_ids=mm_token_type_ids,
         multi_modal_input=processed_prompt.multi_modal_input,
+        image_data=processed_prompt.image_data,
     )
 
 
@@ -944,12 +1071,14 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         chat_template_type: str = "hf",
         lora_name: str = "",
         require_multimodal_processor: bool = False,
+        tool_call_parser_allow_recovery: bool = True,
     ):
         super().__init__(client)
         self.engine = engine
         self.tokenizer = tokenizer
         self.processor = processor
         self.tool_call_parser = tool_call_parser
+        self.tool_call_parser_allow_recovery = tool_call_parser_allow_recovery
         self.reasoning_parser = reasoning_parser
         self._cache = cache
         self.engine_max_tokens = engine_max_tokens
@@ -1175,6 +1304,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             extra_body=extra_body,
             require_multimodal_processor=self.require_multimodal_processor,
             processor_cache=processor_cache,
+            align_sglang_images=_is_sglang_backend(self.engine),
         )
         prompt_token_ids = prepared_prompt.input_ids
         if interaction is not None and self.processor is not None:
@@ -1277,23 +1407,44 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             ),
         )
 
+        from areal.utils.sglang_image import image_prompt_metadata
+
+        request_metadata = image_prompt_metadata(
+            metadata if not is_omitted(metadata) else {},
+            prompt_token_ids,
+            prepared_prompt.mm_token_type_ids if has_images else None,
+            image_data
+            if has_images and sglang_qwen_image_kwargs(self.processor) is not None
+            else None,
+            self.processor,
+        )
         model_request = ModelRequest(
             input_ids=prompt_token_ids,
             gconfig=gconfig,
             rid=str(uuid.uuid4()),
-            metadata=metadata if not is_omitted(metadata) else {},
+            metadata=request_metadata,
             tokenizer=self.tokenizer,
             processor=self.processor,
-            image_data=image_data if has_images else None,
+            image_data=(prepared_prompt.image_data or image_data)
+            if has_images
+            else None,
             vision_msg_vllm=([vision_messages_for_vllm] if has_images else None),
         )
 
         # Call inference engine
         response = await self.engine.agenerate(model_request)
         output_text = self.tokenizer.decode(response.output_tokens_without_stop)
+        reasoning_prefilled = (
+            not self.tool_call_parser_allow_recovery
+            and self.tool_call_parser == "qwen3_coder"
+            and bool(self.reasoning_parser)
+            and _prompt_prefills_reasoning(self.tokenizer, prompt_token_ids)
+        )
         # Parse raw output first: prefilled Qwen thinking may enter a tool call
         # without emitting </think>. Splitting first would swallow that call.
         tool_calls = None
+        invalid_tool_call_error: InvalidToolCallError | None = None
+        tool_call_parse_failed = False
         try:
             if (is_omitted(tool_choice) or tool_choice != "none") and tools_list:
                 tool_calls, output_text, response.stop_reason = process_tool_calls(
@@ -1303,8 +1454,14 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                     self.reasoning_parser,
                     response.stop_reason,
                     tokenizer=self.tokenizer,
+                    tool_call_parser_allow_recovery=self.tool_call_parser_allow_recovery,
+                    reasoning_prefilled=reasoning_prefilled,
                 )
+        except InvalidToolCallError as e:
+            invalid_tool_call_error = e
+            tool_call_parse_failed = True
         except json.JSONDecodeError as e:
+            tool_call_parse_failed = True
             logger.warning(
                 f"Failed to parse tool calls from output text: {e}, output_text:\n"
                 f"{output_text}"
@@ -1313,10 +1470,18 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         reasoning_text, output_text = split_reasoning(
             output_text,
             self.reasoning_parser,
-            force_reasoning=_force_reasoning_from_chat_template_kwargs(
+            force_reasoning=reasoning_prefilled
+            or _force_reasoning_from_chat_template_kwargs(
                 extra_body.get("chat_template_kwargs")
             ),
         )
+        if interaction is not None:
+            _record_response_parse(
+                interaction,
+                output_text=output_text,
+                tool_calls=tool_calls,
+                tool_call_parse_failed=tool_call_parse_failed,
+            )
 
         # If streaming is requested, return an async generator
         if is_streaming:
@@ -1326,7 +1491,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             # message_start, content_block_start) before iterating the original
             # generator, so if the client disconnects early, the cache update
             # code inside the generator would never execute.
-            if cache is not None:
+            if interaction is not None:
                 chat_completion, output_message = self._build_chat_completion(
                     completion_id=completion_id,
                     current_time=current_time,
@@ -1336,11 +1501,16 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                     response=response,
                     reasoning_text=reasoning_text,
                 )
-                cache[completion_id].completion = chat_completion
-                cache[completion_id].model_response = response
-                cache[completion_id].output_message_list = [
+                # Retry cleanup may have removed this interaction while the
+                # generation was in flight. Finish its response without
+                # looking it up again or restoring an orphan to the cache.
+                interaction.completion = chat_completion
+                interaction.model_response = response
+                interaction.output_message_list = [
                     output_message.model_dump(exclude_none=True)
                 ]
+            if invalid_tool_call_error is not None:
+                raise invalid_tool_call_error
             return self._create_stream(
                 completion_id=completion_id,
                 current_time=current_time,
@@ -1362,12 +1532,14 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             reasoning_text=reasoning_text,
         )
 
-        if cache is not None:
-            cache[completion_id].completion = chat_completion
-            cache[completion_id].model_response = response
-            cache[completion_id].output_message_list = [
+        if interaction is not None:
+            interaction.completion = chat_completion
+            interaction.model_response = response
+            interaction.output_message_list = [
                 output_message.model_dump(exclude_none=True)
             ]
+        if invalid_tool_call_error is not None:
+            raise invalid_tool_call_error
         return chat_completion
 
     async def _create_stream(
@@ -1540,12 +1712,14 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         chat_template_type: str = "hf",
         lora_name: str = "",
         require_multimodal_processor: bool = False,
+        tool_call_parser_allow_recovery: bool = True,
     ):
         super().__init__(client)
         self.engine = engine
         self.tokenizer = tokenizer
         self.processor = processor
         self.tool_call_parser = tool_call_parser
+        self.tool_call_parser_allow_recovery = tool_call_parser_allow_recovery
         self.reasoning_parser = reasoning_parser
         self._cache = cache
         self.engine_max_tokens = engine_max_tokens
@@ -1669,6 +1843,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             extra_body=extra_body,
             require_multimodal_processor=self.require_multimodal_processor,
             processor_cache=processor_cache,
+            align_sglang_images=_is_sglang_backend(self.engine),
         )
         prompt_token_ids = prepared_prompt.input_ids
         if self.processor is not None:
@@ -1728,23 +1903,44 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             ),
         )
 
+        from areal.utils.sglang_image import image_prompt_metadata
+
+        request_metadata = image_prompt_metadata(
+            metadata if not is_omitted(metadata) else {},
+            prompt_token_ids,
+            prepared_prompt.mm_token_type_ids if has_images else None,
+            image_data
+            if has_images and sglang_qwen_image_kwargs(self.processor) is not None
+            else None,
+            self.processor,
+        )
         model_request = ModelRequest(
             input_ids=prompt_token_ids,
             gconfig=gconfig,
             rid=str(uuid.uuid4()),
-            metadata=metadata if not is_omitted(metadata) else {},
+            metadata=request_metadata,
             tokenizer=self.tokenizer,
             processor=self.processor,
-            image_data=image_data if has_images else None,
+            image_data=(prepared_prompt.image_data or image_data)
+            if has_images
+            else None,
             vision_msg_vllm=([vision_messages_for_vllm] if has_images else None),
         )
 
         # Call inference engine
         engine_resp = await self.engine.agenerate(model_request)
         output_text = self.tokenizer.decode(engine_resp.output_tokens_without_stop)
+        reasoning_prefilled = (
+            not self.tool_call_parser_allow_recovery
+            and self.tool_call_parser == "qwen3_coder"
+            and bool(self.reasoning_parser)
+            and _prompt_prefills_reasoning(self.tokenizer, prompt_token_ids)
+        )
 
         # Parse tool calls.
         tool_calls = None
+        invalid_tool_call_error: InvalidToolCallError | None = None
+        tool_call_parse_failed = False
         try:
             if (is_omitted(tool_choice) or tool_choice != "none") and tools_list:
                 tool_calls, output_text, engine_resp.stop_reason = process_tool_calls(
@@ -1755,12 +1951,34 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
                     engine_resp.stop_reason,
                     use_responses=True,
                     tokenizer=self.tokenizer,
+                    tool_call_parser_allow_recovery=self.tool_call_parser_allow_recovery,
+                    reasoning_prefilled=reasoning_prefilled,
                 )
+        except InvalidToolCallError as e:
+            invalid_tool_call_error = e
+            tool_call_parse_failed = True
         except json.JSONDecodeError as e:
+            tool_call_parse_failed = True
             logger.warning(
                 f"Failed to parse tool calls from output text: {e}, output_text:\n"
                 f"{output_text}"
             )
+
+        # Validate visible content while preserving Responses API serialization.
+        _, visible_output_text = split_reasoning(
+            output_text,
+            self.reasoning_parser,
+            force_reasoning=reasoning_prefilled
+            or _force_reasoning_from_chat_template_kwargs(
+                extra_body.get("chat_template_kwargs")
+            ),
+        )
+        _record_response_parse(
+            interaction,
+            output_text=visible_output_text,
+            tool_calls=tool_calls,
+            tool_call_parse_failed=tool_call_parse_failed,
+        )
 
         # Extract reasoning tokens from output
         reasoning_token_count = self._count_reasoning_tokens(output_text)
@@ -1828,11 +2046,17 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             user=None,
         )
 
-        cache[resp_id].response = deepcopy(response)
-        cache[resp_id].model_response = engine_resp
-        cache[resp_id].output_message_list = [
-            o.model_dump(exclude_none=True) for o in resp_output
+        interaction.response = deepcopy(response)
+        interaction.model_response = engine_resp
+        # Cache the same representation used for incoming Responses items so a
+        # caller can return response.output and retain the sampled parent prefix.
+        interaction.output_message_list = [
+            message
+            for item in resp_output
+            for message in _build_messages_list(item.model_dump(exclude_none=True))
         ]
+        if invalid_tool_call_error is not None:
+            raise invalid_tool_call_error
         return response
 
     def _count_reasoning_tokens(
@@ -1857,6 +2081,10 @@ class ArealOpenAI(AsyncOpenAI):
     """
     Extended AsyncOpenAI client that uses AReaL's inference engine
     and supports reward setting.
+
+    ``response_validator`` controls the task-reward policy applied at rollout
+    finalization. It returns an error reason or None to accept a response;
+    passing None disables validation without changing response parsing.
     """
 
     def __init__(
@@ -1870,18 +2098,27 @@ class ArealOpenAI(AsyncOpenAI):
         lora_name: str = "",
         processor: "ProcessorMixin | None" = None,
         require_multimodal_processor: bool = False,
+        tool_call_parser_allow_recovery: bool = True,
+        response_validator: ResponseValidator | None = final_response_error,
         **kwargs,
     ):
+        if not tool_call_parser_allow_recovery and tool_call_parser != "qwen3_coder":
+            raise ValueError(
+                "tool_call_parser_allow_recovery=False requires "
+                "tool_call_parser='qwen3_coder'"
+            )
         super().__init__(**kwargs)
         self.engine = engine
         self.tokenizer = tokenizer
         self.processor = processor
         self.tool_call_parser = tool_call_parser
+        self.tool_call_parser_allow_recovery = tool_call_parser_allow_recovery
         self.reasoning_parser = reasoning_parser
         self.lora_name = lora_name
 
         # Use an ordered dict to maintain insertion order of completions/responses
         self._cache: InteractionCache = InteractionCache()
+        self.response_validator = response_validator
 
         # Override responses with our extended implementation
         self.responses = AsyncResponsesWithReward(
@@ -1891,6 +2128,7 @@ class ArealOpenAI(AsyncOpenAI):
             processor,
             self._cache,
             tool_call_parser=self.tool_call_parser,
+            tool_call_parser_allow_recovery=self.tool_call_parser_allow_recovery,
             reasoning_parser=self.reasoning_parser,
             engine_max_tokens=engine_max_tokens,
             chat_template_type=chat_template_type,
@@ -1906,6 +2144,7 @@ class ArealOpenAI(AsyncOpenAI):
             processor,
             self._cache,
             tool_call_parser=self.tool_call_parser,
+            tool_call_parser_allow_recovery=self.tool_call_parser_allow_recovery,
             reasoning_parser=self.reasoning_parser,
             engine_max_tokens=engine_max_tokens,
             chat_template_type=chat_template_type,
@@ -1929,7 +2168,9 @@ class ArealOpenAI(AsyncOpenAI):
             raise RuntimeError("No interaction in cache to set reward for")
         return self._cache.set_last_reward(reward)
 
-    def apply_reward_discount(self, turn_discount: float = 1.0) -> None:
+    def apply_reward_discount(
+        self, turn_discount: float = 1.0, *, drop_retry_orphans: bool = False
+    ) -> None:
         """Apply backward discounted rewards across cached completions/responses.
 
         This method iterates over the cached completions/responses in reverse creation
@@ -1950,6 +2191,8 @@ class ArealOpenAI(AsyncOpenAI):
         turn_discount : float, optional
             The per-turn discount factor applied when propagating reward
             backward from a later completion/response to an earlier one, by default 1.0.
+        drop_retry_orphans : bool, optional
+            Remove unused retries before applying response policy and discounting.
 
         Returns
         -------
@@ -1957,10 +2200,22 @@ class ArealOpenAI(AsyncOpenAI):
             A shallow copy of the completion/response cache after rewards have been
             updated in-place.
         """
-        return self._cache.apply_reward_discount(turn_discount)
+        if self._cache.reward_discount_applied:
+            raise RuntimeError("apply_reward_discount should only be called once.")
+        return finalize_interactions(
+            self._cache,
+            style="individual",
+            reward_discount=turn_discount,
+            drop_retry_orphans=drop_retry_orphans,
+            response_validator=self.response_validator,
+        )
 
     def export_interactions(
-        self, style: str
+        self,
+        style: str,
+        *,
+        reward_discount: float | None = None,
+        drop_retry_orphans: bool = False,
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Export cached completions/responses in different formats.
 
@@ -1970,14 +2225,20 @@ class ArealOpenAI(AsyncOpenAI):
         parent. It then returns only leaf-node completions/responses (those without
         children). No reward propagation is performed here.
 
-        When ``style='individual'``, all cached completions/responses are returned as-is
-        without constructing the tree.
+        Response policy is applied to retained concat leaves, or to each retained
+        individual response before optional backward reward discounting. Already
+        discounted returns are preserved on subsequent exports.
 
         Parameters
         ----------
         style : str, optional
             The export style, either ``'concat'`` (build tree and return leaves)
             or ``'individual'`` (return all), by default 'concat'.
+        reward_discount : float, optional
+            Apply backward discounting for individual export after validation.
+        drop_retry_orphans : bool, optional
+            Remove unused retries before validation. Cleanup must precede the
+            first discount call and should not be requested again afterward.
 
         Returns
         -------
@@ -1991,7 +2252,13 @@ class ArealOpenAI(AsyncOpenAI):
         ValueError
             If an unsupported ``style`` is provided.
         """
-        return self._cache.export_interactions(style)
+        return finalize_interactions(
+            self._cache,
+            style=style,
+            reward_discount=reward_discount,
+            drop_retry_orphans=drop_retry_orphans,
+            response_validator=self.response_validator,
+        )
 
 
 def is_omitted(value) -> bool:

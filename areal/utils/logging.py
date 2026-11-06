@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import getpass
 import logging.config
 import os
 import threading
@@ -75,6 +76,7 @@ LOGGER_COLORS_EXACT = {
     "vLLMEngine": "white",
     # Dataset - green
     "Dataset": "light_green",
+    "DataEngineeringRunner": "light_green",
     "CLEVR70KDataset": "light_green",
     "ViRL39KDataset": "light_green",
     # Trainers - green
@@ -139,8 +141,9 @@ LOGGER_COLORS_EXACT = {
     "R3Replay": "light_cyan",
     "R3Layout": "light_cyan",
     # AWEX weight exchange - cyan (compute backend)
-    "AwexColocate": "light_cyan",
-    "AwexColocateReader": "light_cyan",
+    "AwexMegatronAdapter": "light_cyan",
+    "AwexSGLangAdapter": "light_cyan",
+    "AwexFSDPAdapter": "light_cyan",
     "MegatronResidency": "light_cyan",
     "MOPDTeacherPhase": "light_cyan",
     "AwexSGLangPlugin": "light_cyan",
@@ -356,6 +359,19 @@ log_config = {
     },
     "disable_existing_loggers": True,
 }
+
+
+def get_experiment_log_path(
+    experiment_name: str | None,
+    trial_name: str | None,
+    fileroot: str | None,
+) -> str:
+    """Create an experiment log directory without importing metrics backends."""
+    if not fileroot or not experiment_name or not trial_name:
+        raise ValueError("fileroot, experiment_name, and trial_name must be provided.")
+    path = f"{fileroot}/logs/{getpass.getuser()}/{experiment_name}/{trial_name}"
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def getLogger(

@@ -11,6 +11,7 @@ from areal.trainer.ppo.actor import PPOActor
 from areal.trainer.ppo.gae import (
     _compute_token_level_gae,
     _compute_turn_level_gae,
+    compute_gae_lambda,
 )
 from areal.trainer.ppo.lambda_fn import (
     relative_position_gae_lambda,
@@ -37,25 +38,39 @@ def _make_actor(
         recompute_logprob=recompute_logprob,
         use_decoupled_loss=use_decoupled_loss,
     )
-    actor = PPOActor.__new__(PPOActor)
-    actor.config = config
-    actor.reward_bias = 0.0
-    actor.reward_scaling = 1.0
-    actor.reward_clip = 20.0
-    actor.reward_norm = None
-    actor.adv_norm = None
-    actor.kl_ctl = kl_ctl
-    actor.kl_estimator = KLEstimator("k1")
-    actor.discount = 1.0
-    actor.gae_timestep_unit = gae_timestep_unit
-    actor.gae_lambda = gae_lambda
-    actor.gae_lambda_fn, actor._gae_lambda_is_custom = resolve_gae_lambda_fn(gae_lambda)
-    actor.gae_lambda_kwargs = (
-        dict(config.gae_lambda_kwargs) if actor._gae_lambda_is_custom else {}
+    actor = PPOActor(config, engine=None)
+    actor.advantage_fn.reward_bias = 0.0
+    actor.advantage_fn.reward_scaling = 1.0
+    actor.advantage_fn.reward_clip = 20.0
+    actor.advantage_fn.reward_norm = None
+    actor.advantage_fn.adv_norm = None
+    actor.advantage_fn.kl_ctl = kl_ctl
+    actor.advantage_fn.kl_estimator = KLEstimator("k1")
+    actor.advantage_fn.discount = 1.0
+    actor.advantage_fn.gae_timestep_unit = gae_timestep_unit
+    actor.advantage_fn.gae_lambda = gae_lambda
+    actor.advantage_fn.gae_lambda_fn, actor.advantage_fn._gae_lambda_is_custom = (
+        resolve_gae_lambda_fn(gae_lambda)
     )
-    actor.mask_no_eos_with_zero = False
+    actor.advantage_fn.gae_lambda_kwargs = (
+        dict(config.gae_lambda_kwargs)
+        if actor.advantage_fn._gae_lambda_is_custom
+        else {}
+    )
+    actor.advantage_fn.mask_no_eos_with_zero = False
     actor.m2_threshold = None
     return actor
+
+
+def _resolve_lambda(actor, loss_mask, turn_ids):
+    pipeline = actor.advantage_fn
+    return compute_gae_lambda(
+        pipeline.gae_lambda_fn,
+        loss_mask,
+        turn_ids,
+        timestep_unit=pipeline.gae_timestep_unit,
+        kwargs=pipeline.gae_lambda_kwargs,
+    )
 
 
 def test_mopd_preserves_rollout_behavior_logprobs_when_recomputing_proximal():
@@ -266,7 +281,7 @@ def test_static_gae_lambda_ignores_kwargs_and_legacy_missing_turn_ids():
     )
     loss_mask = torch.tensor([[1.0, 1.0], [1.0, 0.0]])
 
-    gae_lambda = actor._compute_gae_lambda(loss_mask, turn_ids=None)
+    gae_lambda = _resolve_lambda(actor, loss_mask, turn_ids=None)
 
     torch.testing.assert_close(
         gae_lambda,
@@ -283,7 +298,9 @@ def test_static_gae_lambda_main_path_skips_dynamic_context(monkeypatch):
     def fail_dynamic_resolution(*_args, **_kwargs):
         raise AssertionError("static lambda should not use dynamic resolution")
 
-    monkeypatch.setattr(actor, "_compute_gae_lambda", fail_dynamic_resolution)
+    monkeypatch.setattr(
+        "areal.trainer.ppo.gae._build_gae_lambda_context", fail_dynamic_resolution
+    )
     batch = {
         "input_ids": torch.zeros(1, 4, dtype=torch.long),
         "loss_mask": torch.tensor([[0, 1, 1, 1]], dtype=torch.float32),
@@ -335,7 +352,7 @@ def test_vapo_gae_lambda_uses_selected_token_lengths_per_sample():
         dtype=torch.int32,
     )
 
-    gae_lambda = actor._compute_gae_lambda(loss_mask, turn_ids)
+    gae_lambda = _resolve_lambda(actor, loss_mask, turn_ids)
 
     torch.testing.assert_close(
         gae_lambda,
@@ -368,7 +385,7 @@ def test_vapo_gae_lambda_uses_selected_turn_counts_per_sample():
         dtype=torch.int32,
     )
 
-    gae_lambda = actor._compute_gae_lambda(loss_mask, turn_ids)
+    gae_lambda = _resolve_lambda(actor, loss_mask, turn_ids)
 
     torch.testing.assert_close(
         gae_lambda,
@@ -487,7 +504,7 @@ def test_relative_position_gae_lambda_turn_mode_uses_effective_turn_count():
         dtype=torch.int32,
     )
 
-    gae_lambda = actor._compute_gae_lambda(loss_mask, turn_ids)
+    gae_lambda = _resolve_lambda(actor, loss_mask, turn_ids)
 
     torch.testing.assert_close(
         gae_lambda,
@@ -505,7 +522,7 @@ def test_custom_token_gae_lambda_uses_lengths_without_turn_ids():
     )
     loss_mask = torch.tensor([[1.0, 1.0], [1.0, 0.0]])
 
-    gae_lambda = actor._compute_gae_lambda(loss_mask, turn_ids=None)
+    gae_lambda = _resolve_lambda(actor, loss_mask, turn_ids=None)
 
     torch.testing.assert_close(
         gae_lambda,
@@ -522,12 +539,13 @@ def test_custom_gae_lambda_rejects_scalar_output():
     def scalar_lambda(context):
         return torch.tensor(0.5)
 
-    actor._gae_lambda_is_custom = True
-    actor.gae_lambda_fn = scalar_lambda
-    actor.gae_lambda_kwargs = {}
+    actor.advantage_fn._gae_lambda_is_custom = True
+    actor.advantage_fn.gae_lambda_fn = scalar_lambda
+    actor.advantage_fn.gae_lambda_kwargs = {}
 
     with pytest.raises(ValueError, match="one value per local trajectory"):
-        actor._compute_gae_lambda(
+        _resolve_lambda(
+            actor,
             torch.ones(2, 2),
             torch.zeros(2, 2, dtype=torch.int32),
         )
@@ -631,9 +649,9 @@ def test_main_path_lambda_context_counts_shifted_training_tokens_including_eos()
         captured_context.update({key: value.clone() for key, value in context.items()})
         return torch.ones_like(context["timestep_lengths"], dtype=torch.float32)
 
-    actor._gae_lambda_is_custom = True
-    actor.gae_lambda_fn = capture_context
-    actor.gae_lambda_kwargs = {}
+    actor.advantage_fn._gae_lambda_is_custom = True
+    actor.advantage_fn.gae_lambda_fn = capture_context
+    actor.advantage_fn.gae_lambda_kwargs = {}
     batch = {
         "input_ids": torch.zeros(1, 5, dtype=torch.long),
         # The three generated tokens include the terminal EOS at position 3.

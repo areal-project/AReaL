@@ -2,8 +2,10 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 from collections import Counter
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,6 +51,7 @@ def test_load_arena_stream_configs_preserves_reward_specs(tmp_path, source):
             },
             "reward_threshold": 0.98,
             "reward_transform_fn": "examples.swe.reward_transforms.astra_partial_reward",
+            "dataset_snapshot_file": " /snapshots/astra.json ",
         },
         {
             "name": "tbench",
@@ -78,6 +81,8 @@ def test_load_arena_stream_configs_preserves_reward_specs(tmp_path, source):
     )
     assert streams[0].task_envs == {"COMMON": "1"}
     assert streams[1].reward_transform_fn == ""
+    assert streams[0].dataset_snapshot_file == "/snapshots/astra.json"
+    assert streams[1].dataset_snapshot_file == ""
 
 
 @pytest.mark.parametrize("source", ["file", "base64"])
@@ -629,6 +634,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
             task_id="task-b",
             status="DONE",
             score=0.5,
+            sub_scores={"quality": 0.25},
             raw={"exit_code": 0, "reward_txt": "ok"},
             trace_id="trace-b",
         )
@@ -671,10 +677,13 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
     assert stats["rollout/training_score"] == pytest.approx(0.75)
     assert stats["rollout/arena_raw_present"] == 1.0
     assert stats["rollout/stream/b/arena_score"] == pytest.approx(0.5)
+    assert stats["rollout/reward_sub_score/quality"] == pytest.approx(0.25)
+    assert stats["rollout/stream/b/reward_sub_score/quality"] == pytest.approx(0.25)
     dump_files = list((tmp_path / "arena-results").glob("arena_results_*.jsonl"))
     assert len(dump_files) == 1
     dump_record = json.loads(dump_files[0].read_text(encoding="utf-8"))
     assert dump_record["raw"] == {"exit_code": 0, "reward_txt": "ok"}
+    assert dump_record["sub_scores"] == {"quality": 0.25}
     assert dump_record["expected_reward_ref"] == {
         "key": "reward-b",
         "version": "2",
@@ -922,6 +931,11 @@ def _core_model_failure_error(
             "provider_length_stop",
             "model stopped with reason: length",
         ),
+        (
+            "LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED",
+            "provider_length_stop",
+            "provider terminal response includes final usage",
+        ),
     ],
 )
 def test_core_model_failure_with_matching_native_receipt_keeps_zero(
@@ -1041,8 +1055,325 @@ def test_core_context_budget_exhaustion_keeps_zero_with_matching_native_receipt(
     )
 
 
+def _core_tool_json_failure_error() -> ArenaTaskFailedError:
+    """Legacy Core drops the error code but retains the proxy message digest."""
+    message = (
+        "model reported a streaming error (event=error, code=None, "
+        'type=Some("invalid_request_error"), reason=None)'
+    )
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED", "empty_completion", message
+    )
+    outcome = {
+        "code": "LLM_RESPONSE_FAILED",
+        "class": "infrastructure",
+        "source": "provider_stream",
+        "details": {
+            "code": None,
+            "reason": None,
+            "errorShape": "object",
+            "errorType": "invalid_request_error",
+            "eventType": "error",
+            "diagnosticSignals": {
+                "authenticationHint": False,
+                "contextLimitHint": False,
+                "overloadHint": False,
+                "rateLimitHint": False,
+                "messageBytes": 54,
+                "messageScannedChars": 54,
+                "messageSha256": "ddd36581ad2c321e36429041d24f12b20185f0e7ca2068ef535b09c1f54bebaa",
+            },
+        },
+    }
+    summary = (
+        "GAMEAGENT_OUTCOME_CODE=LLM_RESPONSE_FAILED "
+        "GAMEAGENT_OUTCOME_CLASS=infrastructure"
+    )
+    error.result.raw["harness"]["summary"] = summary
+    error.result.raw["error"] = summary
+    error.harness_result["summary"] = summary
+    error.harness_result["error"][0]["message"] = message
+    _set_core_failure_outcome(error, outcome)
+    return error
+
+
+def _set_core_failure_outcome(error, outcome):
+    """Keep the three independently transported outcome envelopes in agreement."""
+    error.result.raw["outcome"] = deepcopy(outcome)
+    error.harness_result["error"][-1]["outcome"] = deepcopy(outcome)
+    error.harness_result["raw"]["outcome"] = deepcopy(outcome)
+
+
+def _core_review_failure_error(failure="invalid_tool_json", completed_turns=1):
+    if failure == "invalid_tool_json":
+        error = _core_tool_json_failure_error()
+    elif failure == "context_limit":
+        error = _core_context_failure_error()
+    elif failure == "provider_context":
+        error = _provider_context_failure_error()
+    elif failure == "output_limit":
+        error = _core_model_failure_error(
+            "LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED",
+            "provider_length_stop",
+            "model stopped with reason: length",
+        )
+    else:
+        error = _core_model_failure_error(
+            "LLM_RESPONSE_FAILED",
+            "empty_completion",
+            "model stopped without visible output or tool calls",
+        )
+    receipt = deepcopy(error.harness_result)
+    receipt["turn_statuses"] = ["completed"] * completed_turns + ["failed"]
+    receipt["error"] = [None] * completed_turns + receipt["error"]
+    receipt["continuations"] = completed_turns
+    receipt["delivery"] = {
+        "status": "incomplete",
+        "reasons": ["Registered inspection review pending: review.json"],
+    }
+    error.harness_result = receipt
+    return error
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "invalid_tool_json",
+        "context_limit",
+        "provider_context",
+        "output_limit",
+        "empty_response",
+    ],
+)
+@pytest.mark.parametrize("completed_turns", [1, 2, 4])
+@pytest.mark.parametrize("has_delivery", [False, True])
+def test_core_review_terminal_model_failure_keeps_zero(
+    failure, completed_turns, has_delivery
+):
+    """Successful earlier turns do not hide the final model-attributed failure."""
+    error = _core_review_failure_error(failure, completed_turns)
+    if not has_delivery:
+        error.harness_result["delivery"] = None
+    before = deepcopy(error.harness_result)
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error,
+            context_overflow=False,
+            invalid_tool_json=failure == "invalid_tool_json",
+            interaction_count=2,
+        )
+        == "model_failure_zero"
+    )
+    assert error.harness_result == before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_continuations",
+        "wrong_continuations",
+        "boolean_continuations",
+        "prior_failed",
+        "prior_cancelled",
+        "prior_error",
+        "terminal_completed",
+        "error_count",
+        "terminal_error",
+        "empty_message",
+        "missing_delivery",
+        "complete_delivery",
+        "unknown_delivery",
+        "bad_delivery",
+        "failed_collection",
+        "runner_timeout",
+        "external_interruption",
+        "receipt_failure",
+        "terminal_outcome",
+        "receipt_outcome",
+        "system_message",
+        "missing_proxy_flag",
+        "no_interactions",
+        "authentication_hint",
+        "overload_hint",
+        "rate_limit_hint",
+        "bad_hint_type",
+        "wrong_terminal_digest",
+        "missing_terminal_digest",
+        "wrong_message_size",
+        "noninteger_message_size",
+    ],
+)
+def test_core_review_missing_or_conflicting_evidence_stays_rejected(mutation):
+    """An earlier proxy flag cannot turn a later system error into reward zero."""
+    error = _core_review_failure_error()
+    receipt = error.harness_result
+    if mutation == "missing_continuations":
+        receipt.pop("continuations")
+    elif mutation == "wrong_continuations":
+        receipt["continuations"] = 2
+    elif mutation == "boolean_continuations":
+        receipt["continuations"] = True
+    elif mutation in {"prior_failed", "prior_cancelled"}:
+        receipt["turn_statuses"][0] = mutation.removeprefix("prior_")
+    elif mutation == "prior_error":
+        receipt["error"][0] = {"message": "HTTP 503 service unavailable"}
+    elif mutation == "terminal_completed":
+        receipt["turn_statuses"][-1] = "completed"
+    elif mutation == "error_count":
+        receipt["error"].pop(0)
+    elif mutation == "terminal_error":
+        receipt["error"][-1] = None
+    elif mutation == "empty_message":
+        receipt["error"][-1]["message"] = ""
+    elif mutation == "missing_delivery":
+        receipt.pop("delivery")
+    elif mutation in {"complete_delivery", "unknown_delivery"}:
+        receipt["delivery"]["status"] = mutation.removesuffix("_delivery")
+    elif mutation == "bad_delivery":
+        receipt["delivery"] = "incomplete"
+    elif mutation == "failed_collection":
+        receipt["collection"] = {"status": "ERROR"}
+    elif mutation == "runner_timeout":
+        receipt["observed_runner_timeout"] = True
+    elif mutation == "external_interruption":
+        receipt["observed_external_interruption"] = True
+    elif mutation == "receipt_failure":
+        receipt["failure"] = {"code": "EXPORT_FAILED"}
+    elif mutation == "terminal_outcome":
+        receipt["error"][-1]["outcome"]["source"] = "unknown"
+    elif mutation == "receipt_outcome":
+        receipt["raw"]["outcome"]["source"] = "unknown"
+    elif mutation == "system_message":
+        receipt["error"][-1]["message"] = "HTTP 503 service unavailable"
+    elif mutation not in {"missing_proxy_flag", "no_interactions"}:
+        outcome = deepcopy(error.result.raw["outcome"])
+        signals = outcome["details"]["diagnosticSignals"]
+        if mutation.endswith("_hint"):
+            signals[
+                {
+                    "authentication_hint": "authenticationHint",
+                    "overload_hint": "overloadHint",
+                    "rate_limit_hint": "rateLimitHint",
+                }[mutation]
+            ] = True
+        elif mutation == "bad_hint_type":
+            signals["authenticationHint"] = "false"
+        elif mutation == "wrong_terminal_digest":
+            signals["messageSha256"] = "0" * 64
+        elif mutation == "missing_terminal_digest":
+            outcome["details"].pop("diagnosticSignals")
+        elif mutation == "wrong_message_size":
+            signals["messageBytes"] = 55
+        elif mutation == "noninteger_message_size":
+            signals["messageBytes"] = 54.0
+        _set_core_failure_outcome(error, outcome)
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error,
+            context_overflow=True,
+            invalid_tool_json=mutation != "missing_proxy_flag",
+            interaction_count=0 if mutation == "no_interactions" else 2,
+        )
+        == "unknown_failure_reject"
+    )
+
+
+def test_core_review_cleanup_failure_is_not_model_failure():
+    """The observed three-turn cleanup failure remains a system rejection."""
+    error = _core_review_failure_error(completed_turns=2)
+    outcome = {
+        "code": "HARNESS_INTERNAL_ERROR",
+        "class": "infrastructure",
+        "source": "core",
+        "details": {"reason": "cleanup_failed"},
+    }
+    summary = "GAMEAGENT_OUTCOME_CODE=HARNESS_INTERNAL_ERROR GAMEAGENT_OUTCOME_CLASS=infrastructure"
+    error.result.raw["error"] = summary
+    error.result.raw["harness"]["summary"] = summary
+    error.harness_result["summary"] = summary
+    error.harness_result["error"][-1]["message"] = (
+        "Runtime scope cleanup failed: CleanupFailed: executor output/exit "
+        "stream was lost or violated ordering"
+    )
+    _set_core_failure_outcome(error, outcome)
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=True, invalid_tool_json=True, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["HTTP 503 service unavailable", "authentication failed", "request timed out"],
+)
+def test_core_review_context_code_cannot_override_terminal_system_error(message):
+    """The final native error must not contradict its context outcome code."""
+    error = _core_review_failure_error("provider_context")
+    error.harness_result["error"][-1]["message"] = message
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=True, invalid_tool_json=True, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize("field", ["code", "reason"])
+def test_core_review_explicit_tool_code_does_not_require_legacy_digest(field):
+    error = _core_review_failure_error()
+    outcome = deepcopy(error.result.raw["outcome"])
+    outcome["details"][field] = "invalid_tool_json"
+    outcome["details"].pop("diagnosticSignals")
+    _set_core_failure_outcome(error, outcome)
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, invalid_tool_json=True, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+
+
+def test_core_tool_error_digest_matches_the_actual_proxy_error():
+    """The legacy diagnostic must identify the proxy's real typed error text."""
+    from areal.experimental.openai.tool_call_parser import (
+        InvalidToolCallError,
+        _build_tool_call,
+    )
+
+    with pytest.raises(InvalidToolCallError) as caught:
+        _build_tool_call("example", chr(0xD800), False)
+    message = str(caught.value).encode()
+    signals = _core_tool_json_failure_error().result.raw["outcome"]["details"][
+        "diagnosticSignals"
+    ]
+    assert len(message) == signals["messageBytes"]
+    assert hashlib.sha256(message).hexdigest() == signals["messageSha256"]
+
+
+def test_core_single_turn_legacy_receipt_keeps_existing_compatibility():
+    error = _core_tool_json_failure_error()
+    outcome = deepcopy(error.result.raw["outcome"])
+    outcome["details"].pop("diagnosticSignals")
+    _set_core_failure_outcome(error, outcome)
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, invalid_tool_json=True, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["legacy_context", "current_context", "provider_context", "whitebox_deadline"],
+)
 def test_context_budget_failure_fetches_native_receipt_before_classification(
     monkeypatch,
+    failure,
 ):
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
@@ -1052,9 +1383,23 @@ def test_context_budget_failure_fetches_native_receipt_before_classification(
             "arena_streams": [{"name": "a", "stream_id": "stream-a"}],
         }
     )
-    error = _core_context_failure_error()
-    receipt = error.harness_result
-    error.harness_result = None
+    if failure == "whitebox_deadline":
+        workflow.stream_configs["a"].harness = "whitebox-unified-b-areal@0.1.0"
+        error = _whitebox_deadline_error()
+        receipt = error.whitebox_lifecycle
+        error.whitebox_lifecycle = None
+        fetch_method = "get_whitebox_lifecycle_async"
+    else:
+        error = (
+            _current_core_context_failure_error()
+            if failure == "current_context"
+            else _core_context_failure_error()
+        )
+        if failure == "provider_context":
+            error = _provider_context_failure_error()
+        receipt = error.harness_result
+        error.harness_result = None
+        fetch_method = "get_harness_result_async"
     fetched = []
 
     async def register(**_kwargs):
@@ -1073,7 +1418,7 @@ def test_context_budget_failure_fetches_native_receipt_before_classification(
 
     monkeypatch.setattr(workflow.client, "register_llm_proxy_async", register)
     monkeypatch.setattr(workflow.client, "launch_one_task_result", launch)
-    monkeypatch.setattr(workflow.client, "get_harness_result_async", get_receipt)
+    monkeypatch.setattr(workflow.client, fetch_method, get_receipt)
     monkeypatch.setattr(workflow.client, "delete_llm_proxy_async", delete)
 
     with pytest.raises(ArenaTaskFailedError) as caught:
@@ -2112,3 +2457,63 @@ def test_healthy_native_receipt_cannot_hide_explicit_system_failure(
         )
         == "unknown_failure_reject"
     )
+
+
+def _provider_context_failure_error(source="provider_stream"):
+    error = _core_context_failure_error()
+    outcome = {
+        "code": "LLM_CONTEXT_WINDOW_EXCEEDED",
+        "class": "agent",
+        "source": source,
+        "details": {
+            "code": "context_length_exceeded",
+            "errorShape": "object",
+            "errorType": "context_length_exceeded",
+            "eventType": "error",
+            "reason": None,
+        },
+    }
+    error.result.raw["outcome"] = outcome
+    error.harness_result["error"][0] = {
+        "message": "provider stream error: context_length_exceeded",
+        "outcome": outcome.copy(),
+    }
+    error.harness_result["raw"]["outcome"] = outcome.copy()
+    return error
+
+
+def _current_core_context_failure_error(reason="compaction is disabled"):
+    error = _core_context_failure_error()
+    details = {"estimatedTokens": 189066, "inputLimit": 188416, "reason": reason}
+    error.result.raw["outcome"]["details"] = details
+    for outcome in (
+        error.harness_result["error"][0]["outcome"],
+        error.harness_result["raw"]["outcome"],
+    ):
+        outcome["details"] = details.copy()
+    error.harness_result["error"][0]["message"] = (
+        f"context window limit exceeded: {reason} "
+        "(189066 estimated tokens / 188416 input tokens)"
+    )
+    return error
+
+
+def _whitebox_deadline_error():
+    error = _core_context_failure_error()
+    error.result = replace(
+        error.result,
+        raw={
+            "error": "harness agent phase exited with code 1",
+            "harness": {"phase": "agent", "exit_code": 1},
+        },
+    )
+    error.harness_result = None
+    error.whitebox_lifecycle = {
+        "schema": "whitebox-runner-lifecycle/v1",
+        "status": "INTERRUPTED",
+        "trigger": "BRIDGE_EXECUTION_DEADLINE",
+        "native_exit_code": -9,
+        "remaining_pids": [],
+        "native_receipt_synthesized": False,
+    }
+    return error

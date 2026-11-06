@@ -8,8 +8,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import torch
 
-from examples.swe.arena_agent import ArenaStreamAgentWorkflow
+from examples.swe.arena_agent import ArenaStreamAgentWorkflow, _ArenaTaskWaitTimeout
 from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
+from tests.test_swe_arena_multi_stream import _core_review_failure_error
 
 from areal.api import ModelResponse
 from areal.experimental.openai.cache import InteractionCache
@@ -102,6 +103,53 @@ class _FakeProxyClient:
         if self.interaction_count == 0:
             return {}
         return {"completion-1": self.interaction}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["invalid_tool_json", "context_limit"])
+@pytest.mark.parametrize("proxy_system_error", [False, True])
+async def test_tw_review_failure_recovers_zero_with_system_error_veto(
+    monkeypatch, failure, proxy_system_error
+):
+    """The actual Arena classifier exports model failures and rejects proxy faults."""
+    monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    client = _FakeProxyClient()
+    client.context_overflow = False
+    client.invalid_tool_json = failure == "invalid_tool_json"
+    client.system_error = proxy_system_error
+    client.export_interactions = AsyncMock(
+        return_value={"completion-1": client.interaction}
+    )
+    monkeypatch.setattr(
+        workflow_module, "OpenAIProxyClient", lambda *args, **kwargs: client
+    )
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    agent = ArenaStreamAgentWorkflow(
+        econfig={"arena_streams": [{"name": "test", "stream_id": "stream"}]}
+    )
+    agent.persist_episode_result = AsyncMock()
+    error = _core_review_failure_error(failure, completed_turns=2)
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent, export_style="concat")
+    monkeypatch.setattr(workflow, "_run_agent", AsyncMock(side_effect=error))
+    monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
+    workflow_context.set(WorkflowContext(task_id=22, sample_idx=3, group_size=12))
+    try:
+        if proxy_system_error:
+            with pytest.raises(ArenaTaskFailedError):
+                await workflow.arun_episode(None, {})
+            assert client.last_reward is None
+            client.export_interactions.assert_not_awaited()
+        else:
+            result = await workflow.arun_episode(None, {})
+            assert result["completion-1"].reward == client.last_reward == 0.0
+            assert client.export_interactions.await_args.kwargs["episode_reward"] == 0.0
+            agent.persist_episode_result.assert_awaited_once_with({}, 0.0)
+    finally:
+        workflow_context.set(WorkflowContext())
+        stats_tracker.export_all(reset=True)
 
 
 @pytest.mark.parametrize("receipt", ["envelope", "full"])
@@ -312,11 +360,14 @@ async def test_caught_system_error_cannot_be_recovered_as_context_zero(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_recovered_overflow_keeps_all_eleven_siblings(monkeypatch):
+@pytest.mark.parametrize("failure", ["context_overflow", "invalid_tool_json"])
+async def test_recovered_overflow_keeps_all_eleven_siblings(monkeypatch, failure):
     from areal.api import RolloutWorkflow
     from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
 
     client = _FakeProxyClient()
+    client.context_overflow = failure == "context_overflow"
+    client.invalid_tool_json = failure == "invalid_tool_json"
     monkeypatch.setattr(workflow_module, "OpenAIProxyClient", lambda **_: client)
     monkeypatch.setattr(
         workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
@@ -348,6 +399,93 @@ async def test_recovered_overflow_keeps_all_eleven_siblings(monkeypatch):
         assert sorted(completed) == list(range(1, 12))
         assert len(result) == 12
         assert result["completion-1"].reward == 0.0
+    finally:
+        stats_tracker.export_all(reset=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid_siblings", [7, 11])
+@pytest.mark.parametrize("reward_normalization", [False, True])
+async def test_local_task_deadline_preserves_healthy_siblings(
+    monkeypatch, valid_siblings, reward_normalization
+):
+    from areal.api import RolloutWorkflow
+    from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
+
+    monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    client = _FakeProxyClient()
+    client.context_overflow = True
+    client.invalid_tool_json = True
+    client.export_interactions = AsyncMock()
+    monkeypatch.setattr(workflow_module, "OpenAIProxyClient", lambda **_: client)
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    agent = ArenaStreamAgentWorkflow(reject_terminal_task_failures=True)
+    proxy = OpenAIProxyWorkflow(mode="inline", agent=agent)
+    monkeypatch.setattr(proxy, "_grant_capacity", AsyncMock())
+    monkeypatch.setattr(
+        proxy, "_run_agent", AsyncMock(side_effect=_ArenaTaskWaitTimeout("task", 15000))
+    )
+    finished = []
+    healthy = {}
+    rejected = asyncio.Event()
+    failed_siblings = 12 - valid_siblings
+
+    class Episodes(RolloutWorkflow):
+        async def arun_episode(self, engine, data):
+            index = workflow_context.get().sample_idx
+            if index < failed_siblings:
+                result = await proxy.arun_episode(engine, data)
+                rejected.set()
+                return result
+            await rejected.wait()
+            await asyncio.sleep(0)
+            interaction = InteractionWithTokenLogpReward(
+                reward=float(index % 2),
+                model_response=ModelResponse(
+                    input_tokens=[1, index + 2],
+                    output_tokens=[index + 20],
+                    output_logprobs=[-0.1],
+                    output_versions=[4],
+                ),
+            )
+            healthy[f"peer-{index}"] = interaction
+            finished.append(index)
+            return {f"peer-{index}": interaction}
+
+    grouped = GroupedRolloutWorkflow(
+        Episodes(),
+        group_size=12,
+        min_usable_group_size=8,
+        logger=MagicMock(),
+        reward_normalization=reward_normalization,
+        reward_normalization_use_std=True,
+    )
+    try:
+        result = await grouped.arun_episode(None, {})
+        assert sorted(finished) == list(range(failed_siblings, 12))
+        assert client.last_reward is None
+        client.export_interactions.assert_not_awaited()
+        if valid_siblings < 8:
+            assert result is None
+        else:
+            assert result == healthy
+            raw_rewards = torch.tensor(
+                [float(index % 2) for index in range(failed_siblings, 12)]
+            )
+            expected = raw_rewards
+            if reward_normalization:
+                expected = (raw_rewards - raw_rewards.mean()) / raw_rewards.std(
+                    unbiased=False
+                )
+            actual = torch.tensor([result[key].reward for key in healthy])
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+            for index in range(failed_siblings, 12):
+                row = result[f"peer-{index}"]
+                assert row.model_response.output_tokens == [index + 20]
+                assert row.model_response.output_versions == [4]
     finally:
         stats_tracker.export_all(reset=True)
 
@@ -743,7 +881,10 @@ async def test_concat_per_completion_rewards_do_not_fill_unscored_branch(monkeyp
         ("TIMEOUT", True),
         ("NO_OUTPUT", True),
         ("EVAL_FAILED", True),
-        ("SETUP_FAILED", False),
+        ("SETUP_FAILED", True),
+        ("COLLECT_FAILED", True),
+        ("LOCAL_WAIT_TIMEOUT", True),
+        ("CLIENT_TIMEOUT", False),
     ],
 )
 @pytest.mark.parametrize("reject_terminal_task_failures", [False, True])
@@ -795,6 +936,10 @@ async def test_arena_unhealthy_receipt_rejection_preserves_failure_scope(
             },
         ),
     )
+    if status == "LOCAL_WAIT_TIMEOUT":
+        error = _ArenaTaskWaitTimeout("task", 15000.0)
+    elif status == "CLIENT_TIMEOUT":
+        error = TimeoutError("client poll timed out")
     workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
     monkeypatch.setattr(workflow, "_run_agent", AsyncMock(side_effect=error))
     monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
@@ -810,7 +955,7 @@ async def test_arena_unhealthy_receipt_rejection_preserves_failure_scope(
         ):
             assert await workflow.arun_episode(engine=None, data={}) is None
         else:
-            with pytest.raises(ArenaTaskFailedError) as caught:
+            with pytest.raises(type(error)) as caught:
                 await workflow.arun_episode(engine=None, data={})
             assert caught.value is error
     finally:

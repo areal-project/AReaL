@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
@@ -10,6 +11,7 @@ from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
 
 from areal.api import ModelResponse
 from areal.experimental.openai.cache import InteractionCache
+from areal.experimental.openai.finalization import finalize_interactions
 from areal.experimental.openai.proxy import proxy_rollout_server as server_module
 from areal.experimental.openai.proxy import workflow as workflow_module
 from areal.experimental.openai.proxy.client_session import OpenAIProxyClient
@@ -17,6 +19,7 @@ from areal.experimental.openai.proxy.server import (
     ExportTrajectoriesRequest,
     SessionData,
     deserialize_interactions,
+    serialize_interactions,
 )
 from areal.experimental.openai.proxy.workflow import OpenAIProxyWorkflow
 from areal.experimental.openai.types import (
@@ -185,24 +188,288 @@ async def test_arena_compacted_episode_scores_all_actions_once(
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_response", [None, "earlier", "terminal"])
+@pytest.mark.parametrize("materialize_first", [False, True])
+@pytest.mark.parametrize("use_std", [False, True])
+async def test_scored_concat_segments_export_policy_adjusted_episode_reference(
+    monkeypatch, invalid_response, materialize_first, use_std
+):
+    """RPC export preserves row returns and one validated episode reference."""
+    cache = _compacted_session((2, 1, 2))
+    cache.set_reward("2", 0.2)
+    cache.set_reward("3", 0.6)
+    cache.set_last_reward(0.8)
+    if invalid_response is not None:
+        invalid_id = "2" if invalid_response == "earlier" else "5"
+        cache[invalid_id].metadata["response_parse"] = {
+            "tool_call_parse_failed": False,
+            "has_content": False,
+            "has_tool_calls": False,
+        }
+    leaves = cache.export_interactions(style="concat")
+    if materialize_first:
+        for leaf in leaves.values():
+            leaf.to_tensor_dict()
+    session = SessionData(session_id="scored-episode")
+    session._completions = cache
+    session.finish()
+    monkeypatch.setattr(server_module, "_session_cache", {session.session_id: session})
+    monkeypatch.setattr(server_module, "_prm_runner", None)
+
+    response = await server_module.export_trajectories(
+        ExportTrajectoriesRequest(
+            session_id=session.session_id, style="concat", episode_reward=0.8
+        )
+    )
+    restored = deserialize_interactions(response.interactions)
+
+    row_returns = [
+        0.0 if invalid_response == "earlier" else 0.2,
+        0.6,
+        0.0 if invalid_response == "terminal" else 0.8,
+    ]
+    reference = 0.0 if invalid_response == "terminal" else 0.8
+    assert [leaf.reward for leaf in restored.values()] == row_returns
+    assert [leaf.rollout_reward for leaf in restored.values()] == [reference] * 3
+    peer = {"peer": InteractionWithTokenLogpReward(reward=0.4)}
+    assert normalize_logical_rollout_rewards([restored, peer], use_std=use_std)
+    mean = (reference + 0.4) / 2
+    scale = abs(reference - 0.4) / 2 + 1e-8 if use_std else 1.0
+    tensors = concat_tensor_interactions(restored)
+    torch.testing.assert_close(
+        tensors["rewards"],
+        (torch.tensor(row_returns) - mean) / scale,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        tensors["original_rewards"], torch.tensor(row_returns), rtol=0, atol=0
+    )
+    assert tensors["rollout_group"].rewards == pytest.approx(
+        ((reference - mean) / scale,)
+    )
+    assert peer["peer"].reward == pytest.approx((0.4 - mean) / scale)
+    assert tensors["loss_mask"].sum().item() == 5
+    stats_tracker.export_all(reset=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("materialize_first", [False, True])
+@pytest.mark.parametrize("use_std", [False, True])
+async def test_scored_retry_branches_share_episode_reference_across_rpc(
+    monkeypatch, materialize_first, use_std
+):
+    """A failed retry and its successful sibling keep distinct training returns."""
+    cache = _compacted_session((2,))
+    retry = deepcopy(cache["2"])
+    retry.interaction_id = "3"
+    retry.output_message_list = [{"role": "assistant", "content": "success"}]
+    retry.model_response.output_tokens = [13]
+    cache["3"] = retry
+    cache.set_reward("2", 0.0)
+    cache.set_last_reward(0.8)
+    cache["2"].metadata["response_parse"] = {
+        "tool_call_parse_failed": True,
+        "has_content": False,
+        "has_tool_calls": False,
+    }
+    leaves = cache.export_interactions(style="concat")
+    assert list(leaves) == ["2", "3"]
+    assert leaves["2"].parent is leaves["3"].parent is cache["1"]
+    if materialize_first:
+        for leaf in leaves.values():
+            leaf.to_tensor_dict()
+    session = SessionData(session_id="retry-episode")
+    session._completions = cache
+    session.finish()
+    monkeypatch.setattr(server_module, "_session_cache", {session.session_id: session})
+    monkeypatch.setattr(server_module, "_prm_runner", None)
+
+    response = await server_module.export_trajectories(
+        ExportTrajectoriesRequest(
+            session_id=session.session_id, style="concat", episode_reward=0.8
+        )
+    )
+    restored = deserialize_interactions(response.interactions)
+
+    assert [leaf.reward for leaf in restored.values()] == [0.0, 0.8]
+    references = [leaf.rollout_reward for leaf in restored.values()]
+    peer = {"peer": InteractionWithTokenLogpReward(reward=0.4)}
+    assert normalize_logical_rollout_rewards([restored, peer], use_std=use_std)
+    assert references == [0.8, 0.8]
+    tensors = concat_tensor_interactions(restored)
+    scale = 0.2 + 1e-8 if use_std else 1.0
+    torch.testing.assert_close(
+        tensors["rewards"],
+        torch.tensor([-0.6, 0.2]) / scale,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        tensors["original_rewards"], torch.tensor([0.0, 0.8]), rtol=0, atol=0
+    )
+    assert tensors["rollout_group"].rewards == pytest.approx((0.2 / scale,))
+    stats_tracker.export_all(reset=True)
+
+
+def test_episode_reference_preserves_differing_cached_rows_across_rpc():
+    """A scalar leaf may already contain several physical rows with own returns."""
+    cache = _compacted_session((1,))
+    cache.set_last_reward(0.8)
+    leaf = cache["1"]
+    tensors = leaf.to_tensor_dict()
+    leaf._cache = {
+        key: value.repeat((2,) + (1,) * (value.ndim - 1))
+        for key, value in tensors.items()
+    }
+    leaf._cache["rewards"] = torch.tensor([0.2, 0.8])
+    leaf._cache["original_rewards"] = torch.tensor([0.2, 0.8])
+
+    exported = finalize_interactions(cache, style="concat", episode_reward=0.8)
+    restored = deserialize_interactions(serialize_interactions(exported))
+
+    assert restored["1"].rollout_reward == 0.8
+    peer = {"peer": InteractionWithTokenLogpReward(reward=0.4)}
+    assert normalize_logical_rollout_rewards([restored, peer], use_std=False)
+    tensors = concat_tensor_interactions(restored)
+    assert tensors["rollout_group"].row_counts == (2,)
+    torch.testing.assert_close(
+        tensors["rewards"], torch.tensor([-0.4, 0.2]), rtol=1e-6, atol=1e-6
+    )
+    torch.testing.assert_close(
+        tensors["original_rewards"], torch.tensor([0.2, 0.8]), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("references", [(2.0, None, None), (2.0, 3.0, None)])
+def test_episode_export_preserves_existing_references_and_conflicts(references):
+    """An episode hook cannot silently replace a producer's explicit reference."""
+    cache = _compacted_session((2, 1, 2))
+    cache.set_reward("2", 0.2)
+    cache.set_reward("3", 0.6)
+    cache.set_last_reward(0.8)
+    for leaf, reference in zip(
+        cache.export_interactions(style="concat").values(), references
+    ):
+        leaf.rollout_reward = reference
+
+    exported = finalize_interactions(cache, style="concat", episode_reward=0.8)
+
+    assert [leaf.reward for leaf in exported.values()] == [0.2, 0.6, 0.8]
+    assert tuple(leaf.rollout_reward for leaf in exported.values()) == references
+    if references[1] is not None:
+        with pytest.raises(ValueError, match="must share rollout_reward"):
+            normalize_logical_rollout_rewards([exported])
+    else:
+        assert concat_tensor_interactions(exported)["rollout_group"].rewards == (2.0,)
+
+
+@pytest.mark.parametrize("invalid_terminal", [False, True])
+def test_equally_scored_segments_keep_episode_response_validation(invalid_terminal):
+    """Already scored segments still share the true terminal response gate."""
+    cache = _compacted_session((1, 1))
+    cache.set_reward("1", 0.8)
+    cache.set_last_reward(0.8)
+    # A summary segment may end without user-facing content; the episode's
+    # actual terminal response alone determines the shared validation result.
+    for interaction_id in ["1", "2"] if invalid_terminal else ["1"]:
+        cache[interaction_id].metadata["response_parse"] = {
+            "tool_call_parse_failed": False,
+            "has_content": False,
+            "has_tool_calls": False,
+        }
+    cache.move_to_end("1")  # Export order must not determine the terminal ID.
+
+    exported = finalize_interactions(cache, style="concat", episode_reward=0.8)
+
+    expected = 0.0 if invalid_terminal else 0.8
+    assert [leaf.reward for leaf in exported.values()] == [expected, expected]
+    assert [leaf.rollout_reward for leaf in exported.values()] == [expected, expected]
+
+
+@pytest.mark.parametrize("token_rewards", [False, True])
+def test_episode_reference_does_not_score_unscored_shared_branch(token_rewards):
+    """A normalization reference does not admit an ambiguously unscored row."""
+    cache = _compacted_session((2, 1))
+    cache["3"].parent = cache["1"]
+    if token_rewards:
+        cache["1"].token_rewards = torch.tensor([0.25])
+    cache.set_last_reward(0.8)
+
+    exported = finalize_interactions(cache, style="concat", episode_reward=0.8)
+
+    assert [leaf.reward for leaf in exported.values()] == [None, 0.8]
+    assert [leaf.rollout_reward for leaf in exported.values()] == [0.8, 0.8]
+    assert exported["2"].parent is exported["3"].parent is cache["1"]
+    if token_rewards:
+        torch.testing.assert_close(
+            cache["1"].token_rewards, torch.tensor([0.25]), rtol=0, atol=0
+        )
+    assert not normalize_logical_rollout_rewards([exported])
+
+
+def test_episode_reference_requires_identifiable_terminal_response():
+    """Several scored leaves do not identify which response ended the episode."""
+    cache = _compacted_session((1, 1))
+    cache.set_reward("1", 0.2)
+    cache.set_reward("2", 0.8)
+
+    with pytest.raises(ValueError, match="requires a final response ID"):
+        finalize_interactions(cache, style="concat", episode_reward=0.8)
+
+    assert [leaf.reward for leaf in cache.values()] == [0.2, 0.8]
+    assert all(leaf.rollout_reward is None for leaf in cache.values())
+
+
+@pytest.mark.parametrize("reference", [None, 0.8])
+def test_discounted_episode_export_does_not_reapply_policy_or_infer_reference(
+    reference,
+):
+    """Late export preserves discounted returns or rejects a missing reference."""
+    cache = _compacted_session((1, 1))
+    cache.set_last_reward(0.8)
+    cache["2"].rollout_reward = reference
+    cache["2"].metadata["response_parse"] = {
+        "tool_call_parse_failed": True,
+        "has_content": False,
+        "has_tool_calls": False,
+    }
+    cache.apply_reward_discount(turn_discount=0.5)
+    before = [(leaf.reward, leaf.rollout_reward) for leaf in cache.values()]
+
+    if reference is None:
+        with pytest.raises(ValueError, match="before reward discounting"):
+            finalize_interactions(cache, style="concat", episode_reward=0.8)
+    else:
+        exported = finalize_interactions(cache, style="concat", episode_reward=0.8)
+        assert exported == dict(cache)
+
+    assert [(leaf.reward, leaf.rollout_reward) for leaf in cache.values()] == before
+
+
 @pytest.mark.parametrize(
-    "ambiguity",
+    ("ambiguity", "reason"),
     [
-        "shared_ancestor",
-        "scalar_conflict",
-        "reference_conflict",
-        "original_reward_conflict",
-        "token_rewards",
-        "ancestor_reward",
-        "matching_ancestor_reward",
-        "incomplete",
-        "missing_id",
-        "duplicate_id",
-        "non_concat",
-        "cycle",
+        ("shared_ancestor", "shared_ancestor"),
+        ("scalar_conflict", "reward_conflict"),
+        ("reference_conflict", "rollout_reward_conflict"),
+        ("original_reward_conflict", "original_reward_conflict"),
+        ("token_rewards", "token_rewards"),
+        ("ancestor_reward", "ancestor_reward"),
+        ("matching_ancestor_reward", "ancestor_reward"),
+        ("incomplete", "incomplete"),
+        ("missing_id", "missing_id"),
+        ("duplicate_id", "duplicate_id"),
+        ("non_concat", "non_concat"),
+        ("cycle", "cycle"),
     ],
 )
-def test_arena_episode_reward_leaves_ambiguous_exports_unchanged(ambiguity):
+def test_arena_episode_reward_leaves_ambiguous_exports_unchanged(
+    monkeypatch, ambiguity, reason
+):
+    warning = Mock()
+    monkeypatch.setattr("areal.experimental.openai.cache.logger.warning", warning)
     cache = _compacted_session()
     cache.set_last_reward(0.5)
     leaves = cache.export_interactions(style="concat")
@@ -237,6 +504,32 @@ def test_arena_episode_reward_leaves_ambiguous_exports_unchanged(ambiguity):
         (x.reward, x.rollout_reward, x.original_reward) for x in cache.values()
     ] == before
     assert leaves["71"].reward is None
+    warning.assert_called_once()
+    assert warning.call_args.args[2] == reason
+    assert warning.call_args.args[-1] == len(leaves)
+
+
+def test_arena_episode_reward_rejection_log_bounds_ids_without_message_content(
+    monkeypatch,
+):
+    warning = Mock()
+    monkeypatch.setattr("areal.experimental.openai.cache.logger.warning", warning)
+    cache = _compacted_session(chain_lengths=(1, 1))
+    leaf = cache["1"]
+    leaf.interaction_id = "x" * 1000
+    leaf.messages = [{"role": "user", "content": "private-image-payload"}]
+    leaf.token_rewards = torch.tensor([0.25])
+
+    InteractionCache.from_dict({"leaf": leaf}).assign_episode_reward(0.5)
+
+    warning.assert_called_once()
+    fmt, *args = warning.call_args.args
+    message = fmt % tuple(args)
+    assert "reason=token_rewards" in message
+    assert "x" * 80 in message
+    assert "x" * 81 not in message
+    assert "private-image-payload" not in message
+    assert leaf.reward is None
 
 
 @pytest.mark.parametrize("status", ["HARNESS_FAILED", "EVAL_FAILED", "RUNNING"])

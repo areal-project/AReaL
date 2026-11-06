@@ -46,7 +46,7 @@ def _meta(tp=8, pp=1, dp=2):
     [
         (None, False, "areal.v2.inference_service.sglang.launch_server"),
         ("theta", False, "sglang.launch_server"),
-        ("theta", True, "areal.engine.awex.sglang_plugin"),
+        ("theta", True, "areal.engine.awex.plugins.sglang_plugin"),
     ],
 )
 def test_launch_selects_native_theta_only_without_awex(
@@ -96,7 +96,7 @@ def test_awex_environment_keeps_plugin_entrypoint(monkeypatch, launched_servers)
     assert launched_servers[0][0][2:6] == [
         "areal.engine.sglang_model_patches",
         "--entrypoint",
-        "areal.engine.awex.sglang_plugin",
+        "areal.engine.awex.plugins.sglang_plugin",
         "--",
     ]
 

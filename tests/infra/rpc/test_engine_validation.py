@@ -67,6 +67,7 @@ def test_set_env_invalid_json(client):
         ("echo", frozenset({"echo"}), True, False),
         ("wait_for_task", frozenset(), False, True),
         ("_wait_for_task_result", frozenset(), False, True),
+        ("get_rollout_result", frozenset(), False, True),
     ],
 )
 def test_call_engine_scopes_alias_preservation_to_supported_v1_boundaries(
@@ -90,6 +91,9 @@ def test_call_engine_scopes_alias_preservation_to_supported_v1_boundaries(
             return value
 
         def _wait_for_task_result(self, value):
+            return value
+
+        def get_rollout_result(self, value):
             return value
 
     localize_calls = []
@@ -130,24 +134,35 @@ def test_call_engine_scopes_alias_preservation_to_supported_v1_boundaries(
 
 
 @pytest.mark.parametrize("outcome", ["success", "rejected", "contract_failure"])
+@pytest.mark.parametrize("method", ["_wait_for_task_result", "get_rollout_result"])
 def test_raw_rollout_result_preserves_remote_tensor_transport(
-    client, monkeypatch, outcome
+    client, monkeypatch, outcome, method
 ):
+    """Trajectory and metrics envelopes preserve shared multimodal tensor shards."""
     image = torch.ones(1, 4)
     trajectory = {
         "input_ids": torch.ones(2, 4, dtype=torch.long),
         "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 0, 0]]),
         "multi_modal_input": [{"pixel_values": image}, {"pixel_values": image}],
     }
+    metrics = {"rollout/reward": [float(outcome == "success")]}
     result = {
-        "success": _RolloutResult(task_id=7, trajectory=trajectory),
-        "rejected": None,
+        "success": _RolloutResult(task_id=7, trajectory=trajectory, metrics=metrics),
+        "rejected": (
+            _RolloutResult(task_id=7, trajectory=None, metrics=metrics)
+            if method == "get_rollout_result"
+            else None
+        ),
         "contract_failure": WorkflowContractFailure("invalid group"),
     }[outcome]
 
     class Engine:
         _wait_for_task_result = RemoteInfEngine._wait_for_task_result
-        workflow_executor = SimpleNamespace(_wait_for_task_result=lambda *args: result)
+        get_rollout_result = RemoteInfEngine.get_rollout_result
+        workflow_executor = SimpleNamespace(
+            _wait_for_task_result=lambda *args: result,
+            dispatcher=SimpleNamespace(wait_for_task=lambda *args, **kwargs: result),
+        )
 
     stored = []
 
@@ -162,12 +177,15 @@ def test_raw_rollout_result_preserves_remote_tensor_transport(
     )
     response = client.post(
         "/call",
-        json={"method": "_wait_for_task_result", "engine_name": "test", "args": [7]},
+        json={"method": method, "engine_name": "test", "args": [7]},
     )
     assert response.status_code == 200, response.get_json()
     payload = deserialize_value(response.get_json()["result"])
+    if method == "get_rollout_result" and outcome != "contract_failure":
+        assert payload["metrics"] == metrics
+        payload = payload["trajectory"]
     if outcome != "success":
-        assert payload == result
+        assert payload == (None if outcome == "rejected" else result)
         assert stored == []
         return
     assert isinstance(payload["input_ids"], RTensor)

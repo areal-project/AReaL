@@ -15,6 +15,7 @@ from areal.utils.dynamic_import import import_from_string
 
 __all__ = [
     "GAELambdaContext",
+    "GAELambdaInputs",
     "GAELambdaFn",
     "constant_gae_lambda",
     "relative_position_gae_lambda",
@@ -31,6 +32,8 @@ class GAELambdaContext(TypedDict):
     timestep_lengths: torch.Tensor
 
 
+# Alias for advantage plugins; retain the original public context name.
+GAELambdaInputs = GAELambdaContext
 GAELambdaFn = Callable[..., torch.Tensor]
 
 

@@ -24,6 +24,18 @@ rollout:
   max_head_offpolicyness: 4  # 允许落后最多4个版本步骤
 ```
 
+`mask_stale_tokens` 默认为 `false`，保留现有训练 loss 行为。
+如需在训练时按 token 的策略版本差过滤 actor loss，须显式开启：
+
+```yaml
+rollout:
+  max_head_offpolicyness: 4
+  mask_stale_tokens: true
+```
+
+版本差超过阈值的 token 不计入 actor loss（包括 MTP）。推理正常继续，
+上下文、reward、PRM 分数、advantage 计算以及原有 loss 归一化分母均保留。
+
 **配置建议：**
 
 - 设置为 `0` 用于同步RL（适用于调试或基线比较）

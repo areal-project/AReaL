@@ -1,5 +1,9 @@
+import ast
+import operator
 import random
 import re
+from collections import Counter
+from fractions import Fraction
 
 
 def extract_solution(solution_str):
@@ -22,34 +26,77 @@ def extract_solution(solution_str):
     return final_answer
 
 
-def validate_equation(equation_str, available_numbers):
-    """Validate that equation only uses available numbers and each number once."""
+# Bound parsing and exact arithmetic even when these helpers are called directly.
+_MAX_EQUATION_LENGTH = 4096
+_MAX_AST_NODES = 256
+_BINARY_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _parse_equation(equation_str: str) -> ast.Expression:
+    """Accept integer operands, arithmetic operators and parentheses only."""
+    if len(equation_str) > _MAX_EQUATION_LENGTH or not re.fullmatch(
+        r"[0-9+\-*/()\s]+", equation_str
+    ):
+        raise ValueError("Invalid characters or oversized equation.")
+    tree = ast.parse(equation_str.strip(), mode="eval")
+    nodes = list(ast.walk(tree))
+    if len(nodes) > _MAX_AST_NODES:
+        raise ValueError("Equation is too complex.")
+    for node in nodes:
+        if isinstance(node, ast.Constant):
+            if type(node.value) is not int:
+                raise ValueError("Only integer operands are allowed.")
+        elif type(node) not in (
+            ast.Expression,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.UAdd,
+            ast.USub,
+            *_BINARY_OPERATORS,
+        ):
+            raise ValueError("Only +, -, * and / are allowed.")
+    return tree
+
+
+def validate_equation(equation_str: str, available_numbers: list[int]) -> bool:
+    """Require valid arithmetic using each supplied integer exactly once."""
     try:
-        # Extract all numbers from the equation
-        numbers_in_eq = [int(n) for n in re.findall(r"\d+", equation_str)]
-
-        # Check if all numbers in equation are available
-        available_numbers = sorted(available_numbers)
-        numbers_in_eq = sorted(numbers_in_eq)
-
-        # Each number should be used exactly once
-        return numbers_in_eq == available_numbers
-    except Exception:
+        tree = _parse_equation(equation_str)
+        numbers = [
+            node.value for node in ast.walk(tree) if isinstance(node, ast.Constant)
+        ]
+        return Counter(numbers) == Counter(available_numbers)
+    except (SyntaxError, ValueError, TypeError, RecursionError):
         return False
 
 
-def evaluate_equation(equation_str):
-    """Safely evaluate the arithmetic equation using eval() with precautions."""
-    try:
-        # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
-        allowed_pattern = r"^[\d+\-*/().\s]+$"
-        if not re.match(allowed_pattern, equation_str):
-            raise ValueError("Invalid characters in equation.")
+def _evaluate_node(node: ast.AST) -> Fraction:
+    if isinstance(node, ast.Constant):
+        return Fraction(node.value)
+    if isinstance(node, ast.UnaryOp):
+        value = _evaluate_node(node.operand)
+        return -value if isinstance(node.op, ast.USub) else value
+    if isinstance(node, ast.BinOp):
+        return _BINARY_OPERATORS[type(node.op)](
+            _evaluate_node(node.left), _evaluate_node(node.right)
+        )
+    raise ValueError("Unsupported arithmetic expression.")
 
-        # Evaluate the equation with restricted globals and locals
-        result = eval(equation_str, {"__builtins__": None}, {})
-        return result
-    except Exception:
+
+def evaluate_equation(equation_str: str) -> Fraction | None:
+    """Evaluate restricted arithmetic without executing Python code.
+
+    Division may produce fractional intermediate values, but decimal literals,
+    exponentiation and floor division are not part of the Countdown rules.
+    """
+    try:
+        return _evaluate_node(_parse_equation(equation_str).body)
+    except (SyntaxError, ValueError, TypeError, ArithmeticError, RecursionError):
         return None
 
 

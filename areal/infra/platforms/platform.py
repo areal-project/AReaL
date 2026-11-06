@@ -105,6 +105,18 @@ class Platform:
         raise NotImplementedError()
 
     @classmethod
+    def device_of(cls, local_rank: int) -> torch.device:
+        """Return the torch device for ``local_rank`` on this platform.
+
+        The device type is always spelled out. ``torch.device(0)`` resolves to
+        ``cuda:0`` regardless of the active platform, which silently misroutes
+        tensors on XPU/NPU, so callers must not pass a bare index.
+        """
+        if cls.device_type == "cpu":
+            return torch.device("cpu")
+        return torch.device(f"{cls.device_type}:{local_rank}")
+
+    @classmethod
     def set_numa_affinity(cls, local_rank: int) -> None:
         """Bind the current process to CPU cores near the assigned device."""
         return

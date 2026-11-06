@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from areal.engine.awex import colocate_writer
-from areal.engine.awex.colocate_writer import AwexWeightPublisher
+from areal.engine.awex.adapters import megatron_adapter
+from areal.engine.awex.adapters.megatron_adapter import AwexMegatronAdapter
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for AWEX IPC exports"
@@ -20,20 +20,21 @@ pytestmark = pytest.mark.skipif(
 )
 def test_colocate_export_lifetime_follows_reader_ack(monkeypatch, completion):
     """Free packed GPU storage before write_finished only after a successful ACK."""
-    from awex.util import tensor_util
-
     model = torch.nn.Linear(8, 8, bias=False, device="cuda")
     engine = SimpleNamespace(model=[model], cpu_group=object())
     residency = SimpleNamespace(release_memory=lambda tags: None)
-    publisher = AwexWeightPublisher(engine, residency=residency)
-    publisher._ip_address = "127.0.0.1"
-    publisher._physical_gpu_id = 0
-    publisher._logical_train_rank = 0
-    publisher._num_infer_engines = 1
-    publisher._timeout_s = 1
+    publisher = AwexMegatronAdapter(engine, residency=residency)
+    publisher._legacy_ip_address = "127.0.0.1"
+    publisher._legacy_physical_gpu_id = 0
+    publisher._legacy_logical_train_rank = 0
+    publisher._legacy_num_infer_engines = 1
+    publisher._legacy_timeout_s = 1
+    publisher._rank_info = SimpleNamespace()
     publisher._prepare_residency_for_publish = lambda: None
-    publisher._lazy_initialize = lambda: None
-    publisher._convert_parameters = lambda: {"weight": model.weight.detach().clone()}
+    publisher._lazy_initialize_legacy_colocate = lambda: None
+    publisher.get_local_shard_parameters = lambda: {
+        "weight": model.weight.detach().clone()
+    }
     exports = []
     signals = []
 
@@ -67,15 +68,15 @@ def test_colocate_export_lifetime_follows_reader_ack(monkeypatch, completion):
             assert all(ref() is None for ref in exports)
             signals.append(key)
 
-    publisher._meta_server_client = MetaServer()
-    monkeypatch.setattr(tensor_util, "cuda_ipc_serialize", serialize)
-    monkeypatch.setattr(colocate_writer.dist, "get_rank", lambda group=None: 0)
-    monkeypatch.setattr(colocate_writer.dist, "barrier", lambda group: None)
+    publisher._legacy_meta_server_client = MetaServer()
+    monkeypatch.setattr(megatron_adapter, "cuda_ipc_serialize", serialize)
+    monkeypatch.setattr(megatron_adapter.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(megatron_adapter.dist, "barrier", lambda group: None)
 
     if completion is True:
         for version in range(3):
-            publisher.execute_colocate_weight_update(version)
-            publisher.finish_colocate_weight_update(training_world_size=1)
+            publisher.execute_legacy_colocate_weight_update(version)
+            publisher.finish_legacy_colocate_weight_update(training_world_size=1)
         assert signals.count("finished_weights_update_engines") == 3
     else:
         error_type = TimeoutError if isinstance(completion, Exception) else RuntimeError
@@ -83,7 +84,7 @@ def test_colocate_export_lifetime_follows_reader_ack(monkeypatch, completion):
             "reader timeout" if isinstance(completion, Exception) else "reader failed"
         )
         with pytest.raises(error_type, match=error_text):
-            publisher.execute_colocate_weight_update(0)
+            publisher.execute_legacy_colocate_weight_update(0)
         assert publisher._pending_ipc_export is not None
         assert all(ref() is not None for ref in exports)
         assert not any(key.startswith("write_finished") for key in signals)

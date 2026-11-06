@@ -7,22 +7,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from areal.engine.awex.colocate_writer import (
-    AwexMegatronAdapter as V1AwexMegatronAdapter,
-)
+from areal.engine.awex.adapters.megatron_adapter import AwexMegatronAdapter
 from areal.engine.megatron_utils.gpu_staged_optimizer import (
     GPUStagedAdamW,
     GPUStagedAdamWConfig,
 )
 from areal.engine.megatron_utils.weight_residency import MegatronWeightResidency
-from areal.v2.weight_update.awex.megatron_adapter import (
-    AwexMegatronAdapter as V2AwexMegatronAdapter,
-)
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 AWEX_ADAPTERS = [
-    V1AwexMegatronAdapter,
-    V2AwexMegatronAdapter,
+    AwexMegatronAdapter,
     MegatronWeightResidency,
 ]
 

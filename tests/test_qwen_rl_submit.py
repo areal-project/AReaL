@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise the submission boundary without installing packages or submitting jobs."""
 
+import importlib.util
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -9,6 +11,36 @@ import pytest
 import yaml
 
 RECIPE = Path(__file__).parents[1] / "examples/swe/qwen38_flash_next"
+
+
+@pytest.mark.parametrize(
+    "relative_config",
+    [
+        "examples/swe/qwen38_flash_next/swe_mm_rl.yaml",
+        "examples/swe/rl/qwen38_27b/train.yaml",
+        "examples/swe/rl/qwen38_27b/train_fine_released64_bs16.yaml",
+    ],
+)
+def test_recipe_python_startup_targets_are_packaged(relative_config):
+    config_path = Path(__file__).parents[1] / relative_config
+    config = yaml.safe_load(config_path.read_text())
+    for role in ("actor", "rollout"):
+        for spec in config[role]["scheduling_spec"]:
+            for command in [*spec["additional_bash_cmds"], spec["cmd"]]:
+                args = shlex.split(command)
+                if not args or args[0] != "python3":
+                    continue
+                if args[1] == "-m":
+                    local_module = config_path.parent / Path(
+                        *args[2].split(".")
+                    ).with_suffix(".py")
+                    assert (
+                        local_module.is_file()
+                        or importlib.util.find_spec(args[2]) is not None
+                    ), command
+                elif args[1].startswith("$QWEN_RECIPE_DIR/"):
+                    target = config_path.parent / args[1].split("/", 1)[1]
+                    assert target.is_file(), command
 
 
 def _environment(tmp_path):

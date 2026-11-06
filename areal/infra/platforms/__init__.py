@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import torch
-from transformers.utils.import_utils import is_torch_npu_available
+from transformers.utils.import_utils import (
+    is_torch_npu_available,
+    is_torch_xpu_available,
+)
 
 import areal.utils.logging as logging
 
@@ -13,11 +16,13 @@ from .npu import NPUPlatform
 from .platform import Platform
 from .rocm import ROCmPlatform
 from .unknown import UnknownPlatform
+from .xpu import XpuPlatform
 
 logger = logging.getLogger("PlatformInit")
 
 
 is_npu_available = is_torch_npu_available()
+is_xpu_available = is_torch_xpu_available()
 
 
 def _init_platform() -> Platform:
@@ -26,8 +31,9 @@ def _init_platform() -> Platform:
     Priority:
     1. CUDA (NVIDIA)
     2. ROCm (AMD)
-    3. TODO: NPU (if torch_npu is installed)
-    4. CPU (fallback)
+    3. NPU (if torch_npu is installed)
+    4. XPU (Intel)
+    5. CPU (fallback)
     Returns:
         An instance of a subclass of Platform corresponding to the detected hardware.
     """
@@ -46,6 +52,9 @@ def _init_platform() -> Platform:
     elif is_npu_available:
         logger.info("Initializing NPU platform (NPU).")
         return NPUPlatform()
+    elif is_xpu_available:
+        logger.info("Initializing XPU platform (Intel).")
+        return XpuPlatform()
     else:
         logger.info("No supported accelerator detected. Initializing CPU platform.")
         return CpuPlatform()
@@ -101,4 +110,4 @@ current_platform: Platform | _LazyPlatform = (
 )  # NOTE: This is a proxy, not a subclass of Platform.
 
 
-__all__ = ["Platform", "current_platform", "is_npu_available"]
+__all__ = ["Platform", "current_platform", "is_npu_available", "is_xpu_available"]

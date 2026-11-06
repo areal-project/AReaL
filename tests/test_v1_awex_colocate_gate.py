@@ -3,21 +3,24 @@
 
 import ast
 import pathlib
+from unittest.mock import Mock
 
 import pytest
+from transformers import PretrainedConfig
 
 import areal.trainer.rl_trainer as rl_trainer_module
 from areal.api.cli_args import SchedulingStrategy
 from areal.trainer.rl_trainer import PPOTrainer
 
 
-def _config(version: str, mode: str, colocated: bool):
+def _config(version: str, mode: str, colocated: bool, use_lora: bool = False):
     actor = type(
         "Actor",
         (),
         {
             "_version": version,
             "weight_update_mode": mode,
+            "use_lora": use_lora,
             "scheduling_strategy": SchedulingStrategy(
                 type="colocation" if colocated else "separation",
                 target="rollout" if colocated else "",
@@ -65,6 +68,103 @@ class TestV1AwexColocateGate:
             )
             is True
         )
+
+
+class TestQwen2WeightUpdateGuard:
+    @pytest.mark.parametrize(
+        "model_config",
+        [
+            {"model_type": "qwen2"},
+            {"architectures": ["Qwen2ForCausalLM"]},
+        ],
+    )
+    @pytest.mark.parametrize(
+        "version,mode",
+        [
+            ("v1", "awex"),
+            ("v2", "awex"),
+            ("v2", "xccl"),
+            ("v2", "disk"),
+        ],
+    )
+    def test_qwen2_rejects_unsupported_weight_update(
+        self, monkeypatch, model_config, version, mode
+    ):
+        trainer = object.__new__(PPOTrainer)
+        trainer.config = _config(version, mode, colocated=False)
+        trainer.actor_alloc = Mock(backend="megatron")
+        trainer.config.actor.path = "renamed-checkpoint"
+        load_config = Mock(return_value=(model_config, {}))
+        monkeypatch.setattr(PretrainedConfig, "get_config_dict", load_config)
+
+        with pytest.raises(
+            ValueError, match="Qwen2/Qwen2.5 text models do not support Megatron AWEX"
+        ):
+            trainer._validate_weight_update_model()
+
+        load_config.assert_called_once_with("renamed-checkpoint")
+
+    @pytest.mark.parametrize(
+        "version,mode,use_lora",
+        [
+            ("v1", "xccl", False),
+            ("v1", "disk", False),
+            ("v2", "xccl", True),
+            ("v2", "awex", True),
+            ("v2", "disk", True),
+        ],
+    )
+    def test_supported_modes_do_not_load_model_config(
+        self, monkeypatch, version, mode, use_lora
+    ):
+        trainer = object.__new__(PPOTrainer)
+        trainer.config = _config(version, mode, colocated=False, use_lora=use_lora)
+        trainer.actor_alloc = Mock(backend="megatron")
+        load_config = Mock(side_effect=AssertionError("must not load model config"))
+        monkeypatch.setattr(PretrainedConfig, "get_config_dict", load_config)
+
+        trainer._validate_weight_update_model()
+
+        load_config.assert_not_called()
+
+    def test_v2_fsdp_qwen2_does_not_require_megatron_converter(self, monkeypatch):
+        trainer = object.__new__(PPOTrainer)
+        trainer.config = _config("v2", "xccl", colocated=False)
+        trainer.actor_alloc = Mock(backend="fsdp")
+        load_config = Mock(side_effect=AssertionError("must not load model config"))
+        monkeypatch.setattr(PretrainedConfig, "get_config_dict", load_config)
+
+        trainer._validate_weight_update_model()
+
+        load_config.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "model_type,architecture",
+        [
+            ("qwen3", "Qwen3ForCausalLM"),
+            ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),
+        ],
+    )
+    def test_other_architectures_are_not_rejected(
+        self, monkeypatch, model_type, architecture
+    ):
+        trainer = object.__new__(PPOTrainer)
+        trainer.config = _config("v2", "awex", colocated=False)
+        trainer.actor_alloc = Mock(backend="megatron")
+        trainer.config.actor.path = "checkpoint"
+        monkeypatch.setattr(
+            PretrainedConfig,
+            "get_config_dict",
+            Mock(
+                return_value=(
+                    {"model_type": model_type, "architectures": [architecture]},
+                    {},
+                )
+            ),
+        )
+
+        trainer._validate_weight_update_model()
 
 
 class TestNoUngatedAwexChecks:

@@ -10,8 +10,8 @@ from areal.trainer.ppo.actor import (
     PPOActor,
     _shape_advantages_with_gvpo,
     _shape_advantages_with_process_weighting,
-    resolve_gae_lambda_fn,
 )
+from areal.trainer.ppo.lambda_fn import resolve_gae_lambda_fn
 from areal.utils.data import KLEstimator
 
 
@@ -21,26 +21,28 @@ def _actor(
     gae_timestep_unit: str = "token",
     mask_no_eos_with_zero: bool = False,
 ) -> PPOActor:
-    actor = PPOActor.__new__(PPOActor)
-    actor.config = PPOActorConfig(
+    config = PPOActorConfig(
         token_rewards_as_adv=direct,
         gae_timestep_unit=gae_timestep_unit,
         kl_ctl=0.0,
     )
-    actor.reward_bias = 0.0
-    actor.reward_scaling = 1.0
-    actor.reward_clip = 20.0
-    actor.reward_norm = None
-    actor.adv_norm = None
-    actor.kl_ctl = 0.0
-    actor.kl_estimator = KLEstimator("k1")
-    actor.discount = 1.0
-    actor.gae_lambda = 1.0
-    actor.gae_lambda_fn, actor._gae_lambda_is_custom = resolve_gae_lambda_fn(1.0)
-    actor.gae_lambda_kwargs = {}
-    actor.gae_timestep_unit = gae_timestep_unit
-    actor.mask_no_eos_with_zero = mask_no_eos_with_zero
-    actor.token_rewards_as_adv = direct
+    actor = PPOActor(config, engine=None)
+    actor.advantage_fn.reward_bias = 0.0
+    actor.advantage_fn.reward_scaling = 1.0
+    actor.advantage_fn.reward_clip = 20.0
+    actor.advantage_fn.reward_norm = None
+    actor.advantage_fn.adv_norm = None
+    actor.advantage_fn.kl_ctl = 0.0
+    actor.advantage_fn.kl_estimator = KLEstimator("k1")
+    actor.advantage_fn.discount = 1.0
+    actor.advantage_fn.gae_lambda = 1.0
+    actor.advantage_fn.gae_lambda_fn, actor.advantage_fn._gae_lambda_is_custom = (
+        resolve_gae_lambda_fn(1.0)
+    )
+    actor.advantage_fn.gae_lambda_kwargs = {}
+    actor.advantage_fn.gae_timestep_unit = gae_timestep_unit
+    actor.advantage_fn.mask_no_eos_with_zero = mask_no_eos_with_zero
+    actor.advantage_fn.token_rewards_as_adv = direct
     return actor
 
 
@@ -273,7 +275,7 @@ def test_process_weighting_shapes_normalized_advantage_without_changing_returns(
     batch = _batch()
     batch["token_rewards"] = torch.tensor([[0.0, 0.0, 0.25, 0.25, 0.0, 0.5, 0.5, 0.5]])
     actor = _actor(direct=True, gae_timestep_unit=gae_timestep_unit)
-    actor.adv_norm = _ShiftNegative()
+    actor.advantage_fn.adv_norm = _ShiftNegative()
 
     output = actor._compute_advantages(
         batch,
@@ -353,7 +355,7 @@ def test_gvpo_uses_normalized_advantage_for_piecewise_branch(gae_timestep_unit):
             return advantages - 1.0
 
     actor = _actor(direct=True, gae_timestep_unit=gae_timestep_unit)
-    actor.adv_norm = _CenterAtOne()
+    actor.advantage_fn.adv_norm = _CenterAtOne()
 
     output = actor._compute_advantages(
         _batch(), advantage_shaping_mode="gvpo", gvpo_zero_penalty=0.4
@@ -382,7 +384,7 @@ def test_gvpo_mask_no_eos_matches_no_process_reward_with_kl_and_values(
             gae_timestep_unit=gae_timestep_unit,
             mask_no_eos_with_zero=True,
         )
-        actor.kl_ctl = 0.2
+        actor.advantage_fn.kl_ctl = 0.2
         return actor
 
     with_process = _batch()
@@ -406,8 +408,8 @@ def test_gvpo_mask_no_eos_matches_no_process_reward_with_kl_and_values(
 def test_gvpo_does_not_change_returns_with_dynamic_gae_lambda(gae_timestep_unit):
     def _configured_actor():
         actor = _actor(direct=True, gae_timestep_unit=gae_timestep_unit)
-        actor._gae_lambda_is_custom = True
-        actor.gae_lambda_fn = lambda context, **kwargs: torch.full(
+        actor.advantage_fn._gae_lambda_is_custom = True
+        actor.advantage_fn.gae_lambda_fn = lambda context, **kwargs: torch.full(
             (context["timestep_lengths"].shape[0],),
             0.5,
             device=context["timestep_lengths"].device,

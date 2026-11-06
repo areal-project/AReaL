@@ -264,9 +264,15 @@ def apply_non_moe_tp(
         "layers.*.self_attn.q_proj": ColwiseParallel(),
         "layers.*.self_attn.k_proj": ColwiseParallel(),
         "layers.*.self_attn.v_proj": ColwiseParallel(),
-        # special q/k norm for qwen3
-        "layers.*.self_attn.q_norm": ReplicateParallel(),
-        "layers.*.self_attn.k_norm": ReplicateParallel(),
+        # Qwen3 normalizes [batch, sequence, local_heads, head_dim] before
+        # transposing attention axes. Describe the head shard so gradients of
+        # shared norm weights sum contributions from every TP rank.
+        "layers.*.self_attn.q_norm": SequenceParallel(
+            sequence_dim=2, use_local_output=True
+        ),
+        "layers.*.self_attn.k_norm": SequenceParallel(
+            sequence_dim=2, use_local_output=True
+        ),
         # Reduce in RowwiseParallel, Scatter by Shard(1)
         "layers.*.self_attn.o_proj": RowwiseParallel(
             output_layouts=Shard(1),
@@ -305,11 +311,18 @@ def apply_non_moe_tp(
     # For root module
     root_tp_plan: dict[str, ParallelStyle] = {}
     if hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Module):
-        # Implicitly all-gather in ColwiseParallel
-        # Output is sharded on the last dimension (Shard(2))
-        root_tp_plan["lm_head"] = ColwiseParallel(
-            input_layouts=Shard(1),
+        # HF causal-LM wrappers slice hidden states before calling lm_head.
+        # Gather the sequence at the final norm boundary so that slicing sees
+        # an ordinary full-sequence tensor, including on DTensor versions that
+        # do not implement aten.alias. The projection now receives replicated
+        # inputs; it must not gather the sequence a second time.
+        model_tp_plan["norm"] = ReplicateParallel(
+            input_layout=Shard(1),
+            desired_input_layout=Shard(1),
+            output_layout=Replicate(),
+            use_local_output=True,
         )
+        root_tp_plan["lm_head"] = ColwiseParallel(input_layouts=Replicate())
     if hasattr(model, "score") and isinstance(model.score, nn.Module):
         # For PPO's critic model's score layer:
         # 1. The input is sharded by sequence parallelism (Shard(1))

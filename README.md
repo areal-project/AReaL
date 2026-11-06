@@ -93,8 +93,8 @@ and the [announcement on X](https://x.com/guohao_li/status/2009678513574408636).
 
 **\[2026/01/01\]** Happy New Year! Thanks to the outstanding contribution from
 @HwVanICI, we are excited to officially announce stable support for AReaL training on
-**Ascend NPU devices**! The code is actively maintained and continuously updated in the
-[`ascend` branch](https://github.com/areal-project/AReaL/tree/ascend). Check out
+**Huawei Ascend NPU devices**! The code is actively maintained and continuously updated
+in the [`ascend` branch](https://github.com/areal-project/AReaL/tree/ascend). Check out
 [our documentation](https://areal-project.github.io/AReaL/en/tutorial/installation_npu.html)
 to get started, and feel free to report any issues!
 
@@ -244,6 +244,12 @@ All RL algorithms support both asynchronous and synchronous versions by setting
 | **Qwen3-VL**               | ✅       | ✅           | ❌             | Vision-language model                                    |
 | **Gemma 3**                | ❌       | ✅           | ❌             | Vision-language model                                    |
 | **Other Hugging Face LLM** | ❌       | ✅           | ❌             | Compatibility depending on the version of `transformers` |
+
+Qwen2 and Qwen2.5 **text models** support RL weight updates with
+`actor.weight_update_mode=disk` in both v1 and v2. XCCL weight updates require
+`actor._version=v1`, `rollout._version=v1`, and `actor.weight_update_mode=xccl`. AWEX
+weight updates are not supported for these models. This restriction does not apply to
+Qwen2.5-VL.
 
 Check the [AI Coding Assistant Guide](docs/en/reference/ai_assisted_dev.md) and
 [Archon Reference](docs/en/tutorial/archon.md) for how to integrate new models into

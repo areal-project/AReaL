@@ -12,7 +12,7 @@ import re
 import struct
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -56,6 +56,7 @@ from areal.api.loss import (
     LossValue,
     is_named_loss_normalizer,
 )
+from areal.engine.awex.dte.delta_config import DTERuntimeConfig
 from areal.engine.core import (
     aggregate_eval_losses,
     compute_microbatch_loss_weight,
@@ -76,6 +77,10 @@ from areal.engine.core.model import (
     requires_padded_seq,
     resolve_sequence_packing_mode,
     validate_model_packed_seq_dependencies,
+)
+from areal.engine.megatron_utils.activation_storage import (
+    install_activation_storage_tracking,
+    track_activation_storage,
 )
 from areal.engine.megatron_utils.bailing_v3 import (
     BailingV3MlaWeightPairs,
@@ -209,7 +214,6 @@ from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.seeding import get_seed
 from areal.utils.training_metrics import export_training_metrics, record_training_batch
-from areal.v2.weight_update.awex.delta_config import DTERuntimeConfig
 
 if TYPE_CHECKING:
     from megatron.bridge.peft.lora import LoRA as MegatronBridgeLoRA
@@ -221,7 +225,7 @@ if TYPE_CHECKING:
         PPOActorConfig,
         PPOCriticConfig,
     )
-    from areal.engine.awex.colocate_writer import AwexWeightPublisher
+    from areal.engine.awex.adapters.megatron_adapter import AwexMegatronAdapter
     from areal.engine.megatron_utils.weight_residency import MegatronWeightResidency
 
 
@@ -440,7 +444,7 @@ class MegatronEngine(TrainEngine):
         self.is_offload: bool = False
         self._offload_depth: int = 0
         self._weight_residency: MegatronWeightResidency | None = None
-        self._awex_publisher: AwexWeightPublisher | None = None
+        self._awex_adapter: AwexMegatronAdapter | None = None
         self._dte_runtime_config = DTERuntimeConfig.from_env()
         self._warned_unbounded_microbatch = False
         self.enable_tree_training: bool = self.config.enable_tree_training
@@ -1234,8 +1238,8 @@ class MegatronEngine(TrainEngine):
             self._init_weight_update_from_distributed(meta)
             self.weight_update_group_initialized = True
         elif meta.type == "awex":
-            publisher = self._ensure_awex_publisher()
-            publisher.init_colocate_weight_update(
+            adapter = self._ensure_awex_adapter()
+            adapter.init_legacy_colocate_weight_update(
                 meta_server_addr=meta.nccl_master_address,
                 pair_name=meta.nccl_group_name or "default",
                 transfer_rank=self.rank or 0,
@@ -1299,7 +1303,7 @@ class MegatronEngine(TrainEngine):
         self._check_rollout_engine_connected()
         if meta.type == "awex":
             # Colocate mode flow (mirrors the AWEX reference integration):
-            # 1. execute_colocate_weight_update: release grad → convert → offload
+            # 1. execute_legacy_colocate_weight_update: release grad → convert → offload
             #    weights → signal offloaded → IPC serialize → wait reader done →
             #    cleanup shared → signal write_finished
             # 2. finish: wait all infer engines done → cleanup MetaServer keys
@@ -1307,11 +1311,11 @@ class MegatronEngine(TrainEngine):
             # actor worker returns. Calling back into the rollout from this RPC
             # creates a nested controller/rollout call while the actor collective
             # is still active and deadlocks at the final barrier.
-            if self._awex_publisher is None:
+            if self._awex_adapter is None:
                 raise RuntimeError(
-                    "AWEX weight update requested before publisher initialization"
+                    "AWEX weight update requested before adapter initialization"
                 )
-            self._awex_publisher.execute_colocate_weight_update(meta.version or 0)
+            self._awex_adapter.execute_legacy_colocate_weight_update(meta.version or 0)
             # Do NOT flip is_offload here: residency tracks released memory,
             # and the trainer onloads explicitly
             # at the next train phase. Marking is_offload would make every
@@ -1320,7 +1324,7 @@ class MegatronEngine(TrainEngine):
 
             dist.barrier(group=self.cpu_group)
 
-            self._awex_publisher.finish_colocate_weight_update(
+            self._awex_adapter.finish_legacy_colocate_weight_update(
                 training_world_size=dist.get_world_size(self.cpu_group)
             )
 
@@ -1349,7 +1353,7 @@ class MegatronEngine(TrainEngine):
             # coalesced all-gather transient.
             self._weight_residency.release_grad_memory()
             gc.collect()
-            torch.cuda.empty_cache()
+            current_platform.clear_memory()
         with self._checkpoint_aware_context(
             with_model=True, with_optimizer=meta.with_optim
         ):
@@ -2079,30 +2083,26 @@ class MegatronEngine(TrainEngine):
                 and self.sequence_packing_mode == SequencePackingMode.WRAPPER_THD
                 and self.hf_config.architectures == ["Qwen4ExpForConditionalGeneration"]
             )
-            qwen35_text_thd = (
-                self.use_model_packed_seq
-                and is_qwen3_5_model(self.hf_config.model_type)
-                and not has_vision_inputs
+            qwen35_model_thd = self.use_model_packed_seq and is_qwen3_5_model(
+                self.hf_config.model_type
             )
-            # Qwen4Exp's wrapper retains the visual embedding forward while
-            # bypassing only the inner language model's final projection. Its
-            # mRoPE and token masks are prepared before the shared THD/CP split.
+            # Both wrappers retain visual embedding/fusion and mRoPE before
+            # their THD/CP split. Hidden-state mode bypasses only the inner
+            # language model's final projection, so image/video inputs do not
+            # change the chunked LM Head's hidden-state or label contract.
             if (
                 use_chunked_lm_head
-                and not qwen4_wrapper_thd
+                and not (qwen4_wrapper_thd or qwen35_model_thd)
                 and (
                     has_vision_inputs
-                    or (
-                        self.is_vision_model
-                        and not self.use_padded_seq
-                        and not qwen35_text_thd
-                    )
+                    or (self.is_vision_model and not self.use_padded_seq)
                 )
             ):
                 raise NotImplementedError(
-                    "chunked LM Head vision inputs require the Qwen4Exp "
-                    "mcore-bridge WRAPPER_THD path; text-only Qwen3.5 supports "
-                    "padded BSHD and model-owned THD"
+                    "chunked LM Head vision inputs require Qwen3.5 "
+                    "megatron-bridge model-owned THD or Qwen4Exp "
+                    "mcore-bridge wrapper-owned THD; text-only Qwen3.5 "
+                    "also supports padded BSHD"
                 )
 
             # MTP training: pass the token loss mask through the model's actual
@@ -2133,6 +2133,19 @@ class MegatronEngine(TrainEngine):
                         f"{input_ids.shape}."
                     )
                 mb_input.padded_mb["mtp_loss_mask"] = mtp_loss_mask
+                mtp_version_mask = mb_input.padded_mb.get("mtp_version_mask")
+                if (
+                    mtp_version_mask is not None
+                    and mtp_version_mask.shape != input_ids.shape
+                ):
+                    raise ValueError(
+                        "MTP version mask must match input_ids before layout "
+                        f"conversion, got {mtp_version_mask.shape} and {input_ids.shape}."
+                    )
+            else:
+                # The actor carries this mask with policy-version filtering,
+                # but it only applies to an active MTP training objective.
+                mb_input.padded_mb.pop("mtp_version_mask", None)
 
             output = packed_context_parallel_forward(
                 model,
@@ -2400,11 +2413,39 @@ class MegatronEngine(TrainEngine):
                     total_token_count=total_token_count,
                 )
 
-            self.forward_backward_batch(
-                mb_list,
-                process_output,
-                forward_only=False,
-            )
+            activation_context = nullcontext()
+            if self._weight_residency is not None:
+                install_activation_storage_tracking()
+                model_chunks = (
+                    self.model
+                    if isinstance(self.model, (list, tuple))
+                    else [self.model]
+                )
+                protected_tensors = [
+                    tensor
+                    for model_chunk in model_chunks
+                    # Megatron DDP shadows nn.Module.buffers with its grad buffers.
+                    for tensor in (
+                        *model_chunk.parameters(),
+                        *torch.nn.Module.buffers(model_chunk),
+                    )
+                ]
+                activation_context = track_activation_storage(protected_tensors)
+            with activation_context as activation_tracker:
+                self.forward_backward_batch(
+                    mb_list,
+                    process_output,
+                    forward_only=False,
+                )
+
+            if activation_tracker is not None:
+                released_storages, released_bytes = activation_tracker.release()
+                if released_storages:
+                    self.logger.debug(
+                        "Released %d retained Megatron/TE activation storages (%.3f GiB)",
+                        released_storages,
+                        released_bytes / 1024**3,
+                    )
 
             # Step 4: Optimizer step
             stats = self.optimizer_step()
@@ -2617,14 +2658,14 @@ class MegatronEngine(TrainEngine):
         return data
 
     def init_awex_adapter(self, meta_server_addr: str | None = None) -> None:
-        """Create the AWEX publisher early for colocated weight transfer.
+        """Create the AWEX adapter early for colocated weight transfer.
 
         Must be called before offload() in colocate mode so that offload uses
         flat-buffer residency instead of TMS, which is all-or-nothing and can
         OOM when SGLang already occupies the GPU.
         """
-        publisher = self._ensure_awex_publisher()
-        publisher.eager_publish_train_info(meta_server_addr)
+        adapter = self._ensure_awex_adapter()
+        adapter.eager_publish_train_info(meta_server_addr)
 
     def _ensure_weight_residency(self) -> MegatronWeightResidency:
         if self._weight_residency is None:
@@ -2636,16 +2677,16 @@ class MegatronEngine(TrainEngine):
             self.logger.info("Created Megatron weight residency manager")
         return self._weight_residency
 
-    def _ensure_awex_publisher(self) -> AwexWeightPublisher:
+    def _ensure_awex_adapter(self) -> AwexMegatronAdapter:
         residency = self._ensure_weight_residency()
-        if self._awex_publisher is None:
-            from areal.engine.awex.colocate_writer import AwexWeightPublisher
+        if self._awex_adapter is None:
+            from areal.engine.awex.adapters.megatron_adapter import AwexMegatronAdapter
 
-            self._awex_publisher = AwexWeightPublisher(self, residency)
-            self.logger.info("Created AWEX weight publisher")
-        elif self._awex_publisher.residency is not residency:
-            raise RuntimeError("AWEX publisher does not own the engine residency")
-        return self._awex_publisher
+            self._awex_adapter = AwexMegatronAdapter(self, residency)
+            self.logger.info("Created AWEX weight adapter")
+        elif self._awex_adapter.residency is not residency:
+            raise RuntimeError("AWEX adapter does not share the engine residency")
+        return self._awex_adapter
 
     def init_weight_residency_adapter(self) -> None:
         """Enable DDP-flat-buffer residency without AWEX publication state."""

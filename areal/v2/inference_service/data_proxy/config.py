@@ -26,6 +26,7 @@ class DataProxyConfig:
 
     # ArealOpenAI client parameters (forwarded from AgentConfig)
     tool_call_parser: str = "qwen"
+    tool_call_parser_allow_recovery: bool = True
     reasoning_parser: str = "qwen3"
     engine_max_tokens: int | None = None
     chat_template_type: str = "hf"

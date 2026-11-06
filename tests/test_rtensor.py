@@ -743,6 +743,7 @@ class TestRemotize:
     @pytest.mark.parametrize("preserve_tensor_aliases", [False, True])
     def test_remotize_list_of_dicts(self, monkeypatch, preserve_tensor_aliases):
         """Test remotizing list of dicts with different attention masks."""
+        # Remotize stores locally; node_addr alone does not upload to an RPC server.
         backend = _RecordingRTensorBackend()
         monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
         monkeypatch.setattr("areal.infra.rpc.rtensor._fetch_buffer", {})

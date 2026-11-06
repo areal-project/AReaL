@@ -40,7 +40,7 @@ concurrency:
 env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   RUNNER_VERSION: '2.332.0'
-  GCP_OS_IMAGE: areal-cicd-test-20260506-432
+  GCP_OS_IMAGE: areal-cicd-test-20261008-454
 
 jobs:
   determine-variants:

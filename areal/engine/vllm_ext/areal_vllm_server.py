@@ -325,6 +325,11 @@ async def areal_pause_generation(raw_request: Request):
 async def areal_continue_generation(raw_request: Request):
     logger.info("API server starts areal_continue_generation")
     llm = raw_request.app.state.engine_client
+    # Trainers resume generation after the last bucket of a refit, so this is where
+    # the weight-update session started by areal_update_weight_xccl is closed.
+    ret_list = await llm.collective_rpc("areal_finalize_weight_update")
+    if not all(success for success, _ in ret_list):
+        return build_response(ret_list)
     await llm.resume_generation()
     _generation_run_event.set()
     return to_json_response(True, "Generation continued")

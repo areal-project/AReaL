@@ -20,17 +20,23 @@ from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.trainer.mopd.loss import compose_mopd_loss
 from areal.trainer.mopd.targets import aggregate_mopd_targets
-from areal.trainer.ppo.gae import (
-    _build_gae_lambda_context,
-    _compute_token_level_gae,
-    _compute_turn_level_gae,
+from areal.trainer.ppo.advantage import (
+    AdvantageInputs,
+    _get_truncated_mask,
+    resolve_advantage_fn,
+    validate_advantage_result,
 )
-from areal.trainer.ppo.lambda_fn import resolve_gae_lambda_fn
+from areal.trainer.ppo.advantage_algorithms import (
+    _shape_advantages_with_gvpo as _shape_advantages_with_gvpo,
+)
+from areal.trainer.ppo.advantage_algorithms import (
+    _shape_advantages_with_process_weighting as _shape_advantages_with_process_weighting,
+)
 from areal.trainer.ppo.loss_reduction import (
     PreparedLossStep,
     prepare_policy_gradient_batch,
 )
-from areal.trainer.ppo.stats import infer_token_denominator, log_train_inference_stats
+from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
     PROX_APPROX_METHOD_LINEAR,
@@ -43,20 +49,16 @@ from areal.utils.constants import (
     ProxLogpMethod,
 )
 from areal.utils.data import (
-    KLEstimator,
-    Normalization,
     TrajBatchMeta,
     batched_call,
     concat_batch,
     is_multi_modal_key,
-    normalize_rollout_rewards,
     split_training_batch_into_microbatches,
 )
 from areal.utils.functional import (
     apply_rejection_sampling,
     cispo_loss_fn,
     ppo_actor_loss_fn,
-    reward_overlong_penalty,
     sapo_loss_fn,
 )
 from areal.utils.functional.loss_aggregation import (
@@ -64,6 +66,7 @@ from areal.utils.functional.loss_aggregation import (
     TokenMean,
 )
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.score_centering import resolve_score_centering_tis_cap
 from areal.utils.stats_tracker import ReduceType
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -112,61 +115,6 @@ def _group_training_metrics(
     return group_starts, usable_group_sizes, group_loss_weights
 
 
-def _shape_advantages_with_gvpo(
-    advantages: torch.Tensor,
-    token_advantages: torch.Tensor,
-    loss_mask: torch.Tensor,
-    *,
-    negative_scale: float,
-    zero_penalty: float,
-    zero_eps: float,
-) -> torch.Tensor:
-    """Shape outcome advantages where a negative process signal marks failure."""
-    for name, value in (
-        ("negative_scale", negative_scale),
-        ("zero_penalty", zero_penalty),
-        ("zero_eps", zero_eps),
-    ):
-        if not math.isfinite(value) or value < 0:
-            raise ValueError(
-                f"GVPO {name} must be finite and non-negative, got {value}"
-            )
-
-    failed_mask = (token_advantages < 0) & loss_mask.bool()
-    negative_mask = failed_mask & (advantages < -zero_eps)
-    zero_mask = failed_mask & (advantages.abs() <= zero_eps)
-    positive_mask = failed_mask & (advantages > zero_eps)
-
-    shaped = torch.where(
-        negative_mask,
-        advantages * (1.0 + negative_scale),
-        advantages,
-    )
-    shaped = torch.where(zero_mask, torch.full_like(shaped, -zero_penalty), shaped)
-    return shaped.masked_fill(positive_mask, 0.0)
-
-
-def _shape_advantages_with_process_weighting(
-    advantages: torch.Tensor,
-    process_rewards: torch.Tensor,
-    loss_mask: torch.Tensor,
-) -> torch.Tensor:
-    """Combine outcome advantages with process rewards in ``[0, 1]``."""
-    active_mask = loss_mask.bool()
-    rewards_in_range = (process_rewards >= 0) & (process_rewards <= 1)
-    torch._assert_async(
-        torch.all(rewards_in_range | ~active_mask),
-        "Process-weighted advantage shaping requires process rewards in [0, 1]",
-    )
-
-    shaped = torch.where(
-        advantages >= 0,
-        advantages * process_rewards,
-        torch.where(process_rewards > 0, process_rewards, advantages),
-    )
-    return torch.where(active_mask, shaped, advantages)
-
-
 def _infer_prompt_lens(
     attention_mask: torch.Tensor, loss_mask: torch.Tensor
 ) -> torch.Tensor:
@@ -182,50 +130,12 @@ def _infer_prompt_lens(
     return torch.where(has_gen, first_gen_idx, attention_mask.long().sum(-1))
 
 
-def _get_truncated_mask(data: dict[str, Any], seqlens: torch.Tensor) -> torch.Tensor:
-    is_truncated = data.get("is_truncated")
-    if is_truncated is None:
-        # Preserve compatibility with custom tensor workflows that predate the
-        # explicit per-trajectory termination metadata.
-        return seqlens == data["attention_mask"].shape[-1]
-    if not torch.is_tensor(is_truncated):
-        raise TypeError("`is_truncated` must be a tensor")
-    if is_truncated.shape != seqlens.shape:
-        raise ValueError(
-            "`is_truncated` must have one value per trajectory, got "
-            f"shape {tuple(is_truncated.shape)} for batch shape {tuple(seqlens.shape)}"
-        )
-    return is_truncated.to(device=seqlens.device, dtype=torch.bool)
-
-
 class PPOActor:
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         self.config = config
         self.engine = engine
 
-        self.reward_bias = config.reward_bias
-        self.reward_scaling = config.reward_scaling
-        self.reward_clip = config.reward_clip
-
-        self.kl_ctl = config.kl_ctl
-        self.kl_estimator = KLEstimator(config.kl_estimator)
-
-        self.adv_norm = Normalization(config.adv_norm) if config.adv_norm else None
-        self.reward_norm = (
-            Normalization(config.reward_norm) if config.reward_norm else None
-        )
-
-        self.discount = config.discount
-        self.gae_lambda = config.gae_lambda
-        self.gae_lambda_fn, self._gae_lambda_is_custom = resolve_gae_lambda_fn(
-            config.gae_lambda
-        )
-        self.gae_lambda_kwargs = (
-            dict(config.gae_lambda_kwargs) if self._gae_lambda_is_custom else {}
-        )
-        self.gae_timestep_unit = config.gae_timestep_unit
-        self.mask_no_eos_with_zero = config.mask_no_eos_with_zero
-        self.token_rewards_as_adv = config.token_rewards_as_adv
+        self.advantage_fn = resolve_advantage_fn(config)
 
         self.temperature = config.temperature
 
@@ -237,6 +147,8 @@ class PPOActor:
 
     def configure_mopd_loss(self, config: MOPDLossConfig) -> None:
         """Bind static MOPD loss settings once on each actor worker."""
+        if self.config.use_score_centering:
+            raise ValueError("Score centering with distillation is not supported.")
         if (
             config.distillation_coefficient != 0
             and self.config.loss_aggregation != "token_mean"
@@ -258,7 +170,14 @@ class PPOActor:
         logger.info("=" * 70)
 
         # Log PPO mode and proximal policy computation
-        if not config.use_decoupled_loss:
+        if config.use_score_centering:
+            logger.info(
+                "Mode: REINFORCE with score centering (sampler behavior probabilities)"
+            )
+            tis_cap = resolve_score_centering_tis_cap(config.rejection_sampling)
+            if tis_cap is not None:
+                logger.info(f"  TIS weighted-score centering, cap={tis_cap}")
+        elif not config.use_decoupled_loss:
             logger.info("Mode: Standard PPO (on-policy)")
             if config.recompute_logprob:
                 logger.info("  old_logp (π_old): RECOMPUTED from current policy")
@@ -482,332 +401,53 @@ class PPOActor:
         gvpo_zero_penalty: float = 0.4,
         gvpo_zero_eps: float = 1e-6,
     ) -> dict[str, Any]:
-        if advantage_shaping_mode not in {"additive", "gvpo", "process_weighted"}:
-            raise ValueError(
-                f"Invalid PRM advantage shaping mode: {advantage_shaping_mode!r}"
+        result = self.advantage_fn(
+            AdvantageInputs(
+                data=data,
+                config=self.config,
+                meta=meta,
+                process_implementation=advantage_shaping_mode,
+                process_kwargs={
+                    "negative_scale": gvpo_negative_scale,
+                    "zero_penalty": gvpo_zero_penalty,
+                    "zero_eps": gvpo_zero_eps,
+                },
             )
-        if (
-            advantage_shaping_mode in {"gvpo", "process_weighted"}
-            and not self.token_rewards_as_adv
-        ):
-            raise ValueError(
-                f"{advantage_shaping_mode!r} advantage shaping requires "
-                "token_rewards_as_adv=True"
-            )
-        if advantage_shaping_mode == "process_weighted" and self.mask_no_eos_with_zero:
-            raise ValueError(
-                "'process_weighted' advantage shaping is incompatible with "
-                "mask_no_eos_with_zero=True"
-            )
-
-        bs = data["input_ids"].shape[0]
-        batch_indices = torch.arange(
-            bs, device=data["input_ids"].device, dtype=torch.long
         )
-
-        unpenalized_rewards = None
-        # Reward Penalty on length
-        if self.config.overlong_reward_penalty:
-            if (
-                self.reward_norm
-                and meta is not None
-                and meta.rollout_groups is not None
-            ):
-                unpenalized_rewards = data["rewards"].clone()
-            overlong_tokens = self.config.overlong_tokens
-            overlong_penalty_factor = self.config.overlong_penalty_factor
-
-            assert overlong_tokens is not None
-            assert overlong_penalty_factor is not None
-            data = reward_overlong_penalty(
-                data,
-                overlong_tokens=overlong_tokens,
-                overlong_penalty_factor=overlong_penalty_factor,
-                max_response_length=self.config.max_new_tokens,
-            )
-
-        # Reward Scaling
-        reward_score = data["rewards"]
-        reward_score = (reward_score + self.reward_bias) * self.reward_scaling
-        reward_score = torch.clip(
-            reward_score, max=self.reward_clip, min=-self.reward_clip
-        )
-        # Use actual trajectory group sizes when available so group-level
-        # normalization handles failed/filtered rollout samples without slicing
-        # across prompts. Direct calls without batched metadata keep the legacy
-        # fixed-group-size behavior.
-        group_sizes = meta.traj_group_sizes if meta is not None else None
-        if self.reward_norm:
-            if meta is not None and meta.rollout_groups is not None:
-                reward_score = normalize_rollout_rewards(
-                    data["rewards"],
-                    self.reward_norm,
-                    meta,
-                    reward_bias=self.reward_bias,
-                    reward_scaling=self.reward_scaling,
-                    reward_clip=self.reward_clip,
-                    unpenalized_rewards=unpenalized_rewards,
-                )
-            else:
-                reward_score = self.reward_norm(reward_score, group_sizes=group_sizes)
-
-        token_loss_mask = data["loss_mask"].bool()
-        # Preserve token provenance before converting to next-token loss alignment.
-        # Multimodal preprocessing must distinguish generated special IDs from
-        # prompt image/video placeholders even after advantages are computed.
-        data["input_token_loss_mask"] = token_loss_mask
-        loss_mask = token_loss_mask.float()
-        loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
-
-        if "mopd_teacher_logp_sum" in data:
-            # MOPD's correction is always relative to the immutable rollout
-            # behavior policy, even when standard PPO recomputes its proximal
-            # policy and overwrites ``logprobs`` below.
-            data["mopd_behavior_logprobs"] = (
-                torch.roll(data["logprobs"], shifts=-1, dims=-1) * loss_mask
-            ).detach()
-
-        # Align structural turn IDs to the same next-token prediction
-        # convention used by loss_mask and log probabilities.
-        turn_ids = data.get("turn_ids")
-        if turn_ids is not None:
-            turn_ids = torch.roll(turn_ids, shifts=-1, dims=-1)
-            turn_ids[:, -1] = -1
-        elif self.gae_timestep_unit == "turn":
-            raise ValueError(
-                "actor.gae_timestep_unit='turn' requires rollout data to "
-                "include 'turn_ids'."
-            )
-        # Apply the mask to log probabilities.
-        if data.get("prox_logp") is not None:
-            log_train_inference_stats(
-                data["prox_logp"],
-                torch.roll(data["logprobs"], shifts=-1, dims=-1),
-                loss_mask.bool(),
-            )
-        if not self.config.use_decoupled_loss and self.config.recompute_logprob:
-            # Overwrite logprobs produced by the inference engine
-            prox_logp_value = data["prox_logp"]
-            if prox_logp_value is None:
-                raise ValueError(
-                    "prox_logp is None but recompute_logprob=True. "
-                    "This indicates compute_logp() was skipped incorrectly."
-                )
-            old_logp = data["logprobs"] = prox_logp_value
-        else:
-            old_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
-            if not self.config.use_decoupled_loss:
-                # prox logp not available, use inferenced logp
-                data["prox_logp"] = old_logp
-        ref_logp = data.get("ref_logp")
-        if ref_logp is None:
-            ref_logp = torch.zeros_like(old_logp)
-        ref_logp *= loss_mask
-        old_logp *= loss_mask
-
-        # Compute KL-regularized rewards.
-        attn_mask = data["attention_mask"]
-        seqlens = attn_mask.sum(-1).long()
-        seq_truncated_mask = _get_truncated_mask(data, seqlens)
-        data["is_truncated"] = seq_truncated_mask
-        rewards = -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
-        kl_rewards = rewards.clone()
-        # KL rewards at the next token after eos is zero.
-        rewards[batch_indices, seqlens - 1] = 0
-        gae_kl_rewards = rewards.clone()
-        indices = torch.clip(seqlens - 2, min=0)
-        gae_outcome_rewards = torch.zeros_like(rewards)
-        if self.mask_no_eos_with_zero:
-            gae_outcome_rewards[batch_indices, indices] = torch.where(
-                seq_truncated_mask, 0, reward_score
-            )
-        else:
-            gae_outcome_rewards[batch_indices, indices] = reward_score
-
-        # Turn-level GAE treats each generated turn as a macro timestep. Keep
-        # token KL as a local actor penalty rather than broadcasting a turn's
-        # summed KL into every token and into critic targets.
-        if self.gae_timestep_unit == "turn":
-            rewards = gae_outcome_rewards
-        else:
-            rewards = gae_kl_rewards + gae_outcome_rewards
-
-        token_advantages = None
-        token_rewards = data.get("token_rewards")
-        if token_rewards is not None:
-            if token_rewards.shape != rewards.shape:
-                raise ValueError(
-                    "token_rewards must match the padded sequence shape: "
-                    f"expected {tuple(rewards.shape)}, got {tuple(token_rewards.shape)}"
-                )
-            aligned_token_rewards = token_rewards.to(
-                device=rewards.device, dtype=rewards.dtype
-            )
-            if self.mask_no_eos_with_zero:
-                aligned_token_rewards = torch.where(
-                    seq_truncated_mask.unsqueeze(-1),
-                    torch.zeros_like(aligned_token_rewards),
-                    aligned_token_rewards,
-                )
-            rolled_token_rewards = torch.roll(
-                aligned_token_rewards,
-                shifts=-1,
-                dims=-1,
-            )
-            if self.token_rewards_as_adv:
-                token_advantages = rolled_token_rewards * loss_mask
-            else:
-                adjacent_turn_tokens = token_loss_mask[:, :-1] & token_loss_mask[:, 1:]
-                if turn_ids is not None:
-                    raw_turn_ids = data["turn_ids"]
-                    adjacent_turn_tokens &= raw_turn_ids[:, :-1] == raw_turn_ids[:, 1:]
-                adjacent_rewards_match = (
-                    aligned_token_rewards[:, :-1] == aligned_token_rewards[:, 1:]
-                ) | ~adjacent_turn_tokens.to(device=aligned_token_rewards.device)
-                torch._assert_async(
-                    torch.all(adjacent_rewards_match),
-                    "token_rewards_as_adv=False requires uniform token rewards "
-                    "within each turn; use token_rewards_as_adv=True for dense "
-                    "or sparse per-token rewards.",
-                )
-                next_mask = torch.zeros_like(loss_mask)
-                next_mask[:, :-1] = loss_mask[:, 1:]
-                if turn_ids is not None:
-                    next_mask[:, :-1] *= turn_ids[:, :-1] == turn_ids[:, 1:]
-                is_turn_end = loss_mask * (1 - next_mask)
-                rewards = rewards + rolled_token_rewards * is_turn_end
-
-        # Compute GAE.
-        if "values" not in data:
-            values = torch.zeros_like(rewards)
-        else:
-            values = data["values"]
-        bootstrap_values = values[batch_indices, seqlens - 1]
-        if self._gae_lambda_is_custom:
-            gae_lambda = self._compute_gae_lambda(loss_mask, turn_ids)
-        else:
-            gae_lambda = float(self.gae_lambda)
-            if not math.isfinite(gae_lambda):
-                raise ValueError(f"Static gae_lambda must be finite, got {gae_lambda}")
-        if self.gae_timestep_unit == "turn":
-            assert turn_ids is not None
-            advantages, returns = _compute_turn_level_gae(
-                rewards=rewards,
-                values=values,
-                loss_mask=loss_mask,
-                turn_ids=turn_ids,
-                seq_no_eos_mask=seq_truncated_mask,
-                bootstrap_values=bootstrap_values,
-                discount=self.discount,
-                gae_lambda=gae_lambda,
-            )
-            advantages = advantages + gae_kl_rewards
-        else:
-            advantages, returns = _compute_token_level_gae(
-                rewards=rewards,
-                values=values,
-                loss_mask=loss_mask,
-                seq_no_eos_mask=seq_truncated_mask,
-                bootstrap_values=bootstrap_values,
-                discount=self.discount,
-                gae_lambda=gae_lambda,
-            )
-        data["returns"] = returns
-
-        # Optionally perform advantage normalization.
-        if self.adv_norm is not None:
-            # Use the same actual trajectory group sizes as reward normalization;
-            # ignored when adv_norm is batch-level.
-            advantages = self.adv_norm(
-                advantages,
-                loss_mask,
-                group_sizes=group_sizes,
-                group_member_counts=meta.logical_group_sizes
-                if meta is not None
-                else None,
-            )
-
-        if token_advantages is not None:
-            if advantage_shaping_mode == "gvpo":
-                advantages = _shape_advantages_with_gvpo(
-                    advantages,
-                    token_advantages,
-                    loss_mask,
-                    negative_scale=gvpo_negative_scale,
-                    zero_penalty=gvpo_zero_penalty,
-                    zero_eps=gvpo_zero_eps,
-                )
-            elif advantage_shaping_mode == "process_weighted":
-                advantages = _shape_advantages_with_process_weighting(
-                    advantages,
-                    token_advantages,
-                    loss_mask,
-                )
-            else:
-                advantages = advantages + token_advantages
-
-        # Store data in the dict.
-        data["advantages"] = advantages
-        data["kl_rewards"] = kl_rewards
-        # ``rewards`` contains every signal consumed by GAE, including folded
-        # process rewards. Turn-level GAE deliberately excludes token-level KL
-        # from ``rewards``, so add it back only for the monitoring metric.
-        data["tot_rewards"] = (
-            rewards + gae_kl_rewards if self.gae_timestep_unit == "turn" else rewards
-        )
-        data["loss_mask"] = loss_mask
-        # because we have rolled old_logp by -1
-        data["logprobs"] = old_logp
-
+        data.update(validate_advantage_result(result, data))
+        if self.config.use_score_centering:
+            for key in ("sampler_head_ids", "sampler_head_logprobs"):
+                if key not in data:
+                    raise ValueError(
+                        "Score centering requires SGLang sampler heads on every trajectory."
+                    )
+                if (
+                    data[key].ndim != 3
+                    or data[key].shape[:2] != data["input_ids"].shape
+                ):
+                    raise ValueError(
+                        "Sampler heads must have shape [batch, sequence, head_width]."
+                    )
+                data[key] = torch.roll(data[key], shifts=-1, dims=1)
         return data
-
-    def _compute_gae_lambda(
-        self,
-        loss_mask: torch.Tensor,
-        turn_ids: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Resolve one lambda value per local trajectory without changing masks."""
-        context = _build_gae_lambda_context(
-            loss_mask,
-            turn_ids,
-            gae_timestep_unit=self.gae_timestep_unit,
-        )
-        gae_lambda = self.gae_lambda_fn(context, **self.gae_lambda_kwargs)
-        if not isinstance(gae_lambda, torch.Tensor):
-            raise TypeError(
-                "gae_lambda function must return a torch.Tensor with shape "
-                f"[{loss_mask.shape[0]}], got {type(gae_lambda).__name__}"
-            )
-        expected_shape = torch.Size([loss_mask.shape[0]])
-        if gae_lambda.shape != expected_shape:
-            raise ValueError(
-                "gae_lambda function must return one value per local trajectory: "
-                f"expected shape {expected_shape}, got {gae_lambda.shape}"
-            )
-        if gae_lambda.device != loss_mask.device:
-            raise ValueError(
-                "gae_lambda output and loss_mask must be on the same device, got "
-                f"{gae_lambda.device} and {loss_mask.device}"
-            )
-        if not torch.is_floating_point(gae_lambda):
-            raise TypeError(
-                "gae_lambda function must return a floating-point tensor, got "
-                f"{gae_lambda.dtype}"
-            )
-        torch._assert_async(
-            torch.all(torch.isfinite(gae_lambda)),
-            "gae_lambda function returned a non-finite value",
-        )
-        return gae_lambda.detach().float()
 
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
-    def ppo_update(self, data: list[dict[str, Any]]) -> None:
+    def ppo_update(
+        self,
+        data: list[dict[str, Any]],
+        *,
+        max_head_offpolicyness: int | None = None,
+    ) -> None:
         batched, meta = concat_batch(data)
-        self._ppo_update(batched, meta)
+        self._ppo_update(batched, meta, max_head_offpolicyness=max_head_offpolicyness)
 
     def _ppo_update(
-        self, data: dict[str, Any], meta: TrajBatchMeta | None = None
+        self,
+        data: dict[str, Any],
+        meta: TrajBatchMeta | None = None,
+        *,
+        max_head_offpolicyness: int | None = None,
     ) -> None:
         if self.config.loss_aggregation != "token_mean" and (
             data.get("teacher_logp") is not None
@@ -907,6 +547,9 @@ class PPOActor:
                 _log_version_staleness_stats(
                     metric_versions, self.engine.get_version(), loss_mask.bool()
                 )
+                _log_policy_version_age_distribution(
+                    metric_versions, self.engine.get_version(), loss_mask.bool()
+                )
         if group_metrics is not None:
             group_starts, usable_group_sizes, group_loss_weights = group_metrics
             stats_tracker.stat(
@@ -945,6 +588,34 @@ class PPOActor:
                 denominator="agent",
             )
         ########## Logging code ends ##########
+
+        if max_head_offpolicyness is not None:
+            version_mask, aligned_versions = _policy_version_loss_mask(
+                data.get("versions"),
+                loss_mask,
+                self.engine.get_version(),
+                max_head_offpolicyness,
+            )
+            # Keep original masks for reduction denominators and input-token
+            # provenance. This extra numerator mask travels through packing/CP.
+            data["policy_version_mask"] = version_mask
+            # MCore derives MTP targets from input_ids and rolls once for the
+            # first target, then once per prediction layer. Keep input-token
+            # provenance here; the forward path applies those rolls itself.
+            versions = data["versions"].to(torch.int64)
+            data["mtp_version_mask"] = (versions >= 0) & (
+                self.engine.get_version() - versions <= max_head_offpolicyness
+            )
+            with stats_tracker.scope("update"):
+                stats_tracker.stat_compact(
+                    loss_mask.bool(),
+                    ReduceType.AVG,
+                    version_filtered_fraction=(~version_mask).float(),
+                )
+                with stats_tracker.scope("version_filtered"):
+                    _log_version_staleness_stats(
+                        aligned_versions, self.engine.get_version(), version_mask
+                    )
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
@@ -1004,6 +675,7 @@ class PPOActor:
             ):
                 loss_fn = functools.partial(
                     grpo_loss_fn,
+                    use_score_centering=self.config.use_score_centering,
                     eps_clip=self.config.eps_clip,
                     eps_clip_higher=self.config.eps_clip_higher,
                     c_clip=self.config.c_clip,
@@ -1270,13 +942,23 @@ def grpo_loss_fn(
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
+    use_score_centering: bool = False,
+    sc_correction: torch.Tensor | None = None,
 ):
     """Compute loss and logging stats using the actor's assembled reduction."""
+    if use_score_centering and (
+        mopd_loss_config is not None
+        or input_data.get("mopd_teacher_logp_sum") is not None
+        or input_data.get("teacher_logp") is not None
+    ):
+        raise ValueError("Score centering with distillation is not supported.")
     denominator_mask = input_data["loss_mask"].bool()
     pg_reduction = (
         TokenMean(denominator_mask) if loss_step is None else loss_step.bind(input_data)
     )
     loss_mask = denominator_mask
+    if "policy_version_mask" in input_data:
+        loss_mask = loss_mask & input_data["policy_version_mask"].bool()
     if mopd_loss_config is not None and mopd_loss_config.rl_coefficient == 0:
         teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
         teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")
@@ -1287,7 +969,7 @@ def grpo_loss_fn(
             raise RuntimeError(
                 "MOPD targets require immutable rollout behavior log-probabilities"
             )
-        normalization_mask = loss_mask
+        normalization_mask = denominator_mask
         prox_logp_gt = input_data.get("prox_logp")
         if m2_threshold is not None or rejection_sampling is not None:
             prox_logp = _resolve_proximal_logp(
@@ -1365,8 +1047,36 @@ def grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
-    # Use CISPO, SAPO, or PPO loss
-    if use_cispo_loss:
+    # Score centering uses the explicit REINFORCE surrogate, not clipped PPO.
+    if use_score_centering:
+        if sc_correction is None:
+            raise ValueError("Score centering requires a score-centering logprob path.")
+        if input_data.get("teacher_logp") is not None:
+            raise ValueError("Score centering with distillation is not supported.")
+        tis_cap = resolve_score_centering_tis_cap(rejection_sampling)
+        if tis_cap is None:
+            sc_weight = torch.ones_like(logprobs)
+            sc_clipped = torch.zeros_like(loss_mask)
+        else:
+            from areal.utils.score_centering import score_centering_tis_weights
+
+            # Original sampler logprobs, never the proximal policy. The correction
+            # already centers weighted scores; do not multiply it by sc_weight.
+            behavior_logp = torch.where(loss_mask.bool(), old_logp, logprobs.detach())
+            sc_weight = score_centering_tis_weights(logprobs, behavior_logp, tis_cap)
+            sc_clipped = (
+                logprobs.detach() - behavior_logp > math.log(tis_cap)
+            ) & loss_mask.bool()
+        token_loss = advantages.detach() * (sc_correction - sc_weight * logprobs)
+        loss = pg_reduction.aggregate(token_loss, loss_mask)
+        stat = dict(
+            loss=token_loss.detach(),
+            importance_weight=sc_weight,
+            approx_kl=old_logp - logprobs.detach(),
+            clip_mask=sc_clipped,
+            dual_clip_mask=torch.zeros_like(loss_mask),
+        )
+    elif use_cispo_loss:
         if use_sapo_loss:
             raise ValueError(
                 "CISPO and SAPO are mutually exclusive surrogates. "
@@ -1516,6 +1226,11 @@ def grpo_loss_fn(
                 rkl_loss=rkl_stat,
                 denominator="n_valid_tokens",
             )
+
+    if use_score_centering:
+        stats_tracker.stat(
+            sc_correction=sc_correction.detach(), denominator="n_valid_tokens"
+        )
 
     logp_diff = (old_logp - logprobs.detach()) * loss_mask
     stats_tracker.stat(
@@ -2062,6 +1777,40 @@ def _log_proximal_approximation_stats(
             )
 
 
+def _policy_version_loss_mask(
+    versions: torch.Tensor | None,
+    loss_mask: torch.Tensor,
+    current_version: int,
+    max_head_offpolicyness: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask expired targets without removing tokens from the model context.
+
+    Versions retain input-token positions; the advantage-preprocessed loss mask
+    already addresses next-token predictions. Align before packing or CP splits.
+    Negative versions on supervised positions are invalid and are masked too.
+    """
+    if max_head_offpolicyness < 0:
+        raise ValueError("max_head_offpolicyness must be nonnegative")
+    if versions is None or versions.shape != loss_mask.shape:
+        raise ValueError("Training version masking requires shape-matched versions")
+    if versions.dtype not in (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    ):
+        raise ValueError("Training versions must have an integer dtype")
+    aligned_versions = torch.roll(versions.to(torch.int64), shifts=-1, dims=-1)
+    aligned_versions[..., -1] = -1
+    keep = (
+        loss_mask.bool()
+        & (aligned_versions >= 0)
+        & (current_version - aligned_versions <= max_head_offpolicyness)
+    )
+    return keep, aligned_versions
+
+
 def _log_version_staleness_stats(
     versions: torch.Tensor,
     current_version: int,
@@ -2116,3 +1865,44 @@ def _log_version_staleness_stats(
             v_theta=v_theta,
             v_proximal=v_proximal,
         )
+
+
+_MAX_EXACT_POLICY_VERSION_AGE = 16
+
+
+def _log_policy_version_age_distribution(
+    versions: torch.Tensor,
+    current_version: int,
+    loss_mask: torch.Tensor,
+) -> None:
+    """Report pre-filter token fractions by checkpoint age across workers.
+
+    The supervised-token count is the common denominator, including tokens
+    with invalid or future versions. Fixed bins keep metric keys and the
+    distributed reduction order identical on every worker.
+    """
+    max_age = _MAX_EXACT_POLICY_VERSION_AGE
+    age = current_version - versions.to(torch.int64)
+    bins = torch.where(
+        versions < 0,
+        max_age + 2,
+        torch.where(
+            versions > current_version, max_age + 3, age.clamp(max=max_age + 1)
+        ),
+    )
+    counts = torch.zeros(max_age + 4, dtype=torch.int64, device=versions.device)
+    counts.scatter_add_(0, bins.reshape(-1), loss_mask.reshape(-1).to(torch.int64))
+    total = counts.sum().float()
+    fractions = counts.float() / total.clamp_min(1)
+
+    with stats_tracker.scope("version_stats"):
+        for age_bin in range(max_age + 1):
+            stats_tracker.weighted_mean(
+                f"age_{age_bin}_fraction", fractions[age_bin], total
+            )
+        for name, bin_index in (
+            (f"age_gt_{max_age}_fraction", max_age + 1),
+            ("invalid_version_fraction", max_age + 2),
+            ("future_version_fraction", max_age + 3),
+        ):
+            stats_tracker.weighted_mean(name, fractions[bin_index], total)

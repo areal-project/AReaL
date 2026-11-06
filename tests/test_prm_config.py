@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from areal.api.cli_args import (
+    AdvantageConfig,
+    AdvantageFunctionConfig,
     PPOConfig,
     PRMAdvantageShapingConfig,
     PRMScorerConfig,
@@ -179,3 +181,37 @@ def test_prm_import_does_not_load_math_verify():
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("legacy", ["gvpo", "process_weighted"])
+@pytest.mark.parametrize("compute_override", [False, True])
+def test_actor_override_does_not_validate_unused_legacy_process_mode(
+    legacy, compute_override
+):
+    """Actor-owned composition must win during config validation as at runtime."""
+    config = PPOConfig()
+    config.rollout.agent.prm.advantage_shaping.mode = legacy
+    config.actor.token_rewards_as_adv = False
+    config.actor.mask_no_eos_with_zero = True
+    config.actor.advantage = (
+        AdvantageConfig(
+            compute=AdvantageFunctionConfig(implementation="my_plugins.compute")
+        )
+        if compute_override
+        else AdvantageConfig(
+            process_adv_shaping=AdvantageFunctionConfig(implementation="additive")
+        )
+    )
+    config.__post_init__()
+
+
+def test_process_auto_still_validates_legacy_mode():
+    """Auto retains legacy selection and therefore its compatibility checks."""
+    config = PPOConfig()
+    config.actor.advantage = AdvantageConfig(
+        process_adv_shaping=AdvantageFunctionConfig()
+    )
+    config.rollout.agent.prm.advantage_shaping.mode = "process_weighted"
+    config.actor.mask_no_eos_with_zero = True
+    with pytest.raises(ValueError, match="mask_no_eos_with_zero=True"):
+        config.__post_init__()

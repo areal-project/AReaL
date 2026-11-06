@@ -6,6 +6,7 @@
 import json
 
 import pytest
+import torch
 from openai.types.chat import ChatCompletionToolParam
 
 from tests.utils import get_model_path
@@ -116,6 +117,153 @@ CALCULATOR_TOOL: ChatCompletionToolParam = {
         },
     },
 }
+
+
+@pytest.mark.parametrize(
+    "stop_reason,stop_tokens",
+    [
+        ("stop", ["eos"]),
+        ("stop", ["pad"]),
+        ("stop", ["eos", "eos"]),
+        ("stop", ["eos", "pad"]),
+        ("length", []),
+        ("abort", []),
+    ],
+)
+def test_concat_preserves_sampled_tokens_and_inherited_logprobs(
+    tokenizer, stop_reason, stop_tokens
+):
+    """Stop normalization must not replace actions whose logprobs are inherited."""
+    messages = [{"role": "user", "content": "Hello"}]
+    parent = create_interaction_with_response(
+        tokenizer,
+        messages,
+        parent=None,
+        output_message_list=[{"role": "assistant", "content": "answer"}],
+        response_content="answer",
+    )
+    resp = parent.model_response
+    special_ids = {"eos": tokenizer.eos_token_id, "pad": tokenizer.pad_token_id}
+    resp.output_tokens = tokenizer.encode("answer", add_special_tokens=False) + [
+        special_ids[token] for token in stop_tokens
+    ]
+    resp.output_logprobs = [-0.25 * (i + 1) for i in range(resp.output_len)]
+    resp.output_versions = [3] * resp.output_len
+    resp.stop_reason = stop_reason
+    sampled_prefix = resp.input_tokens + resp.output_tokens
+    child_messages = [{"role": "user", "content": "Continue"}]
+
+    tokens = concat_prompt_token_ids_with_parent(
+        child_messages, parent=parent, tokenizer=tokenizer
+    )
+    child = InteractionWithTokenLogpReward(
+        model_response=ModelResponse(
+            input_tokens=tokens,
+            output_tokens=[tokenizer.eos_token_id],
+            output_logprobs=[-0.75],
+            output_versions=[4],
+        ),
+        parent=parent,
+        chat_template_type="concat",
+    )
+    actual = child.to_tensor_dict()
+    parent_tensors = parent.to_tensor_dict()
+    parent_len = len(sampled_prefix)
+
+    assert tokens[:parent_len] == sampled_prefix
+    for key in ("input_ids", "loss_mask", "logprobs", "versions", "turn_ids"):
+        torch.testing.assert_close(
+            actual[key][:, :parent_len], parent_tensors[key], rtol=0.0, atol=0.0
+        )
+    assert not actual["loss_mask"][0, parent_len : len(tokens)].any()
+    if not resp.output_tokens or resp.output_tokens[-1] != tokenizer.eos_token_id:
+        assert tokens[parent_len] == tokenizer.eos_token_id
+        assert actual["loss_mask"][0, parent_len] == 0
+
+
+def test_concat_repeated_stop_tokens_do_not_consume_later_message_boundaries(tokenizer):
+    """Raw sampled EOS counts must not advance the canonical template cutoff."""
+    parent = None
+    history = []
+    for turn in range(3):
+        remaining = [{"role": "user", "content": f"Question {turn}"}]
+        tokens = concat_prompt_token_ids_with_parent(
+            remaining, parent=parent, tokenizer=tokenizer
+        )
+        if parent is not None:
+            parent_prefix = (
+                parent.model_response.input_tokens + parent.model_response.output_tokens
+            )
+            # An EOS-closed parent is followed by a newline and the fresh user turn.
+            new_turn = apply_chat_template(
+                tokenizer, remaining, add_generation_prompt=True, tokenize=False
+            )
+            expected_suffix = tokenizer.encode(
+                "\n" + new_turn, add_special_tokens=False
+            )
+            assert tokens == parent_prefix + expected_suffix
+        output_message = {"role": "assistant", "content": f"Answer {turn}"}
+        response = create_fake_model_response(
+            tokenizer, tokens, output_message["content"]
+        )
+        response.output_tokens.append(tokenizer.eos_token_id)
+        response.output_logprobs.append(-0.5)
+        response.output_versions.append(turn)
+        history += remaining
+        parent = InteractionWithTokenLogpReward(
+            model_response=response,
+            messages=list(history),
+            output_message_list=[output_message],
+            parent=parent,
+            chat_template_type="concat",
+        )
+        history += [output_message]
+    parent.to_tensor_dict()
+
+
+def test_concat_tools_iterator_matches_materialized_tools(tokenizer):
+    """Both parent and child templates must receive the same tool definitions."""
+    parent = create_interaction_with_response(
+        tokenizer,
+        [{"role": "user", "content": "Hello"}],
+        parent=None,
+        tools=[WEATHER_TOOL],
+        output_message_list=[{"role": "assistant", "content": "answer"}],
+        response_content="answer",
+    )
+    remaining = [{"role": "user", "content": "Continue"}]
+
+    actual = concat_prompt_token_ids_with_parent(
+        remaining, parent=parent, tokenizer=tokenizer, tools=iter([WEATHER_TOOL])
+    )
+    expected = concat_prompt_token_ids_with_parent(
+        remaining, parent=parent, tokenizer=tokenizer, tools=[WEATHER_TOOL]
+    )
+
+    assert actual == expected
+
+
+def test_concat_parent_template_without_eos_rejects_ambiguous_boundary(
+    tokenizer, monkeypatch
+):
+    """Unsupported templates must fail instead of silently duplicating history."""
+    parent = create_interaction_with_response(
+        tokenizer,
+        [{"role": "user", "content": "Hello"}],
+        parent=None,
+        output_message_list=[{"role": "assistant", "content": "answer"}],
+        response_content="answer",
+    )
+    monkeypatch.setattr(
+        "areal.experimental.openai.client.apply_chat_template", lambda *a, **kw: [1, 2]
+    )
+
+    with pytest.raises(RuntimeError, match="parent chat template contains no EOS"):
+        concat_prompt_token_ids_with_parent(
+            [{"role": "user", "content": "Continue"}],
+            parent=parent,
+            tokenizer=tokenizer,
+        )
 
 
 class TestConcatPromptTokenIds:

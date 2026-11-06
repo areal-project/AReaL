@@ -58,6 +58,7 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         super().__init__(*args, **kwargs)
         self._apply_reward_discount_called = False
         self._total_reward = 0.0
+        self._last_task_reward_id: str | None = None
         self._lock = threading.Lock()
 
     def __deepcopy__(self, memo):
@@ -86,6 +87,11 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
     @property
     def total_reward(self) -> float:
         return self._total_reward
+
+    @property
+    def reward_discount_applied(self) -> bool:
+        """Whether scalar rewards have already been propagated backward."""
+        return self._apply_reward_discount_called
 
     def set_reward(self, interaction_id: str, reward: float) -> None:
         """Set reward for a specific completion/response by its ID."""
@@ -176,7 +182,9 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
 
     def set_last_reward(self, reward: float) -> None:
         """Set reward for the most recent completion/response."""
-        self.set_reward(self.last_interaction_id, reward)
+        interaction_id = self.last_interaction_id
+        self.set_reward(interaction_id, reward)
+        self._last_task_reward_id = interaction_id
 
     def assign_episode_reward(self, reward: float) -> None:
         """Score disjoint exported concat segments with one episode return.
@@ -192,11 +200,18 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         if not any(leaf.reward is None for leaf in self.values()):
             return
 
-        if not self._can_assign_episode_reward(reward):
+        rejection = self._episode_reward_rejection(reward)
+        if rejection is not None:
+            reason, leaf_id, interaction_id = rejection
             logger.warning(
                 "Session %s has ambiguous or explicitly scored branches; "
-                "leaving missing rewards unchanged.",
+                "leaving missing rewards unchanged. "
+                "reason=%s leaf=%s interaction=%s exported_leaves=%d",
                 self._session_id,
+                reason,
+                str(leaf_id)[:80],
+                str(interaction_id)[:80],
+                len(self),
             )
             return
 
@@ -214,34 +229,48 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
 
     def _can_assign_episode_reward(self, reward: float) -> bool:
         """Check that disjoint concat chains permit episode-level scoring."""
-        seen_ids: set[str] = set()
+        return self._episode_reward_rejection(reward) is None
+
+    def _episode_reward_rejection(
+        self, reward: float
+    ) -> tuple[str, str | None, str | None] | None:
+        """Identify an unsafe branch without logging messages or image payloads."""
+        seen_ids: dict[str, int] = {}
         for leaf in self.values():
             current = leaf
+            path_objects: set[int] = set()
             while current is not None:
                 interaction_id = current.interaction_id
-                if interaction_id is None or interaction_id in seen_ids:
-                    return False
-                if (
-                    current.output_message_list is None
-                    or current.chat_template_type != "concat"
-                ):
-                    return False
-                if current.token_rewards is not None:
-                    return False
-                if current is not leaf and current.reward is not None:
-                    return False
-                if any(
-                    score is not None and score != reward
-                    for score in (
-                        current.reward,
-                        current.original_reward,
-                        current.rollout_reward,
+                object_id = id(current)
+                reason = None
+                if object_id in path_objects:
+                    reason = "cycle"
+                elif interaction_id is None:
+                    reason = "missing_id"
+                elif interaction_id in seen_ids:
+                    reason = (
+                        "shared_ancestor"
+                        if seen_ids[interaction_id] == object_id
+                        else "duplicate_id"
                     )
-                ):
-                    return False
-                seen_ids.add(interaction_id)
+                elif current.output_message_list is None:
+                    reason = "incomplete"
+                elif current.chat_template_type != "concat":
+                    reason = "non_concat"
+                if reason is not None:
+                    return reason, leaf.interaction_id, interaction_id
+                if current.token_rewards is not None:
+                    return "token_rewards", leaf.interaction_id, interaction_id
+                if current is not leaf and current.reward is not None:
+                    return "ancestor_reward", leaf.interaction_id, interaction_id
+                for name in ("reward", "original_reward", "rollout_reward"):
+                    score = getattr(current, name)
+                    if score is not None and score != reward:
+                        return f"{name}_conflict", leaf.interaction_id, interaction_id
+                seen_ids[interaction_id] = object_id
+                path_objects.add(object_id)
                 current = current.parent
-        return True
+        return None
 
     def _invalidate_tensor_caches_from(
         self, interaction: InteractionWithTokenLogpReward
@@ -482,6 +511,17 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
 
                 current_reward = current_reward * turn_discount + interaction.reward
                 interaction.reward = current_reward
+                if interaction._cache is not None:
+                    # Discount changes returns, not the recorded task score.
+                    cached_reward = interaction._cache.get("rewards")
+                    interaction._cache = {
+                        **interaction._cache,
+                        "rewards": (
+                            cached_reward.new_tensor([current_reward])
+                            if cached_reward is not None
+                            else torch.tensor([current_reward])
+                        ),
+                    }
         return dict(**self)
 
     def __setitem__(
@@ -642,7 +682,8 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         children). No reward propagation is performed here.
 
         When ``style='individual'``, all cached completions/responses are returned as-is
-        without constructing the tree.
+        without constructing the tree. Training callers should use the rollout
+        finalizer to apply response-validation policy before reward discounting.
 
         Parameters
         ----------
@@ -731,5 +772,6 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
                 for id, interaction in complete_cache.items()
                 if id not in has_children
             }
+
         elif style == "individual":
             return dict(**complete_cache)

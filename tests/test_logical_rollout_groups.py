@@ -245,8 +245,12 @@ async def test_rollout_time_normalization_preserves_row_rewards_and_cache(explic
 
 def test_actor_penalizes_rows_but_transforms_explicit_reference_without_length_penalty():
     actor = _actor(direct=False)
-    actor.reward_norm = _norm()
-    actor.reward_bias, actor.reward_scaling, actor.reward_clip = 1.0, 2.0, 8.0
+    actor.advantage_fn.reward_norm = _norm()
+    (
+        actor.advantage_fn.reward_bias,
+        actor.advantage_fn.reward_scaling,
+        actor.advantage_fn.reward_clip,
+    ) = 1.0, 2.0, 8.0
     actor.config.overlong_reward_penalty = True
     actor.config.overlong_tokens = 2
     actor.config.overlong_penalty_factor = 1.0
