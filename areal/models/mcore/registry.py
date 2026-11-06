@@ -14,6 +14,7 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig as MCoreDDPConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 from transformers import AutoConfig, PretrainedConfig
 
@@ -404,6 +405,25 @@ def make_mcore_layer_specs(hf_config: PretrainedConfig, tf_config: TransformerCo
         )
 
 
+def _configure_attention_backend(
+    model_config: TransformerConfig, engine_config: MegatronEngineConfig
+) -> None:
+    if engine_config.attention_backend is None:
+        return
+    model_config.attention_backend = AttnBackend[engine_config.attention_backend]
+    logger.info(
+        "Training attention_backend set to %s.", engine_config.attention_backend
+    )
+    if (
+        model_config.attention_backend == AttnBackend.flash
+        and getattr(model_config, "context_parallel_size", 1) > 1
+    ):
+        from areal.models.mcore.flash_attention_compat import patch_te_flash_attention_3
+
+        if patch_te_flash_attention_3():
+            logger.info("Adapted TE CP calls to the FA3 tuple-window interface.")
+
+
 def make_mcore_model(
     hf_config: PretrainedConfig,
     tf_config: TransformerConfig,
@@ -413,6 +433,10 @@ def make_mcore_model(
     is_critic: bool = False,
     use_lora: bool = False,
 ) -> list[GPTModel | DDP]:
+    if mcore_config is not None:
+        # mbridge and mcore-bridge return their own config as tf_config.
+        # Apply before get_model(), including the direct GPTModel path.
+        _configure_attention_backend(tf_config, mcore_config)
     if mcore_config is not None and mcore_config.mtp_only:
         if bridge_type != "megatron-bridge" or bridge is None:
             raise ValueError("mtp_only requires a megatron-bridge model")
@@ -572,6 +596,7 @@ def make_mcore_model(
         if mcore_config.use_deterministic_algorithms:
             set_deterministic_algorithms(provider, prebuild=True)
 
+        _configure_attention_backend(provider, mcore_config)
         provider.finalize()
 
         if getattr(hf_config, "model_type", None) in (

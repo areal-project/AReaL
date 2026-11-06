@@ -51,6 +51,15 @@ TP2 × DP4, EP8, ETP1, full-layer recomputation, and BF16 model parameters with
 CPU-staged AdamW. Rollout uses DP attention with DP8/EP8 on the same eight GPUs. Saver
 and recovery checkpoint writes are disabled.
 
+The recipe sets `actor.megatron.attention_backend=flash` before model construction to
+avoid the cuDNN fused THD/GQA backward issue observed with Qwen3.5 on the tested stack.
+SFT and RL training share this setting; keep `use_deterministic_algorithms=false` for
+packed Qwen3.5/GDN training. The backend setting also accepts `auto`, `fused`, or
+`unfused`; its default `null` preserves the bridge's selection. Explicit non-Flash
+backends conflict with AReaL's deterministic mode and are rejected. This setting does
+not select a FlashAttention generation or change SGLang rollout's separate
+`attention_backend` setting.
+
 AdamW FP8 publication consumes complete expert matrices from its GPU staging slot. Each
 matrix must fit in `actor.megatron.cpu_staged_offload.bucket_size_mb`; oversized
 matrices fail at binding. Expert-only BF16 parameter buffers are released while FP32

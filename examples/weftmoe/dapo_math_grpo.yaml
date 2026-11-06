@@ -62,6 +62,7 @@ actor:
     type: adam
     warmup_steps: 0
   megatron:
+    attention_backend: flash
     moe_token_dispatcher_type: alltoall
     moe_enable_deepep: false
     use_precision_aware_optimizer: true
