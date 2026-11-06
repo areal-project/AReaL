@@ -52,6 +52,8 @@ LOGGER_COLORS_EXACT = {
     # Workflows - purple
     "RLVRWorkflow": "light_purple",
     "VisionRLVRWorkflow": "light_purple",
+    "PixelReasonerWorkflow": "light_purple",
+    "PixelReasoner": "light_green",
     "MultiTurnWorkflow": "light_purple",
     "MultiTurnV2Workflow": "light_purple",
     # Controllers - white

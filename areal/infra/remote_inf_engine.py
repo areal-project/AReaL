@@ -1278,6 +1278,7 @@ class RemoteInfEngine(InferenceEngine):
                 : len(req.input_ids) - len(accumulated_output_tokens)
             ],
             input_images=req.image_data,
+            input_videos=req.video_data,
             sampler_head_ids=accumulated_head_ids
             if gconfig.score_centering_top_k
             else None,

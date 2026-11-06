@@ -61,6 +61,11 @@ class VLLMBackend:
     ) -> HttpRequest:
         """Build vLLM generation request."""
         gconfig = req.gconfig
+        if req.video_data is not None:
+            raise NotImplementedError(
+                "ModelRequest.video_data is currently wired only to SGLang. "
+                "The AReaL vLLM adapter does not transport this field yet."
+            )
         if gconfig.score_centering_top_k:
             raise ValueError("Score-centering sampler heads currently require SGLang.")
         stop_token_ids = gconfig.stop_token_ids
