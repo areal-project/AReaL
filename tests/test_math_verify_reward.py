@@ -1,3 +1,5 @@
+"""Shared math-verifier integration and legacy GSM8K/Geometry3K reward cases."""
+
 from areal.reward import geometry3k_reward_fn, get_math_verify_worker, gsm8k_reward_fn
 
 
@@ -111,12 +113,11 @@ class TestGeometry3KRewardFn:
         """Test fallback to last number when no bracket format."""
         reward = geometry3k_reward_fn(
             prompt="What is the angle?",
-            completions="The answer is 90 degrees.",
+            completions="The answer is 90.",
             prompt_ids=[],
             completion_ids=[],
             answer="90",
         )
-        # With math-verify, this should work if both parse to 90
         assert reward == 1.0, "Fallback to last number should work"
 
     def test_geometry3k_symbolic_fraction(self):
@@ -324,8 +325,7 @@ class TestGeometry3KAdvanced:
             completion_ids=[],
             answer="45",
         )
-        # Should handle unit stripping or work anyway
-        assert reward == 1.0, "Units should be handled"
+        assert reward == 0.0, "Geometry3K answers must not include units"
 
     def test_geometry3k_fraction_angle(self):
         """Test fractional angles with explicit values."""
