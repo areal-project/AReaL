@@ -31,6 +31,65 @@ from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
 logger = init_logger("vllm_worker_extension")
 
 
+def restore_offloaded_weights(worker) -> bool:
+    """Map vLLM's slept weight pool back onto the GPU.
+
+    Colocation sleeps the rollout (level 1) before the disk reload, so the
+    weight allocations are unmapped and only a CPU backup remains. Writing
+    them in that state raises ``CUDA error: invalid argument``. Returns True
+    when this call performed the wake and the caller must offload again.
+    """
+    del worker
+    try:
+        from vllm.device_allocator.cumem import CuMemAllocator
+    except Exception:
+        return False
+    try:
+        allocator = CuMemAllocator.get_instance()
+    except Exception:
+        return False
+    if not any(
+        data.tag == "weights" and data.cpu_backup_tensor is not None
+        for data in allocator.pointer_to_data.values()
+    ):
+        return False
+    allocator.wake_up(tags=["weights"])
+    return True
+
+
+def offload_weights_tag(worker) -> None:
+    """Offload only the weight pool, leaving an already-discarded KV pool alone."""
+    del worker
+    import ctypes
+    import gc
+
+    import torch
+    from vllm.device_allocator.cumem import CuMemAllocator, unmap_and_release
+    from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+    from vllm.utils.platform_utils import is_pin_memory_available
+
+    allocator = CuMemAllocator.get_instance()
+    runtime = CudaRTLibrary()
+    for ptr, data in allocator.pointer_to_data.items():
+        if data.tag != "weights" or data.cpu_backup_tensor is not None:
+            continue
+        size_in_bytes = data.handle[1]
+        backup = torch.empty(
+            size_in_bytes,
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=is_pin_memory_available(),
+        )
+        runtime.cudaMemcpy(
+            ctypes.c_void_p(backup.data_ptr()),
+            ctypes.c_void_p(ptr),
+            size_in_bytes,
+        )
+        data.cpu_backup_tensor = backup
+        unmap_and_release(data.handle)
+    gc.collect()
+
+
 class VLLMWorkerExtension:
     """
     Iherited from vllm codebase
@@ -65,33 +124,41 @@ class VLLMWorkerExtension:
 
     def areal_update_weights(self, model_path):
         logger.info(f"start update weights, {model_path}", flush=True)
+        # Disk reload runs while colocation has the rollout asleep. Wake the
+        # weight pool for the copy, then offload it again so the actor keeps
+        # the card. A full executor wake would also bring the KV cache back.
+        resleep = restore_offloaded_weights(self)
         try:
-            if self._areal_needs_layerwise_reload():
-                # reload_weights re-runs process_weights_after_loading (the aiter MoE
-                # shuffle) and copies the result into the original storage.
-                with (
-                    torch.device(self.model_runner.device),
-                    set_current_vllm_config(self.model_runner.vllm_config),
-                ):
-                    self.model_runner.reload_weights(weights_path=model_path)
-            else:
-                self.model_runner.model_config.model = model_path
-                model_loader = get_model_loader(
-                    self.model_runner.vllm_config.load_config
-                )
-                logger.info("Reloading weights inplace...")
-                with set_current_vllm_config(self.model_runner.vllm_config):
-                    model_loader.load_weights(
-                        self.model_runner.model,
-                        model_config=self.model_runner.model_config,
+            try:
+                if self._areal_needs_layerwise_reload():
+                    # reload_weights re-runs process_weights_after_loading (the aiter
+                    # MoE shuffle) and copies the result into the original storage.
+                    with (
+                        torch.device(self.model_runner.device),
+                        set_current_vllm_config(self.model_runner.vllm_config),
+                    ):
+                        self.model_runner.reload_weights(weights_path=model_path)
+                else:
+                    self.model_runner.model_config.model = model_path
+                    model_loader = get_model_loader(
+                        self.model_runner.vllm_config.load_config
                     )
-            self.sync()
+                    logger.info("Reloading weights inplace...")
+                    with set_current_vllm_config(self.model_runner.vllm_config):
+                        model_loader.load_weights(
+                            self.model_runner.model,
+                            model_config=self.model_runner.model_config,
+                        )
+                self.sync()
 
-            return True, "Success"
-        except Exception as e:
-            error_msg = f"failed to upload weights! {e}"
-            logger.error(error_msg)
-            return False, error_msg
+                return True, "Success"
+            except Exception as e:
+                error_msg = f"failed to upload weights! {e}"
+                logger.error(error_msg)
+                return False, error_msg
+        finally:
+            if resleep:
+                offload_weights_tag(self)
 
     def areal_update_weights_lora(
         self,
