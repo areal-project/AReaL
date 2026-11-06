@@ -79,6 +79,8 @@ def _run_until_provider_finalize(
     freeze_vision_model: bool | None = None,
     freeze_vision_projection: bool | None = None,
     model_type: str | None = None,
+    dispatcher: str = "alltoall",
+    deepep: bool = False,
 ) -> None:
     pytest.importorskip("mbridge")
     pytest.importorskip("megatron.core")
@@ -86,6 +88,8 @@ def _run_until_provider_finalize(
 
     tf_config = SimpleNamespace(params_dtype=None)
     mcore_config = _make_mcore_config(deterministic=deterministic)
+    mcore_config.moe_token_dispatcher_type = dispatcher
+    mcore_config.moe_enable_deepep = deepep
     mcore_config.freeze_vision_model = freeze_vision_model
     mcore_config.freeze_vision_projection = freeze_vision_projection
 
@@ -297,3 +301,13 @@ def test_megatron_bridge_enables_native_mtp_gradient_isolation():
         )
 
     assert provider.mtp_detach_heads is True
+
+
+@pytest.mark.parametrize("dispatcher,deepep", [("alltoall", False), ("flex", True)])
+def test_megatron_bridge_honors_expert_dispatcher(dispatcher, deepep):
+    provider = _make_provider(attention_backend=object())
+    _run_until_provider_finalize(
+        provider, deterministic=False, dispatcher=dispatcher, deepep=deepep
+    )
+    assert provider.moe_token_dispatcher_type == dispatcher
+    assert provider.moe_enable_deepep is deepep

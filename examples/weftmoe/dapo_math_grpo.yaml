@@ -1,0 +1,129 @@
+defaults:
+  - ../cpu_staged_offload/dapo-math_grpo_qwen3_5_cpu_staged@_global_
+  - _self_
+
+experiment_name: weftmoe-qwen35b-dapo-math
+trial_name: ${oc.env:WEFTMOE_TRIAL,bf16}
+total_train_epochs: 1
+total_train_steps: 20
+allocation_mode: "megatron[actor]:(attn:d4p1t2c1|ffn:d1e8)|sglang[rollout]:d1t8p1"
+
+scheduler:
+  type: ray
+
+rollout:
+  backend: "sglang:d1t8p1"
+  setup_timeout: 1800.0
+  max_concurrent_rollouts: 32
+  consumer_batch_size: 32
+  queue_size: 64
+  max_head_offpolicyness: 1
+  scheduling_strategy:
+    type: colocation
+    target: actor
+    fork: false
+  scheduling_spec:
+    - task_type: worker
+      port_count: 3
+      gpu: 8
+      cpu: 16
+      mem: 128
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        AREAL_USE_WEFTMOE: ${oc.env:AREAL_USE_WEFTMOE,1}
+        WEFTMOE_FP8: ${oc.env:WEFTMOE_FP8,0}
+        WEFTMOE_TENSOR_EXTENSION: ${oc.env:WEFTMOE_TENSOR_EXTENSION,""}
+        WEFTMOE_AUTOTUNE_TABLE: ""
+        WEFTMOE_STATIC_RING_TOKENS: "2048"
+        WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS: "2"
+        WEFTMOE_PF_MIN_RING_DEPTH: "2"
+        WEFTMOE_PF_CREDIT_WINDOWS: "2"
+        WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS: "0"
+        NCCL_NVLS_ENABLE: "0"
+        NCCL_CUMEM_ENABLE: "1"
+        PYTORCH_CUDA_ALLOC_CONF: ""
+        PYTORCH_ALLOC_CONF: ""
+        SGLANG_MEMORY_SAVER_CUDA_GRAPH: "1"
+
+gconfig:
+  n_samples: 16
+  max_new_tokens: 16384
+  max_tokens: 16383
+  temperature: 1.0
+  top_p: 1.0
+
+actor:
+  path: ${oc.env:WEFTMOE_MODEL_PATH,Qwen/Qwen3.5-35B-A3B-Base}
+  mb_spec:
+    n_mbs: 1
+    max_tokens_per_mb: 16384
+    n_mbs_divisor: 1
+  optimizer:
+    type: adam
+    warmup_steps: 0
+  megatron:
+    moe_token_dispatcher_type: alltoall
+    moe_enable_deepep: false
+    use_precision_aware_optimizer: true
+    cpu_staged_offload:
+      enabled: true
+      buffer_count: 1
+      bucket_size_mb: 128
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    disable_grad_buffers_cpu_backup: true
+    async_save: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    recompute_modules: null
+  scheduling_strategy:
+    type: separation
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 64
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        AREAL_USE_WEFTMOE: ${oc.env:AREAL_USE_WEFTMOE,1}
+        WEFTMOE_FP8: ${oc.env:WEFTMOE_FP8,0}
+        WEFTMOE_TENSOR_EXTENSION: ${oc.env:WEFTMOE_TENSOR_EXTENSION,""}
+        WEFTMOE_AUTOTUNE_TABLE: ""
+        WEFTMOE_STATIC_RING_TOKENS: "2048"
+        WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS: "2"
+        WEFTMOE_PF_MIN_RING_DEPTH: "2"
+        WEFTMOE_PF_CREDIT_WINDOWS: "2"
+        NCCL_NVLS_ENABLE: "0"
+        NCCL_CUMEM_ENABLE: "1"
+        CUDA_DEVICE_MAX_CONNECTIONS: "1"
+        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+sglang:
+  context_length: 16400
+  mem_fraction_static: 0.7
+  dp_size: 8
+  ep_size: 8
+  enable_dp_attention: true
+  max_running_requests: 512
+  cuda_graph_max_bs: 64
+  max_prefill_tokens: 32768
+  chunked_prefill_size: -1
+
+train_dataset:
+  batch_size: 32
+  max_length: 2048
+  num_workers: 0
+
+recover:
+  mode: disabled
+  freq_steps: null
+  freq_epochs: null
+  freq_secs: null
+
+memory_profiler:
+  profile_steps: []
