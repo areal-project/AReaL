@@ -23,23 +23,6 @@ from areal.workflow.rlvr import RLVRWorkflow
 logger = logging.getLogger("VisionRLVRWorkflow")
 
 
-def _infer_mm_token_type_ids(processor: Any, input_ids: torch.Tensor):
-    """Build modality IDs (0 text, 1 image, 2 video) from placeholder tokens.
-
-    Matches what Qwen-VL processors return from transformers 5.3 onward, for
-    older processors that do not return ``mm_token_type_ids``.
-    """
-    image_token_id = getattr(processor, "image_token_id", None)
-    if image_token_id is None:
-        return None
-    token_types = torch.zeros_like(input_ids)
-    token_types[input_ids == image_token_id] = 1
-    video_token_id = getattr(processor, "video_token_id", None)
-    if video_token_id is not None:
-        token_types[input_ids == video_token_id] = 2
-    return token_types
-
-
 class VisionRLVRWorkflow(RLVRWorkflow):
     def __init__(
         self,
@@ -58,6 +41,23 @@ class VisionRLVRWorkflow(RLVRWorkflow):
         if isinstance(processor, str):
             processor = AutoProcessor.from_pretrained(processor)
         self.processor = processor
+
+    @staticmethod
+    def _infer_mm_token_type_ids(processor: Any, input_ids: torch.Tensor):
+        """Build modality IDs (0 text, 1 image, 2 video) from placeholder tokens.
+
+        Matches what Qwen-VL processors return from transformers 5.3 onward, for
+        older processors that do not return ``mm_token_type_ids``.
+        """
+        image_token_id = getattr(processor, "image_token_id", None)
+        if image_token_id is None:
+            return None
+        token_types = torch.zeros_like(input_ids)
+        token_types[input_ids == image_token_id] = 1
+        video_token_id = getattr(processor, "video_token_id", None)
+        if video_token_id is not None:
+            token_types[input_ids == video_token_id] = 2
+        return token_types
 
     @trace_session("reward")
     async def _compute_rewards(
@@ -154,7 +154,7 @@ class VisionRLVRWorkflow(RLVRWorkflow):
         input_ids: list[int] = processed_input["input_ids"].tolist()[0]
         token_types = processed_input.get("mm_token_type_ids")
         if token_types is None:
-            token_types = _infer_mm_token_type_ids(
+            token_types = self._infer_mm_token_type_ids(
                 self.processor, processed_input["input_ids"]
             )
         mm_token_type_ids = token_types.tolist()[0] if token_types is not None else None
