@@ -636,35 +636,42 @@ def test_single_teacher_m2_filtering_preserves_loss_and_gradient_across_microbat
                 ),
             )
 
-    # Both legacy KD branches retain the stale first token after RL rejection.
+    # The joint KD term keeps the post-M2 mask after RL rejection; pure KD runs
+    # through the policy loss, so it shares the RL mask and PPO clipping.
     teacher_mask = torch.tensor([[1, 1, 0], [0, 0, 0]], dtype=torch.bool)
     rl_mask = teacher_mask.clone()
     if reject_stale_tokens:
         rl_mask[0, 0] = False
     n_tokens = original_mask.count_nonzero()
     detached_logprobs = logprobs.detach()
+    # Surviving rejection-weighted tokens have proximal and behavior logp 0;
+    # without rejection, PPO uses its proximal ratio.
+    ratio = (detached_logprobs - proximal_logp).exp()
     if rl_loss_weight == 0:
-        teacher_terms = detached_logprobs.exp() * (detached_logprobs - teacher_logp)
+        # The reverse-KL reward is the advantage of the clipped PPO surrogate.
+        advantages = (teacher_logp - detached_logprobs) * teacher_mask
+        unclipped = -advantages * ratio
+        clipped = -advantages * ratio.clamp(0.8, 1.2)
         expected_loss = (
-            distill_loss_weight * (teacher_terms * teacher_mask).sum() / n_tokens
+            distill_loss_weight
+            * (torch.maximum(unclipped, clipped) * rl_mask).sum()
+            / n_tokens
         )
-        # The legacy pure-KD surrogate detaches the score reward.
         expected_gradient = (
-            distill_loss_weight * teacher_terms * teacher_mask / n_tokens
+            distill_loss_weight
+            * torch.where(rl_mask & (unclipped >= clipped), unclipped, 0.0)
+            / n_tokens
         )
     else:
-        # Surviving rejection-weighted tokens have proximal and behavior logp 0;
-        # without rejection, PPO uses its proximal ratio. Neither case clips.
-        ratio = (detached_logprobs - proximal_logp).exp()
+        # RL advantages are positive and below the clip bound, so RL never clips.
         rl_terms = -ratio * rl_mask
+        log_ratio = detached_logprobs - teacher_logp
         expected_loss = (
             rl_loss_weight * rl_terms.sum()
-            + distill_loss_weight
-            * ((detached_logprobs - teacher_logp) * teacher_mask).sum()
+            + distill_loss_weight * (0.5 * log_ratio.square() * teacher_mask).sum()
         ) / n_tokens
         expected_gradient = (
-            rl_loss_weight * rl_terms
-            + distill_loss_weight * teacher_mask.to(logprobs.dtype)
+            rl_loss_weight * rl_terms + distill_loss_weight * log_ratio * teacher_mask
         ) / n_tokens
 
     full_loss = evaluate(slice(None))
