@@ -64,6 +64,16 @@ python -m examples.autopilot.revising --demo --target optimizer \
 [DeepSeek 接口](https://api-docs.deepseek.com/)与
 [JSON Output](https://api-docs.deepseek.com/guides/json_mode/)。
 
+## Workload 变化触发 Revision
+
+```bash
+python -m examples.autopilot.elastic.simulate_revision --demo --output /tmp/elastic-revision-demo
+```
+
+`revision-example.json` 配置检测窗口、阈值、评测范围和修订预算。此演示使用显式 CPU 公式、重复查询的初态 Optimizer 和本地受控
+proposer。结果及每轮材料写入输出目录。Revision 同步执行，墙钟耗时另行记录。实际场景使用 `--profile`、`--workload`，以及
+`--model-settings` 或 `--agent-command`。
+
 ## 原生训练
 
 使用[任务工作流](../../task_workflows/README.md)或[Hermes 示例](../../hermes/README.md)启动原生

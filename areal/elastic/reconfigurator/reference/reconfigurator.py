@@ -42,7 +42,6 @@ class OnlineReconfiguratorConfig:
     decision_delay_seconds: float
     minimum_completed_requests: int
     max_evaluations: int
-    optimize_search: bool = True
     deduplicate_searches: bool = True
     pressure_request_fraction: float = 0.8
     slack_request_fraction: float = 0.9
@@ -233,10 +232,6 @@ class OnlineReconfigurator:
         layouts = candidates[: cfg.max_evaluations]
         if cfg.independent_role_history and len(layouts) == 1:
             return keep("No alternative layout under role history constraints", trigger)
-        evaluate_many = getattr(evaluator, "evaluate_many", None)
-        if hasattr(evaluator, "optimizer"):
-            evaluator.optimizer = self.optimizer
-        search = getattr(evaluator, "search", None)
         preferred = ()
         if historical and self._winners and (self.forecaster.features is not None):
             preferred = (
@@ -245,94 +240,38 @@ class OnlineReconfigurator:
                     key=lambda row: row[0].distance(self.forecaster.features),
                 )[1],
             )
-        predictions = (
-            tuple(
-                search(view, forecasts, layouts, preferred=preferred, trigger=trigger)
+        predictions = tuple(
+            self.optimizer.search(
+                evaluator,
+                view,
+                forecasts,
+                layouts,
+                preferred=preferred,
+                trigger=trigger,
             )
-            if historical and cfg.optimize_search and (search is not None)
-            else tuple(evaluate_many(view, forecasts, layouts))
-            if evaluate_many is not None
-            else tuple(evaluator.evaluate(view, forecasts, c) for c in layouts)
         )
-        expected = predictions[0].work_ids
-        runnable = [
-            p
-            for p in predictions
-            if p.supported
-            and p.work_ids == expected
-            and (p.worst_request_fraction is not None)
-            and (p.mean_gpu_seconds is not None)
-        ]
-        eligible = [
-            p
-            for p in runnable
-            if p.worst_request_fraction + 1e-12 >= slo.minimum_request_fraction
-        ]
-        if historical:
-            current = next((p for p in runnable if p.layout == view.layout), None)
-            if not runnable:
-                return keep(
-                    "No executable candidate with verified Actor capacity",
-                    trigger,
-                    predictions,
-                    seeds,
-                )
-            best = self.optimizer.select(
-                predictions, view.layout, slo.minimum_request_fraction, trigger=trigger
-            )
-            if best is None:
-                return keep(
-                    "No scored candidate; retain current deployment",
-                    trigger,
-                    predictions,
-                    seeds,
-                )
-            if meets_target(best, slo.minimum_request_fraction):
-                reason = (
-                    "Minimum switching plus fixed-window GPU cost among SLO-target and sustainable-Actor candidates; "
-                    + (
-                        "current excluded when a feasible replacement exists"
-                        if trigger == "pressure"
-                        else "current included under slack"
-                    )
-                )
-            elif trigger == "slack":
-                reason = "No SLO-target and sustainable-Actor candidate under slack; retain current deployment"
-            else:
-                reason = "Best executable request fraction, then minimum credit deficit and switching plus fixed-window GPU cost; SLO/capacity target remains unmet"
-            if self.forecaster.features is not None:
-                self._winners = (
-                    self._winners + [(self.forecaster.features, best.layout)]
-                )[-16:]
-            return OnlineDecision(
-                view.now,
-                trigger,
-                best.layout,
-                predictions,
-                seeds,
-                stats,
-                time.perf_counter() - started,
-                reason,
-                evidence,
-                self.forecaster.features,
-                current.window_gpu_seconds - best.window_gpu_seconds
-                if current
-                and current.window_gpu_seconds is not None
-                and (best.window_gpu_seconds is not None)
-                else None,
-                current.mean_gpu_seconds - best.mean_gpu_seconds if current else None,
-            )
-        if not eligible:
+        best = self.optimizer.select(
+            predictions, view.layout, slo.minimum_request_fraction, trigger=trigger
+        )
+        if best is None:
             return keep(
-                "No predicted SLO-feasible candidate; continue serving current deployment",
+                "No scored candidate; retain current deployment",
                 trigger,
                 predictions,
                 seeds,
             )
-        best = min(
-            eligible,
-            key=lambda p: (p.mean_gpu_seconds, p.layout != view.layout, p.layout),
+        current = next(
+            (p for p in predictions if p.layout == view.layout and p.supported), None
         )
+        if meets_target(best, slo.minimum_request_fraction):
+            reason = "Minimum predicted GPU cost among SLO-target and sustainable-Actor candidates"
+        elif trigger == "slack":
+            reason = "No SLO-target and sustainable-Actor alternative; retain current deployment"
+        else:
+            reason = "Best executable request fraction, then minimum Actor-supply deficit and GPU cost. SLO/capacity target remains unmet"
+        features = self.forecaster.features if historical else None
+        if features is not None:
+            self._winners = (self._winners + [(features, best.layout)])[-16:]
         return OnlineDecision(
             view.now,
             trigger,
@@ -341,7 +280,17 @@ class OnlineReconfigurator:
             seeds,
             stats,
             time.perf_counter() - started,
-            "Minimum predicted GPU seconds among SLO-feasible sampled continuations",
+            reason,
+            evidence,
+            features,
+            current.window_gpu_seconds - best.window_gpu_seconds
+            if current
+            and current.window_gpu_seconds is not None
+            and best.window_gpu_seconds is not None
+            else None,
+            current.mean_gpu_seconds - best.mean_gpu_seconds
+            if current and current.mean_gpu_seconds is not None
+            else None,
         )
 
     def make_evaluator(self, *args, **kwargs):
@@ -626,16 +575,8 @@ class OnlineReconfigurator:
             job.validation,
             view.layout,
             sim.slo.minimum_request_fraction,
-            trigger=job.decision.trigger
-            if isinstance(self.forecaster, HistoricalReplay)
-            else "slack",
+            trigger=job.decision.trigger,
         )
-        if (
-            not isinstance(self.forecaster, HistoricalReplay)
-            and best is not None
-            and (best.worst_request_fraction + 1e-12 < sim.slo.minimum_request_fraction)
-        ):
-            best = None
         if best is None or best.layout == view.layout:
             self.finish(
                 "retained",

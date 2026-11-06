@@ -5,7 +5,7 @@
 from pathlib import Path
 
 
-def proposal_context(target):
+def proposal_context(target, *, workload_change=None, objective=None):
     """Supply target-specific instructions and reference source for the Agent."""
     reference_files = [
         "elastic/contracts.py",
@@ -42,7 +42,7 @@ def proposal_context(target):
         raise ValueError("Online revision target must be evaluator or optimizer")
 
     source_root = Path(__file__).resolve().parents[3]
-    return {
+    context = {
         "factory": factory,
         "instructions": instructions,
         "reference_sources": {
@@ -50,3 +50,15 @@ def proposal_context(target):
             for name in reference_files
         },
     }
+    if workload_change is not None:
+        context["workload_change"] = workload_change
+    if objective is not None:
+        context["objective"] = objective
+        context["instructions"] += (
+            " The objective specifies complete outer Simulation evaluation. "
+            "Service success and training progress are checked per case. "
+            "GPU seconds are compared first; at tied GPU cost, fewer Evaluator "
+            "queries count as an improvement. Use the observed workload change "
+            "and earlier revision outcomes to guide the search implementation."
+        )
+    return context

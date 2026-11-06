@@ -1,0 +1,58 @@
+{
+  "description": "Controlled CPU revision demonstration using explicit synthetic component formulas and an initially redundant Optimizer",
+  "input_closes_at": 480,
+  "initial_layout": {"actor_dp": 2, "actor_tp": 1, "rollout_replicas": 2, "rollout_tp": 1},
+  "assembly": {
+    "replay": {
+      "history_seconds": 30,
+      "feature_window_seconds": 30,
+      "change_ratio": 0.5,
+      "change_checks": 2,
+      "initial_regime_seconds": 30,
+      "max_new_tokens": 32
+    }
+  },
+  "trigger": {
+    "window_seconds": 120,
+    "check_interval_seconds": 10,
+    "relative_change": 0.15,
+    "change_checks": 3,
+    "cooldown_seconds": 120,
+    "minimum_length_samples": 30,
+    "noise_multiplier": 2
+  },
+  "evaluation": {
+    "history_seconds": 120,
+    "horizon_seconds": 120,
+    "samples": 1,
+    "seed": 20261105
+  },
+  "revision": {
+    "max_rounds": 1,
+    "max_queries": 12,
+    "max_seconds": 30,
+    "criteria": {"cost_relative_tolerance": 1e-9, "slo_tolerance": 1e-12}
+  },
+  "demo_workload": {
+    "schema_version": "synthetic-workload-v2",
+    "seed": 20261105,
+    "duration_s": 480,
+    "arrivals": [
+      {"until_s": 240, "rate_per_s": 0.2},
+      {"until_s": 480, "rate_per_s": 2}
+    ],
+    "composition": [{"until_s": 480, "weights": {"short": 1}}],
+    "families": [{
+      "name": "short",
+      "prompt": {"median": 16, "sigma": 0, "minimum": 16, "maximum": 16},
+      "output": {"median": 4, "sigma": 0, "minimum": 4, "maximum": 4},
+      "tool_output": {"median": 1, "sigma": 0, "minimum": 1, "maximum": 1},
+      "tool_work": {"median": 1, "sigma": 0, "minimum": 1, "maximum": 1},
+      "mean_turns": 1,
+      "max_turns": 1,
+      "tool_type": "python",
+      "tool_reference": "synthetic-python-work-v1",
+      "message_overhead_tokens": 0
+    }]
+  }
+}

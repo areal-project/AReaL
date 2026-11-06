@@ -5,6 +5,7 @@
 import json
 import os
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -19,6 +20,102 @@ from areal.autopilot.domains.elastic.evaluation.evaluator import (
 from areal.autopilot.revision.execution import load_module
 from areal.elastic.contracts import CandidateWave
 from areal.elastic.serving import ServingSLO
+
+
+def run_optimizer_search(source, ports, settings, runner, directory):
+    """Run frozen searches in the child, serving their Evaluator calls here."""
+    from areal.elastic.contracts import CandidatePrediction, OnlineLayout
+    from areal.elastic.reconfigurator.reference.optimizer import SearchBound
+
+    begun, finished = set(), {}
+
+    def simulate(message):
+        index = message["case"]
+        if type(index) is not int or not 0 <= index < len(ports):
+            raise ValueError("Unknown Online case")
+        port, case = ports[index], ports[index].problem
+        operation = message["operation"]
+        if operation == "start":
+            if index in begun:
+                return port.reject("Search case started twice")
+            begun.add(index)
+            port.started = time.monotonic()
+            return dict(
+                context_id=port.context_id,
+                historical=port.historical,
+                slo=asdict(port.slo),
+                parallel_available=port.parallel_available,
+            )
+        if index not in begun:
+            return port.reject("Search queried before starting its case")
+        if operation == "order":
+            return {
+                "order": [
+                    (i, asdict(layout))
+                    for i, layout in port.order_candidates(
+                        case.observation,
+                        case.forecasts,
+                        case.candidates,
+                        case.preferred,
+                    )
+                ]
+            }
+        if operation == "wave":
+            raw = message.get("bound")
+            bound = (
+                None
+                if raw is None
+                else SearchBound(
+                    port.context_id,
+                    raw["target"],
+                    decode(CandidatePrediction, raw["best"]),
+                    raw["fraction_pruning"],
+                )
+            )
+            wave = port.evaluate_wave(
+                case.observation,
+                case.forecasts,
+                tuple(
+                    (i, decode(OnlineLayout, layout))
+                    for i, layout in message["indexed"]
+                ),
+                bound=bound,
+                chunk_size=message.get("chunk_size", 2),
+            )
+            return {"wave": asdict(wave)}
+        if operation == "finish":
+            finished[index] = port.finish(
+                tuple(
+                    decode(CandidatePrediction, value)
+                    for value in message["predictions"]
+                )
+            )
+            return {"finished": True}
+        return port.reject("Unknown configuration Evaluator operation")
+
+    output = runner.run(
+        source,
+        dict(
+            target="optimizer",
+            settings=settings,
+            cases=[asdict(port.problem) for port in ports],
+        ),
+        directory,
+        simulate,
+    )
+    if output.get("error"):
+        raise ValueError(output["error"])
+    if len(output["predictions"]) != len(ports):
+        raise ValueError("Search omitted cases")
+    predictions = []
+    for index, (port, raw) in enumerate(zip(ports, output["predictions"], strict=True)):
+        result = tuple(decode(CandidatePrediction, value) for value in raw)
+        if index not in finished or result != finished[index] or port.violations:
+            raise ValueError(
+                "Search result lacks its completed parent-owned evaluation"
+            )
+        predictions.append(result)
+    return tuple(predictions)
 
 
 def main():

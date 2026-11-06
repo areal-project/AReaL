@@ -32,11 +32,15 @@ def cpu_math_imports():
 
 
 def load_workload(path, tool_seconds_per_unit):
+    rows = (json.loads(line) for line in Path(path).read_text().splitlines())
+    return workload_samples(rows, tool_seconds_per_unit)
+
+
+def workload_samples(rows, tool_seconds_per_unit):
     from areal.elastic.contracts import EpisodeSample, Turn
 
     result = []
-    for line in Path(path).read_text().splitlines():
-        raw = json.loads(line)
+    for raw in rows:
         nodes = raw["nodes"]
         turns = []
         for index in range(0, len(nodes), 2):

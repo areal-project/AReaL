@@ -7,6 +7,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sys
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -27,9 +28,91 @@ def candidate_runner(runner=None):
         or runner.worker_module is not None
     ):
         return runner
-    return replace(
-        runner, worker_module="areal.autopilot.domains.elastic.evaluation.worker"
+    bootstrap = (
+        "import runpy,sys,types;"
+        "package=types.ModuleType('areal');"
+        f"package.__path__=[{str(Path(__file__).resolve().parents[3])!r}];"
+        "sys.modules['areal']=package;"
+        "runpy.run_module('areal.autopilot.domains.elastic.evaluation.worker',run_name='__main__')"
     )
+    return replace(runner, command=(sys.executable, "-c", bootstrap))
+
+
+def optimizer_simulation_cases(
+    view,
+    *,
+    history_seconds=120.0,
+    horizon_seconds=120.0,
+    samples=1,
+    minimum_completed_episodes=1,
+    seed=0,
+    max_new_tokens=32768,
+    unseen_tool_residual_seconds=5.0,
+):
+    """Freeze future replay work sampled exclusively from the observed history."""
+    from areal.autopilot.domains.elastic.contracts import OptimizerSimulationCase
+    from areal.elastic.reconfigurator.reference.forecast import (
+        ForecastConfig,
+        HistoricalForecaster,
+    )
+
+    forecaster = HistoricalForecaster(
+        ForecastConfig(
+            history_seconds,
+            horizon_seconds,
+            samples,
+            minimum_completed_episodes,
+            seed,
+            max_new_tokens,
+            unseen_tool_residual_seconds,
+        )
+    )
+    return tuple(
+        OptimizerSimulationCase(view, workload)
+        for workload in forecaster.predict(view, 0)
+    )
+
+
+def revise_optimizer(
+    agent,
+    benchmark,
+    root,
+    *,
+    initial_source=None,
+    workload_change=None,
+    history_root=None,
+    max_rounds=3,
+):
+    """Run one Optimizer stage with a fixed Evaluator and outer Simulation cases."""
+    from dataclasses import asdict
+
+    objective = dict(
+        evaluation="complete_simulation",
+        constraints=[
+            "Do not reduce SLO success in any case",
+            "Do not reduce completed requests, updates or trained episodes",
+        ],
+        priority=["total_gpu_seconds", "evaluator_queries_at_tied_gpu_cost"],
+        case_count=len(benchmark.cases),
+        max_queries_per_search=benchmark.max_queries,
+        max_seconds_per_search=benchmark.max_seconds,
+        criteria=asdict(benchmark.criteria),
+    )
+    context = proposal_context(
+        "optimizer",
+        workload_change=asdict(workload_change)
+        if workload_change is not None
+        else None,
+        objective=objective,
+    )
+    return RevisionLoop(
+        agent,
+        benchmark,
+        Path(root),
+        initial_source=initial_source,
+        proposal_context=context,
+        history_root=history_root,
+    ).run(max_rounds=max_rounds)
 
 
 class ElasticRevisionBenchmark:

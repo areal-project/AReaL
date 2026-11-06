@@ -81,6 +81,52 @@ class OnlineProblem:
             raise ValueError("Invalid Online search problem")
 
 
+@dataclasses.dataclass(frozen=True)
+class LengthStatistics:
+    count: int
+    mean: float | None
+    variance: float | None
+    cv: float | None
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkloadProfile:
+    started_at: float
+    ended_at: float
+    arrivals: int
+    inputs: LengthStatistics
+    outputs: LengthStatistics
+    mean_turns: float | None = None
+    mean_tool_seconds: float | None = None
+
+    @property
+    def arrival_rate(self):
+        return self.arrivals / max(self.ended_at - self.started_at, 1e-12)
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkloadChange:
+    observed_at: float
+    reference: WorkloadProfile
+    current: WorkloadProfile
+    features: tuple[str, ...]
+    relative_changes: tuple[tuple[str, float], ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class OptimizerSimulationCase:
+    """One observed boundary and frozen workload for paired outer simulations."""
+
+    observation: OnlineObservation
+    workload: Forecast
+
+    def __post_init__(self):
+        if self.observation.busy:
+            raise ValueError("Revision simulation requires a stable execution boundary")
+        if self.workload.input_closes_at <= self.observation.now:
+            raise ValueError("Revision workload must extend beyond its observation")
+
+
 BASELINE_SOURCE = {
     "evaluator": """from areal.autopilot.domains.elastic.evaluation.evaluator import calibrated_cost_models
 

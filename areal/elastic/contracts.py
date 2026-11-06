@@ -307,6 +307,66 @@ class Reconfigurator(Protocol):
     ) -> OnlineDecision: ...
 
 
+@dataclass(frozen=True)
+class ExecutionConfig:
+    """One candidate using AReaL's native backend:parallelism syntax.
+
+    d/t/p/c/e denote data/tensor/pipeline/context/expert parallelism.
+    MoE may use separate attn/ffn layouts; ffn:t denotes Expert TP.
+    None leaves an optional setting for the run/backend to resolve.
+    """
+
+    # fsdp | megatron | archon: dimensions d/t/p/c/e; FSDP requires PP=EP=1.
+    # Hybrid MoE: <backend>:(attn:<d/t/p/c dims>|ffn:<d/t/p/e dims>).
+    # FFN d/t = Expert DP/TP; both layouts share PP and GPU count.
+    actor_backend: str
+    # sglang: dimensions d/t/p; d=replicas, t=TP and p=PP per replica.
+    rollout_backend: str
+
+    # Microbatch count per DP shard; a minimum when a token cap is also set.
+    actor_n_mbs: int | None = 1
+    # Packed-token cap per microbatch, before context-parallel splitting.
+    actor_max_tokens_per_mb: int | None = None
+    # Pad each packed microbatch to its configured token upper bound.
+    actor_pad_to_maximum: bool = False
+    # Sequence parallelism follows the backend's TP configuration.
+    # # Virtual model chunks per physical pipeline stage; 1 disables VPP.
+    # actor_virtual_pipeline_parallel_size: int = 1
+
+    # In-flight rollout workflows; None falls back to consumer_batch_size.
+    rollout_max_concurrent_rollouts: int | None = None
+    # Enable data-parallel attention inside each SGLang instance.
+
+    sglang_enable_dp_attention: bool = False
+    # Internal attention DP degree; used when DP attention is enabled.
+    sglang_dp_size: int = 1
+    # Enable expert parallelism for a MoE model inside each SGLang instance.
+    sglang_enable_ep_moe: bool = False
+    # Internal MoE expert-parallel group size.
+    sglang_ep_size: int = 1
+    # Active-request budget per SGLang instance; None = auto.
+    # DP Attention divides this budget among its internal DP groups.
+    sglang_max_running_requests: int | None = None
+    # Input-token budget for one prefill batch, measured in tokens.
+    sglang_max_prefill_tokens: int = 32768
+    # GPU memory fraction for model weights and KV cache; 0.9 means 90%.
+    sglang_mem_fraction_static: float | None = 0.9
+
+    # Example grid: 32 GPUs (4x8), Actor + Rollout <= 32.
+    # Each cell: (parallel layouts only, all raw parameter combinations).
+    # TP/ETP: 1/2/4/8; PP/CP/EP: 1/2/4/8/16; DP/replicas: positive integers.
+    # Actor n_mbs/token_cap/pad: 4/4/2 choices; rollout concurrency: 4.
+    # SGLang running/prefill/memory: 4/3/3 choices.
+    # Model, batch, memory and physical-placement filters are not applied.
+    # Rollout backend: SGLang.
+    #
+    # | Actor backend | Dense             | MoE                 |
+    # | ------------- | ----------------- | ------------------- |
+    # | FSDP          | (8328, 38375424)   | (17256, 79515648)    |
+    # | Megatron      | (13980, 64419840)  | (171136, 788594688)  |
+    # | Archon        | (13980, 64419840)  | (75638, 348539904)   |
+
+
 # Causal online planning contracts shared by Basic and Reference.
 @dataclass(frozen=True, order=True)
 class OnlineLayout:

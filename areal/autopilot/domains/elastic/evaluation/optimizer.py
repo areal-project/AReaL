@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from areal.autopilot.domains.elastic.contracts import OnlineProblem, decode
 from areal.autopilot.domains.elastic.cycle import (
@@ -155,19 +157,36 @@ class VerifiedOnlineOptimizer:
 
     select = staticmethod(select_prediction)
 
-    def __init__(self, source, settings=None, *, max_queries=64, max_seconds=30):
+    def __init__(
+        self,
+        source,
+        settings=None,
+        *,
+        max_queries=64,
+        max_seconds=30,
+        runner=None,
+        directory=None,
+    ):
         self.source = source
         self.settings = copy.deepcopy(settings or {})
-        self.searcher = load_source(source).build_optimizer(self.settings)
-        if not callable(getattr(self.searcher, "search", None)):
-            raise ValueError(
-                "build_optimizer must return an Online search implementation"
-            )
+        self.runner = candidate_runner(runner) if runner is not None else None
+        self.directory = Path(directory) if directory is not None else None
+        if self.runner is not None and self.directory is None:
+            raise ValueError("Subprocess Optimizer searches need an output directory")
+        if self.runner is None:
+            self.searcher = load_source(source).build_optimizer(self.settings)
+            if not callable(getattr(self.searcher, "search", None)):
+                raise ValueError(
+                    "build_optimizer must return an Online search implementation"
+                )
         self.max_queries, self.max_seconds = max_queries, max_seconds
+        self.searches = self.query_count = 0
+        self.search_wall_seconds = 0.0
 
     def search(
         self, evaluator, view, forecasts, layouts, *, preferred=(), trigger="pressure"
     ):
+        started = time.perf_counter()
         problem = OnlineProblem(
             view, tuple(forecasts), tuple(layouts), tuple(preferred), trigger
         )
@@ -177,14 +196,30 @@ class VerifiedOnlineOptimizer:
             max_queries=self.max_queries,
             max_seconds=self.max_seconds,
         )
-        searcher = load_source(self.source).build_optimizer(
-            copy.deepcopy(self.settings)
-        )
-        predictions = port.finish(
-            searcher.search(
-                port, view, forecasts, layouts, preferred=preferred, trigger=trigger
+        self.searches += 1
+        if self.runner is None:
+            searcher = load_source(self.source).build_optimizer(
+                copy.deepcopy(self.settings)
             )
-        )
+            predictions = port.finish(
+                searcher.search(
+                    port, view, forecasts, layouts, preferred=preferred, trigger=trigger
+                )
+            )
+        else:
+            from areal.autopilot.domains.elastic.evaluation.worker import (
+                run_optimizer_search,
+            )
+
+            predictions = run_optimizer_search(
+                self.source,
+                (port,),
+                self.settings,
+                self.runner,
+                self.directory / f"search-{self.searches:04d}",
+            )[0]
+        self.query_count += port.queries
+        self.search_wall_seconds += time.perf_counter() - started
         evaluator.execution_stats = dict(
             mode="verified_online_revision",
             model_queries=port.queries,
@@ -194,6 +229,8 @@ class VerifiedOnlineOptimizer:
 
     def evaluate_many(self, evaluator, view, forecasts, layouts):
         # Application revalidation evaluates the supplied layouts directly.
+        layouts = tuple(layouts)
+        self.query_count += len(layouts)
         return OnlineOptimizer().evaluate_many(evaluator, view, forecasts, layouts)
 
 
@@ -298,108 +335,19 @@ class OptimizerRevisionBenchmark(ElasticRevisionBenchmark):
             )
             for c in self.cases
         ]
-        # Start each case's budget when the child begins it, excluding process startup.
-        begun = set()
-        finished = {}
-
-        def simulate(message):
-            index = message["case"]
-            if type(index) is not int or not 0 <= index < len(ports):
-                raise ValueError("Unknown Online case")
-            port, case = ports[index], self.cases[index]
-            operation = message["operation"]
-            if operation == "start":
-                if index in begun:
-                    return port.reject("Search case started twice")
-                begun.add(index)
-                port.started = time.monotonic()
-                return dict(
-                    context_id=port.context_id,
-                    historical=port.historical,
-                    slo=asdict(port.slo),
-                    parallel_available=port.parallel_available,
-                )
-            if index not in begun:
-                return port.reject("Search queried before starting its case")
-            if operation == "order":
-                return {
-                    "order": [
-                        (i, asdict(c))
-                        for i, c in port.order_candidates(
-                            case.observation,
-                            case.forecasts,
-                            case.candidates,
-                            case.preferred,
-                        )
-                    ]
-                }
-            if operation == "wave":
-                from areal.elastic.contracts import CandidatePrediction, OnlineLayout
-
-                indexed = tuple(
-                    (i, decode(OnlineLayout, c)) for i, c in message["indexed"]
-                )
-                raw = message.get("bound")
-                bound = (
-                    None
-                    if raw is None
-                    else SearchBound(
-                        port.context_id,
-                        raw["target"],
-                        decode(CandidatePrediction, raw["best"]),
-                        raw["fraction_pruning"],
-                    )
-                )
-                result = port.evaluate_wave(
-                    case.observation,
-                    case.forecasts,
-                    indexed,
-                    bound=bound,
-                    chunk_size=message.get("chunk_size", 2),
-                )
-                return {"wave": asdict(result)}
-            if operation == "finish":
-                from areal.elastic.contracts import CandidatePrediction
-
-                finished[index] = port.finish(
-                    tuple(
-                        decode(CandidatePrediction, p) for p in message["predictions"]
-                    )
-                )
-                return {"finished": True}
-            return port.reject("Unknown configuration Evaluator operation")
-
         try:
             self.assert_unchanged()
-            output = self.runner.run(
-                source,
-                dict(
-                    target=self.target,
-                    settings=self.settings,
-                    cases=[asdict(c) for c in self.cases],
-                ),
-                directory,
-                simulate,
+            from areal.autopilot.domains.elastic.evaluation.worker import (
+                run_optimizer_search,
             )
-            if output.get("error"):
-                raise ValueError(output["error"])
-            if len(output["predictions"]) != len(self.cases):
-                raise ValueError("Search omitted cases")
-            from areal.elastic.contracts import CandidatePrediction
 
-            for index, (case, raw) in enumerate(
-                zip(self.cases, output["predictions"], strict=True)
+            results = run_optimizer_search(
+                source, ports, self.settings, self.runner, directory
+            )
+            for index, (case, predictions) in enumerate(
+                zip(self.cases, results, strict=True)
             ):
                 port = ports[index]
-                predictions = tuple(decode(CandidatePrediction, p) for p in raw)
-                if (
-                    index not in finished
-                    or predictions != finished[index]
-                    or port.violations
-                ):
-                    raise ValueError(
-                        "Search result lacks its completed parent-owned evaluation"
-                    )
                 selected = select_prediction(
                     predictions,
                     case.observation.layout,
@@ -517,6 +465,286 @@ class OptimizerRevisionBenchmark(ElasticRevisionBenchmark):
             score=report.score,
             metrics={
                 k: v for k, v in report.metrics.items() if k != "selection_sha256"
+            },
+            errors=report.errors,
+        )
+
+
+@dataclass(frozen=True)
+class OptimizerSimulationCriteria:
+    """Preserve service and training, then improve cost or tied-cost queries."""
+
+    cost_relative_tolerance: float = 1e-9
+    slo_tolerance: float = 1e-12
+
+    def __post_init__(self):
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in (self.cost_relative_tolerance, self.slo_tolerance)
+        ):
+            raise ValueError("Simulation comparison tolerances must be nonnegative")
+
+
+class OptimizerSimulationBenchmark(ElasticRevisionBenchmark):
+    """Evaluate complete reconfiguration runs on frozen, observation-derived work."""
+
+    target = "optimizer"
+
+    def __init__(
+        self,
+        cases,
+        *,
+        assembly,
+        cost_models,
+        prediction_cost_models=None,
+        settings=None,
+        criteria=None,
+        runner=None,
+        max_queries=64,
+        max_seconds=30,
+    ):
+        from areal.autopilot.domains.elastic.contracts import OptimizerSimulationCase
+
+        self.cases = tuple(
+            copy.deepcopy(
+                decode(OptimizerSimulationCase, case)
+                if isinstance(case, dict)
+                else case
+            )
+            for case in cases
+        )
+        if not self.cases:
+            raise ValueError("Freeze at least one complete Simulation case")
+        if (
+            type(max_queries) is not int
+            or max_queries < 1
+            or not math.isfinite(max_seconds)
+            or max_seconds <= 0
+        ):
+            raise ValueError("Optimizer requires positive query and time budgets")
+        self.assembly = json.loads(json.dumps(assembly, allow_nan=False))
+        self.cost_models = cost_models
+        self.prediction_cost_models = prediction_cost_models or cost_models
+        self.settings = copy.deepcopy(settings or {})
+        self.criteria = criteria or OptimizerSimulationCriteria()
+        self.runner = candidate_runner(runner)
+        self.max_queries, self.max_seconds = max_queries, max_seconds
+        self.context = dict(
+            evaluation="complete_simulation",
+            assembly=self.assembly,
+            cost_model_source_ids=tuple(cost_models.source_ids),
+            prediction_source_ids=tuple(self.prediction_cost_models.source_ids),
+            optimizer_settings=self.settings,
+            optimizer_limits=dict(max_queries=max_queries, max_seconds=max_seconds),
+        )
+        self.context = json.loads(json.dumps(self.context, allow_nan=False))
+        self._code = {
+            str(path.relative_to(AREAL_ROOT)): source_digest(path.read_text())
+            for path in protected_files()
+        }
+        self.benchmark_sha256 = digest(
+            dict(
+                cases=[asdict(case) for case in self.cases],
+                context=self.context,
+                criteria=asdict(self.criteria),
+                code=self._code,
+            )
+        )
+        self._reports = set()
+
+    @property
+    def calibration(self):
+        return {}
+
+    def assert_unchanged(self):
+        if any(
+            not (AREAL_ROOT / name).is_file()
+            or source_digest((AREAL_ROOT / name).read_text()) != expected
+            for name, expected in self._code.items()
+        ):
+            raise ValueError("Simulation evaluation code changed")
+        if tuple(self.cost_models.source_ids) != tuple(
+            self.context["cost_model_source_ids"]
+        ) or tuple(self.prediction_cost_models.source_ids) != tuple(
+            self.context["prediction_source_ids"]
+        ):
+            raise ValueError("Frozen Simulation model identities changed")
+
+    def evaluate(self, source, directory):
+        from areal.elastic.contracts import (
+            HandoffConfig,
+            OnlineLayout,
+            SimulationConfig,
+        )
+        from areal.elastic.reconfigurator import build_reconfigurator
+        from areal.elastic.serving import ServingSLO, request_slo_status
+        from areal.elastic.simulation.simulation import OnlineSimulation
+
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "candidate.py").write_text(source)
+        errors, rows = [], []
+        try:
+            self.assert_unchanged()
+            compile(source, str(directory / "candidate.py"), "exec")
+            run = decode(SimulationConfig, self.assembly["run"])
+            handoff = decode(HandoffConfig, self.assembly["handoff"])
+            slo = decode(ServingSLO, self.assembly["slo"])
+            candidates = tuple(
+                decode(OnlineLayout, value) for value in self.assembly["candidates"]
+            )
+            for index, case in enumerate(self.cases):
+                optimizer = VerifiedOnlineOptimizer(
+                    source,
+                    self.settings,
+                    max_queries=self.max_queries,
+                    max_seconds=self.max_seconds,
+                    runner=self.runner,
+                    directory=directory / f"case-{index:03d}",
+                )
+                reconfigurator = build_reconfigurator(
+                    "reference",
+                    candidates=candidates,
+                    settings=self.assembly.get("reconfigurator"),
+                    replay=self.assembly.get("replay"),
+                    forecast=self.assembly.get("forecast"),
+                    slo=slo,
+                    optimizer=optimizer,
+                )
+                simulation = OnlineSimulation.from_forecast(
+                    case.observation,
+                    case.workload,
+                    self.cost_models,
+                    run,
+                    handoff,
+                    slo,
+                    reconfigurator=reconfigurator,
+                    prediction_cost_models=self.prediction_cost_models,
+                    coalesce_decode=True,
+                )
+                reconfigurator.observe_history(case.observation)
+                result = simulation.run()
+                if result["status"] != "complete":
+                    raise ValueError(f"Simulation did not complete: {result['reason']}")
+                if optimizer.searches == 0:
+                    raise ValueError(
+                        "Simulation case did not exercise Optimizer.search; "
+                        "supply observed history and an active decision window"
+                    )
+                completed_before = {
+                    request.request_id
+                    for request in case.observation.requests
+                    if request.completed_at is not None
+                }
+                requests = [
+                    request.view
+                    for request in simulation.requests.values()
+                    if request.view.request_id not in completed_before
+                ]
+                passed = sum(
+                    request_slo_status(request, slo, now=request.completed_at) is True
+                    for request in requests
+                )
+                rows.append(
+                    dict(
+                        total_gpu_seconds=result["total_gpu_seconds"],
+                        joint_request_fraction=passed / len(requests)
+                        if requests
+                        else 1.0,
+                        completed_requests=len(requests),
+                        completed_updates=result["completed_updates"]
+                        - case.observation.training_version,
+                        trained_episodes=result["trained_episodes"]
+                        - case.observation.consumed_episodes,
+                        evaluator_queries=optimizer.query_count,
+                        searches=optimizer.searches,
+                        search_wall_seconds=optimizer.search_wall_seconds,
+                        final_layout=result["final_layout"],
+                    )
+                )
+            self.assert_unchanged()
+        except Exception as error:
+            errors.append(f"{type(error).__name__}: {error}")
+        metrics = dict(
+            total_gpu_seconds=sum(row["total_gpu_seconds"] for row in rows),
+            evaluator_queries=sum(row["evaluator_queries"] for row in rows),
+            search_wall_seconds=sum(row["search_wall_seconds"] for row in rows),
+            cases=rows,
+            selection_sha256=digest(
+                [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key != "search_wall_seconds"
+                    }
+                    for row in rows
+                ]
+            ),
+        )
+        report = RevisionReport(
+            self.target,
+            source_digest(source),
+            self.benchmark_sha256,
+            not errors,
+            metrics["total_gpu_seconds"] if not errors else None,
+            metrics,
+            tuple(errors),
+        )
+        self._reports.add(digest(asdict(report)))
+        return report
+
+    def compare(self, candidate, incumbent):
+        self.assert_unchanged()
+        if any(
+            digest(asdict(report)) not in self._reports
+            for report in (candidate, incumbent)
+        ):
+            raise ValueError("Comparison requires issued Simulation reports")
+        if not incumbent.valid:
+            raise ValueError("Current Optimizer must complete the Simulation cases")
+        if not candidate.valid:
+            return False, "Candidate Simulation failed"
+        for current, proposed in zip(
+            incumbent.metrics["cases"], candidate.metrics["cases"], strict=True
+        ):
+            if (
+                proposed["joint_request_fraction"] + self.criteria.slo_tolerance
+                < current["joint_request_fraction"]
+            ):
+                return False, "Simulation SLO regressed"
+            if any(
+                proposed[key] < current[key]
+                for key in (
+                    "completed_updates",
+                    "trained_episodes",
+                    "completed_requests",
+                )
+            ):
+                return False, "Simulation training or serving progress regressed"
+        old_cost, new_cost = incumbent.score, candidate.score
+        tolerance = self.criteria.cost_relative_tolerance * max(
+            1.0, abs(old_cost), abs(new_cost)
+        )
+        if new_cost > old_cost + tolerance:
+            return False, "Simulation GPU cost regressed"
+        if new_cost < old_cost - tolerance:
+            return True, "Improved Simulation GPU cost"
+        if (
+            candidate.metrics["evaluator_queries"]
+            < incumbent.metrics["evaluator_queries"]
+        ):
+            return True, "Same Simulation GPU cost with fewer Evaluator queries"
+        return False, "No Simulation cost or query improvement"
+
+    def feedback(self, report):
+        if digest(asdict(report)) not in self._reports:
+            raise ValueError("Unknown Simulation report")
+        return dict(
+            score=report.score,
+            metrics={
+                key: value
+                for key, value in report.metrics.items()
+                if key != "selection_sha256"
             },
             errors=report.errors,
         )
