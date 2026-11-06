@@ -56,6 +56,11 @@ from areal.utils.network import (
     split_hostport,
 )
 from areal.utils.perf_tracer import trace_perf
+from areal.v2.inference_service.router.client import (
+    RouteClient,
+    backend_session,
+    current_backend_session,
+)
 
 from .workflow_executor import (
     WorkflowContractError,
@@ -134,7 +139,8 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                     processor_cache=shared_processor_cache,
                 )
             )
-            result = await self.workflow.arun_episode(engine, data)
+            async with backend_session(engine):
+                result = await self.workflow.arun_episode(engine, data)
             completed_results[sample_idx] = result
             return sample_idx, result
 
@@ -592,6 +598,7 @@ class RemoteInfEngine(InferenceEngine):
         self._destroy_callbacks_lock = Lock()
         self._proxy_gateway_addr: str | None = None
         self.local_server_processes: list[LocalInfServerInfo] = []
+        self.route_client: RouteClient | None = None
 
     def _wait_for_server(self, address: str, process: subprocess.Popen | None = None):
         """Wait for a server to become healthy."""
@@ -1066,7 +1073,41 @@ class RemoteInfEngine(InferenceEngine):
             return server
         raise NotImplementedError("Only round-robin scheduling is implemented.")
 
+    def configure_backend_routing(self, **kwargs) -> None:
+        if self.route_client is not None:
+            if (
+                self.route_client.router_addr == kwargs["router_addr"].rstrip("/")
+                and self.route_client.identity
+                == {"pool_id": kwargs["pool_id"], "run_id": kwargs["run_id"]}
+                and self.route_client.headers["Authorization"]
+                == f"Bearer {kwargs['admin_api_key']}"
+            ):
+                return
+            raise RuntimeError("Backend routing cannot change during a run")
+        self.route_client = RouteClient(**kwargs)
+
+    def set_sender_state(self, paused: bool, control_seq: int) -> None:
+        if self.route_client is not None:
+            self.route_client.set_sender_state(paused, control_seq)
+
+    async def close_backend_session(self, session_id: str) -> None:
+        if self.route_client is not None:
+            # The local fence is installed before any await; late acquire
+            # responses can only release their reservation, never send.
+            self.route_client.close_local_session(session_id)
+            session = await workflow_context.get_aiohttp_session()
+            await asyncio.shield(self.route_client.close_session(session, session_id))
+
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
+        if (
+            getattr(self, "route_client", None) is not None
+            and current_backend_session.get() is None
+        ):
+            async with backend_session(self):
+                return await self._agenerate(req)
+        return await self._agenerate(req)
+
+    async def _agenerate(self, req: ModelRequest) -> ModelResponse:
         """Asynchronously generate a response for the given request.
 
         Parameters
@@ -1119,7 +1160,9 @@ class RemoteInfEngine(InferenceEngine):
         final_routed_experts: np.ndarray | None = None
 
         # A single "rid" shares the same server to allow KV cache reuse
-        if req.rid in self.rid_to_address:
+        if getattr(self, "route_client", None) is not None:
+            server_addr = None  # Each actual execution gets its own lease address.
+        elif req.rid in self.rid_to_address:
             server_addr = self.rid_to_address[req.rid]
         else:
             server_addr = self.choose_server()
@@ -1159,24 +1202,62 @@ class RemoteInfEngine(InferenceEngine):
             )
 
             # Loop until the generation is complete
-            result = await arequest_with_retry(
-                session=session,
-                addr=server_addr,
-                endpoint=http_req.endpoint,
-                payload=http_req.payload,
-                method=http_req.method,
-                max_retries=self.config.request_retries,
-                timeout=self.config.request_timeout,
-            )
+            if getattr(self, "route_client", None) is not None:
 
-            # Assert response is JSON dict (not text/binary from error pages)
-            if not isinstance(result, dict):
-                raise ValueError(
-                    f"Expected JSON dict response, got {type(result).__name__}"
+                async def generate(lease):
+                    routed_request = self.backend.build_generation_request(
+                        req,
+                        with_lora=self.config.use_lora,
+                        version=lease.weight_version,
+                    )
+                    base = lease.backend_addr.rstrip("/")
+                    if not base.startswith(("http://", "https://")):
+                        base = "http://" + base
+                    async with session.request(
+                        routed_request.method,
+                        f"{base}/{routed_request.endpoint.lstrip('/')}",
+                        json=routed_request.payload,
+                        timeout=aiohttp.ClientTimeout(
+                            total=self.config.request_timeout
+                        ),
+                    ) as response:
+                        response.raise_for_status()
+                        result = await response.json()
+                    parsed = self.backend.parse_generation_response(result)
+                    if parsed.stop_reason not in (
+                        "stop",
+                        "tool_calls",
+                        "length",
+                        "abort",
+                    ):
+                        raise RuntimeError(
+                            "Generation did not return a known terminal state"
+                        )
+                    return (
+                        parsed,
+                        "aborted" if parsed.stop_reason == "abort" else "completed",
+                    )
+
+                gen_result, request_version = await self.route_client.execute(
+                    session,
+                    current_backend_session.get(),
+                    generate,
                 )
-
-            # Parse response using backend
-            gen_result = self.backend.parse_generation_response(result)
+            else:
+                result = await arequest_with_retry(
+                    session=session,
+                    addr=server_addr,
+                    endpoint=http_req.endpoint,
+                    payload=http_req.payload,
+                    method=http_req.method,
+                    max_retries=self.config.request_retries,
+                    timeout=self.config.request_timeout,
+                )
+                if not isinstance(result, dict):
+                    raise ValueError(
+                        f"Expected JSON dict response, got {type(result).__name__}"
+                    )
+                gen_result = self.backend.parse_generation_response(result)
             stop_reason = gen_result.stop_reason
 
             if (
