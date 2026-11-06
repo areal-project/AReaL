@@ -27,6 +27,7 @@ parts:
     - file: best_practices/handling_oom
     - file: best_practices/perf_profiling
     - file: best_practices/fsdp_train_step_benchmark
+    - file: best_practices/autopilot
   - caption: Customization
     chapters:
     - file: customization/dataset
