@@ -3203,6 +3203,8 @@ class MegatronEngine(TrainEngine):
             self.optimizer = get_megatron_optimizer_with_gpu_staged_adamw(
                 mcore_opt_config, self.model, staged_adamw_config, **optimizer_kwargs
             )
+            if getattr(self, "_weftmoe_adapter", None) is not None:
+                self._weftmoe_adapter.bind_fp32_masters(self.optimizer)
         if mcore_opt_config.optimizer_cpu_offload:
             from areal.engine.megatron_utils.hybrid_optimizer import (
                 install_hybrid_optimizer_checkpoint_compat,

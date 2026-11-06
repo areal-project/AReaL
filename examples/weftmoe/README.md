@@ -14,8 +14,9 @@ blockwise FP8 routed-expert computation.
   workers must import the same WeftMoE package and load the matching extension.
 - The [CPU-staged Muon implementation](https://github.com/areal-project/AReaL/pull/1743)
   and its Megatron dependencies. This recipe uses complete, locally owned expert
-  matrices: expert DP=1 and expert TP=1. FP8 primary weights currently require
-  CPU-staged Muon; AdamW primary-weight offload is not enabled by this integration.
+  matrices: expert DP=1 and expert TP=1. FP8 primary weights support CPU-staged Muon and
+  AdamW. AdamW requires the matching
+  [WeftMoE staged-AdamW adapter support](https://github.com/yulangz/WeftMoE/pull/6).
 - The tests attached to the integration PR used PyTorch 2.9.1+cu129, SGLang
   0.5.10.post1, AWEX 0.9.0, and Megatron-Core 0.19.0 with Muon support. WeftMoE's
   FP8/TMS allocation compatibility requires PyTorch 2.9.x on this path.
@@ -51,6 +52,22 @@ TP2 × DP4, EP8, ETP1, full-layer recomputation, and BF16 model parameters with
 CPU-staged Muon. Rollout uses DP attention with DP8/EP8 on the same eight GPUs. Saver
 and recovery checkpoint writes are disabled.
 
+For CPU-staged AdamW, use these overrides with any of the three variants:
+
+```bash
+bash examples/weftmoe/run.sh fp8 \
+  actor.optimizer.type=adam \
+  actor.megatron.use_precision_aware_optimizer=true \
+  actor.megatron.ddp.use_distributed_optimizer=true
+```
+
+AdamW FP8 publication consumes complete expert matrices from its GPU staging slot. Each
+matrix must fit in `actor.megatron.cpu_staged_offload.bucket_size_mb`; oversized
+matrices fail at binding. Expert-only BF16 parameter buffers are released while FP32
+gradient buffers remain available. Checkpoint operations restore the original buffer
+storage; closing the adapter also restores BF16 writeback and parameter sync. The
+attached screenshots below use Muon, not this AdamW configuration.
+
 For 8K generation and a 65536-token training microbatch limit:
 
 ```bash
@@ -73,11 +90,11 @@ The Megatron adapter is installed before training, invalidated after optimizer u
 suspended before memory offload, and closed at engine teardown. Checkpoint operations
 materialize BF16 weights from FP32 masters when needed.
 
-In FP8 mode, Muon writes W and W-transpose directly from its FP32 staging slot. AWEX
-sends W bytes and FP32 block scales using its existing canonical parameter mapping; it
-does not send W-transpose. SGLang rebuilds its receive views after memory restoration
-and commits the new version after the transfer. The AWEX package and transport protocol
-are unchanged.
+In FP8 mode, the staged optimizer writes W and W-transpose directly from its FP32
+staging slot. AWEX sends W bytes and FP32 block scales using its existing canonical
+parameter mapping; it does not send W-transpose. SGLang rebuilds its receive views after
+memory restoration and commits the new version after the transfer. The AWEX package and
+transport protocol are unchanged.
 
 BF16 offload also handles expert parameters without DDP flat parameter buffers.
 Complete, unaliased Muon expert allocations can be restored from CPU FP32 masters; other

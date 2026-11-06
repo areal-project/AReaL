@@ -176,10 +176,15 @@ class MegatronWeightResidency:
                             nbytes += size
                             count += int(size > 0)
                         if hasattr(buf, "offload_to_cpu"):
-                            buf.offload_to_cpu()
+                            buf.offload_to_cpu(
+                                move_params=not getattr(
+                                    buf, "_weftmoe_fp8_master_managed", False
+                                )
+                            )
                             continue
                         if (
                             buf.param_data is not None
+                            and not getattr(buf, "_weftmoe_fp8_master_managed", False)
                             and buf.param_data.storage().size() > 0
                         ):
                             if not hasattr(buf, "cpu_param_data"):
@@ -365,9 +370,16 @@ class MegatronWeightResidency:
                 for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
                     for buf in buffers:
                         if hasattr(buf, "reload_from_cpu"):
-                            buf.reload_from_cpu(move_grads=load_grad)
+                            buf.reload_from_cpu(
+                                move_params=not getattr(
+                                    buf, "_weftmoe_fp8_master_managed", False
+                                ),
+                                move_grads=load_grad,
+                            )
                             continue
-                        if buf.param_data is not None:
+                        if buf.param_data is not None and not getattr(
+                            buf, "_weftmoe_fp8_master_managed", False
+                        ):
                             if buf.param_data.storage().size() == 0:
                                 buf.param_data.storage().resize_(buf.param_data_size)
                             buf.param_data.copy_(buf.cpu_param_data, non_blocking=True)
