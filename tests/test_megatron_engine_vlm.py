@@ -92,6 +92,86 @@ def test_chunked_model_thd_forward_accepts_qwen35_multimodal(
     assert forward.call_count == int(supported)
 
 
+@pytest.mark.parametrize(
+    ("mtp_enabled", "forward_only"),
+    [(False, False), (True, True), (True, False)],
+)
+def test_version_mask_reaches_packed_forward_only_for_mtp_training(
+    monkeypatch, mtp_enabled, forward_only
+):
+    """Stale-token filtering must also work in non-MTP Megatron updates."""
+    from areal.engine import megatron_engine as module
+    from areal.utils.data import MicroBatchList, MicroBatchSpec
+
+    row = {
+        "input_ids": torch.tensor([10, 11, 12, 13]),
+        "loss_mask": torch.tensor([False, True, True, False]),
+        "policy_version_mask": torch.tensor([False, False, True, False]),
+        "mtp_version_mask": torch.tensor([False, False, True, True]),
+        "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
+        "max_seqlen": 4,
+    }
+    batch = MicroBatchList(
+        data={},
+        mb_spec=MicroBatchSpec(),
+        mbs=[row],
+        padded_mbs=[dict(row)],
+        group_lens=[4],
+        padding_lengths=[0],
+        padded_to_lengths=[4],
+    )
+    engine = module.MegatronEngine.__new__(module.MegatronEngine)
+    engine._ensure_ready = lambda: None
+    engine._r3_enabled = False
+    engine._r3_pending_routed_experts = None
+    engine._r3_pending_valid = None
+    engine.tf_config = SimpleNamespace(num_moe_experts=None)
+    engine.mcore_config = SimpleNamespace(
+        enable_mtp_training=mtp_enabled,
+        enable_chunked_logits=False,
+        lm_head_loss_chunk_size=0,
+    )
+    engine.config = SimpleNamespace(is_critic=False)
+    engine.process_group_initialized = True
+    engine._cpu_group = object()
+    engine.is_vision_model = False
+    engine.enable_tree_training = False
+    engine.device = "cpu"
+    engine.dtype = torch.bfloat16
+    engine.model = [object()]
+    engine.bridge_cls = "megatron-bridge"
+    engine.use_padded_seq = False
+    engine.use_model_packed_seq = False
+
+    class ForwardReached(Exception):
+        pass
+
+    def schedule(**kwargs):
+        kwargs["forward_step_func"](kwargs["data_iterator"], kwargs["model"])
+
+    def forward(_model, input_, **_kwargs):
+        active_mtp = mtp_enabled and not forward_only
+        assert ("mtp_version_mask" in input_) is active_mtp
+        assert ("mtp_loss_mask" in input_) is active_mtp
+        assert "policy_version_mask" in input_
+        raise ForwardReached
+
+    monkeypatch.setattr(module, "get_forward_backward_func", lambda: schedule)
+    monkeypatch.setattr(
+        module, "validate_transport_padding", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(module, "packed_context_parallel_forward", forward)
+    monkeypatch.setattr(module.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(module.mpu, "is_pipeline_last_stage", lambda **_kwargs: True)
+
+    with pytest.raises(ForwardReached):
+        engine.forward_backward_batch(
+            batch, lambda *args: None, forward_only=forward_only
+        )
+    assert "mtp_version_mask" in batch.padded_mbs[0]
+    assert "mtp_loss_mask" not in batch.padded_mbs[0]
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize(
     ("cp_size", "cp_rank"), [(1, 0), (4, 0), (4, 1), (4, 2), (4, 3)]
@@ -944,6 +1024,152 @@ class TestPackedContextParallelForward:
             )
             assert "mtp_kwargs" not in call
             assert output.shape == (expected_ids.numel(), 4)
+
+    def test_single_row_model_thd_leaves_mask_for_bridge_cp_partition(
+        self, monkeypatch
+    ):
+        """The bridge partitions a single THD row; AReaL must not split it first."""
+        from areal.engine.megatron_utils import packed_context_parallel as packing
+
+        monkeypatch.setattr(packing.mpu, "get_context_parallel_world_size", lambda: 2)
+        mask = torch.tensor([False, True, True, False, True, False, True, True])
+        ids = torch.arange(8).unsqueeze(0)
+        cu_seqlens = torch.tensor([0, 8], dtype=torch.int32)
+        prepared = packing._prepare_mtp_loss_mask(
+            mask,
+            ids,
+            torch.ones_like(ids, dtype=torch.bool),
+            cu_seqlens=cu_seqlens,
+            packed_num_tokens=8,
+            uses_padded_form=False,
+            uses_model_packed_seq=True,
+        )
+        torch.testing.assert_close(prepared, mask.unsqueeze(0), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+    @pytest.mark.parametrize("all_expired", [False, True])
+    def test_mtp_version_filter_uses_input_versions_and_original_denominator(
+        self, all_expired, calculate_per_token_loss
+    ):
+        """MTP target i+2/i+3 uses that target's version; counts stay unfiltered."""
+        import inspect
+
+        from megatron.core.transformer.multi_token_prediction import process_mtp_loss
+
+        from areal.engine.megatron_utils import packed_context_parallel as packing
+
+        if "input_ids" not in inspect.signature(process_mtp_loss).parameters:
+            pytest.skip("requires Megatron-Core 0.19 input-derived MTP labels")
+
+        class FakeGPT(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.pg_collection = SimpleNamespace(cp=None)
+                self.hidden_states = torch.ones((18, 1, 1), requires_grad=True)
+
+            def compute_language_model_loss(self, labels, logits):
+                return logits.transpose(0, 1)
+
+            def _postprocess(self, *, loss_mask, labels, packed_seq_params):
+                return process_mtp_loss(
+                    hidden_states=self.hidden_states,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    output_layer=lambda hidden, **_kwargs: (hidden.squeeze(-1), None),
+                    output_weight=None,
+                    runtime_gather_output=False,
+                    is_training=False,
+                    compute_language_model_loss=self.compute_language_model_loss,
+                    config=SimpleNamespace(
+                        mtp_num_layers=2,
+                        mtp_detach_heads=False,
+                        mtp_loss_scaling_factor=1.0,
+                        calculate_per_token_loss=calculate_per_token_loss,
+                    ),
+                    cp_group=None,
+                    packed_seq_params=packed_seq_params,
+                    input_ids=torch.arange(6).unsqueeze(0),
+                )
+
+        model = FakeGPT()
+        base = torch.ones((1, 6), dtype=torch.bool)
+        fresh = (
+            torch.zeros((1, 6), dtype=torch.bool)
+            if all_expired
+            else torch.tensor([[False, True, False, True, True, False]])
+        )
+        with packing._mtp_version_filtered_loss(model, fresh):
+            output = model._postprocess(
+                loss_mask=base, labels=None, packed_seq_params=None
+            )
+        output.sum().backward()
+
+        expected_first = torch.roll(fresh, shifts=-2, dims=-1)
+        expected_first[..., -2:] = False
+        expected_second = torch.roll(fresh, shifts=-3, dims=-1)
+        expected_second[..., -3:] = False
+        original_count = 5  # MCore's first input_ids-to-labels roll.
+        first_scale = 0.5 / 4  # MCore's unfiltered layer-0 token count.
+        second_scale = 0.5 / 3  # MCore's unfiltered layer-1 token count.
+        if calculate_per_token_loss:
+            first_scale *= original_count
+            second_scale *= original_count
+        expected_grad = torch.cat(
+            [
+                torch.ones((6, 1, 1)),
+                expected_first.T.unsqueeze(-1).float() * first_scale,
+                expected_second.T.unsqueeze(-1).float() * second_scale,
+            ],
+            dim=0,
+        )
+        torch.testing.assert_close(
+            model.hidden_states.grad, expected_grad, rtol=0, atol=0
+        )
+        assert "_postprocess" not in model.__dict__
+        assert "compute_language_model_loss" not in model.__dict__
+
+    def test_mtp_version_filter_uses_two_rolls_for_first_layer(self, monkeypatch):
+        from areal.engine.megatron_utils import packed_context_parallel as packing
+
+        class FakeGPT(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.pg_collection = SimpleNamespace(cp=None)
+
+            def compute_language_model_loss(self, labels, logits):
+                return logits
+
+            def _postprocess(self, *, loss_mask, labels, packed_seq_params):
+                first = self.compute_language_model_loss(
+                    labels, torch.ones_like(loss_mask)
+                )
+                second = self.compute_language_model_loss(
+                    labels, torch.ones_like(loss_mask)
+                )
+                return first, second, loss_mask.sum()
+
+        rolls = []
+
+        def roll_mask(mask, **_kwargs):
+            rolled = torch.roll(mask, shifts=-1, dims=-1)
+            rolled[..., -1] = False
+            rolls.append(rolled.clone())
+            return rolled, rolled.sum()
+
+        monkeypatch.setattr(packing, "roll_tensor", roll_mask)
+        model = FakeGPT()
+        base = torch.ones((1, 6), dtype=torch.bool)
+        fresh = torch.tensor([[False, True, False, True, True, False]])
+        with packing._mtp_version_filtered_loss(model, fresh):
+            first, second, original_count = model._postprocess(
+                loss_mask=base, labels=None, packed_seq_params=None
+            )
+        assert original_count == 6
+        torch.testing.assert_close(first.bool(), rolls[1], rtol=0, atol=0)
+        torch.testing.assert_close(second.bool(), rolls[2], rtol=0, atol=0)
+        assert len(rolls) == 3
+        assert "_postprocess" not in model.__dict__
+        assert "compute_language_model_loss" not in model.__dict__
 
     def test_padded_vlm_mtp_uses_padded_labels_and_mask(self, monkeypatch):
         """MTP supervision must follow the ordinary VLM padded layout."""

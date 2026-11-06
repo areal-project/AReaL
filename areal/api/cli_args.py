@@ -1818,7 +1818,7 @@ class RejectionSamplingConfig:
             "help": "Lower bound for filtering (optional). "
             "None means no lower bound. "
             "For 'ratio' metric: typical value is 0.5 (filter out tokens where policy "
-            "probability dropped significantly). Must be > 0. "
+            "probability dropped significantly). Must be > 0 for masking; clamp also allows 0. "
             "For 'kl_k1' metric: can be used to filter negative KL estimates."
         },
     )
@@ -1861,9 +1861,11 @@ class RejectionSamplingConfig:
                     f"upper must be > 1.0 for 'ratio' metric (otherwise all non-identical "
                     f"policy tokens will be filtered), got {self.upper}"
                 )
-            if self.lower is not None and self.lower <= 0:
+            if self.lower is not None and (
+                self.lower < 0 or (self.lower == 0 and self.action != "clamp")
+            ):
                 raise ValueError(
-                    f"lower must be positive for 'ratio' metric, got {self.lower}"
+                    f"lower must be positive for 'ratio' metric (zero is allowed for clamp), got {self.lower}"
                 )
         # For KL metrics, upper must be > 0.
         # Note: kl_k1 is excluded because it is a forward KL unbiased estimator that
@@ -2169,7 +2171,7 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={
             "help": "Rejection sampling configuration for filtering stale samples. "
             "None disables filtering (equivalent to old behave_imp_weight_mode='disabled'). "
-            "Only effective when use_decoupled_loss=True."
+            "Effective with use_decoupled_loss=True, or with score centering for token-wise ratio clamping (no lower bound)."
         },
     )
     importance_sampling_level: str = field(
@@ -2212,7 +2214,7 @@ class PPOActorConfig(TrainEngineConfig):
     use_score_centering: bool = field(
         default=False,
         metadata={
-            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Initial support: SGLang, FSDP, temperature=1, no sampling truncation."
+            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Initial support: SGLang, FSDP (TP/CP), temperature=1, no sampling truncation."
         },
     )
 
@@ -2333,7 +2335,11 @@ class PPOActorConfig(TrainEngineConfig):
                 f"got ppo_n_minibatches={self.ppo_n_minibatches}"
             )
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
-        if not self.use_decoupled_loss and self.rejection_sampling is not None:
+        if (
+            not self.use_decoupled_loss
+            and not self.use_score_centering
+            and self.rejection_sampling is not None
+        ):
             logger.warning(
                 "rejection_sampling is configured but use_decoupled_loss=False. "
                 "Filtering will be ignored. Set use_decoupled_loss=True to enable."
@@ -2434,13 +2440,15 @@ class PPOActorConfig(TrainEngineConfig):
                 self.use_sapo_loss
                 or self.use_cispo_loss
                 or self.use_decoupled_loss
-                or self.rejection_sampling is not None
                 or self.m2_threshold is not None
                 or self.importance_sampling_level != "token"
             ):
                 raise ValueError(
-                    "Score centering selects unweighted token-wise REINFORCE; other policy surrogates and rejection rules are unsupported."
+                    "Score centering selects token-wise REINFORCE with optional TIS; other policy surrogates are unsupported."
                 )
+            from areal.utils.score_centering import resolve_score_centering_tis_cap
+
+            resolve_score_centering_tis_cap(self.rejection_sampling)
 
 
 @dataclass
@@ -2650,6 +2658,14 @@ class SGLangConfig:
     mm_attention_backend: str | None = None
     enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
+    limit_mm_data_per_request: dict[str, int] | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum image, video, and audio items per request. Values must "
+            "be non-negative integers; zero disallows that modality. None uses "
+            "SGLang defaults; an empty mapping disables its item-count limits.",
+        },
+    )
     sampling_backend: str | None = None
     context_length: int | None = 32768
     mem_fraction_static: float | None = 0.9
@@ -2720,6 +2736,24 @@ class SGLangConfig:
     # Internal field, not exposed to users.
     enable_return_routed_experts: bool = False
 
+    def __post_init__(self) -> None:
+        self._validate_mm_limits(self.limit_mm_data_per_request)
+
+    @staticmethod
+    def _validate_mm_limits(limits: dict[str, int] | None) -> None:
+        if limits is None:
+            return
+        if not isinstance(limits, dict) or any(
+            modality not in {"image", "video", "audio"}
+            or type(limit) is not int
+            or limit < 0
+            for modality, limit in limits.items()
+        ):
+            raise ValueError(
+                "limit_mm_data_per_request must map image, video, or audio "
+                "to non-negative integers"
+            )
+
     # Use staticmethod to make OmegaConf happy.
     @staticmethod
     def build_cmd(
@@ -2778,6 +2812,13 @@ class SGLangConfig:
             )
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
+        # build_args also accepts DictConfig, which bypasses __post_init__.
+        limits = args.get("limit_mm_data_per_request")
+        SGLangConfig._validate_mm_limits(limits)
+        if limits is not None:
+            args["limit_mm_data_per_request"] = json.dumps(
+                limits, separators=(",", ":")
+            )
         if sglang_config.enable_multithread_load:
             model_loader_extra_config = dict(
                 enable_multithread_load=sglang_config.enable_multithread_load,
@@ -3194,6 +3235,14 @@ class InferenceEngineConfig:
             "help": "Maximum off-policyness for the head. "
             "If the current version is more than this many versions behind, "
             "the request will not be accepted.",
+        },
+    )
+    mask_stale_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": "Mask actor loss targets whose token policy-version age exceeds "
+            "max_head_offpolicyness. Disabled by default to preserve existing "
+            "training behavior; does not reject rollouts or change scheduling."
         },
     )
     enable_rollout_tracing: bool = field(
