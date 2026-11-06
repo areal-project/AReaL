@@ -127,7 +127,7 @@ def test_unknown_source_is_not_modified(tmp_path, monkeypatch):
     assert not (tmp_path / ".areal-sglang-patches.lock").exists()
 
 
-@pytest.mark.parametrize("installed", ["0.6.7.post3", "0.6.17", "0.6.18rc1", "dev"])
+@pytest.mark.parametrize("installed", ["0.6.7.post3", "0.6.16", "0.6.18rc1", "dev"])
 def test_unsupported_flashinfer_is_rejected_before_source_access(
     monkeypatch, installed
 ):
@@ -137,11 +137,13 @@ def test_unsupported_flashinfer_is_rejected_before_source_access(
         patch, "installed_sglang_root", lambda: pytest.fail("source accessed")
     )
     monkeypatch.setattr(sys, "argv", ["patch"])
-    with pytest.raises(RuntimeError, match="FlashInfer >= 0.6.18"):
+    with pytest.raises(RuntimeError, match="FlashInfer >= 0.6.17"):
         patch.main()
 
 
-@pytest.mark.parametrize("installed", ["0.6.18", "0.6.18.post1", "0.7.1"])
+@pytest.mark.parametrize(
+    "installed", ["0.6.17", "0.6.17.post1", "0.6.18", "0.6.18.post1", "0.7.1"]
+)
 def test_supported_flashinfer_passes_version_guard(monkeypatch, installed):
     monkeypatch.setattr(patch, "version", lambda _: installed)
     patch.validate_flashinfer_version()
@@ -152,5 +154,5 @@ def test_missing_flashinfer_is_reported(monkeypatch):
         raise patch.PackageNotFoundError("flashinfer-python")
 
     monkeypatch.setattr(patch, "version", missing)
-    with pytest.raises(RuntimeError, match="FlashInfer >= 0.6.18"):
+    with pytest.raises(RuntimeError, match="FlashInfer >= 0.6.17"):
         patch.validate_flashinfer_version()
