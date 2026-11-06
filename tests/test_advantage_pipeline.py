@@ -341,6 +341,26 @@ def test_optional_logprob_none_remains_supported(decoupled):
     assert torch.isfinite(result["advantages"]).all()
 
 
+@pytest.mark.parametrize("kl_estimator", ["k1", "k2", "k3"])
+def test_kl_reward_without_ref_logp_is_zero(kl_estimator):
+    """With no reference model, kl_ctl > 0 must not turn the logprobs into rewards."""
+    data = _batch()
+    data["logprobs"] = torch.full((2, 5), -2.0)
+    actor = PPOActor(PPOActorConfig(kl_ctl=0.1, kl_estimator=kl_estimator), engine=None)
+    result = actor._compute_advantages(copy.deepcopy(data))
+    expected = _actor()._compute_advantages(copy.deepcopy(data))
+    torch.testing.assert_close(
+        result["kl_rewards"], torch.zeros_like(result["kl_rewards"]), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        result["advantages"], expected["advantages"], rtol=0, atol=0
+    )
+
+    data["ref_logp"] = torch.full((2, 5), -1.0)
+    with_ref = actor._compute_advantages(copy.deepcopy(data))
+    assert with_ref["kl_rewards"].ne(0).any()
+
+
 @pytest.mark.parametrize("name", ["loss_mask", "is_truncated", "input_token_loss_mask"])
 def test_plugin_masks_must_be_binary(name):
     """Fractional masks would disagree with downstream boolean support tests."""

@@ -313,6 +313,13 @@ class PPOTrainer:
         if requires_ref and config.ref is not None:
             ref_alloc = ModelAllocation.from_str(config.ref.backend, name="ref")
             self.ref = self._create_train_engine(config.ref, ref_alloc)
+        elif config.actor.kl_ctl > 0 and config.ref is None:
+            logger.warning(
+                "actor.kl_ctl=%s has no effect because no reference model is "
+                "configured (ref is None), so the KL reward is zero. Configure ref "
+                "to apply the KL penalty, or set actor.kl_ctl=0.",
+                config.actor.kl_ctl,
+            )
 
         self.teacher = None
         self.teacher_alloc = None
