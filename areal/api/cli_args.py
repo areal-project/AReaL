@@ -1883,7 +1883,7 @@ class RejectionSamplingConfig:
 
         _VALID_LEVELS = ("token", "sequence")
         _VALID_ACTIONS = ("mask", "clamp")
-        _VALID_METRICS = ("ratio", "kl_k1", "kl_k2", "kl_k3")
+        _VALID_METRICS = ("ratio", "kl_k1", "kl_k2", "kl_k3", "binary_kl")
         _VALID_AGGS = ("sum", "mean", "max")
 
         # Validate enum-like fields.
@@ -1924,7 +1924,7 @@ class RejectionSamplingConfig:
         # For KL metrics, upper must be > 0.
         # Note: kl_k1 is excluded because it is a forward KL unbiased estimator that
         # can produce negative values, so requiring upper > 0 would be too restrictive.
-        if self.metric in ("kl_k2", "kl_k3") and self.upper <= 0:
+        if self.metric in ("kl_k2", "kl_k3", "binary_kl") and self.upper <= 0:
             raise ValueError(
                 f"upper must be positive for '{self.metric}' metric, got {self.upper}"
             )
