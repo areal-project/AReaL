@@ -732,6 +732,25 @@ class MegatronEngine(TrainEngine):
                         )
 
         self.model = _MegatronModelList(models)
+        # Model construction leaves temporary allocations in the PyTorch cache.
+        # Native communication allocations (including NCCL cuMem) cannot reclaim
+        # that cache when loading a large checkpoint.
+        current_platform.empty_cache()
+        self._weftmoe_adapter = None
+        if os.environ.get("AREAL_USE_WEFTMOE") == "1":
+            from weftmoe.megatron import MegatronAdapter
+
+            self._weftmoe_adapter = MegatronAdapter(
+                self.model,
+                max_tokens=(
+                    self.config.mb_spec.max_tokens_per_mb
+                    // (
+                        mpu.get_tensor_model_parallel_world_size()
+                        * mpu.get_context_parallel_world_size()
+                    )
+                ),
+            )
+            self._weftmoe_adapter.prepare()
         _warn_if_areal_lm_head_entropy_is_nondifferentiable(
             self.logger,
             global_rank=self.rank,
@@ -1161,6 +1180,9 @@ class MegatronEngine(TrainEngine):
         return self._cpu_group
 
     def destroy(self):
+        if getattr(self, "_weftmoe_adapter", None) is not None:
+            self._weftmoe_adapter.close()
+            self._weftmoe_adapter = None
         if hasattr(self, "_moe_metrics"):
             self._moe_metrics.close()
         self._initialized = False
@@ -1300,6 +1322,10 @@ class MegatronEngine(TrainEngine):
         )
 
     def update_weights(self, meta: WeightUpdateMeta):
+        if getattr(self, "_weftmoe_adapter", None) is not None and (
+            meta.type != "awex" or self._weftmoe_adapter.master_weights is None
+        ):
+            self._weftmoe_adapter.restore_bf16_weights()
         self._check_rollout_engine_connected()
         if meta.type == "awex":
             # Colocate mode flow (mirrors the AWEX reference integration):
@@ -1354,6 +1380,8 @@ class MegatronEngine(TrainEngine):
             self._weight_residency.release_grad_memory()
             gc.collect()
             current_platform.clear_memory()
+        if getattr(self, "_weftmoe_adapter", None) is not None:
+            self._weftmoe_adapter.restore_bf16_weights()
         with self._checkpoint_aware_context(
             with_model=True, with_optimizer=meta.with_optim
         ):
@@ -1419,6 +1447,8 @@ class MegatronEngine(TrainEngine):
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
 
     def load(self, meta: SaveLoadMeta):
+        if getattr(self, "_weftmoe_adapter", None) is not None:
+            self._weftmoe_adapter.restore_bf16_weights()
         binder = getattr(self, "_qwen4_awex_frozen_binder", None)
         if binder is not None:
             binder.invalidate()
@@ -1448,6 +1478,11 @@ class MegatronEngine(TrainEngine):
                 )
             else:
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
+            if getattr(self, "_weftmoe_adapter", None) is not None:
+                if self._weftmoe_adapter.master_weights is not None:
+                    self._weftmoe_adapter.master_weights.refresh()
+                else:
+                    self._weftmoe_adapter.weights_updated()
 
     @contextmanager
     def _checkpoint_aware_context(self, *, with_model: bool, with_optimizer: bool):
@@ -1511,6 +1546,8 @@ class MegatronEngine(TrainEngine):
                 param_group["_areal_last_step_lr"] = float(param_group["lr"])
         with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
+        if getattr(self, "_weftmoe_adapter", None) is not None:
+            self._weftmoe_adapter.weights_updated()
         # MTP-only pipeline stages without an MTP block have no parameter
         # groups. Their stub optimizer must still step for global grad stats.
         current_lr = (
@@ -1992,6 +2029,8 @@ class MegatronEngine(TrainEngine):
         gather_cp_output: bool = False,
     ) -> None:
         self._ensure_ready()
+        if getattr(self, "_weftmoe_adapter", None) is not None:
+            self._weftmoe_adapter.release_bf16_weights()
         validate_transport_padding(
             mb_list,
             has_internal_objectives=bool(self.tf_config.num_moe_experts)
@@ -2726,6 +2765,11 @@ class MegatronEngine(TrainEngine):
             self.is_offload = True
             return
 
+        # Explicit residency drains the adapter in release_memory(), including
+        # direct AWEX calls. Only the TMS fallback needs the hook here.
+        if getattr(self, "_weftmoe_adapter", None) is not None:
+            self._weftmoe_adapter.suspend()
+
         if not is_tms_enabled():
             raise RuntimeError(
                 "torch_memory_saver requires `enable_offload=True` in yaml config."
@@ -3145,6 +3189,8 @@ class MegatronEngine(TrainEngine):
                 mcore_opt_config, self.model, staged_muon_config, **optimizer_kwargs
             )
             self.optimizer.bind_managed_checkpoint_process_group(self.cpu_group)
+            if getattr(self, "_weftmoe_adapter", None) is not None:
+                self._weftmoe_adapter.bind_fp32_masters(self.optimizer)
         elif use_dist_muon:
             self.optimizer = get_megatron_optimizer_with_dist_muon(
                 mcore_opt_config, self.model, **optimizer_kwargs

@@ -384,6 +384,16 @@ class AwexSchedulerPlugin:
                 )
 
                 return ReleaseMemoryOccupationReqOutput()
+            if os.environ.get("AREAL_USE_WEFTMOE") == "1":
+                from weftmoe.sglang import suspend
+
+                if self._receiver is not None:
+                    self._receiver.release_fp8_bindings()
+                suspend(
+                    scheduler.tp_worker.model_runner,
+                    discard_fp8=os.environ.get("WEFTMOE_FP8") == "1"
+                    and "weights" in (getattr(filtered, "tags", None) or ["weights"]),
+                )
             with _retract_memory_idle(scheduler, owner):
                 return original_release(filtered, *args, **kwargs)
 
@@ -395,7 +405,15 @@ class AwexSchedulerPlugin:
                 )
 
                 return ResumeMemoryOccupationReqOutput()
-            return original_resume(filtered, *args, **kwargs)
+            result = original_resume(filtered, *args, **kwargs)
+            if os.environ.get("AREAL_USE_WEFTMOE") == "1" and not getattr(
+                owner, "offload_tags", set()
+            ):
+                from weftmoe.sglang import resume
+
+                # Capture after both weight transfer and KV/graph restoration.
+                resume(scheduler.tp_worker.model_runner)
+            return result
 
         scheduler.release_memory_occupation = _release
         scheduler.resume_memory_occupation = _resume
@@ -1212,6 +1230,10 @@ def awex_run_scheduler_process(*args, **kwargs):
     """
     import os
 
+    if os.environ.get("AREAL_USE_WEFTMOE") == "1":
+        from weftmoe.sglang import install
+
+        install()
     meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
     logger.info(
         "[AWEX] awex_run_scheduler_process starting "
