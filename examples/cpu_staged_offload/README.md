@@ -117,3 +117,20 @@ peaks were essentially unchanged, with the staged run peaking during AWEX exchan
 These short runs validate execution and memory use, not convergence or multi-node
 behavior. Optimizer staging also requires substantial pinned host memory; the validation
 node had 1.5 TiB of RAM.
+
+## WeftMoE compatibility
+
+The WeftMoE engine/AWEX/SGLang integration is maintained in a separate PR targeting
+`main`. This branch supplies only the CPU-staged Muon adaptation: optional expert FP8
+writeback callbacks, complete-master access for BF16 offload/restore, and an engine
+binding hook. Without a WeftMoE adapter, ordinary Muon behavior is preserved.
+
+`GPUStagedMuon.get_full_parameter_master(param)` returns the existing CPU FP32 master
+for a complete locally owned parameter, or `None` otherwise. Call `drain()` before
+consuming it for residency transitions; checkpoint restoration retains its identity. FP8
+writer callbacks run on the update stream before staging-slot reuse. Expert DP=1 avoids
+gathering released BF16 expert storage.
+
+After combining both PRs, select `actor.optimizer.type=dist_muon`,
+`actor.megatron.use_precision_aware_optimizer=false`, and
+`actor.megatron.ddp.use_distributed_optimizer=false` in the WeftMoE recipe.
