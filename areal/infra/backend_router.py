@@ -32,7 +32,9 @@ class BackendRouterService:
         self.run_id = uuid.uuid4().hex
         self.pool_id = f"{role}-{self.run_id}"
         self.admin_key = config.admin_api_key or secrets.token_urlsafe(32)
-        self.address = config.router_addr
+        self.address = (
+            config.router_addr.rstrip("/") if config.router_addr is not None else None
+        )
         self.process: subprocess.Popen | None = None
         self.log_file = None
         self.log_dir = Path(log_dir)

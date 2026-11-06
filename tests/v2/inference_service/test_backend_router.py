@@ -82,19 +82,70 @@ async def test_new_sessions_balance_normalized_load_atomically_and_stay_sticky()
 
 
 @pytest.mark.asyncio
-async def test_duplicate_acquire_release_and_finished_request_cannot_double_count():
+@pytest.mark.parametrize("session_id", [None, "s"])
+async def test_duplicate_acquire_release_and_finished_request_cannot_double_count(
+    session_id,
+):
     state = await registry()
     await transition(state, "READY", 0)
-    leases = await asyncio.gather(*[acquire(state, "request", "s") for _ in range(10)])
+    leases = await asyncio.gather(
+        *[acquire(state, "request", session_id) for _ in range(10)]
+    )
     assert len({x.lease_id for x in leases}) == 1
     with pytest.raises(RoutingError, match="REQUEST_CONFLICT"):
         await acquire(state, "request", "another-session")
     await transition(state, "PAUSED", 1)
-    assert await acquire(state, "request", "s") == leases[0]
+    assert await acquire(state, "request", session_id) == leases[0]
     await asyncio.gather(*[release(state, x) for x in leases])
     assert (await state.snapshot(**IDENTITY))["outstanding"] == 0
+    pool = state._pools["pool"]
+    assert not pool.requests and not pool.leases
+    assert pool.finished_requests == {"request": session_id}
     with pytest.raises(RoutingError, match="REQUEST_FINISHED"):
-        await acquire(state, "request", "s")
+        await acquire(state, "request", session_id)
+    with pytest.raises(RoutingError, match="REQUEST_CONFLICT"):
+        await acquire(state, "request", "another-session")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_before_release", [False, True])
+async def test_session_close_reclaims_history_without_losing_active_retry(
+    close_before_release,
+):
+    state = await registry()
+    await transition(state, "READY", 0)
+    first = await acquire(state, "first", "s")
+    await release(state, first)
+    last = await acquire(state, "last", "s")
+    unrelated = await acquire(state, "unrelated", "other")
+    pool = state._pools["pool"]
+    close = CloseSession(**IDENTITY, session_id="s")
+    if close_before_release:
+        await state.close_session(close)
+        # A lost acquire reply is recoverable after close, until release.
+        assert await acquire(state, "last", "s") == last
+        assert pool.session_outstanding["s"] == 1
+    await release(state, last)
+    await state.close_session(close)
+    assert not pool.finished_requests and not pool.session_finished_requests
+    assert "s" not in pool.sessions and "s" not in pool.session_outstanding
+    assert set(pool.requests) == {"unrelated"}
+    assert set(pool.leases) == {unrelated.lease_id}
+    for request_id in ("first", "last", "new"):
+        with pytest.raises(RoutingError, match="SESSION_CLOSED"):
+            await acquire(state, request_id, "s")
+    # Lost release replies must not decrement a different active execution.
+    await release(state, first)
+    await release(state, last)
+    assert pool.outstanding == 1
+    await release(state, unrelated)
+    await transition(state, "CLOSED", 1)
+    await state.close_session(close)
+    await release(state, unrelated)
+    assert not pool.requests and not pool.leases
+    assert not pool.finished_requests and not pool.session_finished_requests
+    assert not pool.sessions and not pool.closed_sessions
+    assert not pool.session_outstanding
 
 
 @pytest.mark.asyncio
@@ -595,8 +646,13 @@ async def test_engine_direct_http_abort_continuation_uses_lease_versions(
 async def test_retirement_requires_explicit_process_teardown_before_reusing_backends():
     state = await registry()
     await transition(state, "READY", 0)
+    completed = await acquire(state, "completed")
+    await release(state, completed)
     lease = await acquire(state, "uncertain", "s")
     await transition(state, "FAILED", 1)
+    pool = state._pools["pool"]
+    assert set(pool.leases) == {lease.lease_id}
+    assert pool.outstanding == 1
     with pytest.raises(RoutingError, match="POOL_TERMINAL"):
         await transition(state, "CLOSED", 2)
     await state.set_state(
@@ -609,6 +665,21 @@ async def test_retirement_requires_explicit_process_teardown_before_reusing_back
             old_processes_stopped=True,
         ),
     )
+    await release(state, lease)
+    await release(state, completed)
+    await state.close_session(CloseSession(**IDENTITY, session_id="late"))
+    await state.register(pool.registration)
+    assert pool.state == "CLOSED" and pool.outstanding == 0
+    assert not pool.requests and not pool.leases
+    assert not pool.finished_requests and not pool.session_finished_requests
+    assert not pool.sessions and not pool.closed_sessions
+    assert not pool.session_outstanding
+    with pytest.raises(RoutingError, match="STALE_RUN"):
+        await state.release(
+            Release(
+                pool_id="pool", run_id="old", lease_id=lease.lease_id, outcome="failed"
+            )
+        )
     await state.register(
         RegisterBackends(
             pool_id="recovered",

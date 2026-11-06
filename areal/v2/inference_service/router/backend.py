@@ -2,8 +2,11 @@
 
 """Backend execution leases, independent of DataProxy ownership.
 
-All mutations run under one lock without network I/O. Records live for the run:
-neither an idle session nor an uncertain execution is expired by a timer.
+All mutations run under one lock without network I/O. Released leases are removed;
+finished request IDs live until session close (or pool close for sessionless calls).
+Closed session IDs fence late retries until pool close. Neither idle sessions nor
+uncertain executions expire by a timer. Clients must use globally unique request
+IDs and never reuse them across sessions, as RouteClient does with UUIDs.
 """
 
 from __future__ import annotations
@@ -101,7 +104,6 @@ class Backend:
 class Lease:
     request: Acquire
     response: LeaseResponse
-    outcome: ReleaseOutcome | None = None
 
 
 @dataclass
@@ -117,6 +119,8 @@ class Pool:
     session_outstanding: dict[str, int] = field(default_factory=dict)
     requests: dict[str, Lease] = field(default_factory=dict)
     leases: dict[str, Lease] = field(default_factory=dict)
+    finished_requests: dict[str, str | None] = field(default_factory=dict)
+    session_finished_requests: dict[str, set[str]] = field(default_factory=dict)
 
     @property
     def outstanding(self) -> int:
@@ -169,9 +173,11 @@ class BackendRegistry:
             if existing is not None:
                 if existing.request != request:
                     raise RoutingError("REQUEST_CONFLICT")
-                if existing.outcome is not None:
-                    raise RoutingError("REQUEST_FINISHED")
                 return existing.response.model_copy()
+            if request.request_id in pool.finished_requests:
+                if pool.finished_requests[request.request_id] != request.session_id:
+                    raise RoutingError("REQUEST_CONFLICT")
+                raise RoutingError("REQUEST_FINISHED")
             if request.session_id in pool.closed_sessions:
                 raise RoutingError("SESSION_CLOSED")
             if pool.state != "READY":
@@ -213,16 +219,24 @@ class BackendRegistry:
     async def release(self, request: Release) -> None:
         async with self._lock:
             pool = self._pool(request.pool_id, request.run_id)
-            lease = pool.leases.get(request.lease_id)
+            lease = pool.leases.pop(request.lease_id, None)
             if lease is None:
-                raise RoutingError("UNKNOWN_LEASE")
-            if lease.outcome is not None:
+                # Release is idempotent even after its reply is lost. Unknown
+                # IDs are harmless within the validated pool/run: only an
+                # active lease can decrement a backend's outstanding count.
                 return
-            lease.outcome = request.outcome
+            del pool.requests[lease.request.request_id]
             pool.backends[lease.response.backend_id].outstanding -= 1
-            if lease.request.session_id is not None:
-                pool.session_outstanding[lease.request.session_id] -= 1
-            self._remove_closed_binding(pool, lease.request.session_id)
+            session_id = lease.request.session_id
+            if session_id not in pool.closed_sessions:
+                pool.finished_requests[lease.request.request_id] = session_id
+                if session_id is not None:
+                    pool.session_finished_requests.setdefault(session_id, set()).add(
+                        lease.request.request_id
+                    )
+            if session_id is not None:
+                pool.session_outstanding[session_id] -= 1
+            self._remove_closed_binding(pool, session_id)
 
     @staticmethod
     def _remove_closed_binding(pool: Pool, session_id: str | None) -> None:
@@ -235,7 +249,16 @@ class BackendRegistry:
     async def close_session(self, request: CloseSession) -> None:
         async with self._lock:
             pool = self._pool(request.pool_id, request.run_id)
+            if pool.state == "CLOSED":
+                return
             pool.closed_sessions.add(request.session_id)
+            # The session tombstone now rejects retries of finished requests.
+            # Keep active leases so a lost acquire reply can still be retried
+            # and released; closing a session does not prove execution ended.
+            for request_id in pool.session_finished_requests.pop(
+                request.session_id, ()
+            ):
+                del pool.finished_requests[request_id]
             self._remove_closed_binding(pool, request.session_id)
 
     async def set_state(self, pool_id: str, request: SetPoolState) -> None:
@@ -266,13 +289,17 @@ class BackendRegistry:
             if retiring:
                 # This is an explicit control-plane assertion AFTER process
                 # teardown, never a lease TTL or a hot takeover mechanism.
-                for lease in pool.leases.values():
-                    if lease.outcome is None:
-                        lease.outcome = "failed"
                 for backend in pool.backends.values():
                     backend.outstanding = 0
-                pool.closed_sessions.update(pool.sessions)
+            if request.state == "CLOSED":
+                # Keep the pool registration/control fence so delayed register
+                # cannot resurrect this run, but discard all execution history.
+                pool.requests.clear()
+                pool.leases.clear()
+                pool.finished_requests.clear()
+                pool.session_finished_requests.clear()
                 pool.sessions.clear()
+                pool.closed_sessions.clear()
                 pool.session_outstanding.clear()
             pool.state = request.state
             pool.version = request.weight_version

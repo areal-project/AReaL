@@ -13,6 +13,38 @@ from areal.trainer.rl_trainer import PPOTrainer
 from areal.v2.inference_service.router.backend import RoutingError
 
 
+@pytest.mark.parametrize("suffix", ["", "/", "///"])
+def test_external_router_address_normalized_for_health_and_metadata(
+    tmp_path, monkeypatch, suffix
+):
+    address = "http://router:8000"
+    manager = BackendRouterService(
+        BackendRoutingConfig(
+            router_addr=address + suffix, admin_api_key="test-router-key"
+        ),
+        str(tmp_path),
+        "rollout",
+    )
+    get = Mock()
+    request = Mock(return_value=Mock(status_code=200, json=lambda: {}))
+    monkeypatch.setattr(manager._session, "get", get)
+    monkeypatch.setattr(manager._session, "request", request)
+    monkeypatch.setattr(manager, "_watch", lambda: None)
+    try:
+        manager.start(
+            [{"backend_id": "b", "backend_addr": "http://backend", "capacity": 1}]
+        )
+        manager._monitor.join()
+        get.assert_called_once_with(address + "/health", timeout=2)
+        assert [call.args[1] for call in request.call_args_list] == [
+            address + "/routing/backends/register",
+            address + f"/routing/pools/{manager.pool_id}/state",
+        ]
+        assert manager.client_kwargs()["router_addr"] == address
+    finally:
+        manager._session.close()
+
+
 def test_training_and_eval_share_pause_but_resume_only_the_selected_senders():
     events = []
 
