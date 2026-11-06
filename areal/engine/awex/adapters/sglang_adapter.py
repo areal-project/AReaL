@@ -7,6 +7,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import re
 import time
 from typing import Any
 
@@ -558,9 +559,99 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             )
         return self._weight_converter
 
+    def _iter_qwen_composite_fsdp_params(self, rank_info: RankInfo, config: Any):
+        """Expose FSDP HF-layout views into the dense Qwen VL runtime tensors.
+
+        The transfer code writes into these views, so conversion must never
+        materialize a copy. Rank-packed fused tensors do not describe a single
+        contiguous HF shard for inference TP > 1.
+        """
+        if rank_info.tp_size != 1 or rank_info.attn_tp_size != 1:
+            raise NotImplementedError(
+                "FSDP AWEX for dense Qwen3-VL/Qwen3.5 currently requires "
+                "SGLang inference TP=1; rank-packed fused weights cannot be "
+                "represented as contiguous HF shards."
+            )
+
+        model_type = config.model_type
+        text_config = getattr(config, "text_config", config)
+        for name, param in self._get_model().named_parameters():
+            tensor = param.data
+            if name.startswith("visual."):
+                name = name.replace(".attn.qkv_proj.", ".attn.qkv.")
+                if model_type == "qwen3_5":
+                    name = f"model.{name}"
+                yield name, tensor
+                continue
+
+            if model_type == "qwen3_5":
+                name = re.sub(
+                    r"^(model\.layers\.\d+)\.(qkv_proj|o_proj|q_norm|k_norm)(\.)",
+                    r"\1.self_attn.\2\3",
+                    name,
+                )
+
+            if name.startswith("model.") and not name.startswith(
+                "model.language_model."
+            ):
+                name = name.replace("model.", "model.language_model.", 1)
+
+            if ".self_attn.qkv_proj." in name:
+                head_dim = getattr(text_config, "head_dim", None)
+                if head_dim is None:
+                    head_dim = (
+                        text_config.hidden_size // text_config.num_attention_heads
+                    )
+                query_size = text_config.num_attention_heads * head_dim
+                if model_type == "qwen3_5" and getattr(
+                    text_config, "attn_output_gate", True
+                ):
+                    query_size *= 2
+                kv_size = text_config.num_key_value_heads * head_dim
+                q, k, v = tensor.split((query_size, kv_size, kv_size), dim=0)
+                for projection, part in zip(("q_proj", "k_proj", "v_proj"), (q, k, v)):
+                    yield name.replace("qkv_proj", projection), part
+                continue
+
+            if model_type == "qwen3_5" and ".linear_attn.in_proj_qkvz." in name:
+                key_dim = (
+                    text_config.linear_num_key_heads * text_config.linear_key_head_dim
+                )
+                value_dim = (
+                    text_config.linear_num_value_heads
+                    * text_config.linear_value_head_dim
+                )
+                qkv, z = tensor.split((2 * key_dim + value_dim, value_dim), dim=0)
+                yield name.replace("in_proj_qkvz", "in_proj_qkv"), qkv
+                yield name.replace("in_proj_qkvz", "in_proj_z"), z
+                continue
+
+            if model_type == "qwen3_5" and ".linear_attn.in_proj_ba." in name:
+                heads = text_config.linear_num_value_heads
+                b, a = tensor.split((heads, heads), dim=0)
+                yield name.replace("in_proj_ba", "in_proj_b"), b
+                yield name.replace("in_proj_ba", "in_proj_a"), a
+                continue
+
+            yield from self._unfuse_params(name, tensor)
+
     def _iter_hf_params(self, rank_info: RankInfo):
         """Yield parameters in the canonical layout selected by training."""
         if self._parameter_layout == "hf":
+            config = self._get_awex_hf_config()
+            architectures = getattr(config, "architectures", None) or [
+                self._get_model_arch_name()
+            ]
+            composite_models = {
+                ("qwen3_vl", "Qwen3VLForConditionalGeneration"),
+                ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            }
+            if any(
+                (getattr(config, "model_type", None), arch) in composite_models
+                for arch in architectures
+            ):
+                yield from self._iter_qwen_composite_fsdp_params(rank_info, config)
+                return
             for name, param in self._get_model().named_parameters():
                 yield from self._unfuse_params(name, param.data)
             return
