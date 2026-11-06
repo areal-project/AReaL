@@ -87,6 +87,8 @@ async def test_rlvr_workflow_preserves_length_termination():
     workflow.reward_fn = MagicMock()
     workflow.tokenizer = tokenizer
     workflow.enable_thinking = False
+    workflow.r3_num_moe_layers = None
+    workflow.r3_topk = None
     workflow.gconfig = GenerationHyperparameters(max_new_tokens=3)
     workflow.get_input_ids_fn = lambda *_args: [1, 2]
     workflow.data_extract_prompt_fn = lambda data: data["messages"]

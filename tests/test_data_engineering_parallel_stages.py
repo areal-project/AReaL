@@ -42,7 +42,7 @@ async def test_generation_scoring_and_ranking_use_bounded_parallel_workers(
     tmp_path, backend
 ):
     """Actual workers overlap in every added stage; quotas merge globally."""
-    cfg = config(tmp_path, workers=2, backend=backend, delay=0.02)
+    cfg = config(tmp_path, workers=2, backend=backend, overlap_workers=2)
     snapshot = await run_data_job(cfg, tmp_path / "job")
     assert [row["task_id"] for row in snapshot.training_rows()] == [
         str(i) for i in range(15, 7, -1)

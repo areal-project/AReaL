@@ -57,10 +57,17 @@ def record(directory, phase, task_id):
 
 class ParallelRecipe:
     def __init__(
-        self, count=8, directory=None, delay=0, fail_task="3", fail_phase="clean"
+        self,
+        count=8,
+        directory=None,
+        delay=0,
+        fail_task="3",
+        fail_phase="clean",
+        overlap_workers=0,
     ):
         self.count, self.directory, self.delay = count, directory, delay
         self.fail_task, self.fail_phase = fail_task, fail_phase
+        self.overlap_workers = overlap_workers
 
     def generate(self, context):
         record(self.directory, "generate", context.batch_index)
@@ -69,6 +76,19 @@ class ParallelRecipe:
 
     def visit(self, phase, sample):
         record(self.directory, phase + ".start", sample.task.task_id)
+        if self.overlap_workers and int(sample.task.task_id) < self.overlap_workers:
+            # Rendezvous after recording starts, so process startup skew cannot
+            # make the bounded-concurrency assertion depend on a short sleep.
+            directory = Path(self.directory)
+            (directory / f"{phase}-{sample.task.task_id}.ready").touch()
+            deadline = time.monotonic() + 30
+            while not all(
+                (directory / f"{phase}-{index}.ready").exists()
+                for index in range(self.overlap_workers)
+            ):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Workers did not overlap during {phase}")
+                time.sleep(0.01)
         if self.delay:
             time.sleep(self.delay)
         if (

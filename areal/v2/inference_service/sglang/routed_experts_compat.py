@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 from typing import Any
 
@@ -75,16 +76,25 @@ def apply_sglang_routed_experts_token_cache_patch() -> bool:
     """Patch SGLang routed expert device cache to be token-sized.
 
     Returns ``True`` when this call applied the patch and ``False`` when the
-    current process was already patched.
+    current process was already patched or uses a newer native capture API.
     """
 
     import torch
-    from sglang.srt.layers.moe import routed_experts_capturer
-    from sglang.srt.server_args import get_global_server_args
 
-    cache_cls = routed_experts_capturer._RoutedExpertsDeviceCache
+    module_name = "sglang.srt.layers.moe.routed_experts_capturer"
+    try:
+        routed_experts_capturer = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name != module_name:
+            raise
+        return False
+    cache_cls = getattr(routed_experts_capturer, "_RoutedExpertsDeviceCache", None)
+    if cache_cls is None:
+        return False
     if getattr(cache_cls, _PATCH_ATTR, False):
         return False
+
+    from sglang.srt.server_args import get_global_server_args
 
     original_init = cache_cls.__init__
     original_capture = cache_cls.capture_fwd_routed_experts

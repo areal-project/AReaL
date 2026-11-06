@@ -71,11 +71,15 @@ IS_SGLANG_INSTALLED = is_available("sglang")
     ],
 )
 def test_resolve_colocated_base_gpu_id_supports_scheduler_device_namespaces(
-    env, gpus_per_server, fallback, expected, source
+    monkeypatch, env, gpus_per_server, fallback, expected, source
 ) -> None:
     """Colocated SGLang uses logical IDs under scheduler device isolation."""
     from areal.engine.sglang_remote import _resolve_colocated_base_gpu_id
 
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.current_platform",
+        SimpleNamespace(device_control_env_var="CUDA_VISIBLE_DEVICES"),
+    )
     resolved, resolved_source = _resolve_colocated_base_gpu_id(
         env,
         gpus_per_server,
@@ -109,11 +113,15 @@ def test_resolve_colocated_base_gpu_id_supports_scheduler_device_namespaces(
     ],
 )
 def test_resolve_colocated_base_gpu_id_rejects_invalid_namespaces(
-    env, gpus_per_server, fallback, error
+    monkeypatch, env, gpus_per_server, fallback, error
 ) -> None:
     """Invalid colocated GPU namespaces fail before SGLang starts."""
     from areal.engine.sglang_remote import _resolve_colocated_base_gpu_id
 
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.current_platform",
+        SimpleNamespace(device_control_env_var="CUDA_VISIBLE_DEVICES"),
+    )
     with pytest.raises(ValueError, match=error):
         _resolve_colocated_base_gpu_id(env, gpus_per_server, fallback)
 
