@@ -297,6 +297,7 @@ class GPUStagedAdamW(torch.optim.AdamW):
         self.cpu_slabs: AdamWCPUSlabs | None = None
         self._layouts: tuple[_ParamLayout, ...] = ()
         self._units: tuple[_UpdateUnit, ...] = ()
+        self._master_writers: dict[int, Callable[[torch.Tensor], None]] = {}
         self._runtime = StagedOptimizerRuntime(
             self.staged_config.buffer_count,
             ("master", "exp_avg", "exp_avg_sq", "grad"),
@@ -410,9 +411,36 @@ class GPUStagedAdamW(torch.optim.AdamW):
             )
         self.drain()
 
+    def set_master_writers(
+        self, writers: Mapping[torch.Tensor, Callable[[torch.Tensor], None]]
+    ) -> None:
+        """Replace selected BF16 writebacks with complete GPU-master consumers.
+
+        Consumers run on the update stream before the staging slot is recycled.
+        Their tensors are borrowed and must not be retained after the callback.
+        """
+        if not self._bound:
+            raise RuntimeError("Bind owned parameters before installing master writers")
+        owned = {id(layout.param): layout for layout in self._layouts}
+        for param in writers:
+            layout = owned.get(id(param))
+            if layout is None or layout.numel > self.staged_config.bucket_numel:
+                raise ValueError(
+                    "Master writers require an owned matrix fitting one staging slot"
+                )
+        self.drain()
+        self._master_writers = {id(param): writer for param, writer in writers.items()}
+        self._units = self._build_units(
+            list(self._layouts),
+            self.staged_config.bucket_numel,
+            set(self._master_writers),
+        )
+
     @staticmethod
     def _build_units(
-        layouts: list[_ParamLayout], bucket_numel: int
+        layouts: list[_ParamLayout],
+        bucket_numel: int,
+        whole_params: set[int] | None = None,
     ) -> tuple[_UpdateUnit, ...]:
         units: list[_UpdateUnit] = []
         by_group: dict[int, list[_ParamLayout]] = {}
@@ -424,6 +452,14 @@ class GPUStagedAdamW(torch.optim.AdamW):
             unit_start = group_start
             while unit_start < group_end:
                 unit_end = min(unit_start + bucket_numel, group_end)
+                for layout in group_layouts:
+                    if (
+                        whole_params
+                        and id(layout.param) in whole_params
+                        and layout.offset < unit_end < layout.offset + layout.numel
+                    ):
+                        unit_end = layout.offset
+                        break
                 parts: list[_UnitPart] = []
                 for layout in group_layouts:
                     overlap_start = max(unit_start, layout.offset)
@@ -571,9 +607,14 @@ class GPUStagedAdamW(torch.optim.AdamW):
                     maximize=False,
                 )
             for part, master_part in zip(active_parts, master_parts, strict=True):
-                part.param.detach().view(-1).narrow(
-                    0, part.param_offset, part.numel
-                ).copy_(master_part)
+                writer = self._master_writers.get(id(part.param))
+                if writer is not None:
+                    assert part.param_offset == 0 and part.numel == part.param.numel()
+                    writer(master_part)
+                else:
+                    part.param.detach().view(-1).narrow(
+                        0, part.param_offset, part.numel
+                    ).copy_(master_part)
             slot.compute_done.record(slot.compute_stream)
 
         with torch.cuda.stream(slot.d2h_stream):
