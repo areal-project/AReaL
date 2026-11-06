@@ -182,38 +182,6 @@ class RecoverHandler:
         )
 
     @staticmethod
-    def _is_gateway_train_controller(
-        engine: TrainEngine
-        | TrainController
-        | dict[str, TrainEngine | TrainController],
-    ) -> bool:
-        from areal.v2.training_service.controller.controller import (
-            GatewayTrainController,
-        )
-
-        if isinstance(engine, GatewayTrainController):
-            return True
-        if isinstance(engine, dict):
-            return any(
-                isinstance(controller, GatewayTrainController)
-                for controller in engine.values()
-            )
-        return False
-
-    def _ensure_recover_supported(
-        self,
-        engine: TrainEngine
-        | TrainController
-        | dict[str, TrainEngine | TrainController],
-    ) -> None:
-        if self._is_gateway_train_controller(engine):
-            raise NotImplementedError(
-                "Recovery is not supported with GatewayTrainController "
-                '(`_version="v2"`) yet. Disable `recover.mode` or use '
-                '`_version="v1"`.'
-            )
-
-    @staticmethod
     def _normalize_recover_engines(
         engine: TrainEngine
         | TrainController
@@ -306,7 +274,6 @@ class RecoverHandler:
     ):
         if self.config.mode in ("disabled", "off"):
             return
-        self._ensure_recover_supported(engine)
         # currently only support recover on one engine
         if not self.freq_ctl.check(
             epochs=int(step_info.epoch_step == self.ft_spec.steps_per_epoch - 1),
@@ -434,18 +401,14 @@ class RecoverHandler:
         inference_engine: InferenceEngine | None = None,
         weight_update_meta: WeightUpdateMeta | None = None,
         inference_engine_update_from: str = "default",
+        inference_engine_connected: bool = False,
         colocated_rollout: bool = False,
     ) -> RecoverInfo | None:
         if self.config.mode in ("disabled", "off"):
             return
-        self._ensure_recover_supported(engine)
         if inference_engine is not None and weight_update_meta is None:
             raise ValueError("Weight update meta is required for recovery.")
 
-        # TODO(agent): GatewayTrainController is currently duck-typed and does
-        # not satisfy this TrainController type check. Extend recovery to accept
-        # controller-v2 instances (or make v2 inherit TrainController) before
-        # relying on resumed runs with `_version="v2"`.
         normalized_engine: dict[str, TrainEngine | TrainController] = (
             self._normalize_recover_engines(engine)
         )
@@ -486,14 +449,19 @@ class RecoverHandler:
             global_step = recover_info.last_step_info.global_step
             recovery_version = global_step + 1
 
-            is_awex_colocate = self._should_run_awex_colocate_transfer(
-                inference_engine=inference_engine,
-                weight_update_meta=weight_update_meta,
-                colocated_rollout=colocated_rollout,
+            metadata_colocate = bool(
+                inference_engine is not None
+                and getattr(weight_update_meta, "type", None) == "awex"
+                and getattr(weight_update_meta, "colocate", False)
             )
-            if is_awex_colocate:
-                self._require_colocate_rollout_protocol(inference_engine)
-
+            is_awex_colocate = (
+                metadata_colocate
+                or self._should_run_awex_colocate_transfer(
+                    inference_engine=inference_engine,
+                    weight_update_meta=weight_update_meta,
+                    colocated_rollout=colocated_rollout,
+                )
+            )
             if not is_awex_colocate:
                 for name, engine_ in normalized_engine.items():
                     self._load_checkpoint(
@@ -504,47 +472,68 @@ class RecoverHandler:
                 assert weight_update_meta is not None
                 update_engine = normalized_engine[inference_engine_update_from]
                 versioned_meta = weight_update_meta.with_version(recovery_version)
-                update_engine.connect_engine(inference_engine, versioned_meta)
-                inference_engine.pause()
-                colocate_restore_started = is_awex_colocate
-                can_resume_inference = not is_awex_colocate
-                try:
-                    # AWEX colocate transfer requires the full engine-level
-                    # pause/offload protocol, not just the controller pause. The
-                    # sglang plugin's patched event loop only drains the weight-
-                    # update queue while scheduler._engine_paused is True (set by
-                    # pause_generation), and the reader-side protocol expects the
-                    # engine's kv/weights released before the writer publishes.
-                    # Without this the recover-path transfer deadlocks: reader
-                    # never consumes the queued version marker, writer blocks on
-                    # weights_update_finished forever.
-                    # Restore rollout after every actor worker has returned.
-                    if is_awex_colocate:
-                        inference_engine.pause_generation_sync()
-                        inference_engine.offload(tags=["kv_cache"])
-                        inference_engine.offload(tags=["weights"])
-                        inference_engine.offload(tags=["cuda_graph"])
-                        # Load the actor checkpoint only after the colocated
-                        # rollout engine has released its GPU memory; loading
-                        # first would stack DCP weights/optimizer on top of the
-                        # still-resident sglang allocation and risk OOM.
+                if not inference_engine_connected:
+                    update_engine.connect_engine(inference_engine, versioned_meta)
+                from areal.v2.training_service.controller.controller import (
+                    GatewayTrainController,
+                )
+
+                if is_awex_colocate and isinstance(
+                    update_engine, GatewayTrainController
+                ):
+                    colocate_restore_started = True
+                    with update_engine.train_phase():
                         for name, engine_ in normalized_engine.items():
                             self._load_checkpoint(
                                 engine_, path=source.payloads[name], name=name
                             )
-                    update_engine.update_weights(versioned_meta)
-                    update_engine.set_version(recovery_version)
-                    inference_engine.set_version(recovery_version)
+                        update_engine.update_weights(versioned_meta)
+                        update_engine.set_version(recovery_version)
+                        inference_engine.set_version(recovery_version)
+                        update_engine.mark_colocate_update_committed()
+                else:
                     if is_awex_colocate:
-                        inference_engine.abort_all_requests()
-                        inference_engine.onload(tags=["cuda_graph"])
-                        inference_engine.onload(tags=["kv_cache"])
-                        call_maybe_async(inference_engine.continue_generation)
-                        can_resume_inference = True
-                finally:
-                    # Do not admit work to partially restored colocated workers.
-                    if can_resume_inference:
-                        inference_engine.resume()
+                        self._require_colocate_rollout_protocol(inference_engine)
+                    inference_engine.pause()
+                    colocate_restore_started = is_awex_colocate
+                    can_resume_inference = not is_awex_colocate
+                    try:
+                        # AWEX colocate transfer requires the full engine-level
+                        # pause/offload protocol, not just the controller pause. The
+                        # sglang plugin's patched event loop only drains the weight-
+                        # update queue while scheduler._engine_paused is True (set by
+                        # pause_generation), and the reader-side protocol expects the
+                        # engine's kv/weights released before the writer publishes.
+                        # Without this the recover-path transfer deadlocks: reader
+                        # never consumes the queued version marker, writer blocks on
+                        # weights_update_finished forever.
+                        # Restore rollout after every actor worker has returned.
+                        if is_awex_colocate:
+                            inference_engine.pause_generation_sync()
+                            inference_engine.offload(tags=["kv_cache"])
+                            inference_engine.offload(tags=["weights"])
+                            inference_engine.offload(tags=["cuda_graph"])
+                            # Load the actor checkpoint only after the colocated
+                            # rollout engine has released its GPU memory; loading
+                            # first would stack DCP weights/optimizer on top of the
+                            # still-resident sglang allocation and risk OOM.
+                            for name, engine_ in normalized_engine.items():
+                                self._load_checkpoint(
+                                    engine_, path=source.payloads[name], name=name
+                                )
+                        update_engine.update_weights(versioned_meta)
+                        update_engine.set_version(recovery_version)
+                        inference_engine.set_version(recovery_version)
+                        if is_awex_colocate:
+                            inference_engine.abort_all_requests()
+                            inference_engine.onload(tags=["cuda_graph"])
+                            inference_engine.onload(tags=["kv_cache"])
+                            call_maybe_async(inference_engine.continue_generation)
+                            can_resume_inference = True
+                    finally:
+                        # Do not admit work to partially restored colocated workers.
+                        if can_resume_inference:
+                            inference_engine.resume()
             return recover_info
         except (FileNotFoundError, InValidRecoverInfo) as e:
             if source.transactional:

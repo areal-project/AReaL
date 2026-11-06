@@ -465,3 +465,28 @@ class TestWorkerEndpoints:
         result = deserialize_value(resp.get_json()["result"])
         assert isinstance(result, dict)
         assert "total" in result
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_async_checkpoint_drain_runs_on_engine_thread(client, monkeypatch, failed):
+    import threading
+
+    import areal.v2.training_service.worker.app as worker_app
+
+    threads = []
+
+    def wait():
+        threads.append(threading.current_thread().name)
+        if failed:
+            raise RuntimeError("checkpoint finalize failed")
+
+    monkeypatch.setattr(
+        worker_app,
+        "_engine",
+        SimpleNamespace(checkpointer=SimpleNamespace(wait_async_saves=wait)),
+    )
+    response = client.post("/wait_async_saves", json={})
+    assert response.status_code == (400 if failed else 200)
+    assert threads == ["EngineWorker"]
+    if failed:
+        assert "checkpoint finalize failed" in response.get_json()["error"]

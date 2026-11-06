@@ -71,7 +71,7 @@ class InfBridgeBackend(Protocol):
         """Return the HTTP request that resumes generation on the backend."""
         ...
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Return the HTTP request that offloads model memory on the backend."""
         ...
 

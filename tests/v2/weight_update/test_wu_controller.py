@@ -148,6 +148,23 @@ class TestUpdateWeights:
         with pytest.raises(RuntimeError, match="Not connected"):
             ctrl.update_weights(version=1)
 
+    def test_update_weights_error_result_raises(self, ctrl):
+        ctrl._pair_name = "pair0"
+        ctrl._session.post.return_value = _mock_response(
+            200,
+            {
+                "status": "error",
+                "version": 5,
+                "duration_ms": 123.4,
+                "error": "reader failed",
+            },
+        )
+
+        with pytest.raises(
+            RuntimeError, match="Weight update v5 failed: reader failed"
+        ):
+            ctrl.update_weights(version=5)
+
 
 class TestDisconnect:
     def test_disconnect_clears_state(self, ctrl):

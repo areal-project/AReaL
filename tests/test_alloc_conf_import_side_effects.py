@@ -11,7 +11,10 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _run(code: str, env_extra: dict[str, str]) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PYTHONPATH": REPO_ROOT, **env_extra}
+    env = dict(os.environ)
+    for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        env.pop(name, None)
+    env.update({"PYTHONPATH": REPO_ROOT, **env_extra})
     return subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, env=env
     )
@@ -53,10 +56,15 @@ class TestNoImportTimeAllocConfRewrite:
 
 
 class TestSglangPluginRejectsExpandableSegments:
-    def test_import_fails_loudly_when_expandable_segments_is_enabled(self):
+    @pytest.mark.parametrize("name", ["PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"])
+    def test_import_fails_loudly_when_expandable_segments_is_enabled(self, name):
         result = _run(
             "import areal.engine.awex.plugins.sglang_plugin",
-            {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+            {
+                "PYTORCH_ALLOC_CONF": "",
+                "PYTORCH_CUDA_ALLOC_CONF": "",
+                name: "expandable_segments:True",
+            },
         )
 
         assert result.returncode != 0
@@ -73,3 +81,49 @@ class TestSglangPluginRejectsExpandableSegments:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize(
+    "env,rejected",
+    [
+        ({}, False),
+        ({"PYTORCH_ALLOC_CONF": "max_split_size_mb:128"}, False),
+        ({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"}, False),
+        (
+            {
+                "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+            },
+            False,
+        ),
+        (
+            {"PYTORCH_ALLOC_CONF": "max_split_size_mb:128, expandable_segments: True"},
+            True,
+        ),
+        ({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}, True),
+        (
+            {
+                "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+            },
+            True,
+        ),
+        (
+            {
+                "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+            True,
+        ),
+    ],
+)
+def test_memory_saver_allocator_validation_never_rewrites_environment(env, rejected):
+    from areal.engine.awex.utils import validate_memory_saver_allocator
+
+    original = env.copy()
+    if rejected:
+        with pytest.raises(RuntimeError, match="rollout role"):
+            validate_memory_saver_allocator(env)
+    else:
+        validate_memory_saver_allocator(env)
+    assert env == original

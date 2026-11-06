@@ -155,12 +155,17 @@ class WeightUpdateController:
         )
         resp.raise_for_status()
         data = resp.json()
-        return WeightUpdateResult(
+        result = WeightUpdateResult(
             status=data["status"],
             version=data["version"],
             duration_ms=data["duration_ms"],
             error=data.get("error"),
         )
+        if result.status != "ok":
+            raise RuntimeError(
+                f"Weight update v{version} failed: {result.error or result.status}"
+            )
+        return result
 
     def disconnect(self) -> None:
         if self._pair_name is None:
