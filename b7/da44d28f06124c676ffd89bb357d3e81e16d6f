@@ -1,0 +1,19 @@
+areal/engine/awex/adapters/sglang_adapter.py
+  s_d2cc4f3536bafd::t_17842650231028 383-385,388-394,1414,1425
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b7da44d28f06124c676ffd89bb357d3e81e16d6f",
+  "prompts": {},
+  "sessions": {
+    "s_d2cc4f3536bafd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1335a-3e29-77d3-9130-2955bc5b7e89",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
