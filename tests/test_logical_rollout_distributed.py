@@ -67,6 +67,38 @@ def _check_logical_rollouts(rank, rendezvous):
         )
         torch.testing.assert_close(actual, rows - 1.0, rtol=0, atol=0)
 
+        # A shaped override on only one rank must not change collective ordering.
+        shaped_norm = Normalization(
+            NormConfig(
+                mean_level="batch", std_level="batch", std_unbiased=False, eps=0.0
+            )
+        )
+        shaped_rows = rows * 2 if rank == 0 else rows
+        shaped_refs = torch.tensor(refs) * 2 if rank == 0 else None
+        actual = normalize_rollout_rewards(
+            shaped_rows,
+            shaped_norm,
+            meta,
+            normalization_rewards=shaped_refs,
+            reduce_group=dist.group.WORLD,
+        )
+        torch.testing.assert_close(
+            actual,
+            (shaped_rows - 6.0) / (8.0**0.5),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        # When shaping requires new references, all ranks reject a missing one.
+        with pytest.raises(RuntimeError, match="requires normalization_rewards"):
+            normalize_rollout_rewards(
+                shaped_rows,
+                shaped_norm,
+                meta,
+                normalization_rewards=shaped_refs,
+                require_shaped_references=True,
+                reduce_group=dist.group.WORLD,
+            )
+
         # Only one rank has ambiguous rows; both fail before statistic collectives.
         if rank == 0:
             meta.rollout_groups = [RolloutGroup(counts)]

@@ -615,3 +615,126 @@ def test_process_tool_calls_qwen25_chat_completions_with_tool_call_in_thinking_v
 
     _assert_tool_calls(tool_calls, new_text, new_finish_reason)
     assert "<tool_call>" in new_text
+
+
+@pytest.mark.parametrize("use_responses", [False, True])
+@pytest.mark.parametrize("prefilled", [False, True])
+def test_qwen3_coder_strict_parser_rejects_malformed_calls_without_fallback(
+    monkeypatch, use_responses, prefilled
+):
+    """Strict parsing accepts real calls after thinking but never repairs bad XML."""
+    from unittest.mock import Mock
+
+    from areal.experimental.openai import tool_call_parser as parser
+
+    backend = Mock(side_effect=AssertionError("Unexpected backend fallback"))
+    monkeypatch.setattr(parser, "_process_tool_calls_sglang", backend)
+    monkeypatch.setattr(parser, "_process_tool_calls_vllm", backend)
+    function = {"name": "Ping", "parameters": {"type": "object"}}
+    tools = (
+        [{"type": "function", **function}]
+        if use_responses
+        else [{"type": "function", "function": function}]
+    )
+    prefix = "Discuss <tool_call> syntax.</think>Done.\n" if prefilled else ""
+    call = "<tool_call><function=Ping></function></tool_call>"
+    kwargs = dict(
+        tools=tools,
+        tool_call_parser="qwen3_coder",
+        reasoning_parser="qwen3",
+        finish_reason="stop",
+        use_responses=use_responses,
+        tool_call_parser_allow_recovery=False,
+        reasoning_prefilled=prefilled,
+    )
+    calls, remaining, reason = parser.process_tool_calls(text=prefix + call, **kwargs)
+    assert len(calls) == 1
+    assert remaining == prefix
+    assert reason == "tool_calls"
+    with pytest.raises(parser.InvalidToolCallError):
+        parser.process_tool_calls(
+            text=prefix + call.replace("</function>", ""), **kwargs
+        )
+    backend.assert_not_called()
+
+
+@pytest.mark.parametrize("use_responses", [False, True])
+@pytest.mark.parametrize(
+    "schema_type,raw_value",
+    [
+        ("object", r'{"content": "\udc21"}'),
+        ("object", r'{"content": "\ud800"}'),
+        ("object", r'{"nested": [{"content": "\udc21"}]}'),
+        ("object", r'{"\udc21": "content"}'),
+        ("array", r'["\udc21"]'),
+    ],
+)
+def test_qwen3_coder_structured_arguments_unpaired_surrogate_rejected(
+    use_responses, schema_type, raw_value
+):
+    """Escaped model output must not become a retryable SSE encoding failure."""
+    function = {
+        "name": "Edit",
+        "parameters": {
+            "type": "object",
+            "properties": {"patch": {"type": schema_type}},
+        },
+    }
+    tools = (
+        [{"type": "function", **function}]
+        if use_responses
+        else [{"type": "function", "function": function}]
+    )
+    text = (
+        "<tool_call><function=Edit><parameter=patch>"
+        f"{raw_value}</parameter></function></tool_call>"
+    )
+
+    with pytest.raises(parser_module.InvalidToolCallError, match="invalid_tool_json"):
+        parser_module.process_tool_calls(
+            text,
+            tools,
+            "qwen3_coder",
+            None,
+            "stop",
+            use_responses=use_responses,
+            tool_call_parser_allow_recovery=False,
+        )
+
+
+@pytest.mark.parametrize("use_responses", [False, True])
+@pytest.mark.parametrize(
+    "raw_value", [r'{"content": "\ud83d\ude00"}', '{"content": "中文"}']
+)
+def test_qwen3_coder_structured_arguments_valid_unicode_roundtrips(
+    use_responses, raw_value
+):
+    """Valid surrogate pairs and Unicode remain valid serializable actions."""
+    function = {
+        "name": "Edit",
+        "parameters": {
+            "type": "object",
+            "properties": {"patch": {"type": "object"}},
+        },
+    }
+    tools = (
+        [{"type": "function", **function}]
+        if use_responses
+        else [{"type": "function", "function": function}]
+    )
+    calls, _, reason = parser_module.process_tool_calls(
+        "<tool_call><function=Edit><parameter=patch>"
+        f"{raw_value}</parameter></function></tool_call>",
+        tools,
+        "qwen3_coder",
+        None,
+        "stop",
+        use_responses=use_responses,
+        tool_call_parser_allow_recovery=False,
+    )
+
+    call = calls[0]
+    arguments = call.arguments if use_responses else call.function.arguments
+    assert json.loads(arguments) == {"patch": json.loads(raw_value)}
+    assert reason == "tool_calls"
+    assert json.loads(call.model_dump_json())

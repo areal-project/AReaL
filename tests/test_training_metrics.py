@@ -419,7 +419,9 @@ def test_stats_logger_logs_expert_table_without_expert_scalar_series(monkeypatch
 
     logged = []
     monkeypatch.setattr(
-        stats_logger.wandb, "log", lambda data, step: logged.append((data, step))
+        stats_logger.wandb,
+        "log",
+        lambda data, step, commit=None: logged.append((data, step)),
     )
     monkeypatch.setattr(stats_logger.swanlab, "log", lambda *args, **kwargs: None)
     logger = stats_logger.StatsLogger.__new__(stats_logger.StatsLogger)
@@ -524,7 +526,7 @@ def test_stats_logger_large_expert_table_serializes_every_layer(monkeypatch):
     monkeypatch.setattr(
         stats_logger.wandb,
         "log",
-        lambda data, step: serialized.append(
+        lambda data, step, commit=None: serialized.append(
             data["moe_balance/expert_loads"]._to_table_json()
         ),
     )
@@ -545,3 +547,35 @@ def test_stats_logger_large_expert_table_serializes_every_layer(monkeypatch):
     logger.commit(0, 0, 0, metrics)
     assert len(serialized[0]["data"]) == 10240
     assert serialized[0]["data"][-1] == [39, 255, 1, 100 / 256]
+
+
+@pytest.mark.parametrize("last_commit_step", [-1, 5])
+def test_stats_logger_finalizes_each_row_before_next_training_step(
+    monkeypatch, last_commit_step
+):
+    """Explicit W&B steps otherwise leave the latest row pending indefinitely."""
+    from areal.utils import stats_logger
+
+    committed = []
+
+    def log(data, *, step, commit=None):
+        # W&B defaults to commit=False when an explicit step is supplied.
+        if commit:
+            committed.append((step, data))
+
+    monkeypatch.setattr(stats_logger.wandb, "log", log)
+    monkeypatch.setattr(stats_logger.swanlab, "log", lambda *args, **kwargs: None)
+    logger = stats_logger.StatsLogger.__new__(stats_logger.StatsLogger)
+    logger.ft_spec = SimpleNamespace(
+        total_train_epochs=1, steps_per_epoch=10, total_train_steps=10
+    )
+    logger._last_commit_step = last_commit_step
+    logger.summary_writer = None
+    logger.print_stats = lambda _data: None
+    rows = [{"train/loss": 0.2}, {"eval/reward": 0.5}]
+
+    logger.commit(epoch=0, step=1, global_step=1, data=rows)
+
+    first_step = max(1, last_commit_step + 1)
+    assert committed == [(first_step, rows[0]), (first_step + 1, rows[1])]
+    assert logger.state_dict() == {"last_commit_step": first_step + 1}

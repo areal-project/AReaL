@@ -540,6 +540,8 @@ async def test_multi_step_tool_calling_concat_style(openai_client):
     concatenated trajectories.
     """
     openai_client: ArealOpenAI
+    # Test concat rewards and masks independently of sampled response validity.
+    openai_client.response_validator = None
     openai_client.chat_template_type = "concat"
     openai_client.chat.completions.chat_template_type = "concat"
 

@@ -37,6 +37,7 @@ from areal.api.cli_args import (
     SchedulingStrategyType,
 )
 from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY, DatasetRoute
+from areal.infra.rpc.rtensor import flatten_shard_ids
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
 from areal.infra.utils.inference_targets import write_inference_targets
@@ -45,6 +46,7 @@ from areal.utils.data import cycle_dataloader
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.rollout_metrics import ConsumedMetrics
 
 from ..staleness_manager import StalenessManager
 from ..workflow_executor import (
@@ -170,6 +172,7 @@ class RolloutController:
         self.inf_engine = inf_engine
         self.config = config
         self.scheduler = scheduler
+        self.consumed_metrics = ConsumedMetrics()
 
         # Parse allocation from config.backend
         self.rollout_alloc = ModelAllocation.from_str(config.backend)
@@ -346,6 +349,11 @@ class RolloutController:
         ](
             max_queue_size=qsize,
             task_factory=self._create_submit_callback,
+            consume_result=lambda result: (
+                result
+                if isinstance(result, WorkflowContractFailure)
+                else self.consumed_metrics.consume(result)
+            ),
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
             terminal_error_fn=get_workflow_result_error,
@@ -441,11 +449,11 @@ class RolloutController:
             self.config.scheduling_strategy.type
             == SchedulingStrategyType.colocation.value
         ):
-            # Colocation (AWEX) path: multiple servers share a node, so SLURM does
-            # NOT isolate GPUs per worker. We must compute base_gpu_id explicitly and
-            # inject `_awex_gpus_per_server` so the worker recomputes base_gpu_id from
-            # its own SLURM_LOCALID at runtime (the only value guaranteed unique per
-            # node-slot). See SGLangBackend.launch_server.
+            # Colocation (AWEX) path: compute a fallback node-local GPU offset.
+            # The worker uses `_awex_gpus_per_server` to resolve placement against
+            # its actual CUDA_VISIBLE_DEVICES: forked/reused workers may already
+            # be isolated, while other workers need a SLURM_LOCALID-based offset.
+            # See SGLangBackend.launch_server.
             #
             # NOTE: this assumes a server fits within one node
             # (gpus_per_server <= n_gpus_per_node). Cross-node TP servers would
@@ -1133,7 +1141,7 @@ class RolloutController:
                 # Fetch the result
                 result = await self.scheduler.async_call_engine(
                     worker.id,
-                    "_wait_for_task_result",
+                    "get_rollout_result",
                     engine_name=engine_name,
                     task_id=engine_task_id,
                     timeout=0.1,  # A short time to prevent blocking other requests
@@ -1145,7 +1153,7 @@ class RolloutController:
                     manager.on_rollout_rejected()
                     return result
 
-                traj = result
+                traj = result["trajectory"] if result is not None else None
                 if traj is not None:
                     traj = self._propagate_mopd_route(pending_task.mopd_route, traj)
                     manager.on_rollout_accepted()
@@ -1153,12 +1161,16 @@ class RolloutController:
                         logger.info(
                             f"Finish and accept rollout. {self._rollout_stats()}"
                         )
-                    return _RolloutResult(task_id=task_id, trajectory=traj)
+                    return _RolloutResult(
+                        task_id=task_id, trajectory=traj, metrics=result["metrics"]
+                    )
 
                 manager.on_rollout_rejected()
                 if self.config.enable_rollout_tracing:
                     logger.info(f"Finish but reject rollout. {self._rollout_stats()}")
-                return None
+                return _RolloutResult(
+                    task_id, None, result["metrics"] if result is not None else None
+                )
 
             except TimeoutError:
                 if task_id is not None:
@@ -1383,6 +1395,40 @@ class RolloutController:
 
         return run_async_task(_compute)
 
+    def clear_batches(self, *targets: Any) -> None:
+        """Drain worker input caches after teacher scoring.
+
+        The actor controller owns source-storage cleanup. Send only shard IDs
+        here so workers can evict cached inputs even after those sources have
+        been deleted, without localizing or refetching the batch. Wait for all
+        worker drains before propagating a failure.
+        """
+        shard_ids = list(dict.fromkeys(flatten_shard_ids(targets)))
+        if not shard_ids:
+            return
+
+        async def _clear() -> list[Any]:
+            return await asyncio.gather(
+                *[
+                    self.scheduler.async_call_engine(
+                        worker_id=worker.id,
+                        method="clear_batches",
+                        engine_name=self._engine_name(rank),
+                        shard_ids=shard_ids,
+                        rpc_meta={"broadcast": False},
+                        http_timeout=self.config.request_timeout,
+                    )
+                    for rank, worker in enumerate(self.workers)
+                ],
+                return_exceptions=True,
+            )
+
+        results = run_async_task(_clear)
+        for worker, result in zip(self.workers, results, strict=True):
+            if isinstance(result, BaseException):
+                result.add_note(f"clear_batches failed on worker {worker.id}")
+                raise result
+
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
         """Asynchronously generate a response for the given request.
 
@@ -1495,7 +1541,24 @@ class RolloutController:
             all_raw_stats += self._proxy_collective_rpc(
                 method="export_stats", http_timeout=60.0
             )
-        return _merge_worker_stats(all_raw_stats)
+        consumed = self.consumed_metrics.export()
+        merged = _merge_worker_stats([*all_raw_stats, consumed])
+        # Expose denominators for batch-aligned quality metrics.
+        merged.update(
+            {
+                k: v
+                for k, v in consumed.items()
+                if k.endswith("__count")
+                or k
+                in {
+                    "rollout/reward_sample_count",
+                    "rollout/group_attempt_count",
+                    "rollout/task_attempt_count",
+                    "rollout/task_result_count",
+                }
+            }
+        )
+        return merged
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
         async def _call():

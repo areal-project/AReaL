@@ -2,6 +2,10 @@
 
 """Generalized advantage estimation kernels and turn metadata helpers."""
 
+import math
+from collections.abc import Callable, Mapping
+from typing import Any
+
 import torch
 
 from areal.trainer.ppo.lambda_fn import GAELambdaContext
@@ -213,3 +217,57 @@ def _build_gae_lambda_context(
         "turn_counts": turn_counts,
         "timestep_lengths": timestep_lengths,
     }
+
+
+def compute_gae_lambda(
+    gae_lambda: float | torch.Tensor | Callable,
+    loss_mask: torch.Tensor,
+    turn_ids: torch.Tensor | None,
+    *,
+    timestep_unit: str,
+    kwargs: Mapping[str, Any] | None = None,
+) -> float | torch.Tensor:
+    """Resolve lambda using the estimator's actual timestep unit."""
+    if isinstance(gae_lambda, (int, float)) and not isinstance(gae_lambda, bool):
+        if not math.isfinite(gae_lambda):
+            raise ValueError(f"Static gae_lambda must be finite, got {gae_lambda}")
+        if not 0.0 <= gae_lambda <= 1.0:
+            raise ValueError(f"Static gae_lambda must be in [0, 1], got {gae_lambda}")
+        return float(gae_lambda)
+    if callable(gae_lambda):
+        context = _build_gae_lambda_context(
+            loss_mask,
+            turn_ids,
+            gae_timestep_unit=timestep_unit,
+        )
+        gae_lambda = gae_lambda(context, **(kwargs or {}))
+    if not isinstance(gae_lambda, torch.Tensor):
+        raise TypeError(
+            "gae_lambda function must return a torch.Tensor with shape "
+            f"[{loss_mask.shape[0]}], got {type(gae_lambda).__name__}"
+        )
+    expected_shape = torch.Size([loss_mask.shape[0]])
+    if gae_lambda.shape != expected_shape:
+        raise ValueError(
+            "gae_lambda function must return one value per local trajectory: "
+            f"expected shape {expected_shape}, got {gae_lambda.shape}"
+        )
+    if gae_lambda.device != loss_mask.device:
+        raise ValueError(
+            "gae_lambda output and loss_mask must be on the same device, got "
+            f"{gae_lambda.device} and {loss_mask.device}"
+        )
+    if not torch.is_floating_point(gae_lambda):
+        raise TypeError(
+            "gae_lambda function must return a floating-point tensor, got "
+            f"{gae_lambda.dtype}"
+        )
+    torch._assert_async(
+        torch.all(torch.isfinite(gae_lambda)),
+        "gae_lambda function returned a non-finite value",
+    )
+    torch._assert_async(
+        torch.all((gae_lambda >= 0.0) & (gae_lambda <= 1.0)),
+        "gae_lambda function values must be in [0, 1]",
+    )
+    return gae_lambda.detach().float()

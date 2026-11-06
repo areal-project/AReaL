@@ -8,6 +8,7 @@ import pathlib
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 
 from areal.api.alloc_mode import AllocationType, _AllocationMode
 from areal.utils import logging, name_resolve, names
@@ -130,19 +131,29 @@ def get_scheduling_spec(config_part):
         return SchedulingSpec()
 
 
-def get_env_vars(additional_env_vars: str | None = None) -> dict[str, str]:
+def get_env_vars(
+    additional_env_vars: str | Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """Returns the environment variables for the cluster.
 
     This function dynamically captures the current Python path (sys.path) to ensure
     that spawned worker processes can import modules from the same locations as the
     parent process. This is essential for deserializing custom config classes defined
     outside the areal package (e.g., in examples/).
+
+    ``additional_env_vars`` is either a mapping, whose values are used verbatim, or
+    a comma-separated ``KEY=VALUE`` string. In the string form only the first ``=``
+    of each item separates key from value; values containing ``,`` must be passed
+    as a mapping.
     """
-    _additional_env_vars = (
-        dict(item.split("=") for item in additional_env_vars.split(","))
-        if additional_env_vars
-        else dict()
-    )
+    if isinstance(additional_env_vars, Mapping):
+        _additional_env_vars = dict(additional_env_vars)
+    elif additional_env_vars:
+        _additional_env_vars = dict(
+            item.split("=", 1) for item in additional_env_vars.split(",")
+        )
+    else:
+        _additional_env_vars = {}
 
     # Dynamically build PYTHONPATH from current sys.path to ensure workers
     # can import custom modules in controller mode

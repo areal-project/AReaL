@@ -37,8 +37,19 @@ from areal.infra.workflow_executor import WorkflowTaskResult
 from areal.utils import perf_tracer, stats_tracker
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, format_host_for_url
+from areal.utils.sglang_image import image_request_kwargs
 
 logger = getLogger("SGLangRemote")
+
+
+def _has_isolated_device_namespace(
+    env: Mapping[str, str], gpus_per_server: int
+) -> bool:
+    visible_devices = env.get(current_platform.device_control_env_var, "")
+    return (
+        len([device for device in visible_devices.split(",") if device.strip()])
+        == gpus_per_server
+    )
 
 
 def _resolve_colocated_base_gpu_id(
@@ -64,22 +75,19 @@ def _resolve_colocated_base_gpu_id(
         return parsed
 
     device_control_env_var = current_platform.device_control_env_var
-    visible_devices = env.get(device_control_env_var, "")
-    visible_device_count = len(
-        [device for device in visible_devices.split(",") if device.strip()]
-    )
+    isolated_devices = _has_isolated_device_namespace(env, gpus_per_server)
 
     explicit_base_gpu_id = env.get("AREAL_SGLANG_BASE_GPU_ID")
     if explicit_base_gpu_id is not None:
         resolved = _nonnegative_int(explicit_base_gpu_id, "AREAL_SGLANG_BASE_GPU_ID")
-        if visible_device_count == gpus_per_server and resolved != 0:
+        if isolated_devices and resolved != 0:
             raise ValueError(
                 "AREAL_SGLANG_BASE_GPU_ID must be 0 when the worker has an "
                 f"isolated {device_control_env_var} namespace"
             )
         return resolved, "AREAL_SGLANG_BASE_GPU_ID"
 
-    if visible_device_count == gpus_per_server:
+    if isolated_devices:
         return 0, device_control_env_var
 
     slurm_local_id = env.get("SLURM_LOCALID")
@@ -91,36 +99,6 @@ def _resolve_colocated_base_gpu_id(
         _nonnegative_int(fallback_base_gpu_id, "fallback_base_gpu_id"),
         "controller fallback",
     )
-
-
-def _compact_image_tokens(req: ModelRequest) -> list[int]:
-    """Use one placeholder per image on the wire, preserving training token IDs.
-
-    HF processors expand an image placeholder into patch tokens. SGLang expands
-    placeholders again while processing image_data; sending expanded tokens can
-    force it to decode and retokenize the entire prompt, changing generated token
-    IDs and invalidating the context budget. Only compact when image-token runs
-    match the supplied images, leaving unknown processor formats unchanged.
-    """
-    image_token_id = getattr(req.processor, "image_token_id", None)
-    if not req.image_data or not isinstance(image_token_id, int):
-        return req.input_ids.copy()
-
-    compact_ids: list[int] = []
-    image_count = 0
-    previous_is_image = False
-    for token in req.input_ids:
-        is_image = token == image_token_id
-        if is_image and previous_is_image:
-            continue
-        if is_image:
-            image_count += 1
-        compact_ids.append(token)
-        previous_is_image = is_image
-
-    if image_count != len(req.image_data):
-        return req.input_ids.copy()
-    return compact_ids
 
 
 class SGLangBackend:
@@ -165,12 +143,18 @@ class SGLangBackend:
             sample_params["sampling_seed"] = gconfig.seed
 
         payload = {
-            "input_ids": _compact_image_tokens(req),
+            **image_request_kwargs(req),
             "image_data": req.image_data,  # ImageObject or str
             "sampling_params": sample_params,
             "return_logprob": True,
             "stream": False,
         }
+
+        if gconfig.score_centering_top_k:
+            from areal.utils.score_centering import validate_sampling
+
+            validate_sampling(gconfig)
+            payload["top_logprobs_num"] = gconfig.score_centering_top_k
 
         # Add return_routed_experts to payload if set
         if req.metadata.get("return_routed_experts", False):
@@ -223,7 +207,12 @@ class SGLangBackend:
         output_tokens = [x[1] for x in meta_info["output_token_logprobs"]]
         output_logprobs = [x[0] for x in meta_info["output_token_logprobs"]]
 
+        from areal.utils.score_centering import parse_sampler_heads
+
+        head_ids, head_logprobs = parse_sampler_heads(meta_info, output_tokens)
         return HttpGenerationResult(
+            sampler_head_ids=head_ids,
+            sampler_head_logprobs=head_logprobs,
             output_tokens=output_tokens,
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
@@ -553,20 +542,31 @@ class SGLangBackend:
         awex_transfer_rank_base = server_args.pop("_awex_transfer_rank_base", None)
         if awex_gpus_per_server is not None:
             fallback_base_gpu_id = int(server_args.get("base_gpu_id", 0))
-            awex_transfer_rank_base = fallback_base_gpu_id
             base_gpu_id, source = _resolve_colocated_base_gpu_id(
                 os.environ,
                 int(awex_gpus_per_server),
                 fallback_base_gpu_id,
             )
             server_args["base_gpu_id"] = base_gpu_id
+            if awex_transfer_rank_base is None:
+                # Isolated devices start at logical zero but retain a dense
+                # transfer offset. Otherwise follow actual worker placement:
+                # controller enumeration need not match Slurm's local order.
+                awex_transfer_rank_base = (
+                    fallback_base_gpu_id
+                    if _has_isolated_device_namespace(
+                        os.environ, int(awex_gpus_per_server)
+                    )
+                    else base_gpu_id
+                )
             logger.info(
                 "AWEX colocate base_gpu_id=%s resolved from %s "
-                "(gpus_per_server=%s, requested=%s)",
+                "(gpus_per_server=%s, requested=%s, transfer_rank_base=%s)",
                 base_gpu_id,
                 source,
                 awex_gpus_per_server,
                 fallback_base_gpu_id,
+                awex_transfer_rank_base,
             )
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
@@ -612,7 +612,9 @@ class SGLangBackend:
                 "areal.v2.inference_service.sglang.launch_server",
             )
             cmd = [
-                "areal.engine.awex.sglang_plugin" if c in sglang_entrypoints else c
+                "areal.engine.awex.plugins.sglang_plugin"
+                if c in sglang_entrypoints
+                else c
                 for c in cmd
             ]
             if awex_meta_addr:
@@ -794,6 +796,12 @@ class RemoteSGLangEngine(InferenceEngine):
         """Wait for a specified number of requests to complete."""
         return self._engine.wait(count, timeout, raise_timeout)
 
+    def get_rollout_result(
+        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+    ) -> dict[str, Any] | None:
+        """Transfer the trajectory and quality metrics to the rollout consumer."""
+        return self._engine.get_rollout_result(task_id, timeout, raise_timeout)
+
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | None:
@@ -893,7 +901,11 @@ class RemoteSGLangEngine(InferenceEngine):
         return self._engine.onload(tags=tags)
 
     def export_stats(self) -> dict[str, float]:
-        return stats_tracker.export_all(reduce_group=None)
+        result = stats_tracker.export_all(reduce_group=None)
+        executor = self._engine._workflow_executor
+        if executor is not None:
+            result.update(executor.consumed_metrics.export())
+        return result
 
     @classmethod
     def as_controller(cls, config: InferenceEngineConfig, scheduler: Scheduler):

@@ -792,9 +792,7 @@ class LocalScheduler(Scheduler):
                         role, f"Resource allocation failed for worker {idx}", str(e)
                     ) from e
 
-                env = get_env_vars(
-                    ",".join([f"{k}={v}" for k, v in scheduling.env_vars.items()]),
-                )
+                env = get_env_vars(scheduling.env_vars)
                 if current_platform.device_control_env_var:
                     env[current_platform.device_control_env_var] = ",".join(
                         map(str, gpu_devices)

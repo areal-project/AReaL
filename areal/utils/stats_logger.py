@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import getpass
 import os
 import time
 from dataclasses import asdict
@@ -166,7 +165,8 @@ class StatsLogger:
                     columns=["layer", "expert", "tokens", "load_percent"],
                     data=expert_rows,
                 )
-            wandb.log(wandb_item, step=log_step + i)
+            # Explicit steps otherwise keep the latest row pending until the next log.
+            wandb.log(wandb_item, step=log_step + i, commit=True)
             swanlab.log(item, step=log_step + i)
             if getattr(self, "_trackio_enabled", False):
                 trackio.log(item, step=log_step + i)
@@ -189,10 +189,4 @@ class StatsLogger:
             experiment_name = config.experiment_name
             trial_name = config.trial_name
             fileroot = config.fileroot
-        if not fileroot or not experiment_name or not trial_name:
-            raise ValueError(
-                "fileroot, experiment_name, and trial_name must be provided."
-            )
-        path = f"{fileroot}/logs/{getpass.getuser()}/{experiment_name}/{trial_name}"
-        os.makedirs(path, exist_ok=True)
-        return path
+        return logging.get_experiment_log_path(experiment_name, trial_name, fileroot)

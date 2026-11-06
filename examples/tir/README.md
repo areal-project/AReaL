@@ -229,6 +229,11 @@ Notes:
   snapshot or custom image, update the `daytona_python` factory in
   `examples/tir/tool_manager.py`.
 
+## Data engineering recipe
+
+See the [TIR data engineering example](../data_engineering/tir/README.md) for task
+generation, cleaning, calibration, and dataset export.
+
 ## TODOs
 
 - [ ] Evaluation script

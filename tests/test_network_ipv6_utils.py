@@ -166,3 +166,68 @@ def test_find_free_ports_seeded_candidates_busy_uses_independent_rng(monkeypatch
 
     assert network.find_free_ports(1) == [free_port]
     assert training_rng.getstate() == state
+
+
+@pytest.mark.parametrize("occupied", [False, True])
+@pytest.mark.parametrize("start_port", [10000, 10010, 10020])
+def test_find_free_ports_sparse_availability_returns_remaining_port(
+    monkeypatch, occupied, start_port
+):
+    """Find a sole eligible port regardless of the random starting point."""
+    network = _load_network_module()
+    free_port = 10010
+    unavailable = set(range(10000, 10021)) - {free_port}
+    checked = []
+
+    def is_port_free(port):
+        checked.append(port)
+        return port == free_port
+
+    monkeypatch.setattr(
+        network.random.SystemRandom, "randint", lambda self, lo, hi: start_port
+    )
+    monkeypatch.setattr(network, "is_port_free", is_port_free)
+
+    assert network.find_free_ports(
+        1, (10000, 10020), exclude_ports=set() if occupied else unavailable
+    ) == [free_port]
+    assert len(checked) == len(set(checked))
+    if not occupied:
+        assert checked == [free_port]
+
+
+def test_find_free_ports_full_range_returns_sorted_unique_ports(monkeypatch):
+    """Repeated random draws must not prevent filling an entirely free range."""
+    network = _load_network_module()
+    checked = []
+    monkeypatch.setattr(
+        network.random.SystemRandom, "randint", lambda self, lo, hi: 10003
+    )
+    monkeypatch.setattr(
+        network, "is_port_free", lambda port: checked.append(port) or True
+    )
+
+    assert network.find_free_ports(6, (10000, 10005)) == list(range(10000, 10006))
+    assert len(checked) == len(set(checked)) == 6
+
+
+def test_find_free_ports_exhausted_range_checks_all_eligible_ports_once(monkeypatch):
+    """Report insufficient free ports only after inspecting every candidate."""
+    network = _load_network_module()
+    excluded = {10001, 10004}
+    checked = []
+
+    def is_port_free(port):
+        checked.append(port)
+        return port == 10003
+
+    monkeypatch.setattr(
+        network.random.SystemRandom, "randint", lambda self, lo, hi: 10003
+    )
+    monkeypatch.setattr(network, "is_port_free", is_port_free)
+
+    with pytest.raises(ValueError, match="Could only find 1 free ports out of 2"):
+        network.find_free_ports(2, (10000, 10005), exclude_ports=excluded)
+
+    assert set(checked) == set(range(10000, 10006)) - excluded
+    assert len(checked) == len(set(checked))

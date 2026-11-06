@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_F
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.multi_token_prediction import roll_tensor
 
 from areal.engine.core.model import SequencePackingMode
 from areal.utils.data import (
@@ -69,6 +70,81 @@ def _hidden_states_output(model: torch.nn.Module, enabled: bool):
         yield
     finally:
         language_model.post_process = original
+
+
+@contextmanager
+def _mtp_version_filtered_loss(
+    model: torch.nn.Module, input_version_mask: torch.Tensor | None
+):
+    """Filter MTP loss numerators without changing MCore's base-mask counts.
+
+    Qwen's bridge can replace packed offsets before GPTModel._postprocess, so
+    capture them there instead of rolling with the outer forward's metadata.
+    """
+    if input_version_mask is None:
+        yield
+        return
+
+    language_model = _unwrap_language_model(model)
+    original_postprocess = language_model._postprocess
+    previous_postprocess = language_model.__dict__.get("_postprocess")
+
+    def filtered_postprocess(*args, **kwargs):
+        base_mask = kwargs.get("loss_mask")
+        if base_mask is None or base_mask.shape != input_version_mask.shape:
+            raise ValueError(
+                "MTP version mask must match the model's final loss mask layout, "
+                f"got {input_version_mask.shape} and "
+                f"{None if base_mask is None else base_mask.shape}."
+            )
+        if kwargs.get("labels") is not None:
+            raise ValueError("MTP version filtering requires input-derived labels")
+
+        original_loss = language_model.compute_language_model_loss
+        previous_loss = language_model.__dict__.get("compute_language_model_loss")
+        mask = input_version_mask
+        layer_index = 0
+        packed_seq_params = kwargs.get("packed_seq_params")
+        cp_group = language_model.pg_collection.cp
+
+        def filtered_loss(labels, logits):
+            nonlocal mask, layer_index
+            # MCore rolls input_ids to labels once, then rolls labels for each
+            # MTP layer. Mirror those rolls with the same CP/THD metadata.
+            for _ in range(2 if layer_index == 0 else 1):
+                mask, _ = roll_tensor(
+                    mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
+            layer_index += 1
+            per_token_loss = original_loss(labels, logits)
+            if per_token_loss.shape != mask.shape:
+                raise ValueError(
+                    "MTP per-token loss and version mask layouts differ: "
+                    f"{per_token_loss.shape} and {mask.shape}."
+                )
+            return per_token_loss * mask.to(per_token_loss.dtype)
+
+        language_model.compute_language_model_loss = filtered_loss
+        try:
+            return original_postprocess(*args, **kwargs)
+        finally:
+            if previous_loss is None:
+                language_model.__dict__.pop("compute_language_model_loss", None)
+            else:
+                language_model.compute_language_model_loss = previous_loss
+
+    language_model._postprocess = filtered_postprocess
+    try:
+        yield
+    finally:
+        if previous_postprocess is None:
+            language_model.__dict__.pop("_postprocess", None)
+        else:
+            language_model._postprocess = previous_postprocess
 
 
 def preprocess_packed_seqs_context_parallel(
@@ -447,6 +523,15 @@ def _prepare_mtp_loss_mask(
         padded_loss_mask[attention_mask] = loss_mask
         return padded_loss_mask
 
+    if (
+        uses_model_packed_seq
+        and input_ids.size(0) == 1
+        and mpu.get_context_parallel_world_size() > 1
+    ):
+        # The bridge partitions single-row THD itself with packed_cp_index.
+        # Passing a local mask here would partition it twice.
+        return loss_mask.unsqueeze(0).contiguous()
+
     # Packed context parallelism assigns each rank two zigzag chunks per
     # sequence. Apply the exact same mapping used for input_ids so every local
     # hidden state keeps its token-aligned MTP target and validity mask. MCore's
@@ -661,6 +746,9 @@ def packed_context_parallel_forward(
     # boundary-safe rolls internally.
     extra_forward_kwargs: dict[str, Any] = {}
     mtp_loss_mask = input_.get("mtp_loss_mask", None)
+    mtp_version_mask = input_.get("mtp_version_mask", None)
+    if mtp_version_mask is not None and mtp_loss_mask is None:
+        raise ValueError("MTP version filtering requires an MTP loss mask")
     if mtp_loss_mask is not None:
         extra_forward_kwargs["loss_mask"] = _prepare_mtp_loss_mask(
             mtp_loss_mask,
@@ -672,6 +760,30 @@ def packed_context_parallel_forward(
             and not (use_model_packed_seq or use_wrapper_packed_seq),
             uses_model_packed_seq=use_model_packed_seq,
         )
+
+    local_version_mask = None
+    if mtp_version_mask is not None:
+        local_version_mask = _prepare_mtp_loss_mask(
+            mtp_version_mask,
+            input_ids,
+            attention_mask,
+            cu_seqlens=cu_seqlens,
+            packed_num_tokens=packed_num_tokens,
+            uses_padded_form=needs_padded_form
+            and not (use_model_packed_seq or use_wrapper_packed_seq),
+            uses_model_packed_seq=use_model_packed_seq,
+        )
+        if (
+            use_model_packed_seq
+            and input_ids.size(0) == 1
+            and cu_seqlens is not None
+            and mpu.get_context_parallel_world_size() > 1
+        ):
+            local_version_mask = (
+                split_packed_seqs_for_context_parallel(mtp_version_mask, cu_seqlens)
+                .unsqueeze(0)
+                .contiguous()
+            )
 
     try:
         model_kwargs = {
@@ -685,7 +797,8 @@ def packed_context_parallel_forward(
         if fp32_output is not None:
             model_kwargs["fp32_output"] = fp32_output
         with _hidden_states_output(model, return_hidden_states):
-            output = model(**model_kwargs)
+            with _mtp_version_filtered_loss(model, local_version_mask):
+                output = model(**model_kwargs)
     except Exception as e:
         raise RuntimeError(
             f"Error occurred in packed context parallel forward pass on model {model} "

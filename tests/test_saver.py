@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from areal.api.cli_args import SaverConfig
 from areal.api.io_struct import FinetuneSpec
 from areal.utils.saver import Saver
@@ -88,3 +90,45 @@ def test_save_with_source_matching_destination_preserves_source_path(tmp_path):
 
     meta = engine.save.call_args.args[0]
     assert meta.base_model_path == str(save_path)
+
+
+def _saved_global_steps(engine: Mock) -> list[int]:
+    return [
+        int(call.args[0].path.rsplit("globalstep", 1)[1])
+        for call in engine.save.call_args_list
+    ]
+
+
+@pytest.mark.parametrize(
+    ("freq_kwargs", "expected_steps"),
+    [
+        ({"freq_steps": 2}, [1, 3, 5]),
+        ({"freq_epochs": 2}, [5]),
+    ],
+)
+def test_save_applies_frequency_once_per_step_for_all_models(
+    tmp_path, freq_kwargs, expected_steps
+):
+    """Actor and critic saved in the same step share one frequency decision."""
+    config = SaverConfig(
+        experiment_name="test_exp",
+        trial_name="test_trial",
+        fileroot=str(tmp_path),
+        mode="sync",
+        **freq_kwargs,
+    )
+    ft_spec = FinetuneSpec(total_train_epochs=2, dataset_size=3, train_batch_size=1)
+    saver = Saver(config, ft_spec)
+    saver._should_use_async = Mock(return_value=False)
+    actor, critic = Mock(), Mock()
+    actor.config = critic.config = SimpleNamespace(path=None)
+
+    global_step = 0
+    for epoch in range(ft_spec.total_train_epochs):
+        for step in range(ft_spec.steps_per_epoch):
+            saver.save(actor, epoch, step, global_step)
+            saver.save(critic, epoch, step, global_step, name="critic")
+            global_step += 1
+
+    assert _saved_global_steps(actor) == expected_steps
+    assert _saved_global_steps(critic) == expected_steps

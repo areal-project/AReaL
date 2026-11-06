@@ -1,4 +1,4 @@
-# Installation (Ascend NPU)
+# Installation (Huawei Ascend NPU)
 
 **Note**: Ascend NPU support is maintained on the
 [`ascend-v1.0.5`](https://github.com/areal-project/AReaL/tree/ascend-v1.0.5) branch

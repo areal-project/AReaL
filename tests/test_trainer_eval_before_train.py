@@ -156,6 +156,7 @@ def _build_supervised_trainer(
 
 def _build_ppo_trainer(events: list[tuple], *, recovered: bool = False):
     trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer.mopd_execution_plan = None
     trainer.config = SimpleNamespace(
         total_train_epochs=1,
         total_train_steps=None,
@@ -258,6 +259,24 @@ def test_ppo_trainer_orders_initial_eval_around_recovery(monkeypatch, recovered:
             "epoch_step": -1,
             "global_step": -1,
         }
+
+
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_ppo_trainer_only_passes_token_age_limit_when_enabled(monkeypatch, enabled):
+    _disable_timing_contexts(monkeypatch, rl_trainer)
+    trainer = _build_ppo_trainer([])
+    assert trainer.config.rollout.mask_stale_tokens is False
+    if enabled is not None:
+        trainer.config.rollout.mask_stale_tokens = enabled
+    trainer.config.rollout.max_head_offpolicyness = 1
+    trainer.actor.ppo_update = Mock(side_effect=_StopAfterFirstUpdate)
+
+    with pytest.raises(_StopAfterFirstUpdate):
+        trainer.train(workflow=object())
+
+    trainer.actor.ppo_update.assert_called_once_with(
+        [{}], **({"max_head_offpolicyness": 1} if enabled else {})
+    )
 
 
 @pytest.mark.parametrize("role", ["ref", "critic", "teacher", None])
@@ -516,7 +535,7 @@ def test_initial_eval_stats_use_step_zero_before_first_update(monkeypatch):
     monkeypatch.setattr(
         stats_logger_module.wandb,
         "log",
-        lambda _data, *, step: logged_steps.append(step),
+        lambda _data, *, step, commit=None: logged_steps.append(step),
     )
     monkeypatch.setattr(
         stats_logger_module.swanlab,

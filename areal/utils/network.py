@@ -158,12 +158,12 @@ def find_free_ports(
 
     min_port, max_port = port_range
     free_ports = []
-    attempted_ports = set()
+    range_size = max_port - min_port + 1
 
     # Calculate available port range. Only excluded ports that fall within
     # [min_port, max_port] reduce availability; out-of-range entries do not.
     in_range_excluded = sum(min_port <= p <= max_port for p in exclude_ports)
-    available_range = max_port - min_port + 1 - in_range_excluded
+    available_range = range_size - in_range_excluded
 
     if count > available_range:
         raise ValueError(
@@ -171,32 +171,32 @@ def find_free_ports(
             f"Only {available_range} ports available."
         )
 
-    max_attempts = count * 10  # Reasonable limit to avoid infinite loops
+    if count <= 0:
+        return []
+
     attempts = 0
     # Network resources must not follow or advance the training RNG: jobs with
     # the same training seed otherwise compete for the same port sequence.
     port_rng = random.SystemRandom()
+    start_port = port_rng.randint(min_port, max_port)
 
-    while len(free_ports) < count and attempts < max_attempts:
-        # Generate random port within range
-        port = port_rng.randint(min_port, max_port)
-
-        # Skip if port already attempted or excluded
-        if port in attempted_ports or port in exclude_ports:
-            attempts += 1
+    # Walk the range once, wrapping around at max_port. Repeated random draws
+    # can exhaust a retry budget even when unattempted free ports remain.
+    for offset in range(range_size):
+        port = min_port + (start_port - min_port + offset) % range_size
+        if port in exclude_ports:
             continue
 
-        attempted_ports.add(port)
-
+        attempts += 1
         if is_port_free(port):
             free_ports.append(port)
-
-        attempts += 1
+            if len(free_ports) == count:
+                break
 
     if len(free_ports) < count:
         raise ValueError(
             f"Could only find {len(free_ports)} free ports "
-            f"out of {count} requested after {max_attempts} attempts"
+            f"out of {count} requested after {attempts} attempts"
         )
 
     return sorted(free_ports)

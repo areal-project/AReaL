@@ -278,6 +278,12 @@ class GenerationHyperparameters:
             )
         },
     )
+    score_centering_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "SGLang sampler head width for score centering; 0 disables collection. Requires temperature=1 and untruncated sampling."
+        },
+    )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
 
     def new(self, **kwargs):
@@ -316,6 +322,7 @@ class GenerationHyperparameters:
         )
 
     _OPENAI_UNSUPPORTED_ARGS: ClassVar[set[str]] = {
+        "score_centering_top_k",
         "min_new_tokens",  # Not supported by OpenAI
         "greedy",  # Not directly supported by OpenAI
         "top_k",  # Not supported by OpenAI
@@ -339,6 +346,10 @@ class GenerationHyperparameters:
         self, exclude_args: list[str] | None = None, api_format: str = "completions"
     ) -> dict[str, Any]:
         """Convert the generation hyperparameters to a dictionary of arguments for OpenAI client."""
+        if self.score_centering_top_k:
+            raise ValueError(
+                "Score centering requires the native SGLang RLVR workflow, not OpenAI clients."
+            )
         final_exclude_args = set(exclude_args) if exclude_args is not None else set()
         final_exclude_args.update(self._OPENAI_UNSUPPORTED_ARGS)
         # TODO: move the excluded args into extra body, so they can be passed through the client request
@@ -1162,8 +1173,9 @@ class MegatronEngineConfig:
             "help": "Sequence chunk size for AReaL's chunked LM Head loss. A "
             "positive value requires enable_chunked_logits=True and "
             "entropy_requires_grad=False, and computes LM Head logits and their "
-            "backward one chunk at a time. The chunked path only supports packed "
-            "text actor models without MTP; 0 disables it."
+            "backward one chunk at a time. Supports text actors and the "
+            "Qwen3.5 model-owned / Qwen4Exp wrapper-owned THD multimodal paths "
+            "without MTP; 0 disables it."
         },
     )
     enable_fp32_lm_head: bool = field(
@@ -1229,6 +1241,31 @@ class MegatronEngineConfig:
         },
     )
 
+    freeze_vision_model: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Freeze the vision encoder before DDP/optimizer construction "
+                "(megatron-bridge only). Set freeze_vision_projection=True as well "
+                "to freeze the complete visual feature path. None freezes "
+                "Qwen3-VL/Qwen3.5 vision by default and preserves other providers' "
+                "defaults. Set False explicitly to train the encoder."
+            )
+        },
+    )
+
+    freeze_vision_projection: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Freeze the vision projector/merger, including deepstack mergers, "
+                "before DDP/optimizer construction (megatron-bridge only). "
+                "None freezes Qwen3-VL/Qwen3.5 mergers by default and preserves "
+                "other providers' defaults. Set False explicitly to train them."
+            )
+        },
+    )
+
     freeze_ple_table: bool = field(
         default=True,
         metadata={
@@ -1273,6 +1310,15 @@ class MegatronEngineConfig:
     )
 
     def __post_init__(self) -> None:
+        if (
+            self.freeze_vision_model is not None
+            or self.freeze_vision_projection is not None
+        ) and self.bridge_type != "megatron-bridge":
+            raise ValueError(
+                "freeze_vision_model and freeze_vision_projection require "
+                "bridge_type='megatron-bridge'; Qwen4-Exp with mcore-bridge "
+                "already freezes its complete visual module by default"
+            )
         if self.cpu_staged_offload.enabled and self.async_save:
             raise ValueError(
                 "megatron.async_save is not supported with "
@@ -1826,7 +1872,7 @@ class RejectionSamplingConfig:
             "help": "Lower bound for filtering (optional). "
             "None means no lower bound. "
             "For 'ratio' metric: typical value is 0.5 (filter out tokens where policy "
-            "probability dropped significantly). Must be > 0. "
+            "probability dropped significantly). Must be > 0 for masking; clamp also allows 0. "
             "For 'kl_k1' metric: can be used to filter negative KL estimates."
         },
     )
@@ -1837,7 +1883,7 @@ class RejectionSamplingConfig:
 
         _VALID_LEVELS = ("token", "sequence")
         _VALID_ACTIONS = ("mask", "clamp")
-        _VALID_METRICS = ("ratio", "kl_k1", "kl_k2", "kl_k3")
+        _VALID_METRICS = ("ratio", "kl_k1", "kl_k2", "kl_k3", "binary_kl")
         _VALID_AGGS = ("sum", "mean", "max")
 
         # Validate enum-like fields.
@@ -1869,14 +1915,16 @@ class RejectionSamplingConfig:
                     f"upper must be > 1.0 for 'ratio' metric (otherwise all non-identical "
                     f"policy tokens will be filtered), got {self.upper}"
                 )
-            if self.lower is not None and self.lower <= 0:
+            if self.lower is not None and (
+                self.lower < 0 or (self.lower == 0 and self.action != "clamp")
+            ):
                 raise ValueError(
-                    f"lower must be positive for 'ratio' metric, got {self.lower}"
+                    f"lower must be positive for 'ratio' metric (zero is allowed for clamp), got {self.lower}"
                 )
         # For KL metrics, upper must be > 0.
         # Note: kl_k1 is excluded because it is a forward KL unbiased estimator that
         # can produce negative values, so requiring upper > 0 would be too restrictive.
-        if self.metric in ("kl_k2", "kl_k3") and self.upper <= 0:
+        if self.metric in ("kl_k2", "kl_k3", "binary_kl") and self.upper <= 0:
             raise ValueError(
                 f"upper must be positive for '{self.metric}' metric, got {self.upper}"
             )
@@ -1901,8 +1949,90 @@ class RejectionSamplingConfig:
 
 
 @dataclass
+class AdvantageFunctionConfig:
+    """Reference one built-in algorithm key or a dotted Python callable path."""
+
+    implementation: str = field(
+        default="auto",
+        metadata={
+            "help": "Built-in algorithm key or trusted dotted Python callable path."
+        },
+    )
+    kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"help": "Keyword arguments forwarded to the resolved callable."},
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.implementation, str) or not self.implementation.strip():
+            raise ValueError("advantage function implementation must be non-empty")
+        self.implementation = self.implementation.strip()
+        if not isinstance(self.kwargs, (dict, DictConfig)):
+            raise TypeError("advantage function kwargs must be a mapping")
+        if isinstance(self.kwargs, DictConfig):
+            self.kwargs = OmegaConf.to_container(self.kwargs, resolve=False)
+        try:
+            json.dumps(self.kwargs)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "advantage function kwargs must contain only serializable values"
+            ) from exc
+
+
+@dataclass
+class AdvantageConfig:
+    """Select the advantage function and its orthogonal built-in stages."""
+
+    compute: AdvantageFunctionConfig = field(
+        default_factory=lambda: AdvantageFunctionConfig(implementation="default"),
+        metadata={"help": "Default compute key or custom dotted compute path."},
+    )
+    outcome_reward_shaping: AdvantageFunctionConfig | None = field(
+        default=None,
+        metadata={
+            "help": "Transform task-result rewards before reward normalization; built-in key or dotted callable path."
+        },
+    )
+    estimator: AdvantageFunctionConfig | None = field(
+        default=None,
+        metadata={"help": "Optional advantage-estimator key or dotted callable path."},
+    )
+    process_adv_shaping: AdvantageFunctionConfig | None = field(
+        default=None,
+        metadata={
+            "help": "Modify estimated advantages using process rewards; additive by default, or a built-in key or dotted callable path."
+        },
+    )
+
+    def __post_init__(self) -> None:
+        def normalize(value):
+            if value is None or isinstance(value, AdvantageFunctionConfig):
+                return value
+            if isinstance(value, (dict, DictConfig)):
+                return AdvantageFunctionConfig(**dict(value))
+            raise TypeError("advantage algorithm specifications must be mappings")
+
+        self.compute = normalize(self.compute)
+        if self.compute is None:
+            raise ValueError("advantage.compute must not be None")
+        for name in (
+            "outcome_reward_shaping",
+            "estimator",
+            "process_adv_shaping",
+        ):
+            setattr(self, name, normalize(getattr(self, name)))
+
+
+@dataclass
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
+
+    advantage: AdvantageConfig = field(
+        default_factory=AdvantageConfig,
+        metadata={
+            "help": "Composable advantage computation; defaults preserve GAE/PRM settings."
+        },
+    )
 
     # Core PPO/GRPO Parameters
     ppo_n_minibatches: int = field(
@@ -2095,7 +2225,7 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={
             "help": "Rejection sampling configuration for filtering stale samples. "
             "None disables filtering (equivalent to old behave_imp_weight_mode='disabled'). "
-            "Only effective when use_decoupled_loss=True."
+            "Effective with use_decoupled_loss=True, or with score centering for token-wise ratio clamping (no lower bound)."
         },
     )
     importance_sampling_level: str = field(
@@ -2133,6 +2263,13 @@ class PPOActorConfig(TrainEngineConfig):
     max_new_tokens: int = field(
         default=1024,
         metadata={"help": "Maximum number of new tokens to generate"},
+    )
+
+    use_score_centering: bool = field(
+        default=False,
+        metadata={
+            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Initial support: SGLang, FSDP (TP/CP), temperature=1, no sampling truncation."
+        },
     )
 
     def _uses_group_statistics(self) -> bool:
@@ -2178,6 +2315,10 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if isinstance(self.advantage, (dict, DictConfig)):
+            self.advantage = AdvantageConfig(**dict(self.advantage))
+        if not isinstance(self.advantage, AdvantageConfig):
+            raise ValueError("advantage must be an AdvantageConfig or mapping")
         if isinstance(self.gae_lambda, bool) or not isinstance(
             self.gae_lambda, int | float | str
         ):
@@ -2248,7 +2389,11 @@ class PPOActorConfig(TrainEngineConfig):
                 f"got ppo_n_minibatches={self.ppo_n_minibatches}"
             )
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
-        if not self.use_decoupled_loss and self.rejection_sampling is not None:
+        if (
+            not self.use_decoupled_loss
+            and not self.use_score_centering
+            and self.rejection_sampling is not None
+        ):
             logger.warning(
                 "rejection_sampling is configured but use_decoupled_loss=False. "
                 "Filtering will be ignored. Set use_decoupled_loss=True to enable."
@@ -2334,6 +2479,30 @@ class PPOActorConfig(TrainEngineConfig):
                 )
 
         super().__post_init__()
+        if self.use_score_centering:
+            if (
+                not self.backend.startswith("fsdp:")
+                or self.enable_tree_training
+                or self.is_critic
+            ):
+                raise ValueError("Score centering requires an ordinary FSDP actor.")
+            if self.temperature != 1.0 or self.recompute_logprob:
+                raise ValueError(
+                    "Score centering requires temperature=1 and recompute_logprob=False to preserve sampler probabilities."
+                )
+            if (
+                self.use_sapo_loss
+                or self.use_cispo_loss
+                or self.use_decoupled_loss
+                or self.m2_threshold is not None
+                or self.importance_sampling_level != "token"
+            ):
+                raise ValueError(
+                    "Score centering selects token-wise REINFORCE with optional TIS; other policy surrogates are unsupported."
+                )
+            from areal.utils.score_centering import resolve_score_centering_tis_cap
+
+            resolve_score_centering_tis_cap(self.rejection_sampling)
 
 
 @dataclass
@@ -2509,6 +2678,14 @@ class SGLangConfig:
     random_seed: int = 1
     skip_tokenizer_init: bool = False
     disable_cuda_graph: bool = False
+    disable_prefill_cuda_graph: bool | None = field(
+        default=None,
+        metadata={
+            "help": "Disable only prefill CUDA graphs while retaining decode graphs. "
+            "None omits the flag for compatibility with older SGLang versions; "
+            "requires a runtime supporting --disable-prefill-cuda-graph."
+        },
+    )
     disable_radix_cache: bool = True
     disable_cuda_graph_padding: bool = False
     enable_nccl_nvls: bool = False
@@ -2535,6 +2712,14 @@ class SGLangConfig:
     mm_attention_backend: str | None = None
     enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
+    limit_mm_data_per_request: dict[str, int] | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum image, video, and audio items per request. Values must "
+            "be non-negative integers; zero disallows that modality. None uses "
+            "SGLang defaults; an empty mapping disables its item-count limits.",
+        },
+    )
     sampling_backend: str | None = None
     context_length: int | None = 32768
     mem_fraction_static: float | None = 0.9
@@ -2605,6 +2790,24 @@ class SGLangConfig:
     # Internal field, not exposed to users.
     enable_return_routed_experts: bool = False
 
+    def __post_init__(self) -> None:
+        self._validate_mm_limits(self.limit_mm_data_per_request)
+
+    @staticmethod
+    def _validate_mm_limits(limits: dict[str, int] | None) -> None:
+        if limits is None:
+            return
+        if not isinstance(limits, dict) or any(
+            modality not in {"image", "video", "audio"}
+            or type(limit) is not int
+            or limit < 0
+            for modality, limit in limits.items()
+        ):
+            raise ValueError(
+                "limit_mm_data_per_request must map image, video, or audio "
+                "to non-negative integers"
+            )
+
     # Use staticmethod to make OmegaConf happy.
     @staticmethod
     def build_cmd(
@@ -2663,6 +2866,13 @@ class SGLangConfig:
             )
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
+        # build_args also accepts DictConfig, which bypasses __post_init__.
+        limits = args.get("limit_mm_data_per_request")
+        SGLangConfig._validate_mm_limits(limits)
+        if limits is not None:
+            args["limit_mm_data_per_request"] = json.dumps(
+                limits, separators=(",", ":")
+            )
         if sglang_config.enable_multithread_load:
             model_loader_extra_config = dict(
                 enable_multithread_load=sglang_config.enable_multithread_load,
@@ -2872,6 +3082,17 @@ class AgentConfig:
         default="qwen",
         metadata={"help": "Parser for tool calls in model output."},
     )
+    tool_call_parser_allow_recovery: bool = field(
+        default=True,
+        metadata={
+            "help": "Allow permissive tool-call parsing (legacy behavior). "
+            "False currently requires tool_call_parser='qwen3_coder': validate "
+            "the complete XML call structure without tag repairs, partial-call "
+            "extraction, or SGLang/vLLM fallback. Invalid tool protocol is "
+            "cached as a model interaction and returned as non-retryable "
+            "invalid_tool_json. Argument schema validation remains with the tool."
+        },
+    )
     reasoning_parser: str = field(
         default="qwen3",
         metadata={"help": "Parser for reasoning content (<think> tags)."},
@@ -2974,6 +3195,14 @@ class AgentConfig:
     def __post_init__(self) -> None:
         if not self.agent_cls_path:
             raise ValueError("agent_cls_path must be a non-empty import path")
+        if (
+            not self.tool_call_parser_allow_recovery
+            and self.tool_call_parser != "qwen3_coder"
+        ):
+            raise ValueError(
+                "tool_call_parser_allow_recovery=False requires "
+                "tool_call_parser='qwen3_coder'"
+            )
         if len(self.scheduling_spec) != 1:
             raise ValueError(
                 f"scheduling_spec must contain exactly 1 SchedulingSpec, got {len(self.scheduling_spec)}"
@@ -3018,6 +3247,14 @@ class InferenceEngineConfig:
             "help": "Maximum off-policyness for the head. "
             "If the current version is more than this many versions behind, "
             "the request will not be accepted.",
+        },
+    )
+    mask_stale_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": "Mask actor loss targets whose token policy-version age exceeds "
+            "max_head_offpolicyness. Disabled by default to preserve existing "
+            "training behavior; does not reject rollouts or change scheduling."
         },
     )
     enable_rollout_tracing: bool = field(
@@ -4276,8 +4513,17 @@ class PPOConfig(BaseExperimentConfig):
                 "actor.token_rewards_as_adv=True; folded process rewards are "
                 "not supported yet"
             )
+        # Actor overrides own process semantics. Keep legacy validation only
+        # when the default pipeline will actually consume the legacy selection.
+        advantage = self.actor.advantage
+        process = advantage.process_adv_shaping
+        uses_legacy_process = advantage.compute.implementation in {
+            "default",
+            "areal.trainer.ppo.advantage.compute_advantages",
+        } and (process is None or process.implementation == "auto")
         if (
             prm.enabled
+            and uses_legacy_process
             and prm.advantage_shaping.mode in {"gvpo", "process_weighted"}
             and not self.actor.token_rewards_as_adv
         ):
@@ -4287,6 +4533,7 @@ class PPOConfig(BaseExperimentConfig):
             )
         if (
             prm.enabled
+            and uses_legacy_process
             and prm.advantage_shaping.mode == "process_weighted"
             and self.actor.mask_no_eos_with_zero
         ):

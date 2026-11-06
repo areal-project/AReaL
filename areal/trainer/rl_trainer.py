@@ -1152,7 +1152,12 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                self.actor.ppo_update(adv_batch)
+                update_kwargs = (
+                    {"max_head_offpolicyness": config.rollout.max_head_offpolicyness}
+                    if config.rollout.mask_stale_tokens
+                    else {}
+                )
+                self.actor.ppo_update(adv_batch, **update_kwargs)
                 self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("ppo update")
 
@@ -1276,6 +1281,13 @@ class PPOTrainer:
                     if self.ref is not None:
                         cleanups.append(
                             ("ref", lambda: self.ref.clear_batches(rollout_batch))
+                        )
+                    if self.teacher is not None:
+                        cleanups.append(
+                            (
+                                "teacher",
+                                lambda: self.teacher.clear_batches(rollout_batch),
+                            )
                         )
                     if self.data_controller is not None:
                         cleanups.append(
@@ -1987,6 +1999,33 @@ class PPOTrainer:
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
+    def _validate_weight_update_model(self) -> None:
+        """Reject Qwen2/Qwen2.5 text models on the Megatron AWEX path."""
+        actor = self.config.actor
+        # Controller v2 selects disk for LoRA and AWEX otherwise, regardless
+        # of weight_update_mode. FSDP uses HF parameter layout and bypasses
+        # the Megatron model converter. Controller v1 dispatches on the field.
+        if actor._version == "v2" and (
+            actor.use_lora or self.actor_alloc.backend != "megatron"
+        ):
+            return
+        if actor._version == "v1" and actor.weight_update_mode in ("disk", "xccl"):
+            return
+
+        from transformers import PretrainedConfig
+
+        # Read the checkpoint metadata, not its directory/repository name. Qwen2.5
+        # text models also identify as Qwen2ForCausalLM, unlike Qwen2.5-VL.
+        model_config, _ = PretrainedConfig.get_config_dict(actor.path)
+        if model_config.get("model_type") == "qwen2" or "Qwen2ForCausalLM" in (
+            model_config.get("architectures") or []
+        ):
+            raise ValueError(
+                "Qwen2/Qwen2.5 text models do not support Megatron AWEX weight updates. "
+                "For v1, set actor.weight_update_mode=disk or xccl. "
+                "For v2, set actor.use_lora=True to select disk adapter updates."
+            )
+
     def _resolve_actor_r3_moe_config(self) -> R3MoEConfig:
         if self._r3_moe_config is None:
             from transformers import AutoConfig
@@ -2126,6 +2165,7 @@ class PPOTrainer:
                 f"actor._version ('{actor_version}') and rollout._version "
                 f"('{rollout_version}') must match. Both must be 'v1' or both 'v2'."
             )
+        self._validate_weight_update_model()
         if self.config.mopd is not None:
             requires_teacher_scoring = (
                 self.mopd_execution_plan is not None

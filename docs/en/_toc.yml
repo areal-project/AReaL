@@ -26,10 +26,13 @@ parts:
     - file: best_practices/debugging
     - file: best_practices/handling_oom
     - file: best_practices/perf_profiling
+    - file: best_practices/fsdp_train_step_benchmark
   - caption: Customization
     chapters:
     - file: customization/dataset
+    - file: customization/data_engineering
     - file: customization/agent
+    - file: customization/advantage
   - caption: Algorithms
     chapters:
     - file: algorithms/async

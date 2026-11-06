@@ -23,6 +23,7 @@ from areal.experimental.openai.proxy.server import (
     deserialize_interactions,
 )
 from areal.experimental.openai.proxy.tensor_reference import GroupTensorStoreRegistry
+from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry
 from areal.infra.rpc.serialization import deserialize_value
@@ -172,6 +173,7 @@ def _reset_server_globals(monkeypatch):
     monkeypatch.setattr(srv, "_session_cache", {})
     monkeypatch.setattr(srv, "_api_key_to_session", {})
     monkeypatch.setattr(srv, "_session_to_api_key", {})
+    monkeypatch.setattr(srv, "_session_invalid_tool_errors", {})
     monkeypatch.setattr(srv, "_capacity", 0)
     monkeypatch.setattr(srv, "_admin_api_key", _ADMIN_KEY)
     monkeypatch.setattr(srv, "_lock", threading.Lock())
@@ -896,6 +898,69 @@ class TestEndSessionInteractionCount:
             "type": "context_length_exceeded",
             "message": "prompt exceeds context window",
         }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_anthropic_invalid_tool_call_rejects_retries(
+        self, monkeypatch, stream
+    ):
+        generation_count = 0
+
+        async def invalid_tool_create(*, areal_cache, **_kwargs):
+            nonlocal generation_count
+            del areal_cache
+            generation_count += 1
+            raise InvalidToolCallError("model emitted malformed tool JSON")
+
+        monkeypatch.setattr(
+            srv,
+            "_openai_client",
+            SimpleNamespace(
+                chat=SimpleNamespace(
+                    completions=SimpleNamespace(create=invalid_tool_create)
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            srv,
+            "_translate_anthropic_to_openai_request",
+            lambda _request: {
+                "model": "areal",
+                "messages": [{"role": "user", "content": "call a tool"}],
+            },
+        )
+        monkeypatch.setattr(srv, "_capacity", 1)
+
+        async with _client() as client:
+            start = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={"task_id": "invalid-tool"},
+            )
+            assert start.status_code == 200
+            headers = {"Authorization": f"Bearer {start.json()['api_key']}"}
+            request = {
+                "model": "areal",
+                "messages": [{"role": "user", "content": "call a tool"}],
+                "stream": stream,
+            }
+            first = await client.post("/v1/messages", headers=headers, json=request)
+            retry = await client.post("/v1/messages", headers=headers, json=request)
+            cross_endpoint_retry = await client.post(
+                "/v1/chat/completions", headers=headers, json=request
+            )
+            ended = await client.post("/rl/end_session", headers=headers, json={})
+
+        for response in (first, retry, cross_endpoint_retry):
+            assert response.status_code == 422
+            assert response.headers["x-should-retry"] == "false"
+            assert response.json()["error"] == {
+                "type": "invalid_request_error",
+                "code": "invalid_tool_json",
+                "message": "model emitted malformed tool JSON",
+            }
+        assert generation_count == 1
+        assert ended.json()["invalid_tool_json"] is True
 
 
 def test_setup_openai_client_loads_and_passes_vlm_processor(monkeypatch):
