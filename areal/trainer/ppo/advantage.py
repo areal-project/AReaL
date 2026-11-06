@@ -416,19 +416,22 @@ class AdvantagePipeline:
             if not self.config.use_decoupled_loss:
                 # prox logp not available, use inferenced logp
                 data["prox_logp"] = old_logp
+        old_logp *= loss_mask
         ref_logp = data.get("ref_logp")
         if ref_logp is None:
-            ref_logp = torch.zeros_like(old_logp)
-        ref_logp *= loss_mask
-        old_logp *= loss_mask
+            # Missing reference log-probs mean no KL term. Using zeros as a
+            # reference would add a spurious surprisal reward.
+            kl_rewards = torch.zeros_like(old_logp)
+        else:
+            ref_logp *= loss_mask
+            kl_rewards = -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
 
         # Compute KL-regularized rewards.
         attn_mask = data["attention_mask"]
         seqlens = attn_mask.sum(-1).long()
         seq_truncated_mask = _get_truncated_mask(data, seqlens)
         data["is_truncated"] = seq_truncated_mask
-        rewards = -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
-        kl_rewards = rewards.clone()
+        rewards = kl_rewards.clone()
         # KL rewards at the next token after eos is zero.
         rewards[batch_indices, seqlens - 1] = 0
         gae_kl_rewards = rewards.clone()
