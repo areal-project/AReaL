@@ -1153,6 +1153,118 @@ def _set_core_failure_outcome(error, outcome):
     error.harness_result["raw"]["outcome"] = deepcopy(outcome)
 
 
+def _core_tool_argument_budget_failure_error() -> ArenaTaskFailedError:
+    """Reproduce the production Core decoder's 64 KiB tool argument failure."""
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "tool_call_budget_exceeded: argument_bytes (limit 65536, observed 71071)",
+    )
+    _set_core_failure_outcome(
+        error,
+        {
+            "code": "LLM_RESPONSE_FAILED",
+            "class": "agent",
+            "source": "core_tool_decoder",
+            "details": {
+                "budget": "argument_bytes",
+                "code": "tool_call_budget_exceeded",
+                "limit": 65536,
+                "observed": 71071,
+            },
+        },
+    )
+    return error
+
+
+@pytest.mark.parametrize("interaction_count", [0, 1, 3])
+def test_core_tool_argument_budget_failure_requires_exportable_interactions(
+    interaction_count,
+):
+    """A decoder budget violation is a model zero, independent of proxy flags."""
+    error = _core_tool_argument_budget_failure_error()
+    assert ArenaStreamAgentWorkflow.classify_proxy_failure(
+        error, context_overflow=False, interaction_count=interaction_count
+    ) == ("model_failure_zero" if interaction_count else "unknown_failure_reject")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "infrastructure",
+        "wrong_source",
+        "wrong_budget",
+        "wrong_code",
+        "not_exceeded",
+        "boolean_limit",
+        "string_observed",
+        "missing_receipt",
+        "wrong_message",
+        "wrong_outcome",
+        "runner_timeout",
+        "external_interruption",
+        "receipt_failure",
+        "failed_collection",
+        "malformed_collection",
+        "eval_failed",
+        "missing_score",
+    ],
+)
+def test_core_tool_argument_budget_conflicting_evidence_stays_rejected(mutation):
+    """Only the matching agent-origin terminal byte violation earns reward zero."""
+    error = _core_tool_argument_budget_failure_error()
+    if mutation in {
+        "infrastructure",
+        "wrong_source",
+        "wrong_budget",
+        "wrong_code",
+        "not_exceeded",
+        "boolean_limit",
+        "string_observed",
+    }:
+        outcome = deepcopy(error.result.raw["outcome"])
+        if mutation == "infrastructure":
+            outcome["class"] = "infrastructure"
+        elif mutation == "wrong_source":
+            outcome["source"] = "provider_http"
+        else:
+            key, value = {
+                "wrong_budget": ("budget", "tool_count"),
+                "wrong_code": ("code", "invalid_tool_json"),
+                "not_exceeded": ("observed", 65536),
+                "boolean_limit": ("limit", True),
+                "string_observed": ("observed", "71071"),
+            }[mutation]
+            outcome["details"][key] = value
+        _set_core_failure_outcome(error, outcome)
+    elif mutation == "missing_receipt":
+        error.harness_result = None
+    elif mutation == "wrong_message":
+        error.harness_result["error"][0]["message"] = "HTTP 503 service unavailable"
+    elif mutation == "wrong_outcome":
+        error.harness_result["error"][0]["outcome"]["details"]["observed"] = 90000
+    elif mutation == "runner_timeout":
+        error.harness_result["observed_runner_timeout"] = True
+    elif mutation == "external_interruption":
+        error.harness_result["observed_external_interruption"] = True
+    elif mutation == "receipt_failure":
+        error.harness_result["failure"] = {"kind": "collect_failed"}
+    elif mutation == "failed_collection":
+        error.harness_result["collection"] = {"status": "ERROR"}
+    elif mutation == "malformed_collection":
+        error.harness_result["collection"] = None
+    elif mutation == "eval_failed":
+        error.status = "EVAL_FAILED"
+    else:
+        error.result = replace(error.result, score=None)
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        != "model_failure_zero"
+    )
+
+
 def _core_review_failure_error(failure="invalid_tool_json", completed_turns=1):
     if failure == "invalid_tool_json":
         error = _core_tool_json_failure_error()
@@ -1160,6 +1272,8 @@ def _core_review_failure_error(failure="invalid_tool_json", completed_turns=1):
         error = _core_context_failure_error()
     elif failure == "provider_context":
         error = _provider_context_failure_error()
+    elif failure == "tool_argument_budget":
+        error = _core_tool_argument_budget_failure_error()
     elif failure == "output_limit":
         error = _core_model_failure_error(
             "LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED",
@@ -1192,6 +1306,7 @@ def _core_review_failure_error(failure="invalid_tool_json", completed_turns=1):
         "provider_context",
         "output_limit",
         "empty_response",
+        "tool_argument_budget",
     ],
 )
 @pytest.mark.parametrize("completed_turns", [1, 2])
@@ -1360,6 +1475,51 @@ def test_core_review_cleanup_failure_is_not_model_failure():
     )
 
 
+@pytest.mark.parametrize("failure", ["tool_argument_budget", "empty_completion", None])
+def test_arena_failure_reason_rates_include_successes_in_denominator(
+    monkeypatch, failure
+):
+    """Dedicated cause rates count every terminal task, including successful ones."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    agent = ArenaStreamAgentWorkflow(
+        econfig={
+            "arena_base_url": "https://arena.example",
+            "arena_streams": [{"name": "test", "stream_id": "stream"}],
+        }
+    )
+    metrics = {}
+    monkeypatch.setattr(
+        "examples.swe.arena_agent._record_arena_metrics",
+        lambda **values: metrics.update(values),
+    )
+    if failure == "tool_argument_budget":
+        error = _core_tool_argument_budget_failure_error()
+    elif failure == "empty_completion":
+        error = _core_model_failure_error(
+            "LLM_RESPONSE_FAILED",
+            "empty_completion",
+            "model stopped without visible output or tool calls",
+        )
+    else:
+        error = None
+    result = (
+        error.result
+        if error
+        else ArenaTaskResult(task_id="success", status="OK", score=0.5)
+    )
+    agent._task_result.set(result)
+    agent._record_attempt_metrics(error)
+    for reason in ("tool_call_argument_bytes_exceeded", "empty_completion"):
+        expected = "tool_argument_budget" if reason.startswith("tool_call") else reason
+        assert metrics[f"harness_error/{reason}"] == float(failure == expected)
+    metadata = agent.get_episode_metadata()
+    assert metadata.get("harness_failure_reason") == (
+        "tool_call_argument_bytes_exceeded"
+        if failure == "tool_argument_budget"
+        else None
+    )
+
+
 @pytest.mark.parametrize(
     "message",
     ["HTTP 503 service unavailable", "authentication failed", "request timed out"],
@@ -1423,7 +1583,13 @@ def test_core_single_turn_legacy_receipt_keeps_existing_compatibility():
 
 @pytest.mark.parametrize(
     "failure",
-    ["legacy_context", "current_context", "provider_context", "whitebox_deadline"],
+    [
+        "legacy_context",
+        "current_context",
+        "provider_context",
+        "whitebox_deadline",
+        "tool_argument_budget",
+    ],
 )
 def test_context_budget_failure_fetches_native_receipt_before_classification(
     monkeypatch,
@@ -1451,6 +1617,8 @@ def test_context_budget_failure_fetches_native_receipt_before_classification(
         )
         if failure == "provider_context":
             error = _provider_context_failure_error()
+        elif failure == "tool_argument_budget":
+            error = _core_tool_argument_budget_failure_error()
         receipt = error.harness_result
         error.harness_result = None
         fetch_method = "get_harness_result_async"

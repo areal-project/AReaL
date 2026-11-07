@@ -106,7 +106,9 @@ class _FakeProxyClient:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["invalid_tool_json", "context_limit"])
+@pytest.mark.parametrize(
+    "failure", ["invalid_tool_json", "context_limit", "tool_argument_budget"]
+)
 @pytest.mark.parametrize("proxy_system_error", [False, True])
 async def test_tw_review_failure_recovers_zero_with_system_error_veto(
     monkeypatch, failure, proxy_system_error

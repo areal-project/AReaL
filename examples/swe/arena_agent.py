@@ -716,6 +716,43 @@ class ArenaStreamAgentWorkflow:
         )
 
     @classmethod
+    def _core_tool_argument_budget_failure_message(cls, raw: Any) -> str | None:
+        """Identify a model tool call exceeding the native decoder's byte budget."""
+        if not isinstance(raw, dict):
+            return None
+        outcome = raw.get("outcome")
+        harness = raw.get("harness")
+        if not isinstance(outcome, dict) or not isinstance(harness, dict):
+            return None
+        details = outcome.get("details")
+        if (
+            outcome.get("code") != "LLM_RESPONSE_FAILED"
+            or outcome.get("class") != "agent"
+            or outcome.get("source") != "core_tool_decoder"
+            or cls._gameagent_outcome_code(raw) != "LLM_RESPONSE_FAILED"
+            or not isinstance(details, dict)
+            or set(details) != {"budget", "code", "limit", "observed"}
+            or details["budget"] != "argument_bytes"
+            or details["code"] != "tool_call_budget_exceeded"
+            or type(details["limit"]) is not int
+            or type(details["observed"]) is not int
+            or details["limit"] <= 0
+            or details["observed"] <= details["limit"]
+            or harness.get("phase") != "agent"
+            or harness.get("result_status") != "ERROR"
+            or type(harness.get("exit_code")) is not int
+            or harness["exit_code"] != 1
+            or harness.get("summary")
+            != "GAMEAGENT_OUTCOME_CODE=LLM_RESPONSE_FAILED GAMEAGENT_OUTCOME_CLASS=agent"
+            or raw.get("failure") is not None
+        ):
+            return None
+        return (
+            "tool_call_budget_exceeded: argument_bytes "
+            f"(limit {details['limit']}, observed {details['observed']})"
+        )
+
+    @classmethod
     def _core_context_zero_failure_message(cls, raw: Any) -> str | None:
         """Validate an agent context guard before treating it as a zero reward."""
         if not isinstance(raw, dict):
@@ -867,6 +904,9 @@ class ArenaStreamAgentWorkflow:
     ) -> bool:
         """Match the terminal model failure, including audited TW continuations."""
         message = cls._core_model_zero_failure_message(raw)
+        budget_message = cls._core_tool_argument_budget_failure_message(raw)
+        if message is None:
+            message = budget_message
         if message is None:
             message = cls._core_context_zero_failure_message(raw)
         context_failure = cls._is_structured_context_failure(raw)
@@ -881,6 +921,24 @@ class ArenaStreamAgentWorkflow:
             or type(receipt.get("exit_code")) is not int
             or receipt["exit_code"] != 1
             or receipt.get("summary") != raw["harness"]["summary"]
+        ):
+            return False
+        if budget_message is not None and (
+            receipt.get("failure") is not None
+            or (
+                "collection" in receipt
+                and (
+                    not isinstance(receipt["collection"], dict)
+                    or receipt["collection"].get("status") != "OK"
+                )
+            )
+            or any(
+                receipt.get(flag, False) is not False
+                for flag in (
+                    "observed_runner_timeout",
+                    "observed_external_interruption",
+                )
+            )
         ):
             return False
         turns = receipt.get("turn_statuses")
@@ -1557,6 +1615,8 @@ class ArenaStreamAgentWorkflow:
             metadata["harness_outcome_code"] = self._gameagent_outcome_metric_code(
                 result.raw
             )
+            if self._core_tool_argument_budget_failure_message(result.raw) is not None:
+                metadata["harness_failure_reason"] = "tool_call_argument_bytes_exceeded"
         return metadata
 
     async def persist_episode_result(
@@ -1694,6 +1754,20 @@ class ArenaStreamAgentWorkflow:
                 metrics[f"harness_error/{code}"] = float(outcome_code == code)
             metrics["harness_error/OTHER"] = float(
                 is_harness_error and outcome_code not in _GAMEAGENT_OUTCOME_METRIC_CODES
+            )
+            metrics["harness_error/tool_call_argument_bytes_exceeded"] = float(
+                is_harness_error
+                and result is not None
+                and self._core_tool_argument_budget_failure_message(result.raw)
+                is not None
+            )
+            metrics["harness_error/empty_completion"] = float(
+                is_harness_error
+                and result is not None
+                and self._core_model_zero_failure_message(result.raw)
+                == _CORE_MODEL_ZERO_FAILURE_MESSAGES[
+                    ("LLM_RESPONSE_FAILED", "empty_completion")
+                ]
             )
         _record_arena_metrics(**metrics)
 
@@ -1971,6 +2045,10 @@ class ArenaStreamAgentWorkflow:
                         self._harness_result_format(exc.result.raw) == "native-runner"
                         or self._is_abbreviated_whitebox_failure(exc.result.raw)
                         or self._core_model_zero_failure_message(exc.result.raw)
+                        is not None
+                        or self._core_tool_argument_budget_failure_message(
+                            exc.result.raw
+                        )
                         is not None
                         or self._is_structured_context_failure(exc.result.raw)
                         or self._is_core_invalid_tool_json_failure(exc.result.raw)

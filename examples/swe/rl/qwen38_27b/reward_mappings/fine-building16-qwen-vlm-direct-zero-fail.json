@@ -1,0 +1,118 @@
+{
+  "stream_id": "fine-building16-tw-advantage-20261103",
+  "count": 16,
+  "items": [
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-cn-add-a043@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-cn-add-a061@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-cn-add-a075@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-cn-base-c183@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-cn-orig-l027@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-cn-orig-l054@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-cn-orig-l061@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-l068@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-m208@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-world-c026@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-world-f039c@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-world-f045@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-world-f070@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-world-f077@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-world-f078@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "data_id": "env:upgrade284-published-20261103-fine-20261016-world-m218@1.0.0",
+      "reward_ref": {
+        "key": "fine-building284-qwen38-vlm-judge-direct-reward",
+        "version": "1.0.0"
+      }
+    }
+  ]
+}
