@@ -35,7 +35,7 @@ gconfig:
   lora_name: ''
   use_beam_search: false
   reward_normalization: true
-  reward_normalization_use_std: true
+  reward_normalization_use_std: false
   drop_incomplete_group: false
 eval_gconfig:
   n_samples: 12

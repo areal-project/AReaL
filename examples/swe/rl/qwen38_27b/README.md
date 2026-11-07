@@ -23,7 +23,7 @@ parameters and Slurm submission preflights. They do not modify the running trial
 | Inference     | 16 TP4 replicas; CUDA graph, memory saver and radix cache enabled   |
 | Attention     | dense provider `auto`; native GDN defaults; no PLE override         |
 | LM head       | native projection; chunked logits disabled                          |
-| Reward        | group normalization uses standard deviation                         |
+| Reward        | group mean centering; no standard deviation scaling                 |
 | R3            | disabled                                                            |
 | Recovery      | auto; model/optimizer/LR/RNG state retained; save every two hours   |
 

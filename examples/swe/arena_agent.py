@@ -1222,9 +1222,7 @@ class ArenaStreamAgentWorkflow:
             if (
                 _HARNESS_SYSTEM_ERROR_PATTERN.search(detail)
                 or "delivery" not in receipt
-                or cls._harness_result_format(receipt) != "native-runner"
                 or receipt.get("failure") is not None
-                or receipt.get("raw") is not None
                 or not isinstance(collection, dict)
                 or collection.get("status") != "OK"
                 or type(collection.get("file_count")) is not int
@@ -1233,6 +1231,8 @@ class ArenaStreamAgentWorkflow:
                 return False
         if (
             receipt.get("implementation") != "rust-core-runtime"
+            or cls._harness_result_format(receipt) != "native-runner"
+            or receipt.get("raw") is not None
             or receipt.get("status") != "ERROR"
             or type(receipt.get("exit_code")) is not int
             or receipt["exit_code"] != 1
@@ -1249,7 +1249,9 @@ class ArenaStreamAgentWorkflow:
             or not isinstance(errors[0].get("message"), str)
         ):
             return False
-        if abbreviated and "outcome" in errors[0]:
+        # Structured outcomes require Core admission and matching envelopes;
+        # a runner message alone cannot override their attribution or health.
+        if "outcome" in errors[0]:
             return False
         message = errors[0]["message"]
         return (
@@ -1581,10 +1583,10 @@ class ArenaStreamAgentWorkflow:
             return disposition == "system_failure_reject"
         if not isinstance(error, ArenaTaskFailedError):
             return False
-        # Setup, collection, and grader failures leave this task unscored without
-        # invalidating healthy siblings. Proxy service errors are still
-        # propagated by OpenAIProxyWorkflow before applying this hook.
-        if error.status in {"SETUP_FAILED", "COLLECT_FAILED", "EVAL_FAILED"}:
+        # Keep terminal system failures consistent with classify_proxy_failure:
+        # the failed task stays unscored without invalidating healthy siblings.
+        # OpenAIProxyWorkflow still propagates proxy service errors first.
+        if error.status in self._SYSTEM_FAILURE_STATUSES:
             return disposition == "system_failure_reject"
         return (
             error.status in {"HARNESS_FAILED", "NO_OUTPUT", "TIMEOUT"}

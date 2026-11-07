@@ -218,6 +218,10 @@ def test_abbreviated_tool_call_budget_failure_keeps_zero(adopted):
         "collection",
         "receipt_failure",
         "provider_failure",
+        "terminal_outcome",
+        "nested_outcome",
+        "top_level_outcome",
+        "native_family",
     ],
 )
 def test_runner_budget_receipt_overrides_earlier_proxy_overflow(
@@ -242,6 +246,21 @@ def test_runner_budget_receipt_overrides_earlier_proxy_overflow(
         receipt["failure"] = {"code": "EXPORT_FAILED"}
     elif fault == "provider_failure":
         receipt["error"][0]["message"] = "HTTP 503 service unavailable"
+    elif fault in {"terminal_outcome", "nested_outcome", "top_level_outcome"}:
+        outcome = {
+            "code": "HARNESS_INTERNAL_ERROR",
+            "class": "infrastructure",
+            "source": "core",
+            "details": {"reason": "unclassified"},
+        }
+        if fault == "terminal_outcome":
+            receipt["error"][0]["outcome"] = outcome
+        elif fault == "nested_outcome":
+            receipt["raw"] = {"outcome": outcome}
+        else:
+            receipt["outcome"] = outcome
+    elif fault == "native_family":
+        receipt["nativeExportHealthy"] = False
 
     assert ArenaStreamAgentWorkflow.classify_proxy_failure(
         error, context_overflow=context_overflow, interaction_count=2
