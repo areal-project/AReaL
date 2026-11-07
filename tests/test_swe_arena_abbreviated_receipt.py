@@ -87,7 +87,9 @@ def test_abbreviated_model_failure_with_native_collection_keeps_zero(
         "multiple_turns",
         "multiple_errors",
         "provider_failure",
-        "argument_budget",
+        "budget_wrong_kind",
+        "budget_not_exceeded",
+        "budget_malformed",
         "public_input_changed",
         "deliverable_conflict",
         "no_interactions",
@@ -139,13 +141,17 @@ def test_abbreviated_failure_with_missing_or_conflicting_evidence_rejected(
         receipt["error"].append({"message": "provider failed"})
     elif mutation in {
         "provider_failure",
-        "argument_budget",
+        "budget_wrong_kind",
+        "budget_not_exceeded",
+        "budget_malformed",
         "public_input_changed",
         "deliverable_conflict",
     }:
         receipt["error"][0]["message"] = {
             "provider_failure": "model service unavailable",
-            "argument_budget": "tool_call_budget_exceeded: argument_bytes (limit 65536, observed 69773)",
+            "budget_wrong_kind": "tool_call_budget_exceeded: tokens (limit 10, observed 11)",
+            "budget_not_exceeded": "tool_call_budget_exceeded: argument_bytes (limit 10, observed 10)",
+            "budget_malformed": "tool_call_budget_exceeded: argument_bytes (limit x, observed 69773)",
             "public_input_changed": "Public inputs changed during agent execution",
             "deliverable_conflict": "Conflicting workspace/output deliverable: renders/view.png",
         }[mutation]
@@ -179,10 +185,34 @@ def test_abbreviated_failure_with_missing_or_conflicting_evidence_rejected(
 
 
 @pytest.mark.parametrize("adopted", [False, True])
+def test_abbreviated_tool_call_budget_failure_keeps_zero(adopted):
+    error = _error(
+        adopted=adopted,
+        message="tool_call_budget_exceeded: argument_bytes (limit 65536, observed 69773)",
+    )
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+
+
+@pytest.mark.parametrize("adopted", [False, True])
 @pytest.mark.parametrize("fetch_fails", [False, True])
 def test_abbreviated_task_fetches_receipt_before_classification(
     monkeypatch, adopted, fetch_fails
 ):
+    for proxy_var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(proxy_var, raising=False)
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
     workflow = ArenaStreamAgentWorkflow(

@@ -91,6 +91,194 @@ async def test_recovered_harness_failure_export_does_not_double_count(
 
 
 @pytest.mark.asyncio
+async def test_tool_call_budget_exceeded_harness_failure_records_rate(
+    workflow, monkeypatch
+):
+    summary = "GAMEAGENT_OUTCOME_CODE=LLM_RESPONSE_FAILED GAMEAGENT_OUTCOME_CLASS=agent"
+    outcome = {
+        "code": "LLM_RESPONSE_FAILED",
+        "class": "agent",
+        "source": "core_tool_decoder",
+        "details": {
+            "code": "tool_call_budget_exceeded",
+            "budget": "argument_bytes",
+            "limit": 65536,
+            "observed": 94917,
+        },
+    }
+    message = "tool_call_budget_exceeded: argument_bytes (limit 65536, observed 94917)"
+    result = ArenaTaskResult(
+        task_id="task-1",
+        status="HARNESS_FAILED",
+        score=0.0,
+        raw={
+            "error": f"harness: running setup hook (timeout=10m0s)\n{summary}",
+            "harness": {
+                "phase": "agent",
+                "result_status": "ERROR",
+                "exit_code": 1,
+                "summary": summary,
+            },
+            "outcome": outcome,
+        },
+    )
+    error = ArenaTaskFailedError("task-1", result.status, result=result)
+    error.harness_result = {
+        "implementation": "rust-core-runtime",
+        "status": "ERROR",
+        "exit_code": 1,
+        "turn_statuses": ["failed"],
+        "delivery": None,
+        "summary": summary,
+        "error": [{"message": message, "outcome": outcome.copy()}],
+        "raw": {"outcome": outcome.copy()},
+    }
+    monkeypatch.setattr(
+        workflow.client, "launch_one_task_result", AsyncMock(side_effect=error)
+    )
+    monkeypatch.setattr(
+        workflow.client,
+        "get_harness_result_async",
+        AsyncMock(return_value=error.harness_result),
+    )
+
+    with capture_metrics() as metrics:
+        with pytest.raises(ArenaTaskFailedError):
+            await run_agent(workflow)
+
+    assert metrics["rollout/harness_error"] == [1.0]
+    assert metrics["rollout/harness_error/tool_call_budget_exceeded_rate"] == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_other_harness_failure_records_zero_tool_call_budget_rate(
+    workflow, monkeypatch
+):
+    error = ArenaTaskFailedError(
+        "task-1",
+        "HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task-1", status="HARNESS_FAILED", score=0.0, raw={}
+        ),
+    )
+    monkeypatch.setattr(
+        workflow.client, "launch_one_task_result", AsyncMock(side_effect=error)
+    )
+
+    with capture_metrics() as metrics:
+        with pytest.raises(ArenaTaskFailedError):
+            await run_agent(workflow)
+
+    assert metrics["rollout/harness_error/tool_call_budget_exceeded_rate"] == [0.0]
+
+
+@pytest.mark.asyncio
+async def test_structured_budget_metric_requires_matching_receipt(
+    workflow, monkeypatch
+):
+    outcome = {
+        "code": "LLM_RESPONSE_FAILED",
+        "class": "agent",
+        "source": "core_tool_decoder",
+        "details": {
+            "code": "tool_call_budget_exceeded",
+            "budget": "argument_bytes",
+            "limit": 100,
+            "observed": 101,
+        },
+    }
+    summary = "GAMEAGENT_OUTCOME_CODE=LLM_RESPONSE_FAILED GAMEAGENT_OUTCOME_CLASS=agent"
+    result = ArenaTaskResult(
+        task_id="task-1",
+        status="HARNESS_FAILED",
+        score=0.0,
+        raw={
+            "error": f"harness: running setup hook (timeout=10m0s)\n{summary}",
+            "harness": {
+                "phase": "agent",
+                "result_status": "ERROR",
+                "exit_code": 1,
+                "summary": summary,
+            },
+            "outcome": outcome,
+        },
+    )
+    error = ArenaTaskFailedError("task-1", result.status, result=result)
+    error.harness_result = {
+        "implementation": "rust-core-runtime",
+        "status": "ERROR",
+        "exit_code": 1,
+        "turn_statuses": ["failed"],
+        "delivery": None,
+        "summary": summary,
+        "error": [
+            {
+                "message": "tool_call_budget_exceeded: argument_bytes (limit 100, observed 101)",
+                "outcome": outcome.copy(),
+            }
+        ],
+        "raw": {"outcome": outcome.copy()},
+    }
+    monkeypatch.setattr(
+        workflow.client, "launch_one_task_result", AsyncMock(side_effect=error)
+    )
+    monkeypatch.setattr(
+        workflow.client,
+        "get_harness_result_async",
+        AsyncMock(return_value=error.harness_result),
+    )
+
+    with capture_metrics() as metrics:
+        with pytest.raises(ArenaTaskFailedError):
+            await run_agent(workflow)
+
+    assert metrics["rollout/harness_error/tool_call_budget_exceeded_rate"] == [1.0]
+
+    error.harness_result["raw"]["outcome"]["details"]["observed"] = 102
+    monkeypatch.setattr(
+        workflow.client, "launch_one_task_result", AsyncMock(side_effect=error)
+    )
+    monkeypatch.setattr(
+        workflow.client,
+        "get_harness_result_async",
+        AsyncMock(return_value=error.harness_result),
+    )
+    with capture_metrics() as metrics:
+        with pytest.raises(ArenaTaskFailedError):
+            await run_agent(workflow)
+    assert metrics["rollout/harness_error/tool_call_budget_exceeded_rate"] == [0.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["DONE", "EVAL_FAILED"])
+async def test_non_harness_terminal_task_records_zero_tool_call_budget_rate(
+    workflow, monkeypatch, status
+):
+    result = ArenaTaskResult(
+        task_id="task-1", status=status, score=0.5 if status == "DONE" else None
+    )
+    if status == "DONE":
+        launch = AsyncMock(return_value=result)
+        expected_status_metric = "rollout/task_status/DONE"
+    else:
+        launch = AsyncMock(
+            side_effect=ArenaTaskFailedError("task-1", status, result=result)
+        )
+        expected_status_metric = "rollout/task_status/EVAL_FAILED"
+    monkeypatch.setattr(workflow.client, "launch_one_task_result", launch)
+
+    with capture_metrics() as metrics:
+        if status == "DONE":
+            await run_agent(workflow)
+        else:
+            with pytest.raises(ArenaTaskFailedError):
+                await run_agent(workflow)
+
+    assert metrics[expected_status_metric] == [1.0]
+    assert metrics["rollout/harness_error/tool_call_budget_exceeded_rate"] == [0.0]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error", [RuntimeError("launch failed"), asyncio.CancelledError()]
 )

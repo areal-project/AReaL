@@ -1074,6 +1074,107 @@ def _core_context_failure_error() -> ArenaTaskFailedError:
     return error
 
 
+def _core_tool_budget_failure_error(continuations=0) -> ArenaTaskFailedError:
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "tool_call_budget_exceeded: argument_bytes (limit 65536, observed 94917)",
+    )
+    outcome = {
+        "code": "LLM_RESPONSE_FAILED",
+        "class": "agent",
+        "source": "core_tool_decoder",
+        "details": {
+            "code": "tool_call_budget_exceeded",
+            "budget": "argument_bytes",
+            "limit": 65536,
+            "observed": 94917,
+        },
+    }
+    summary = "GAMEAGENT_OUTCOME_CODE=LLM_RESPONSE_FAILED GAMEAGENT_OUTCOME_CLASS=agent"
+    raw = dict(error.result.raw)
+    raw["outcome"] = outcome
+    raw["harness"] = {**raw["harness"], "summary": summary}
+    error.result = replace(error.result, raw=raw)
+    receipt = error.harness_result
+    receipt["summary"] = summary
+    receipt["turn_statuses"] = ["completed"] * continuations + ["failed"]
+    receipt["error"] = [None] * continuations + [
+        {
+            "message": "tool_call_budget_exceeded: argument_bytes (limit 65536, observed 94917)",
+            "outcome": deepcopy(outcome),
+        }
+    ]
+    receipt["continuations"] = continuations
+    receipt["delivery"] = None
+    receipt["raw"] = {"outcome": deepcopy(outcome)}
+    return error
+
+
+@pytest.mark.parametrize("continuations", [0, 1])
+def test_core_tool_budget_failure_with_matching_receipt_keeps_zero(continuations):
+    error = _core_tool_budget_failure_error(continuations)
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=0
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "receipt_message",
+        "receipt_error_outcome",
+        "receipt_raw_outcome",
+        "summary",
+        "source",
+        "boolean_limit",
+        "limit_not_exceeded",
+        "unexpected_detail",
+        "continuations",
+        "turn_statuses",
+    ],
+)
+def test_core_tool_budget_failure_rejects_mismatched_evidence(mutation):
+    error = _core_tool_budget_failure_error(continuations=1)
+    if mutation == "receipt_message":
+        error.harness_result["error"][-1]["message"] = "model service unavailable"
+    elif mutation == "receipt_error_outcome":
+        error.harness_result["error"][-1]["outcome"]["source"] = "core_model"
+    elif mutation == "receipt_raw_outcome":
+        error.harness_result["raw"]["outcome"]["details"]["observed"] += 1
+    elif mutation == "summary":
+        error.harness_result["summary"] = "GAMEAGENT_OUTCOME_CLASS=infrastructure"
+    elif mutation == "source":
+        error.result.raw["outcome"]["source"] = "core_model"
+    elif mutation == "boolean_limit":
+        error.result.raw["outcome"]["details"]["limit"] = True
+    elif mutation == "limit_not_exceeded":
+        error.result.raw["outcome"]["details"]["observed"] = 65536
+    elif mutation == "unexpected_detail":
+        error.result.raw["outcome"]["details"]["extra"] = "value"
+    elif mutation == "continuations":
+        error.harness_result["continuations"] = 0
+    else:
+        error.harness_result["turn_statuses"] = ["failed"]
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
+
+
 def test_core_context_budget_exhaustion_keeps_zero_with_matching_native_receipt():
     error = _core_context_failure_error()
 
@@ -1414,12 +1515,27 @@ def test_core_single_turn_legacy_receipt_keeps_existing_compatibility():
 
 @pytest.mark.parametrize(
     "failure",
-    ["legacy_context", "current_context", "provider_context", "whitebox_deadline"],
+    [
+        "legacy_context",
+        "current_context",
+        "provider_context",
+        "whitebox_deadline",
+        "tool_budget",
+    ],
 )
 def test_context_budget_failure_fetches_native_receipt_before_classification(
     monkeypatch,
     failure,
 ):
+    for proxy_var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(proxy_var, raising=False)
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
     workflow = ArenaStreamAgentWorkflow(
@@ -1435,11 +1551,14 @@ def test_context_budget_failure_fetches_native_receipt_before_classification(
         error.whitebox_lifecycle = None
         fetch_method = "get_whitebox_lifecycle_async"
     else:
-        error = (
-            _current_core_context_failure_error()
-            if failure == "current_context"
-            else _core_context_failure_error()
-        )
+        if failure == "tool_budget":
+            error = _core_tool_budget_failure_error()
+        else:
+            error = (
+                _current_core_context_failure_error()
+                if failure == "current_context"
+                else _core_context_failure_error()
+            )
         if failure == "provider_context":
             error = _provider_context_failure_error()
         receipt = error.harness_result
@@ -1613,6 +1732,37 @@ def test_workflow_audits_recovered_failure_with_final_zero_reward(
     assert records[0]["arena_score"] == 0.0
     assert records[0]["training_score"] == 0.0
     assert records[0]["raw"] == {"failure": "context_overflow"}
+
+
+def test_core_tool_budget_failure_audits_zero_after_proxy_classification(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
+    workflow = ArenaStreamAgentWorkflow(
+        econfig={
+            "arena_base_url": "https://arena.example",
+            "arena_result_dump_dir": str(tmp_path / "arena-results"),
+            "stream_id": "stream-a",
+        }
+    )
+    data = {"stream_id": "stream-a", "data_id": "data-a"}
+    error = _core_tool_budget_failure_error()
+    disposition = workflow.classify_proxy_failure(
+        error, context_overflow=False, interaction_count=2
+    )
+
+    async def persist_episode() -> None:
+        await workflow.record_failure_disposition(data, error, disposition)
+        await workflow.persist_episode_result(data, 0.0)
+
+    asyncio.run(persist_episode())
+
+    dump_file = next((tmp_path / "arena-results").glob("arena_results_*.jsonl"))
+    records = [json.loads(line) for line in dump_file.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["status"] == "HARNESS_FAILED"
+    assert records[0]["arena_score"] == 0.0
+    assert records[0]["training_score"] == 0.0
 
 
 def test_workflow_audits_rejected_failure_without_training_reward(
