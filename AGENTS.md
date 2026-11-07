@@ -9,8 +9,9 @@ For AutoPilot work, read the workspace [progress](../PROGRESS.md) and
 advancement; distinguish verified results from planned work. Maintain project plans,
 implementation writeups, experiment reports and machine runbooks in the workspace
 `docs/` directory. Keep only concise usage READMEs beside examples. New project tests
-live in `../local/tests/`; experiment artifacts and logs live in `../local/artifacts/`.
-Keep upstream tests in `tests/`.
+live in `../local/tests/`; Simulation run outputs live in
+`../local/simulation/outputs/`, and other experiment artifacts and validation logs live
+in `../local/artifacts/`. Keep upstream tests in `tests/`.
 
 For Reference work, read the [implementation](../docs/implementation/reference.md). Keep
 Reference independent of Basic; freeze source, calibration and NumPy identities for

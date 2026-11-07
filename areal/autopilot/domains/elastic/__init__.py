@@ -4,8 +4,6 @@
 
 from areal.autopilot.domains.elastic.cycle import (
     ReconfiguratorRevisionCycle,
-    optimizer_simulation_cases,
-    revise_optimizer,
 )
 from areal.autopilot.domains.elastic.evaluation.evaluator import (
     CostModelAcceptanceCriteria,
@@ -18,8 +16,6 @@ from areal.autopilot.domains.elastic.evaluation.evaluator import (
 from areal.autopilot.domains.elastic.evaluation.optimizer import (
     OptimizerRevisionBenchmark,
     OptimizerRevisionCriteria,
-    OptimizerSimulationBenchmark,
-    OptimizerSimulationCriteria,
 )
 from areal.autopilot.domains.elastic.trigger import (
     RevisionTrigger,
@@ -34,8 +30,6 @@ __all__ = [
     "ReconfiguratorRevisionCycle",
     "RevisionTrigger",
     "RevisionTriggerConfig",
-    "optimizer_simulation_cases",
-    "revise_optimizer",
     "load_accepted_cost_models",
     "load_accepted_optimizer",
     "HistoricalCase",
@@ -46,6 +40,4 @@ __all__ = [
     "EvaluatorRevisionBenchmark",
     "OptimizerRevisionCriteria",
     "OptimizerRevisionBenchmark",
-    "OptimizerSimulationBenchmark",
-    "OptimizerSimulationCriteria",
 ]

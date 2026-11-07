@@ -120,20 +120,6 @@ class WorkloadChange:
     relative_changes: tuple[tuple[str, float], ...]
 
 
-@dataclasses.dataclass(frozen=True)
-class OptimizerSimulationCase:
-    """One observed boundary and frozen workload for paired outer simulations."""
-
-    observation: OnlineObservation
-    workload: Forecast
-
-    def __post_init__(self):
-        if self.observation.busy:
-            raise ValueError("Revision simulation requires a stable execution boundary")
-        if self.workload.input_closes_at <= self.observation.now:
-            raise ValueError("Revision workload must extend beyond its observation")
-
-
 BASELINE_SOURCE = {
     "evaluator": """from areal.autopilot.domains.elastic.evaluation.evaluator import calibrated_cost_models
 

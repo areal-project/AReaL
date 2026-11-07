@@ -1,37 +1,25 @@
 # Elastic 快速命令
 
-在 AReaL 仓库根目录执行。先填好训练配置中的模型、GPU 池、`state_root` 和 `checkpoint_estimated_bytes`。
-
-## 启用 Elastic（原生 Cold）
+在 AReaL 仓库根目录启用原生 Elastic，先填好模型、GPU 池、`state_root` 和 `checkpoint_estimated_bytes`：
 
 ```bash
-CUDA_VISIBLE_DEVICES="" AREAL_ELASTIC_RESOURCE_RECONFIGURATION=1 \
+CUDA_VISIBLE_DEVICES="" \
 python -m examples.task_workflows.train \
   --config examples/task_workflows/configs/dapo.yaml \
   elastic.enabled=true
 ```
 
-接入 Reconfigurator 时，追加 `--elastic-profile "$NATIVE_PROFILE"`，指向匹配的原生 Cold 预测配置。
+当前原生入口使用 Megatron＋SGLang 固定布局，保留完整 checkpoint 与观测；Megatron 动态布局切换待实现。
 
-## CPU Simulation
-
-生成 workload：
+CPU 实验在工作区根目录运行：
 
 ```bash
-python -m areal.elastic.simulation.workload \
-  --spec examples/autopilot/elastic/workload-spec.json \
-  --output "$WORKLOAD_DIR"
+python local/simulation/simulate_online.py \
+  --cost-models analytical \
+  --config local/simulation/configs/smoke.json \
+  --search-workers 2 --decision-clock fixed
 ```
 
-指定冻结校准包、组件拟合参数、发布参数和新输出目录，比较 fixed／dynamic：
+输出自动保存在 `local/simulation/outputs/<配置名-时间戳>/`。
 
-```bash
-python -m examples.autopilot.elastic.simulate_online \
-  --reconfigurator reference --mode both --search-workers 4 \
-  --workload "$WORKLOAD_DIR/workload.jsonl" \
-  --config examples/autopilot/elastic/online-v3-example.json \
-  --bundle "$CALIBRATION_BUNDLE" --mechanism-fits "$MECHANISM_FITS" \
-  --publication-metadata "$PUBLICATION_METADATA" --output "$OUTPUT"
-```
-
-模拟配置中的 `handoff.mode` 选择 Hot／Cold；Cold 需填写 `phase_seconds`。
+生成 workload 和单次搜索修订演示见[本地实验命令](../../../local/simulation/command.md)。
