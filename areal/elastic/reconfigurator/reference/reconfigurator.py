@@ -49,10 +49,12 @@ class OnlineReconfiguratorConfig:
     actor_memory_reserve_fraction: float = 0.0
     actor_memory_scope: str = "all_completed"
     independent_role_history: bool = False
+    max_search_seconds: float = 30.0
 
     def __post_init__(self):
         for name in ("check_interval_seconds", "slo_window_seconds"):
             nonnegative(name, getattr(self, name), positive=True)
+        nonnegative("max_search_seconds", self.max_search_seconds, positive=True)
         for name in ("cooldown_seconds", "decision_delay_seconds"):
             nonnegative(name, getattr(self, name))
         if not 0 <= self.pressure_request_fraction < self.slack_request_fraction <= 1:
@@ -101,7 +103,9 @@ class OnlineReconfigurator:
         if not candidates:
             raise ValueError("Explicit online candidates are required")
         self.candidates = tuple(dict.fromkeys(candidates))
-        self.optimizer = OnlineOptimizer()
+        self.optimizer = OnlineOptimizer(
+            max_queries=config.max_evaluations, max_seconds=config.max_search_seconds
+        )
         self.forecaster, self.config, self.slo = (forecaster, config, slo)
         self.decision_index = 0
         self.last_switch = -math.inf
@@ -222,7 +226,7 @@ class OnlineReconfigurator:
                 if (roles["actor"] or c.actor_key == view.layout.actor_key)
                 and (roles["rollout"] or c.rollout_key == view.layout.rollout_key)
             )
-        layouts = candidates[: cfg.max_evaluations]
+        layouts = candidates
         if cfg.independent_role_history and len(layouts) == 1:
             return keep("No alternative layout under role history constraints", trigger)
         preferred = ()
@@ -233,6 +237,7 @@ class OnlineReconfigurator:
                     key=lambda row: row[0].distance(self.forecaster.features),
                 )[1],
             )
+        preferred = tuple(c for c in preferred if c in layouts)
         predictions = tuple(
             self.optimizer.search(
                 evaluator,

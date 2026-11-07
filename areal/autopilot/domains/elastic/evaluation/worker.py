@@ -49,6 +49,8 @@ def run_optimizer_search(source, ports, settings, runner, directory):
                 historical=port.historical,
                 slo=asdict(port.slo),
                 parallel_available=port.parallel_available,
+                max_queries=port.max_queries,
+                max_seconds=port.max_seconds,
             )
         if index not in begun:
             return port.reject("Search queried before starting its case")
@@ -144,8 +146,20 @@ def main():
             self.context_id = metadata["context_id"]
             self.historical = metadata["historical"]
             self.parallel_available = metadata["parallel_available"]
+            self.max_queries = metadata["max_queries"]
+            self.max_seconds = metadata["max_seconds"]
+            self.queries = 0
+            self.started = time.monotonic()
             self.slo = decode(ServingSLO, metadata["slo"])
             self.execution_stats = {}
+
+        @property
+        def remaining_queries(self):
+            return max(0, self.max_queries - self.queries)
+
+        @property
+        def remaining_seconds(self):
+            return max(0.0, self.max_seconds - (time.monotonic() - self.started))
 
         def prepare_context(self, view, forecasts):
             if view != self.case.observation or forecasts != self.case.forecasts:
@@ -175,6 +189,7 @@ def main():
                 bound=None if bound is None else asdict(bound),
                 chunk_size=chunk_size,
             )
+            self.queries += len(indexed)
             return decode(CandidateWave, value["wave"])
 
         def evaluate(self, view, forecasts, layout, *, bound=None):

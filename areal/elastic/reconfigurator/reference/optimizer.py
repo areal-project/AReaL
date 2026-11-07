@@ -6,7 +6,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import zip_longest
-from math import inf
+from math import inf, isfinite
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -137,18 +138,38 @@ class OnlineOptimizer:
 
     select = staticmethod(select_prediction)
 
+    def __init__(self, *, max_queries=64, max_seconds=30.0):
+        if type(max_queries) is not int or max_queries < 1:
+            raise ValueError("Search requires a positive query budget")
+        if not isfinite(max_seconds) or max_seconds <= 0:
+            raise ValueError("Search requires a positive wall-time budget")
+        self.max_queries, self.max_seconds = max_queries, max_seconds
+
     def search(
         self, evaluator, view, forecasts, layouts, *, preferred=(), trigger="pressure"
     ):
+        started = perf_counter()
+        query_limit = min(
+            self.max_queries, getattr(evaluator, "max_queries", self.max_queries)
+        )
+        seconds_limit = min(
+            self.max_seconds, getattr(evaluator, "max_seconds", self.max_seconds)
+        )
         evaluator.prepare_context(view, forecasts)
-        if not evaluator.historical:
-            return self.evaluate_many(evaluator, view, forecasts, layouts)
-        order = evaluator.order_candidates(view, forecasts, layouts, preferred)
+        order = (
+            evaluator.order_candidates(view, forecasts, layouts, preferred)
+            if evaluator.historical
+            else tuple(enumerate(layouts))
+        )
         ordered = [None] * len(layouts)
         best = None
         work, cpus, preparations, pids = ([], 0.0, 0, set())
         waves = [order[:1]] + [order[i : i + 8] for i in range(1, len(order), 8)]
         for wave in waves:
+            remaining = query_limit - len(work)
+            if remaining <= 0 or (work and perf_counter() - started >= seconds_limit):
+                break
+            wave = wave[:remaining]
             bound = (
                 SearchBound(
                     evaluator.context_id,
@@ -156,7 +177,9 @@ class OnlineOptimizer:
                     best,
                     fraction_pruning=False,
                 )
-                if best and (not (trigger == "pressure" and best.layout == view.layout))
+                if evaluator.historical
+                and best
+                and (not (trigger == "pressure" and best.layout == view.layout))
                 else None
             )
             result = evaluator.evaluate_wave(view, forecasts, wave, bound=bound)
@@ -168,26 +191,32 @@ class OnlineOptimizer:
             ):
                 ordered[index] = prediction
                 work.append(prediction)
-            best = self.select(
-                tuple(p for p in ordered if p is not None),
-                view.layout,
-                evaluator.slo.minimum_request_fraction,
-                trigger=trigger,
-            )
+            if evaluator.historical:
+                best = self.select(
+                    tuple(p for p in ordered if p is not None),
+                    view.layout,
+                    evaluator.slo.minimum_request_fraction,
+                    trigger=trigger,
+                )
         evaluator.execution_stats = dict(
             mode="bounded_process_pool"
             if evaluator.parallel_available
             else "bounded_serial",
             considered=len(ordered),
-            completed=sum(p.supported for p in ordered),
-            pruned=sum(p.pruned for p in ordered),
-            unsupported=sum(not p.supported and (not p.pruned) for p in ordered),
+            completed=sum(p.supported for p in work),
+            pruned=sum(p.pruned for p in work),
+            unsupported=sum(not p.supported and (not p.pruned) for p in work),
+            model_queries=len(work),
+            max_queries=query_limit,
+            max_seconds=seconds_limit,
+            elapsed_seconds=perf_counter() - started,
+            budget_exhausted=len(work) < len(layouts),
             evaluation_order=tuple(p.layout.key for p in work),
             workers_used=len(pids),
             worker_task_cpu_seconds=cpus,
             input_preparations=preparations,
         )
-        return tuple(ordered)
+        return tuple(p for p in ordered if p is not None)
 
     def evaluate_many(self, evaluator, view, forecasts, layouts):
         result = evaluator.evaluate_wave(

@@ -30,7 +30,8 @@ def proposal_context(target, *, workload_change=None, objective=None):
             "The evaluation worker will load your module, call build_optimizer(settings), "
             "and then call search(...) on the returned object. "
             "Use only the supplied evaluate-only port: prepare_context, historical, context_id, slo, "
-            "order_candidates, evaluate, evaluate_wave, parallel_available and execution_stats. "
+            "order_candidates, evaluate, evaluate_wave, parallel_available, execution_stats, "
+            "max_queries, max_seconds, remaining_queries and remaining_seconds. "
             "Return predictions supplied by that port. The parent owns SLO/Actor-supply selection, "
             "costs, query limits and acceptance; reduce cost and Evaluator queries at the fixed horizon."
         )

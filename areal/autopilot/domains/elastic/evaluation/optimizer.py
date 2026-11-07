@@ -50,9 +50,19 @@ class SearchPort:
         self.max_queries, self.max_seconds = max_queries, max_seconds
         self.queries = 0
         self.issued = []
+        self.trace = []
         self.violations = []
         self.started = time.monotonic()
+        self.elapsed_seconds = None
         self.evaluator.prepare_context(problem.observation, problem.forecasts)
+
+    @property
+    def remaining_queries(self):
+        return max(0, self.max_queries - self.queries)
+
+    @property
+    def remaining_seconds(self):
+        return max(0.0, self.max_seconds - (time.monotonic() - self.started))
 
     def reject(self, reason):
         self.violations.append(reason)
@@ -122,7 +132,33 @@ class SearchPort:
         result = self.evaluator.evaluate_wave(
             view, forecasts, indexed, bound=bound, chunk_size=chunk_size
         )
-        self.issued.extend(result.predictions)
+        for prediction in result.predictions:
+            self.issued.append(prediction)
+            best = select_prediction(
+                self.issued,
+                view.layout,
+                self.slo.minimum_request_fraction,
+                trigger=self.problem.trigger,
+            )
+            self.trace.append(
+                dict(
+                    query=len(self.issued),
+                    elapsed_seconds=time.monotonic() - self.started,
+                    layout=asdict(prediction.layout),
+                    supported=prediction.supported,
+                    pruned=prediction.pruned,
+                    fraction=prediction.worst_request_fraction,
+                    cost=prediction.mean_gpu_seconds,
+                    feasible=meets_target(
+                        prediction, self.slo.minimum_request_fraction
+                    ),
+                    best_layout=asdict(best.layout) if best is not None else None,
+                    best_feasible_cost=best.mean_gpu_seconds
+                    if best is not None
+                    and meets_target(best, self.slo.minimum_request_fraction)
+                    else None,
+                )
+            )
         self.check(view, forecasts)
         return result
 
@@ -149,6 +185,7 @@ class SearchPort:
                 "Search omitted the current configuration or fabricated predictions"
             )
         self.check(self.problem.observation, self.problem.forecasts)
+        self.elapsed_seconds = time.monotonic() - self.started
         return predictions
 
 
@@ -182,6 +219,7 @@ class VerifiedOnlineOptimizer:
         self.max_queries, self.max_seconds = max_queries, max_seconds
         self.searches = self.query_count = 0
         self.search_wall_seconds = 0.0
+        self.search_records = []
 
     def search(
         self, evaluator, view, forecasts, layouts, *, preferred=(), trigger="pressure"
@@ -220,6 +258,14 @@ class VerifiedOnlineOptimizer:
             )[0]
         self.query_count += port.queries
         self.search_wall_seconds += time.perf_counter() - started
+        self.search_records.append(
+            dict(
+                problem=asdict(problem),
+                trace=port.trace,
+                queries=port.queries,
+                wall_seconds=time.perf_counter() - started,
+            )
+        )
         evaluator.execution_stats = dict(
             mode="verified_online_revision",
             model_queries=port.queries,
@@ -249,6 +295,7 @@ class OptimizerRevisionBenchmark(ElasticRevisionBenchmark):
         max_queries=64,
         max_seconds=30,
         overhead_weight=0.05,
+        reference_predictions=None,
     ):
         if (
             type(max_queries) is not int
@@ -296,11 +343,20 @@ class OptimizerRevisionBenchmark(ElasticRevisionBenchmark):
         )
         self._reports = set()
         self._oracle = []
-        for case in self.cases:
+        references = (
+            tuple(reference_predictions) if reference_predictions is not None else None
+        )
+        if references is not None and len(references) != len(self.cases):
+            raise ValueError("Each frozen case needs one best-known reference")
+        for index, case in enumerate(self.cases):
             evaluator = self.evaluator_factory()
+            layouts = (
+                case.candidates if references is None else (references[index].layout,)
+            )
+            if any(c not in case.candidates for c in layouts):
+                raise ValueError("Best-known reference is outside the frozen catalog")
             predictions = tuple(
-                evaluator.evaluate(case.observation, case.forecasts, c)
-                for c in case.candidates
+                evaluator.evaluate(case.observation, case.forecasts, c) for c in layouts
             )
             chosen = select_prediction(
                 predictions,
@@ -311,6 +367,12 @@ class OptimizerRevisionBenchmark(ElasticRevisionBenchmark):
             if chosen is None:
                 raise ValueError("Each Online case needs a runnable reference choice")
             self._oracle.append(chosen)
+        self.benchmark_sha256 = digest(
+            dict(
+                problem=self.benchmark_sha256,
+                references=[asdict(p) for p in self._oracle],
+            )
+        )
 
     @property
     def calibration(self):
@@ -401,6 +463,11 @@ class OptimizerRevisionBenchmark(ElasticRevisionBenchmark):
                         relative_cost=actual.mean_gpu_seconds
                         / max(oracle.mean_gpu_seconds, 1e-12),
                         queries=port.queries,
+                        search_wall_seconds=port.elapsed_seconds,
+                        trace=port.trace,
+                        slo_fraction=actual.worst_request_fraction,
+                        completed_requests=actual.completed_requests,
+                        completed_updates=actual.completed_updates,
                     )
                 )
             self.assert_unchanged()
@@ -414,6 +481,7 @@ class OptimizerRevisionBenchmark(ElasticRevisionBenchmark):
             mean_gpu_seconds=mean("cost"),
             mean_evaluator_queries=mean("queries"),
             selection_sha256=digest([r["layout"] for r in rows]),
+            cases=rows,
         )
         score = (
             None
@@ -441,6 +509,19 @@ class OptimizerRevisionBenchmark(ElasticRevisionBenchmark):
             raise ValueError("Incumbent search must be valid")
         if not candidate.valid:
             return False, "Candidate search failed"
+        for new, old in zip(
+            candidate.metrics["cases"], incumbent.metrics["cases"], strict=True
+        ):
+            if (
+                new["cost"]
+                > old["cost"] * (1 + self.criteria.max_cost_regression) + 1e-9
+            ):
+                return False, "A frozen case increased GPU cost"
+            if new["slo_fraction"] + 1e-12 < old["slo_fraction"]:
+                return False, "A frozen case reduced request SLO"
+            for key in ("completed_requests", "completed_updates"):
+                if old[key] is not None and (new[key] is None or new[key] < old[key]):
+                    return False, "A frozen case reduced service or training progress"
         if (
             candidate.metrics["mean_gpu_seconds"]
             > incumbent.metrics["mean_gpu_seconds"]
@@ -464,7 +545,9 @@ class OptimizerRevisionBenchmark(ElasticRevisionBenchmark):
         return dict(
             score=report.score,
             metrics={
-                k: v for k, v in report.metrics.items() if k != "selection_sha256"
+                k: v
+                for k, v in report.metrics.items()
+                if k not in ("selection_sha256", "cases")
             },
             errors=report.errors,
         )
