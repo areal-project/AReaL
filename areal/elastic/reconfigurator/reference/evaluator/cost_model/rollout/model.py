@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
@@ -37,6 +38,15 @@ def iteration_cost(
     slices: tuple[ServiceSlice, ...],
     kv_after: int,
 ) -> tuple[float, float]:
+    if (
+        config.pp != 1
+        or config.dp_size != 1
+        or config.ep_size != 1
+        or config.tp > model.kv_heads
+    ):
+        return _distributed_iteration_cost(
+            model, hardware, rates, config, slices, kv_after
+        )
     m, h, r, tp = (model, hardware, rates, config.tp)
     tokens = sum(s.query_tokens for s in slices)
     pairs = sum(
@@ -86,6 +96,131 @@ def iteration_cost(
     seconds = max(compute, memory) + network + m.layers * r.launch_seconds
     lower_bound = m.total_parameters * config.weight_bytes / tp + kv_after * kv_width
     return (seconds, lower_bound)
+
+
+def memory_per_rank(model, config):
+    """Analytical maximum-stage weight bytes and KV bytes per token per DP group."""
+    layers = math.ceil(model.layers / config.pp)
+    attention = model.attention_parameters_per_rank(config.attention_tp)
+    expert = model.expert_parameters_per_layer / config.tp
+    replicated = (
+        model.router_parameters_per_layer + 2 * model.hidden_size + 2 * model.head_dim
+    )
+    heads = 1 if config.pp > 1 or model.tied_embeddings else 2
+    weights = (
+        layers * (attention + expert + replicated)
+        + heads * model.head_parameters / config.tp
+    ) * config.weight_bytes
+    kv = (
+        2
+        * layers
+        * max(1, model.kv_heads / config.attention_tp)
+        * model.head_dim
+        * config.kv_bytes
+    )
+    return weights, kv
+
+
+def _distributed_iteration_cost(model, hardware, rates, config, slices, kv_after):
+    """SGLang PP/DP-Attention/EP roofline prior with explicit grouping costs."""
+    from .scheduling import SGLangScheduler
+
+    m, h, r, c = model, hardware, rates, config
+    groups = [[] for _ in range(c.dp_size)]
+    for item in slices:
+        groups[SGLangScheduler.attention_group(item.request_id, c.dp_size)].append(item)
+    group_tokens = [sum(s.query_tokens for s in row) for row in groups]
+    actual_tokens = sum(group_tokens)
+    # Prefill uses the sum-length DP gather; decode chooses padded/summed
+    # communication. Use the larger uniform-work prior for dense execution.
+    tokens = (
+        actual_tokens
+        if any(s.kind == "prefill" for s in slices)
+        else max(group_tokens) * c.dp_size
+    )
+    pairs = max(
+        sum(
+            s.query_tokens * s.context_tokens
+            + s.query_tokens * (s.query_tokens + 1) / 2
+            for s in row
+        )
+        for row in groups
+    )
+    emitted = sum(s.emit_token for s in slices)
+    active = m.expert_parameters_per_layer * m.top_k / m.experts
+    linear = (
+        2
+        * m.layers
+        * (
+            tokens * (active + m.router_parameters_per_layer) / c.tp
+            + max(group_tokens) * m.attention_parameters_per_rank(c.attention_tp)
+        )
+        + 2 * emitted * m.head_parameters / c.tp
+    )
+    attention = 4 * m.layers * m.attention_heads * m.head_dim * pairs / c.attention_tp
+    compute = linear / (h.bf16_tflops * 1e12 * r.dense) + attention / (
+        h.bf16_tflops * 1e12 * r.attention
+    )
+    weights, kv_width = memory_per_rank(m, c)
+    microbatches = min(
+        c.pp,
+        max(
+            1,
+            math.ceil(len(slices) / max(1, c.max_batch_sequences // c.dp_size // c.pp)),
+        ),
+    )
+    memory = (
+        weights * microbatches * c.pp
+        + (sum(s.context_tokens for s in slices) + actual_tokens)
+        * kv_width
+        * c.pp
+        / c.dp_size
+        + tokens * m.layers * m.hidden_size * c.weight_bytes * 24 / c.tp
+    )
+    memory /= h.hbm_gbps * 1e9 * r.hbm
+
+    def collective(payload, size, span, *, allreduce=True):
+        if size == 1:
+            return 0.0
+        remote = span > h.gpus_per_node
+        bandwidth = (
+            (h.inter_node_gbps if remote else h.intra_node_gbps) * 1e9 * r.network
+        )
+        latency = (h.inter_latency_us if remote else h.intra_latency_us) * 1e-6
+        return (2 if allreduce else 1) * (size - 1) / size * payload / bandwidth + (
+            size - 1
+        ) * latency
+
+    payload = tokens * m.hidden_size * c.weight_bytes
+    network = m.layers * collective(payload / c.dp_size, c.attention_tp, c.attention_tp)
+    if m.mlp_type == "dense":
+        network += m.layers * collective(payload, c.tp, c.tp)
+    else:
+        # EP dispatch/combine; remaining TP ranks shard each expert's matrix.
+        network += (
+            2
+            * m.layers
+            * collective(payload * m.top_k / c.tp, c.ep_size, c.tp, allreduce=False)
+        )
+        network += m.layers * collective(
+            payload * m.top_k / c.ep_size, c.tp // c.ep_size, c.tp
+        )
+    if c.dp_size > 1:
+        network += 2 * m.layers * collective(payload, c.dp_size, c.tp, allreduce=False)
+    pipeline = 0.0
+    if c.pp > 1:
+        remote = c.tp * c.pp > h.gpus_per_node
+        bandwidth = (
+            (h.inter_node_gbps if remote else h.intra_node_gbps) * 1e9 * r.network
+        )
+        latency = (h.inter_latency_us if remote else h.intra_latency_us) * 1e-6
+        pipeline = (c.pp - 1) * (payload / c.tp / bandwidth + microbatches * latency)
+    # Forward pipeline wave: fill/drain plus the occupied microbatch slots.
+    bubble = (c.pp + microbatches - 1) / (c.pp * microbatches)
+    seconds = (
+        max(compute, memory) + network + m.layers * r.launch_seconds * microbatches
+    ) * bubble + pipeline
+    return seconds, weights + kv_after / c.dp_size * kv_width
 
 
 @dataclass(frozen=True)
@@ -173,9 +308,23 @@ class ExpertRolloutModel:
                     ),
                 ),
             )
+        token_overflow = tokens > config.max_batch_tokens
+        if config.prefill_chunk_tokens is not None:
+            from .scheduling import SGLangScheduler
+
+            per_group = [0] * config.dp_size
+            for item in slices:
+                if item.kind == "prefill":
+                    group = SGLangScheduler.attention_group(
+                        item.request_id, config.dp_size
+                    )
+                    per_group[group] += item.query_tokens
+            token_overflow = max(per_group) > min(
+                config.max_batch_tokens, config.prefill_chunk_tokens // config.dp_size
+            )
         if (
             len(slices) > config.max_batch_sequences
-            or tokens > config.max_batch_tokens
+            or token_overflow
             or kv_after > config.kv_capacity_tokens
         ):
             return ServiceEstimate(
@@ -189,8 +338,14 @@ class ExpertRolloutModel:
                 features,
                 kv_after,
             )
-        m, tp = (self.model, config.tp)
-        if m.attention_heads % tp or (m.mlp_type == "dense" and m.kv_heads % tp):
+        m, tp = (self.model, config.attention_tp)
+        if (
+            m.attention_heads % tp
+            or m.layers < config.pp
+            or (m.kv_heads % tp and tp % m.kv_heads)
+            or m.experts % config.ep_size
+            or (m.mlp_type == "dense" and config.ep_size != 1)
+        ):
             return ServiceEstimate(
                 profile,
                 Estimate(
@@ -219,7 +374,8 @@ class ExpertRolloutModel:
         estimate = replace(
             estimate,
             feasibility="infeasible"
-            if lower_bound > self.hardware.memory_gb * 1000000000.0
+            if lower_bound
+            > self.hardware.memory_gb * 1000000000.0 * config.mem_fraction_static
             else "unknown",
             notes=estimate.notes
             + (

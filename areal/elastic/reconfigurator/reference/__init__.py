@@ -6,10 +6,6 @@ from areal.elastic.reconfigurator.reference.evaluator.contracts import (
     ExecutionConfig,
     Request,
 )
-from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.fsdp import (
-    FSDPHostRates,
-    fsdp_publish_tasks,
-)
 from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.model import (
     ActorEstimate,
     AdvantageModel,
@@ -99,8 +95,6 @@ __all__ = [
     "ExpertPublicationModel",
     "ExpertRolloutModel",
     "ExpertTransitionModel",
-    "FSDPHostRates",
-    "fsdp_publish_tasks",
     "Hardware",
     "InferenceRates",
     "Microbatch",

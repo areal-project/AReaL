@@ -26,9 +26,20 @@ class MegatronCosts(Communications):
         ep = self.expert_exchange(ctx, t / (p.tp * p.cp))
         cp_payload = t / (p.cp * p.tp) * m.kv_heads * m.head_dim * 4
         cp = ctx.layers * op.collective(cp_payload * p.cp, p.cp, "cp", p.world_size)
-        fsdp = 0.0
         pp = self.pipeline_transfer(ctx, mb) if not ctx.last else 0.0
-        return {"tp": tp, "cp": cp, "ep": ep, "fsdp": fsdp, "pipeline_transfer": pp}
+        etp = (
+            2
+            * ctx.layers
+            * op.collective(
+                t / (p.tp * p.cp) * m.top_k * p.etp * m.hidden_size * 2,
+                p.etp,
+                "etp",
+                p.world_size,
+            )
+            if m.mlp_type == "moe"
+            else 0.0
+        )
+        return {"tp": tp, "cp": cp, "ep": ep, "etp": etp, "pipeline_transfer": pp}
 
     def gradient_sync(self, ctx: Context) -> float:
         dense, expert = ctx.owned_parameters
@@ -109,8 +120,8 @@ class MegatronCosts(Communications):
         m, p = (ctx.model, ctx.config.parallel)
         if m.mlp_type == "dense":
             dense = ctx.layers * (
-                (m.attention_parameters_per_layer + m.expert_parameters_per_layer)
-                / p.tp
+                m.attention_parameters_per_rank(p.tp)
+                + m.expert_parameters_per_layer / p.tp
                 + 2 * m.hidden_size
                 + 2 * m.head_dim
             )
@@ -120,29 +131,30 @@ class MegatronCosts(Communications):
             dense += heads * m.head_parameters / p.tp
             dense += m.hidden_size if ctx.last else 0
             return (dense, 0.0)
-        dense = (
-            ctx.layers
-            * (
-                m.attention_parameters_per_layer
-                + m.router_parameters_per_layer
-                + 2 * m.hidden_size
-                + 2 * m.head_dim
-            )
-            / p.tp
+        dense = ctx.layers * (
+            m.attention_parameters_per_rank(p.tp)
+            + m.router_parameters_per_layer
+            + 2 * m.hidden_size
+            + 2 * m.head_dim
         )
         dense += (ctx.first + ctx.last) * m.head_parameters / p.tp
         if m.tied_embeddings and ctx.first and ctx.last:
             dense -= m.head_parameters / p.tp
-        expert = ctx.layers * m.expert_parameters_per_layer / p.ep
+        dense += m.hidden_size if ctx.last else 0
+        expert = ctx.layers * m.expert_parameters_per_layer / (p.ep * p.etp)
         return (dense, expert)
 
     @staticmethod
     def mesh_is_valid(config: ActorConfig, model: ModelShape) -> bool:
         p, m = (config.parallel, model)
         invalid = m.experts % p.ep or m.attention_heads % p.tp
+        invalid = invalid or m.intermediate_size % (
+            p.tp if m.mlp_type == "dense" else p.etp
+        )
+        invalid = invalid or m.vocab_size % p.tp
         if m.mlp_type == "dense":
-            invalid = invalid or p.ep != 1 or m.intermediate_size % p.tp
-            invalid = invalid or m.kv_heads % p.tp or p.pp != 1 or (p.cp != 1)
+            invalid = invalid or p.ep != 1 or p.etp != 1
+        invalid = invalid or (m.kv_heads % p.tp != 0 and p.tp % m.kv_heads != 0)
         return not invalid
 
     pipeline_partition = staticmethod(partition_layers)

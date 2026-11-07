@@ -45,10 +45,15 @@ def build_reconfigurator(
     optimizer=None,
 ):
     """Choose a complete algorithm version, independently of its execution backend."""
+    from ..contracts import ExecutionConfig
     from ..serving import ServingSLO
 
     module = component_module(name, "reconfigurator")
     candidates = tuple(candidates)
+    if name == "basic" and any(isinstance(c, ExecutionConfig) for c in candidates):
+        raise ValueError(
+            "Basic v1 retains the original DP/TP interface; full ExecutionConfig requires Reference"
+        )
     if not candidates:
         raise ValueError("A reconfigurator requires explicit executable candidates")
     if replay is not None and forecast is not None:

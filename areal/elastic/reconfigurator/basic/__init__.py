@@ -23,7 +23,6 @@ from .cost_model.aggregate_advantage import (
     AdvantageObservation,
     AggregateAdvantageModel,
 )
-from .cost_model.fsdp import FSDPHostRates, fsdp_publish_tasks
 from .cost_model.packing_diagnostics import (
     PackingTimingDiagnostic,
     PackingTimingObservation,
@@ -84,8 +83,6 @@ __all__ = [
     "ExpertPublicationModel",
     "ExpertRolloutModel",
     "ExpertTransitionModel",
-    "FSDPHostRates",
-    "fsdp_publish_tasks",
     "Hardware",
     "JointSimulator",
     "InferenceRates",

@@ -38,12 +38,6 @@ def parse_microbatch_log(line: str) -> dict | None:
         match = re.search(
             r"microbatch #tokens:\s*(\[[\d,\s]*\]).*padded to:\s*(\[[\d,\s]*\])", line
         )
-    elif "Microbatch #tokens (rank " in line:
-        backend = "archon"
-        match = re.search(
-            r"Microbatch #tokens \(rank \d+\):\s*(\[[\d,\s]*\]), padded to:\s*(\[[\d,\s]*\])",
-            line,
-        )
     else:
         return None
     if match is None:

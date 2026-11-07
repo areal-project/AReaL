@@ -24,7 +24,11 @@ from areal.elastic.serving import ServingSLO
 
 def run_optimizer_search(source, ports, settings, runner, directory):
     """Run frozen searches in the child, serving their Evaluator calls here."""
-    from areal.elastic.contracts import CandidatePrediction, OnlineLayout
+    from areal.elastic.contracts import (
+        CandidatePrediction,
+        ExecutionConfig,
+        OnlineLayout,
+    )
     from areal.elastic.reconfigurator.reference.optimizer import SearchBound
 
     begun, finished = set(), {}
@@ -76,7 +80,7 @@ def run_optimizer_search(source, ports, settings, runner, directory):
                 case.observation,
                 case.forecasts,
                 tuple(
-                    (i, decode(OnlineLayout, layout))
+                    (i, decode(ExecutionConfig | OnlineLayout, layout))
                     for i, layout in message["indexed"]
                 ),
                 bound=bound,
@@ -154,15 +158,16 @@ def main():
                 or tuple(preferred) != self.case.preferred
             ):
                 raise ValueError("Search changed its catalog or preferred layouts")
-            from areal.elastic.contracts import OnlineLayout
+            from areal.elastic.contracts import ExecutionConfig, OnlineLayout
 
             return tuple(
-                (i, decode(OnlineLayout, c))
+                (i, decode(ExecutionConfig | OnlineLayout, c))
                 for i, c in rpc(self.index, "order")["order"]
             )
 
         def evaluate_wave(self, view, forecasts, indexed, *, bound=None, chunk_size=2):
             self.prepare_context(view, forecasts)
+            indexed = tuple(indexed)
             value = rpc(
                 self.index,
                 "wave",

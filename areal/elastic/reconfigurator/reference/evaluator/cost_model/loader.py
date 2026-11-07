@@ -12,15 +12,15 @@ import math
 import re
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 
+from areal.elastic.contracts import ActorMemoryRejected, OnlineLayout, WorkloadStats
+from areal.elastic.contracts import ExecutionConfig as CandidateConfig
 from areal.elastic.reconfigurator.reference.evaluator.contracts import ExecutionConfig
-from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.fsdp import (
-    FSDPHostRates,
-)
 from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.model import (
     AggregateAdvantageModel,
     ExpertActorModel,
@@ -48,9 +48,9 @@ from areal.elastic.reconfigurator.reference.evaluator.cost_model.rollout.schedul
 )
 from areal.elastic.reconfigurator.reference.identity import fingerprint
 
-from .actor.model import CalibratedActorModel
+from .actor.model import Advantages, CalibratedActorModel
 from .publication import CalibratedPublicationModel
-from .rollout.model import CalibratedRolloutModel
+from .rollout.model import CalibratedRolloutModel, memory_per_rank
 
 _KINDS = {"hardware", "topology", "models", "execution/actor", "execution/rollout"}
 _ROLES = {
@@ -212,15 +212,14 @@ def _components(
         model,
         hardware,
         actor["runtime_revision"],
-        efficiency=Efficiency(**actor["efficiency"]),
+        efficiency=Efficiency(
+            **{k: v for k, v in actor["efficiency"].items() if k != "fsdp_overlap"}
+        ),
         group_gbps=tuple(profiles["topology"]["group_gbps"]),
         advantage_model=AggregateAdvantageModel(**actor["advantage"])
         if actor.get("advantage")
         else None,
         dispatch=DispatchConfig(**actor["dispatch"]),
-        fsdp_host_rates=FSDPHostRates(**profiles["topology"]["host_rates"])
-        if profiles["topology"].get("host_rates")
-        else None,
         execution_identity=fingerprint(profiles["model"], actor["execution"])
         if actor.get("execution")
         else "",
@@ -371,6 +370,256 @@ def digest(path: Path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+class AnalyticalCostModels:
+    """Megatron/SGLang execution priors for full candidates; no fitted labels.
+
+    Profiles fix hardware/software and operator efficiencies. The same object
+    serves the experiment environment and the independent candidate evaluator.
+    """
+
+    def __init__(
+        self, actor, actor_template, rollout, rollout_template, bandwidth_GBps
+    ):
+        nonnegative("bandwidth_GBps", bandwidth_GBps, positive=True)
+        self.actor_model = replace(
+            actor, advantage_model=actor.advantage_model or Advantages()
+        )
+        self.actor_template, self.rollout_model, self.rollout_template = (
+            actor_template,
+            rollout,
+            rollout_template,
+        )
+        self.bandwidth = bandwidth_GBps
+        self.weight_bytes = actor.model.total_parameters * 2
+        self.source_ids = (
+            fingerprint(
+                "megatron-sglang-analytical-v1",
+                actor.profile_key(actor_template),
+                rollout.profile_key(rollout_template),
+                bandwidth_GBps,
+            ),
+        )
+        self.scenario_notes = (
+            "Megatron/SGLang full configurations use analytical compute, communication, memory and publication priors",
+            "No DP/TP fit is transferred to PP/CP/EP/ETP or DP Attention; target GPU validation remains separate",
+            "Actor advantage uses an explicit bandwidth/launch prior when no measured model is supplied",
+        )
+
+    @classmethod
+    def from_profiles(
+        cls,
+        *,
+        hardware,
+        topology,
+        model,
+        actor,
+        rollout,
+        bandwidth_GBps,
+        inter_node_GBps=None,
+        catalog=None,
+    ):
+        catalog = catalog or Catalog()
+        profiles = {
+            role: catalog.profile(kind, name)["values"]
+            for role, kind, name in (
+                ("hardware", "hardware", hardware),
+                ("topology", "topology", topology),
+                ("model", "models", model),
+                ("actor", "execution/actor", actor),
+                ("rollout", "execution/rollout", rollout),
+            )
+        }
+        for role in ("actor", "rollout"):
+            if profiles[role].get("model_profile", model) != model:
+                raise ValueError(f"{role} profile belongs to another model")
+        a, r = _components(profiles, hardware)
+        if inter_node_GBps is not None:
+            nonnegative("inter_node_GBps", inter_node_GBps, positive=True)
+            a = replace(
+                a, hardware=replace(a.hardware, inter_node_gbps=inter_node_GBps)
+            )
+            r = replace(
+                r, hardware=replace(r.hardware, inter_node_gbps=inter_node_GBps)
+            )
+        actor_template = _actor(profiles["actor"], ParallelLayout())
+        rollout_template = _rollout(
+            profiles["rollout"], tp=1, replicas=1, kv_capacity_tokens=1
+        )
+        rollout_template = replace(
+            rollout_template,
+            mem_fraction_static=profiles["rollout"]["config"].get(
+                "mem_fraction_static", 0.9
+            ),
+        )
+        result = cls(a, actor_template, r, rollout_template, bandwidth_GBps)
+        result.worker_spec = (
+            "analytical",
+            hardware,
+            topology,
+            model,
+            actor,
+            rollout,
+            bandwidth_GBps,
+            inter_node_GBps,
+            str(catalog.root),
+        )
+        return result
+
+    def validate_layout(self, candidate):
+        """Check model dimensions and weight fit; batch packing needs observations."""
+        from .actor.megatron import MegatronCosts
+
+        if not MegatronCosts.mesh_is_valid(
+            self.actor_config(candidate), self.actor_model.model
+        ):
+            raise ValueError("Model dimensions do not divide the Megatron layout")
+        self.rollout_config(candidate)
+
+    def actor_config(self, candidate):
+        parallel = (
+            ParallelLayout(*candidate.actor_parallel)
+            if isinstance(candidate, CandidateConfig)
+            else ParallelLayout(dp=candidate.actor_dp, tp=candidate.actor_tp)
+        )
+        values = dict(parallel=parallel)
+        if isinstance(candidate, CandidateConfig):
+            values.update(
+                n_mbs=candidate.actor_n_mbs or self.actor_template.n_mbs,
+                max_tokens_per_mb=candidate.actor_max_tokens_per_mb
+                or self.actor_template.max_tokens_per_mb,
+                pad_to_maximum=candidate.actor_pad_to_maximum,
+            )
+        return replace(self.actor_template, **values)
+
+    def resolve(self, candidate):
+        """Bind inherited settings before candidate identity, caching or handoff."""
+        if not isinstance(candidate, CandidateConfig):
+            return candidate
+        return replace(
+            candidate,
+            actor_n_mbs=candidate.actor_n_mbs or self.actor_template.n_mbs,
+            actor_max_tokens_per_mb=candidate.actor_max_tokens_per_mb
+            or self.actor_template.max_tokens_per_mb,
+            rollout_max_concurrent_rollouts=candidate.rollout_max_concurrent_rollouts,
+            sglang_max_running_requests=candidate.sglang_max_running_requests
+            or self.rollout_template.max_batch_sequences,
+            sglang_mem_fraction_static=candidate.sglang_mem_fraction_static
+            if candidate.sglang_mem_fraction_static is not None
+            else self.rollout_template.mem_fraction_static,
+            sglang_enable_dp_attention=candidate.sglang_dp_size > 1,
+            sglang_enable_ep_moe=candidate.sglang_ep_size > 1,
+        )
+
+    @lru_cache(maxsize=512)
+    def rollout_config(self, candidate):
+        values = dict(replicas=candidate.rollout_replicas, tp=candidate.rollout_tp)
+        if isinstance(candidate, CandidateConfig):
+            values.update(
+                pp=candidate.rollout_pp,
+                dp_size=candidate.sglang_dp_size,
+                ep_size=candidate.sglang_ep_size,
+                max_batch_sequences=candidate.sglang_max_running_requests
+                or self.rollout_template.max_batch_sequences,
+                max_batch_tokens=candidate.sglang_max_prefill_tokens,
+                mem_fraction_static=candidate.sglang_mem_fraction_static
+                if candidate.sglang_mem_fraction_static is not None
+                else self.rollout_template.mem_fraction_static,
+            )
+        config = replace(self.rollout_template, **values)
+        model, hardware = self.rollout_model.model, self.rollout_model.hardware
+        if (
+            model.attention_heads % config.attention_tp
+            or (
+                model.kv_heads % config.attention_tp
+                and config.attention_tp % model.kv_heads
+            )
+            or model.experts % config.ep_size
+            or config.pp > model.layers
+            or (model.mlp_type == "dense" and config.ep_size != 1)
+        ):
+            raise ValueError("Model dimensions do not divide the SGLang layout")
+        weights, kv_bytes = memory_per_rank(model, config)
+        available = hardware.memory_gb * 1e9 * config.mem_fraction_static - weights
+        capacity = math.floor(available / kv_bytes) * config.dp_size
+        if capacity <= 0:
+            raise ValueError(
+                "SGLang weights exhaust the configured static memory budget"
+            )
+        return replace(config, kv_capacity_tokens=capacity)
+
+    def service(self, layout, kv, slices):
+        from .contracts import ServiceState
+
+        return self.rollout_model.estimate(
+            self.rollout_config(layout), ServiceState(kv), tuple(slices)
+        ).duration.require_seconds()
+
+    @lru_cache(maxsize=512)
+    def actor_estimate(self, layout, batch):
+        config = self.actor_config(layout)
+        lengths = tuple(
+            t.input_tokens + t.output_tokens for episode in batch for t in episode
+        )
+        work = WorkloadStats(
+            len(lengths),
+            sum(lengths),
+            loss_tokens=sum(t.output_tokens for e in batch for t in e),
+            sequence_lengths=lengths,
+            trajectory_group_sizes=tuple(len(e) for e in batch),
+            trajectory_dispatch_weights=tuple(
+                len(e) * max(t.input_tokens + t.output_tokens for t in e) for e in batch
+            ),
+        )
+        return self.actor_model.estimate(config, work)
+
+    def actor(self, layout, batch):
+        result = self.actor_estimate(layout, batch)
+        if result.total.feasibility == "infeasible":
+            raise ActorMemoryRejected(
+                "Megatron candidate exceeds model/packing/memory constraints: "
+                + "; ".join(result.total.notes)
+            )
+        return tuple(
+            (name, estimate.require_seconds()) for name, estimate in result.stages
+        )
+
+    def actor_memory(self, layout, batch):
+        result = self.actor_estimate(layout, batch)
+        if not result.peak_memory_gb:
+            raise ValueError("Megatron peak memory unavailable for this layout/batch")
+        return (
+            max(result.peak_memory_gb) * 1e9 / 2**30,
+            self.actor_model.hardware.memory_gb * 1e9 / 2**30,
+            False,
+        )
+
+    @lru_cache(maxsize=512)
+    def publication(self, layout, recipients):
+        # One full model image per independent replica; DP Attention duplicates
+        # attention shards. Gather and source/destination copies are separate.
+        model, h = self.actor_model.model, self.actor_model.hardware
+        p = self.actor_config(layout).parallel
+        source = self.weight_bytes / p.pp * (1 - 1 / p.tp)
+        if model.mlp_type == "moe":
+            source += (
+                model.expert_parameters_per_layer
+                * model.layers
+                * 2
+                / p.pp
+                * (1 - 1 / (p.ep * p.etp))
+            )
+        sent = max_endpoint = 0.0
+        for recipient in recipients:
+            config = self.rollout_config(recipient)
+            weights, _ = memory_per_rank(model, config)
+            sent += weights * config.world_size
+            max_endpoint = max(max_endpoint, weights)
+        copy_seconds = (source + max_endpoint) / (
+            h.hbm_gbps * 1e9 * self.actor_model.efficiency.hbm
+        )
+        return copy_seconds + sent / (self.bandwidth * 1e9)
+
+
 class CalibratedCostModels:
     def __init__(
         self,
@@ -456,20 +705,55 @@ class CalibratedCostModels:
             self.parameters, self.weight_bytes, self.bandwidth, self.mechanism
         )
 
+    def _covered_layout(self, layout):
+        if not isinstance(layout, CandidateConfig):
+            return layout
+        if (
+            layout.actor_parallel[2:] != (1, 1, 1, 1)
+            or layout.rollout_pp != 1
+            or layout.sglang_dp_size != 1
+            or layout.sglang_ep_size != 1
+        ):
+            raise ValueError(
+                "Frozen DP/TP calibration does not cover PP/CP/EP/ETP or DP Attention; use explicit analytical models"
+            )
+        actor, rollout = self.actor_template, self.rollout_template
+        if (
+            (layout.actor_n_mbs or actor.n_mbs) != actor.n_mbs
+            or (layout.actor_max_tokens_per_mb or actor.max_tokens_per_mb)
+            != actor.max_tokens_per_mb
+            or layout.actor_pad_to_maximum != actor.pad_to_maximum
+            or (layout.sglang_max_running_requests or rollout.max_batch_sequences)
+            != rollout.max_batch_sequences
+            or layout.sglang_max_prefill_tokens != rollout.max_batch_tokens
+            or layout.sglang_mem_fraction_static is not None
+        ):
+            raise ValueError(
+                "Frozen calibration requires its original packing/batching and measured KV capacity; set memory fraction to None to retain that capacity"
+            )
+        return OnlineLayout(
+            layout.actor_dp, layout.actor_tp, layout.rollout_replicas, layout.rollout_tp
+        )
+
     def rollout_config(self, layout):
-        return self.rollout_model.rollout_config(layout)
+        return self.rollout_model.rollout_config(self._covered_layout(layout))
 
     def service(self, layout, kv, slices):
-        return self.rollout_model.service(layout, kv, slices)
+        return self.rollout_model.service(self._covered_layout(layout), kv, slices)
 
     def decode_affine(self, layout, kv, slices):
-        return self.rollout_model.decode_affine(layout, kv, slices)
+        return self.rollout_model.decode_affine(
+            self._covered_layout(layout), kv, slices
+        )
 
     def actor(self, layout, batch):
-        return self.actor_model.actor(layout, batch)
+        return self.actor_model.actor(self._covered_layout(layout), batch)
 
     def actor_memory(self, layout, batch):
-        return self.actor_model.actor_memory(layout, batch)
+        return self.actor_model.actor_memory(self._covered_layout(layout), batch)
 
     def publication(self, layout, recipients):
-        return self.publication_model.publication(layout, recipients)
+        return self.publication_model.publication(
+            self._covered_layout(layout),
+            tuple(self._covered_layout(r) for r in recipients),
+        )

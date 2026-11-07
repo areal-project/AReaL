@@ -11,7 +11,6 @@ import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from functools import wraps
-from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -171,8 +170,6 @@ class GatewayTrainController:
         ft_spec: FinetuneSpec | None = None,
         **kwargs: Any,
     ) -> None:
-        from dataclasses import asdict
-
         from areal.api.cli_args import SchedulingSpec
         from areal.api.scheduler_api import Job
 
@@ -847,51 +844,17 @@ class GatewayTrainController:
         backend: str,
         identity_sha256: str,
         version: int,
-        restore_plan: dict[str, Any] | None = None,
-        source_world_size: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Save/load full state, building the backend DP mapping when requested.
-
-        Callers may supply the source checkpoint world size instead of constructing
-        a FSDP restore protocol. Existing explicit restore plans remain supported.
-        Every target rank is inspected before collective execution starts.
-        """
+        """Save/load full Megatron state; inspect all ranks before collectives."""
         self._ensure_initialized()
         if operation not in ("save", "load"):
             raise ValueError("Full checkpoint operation must be save or load")
-        if source_world_size is not None:
-            if operation != "load" or restore_plan is not None:
-                raise ValueError(
-                    "Source world size requires a load without an explicit restore plan"
-                )
-            if type(source_world_size) is not int or source_world_size < 1:
-                raise ValueError("Source world size must be a positive integer")
-            target_world_size = self.train_alloc.parallel.world_size
-            if source_world_size != target_world_size:
-                if backend != "fsdp":
-                    raise ValueError("Cross-DP checkpoint loading requires FSDP")
-                from areal.v2.training_service.dp_restore import DPStateRestorePlan
-
-                restore_plan = asdict(
-                    DPStateRestorePlan(
-                        identity_sha256=identity_sha256,
-                        checkpoint_generation=Path(path).name,
-                        policy_version=version,
-                        source_world_size=source_world_size,
-                        target_world_size=target_world_size,
-                        transition_id=uuid4().hex + uuid4().hex,
-                    )
-                )
         kwargs = {
             "path": path,
             "backend": backend,
             "identity_sha256": identity_sha256,
             "version": version,
         }
-        if restore_plan is not None:
-            if operation != "load" or backend != "fsdp":
-                raise ValueError("DP restore plans require a FSDP checkpoint load")
-            kwargs["restore_plan"] = restore_plan
 
         async def all_ranks(
             endpoint: str, parameters: dict[str, Any]

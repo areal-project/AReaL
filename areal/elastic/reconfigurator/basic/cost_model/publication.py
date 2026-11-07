@@ -138,7 +138,7 @@ class PublicationWork:
         object.__setattr__(self, "flows", tuple(self.flows))
         if not self.binding or not self.source_id:
             raise ValueError("Publication work requires binding and provenance")
-        if self.backend not in {"fsdp", "megatron", "archon"}:
+        if self.backend != "megatron":
             raise ValueError("Unknown publication backend")
         if type(self.complete) is not bool:
             raise ValueError("complete must be a boolean")
@@ -219,12 +219,8 @@ class ExpertPublicationModel:
             )
         if self.hardware != actor_model.hardware or work.backend != actor.backend:
             unsupported.append("Publication hardware/backend mismatch")
-        if work.transport not in {"awex_dense", "xccl_broadcast"} or (
-            work.transport == "awex_dense" and actor.backend == "archon"
-        ):
-            unsupported.append(
-                "Unsupported publication transport/backend; Archon v2 AWEX has no runtime adapter"
-            )
+        if work.transport not in {"awex_dense", "xccl_broadcast"}:
+            unsupported.append("Unsupported Megatron publication transport")
         if work.schedule != "bottleneck_rounds":
             unsupported.append("Unknown publication scheduling approximation")
         if not work.complete or not work.flows:
@@ -465,7 +461,7 @@ class ExpertPublicationModel:
                     "Bulk-synchronous preparation/network/writeback prior; network rounds use shared-resource bottlenecks, not exact NCCL scheduling",
                     "Steady-state pause through version confirmation; connection, metadata registration and process-group setup excluded",
                     "No component rates fitted from a whole-stage label; all replica traffic retained and source copies deduplicated upstream per version",
-                    "XCCL uses explicit star-expanded logical bucket traffic with one RPC ack per round; not an inferred NCCL broadcast tree or Archon v2 runtime support",
+                    "XCCL uses explicit star-expanded logical bucket traffic with one RPC ack per round",
                 ),
             ),
             tuple((name, value(t)) for name, t in stages),

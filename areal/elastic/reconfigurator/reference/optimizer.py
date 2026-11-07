@@ -5,11 +5,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import zip_longest
 from math import inf
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from areal.elastic.contracts import CandidatePrediction, OnlineLayout
+    from areal.elastic.contracts import (
+        CandidatePrediction,
+        ExecutionConfig,
+        OnlineLayout,
+    )
 
 
 def meets_target(prediction: CandidatePrediction, target: float) -> bool:
@@ -57,7 +62,8 @@ def select_prediction(predictions, current, target, *, trigger="pressure"):
         eligible = [p for p in eligible if p.layout != current]
     if eligible:
         return min(
-            eligible, key=lambda p: (p.mean_gpu_seconds, p.layout != current, p.layout)
+            eligible,
+            key=lambda p: (p.mean_gpu_seconds, p.layout != current, p.layout.order_key),
         )
     if trigger == "slack":
         return next((p for p in runnable if p.layout == current), None)
@@ -68,7 +74,7 @@ def select_prediction(predictions, current, target, *, trigger="pressure"):
             credit_deficit(p),
             p.mean_gpu_seconds,
             p.layout != current,
-            p.layout,
+            p.layout.order_key,
         ),
         default=None,
     )
@@ -100,24 +106,13 @@ class SearchBound:
 def candidate_order(layouts, current, preferred, score):
     """Prioritize useful seeds/neighbors; every original candidate remains."""
 
-    def distance(layout: OnlineLayout):
+    def distance(layout: ExecutionConfig | OnlineLayout):
         return sum(
             (
                 a != b
-                for a, b in zip(
-                    (
-                        layout.actor_dp,
-                        layout.actor_tp,
-                        layout.rollout_replicas,
-                        layout.rollout_tp,
-                    ),
-                    (
-                        current.actor_dp,
-                        current.actor_tp,
-                        current.rollout_replicas,
-                        current.rollout_tp,
-                    ),
-                    strict=True,
+                for a, b in zip_longest(
+                    layout.actor_key + layout.rollout_key,
+                    current.actor_key + current.rollout_key,
                 )
             )
         )
@@ -130,7 +125,7 @@ def candidate_order(layouts, current, preferred, score):
                 item[1] not in preferred,
                 distance(item[1]) != 1,
                 score(item[1]),
-                item[1],
+                item[1].order_key,
                 item[0],
             ),
         )

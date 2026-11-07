@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass, fields
 from typing import Any, Literal
+
+from areal.elastic.contracts import ExecutionConfig as CandidateConfig
 
 Evidence = Literal["measured", "calibrated", "assumed", "unsupported"]
 Feasibility = Literal["feasible", "infeasible", "unknown"]
@@ -234,55 +235,8 @@ class ParallelLayout:
     @classmethod
     def from_allocation(cls, allocation: str) -> tuple[str, ParallelLayout]:
         """Read AReaL's canonical hybrid MoE notation without importing engines."""
-        text = allocation.lower().replace(" ", "")
-        fsdp = re.fullmatch("fsdp:d(\\d+)", text)
-        if fsdp:
-            return ("fsdp", cls(dp=int(fsdp.group(1))))
-        dense = re.fullmatch("(megatron|archon):([dptc0-9]+)", text)
-        if dense:
-            parts = re.findall("([dptc])(\\d+)", dense.group(2))
-            if "".join((k + n for k, n in parts)) != dense.group(2) or len(
-                {k for k, _ in parts}
-            ) != len(parts):
-                raise ValueError("Malformed or repeated parallel dimension")
-            dimensions = {
-                dict(d="dp", t="tp", p="pp", c="cp")[k]: int(n) for k, n in parts
-            }
-            return (dense.group(1), cls(**dimensions))
-        if ":(" in text and text.endswith(")"):
-            text = text.replace(":(", ":", 1)[:-1]
-        match = re.fullmatch(
-            "(megatron|archon):attn:([dptc0-9]+)\\|ffn:([dpte0-9]+)", text
-        )
-        if match is None:
-            raise ValueError(
-                "Use fsdp:dN or canonical backend:(attn:d...|ffn:d...e...) allocation"
-            )
-
-        def parse(text: str) -> dict[str, int]:
-            parts = re.findall("([a-z])(\\d+)", text)
-            if "".join((k + n for k, n in parts)) != text or len(
-                {k for k, _ in parts}
-            ) != len(parts):
-                raise ValueError("Malformed or repeated parallel dimension")
-            return {k: int(n) for k, n in parts}
-
-        backend, attn_text, ffn_text = match.groups()
-        attn, ffn = (parse(attn_text), parse(ffn_text))
-        layout = cls(
-            dp=attn.get("d", 1),
-            tp=attn.get("t", 1),
-            pp=attn.get("p", 1),
-            cp=attn.get("c", 1),
-            ep=ffn.get("e", 1),
-            etp=ffn.get("t", 1),
-        )
-        if (
-            ffn.get("p", layout.pp) != layout.pp
-            or ffn.get("d", layout.expert_dp) != layout.expert_dp
-        ):
-            raise ValueError("Attention and FFN layouts describe different world sizes")
-        return (backend, layout)
+        candidate = CandidateConfig(allocation, "sglang:d1")
+        return "megatron", cls(*candidate.actor_parallel)
 
 
 @dataclass(frozen=True)
@@ -351,6 +305,15 @@ class ModelShape:
             * (self.attention_heads + self.kv_heads)
         )
 
+    def attention_parameters_per_rank(self, tp: int) -> float:
+        # GQA repeats a KV head when TP is larger than the number of KV heads.
+        return (
+            2
+            * self.hidden_size
+            * self.head_dim
+            * (self.attention_heads / tp + max(1, self.kv_heads / tp))
+        )
+
     @property
     def expert_parameters_per_layer(self) -> int:
         return 3 * self.hidden_size * self.intermediate_size * self.experts
@@ -406,14 +369,9 @@ class ActorConfig:
     compile: bool = False
     enable_tree_training: bool = False
     pipeline_layers: tuple[int, ...] | None = None
-    pipeline_first_less_layers: int = 1
-    pipeline_last_less_layers: int = 1
     optimizer_type: str = "adam"
     optimizer_dtype: str = "float32"
-    offload_params: bool = False
     optimizer_weight_decay: bool = True
-    fsdp_root_reshard_after_forward: bool = True
-    fsdp_parameter_tensors: int | None = None
     precision_aware_optimizer: bool = False
     main_grad_bytes: int = 4
     optimizer_master_storage_bytes: int | None = None
@@ -424,8 +382,8 @@ class ActorConfig:
     def __post_init__(self) -> None:
         if self.pipeline_layers is not None:
             object.__setattr__(self, "pipeline_layers", tuple(self.pipeline_layers))
-        if self.backend not in {"megatron", "archon", "fsdp"}:
-            raise ValueError("Actor cost model supports megatron, archon and fsdp")
+        if self.backend != "megatron":
+            raise ValueError("Actor cost model supports Megatron")
         if self.precision_aware_optimizer and self.backend != "megatron":
             raise ValueError("Precision-aware Adam component requires Megatron")
         if (
@@ -444,52 +402,8 @@ class ActorConfig:
             4,
         } or self.optimizer_master_storage_bytes not in {None, 2, 4}:
             raise ValueError("Unknown main-gradient or master/remainder storage width")
-        if self.optimizer_type not in {
-            "adam",
-            "adam_bf16",
-        } or self.optimizer_dtype not in {"float32", "bfloat16"}:
-            raise ValueError(
-                "Supported optimizer profiles: FP32 Adam or BF16 Adam/Kahan"
-            )
-        if self.backend != "fsdp" and (
-            self.optimizer_type != "adam"
-            or self.optimizer_dtype != "float32"
-            or self.offload_params
-        ):
-            raise ValueError(
-                "BF16 Adam/Kahan and CPU offload require the FSDP component"
-            )
-        if (self.optimizer_type == "adam_bf16") != (self.optimizer_dtype == "bfloat16"):
-            raise ValueError(
-                "BF16 storage requires adam_bf16/Kahan; adam requires float32 storage"
-            )
-        if self.backend == "fsdp" and any(
-            getattr(self.parallel, dim) != 1 for dim in ("tp", "pp", "cp", "ep", "etp")
-        ):
-            raise ValueError(
-                "FSDP component currently covers pure DP; hybrid FSDP needs a separate profile"
-            )
-        if self.backend == "fsdp" and (
-            self.optimizer_type != "adam_bf16"
-            or self.dtype not in {"bf16", "bfloat16"}
-            or self.grad_bytes != 2
-        ):
-            raise ValueError(
-                "FSDP profile currently requires BF16 parameters/gradients and adam_bf16/Kahan"
-            )
-        if self.backend == "fsdp" and (
-            not self.reshard_after_forward or not self.fsdp_root_reshard_after_forward
-        ):
-            raise ValueError(
-                "FSDP profile requires body/root reshard_after_forward=True"
-            )
-        if self.fsdp_parameter_tensors is not None and (
-            type(self.fsdp_parameter_tensors) is not int
-            or self.fsdp_parameter_tensors < 1
-        ):
-            raise ValueError(
-                "fsdp_parameter_tensors must be an observed positive tensor count"
-            )
+        if self.optimizer_type != "adam" or self.optimizer_dtype != "float32":
+            raise ValueError("Megatron component requires FP32 Adam states")
         for name in (
             "pad_to_maximum",
             "gradient_checkpointing",
@@ -501,19 +415,13 @@ class ActorConfig:
             "overlap_grad_reduce",
             "compile",
             "enable_tree_training",
-            "offload_params",
             "optimizer_weight_decay",
-            "fsdp_root_reshard_after_forward",
             "precision_aware_optimizer",
             "enable_chunked_logits",
             "entropy_requires_grad",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
-        if self.parallel.etp != 1:
-            raise ValueError(
-                "Expert tensor parallelism requires another compute component"
-            )
         if self.expert_dispatcher not in {"alltoall", "hierarchical"}:
             raise ValueError("Supported expert_dispatcher: alltoall or hierarchical")
         if (
@@ -551,16 +459,12 @@ class ActorConfig:
             raise ValueError("Unknown AReaL proximal logprob method")
         if self.prox_logp_method == "reuse_train_logp" and self.ppo_n_minibatches != 1:
             raise ValueError("reuse_train_logp requires ppo_n_minibatches=1")
-        for name in ("pipeline_first_less_layers", "pipeline_last_less_layers"):
-            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
-                raise ValueError(f"{name} must be a nonnegative integer")
         if self.pipeline_layers is not None and (
             len(self.pipeline_layers) != self.parallel.pp
-            or any(type(n) is not int or n < 1 for n in self.pipeline_layers)
+            or any(type(n) is not int or n < 0 for n in self.pipeline_layers)
+            or any(n == 0 for n in self.pipeline_layers[1:-1])
         ):
-            raise ValueError(
-                "pipeline_layers must contain one positive layer count per PP stage"
-            )
+            raise ValueError("Only first/last PP stages may have no decoder layers")
 
     @property
     def compute_prox_logp(self) -> bool:
@@ -587,142 +491,48 @@ class ActorConfig:
         actor = data.get("actor", data)
         backend, parallel = ParallelLayout.from_allocation(actor["backend"])
         mb = actor.get("mb_spec", {})
-        megatron, archon = (actor.get("megatron", {}), actor.get("archon", {}))
-        if parallel.pp > 1:
-            if backend == "archon" and (
-                archon.get("pp_schedule", "Interleaved1F1B") != "1F1B"
-                or archon.get("pp_layers_per_stage") is not None
-            ):
-                raise ValueError(
-                    "Expert currently supports non-interleaved 1F1B without virtual stages"
-                )
-            if (
-                backend == "megatron"
-                and megatron.get("virtual_pipeline_parallel_size", 1) != 1
-            ):
-                raise ValueError(
-                    "Expert currently supports non-interleaved 1F1B without virtual stages"
-                )
+        megatron = actor.get("megatron", {})
+        if parallel.pp > 1 and megatron.get("virtual_pipeline_parallel_size", 1) != 1:
+            raise ValueError("Evaluator supports non-interleaved 1F1B, without VPP")
         ddp = megatron.get("ddp", {})
-        precision_aware = backend == "megatron" and megatron.get(
-            "use_precision_aware_optimizer", False
-        )
+        precision_aware = megatron.get("use_precision_aware_optimizer", False)
         if precision_aware and (
             megatron.get("main_grads_dtype", "float32") not in {"bfloat16", "float32"}
             or any(
-                megatron.get(key, "float32") != "float32"
-                for key in ("main_params_dtype", "exp_avg_dtype", "exp_avg_sq_dtype")
+                megatron.get(k, "float32") != "float32"
+                for k in ("main_params_dtype", "exp_avg_dtype", "exp_avg_sq_dtype")
             )
         ):
-            raise ValueError(
-                "Precision-aware profile requires FP32 master/moments and BF16/FP32 gradients"
-            )
+            raise ValueError("Precision-aware Adam requires FP32 master/moments")
         optimizer = actor.get("optimizer", {})
-        optimizer_type = (optimizer or {}).get("type", "adam")
-        optimizer_dtype = actor.get("optimizer_dtype", "float32")
-        if backend == "fsdp" and actor.get("grad_reduce_dtype", "float32") not in {
-            "bfloat16",
-            "bf16",
-        }:
-            raise ValueError("FSDP profile requires explicit BF16 gradient reduction")
-        if backend == "fsdp" and actor.get("fsdp", {}).get(
-            "per_layer_optim_step", False
-        ):
-            raise ValueError(
-                "Per-layer streaming optimizer requires a separate FSDP component"
-            )
-        if backend == "fsdp" and actor.get("fsdp", {}).get("wrap_policy") is not None:
-            raise ValueError("Custom FSDP wrapping requires observed parameter groups")
-        if optimizer is None or (backend != "fsdp" and optimizer_type != "adam"):
-            raise ValueError(
-                "Bundled optimizer component requires full-precision Adam states"
-            )
-        if backend == "archon" and actor.get("optimizer_dtype", "float32") != "float32":
-            raise ValueError("BF16 optimizer states need another optimizer component")
-        if backend == "megatron" and megatron.get("enable_fp32_lm_head", False):
-            raise ValueError("FP32 LM head needs a separate operator profile")
-        if actor.get("use_lora", False):
-            raise ValueError("Bundled model supports full-parameter training, not LoRA")
+        if optimizer is None or optimizer.get("type", "adam") != "adam":
+            raise ValueError("Megatron component requires Adam")
+        if actor.get("use_lora", False) or megatron.get("fp8_config"):
+            raise ValueError("LoRA/FP8 require another operator profile")
+        if actor.get("enable_offload", data.get("enable_offload", False)):
+            raise ValueError("CPU offload is outside this Megatron execution model")
+        if megatron.get("enable_fp32_lm_head", False):
+            raise ValueError("FP32 LM head needs another operator profile")
         if mb.get("max_tokens_per_mb") is None:
-            raise ValueError(
-                "Bundled packing component requires explicit mb_spec.max_tokens_per_mb"
-            )
-        if (
-            backend == "megatron"
-            and megatron.get("fp8_config")
-            or (
-                backend == "archon"
-                and (archon.get("fp8_config") or {}).get("mode", "disabled")
-                != "disabled"
-            )
-        ):
-            raise ValueError("FP8 needs a separate operator/calibration profile")
-        if actor.get("enable_offload", data.get("enable_offload", False)) or archon.get(
-            "offload_params", False
-        ):
-            raise ValueError(
-                "CPU offload requires an explicit transfer component; bundled calibration excludes it"
-            )
-        fraction, note = (1.0, "Full layer recomputation when enabled")
-        if backend == "archon":
-            mode = archon.get("ac_mode", "selective")
-            option = str(archon.get("selective_ac_option", "op"))
-            if mode == "none":
-                fraction = 0.0
-            elif mode == "selective":
-                fraction = (
-                    1 / int(option) if option.isdigit() and int(option) > 0 else 0.25
-                )
-                note = "Selective checkpoint recompute fraction is an analytical approximation; override if known"
-            elif mode == "memory_budget":
-                fraction = 1 - float(archon.get("ac_memory_budget", 0.5))
-                note = "Compiler memory budget is not a compute fraction; 1-budget is a sensitivity prior"
-            elif mode != "full":
-                raise ValueError("Unknown Archon checkpoint mode")
-        elif megatron.get("recompute_granularity", "full") == "selective":
-            fraction, note = (
-                0.25,
-                "Selective Megatron recompute uses a 0.25 layer-service prior",
-            )
-        dispatcher = "alltoall"
-        if (
-            backend == "megatron"
-            and megatron.get("bridge_type", "mbridge") != "megatron-bridge"
-        ):
-            if megatron.get("moe_enable_deepep", False):
-                dispatcher = "hierarchical"
-            elif megatron.get("moe_token_dispatcher_type", "alltoall") != "alltoall":
-                raise ValueError(
-                    "Non-alltoall dispatcher needs an explicit communication component"
-                )
+            raise ValueError("Supply mb_spec.max_tokens_per_mb")
+        selective = megatron.get("recompute_granularity", "full") == "selective"
         return cls(
             backend,
             parallel,
-            precision_aware_optimizer=precision_aware,
-            main_grad_bytes=2 if megatron.get("main_grads_dtype") == "bfloat16" else 4,
-            enable_chunked_logits=megatron.get("enable_chunked_logits", False),
-            lm_head_loss_chunk_size=megatron.get("lm_head_loss_chunk_size", 0),
-            entropy_requires_grad=megatron.get("entropy_requires_grad", True),
-            optimizer_type=optimizer_type,
-            optimizer_dtype=optimizer_dtype,
-            offload_params=actor.get("fsdp", {}).get("offload_params", False)
-            if backend == "fsdp"
-            else False,
-            optimizer_weight_decay=optimizer.get("weight_decay", 0.0) != 0,
             **{
-                key: mb[key]
-                for key in (
+                k: mb[k]
+                for k in (
                     "max_tokens_per_mb",
                     "n_mbs",
                     "n_mbs_divisor",
                     "granularity",
                     "packing_algorithm",
                 )
-                if mb.get(key) is not None
+                if mb.get(k) is not None
             },
             **{
-                key: actor[key]
-                for key in (
+                k: actor[k]
+                for k in (
                     "pad_to_maximum",
                     "dtype",
                     "gradient_checkpointing",
@@ -732,37 +542,25 @@ class ActorConfig:
                     "prox_logp_method",
                     "enable_tree_training",
                 )
-                if key in actor
+                if k in actor
             },
+            precision_aware_optimizer=precision_aware,
+            main_grad_bytes=2 if megatron.get("main_grads_dtype") == "bfloat16" else 4,
+            enable_chunked_logits=megatron.get("enable_chunked_logits", False),
+            lm_head_loss_chunk_size=megatron.get("lm_head_loss_chunk_size", 0),
+            entropy_requires_grad=megatron.get("entropy_requires_grad", True),
+            optimizer_weight_decay=optimizer.get("weight_decay", 0.0) != 0,
             distributed_optimizer=ddp.get("use_distributed_optimizer", True),
-            pipeline_first_less_layers=archon.get("pp_first_stage_less_layers", 1),
-            pipeline_last_less_layers=archon.get("pp_last_stage_less_layers", 1),
-            expert_dispatcher=dispatcher,
-            checkpoint_recompute_fraction=fraction,
-            checkpoint_note=note,
-            reshard_head_after_forward=archon.get(
-                "reshard_after_forward_policy", "default"
-            )
-            == "always",
-            reshard_after_forward=archon.get("reshard_after_forward_policy", "default")
-            != "never"
-            and (
-                not (
-                    archon.get("reshard_after_forward_policy", "default") == "default"
-                    and parallel.pp > 1
-                )
-            ),
             overlap_grad_reduce=ddp.get("overlap_grad_reduce", False),
-            grad_bytes=(
-                4 if actor.get("grad_reduce_dtype", "float32") == "float32" else 2
-            )
-            if backend in {"archon", "fsdp"}
-            else 4
-            if ddp.get("grad_reduce_in_fp32", True)
-            else 2,
-            compile=archon.get("enable_compile", False)
-            if backend == "archon"
-            else bool(megatron.get("cuda_graph_impl")),
+            grad_bytes=4 if ddp.get("grad_reduce_in_fp32", True) else 2,
+            expert_dispatcher="hierarchical"
+            if megatron.get("moe_enable_deepep", False)
+            else "alltoall",
+            checkpoint_recompute_fraction=0.25 if selective else 1.0,
+            checkpoint_note="Selective recompute uses a 0.25 analytical prior"
+            if selective
+            else "Full layer recomputation when enabled",
+            compile=bool(megatron.get("cuda_graph_impl")),
         )
 
 
@@ -800,12 +598,20 @@ class RolloutConfig:
     replicas: int
     tp: int
     max_batch_sequences: int
+    # Prefill cap per DP group; legacy mode caps total iteration queries instead.
     max_batch_tokens: int
     kv_capacity_tokens: int
     backend: str = "sglang"
     weight_bytes: int = 2
     kv_bytes: int = 2
     cache_mode: Literal["none", "prefix"] = "none"
+    pp: int = 1
+    # Attention DP groups inside one TP×PP instance, not external replicas.
+    dp_size: int = 1
+    ep_size: int = 1
+    mem_fraction_static: float = 1.0
+    # Fixed backend chunk size before internal DP division; None keeps legacy batching.
+    prefill_chunk_tokens: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -816,6 +622,9 @@ class RolloutConfig:
             "kv_capacity_tokens",
             "weight_bytes",
             "kv_bytes",
+            "pp",
+            "dp_size",
+            "ep_size",
         ):
             integer(name, getattr(self, name), minimum=1)
         if self.backend != "sglang" or self.cache_mode not in {"none", "prefix"}:
@@ -824,10 +633,29 @@ class RolloutConfig:
             )
         if self.weight_bytes != 2 or self.kv_bytes != 2:
             raise ValueError("Quantized weights/KV require a separate operator profile")
+        if self.tp % self.dp_size or self.tp % self.ep_size:
+            raise ValueError("SGLang attention DP and EP must divide TP")
+        if self.max_batch_sequences < self.dp_size:
+            raise ValueError(
+                "SGLang needs at least one running slot per attention DP group"
+            )
+        if self.prefill_chunk_tokens is not None:
+            integer(
+                "prefill_chunk_tokens", self.prefill_chunk_tokens, minimum=self.dp_size
+            )
+        if (
+            not math.isfinite(self.mem_fraction_static)
+            or not 0 < self.mem_fraction_static <= 1
+        ):
+            raise ValueError("Static memory fraction must be in (0, 1]")
 
     @property
     def world_size(self) -> int:
-        return self.replicas * self.tp
+        return self.replicas * self.tp * self.pp
+
+    @property
+    def attention_tp(self):
+        return self.tp // self.dp_size
 
 
 @dataclass(frozen=True)

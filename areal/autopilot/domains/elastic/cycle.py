@@ -318,9 +318,12 @@ class ReconfiguratorRevisionCycle:
             )
         self.assembly = json.loads(json.dumps(assembly, allow_nan=False))
         from areal.autopilot.domains.elastic.contracts import OnlineProblem, decode
-        from areal.elastic.contracts import OnlineLayout
+        from areal.elastic.contracts import ExecutionConfig, OnlineLayout
 
-        catalog = tuple(decode(OnlineLayout, c) for c in self.assembly["candidates"])
+        catalog = tuple(
+            decode(ExecutionConfig | OnlineLayout, c)
+            for c in self.assembly["candidates"]
+        )
         if any(
             not set((decode(OnlineProblem, c) if isinstance(c, dict) else c).candidates)
             <= set(catalog)
@@ -408,12 +411,13 @@ class ReconfiguratorRevisionCycle:
                 ],
                 cost_model_settings_sha256=digest(self.evaluator_benchmark.settings),
             )
-            from areal.elastic.contracts import OnlineLayout
+            from areal.elastic.contracts import ExecutionConfig, OnlineLayout
 
             prototype = build_reconfigurator(
                 "reference",
                 candidates=tuple(
-                    decode(OnlineLayout, c) for c in self.assembly["candidates"]
+                    decode(ExecutionConfig | OnlineLayout, c)
+                    for c in self.assembly["candidates"]
                 ),
                 settings=self.assembly.get("reconfigurator"),
                 replay=self.assembly.get("replay"),

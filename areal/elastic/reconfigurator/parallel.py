@@ -44,16 +44,34 @@ def evaluate_chunk(job):
     )
     identity = implementation, spec, expected
     if identity != _identity:
-        bundle, mechanism, publication, bandwidth, *cross_node = spec
-        _cost_models = CalibratedCostModels(
-            Path(bundle),
-            Path(mechanism),
-            Path(publication),
-            bandwidth,
-            inter_node_dp_GBps=cross_node[0] if cross_node else None,
-        )
+        if spec[0] == "analytical":
+            from areal.elastic.reconfigurator.reference.evaluator.cost_model.loader import (
+                AnalyticalCostModels,
+                Catalog,
+            )
+
+            _, gpu, topology, model, actor, rollout, bandwidth, link, root = spec
+            _cost_models = AnalyticalCostModels.from_profiles(
+                hardware=gpu,
+                topology=topology,
+                model=model,
+                actor=actor,
+                rollout=rollout,
+                bandwidth_GBps=bandwidth,
+                inter_node_GBps=link,
+                catalog=Catalog(Path(root)),
+            )
+        else:
+            bundle, mechanism, publication, bandwidth, *cross_node = spec
+            _cost_models = CalibratedCostModels(
+                Path(bundle),
+                Path(mechanism),
+                Path(publication),
+                bandwidth,
+                inter_node_dp_GBps=cross_node[0] if cross_node else None,
+            )
         if _cost_models.source_ids != expected:
-            raise ValueError("CPU worker loaded a different frozen calibration")
+            raise ValueError("CPU worker loaded different component models")
         _identity = identity
         _search = None
     context = payload[10] if len(payload) > 10 else None

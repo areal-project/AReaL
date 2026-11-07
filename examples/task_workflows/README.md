@@ -65,9 +65,9 @@ python -m examples.task_workflows.train \
   --config examples/task_workflows/configs/dapo.yaml
 ```
 
-SWE 使用 `configs/swe.yaml`。客户端使用上面的任务命令，将 `--mode eval` 换为
-`--mode resident`；该模式提交原生奖励并交接轨迹。当前手动布局调整由 `PPOTrainer.reconfigure()` 执行。通过
-`elastic.enabled=true` 启用显式 GPU 池与重配置。
+SWE 使用 `configs/swe.yaml`。当前 Actor／Rollout 为 Megatron TP4／SGLang。客户端使用上面的任务命令，将
+`--mode eval` 换为 `--mode resident`；该模式提交原生奖励并交接轨迹。通过 `elastic.enabled=true` 启用显式 GPU
+池、观测和完整 checkpoint；Megatron 动态布局切换待实现。
 
 ## 评分与记录
 

@@ -30,7 +30,6 @@ from ._actor.execution import pipeline_time as _pipeline_time
 from ._actor.packing import DispatchConfig, PackingPlan, plan_workload
 from .advantage import ADVANTAGE_BOUNDARY, AdvantageModel, AdvantageWorkload
 from .aggregate_advantage import AggregateAdvantageModel
-from .fsdp import FSDPHostRates, fsdp_work
 from .packing_observations import ObservedPackingWork, PackingRecord, observed_plan
 
 STAGES = ("recompute_logp", "compute_advantage", "train_step")
@@ -97,9 +96,6 @@ class ActorEstimate:
     timing_boundary: str = ADVANTAGE_BOUNDARY
     advantage_components: tuple[tuple[str, Estimate], ...] = ()
     advantage_features: Features = ()
-    fsdp_components: tuple[tuple[str, Estimate], ...] = ()
-    fsdp_work: tuple[tuple[str, Features], ...] = ()
-    host_memory_gb: tuple[float, ...] = ()
     gpu_working_set_lower_bounds_gb: tuple[tuple[str, float], ...] = ()
 
     def features_for(self, phase: str) -> Features:
@@ -143,7 +139,6 @@ class ExpertActorModel:
     version: str = "expert-actor-v2"
     advantage_model: AdvantageModel | AggregateAdvantageModel | None = None
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
-    fsdp_host_rates: FSDPHostRates | None = None
     execution_identity: str = ""
 
     def __post_init__(self) -> None:
@@ -188,7 +183,6 @@ class ExpertActorModel:
             self.hardware,
             self.efficiency,
             self.group_gbps,
-            self.fsdp_host_rates,
             self.advantage_model.scope_spec
             if isinstance(self.advantage_model, AggregateAdvantageModel)
             else self.advantage_model,
@@ -352,20 +346,6 @@ class ExpertActorModel:
             "recompute_logp": run(plan.logprob, False) if plan.logprob else 0.0,
             "train_step": train,
         }
-        host_components = ()
-        host_work = ()
-        host_memory = ()
-        if config.backend == "fsdp":
-            host_work = fsdp_work(config, m, plan)
-            rates = self.fsdp_host_rates or FSDPHostRates()
-            host_components = tuple(
-                (phase, rates.estimate(work)) for phase, work in host_work
-            )
-            host_memory = (
-                ((m.total_parameters / p.dp * 10 / 1e9),)
-                if config.offload_params
-                else (0.0,)
-            )
         advantage = None
         if isinstance(self.advantage_model, AggregateAdvantageModel):
             if advantage_workload is not None:
@@ -387,15 +367,9 @@ class ExpertActorModel:
             dense, expert = ctx.owned_parameters
             sharded = dense / (p.dp * p.cp) + expert / p.expert_dp
             stored = (
-                (0 if config.offload_params else sharded * 10)
-                if config.backend == "fsdp"
-                else sharded * 16
-                if config.backend == "archon"
-                else (
-                    (dense + expert) * 2 + sharded * 16
-                    if config.distributed_optimizer
-                    else (dense + expert) * 18
-                )
+                (dense + expert) * 2 + sharded * 16
+                if config.distributed_optimizer
+                else (dense + expert) * 18
             )
             if config.precision_aware_optimizer:
                 # BF16 parameters and reduction buffers stay local; Adam m/v
@@ -407,33 +381,6 @@ class ExpertActorModel:
             memory.append(stored / 1e9)
         impossible = max(memory) > self.hardware.memory_gb
         gpu_working_set = ()
-        if config.backend == "fsdp":
-            largest_layer = (
-                m.attention_parameters_per_layer
-                + m.expert_parameters_per_layer
-                + m.router_parameters_per_layer
-                + 2 * m.hidden_size
-                + 2 * m.head_dim
-            )
-            largest_group = 2 * max(largest_layer, m.head_parameters + m.hidden_size)
-            largest_logits = (
-                2
-                * m.vocab_size
-                * max(
-                    mb.compute_tokens
-                    for call in plan.train
-                    for rank in call
-                    for mb in rank
-                )
-            )
-            gpu_working_set = (
-                ("largest_parameter_group", largest_group / 1e9),
-                ("largest_bf16_logits", largest_logits / 1e9),
-            )
-            impossible = (
-                impossible
-                or max(largest_group, largest_logits) / 1e9 > self.hardware.memory_gb
-            )
         notes = plan.assumptions + (
             "Analytical kernels, routing and communication overlap; target measurements required",
             "Non-interleaved 1F1B dependency schedule; no interleaved/virtual pipeline",
@@ -488,12 +435,6 @@ class ExpertActorModel:
                     )
             else:
                 seconds = raw[name]
-                host = dict(host_components).get(name)
-                if host is not None and host.seconds is None:
-                    stages.append((name, replace(host, notes=host.notes + notes)))
-                    continue
-                if host is not None:
-                    seconds += host.require_seconds()
                 result = (
                     apply_calibration(
                         seconds,
@@ -508,14 +449,6 @@ class ExpertActorModel:
                         0.0, "assumed", notes=("Stage disabled by configuration",)
                     )
                 )
-                if host is not None:
-                    result = replace(
-                        result,
-                        notes=result.notes + host.notes,
-                        source_ids=tuple(
-                            dict.fromkeys(result.source_ids + host.source_ids)
-                        ),
-                    )
             provenance = observed_packing.source_ids if observed_packing else ()
             stages.append(
                 (
@@ -551,9 +484,6 @@ class ExpertActorModel:
             ADVANTAGE_BOUNDARY,
             advantage.components if advantage else (),
             advantage_features,
-            host_components,
-            host_work,
-            host_memory,
             gpu_working_set,
         )
 

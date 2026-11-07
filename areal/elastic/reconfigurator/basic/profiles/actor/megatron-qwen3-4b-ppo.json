@@ -41,7 +41,6 @@
       "network": 0.65,
       "moe_imbalance": 1.15,
       "kernel_launch_us": 5.0,
-      "fsdp_overlap": 0.5,
       "ep_overlap": 0.25
     },
     "dispatch": {

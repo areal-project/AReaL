@@ -10,7 +10,12 @@ import types
 from functools import cache
 from typing import Literal, Union, get_args, get_origin, get_type_hints
 
-from areal.elastic.contracts import Forecast, OnlineLayout, OnlineObservation
+from areal.elastic.contracts import (
+    ExecutionConfig,
+    Forecast,
+    OnlineLayout,
+    OnlineObservation,
+)
 
 
 @cache
@@ -49,6 +54,8 @@ def decode(cls, value):
         return tuple(decode(t, x) for t, x in zip(args, value, strict=True))
     if dataclasses.is_dataclass(cls):
         hints = _hints(cls)
+        if not isinstance(value, dict) or set(value) - set(hints):
+            raise ValueError(f"Fields do not match {cls.__name__}")
         return cls(**{k: decode(hints[k], v) for k, v in value.items()})
     if cls is float and type(value) in (int, float):
         return float(value)
@@ -61,8 +68,8 @@ def decode(cls, value):
 class OnlineProblem:
     observation: OnlineObservation
     forecasts: tuple[Forecast, ...]
-    candidates: tuple[OnlineLayout, ...]
-    preferred: tuple[OnlineLayout, ...] = ()
+    candidates: tuple[ExecutionConfig | OnlineLayout, ...]
+    preferred: tuple[ExecutionConfig | OnlineLayout, ...] = ()
     trigger: str = "pressure"
 
     def __post_init__(self):

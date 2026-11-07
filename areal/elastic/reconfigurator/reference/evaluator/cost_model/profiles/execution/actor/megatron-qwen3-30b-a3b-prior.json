@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "kind": "execution/actor",
+  "id": "megatron-qwen3-30b-a3b-prior",
+  "version": "1",
+  "values": {
+    "config": {
+      "backend": "megatron",
+      "max_tokens_per_mb": 32768,
+      "n_mbs": 1,
+      "dtype": "bfloat16",
+      "gradient_checkpointing": true,
+      "recompute_logprob": true,
+      "ppo_n_minibatches": 1,
+      "distributed_optimizer": true,
+      "grad_bytes": 4
+    },
+    "model_profile": "qwen3-30b-a3b",
+    "runtime_revision": "areal-v2.1.0-megatron-analytical-prior",
+    "efficiency": {
+      "dense": 0.45,
+      "moe": 0.28,
+      "attention": 0.3,
+      "hbm": 0.65,
+      "network": 0.65,
+      "moe_imbalance": 1.15,
+      "kernel_launch_us": 5.0,
+      "ep_overlap": 0.25
+    },
+    "dispatch": {"mode": "controller", "group_size": 1},
+    "advantage": null
+  },
+  "provenance": {
+    "evidence": "assumed",
+    "scope": "Megatron BF16 Adam analytical execution for the archived Qwen3-30B-A3B shape. Existing operator efficiency priors are preserved; no FSDP measurements or DP/TP fitted coefficients are transferred.",
+    "calibration_status": "No target-hardware calibration. PP/CP/EP/ETP, routing, peak memory, advantage and publication are analytical priors."
+  }
+}

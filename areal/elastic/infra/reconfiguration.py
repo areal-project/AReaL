@@ -50,10 +50,8 @@ def validate_config(config: Any) -> None:
         raise ValueError(
             "elastic reconfiguration requires native v2 Actor and Rollout controllers"
         )
-    if actor.backend not in ("fsdp", "megatron") or rollout.backend != "sglang":
-        raise ValueError(
-            "elastic reconfiguration currently supports FSDP/Megatron with SGLang"
-        )
+    if actor.backend != "megatron" or rollout.backend != "sglang":
+        raise ValueError("Elastic execution supports Megatron with SGLang")
     if config.rollout.agent is None or config.rollout.agent.mode != "online":
         raise ValueError("elastic reconfiguration requires agent.mode='online'")
     if (
@@ -96,18 +94,12 @@ def validate_config(config: Any) -> None:
         )
     actor_size = actor.parallel.world_size
     actor_pool = len(options.actor_devices)
-    pure_fsdp_dp = actor.backend == "fsdp" and all(
-        getattr(actor.parallel, name) == 1
-        for name in ("tp_size", "pp_size", "cp_size", "ep_size", "etp_size")
-    )
     if (
         rollout.parallel.world_size != len(options.rollout_devices)
-        or actor_size > actor_pool
         or actor_size != actor_pool
-        and not pure_fsdp_dp
     ):
         raise ValueError(
-            "GPU pools must match their layouts; pure FSDP DP may use a subset of its reserved pool"
+            "GPU pools must match the declared Megatron and SGLang layouts"
         )
     if (
         config.gconfig.n_samples != 1
@@ -653,19 +645,8 @@ class TrainerReconfiguration:
 
     @property
     def supports_resource_reconfiguration(self):
-        from areal.api.alloc_mode import ModelAllocation
-
-        actor = self.allocation.parallel
-        rollout = ModelAllocation.from_str(self.config.rollout.backend)
-        return (
-            self.allocation.backend == "fsdp"
-            and all(
-                getattr(actor, key) == 1
-                for key in ("tp_size", "pp_size", "cp_size", "ep_size", "etp_size")
-            )
-            and rollout.backend == "sglang"
-            and rollout.parallel.tp_size == rollout.parallel.pp_size == 1
-        )
+        # Full Megatron layout changes need a separate checkpoint/engine mapping.
+        return False
 
     def control_snapshot(self):
         failed = self.trainer._training_failed
@@ -688,7 +669,7 @@ class TrainerReconfiguration:
             return
         if not self.supports_resource_reconfiguration:
             raise ValueError(
-                "Native layout changes require pure FSDP DP and SGLang TP1"
+                "Native Megatron layout changes are not implemented; use CPU Simulation"
             )
         if not set(target.actor_devices + target.rollout_devices) <= set(
             self.resource_reservation
@@ -718,18 +699,10 @@ class TrainerReconfiguration:
             self.rollout.pause()
 
     def _set_execution_layout(self, target):
-        from areal.api.alloc_mode import ModelAllocation
-
         self.validate_execution_layout(target)
-        if target.actor_devices != self.actor_devices:
-            self.trainer.scheduler.set_gpu_pool(list(target.actor_devices))
         self.actor_devices, self.rollout_devices = (
             target.actor_devices,
             target.rollout_devices,
-        )
-        self.gpu_uuids = tuple(resolve_gpu_uuids(list(self.actor_devices)))
-        self.trainer.actor_alloc = ModelAllocation.from_str(
-            f"fsdp:d{target.world_size}", name="actor"
         )
 
     def save_checkpoint(self, *, reason):
@@ -778,7 +751,9 @@ class TrainerReconfiguration:
         if self.actor is not None:
             return self.actor
         config = deepcopy(self.config.actor)
-        config.backend = f"fsdp:d{self.actor_world_size}"
+        if self.latest_manifest["world_size"] != self.actor_world_size:
+            raise ValueError("Megatron restore requires the saved execution layout")
+        config.backend = self.config.actor.backend
         self.trainer._initialize_reconfigured_actor(config, self.ft_spec)
         self.last_restore_reports = self.actor.full_checkpoint(
             "load",
@@ -786,7 +761,6 @@ class TrainerReconfiguration:
             backend=self.allocation.backend,
             identity_sha256=self.identity,
             version=self.checkpoint_version,
-            source_world_size=self.latest_manifest["world_size"],
         )
         self.generation += 1
         if connect_weights:

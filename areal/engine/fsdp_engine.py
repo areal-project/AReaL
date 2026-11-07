@@ -2280,8 +2280,6 @@ class FSDPPPOActor(FSDPEngine):
         # Convert plain-list inputs (sent without tensors to avoid RPC partitioning)
         # Engine expects 2D tensors [batch, seqlen]
         tensor_data = []
-        # Packing derives cumulative lengths from the complete batch mask;
-        # per-example cu_seqlens would overwrite those combined offsets.
         for item in data:
             tensor_data.append(
                 {
@@ -2294,6 +2292,7 @@ class FSDPPPOActor(FSDPEngine):
                     "loss_mask": torch.tensor(
                         item["loss_mask"], dtype=torch.float32
                     ).unsqueeze(0),
+                    "cu_seqlens": torch.tensor(item["cu_seqlens"], dtype=torch.int32),
                 }
             )
 

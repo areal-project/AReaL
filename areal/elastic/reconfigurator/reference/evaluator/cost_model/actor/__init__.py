@@ -1,19 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Actor backend selection; imports are deferred until a model is queried."""
+"""Megatron execution costs, imported on demand."""
 
 
 def backend_for(name):
-    if name == "fsdp":
-        from .fsdp import FSDPCosts
+    if name != "megatron":
+        raise ValueError("Reference Actor cost model supports Megatron")
+    from .megatron import MegatronCosts
 
-        return FSDPCosts()
-    if name == "megatron":
-        from .megatron import MegatronCosts
-
-        return MegatronCosts()
-    if name == "archon":
-        from .archon import ArchonCosts
-
-        return ArchonCosts()
-    raise ValueError(f"Unknown Actor cost backend: {name}")
+    return MegatronCosts()

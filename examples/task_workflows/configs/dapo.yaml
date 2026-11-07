@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Task workflows: FSDP4 + SGLang1 in an 8-GPU allocation; 16 episodes / 4 updates.
+# Task workflows: Megatron TP4 + SGLang1 in an 8-GPU allocation.
 experiment_name: task-workflows
 trial_name: trial0
 
@@ -52,7 +52,7 @@ gconfig:
   top_p: 1.0
 
 actor:
-  backend: "fsdp:d4"
+  backend: "megatron:d1t4"
   _version: v2
   admin_api_key: ${oc.env:AREAL_ACTOR_ADMIN_KEY}
   experiment_name: ${experiment_name}
@@ -90,7 +90,7 @@ actor:
   # the task-conditioned learning signal.
   reward_norm: null
   adv_norm: null
-  weight_update_mode: xccl
+  weight_update_mode: awex
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker
@@ -121,14 +121,6 @@ sglang:
   max_running_requests: null
   context_length: 65536
   mem_fraction_static: 0.8
-
-vllm:
-  model: ${actor.path}
-  seed: ${seed}
-  skip_tokenizer_init: false
-  dtype: ${actor.dtype}
-  max_model_len: 65536
-  gpu_memory_utilization: 0.8
 
 # datasets
 train_dataset:

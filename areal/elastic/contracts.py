@@ -12,8 +12,13 @@ if TYPE_CHECKING:
         ServiceSlice,
     )
 
+import hashlib
+import json
 import math
-from dataclasses import dataclass
+import re
+from dataclasses import asdict, dataclass, replace
+from functools import cached_property
+from itertools import product
 from typing import Protocol
 
 from areal.elastic.layout import ExecutionLayout
@@ -316,8 +321,7 @@ class ExecutionConfig:
     None leaves an optional setting for the run/backend to resolve.
     """
 
-    # fsdp | megatron | archon: dimensions d/t/p/c/e; FSDP requires PP=EP=1.
-    # Hybrid MoE: <backend>:(attn:<d/t/p/c dims>|ffn:<d/t/p/e dims>).
+    # Megatron: d/t/p/c; MoE: megatron:(attn:<d/t/p/c>|ffn:<d/t/p/e>).
     # FFN d/t = Expert DP/TP; both layouts share PP and GPU count.
     actor_backend: str
     # sglang: dimensions d/t/p; d=replicas, t=TP and p=PP per replica.
@@ -329,14 +333,11 @@ class ExecutionConfig:
     actor_max_tokens_per_mb: int | None = None
     # Pad each packed microbatch to its configured token upper bound.
     actor_pad_to_maximum: bool = False
-    # Sequence parallelism follows the backend's TP configuration.
-    # # Virtual model chunks per physical pipeline stage; 1 disables VPP.
-    # actor_virtual_pipeline_parallel_size: int = 1
+    # Sequence parallelism follows TP. Virtual pipeline stages are not searched.
 
     # In-flight rollout workflows; None falls back to consumer_batch_size.
     rollout_max_concurrent_rollouts: int | None = None
     # Enable data-parallel attention inside each SGLang instance.
-
     sglang_enable_dp_attention: bool = False
     # Internal attention DP degree; used when DP attention is enabled.
     sglang_dp_size: int = 1
@@ -347,7 +348,7 @@ class ExecutionConfig:
     # Active-request budget per SGLang instance; None = auto.
     # DP Attention divides this budget among its internal DP groups.
     sglang_max_running_requests: int | None = None
-    # Input-token budget for one prefill batch, measured in tokens.
+    # Prefill-token budget per internal SGLang DP scheduler; chunk size stays fixed.
     sglang_max_prefill_tokens: int = 32768
     # GPU memory fraction for model weights and KV cache; 0.9 means 90%.
     sglang_mem_fraction_static: float | None = 0.9
@@ -362,9 +363,202 @@ class ExecutionConfig:
     #
     # | Actor backend | Dense             | MoE                 |
     # | ------------- | ----------------- | ------------------- |
-    # | FSDP          | (8328, 38375424)   | (17256, 79515648)    |
     # | Megatron      | (13980, 64419840)  | (171136, 788594688)  |
-    # | Archon        | (13980, 64419840)  | (75638, 348539904)   |
+
+    @staticmethod
+    def _dimensions(text, allowed):
+        pairs = re.findall(r"([a-z])(\d+)", text)
+        if not pairs or "".join(k + v for k, v in pairs) != text:
+            raise ValueError("Use native backend:parallelism notation")
+        if len(dict(pairs)) != len(pairs) or set(dict(pairs)) - set(allowed):
+            raise ValueError("Repeated or unsupported parallel dimension")
+        result = {k: int(v) for k, v in pairs}
+        for name, value in result.items():
+            positive_int(name, value)
+        return result
+
+    @cached_property
+    def actor_parallel(self):
+        """DP, TP, PP, CP, EP, Expert TP; expert DP is derived, not a GPU multiplier."""
+        text = self.actor_backend.lower().replace(" ", "")
+        if not text.startswith("megatron:"):
+            raise ValueError("Elastic candidate evaluation supports Megatron Actors")
+        text = text.split(":", 1)[1]
+        if text.startswith("(") and text.endswith(")"):
+            text = text[1:-1]
+        if text.startswith("attn:"):
+            attention, expert = text.split("|ffn:")
+            a = self._dimensions(attention[5:], "dtpc")
+            e = self._dimensions(expert, "dtpe")
+        else:
+            a, e = self._dimensions(text, "dtpc"), {}
+        dp, tp, pp, cp = (a.get(k, 1) for k in "dtpc")
+        ep, etp = e.get("e", 1), e.get("t", 1)
+        if dp * tp * cp % (ep * etp):
+            raise ValueError("Expert EP×TP must divide the attention stage world size")
+        edp = dp * tp * cp // (ep * etp)
+        if e.get("p", pp) != pp or e.get("d", edp) != edp:
+            raise ValueError("Attention and FFN must have the same GPU count and PP")
+        return dp, tp, pp, cp, ep, etp
+
+    @cached_property
+    def rollout_parallel(self):
+        """Independent SGLang replicas, tensor parallelism, pipeline parallelism."""
+        text = self.rollout_backend.lower().replace(" ", "")
+        if not text.startswith("sglang:"):
+            raise ValueError("Elastic candidate evaluation supports SGLang Rollout")
+        dimensions = self._dimensions(text.split(":", 1)[1], "dtp")
+        return tuple(dimensions.get(k, 1) for k in "dtp")
+
+    def __post_init__(self):
+        dp, tp, pp, cp, ep, etp = self.actor_parallel
+        actor = f"d{dp}t{tp}p{pp}c{cp}"
+        if ep != 1 or etp != 1:
+            actor = f"(attn:{actor}|ffn:d{dp * tp * cp // (ep * etp)}t{etp}p{pp}e{ep})"
+        object.__setattr__(self, "actor_backend", "megatron:" + actor)
+        rd, rt, rp = self.rollout_parallel
+        object.__setattr__(self, "rollout_backend", f"sglang:d{rd}t{rt}p{rp}")
+        for name in (
+            "actor_n_mbs",
+            "actor_max_tokens_per_mb",
+            "rollout_max_concurrent_rollouts",
+            "sglang_max_running_requests",
+            "sglang_max_prefill_tokens",
+            "sglang_dp_size",
+            "sglang_ep_size",
+        ):
+            if getattr(self, name) is not None:
+                positive_int(name, getattr(self, name))
+        for name in (
+            "actor_pad_to_maximum",
+            "sglang_enable_dp_attention",
+            "sglang_enable_ep_moe",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be boolean")
+        if not self.sglang_enable_dp_attention and self.sglang_dp_size != 1:
+            raise ValueError("SGLang internal DP requires DP Attention")
+        if not self.sglang_enable_ep_moe and self.sglang_ep_size != 1:
+            raise ValueError("SGLang expert groups require MoE EP")
+        if rt % self.sglang_dp_size or rt % self.sglang_ep_size:
+            raise ValueError("SGLang internal DP and EP must divide each instance's TP")
+        fraction = self.sglang_mem_fraction_static
+        if fraction is not None and (
+            not math.isfinite(fraction) or not 0 < fraction < 1
+        ):
+            raise ValueError("SGLang static memory fraction must be in (0, 1)")
+
+    actor_dp = property(lambda self: self.actor_parallel[0])
+    actor_tp = property(lambda self: self.actor_parallel[1])
+    actor_pp = property(lambda self: self.actor_parallel[2])
+    actor_cp = property(lambda self: self.actor_parallel[3])
+    actor_ep = property(lambda self: self.actor_parallel[4])
+    actor_etp = property(lambda self: self.actor_parallel[5])
+    rollout_replicas = property(lambda self: self.rollout_parallel[0])
+    rollout_tp = property(lambda self: self.rollout_parallel[1])
+    rollout_pp = property(lambda self: self.rollout_parallel[2])
+
+    @property
+    def actor_gpus(self):
+        return math.prod(self.actor_parallel[:4])
+
+    @property
+    def rollout_gpus(self):
+        return math.prod(self.rollout_parallel)
+
+    @property
+    def actor_key(self):
+        return (
+            self.actor_backend,
+            self.actor_n_mbs,
+            self.actor_max_tokens_per_mb,
+            self.actor_pad_to_maximum,
+        )
+
+    @property
+    def rollout_key(self):
+        return tuple(
+            (k, v) for k, v in asdict(self).items() if not k.startswith("actor_")
+        )
+
+    @property
+    def key(self):
+        return hashlib.sha256(
+            json.dumps(asdict(self), sort_keys=True).encode()
+        ).hexdigest()[:24]
+
+    @property
+    def order_key(self):
+        return (
+            self.actor_dp,
+            self.actor_tp,
+            self.rollout_replicas,
+            self.rollout_tp,
+            self.key,
+        )
+
+    def with_rollout(self, rollout):
+        return replace(
+            self,
+            **{k: v for k, v in asdict(rollout).items() if not k.startswith("actor_")},
+        )
+
+    @classmethod
+    def generate(
+        cls, *, batch_size, gpu_budget, actor, rollout, parameters=None, moe=False
+    ):
+        """Lazily enumerate a declared grid; model/packing checks stay in Evaluator.
+
+        actor keys: dp/tp/pp/cp/ep/etp; rollout keys: replicas/tp/pp.
+        parameters maps remaining ExecutionConfig fields to their allowed values.
+        """
+        positive_int("batch_size", batch_size)
+        positive_int("gpu_budget", gpu_budget)
+        if set(actor) - {"dp", "tp", "pp", "cp", "ep", "etp"} or set(rollout) - {
+            "replicas",
+            "tp",
+            "pp",
+        }:
+            raise ValueError("Unknown parallel dimension in candidate grid")
+        parameters = parameters or {}
+        actor = {k: tuple(v) for k, v in actor.items()}
+        rollout = {k: tuple(v) for k, v in rollout.items()}
+        parameters = {k: tuple(v) for k, v in parameters.items()}
+        for dimensions in (actor, rollout):
+            for name, values in dimensions.items():
+                for value in values:
+                    positive_int(name, value)
+        if set(parameters) - (
+            set(cls.__dataclass_fields__) - {"actor_backend", "rollout_backend"}
+        ):
+            raise ValueError("Unknown execution parameter in candidate grid")
+        names = tuple(parameters)
+        for dp, tp, pp, cp, ep, etp in product(
+            *(actor.get(k, (1,)) for k in ("dp", "tp", "pp", "cp", "ep", "etp"))
+        ):
+            if batch_size % dp or (not moe and (ep != 1 or etp != 1)):
+                continue
+            actor_gpus = dp * tp * pp * cp
+            if actor_gpus >= gpu_budget or dp * tp * cp % (ep * etp):
+                continue
+            backend = f"megatron:(attn:d{dp}t{tp}p{pp}c{cp}|ffn:t{etp}e{ep})"
+            for replicas, rtp, rpp in product(
+                *(rollout.get(k, (1,)) for k in ("replicas", "tp", "pp"))
+            ):
+                if actor_gpus + replicas * rtp * rpp > gpu_budget:
+                    continue
+                for values in product(*(parameters[k] for k in names)):
+                    try:
+                        candidate = cls(
+                            backend,
+                            f"sglang:d{replicas}t{rtp}p{rpp}",
+                            **dict(zip(names, values, strict=True)),
+                        )
+                    except ValueError:
+                        continue
+                    if not moe and candidate.sglang_ep_size != 1:
+                        continue
+                    yield candidate
 
 
 # Causal online planning contracts shared by Basic and Reference.
@@ -394,6 +588,23 @@ class OnlineLayout:
     @property
     def key(self):
         return f"a{self.actor_dp}t{self.actor_tp}-r{self.rollout_replicas}t{self.rollout_tp}"
+
+    @property
+    def actor_key(self):
+        return self.actor_dp, self.actor_tp
+
+    @property
+    def rollout_key(self):
+        return self.rollout_replicas, self.rollout_tp
+
+    def with_rollout(self, rollout):
+        return OnlineLayout(
+            self.actor_dp, self.actor_tp, rollout.rollout_replicas, rollout.rollout_tp
+        )
+
+    @property
+    def order_key(self):
+        return self.actor_dp, self.actor_tp, self.rollout_replicas, self.rollout_tp, ""
 
 
 @dataclass(frozen=True)
@@ -506,7 +717,7 @@ class ActorView:
 @dataclass(frozen=True)
 class OnlineObservation:
     now: float
-    layout: OnlineLayout
+    layout: ExecutionConfig | OnlineLayout
     episodes: tuple[EpisodeView, ...]
     requests: tuple[RequestView, ...]
     services: tuple[ServiceView, ...]
@@ -626,7 +837,7 @@ class CandidatePrediction:
     Legacy sampled forecasts retain their complete-work mean cost.
     """
 
-    layout: OnlineLayout
+    layout: ExecutionConfig | OnlineLayout
     supported: bool
     worst_request_fraction: float | None
     mean_gpu_seconds: float | None
@@ -674,7 +885,7 @@ class ConfigurationEvaluator(Protocol):
         self,
         view: OnlineObservation,
         forecasts: tuple[Forecast, ...],
-        layout: OnlineLayout,
+        layout: ExecutionConfig | OnlineLayout,
     ) -> CandidatePrediction: ...
 
 
@@ -682,7 +893,7 @@ class ConfigurationEvaluator(Protocol):
 class OnlineDecision:
     observed_at: float
     trigger: str
-    target: OnlineLayout
+    target: ExecutionConfig | OnlineLayout
     predictions: tuple[CandidatePrediction, ...]
     forecast_seeds: tuple[int, ...]
     statistics: RollingSLO
@@ -718,15 +929,24 @@ class ControlSnapshot:
 class CostModels(Protocol):
     source_ids: tuple[str, ...]
 
-    def rollout_config(self, layout: OnlineLayout) -> RolloutConfig: ...
+    def rollout_config(
+        self, layout: ExecutionConfig | OnlineLayout
+    ) -> RolloutConfig: ...
     def service(
-        self, layout: OnlineLayout, kv: int, slices: tuple[ServiceSlice, ...]
+        self,
+        layout: ExecutionConfig | OnlineLayout,
+        kv: int,
+        slices: tuple[ServiceSlice, ...],
     ) -> float: ...
     def actor(
-        self, layout: OnlineLayout, batch: tuple[tuple[Turn, ...], ...]
+        self,
+        layout: ExecutionConfig | OnlineLayout,
+        batch: tuple[tuple[Turn, ...], ...],
     ) -> tuple[tuple[str, float], ...]: ...
     def publication(
-        self, layout: OnlineLayout, recipients: tuple[OnlineLayout, ...]
+        self,
+        layout: ExecutionConfig | OnlineLayout,
+        recipients: tuple[ExecutionConfig | OnlineLayout, ...],
     ) -> float: ...
 
 
@@ -764,7 +984,7 @@ class ActorMemoryRejected(ValueError):
 
 @dataclass(frozen=True)
 class NativePlacement:
-    layout: OnlineLayout
+    layout: ExecutionConfig | OnlineLayout
     execution: ExecutionLayout
 
 
@@ -787,6 +1007,8 @@ class HandoffConfig:
     native_placements: tuple[NativePlacement, ...] = ()
     phase_seconds: tuple[tuple[str, float], ...] = ()
     native_checkpoint_version: int | None = None
+    # Target residency budget; hot preparation may use the explicit spare pool.
+    steady_gpu_budget: int | None = None
 
     @classmethod
     def from_dict(cls, raw):
@@ -800,13 +1022,23 @@ class HandoffConfig:
             values["native_source"] = ExecutionLayout.decode(values["native_source"])
         values["native_placements"] = tuple(
             NativePlacement(
-                OnlineLayout(**p["layout"]), ExecutionLayout.decode(p["execution"])
+                (
+                    ExecutionConfig(**p["layout"])
+                    if "actor_backend" in p["layout"]
+                    else OnlineLayout(**p["layout"])
+                ),
+                ExecutionLayout.decode(p["execution"]),
             )
             for p in values.get("native_placements", ())
         )
         return cls(**values)
 
     def __post_init__(self):
+        if self.steady_gpu_budget is None:
+            object.__setattr__(self, "steady_gpu_budget", min(16, sum(self.node_gpus)))
+        positive_int("steady_gpu_budget", self.steady_gpu_budget)
+        if self.steady_gpu_budget > sum(self.node_gpus):
+            raise ValueError("Steady GPU budget exceeds the physical pool")
         if self.mode not in {"hot", "cold"}:
             raise ValueError("Handoff mode must be hot or cold")
         if len(dict(self.phase_seconds)) != len(self.phase_seconds):
@@ -823,13 +1055,11 @@ class HandoffConfig:
             for placement in self.native_placements:
                 target = placement.execution
                 if (
-                    placement.layout.actor_tp != 1
-                    or placement.layout.rollout_tp != 1
-                    or target.world_size != placement.layout.actor_dp
-                    or len(target.rollout_devices) != placement.layout.rollout_replicas
+                    target.world_size != placement.layout.actor_gpus
+                    or len(target.rollout_devices) != placement.layout.rollout_gpus
                 ):
                     raise ValueError(
-                        "Native prediction requires matching FSDP DP / SGLang TP1 layouts"
+                        "Physical mapping must match the candidate's Actor and Rollout GPU counts"
                     )
                 if not set(target.actor_devices + target.rollout_devices) <= set(
                     self.native_devices

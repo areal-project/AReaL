@@ -22,6 +22,7 @@ from areal.elastic.contracts import (
     CostModels,
     EpisodeSample,
     EpisodeView,
+    ExecutionConfig,
     Forecast,
     HandoffConfig,
     OnlineLayout,
@@ -113,7 +114,7 @@ class _Episode:
 class _Deployment:
     identity: int
     role: str
-    layout: OnlineLayout
+    layout: ExecutionConfig | OnlineLayout
     status: str
     version: int
     busy: dict[int, ServiceView] = field(default_factory=dict)
@@ -171,10 +172,7 @@ class MemoryCheckedCostModels:
         return getattr(self.cost_models, name)
 
     def actor(self, layout, batch):
-        if (layout.actor_dp, layout.actor_tp) == (
-            self.target.actor_dp,
-            self.target.actor_tp,
-        ) and batch not in self.checked:
+        if layout.actor_key == self.target.actor_key and batch not in self.checked:
             try:
                 estimate = getattr(self.cost_models, "actor_memory", None)
                 if estimate is None:
@@ -327,7 +325,7 @@ class Evaluator:
         reserve = self.actor_memory_reserve_fraction
         if not reserve:
             return None
-        key = (layout.actor_dp, layout.actor_tp)
+        key = layout.actor_key
         if key in self._memory_checks:
             return self._memory_checks[key]
         peak = capacity = allowed = None
@@ -453,10 +451,17 @@ class Evaluator:
         self,
         view: OnlineObservation,
         forecasts: tuple[Forecast, ...],
-        layout: OnlineLayout,
+        layout: ExecutionConfig | OnlineLayout,
         *,
         bound: SearchBound | None = None,
     ) -> CandidatePrediction:
+        effective = getattr(self.cost_models, "resolve", lambda c: c)(layout)
+        if effective != layout:
+            # Cache and execute the bound configuration; preserve the caller's
+            # candidate identity in the evaluate-only response.
+            return replace(
+                self.evaluate(view, forecasts, effective, bound=bound), layout=layout
+            )
         self.prepare_context(view, forecasts)
         if (
             self.actor_memory_reserve_fraction
@@ -609,7 +614,11 @@ class Evaluator:
                     result = simulation._run(until=forecast.input_closes_at)
                     window_costs.append(result["total_gpu_seconds"])
                     if self.handoff.mode == "cold":
-                        running_cost = result["total_gpu_seconds"]
+                        # A rebuild must not win merely by leaving target GPUs
+                        # unallocated briefly. Keep the measured integral in
+                        # window_gpu_seconds; selection reserves the target for
+                        # the full horizon, plus any larger actual residency.
+                        running_cost = max(running_cost, result["total_gpu_seconds"])
                     window_results.append(result)
                     window_stats.append(
                         rolling_slo(
@@ -688,10 +697,7 @@ class Evaluator:
                     actor_supply=supply,
                 )
             if historical and (not known_batch):
-                changes_actor = (layout.actor_dp, layout.actor_tp) != (
-                    view.layout.actor_dp,
-                    view.layout.actor_tp,
-                )
+                changes_actor = layout.actor_key != view.layout.actor_key
                 owners = {
                     e["target"]
                     for e in simulation.events
@@ -749,7 +755,7 @@ class Evaluator:
             min(fractions) if all(f is not None for f in fractions) else None,
             sum(costs) / len(costs),
             work_ids,
-            "Fixed serving window; cold score = actual GPU residency integral; target tail not scored"
+            "Fixed serving window; cold score = max(actual residency, target reservation); target tail not scored"
             if historical and self.handoff.mode == "cold"
             else "Fixed serving window; score = switching GPU seconds + window seconds * target GPU count; target tail not scored"
             if historical
@@ -831,8 +837,8 @@ class Evaluator:
         turns = tuple(t for e in self._known_batch for t in e)[-16:]
 
         def score(layout):
-            actor_key = (layout.actor_dp, layout.actor_tp)
-            rollout_key = (layout.rollout_replicas, layout.rollout_tp)
+            actor_key = layout.actor_key
+            rollout_key = layout.rollout_key
             try:
                 if actor_key not in actor_scores:
                     actor_scores[actor_key] = (
@@ -936,7 +942,7 @@ class Evaluator:
     def _initialize(
         self,
         episodes: tuple[EpisodeSample, ...],
-        initial: OnlineLayout,
+        initial: ExecutionConfig | OnlineLayout,
         cost_models: CostModels,
         config: SimulationConfig,
         handoff: HandoffConfig,
@@ -950,6 +956,7 @@ class Evaluator:
         candidate_executor: Executor | None = None,
         _work: WorkInputs | None = None,
     ):
+        initial = getattr(cost_models, "resolve", lambda c: c)(initial)
         self._logical = initial
         self._native_step = None
         self._model_gate = "open"
@@ -967,10 +974,8 @@ class Evaluator:
             slo,
         )
         self.now = start_time
-        if initial.actor_gpus + initial.rollout_gpus > 16:
-            raise ValueError(
-                "Initial Actor and Rollout share a sixteen-GPU steady budget"
-            )
+        if initial.actor_gpus + initial.rollout_gpus > self.handoff.steady_gpu_budget:
+            raise ValueError("Initial layout exceeds the steady GPU budget")
         self.pool = GPUAllocator(handoff.node_gpus, now=start_time)
         self.link = SerializedLink(handoff.effective_bandwidth_GBps, start_time)
         self.deployments = {
@@ -978,10 +983,20 @@ class Evaluator:
             1: _Deployment(1, "rollout", initial, "active", 0),
         }
         if (
-            self.pool.acquire("0", "actor", initial.actor_gpus, tp=initial.actor_tp)
+            self.pool.acquire(
+                "0",
+                "actor",
+                initial.actor_gpus,
+                tp=initial.actor_tp,
+                spread=isinstance(initial, ExecutionConfig),
+            )
             is None
             or self.pool.acquire(
-                "1", "rollout", initial.rollout_gpus, tp=initial.rollout_tp
+                "1",
+                "rollout",
+                initial.rollout_gpus,
+                tp=initial.rollout_tp,
+                spread=isinstance(initial, ExecutionConfig),
             )
             is None
         ):
@@ -1002,7 +1017,7 @@ class Evaluator:
         self.actor_batch: tuple[str, ...] = ()
         self.actor_wait: ActorWaitView | None = None
         self.actor_wait_seconds = 0.0
-        self._forecast_target: OnlineLayout | None = None
+        self._forecast_target: ExecutionConfig | OnlineLayout | None = None
         self.actor_stages: tuple[tuple[str, float], ...] = ()
         self.actor_phase = 0
         self.actor_phase_started = start_time
@@ -1041,10 +1056,8 @@ class Evaluator:
             if handoff.native_source is not None:
                 source = handoff.native_source
                 if (
-                    initial.actor_tp != 1
-                    or initial.rollout_tp != 1
-                    or initial.actor_dp != source.world_size
-                    or (initial.rollout_replicas != len(source.rollout_devices))
+                    initial.actor_gpus != source.world_size
+                    or initial.rollout_gpus != len(source.rollout_devices)
                 ):
                     raise ValueError(
                         "Native initial state disagrees with the physical source layout"
@@ -1073,9 +1086,7 @@ class Evaluator:
             else self._last_layout
         )
         rollout = self.deployments[self.rollout_id].layout
-        self._last_layout = OnlineLayout(
-            actor.actor_dp, actor.actor_tp, rollout.rollout_replicas, rollout.rollout_tp
-        )
+        self._last_layout = actor.with_rollout(rollout)
         return self._last_layout
 
     @classmethod
@@ -1144,7 +1155,12 @@ class Evaluator:
             if (
                 role != expected_role
                 or len(devices) != count
-                or len({node for node, _ in devices}) > (2 if count > 8 else 1)
+                or len({node for node, _ in devices})
+                > (
+                    len(handoff.node_gpus)
+                    if isinstance(view.layout, ExecutionConfig) or count > 8
+                    else 1
+                )
                 or any(
                     len({node for node, _ in devices[i : i + tp]}) != 1
                     for i in range(0, count, tp)
@@ -1534,7 +1550,11 @@ class Evaluator:
         while self._admission_cursor < len(self.arrival_order):
             identity = self.arrival_order[self._admission_cursor]
             episode = self.episodes[identity]
-            if active >= self.config.client_concurrency or credits <= 0:
+            limit = (
+                getattr(self.layout, "rollout_max_concurrent_rollouts", None)
+                or self.config.client_concurrency
+            )
+            if active >= limit or credits <= 0:
                 break
             self._admission_cursor += 1
             episode.admitted = True
@@ -1834,6 +1854,7 @@ class Evaluator:
                     "actor",
                     self.layout.actor_gpus,
                     tp=self.layout.actor_tp,
+                    spread=isinstance(self.layout, ExecutionConfig),
                 )
                 is None
             ):
@@ -2147,10 +2168,7 @@ class Evaluator:
         target = self._forecast_target
         if target is None:
             return
-        changes_actor = (target.actor_dp, target.actor_tp) != (
-            self.layout.actor_dp,
-            self.layout.actor_tp,
-        )
+        changes_actor = target.actor_key != self.layout.actor_key
         pending = self.pending_handoff
         repair_planned = self.decision_pending or (
             pending is not None
@@ -2317,13 +2335,11 @@ class Evaluator:
         if reason:
             self.status, self.reason, self.done = ("candidate_pruned", reason, True)
 
-    def _hot_request_handoff(self, target: OnlineLayout):
+    def _hot_request_handoff(self, target: ExecutionConfig | OnlineLayout):
         if not self.reconfiguration_allowed():
             return False
-        if target.actor_gpus + target.rollout_gpus > 16:
-            raise ValueError(
-                "Target Actor and Rollout share a sixteen-GPU steady budget"
-            )
+        if target.actor_gpus + target.rollout_gpus > self.handoff.steady_gpu_budget:
+            raise ValueError("Target layout exceeds the steady GPU budget")
         if self.pending_handoff is not None or target == self.layout:
             return False
         if self.config.batch_size % target.actor_dp:
@@ -2336,24 +2352,18 @@ class Evaluator:
             allowed = self.reconfigurator.allowed_roles(self.now)
             if (
                 not allowed["actor"]
-                and (target.actor_dp, target.actor_tp)
-                != (current.actor_dp, current.actor_tp)
+                and target.actor_key != current.actor_key
                 or (
-                    not allowed["rollout"]
-                    and (target.rollout_replicas, target.rollout_tp)
-                    != (current.rollout_replicas, current.rollout_tp)
+                    not allowed["rollout"] and target.rollout_key != current.rollout_key
                 )
             ):
                 return False
         if self.actor_id not in self.deployments:
             return False
         roles = []
-        if (current.actor_dp, current.actor_tp) != (target.actor_dp, target.actor_tp):
+        if current.actor_key != target.actor_key:
             roles.append(("actor", target.actor_gpus))
-        if (current.rollout_replicas, current.rollout_tp) != (
-            target.rollout_replicas,
-            target.rollout_tp,
-        ):
+        if current.rollout_key != target.rollout_key:
             roles.append(("rollout", target.rollout_gpus))
         acquired = {}
         previous_peak = self.pool.peak_gpus
@@ -2361,7 +2371,16 @@ class Evaluator:
             identity = self.next_deployment
             self.next_deployment += 1
             tp = target.actor_tp if role == "actor" else target.rollout_tp
-            if self.pool.acquire(str(identity), role, count, tp=tp) is None:
+            if (
+                self.pool.acquire(
+                    str(identity),
+                    role,
+                    count,
+                    tp=tp,
+                    spread=isinstance(target, ExecutionConfig),
+                )
+                is None
+            ):
                 for previous in acquired.values():
                     self.pool.release(str(previous))
                 self.pool.peak_gpus = previous_peak
@@ -2411,7 +2430,7 @@ class Evaluator:
         if self.pending_handoff is not None or target == self.layout:
             return False
         if (
-            target.actor_gpus + target.rollout_gpus > 16
+            target.actor_gpus + target.rollout_gpus > self.handoff.steady_gpu_budget
             or self.config.batch_size % target.actor_dp
         ):
             raise ValueError(
@@ -2422,10 +2441,8 @@ class Evaluator:
             self.execution_layout,
             physical,
             actor_running=self.actor_id in self.deployments,
-            force_actor=(target.actor_dp, target.actor_tp)
-            != (self.layout.actor_dp, self.layout.actor_tp),
-            force_rollout=(target.rollout_replicas, target.rollout_tp)
-            != (self.layout.rollout_replicas, self.layout.rollout_tp),
+            force_actor=target.actor_key != self.layout.actor_key,
+            force_rollout=target.rollout_key != self.layout.rollout_key,
         )
         steps = plan.steps
         for step in steps:
@@ -2449,10 +2466,11 @@ class Evaluator:
         )
         return True
 
-    def request_handoff(self, *args, **kwargs):
+    def request_handoff(self, target):
+        target = getattr(self.cost_models, "resolve", lambda c: c)(target)
         if self.handoff.mode == "cold":
-            return self._cold_request_handoff(*args, **kwargs)
-        return self._hot_request_handoff(*args, **kwargs)
+            return self._cold_request_handoff(target)
+        return self._hot_request_handoff(target)
 
     def _hot_switching_gpu_seconds(self):
         """Old changed-role leases beyond target residency; no double counting."""
@@ -2650,7 +2668,11 @@ class Evaluator:
         if actor is None:
             probe = GPUAllocator(self.handoff.node_gpus, leases=dict(source))
             devices = probe.acquire(
-                "source-actor", "actor", self.layout.actor_gpus, tp=self.layout.actor_tp
+                "source-actor",
+                "actor",
+                self.layout.actor_gpus,
+                tp=self.layout.actor_tp,
+                spread=isinstance(self.layout, ExecutionConfig),
             )
             if devices is None:
                 raise ValueError(
@@ -2708,14 +2730,8 @@ class Evaluator:
                     "Native prediction has no physical mapping for this candidate"
                 )
             return target
-        actor_changed = (layout.actor_dp, layout.actor_tp) != (
-            self.layout.actor_dp,
-            self.layout.actor_tp,
-        )
-        rollout_changed = (layout.rollout_replicas, layout.rollout_tp) != (
-            self.layout.rollout_replicas,
-            self.layout.rollout_tp,
-        )
+        actor_changed = layout.actor_key != self.layout.actor_key
+        rollout_changed = layout.rollout_key != self.layout.rollout_key
         probe = GPUAllocator(self.handoff.node_gpus, leases=dict(self.pool.leases))
         for identity, changed in (
             (self.actor_id, actor_changed),
@@ -2725,14 +2741,22 @@ class Evaluator:
                 probe.release(str(identity))
         actor = (
             probe.acquire(
-                "target-actor", "actor", layout.actor_gpus, tp=layout.actor_tp
+                "target-actor",
+                "actor",
+                layout.actor_gpus,
+                tp=layout.actor_tp,
+                spread=isinstance(layout, ExecutionConfig),
             )
             if actor_changed or str(self.actor_id) not in probe.leases
             else probe.leases[str(self.actor_id)][1]
         )
         rollout = (
             probe.acquire(
-                "target-rollout", "rollout", layout.rollout_gpus, tp=layout.rollout_tp
+                "target-rollout",
+                "rollout",
+                layout.rollout_gpus,
+                tp=layout.rollout_tp,
+                spread=isinstance(layout, ExecutionConfig),
             )
             if rollout_changed
             else probe.leases[str(self.rollout_id)][1]

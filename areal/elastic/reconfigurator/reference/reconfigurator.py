@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 
 from areal.elastic.contracts import (
     ConfigurationEvaluator,
+    ExecutionConfig,
     OnlineDecision,
     OnlineLayout,
     OnlineObservation,
@@ -92,7 +93,7 @@ class OnlineReconfigurator:
 
     def __init__(
         self,
-        candidates: tuple[OnlineLayout, ...],
+        candidates: tuple[ExecutionConfig | OnlineLayout, ...],
         forecaster: HistoricalForecaster | HistoricalReplay,
         config: OnlineReconfiguratorConfig,
         slo: ServingSLO,
@@ -218,16 +219,8 @@ class OnlineReconfigurator:
             candidates = tuple(
                 c
                 for c in candidates
-                if (
-                    roles["actor"]
-                    or (c.actor_dp, c.actor_tp)
-                    == (view.layout.actor_dp, view.layout.actor_tp)
-                )
-                and (
-                    roles["rollout"]
-                    or (c.rollout_replicas, c.rollout_tp)
-                    == (view.layout.rollout_replicas, view.layout.rollout_tp)
-                )
+                if (roles["actor"] or c.actor_key == view.layout.actor_key)
+                and (roles["rollout"] or c.rollout_key == view.layout.rollout_key)
             )
         layouts = candidates[: cfg.max_evaluations]
         if cfg.independent_role_history and len(layouts) == 1:

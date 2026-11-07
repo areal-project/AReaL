@@ -20,7 +20,6 @@ from .cost_model._actor.packing import DispatchConfig
 from .cost_model._rollout.scheduling import scheduler_for
 from .cost_model.actor import ExpertActorModel
 from .cost_model.aggregate_advantage import AggregateAdvantageModel
-from .cost_model.fsdp import FSDPHostRates
 from .cost_model.rollout import ExpertRolloutModel, InferenceRates, RolloutConfig
 from .cost_model.rpc import RPCTimingModel
 from .scenario import ExecutionConfig
@@ -177,15 +176,14 @@ def _components(
         model,
         hardware,
         actor["runtime_revision"],
-        efficiency=Efficiency(**actor["efficiency"]),
+        efficiency=Efficiency(
+            **{k: v for k, v in actor["efficiency"].items() if k != "fsdp_overlap"}
+        ),
         group_gbps=tuple(profiles["system"]["group_gbps"]),
         advantage_model=AggregateAdvantageModel(**actor["advantage"])
         if actor.get("advantage")
         else None,
         dispatch=DispatchConfig(**actor["dispatch"]),
-        fsdp_host_rates=FSDPHostRates(**profiles["system"]["host_rates"])
-        if profiles["system"].get("host_rates")
-        else None,
         execution_identity=fingerprint(profiles["model"], actor["execution"])
         if actor.get("execution")
         else "",

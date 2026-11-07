@@ -8,7 +8,6 @@ import heapq
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
-from itertools import combinations
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -229,7 +228,7 @@ class GPUAllocator:
     lease_gpu_seconds: dict[str, float] = field(default_factory=dict)
 
     def acquire(
-        self, owner: str, role: str, count: int, *, tp: int = 1
+        self, owner: str, role: str, count: int, *, tp: int = 1, spread: bool = False
     ) -> tuple[tuple[int, int], ...] | None:
         if owner in self.leases or role not in self.gpu_seconds:
             raise ValueError("A deployment needs a unique owner and known role")
@@ -244,16 +243,15 @@ class GPUAllocator:
             available.append(free)
             if len(free) >= count:
                 return self._lease(owner, role, free[:count])
-        # Preserve the existing node-local contract for roles of <=8 GPUs.
-        # Larger roles span two nodes, with every TP group kept inside a node.
-        if count > 8:
-            for left, right in combinations(available, 2):
-                left_count = min(count, len(left) // tp * tp)
-                right_count = count - left_count
-                if right_count <= len(right) // tp * tp:
-                    return self._lease(
-                        owner, role, left[:left_count] + right[:right_count]
-                    )
+        # Legacy <=8-GPU roles stay node-local. Full candidates may spread
+        # DP/PP/CP/EP across the declared nodes; every TP group stays local.
+        if count > 8 or spread:
+            chosen = []
+            for free in available:
+                take = min(count - len(chosen), len(free) // tp * tp)
+                chosen.extend(free[:take])
+                if len(chosen) == count:
+                    return self._lease(owner, role, tuple(chosen))
         return None
 
     def acquire_exact(self, owner, role, devices):

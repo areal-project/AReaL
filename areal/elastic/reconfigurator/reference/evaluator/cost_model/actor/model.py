@@ -14,10 +14,6 @@ from areal.elastic.contracts import (
     Turn,
     WorkloadStats,
 )
-from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.fsdp import (
-    FSDPHostRates,
-    fsdp_work,
-)
 from areal.elastic.reconfigurator.reference.evaluator.cost_model.actor.operators import (
     Context,
     Efficiency,
@@ -730,10 +726,9 @@ class ActorEstimate:
     timing_boundary: str = ADVANTAGE_BOUNDARY
     advantage_components: tuple[tuple[str, Estimate], ...] = ()
     advantage_features: Features = ()
-    fsdp_components: tuple[tuple[str, Estimate], ...] = ()
-    fsdp_work: tuple[tuple[str, Features], ...] = ()
-    host_memory_gb: tuple[float, ...] = ()
     gpu_working_set_lower_bounds_gb: tuple[tuple[str, float], ...] = ()
+    # Analytical per-stage peak: persistent state + live activations/workspaces.
+    peak_memory_gb: tuple[float, ...] = ()
 
     def features_for(self, phase: str) -> Features:
         return self.features + (
@@ -774,9 +769,8 @@ class ExpertActorModel:
     group_gbps: tuple[tuple[str, float], ...] = ()
     calibration: tuple[PhaseCalibration, ...] = ()
     version: str = "expert-actor-v2"
-    advantage_model: AdvantageModel | AggregateAdvantageModel | None = None
+    advantage_model: AdvantageModel | AggregateAdvantageModel | Advantages | None = None
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
-    fsdp_host_rates: FSDPHostRates | None = None
     execution_identity: str = ""
 
     def __post_init__(self) -> None:
@@ -821,7 +815,6 @@ class ExpertActorModel:
             self.hardware,
             self.efficiency,
             self.group_gbps,
-            self.fsdp_host_rates,
             self.advantage_model.scope_spec
             if isinstance(self.advantage_model, AggregateAdvantageModel)
             else self.advantage_model,
@@ -950,6 +943,7 @@ class ExpertActorModel:
             dict(self.group_gbps),
             p.world_size // p.pp,
             p.tp * p.cp,
+            p.ep * p.etp,
         )
         contexts = tuple(
             (
@@ -961,34 +955,25 @@ class ExpertActorModel:
             "recompute_logp": self.estimate_logprob(plan, contexts, backend),
             "train_step": self.estimate_train(plan, contexts, backend),
         }
-        host_components = ()
-        host_work = ()
-        host_memory = ()
-        if config.backend == "fsdp":
-            host_work = fsdp_work(config, m, plan)
-            rates = self.fsdp_host_rates or FSDPHostRates()
-            host_components = tuple(
-                ((phase, rates.estimate(work)) for phase, work in host_work)
-            )
-            host_memory = (
-                (m.total_parameters / p.dp * 10 / 1000000000.0,)
-                if config.offload_params
-                else (0.0,)
-            )
         advantage = self.estimate_advantage(
             config, workload, profile, advantage_workload
         )
         advantage_features = advantage.features if advantage else ()
-        memory = []
-        for ctx in contexts:
+        memory, peaks = [], []
+        maximum_tokens = max(
+            mb.compute_tokens for update in plan.train for rank in update for mb in rank
+        )
+        maximum_sequence = workload.max_seq_len or max(
+            workload.sequence_lengths
+            or (math.ceil(workload.sequence_tokens / workload.n_seqs),)
+        )
+        for stage, ctx in enumerate(contexts):
             dense, expert = ctx.owned_parameters
             sharded = dense / (p.dp * p.cp) + expert / p.expert_dp
+            # BF16 weights and a full FP32 gradient buffer; Adam/master states
+            # are partitioned across the corresponding dense/expert DP group.
             stored = (
-                (0 if config.offload_params else sharded * 10)
-                if config.backend == "fsdp"
-                else sharded * 16
-                if config.backend == "archon"
-                else (dense + expert) * 2 + sharded * 16
+                (dense + expert) * (2 + config.grad_bytes) + sharded * 12
                 if config.distributed_optimizer
                 else (dense + expert) * 18
             )
@@ -998,40 +983,44 @@ class ExpertActorModel:
                     8 + (config.optimizer_master_storage_bytes or 0)
                 )
             memory.append(stored / 1000000000.0)
-        impossible = max(memory) > self.hardware.memory_gb
-        gpu_working_set = ()
-        if config.backend == "fsdp":
-            largest_layer = (
-                m.attention_parameters_per_layer
-                + m.expert_parameters_per_layer
-                + m.router_parameters_per_layer
-                + 2 * m.hidden_size
-                + 2 * m.head_dim
-            )
-            largest_group = 2 * max(largest_layer, m.head_parameters + m.hidden_size)
-            largest_logits = (
-                2
-                * m.vocab_size
-                * max(
-                    mb.compute_tokens
-                    for call in plan.train
-                    for rank in call
-                    for mb in rank
+            live = min(len(plan.train[0][0]), p.pp - stage)
+            # SP partitions saved layer inputs; checkpointing saves only inputs.
+            local_tokens = maximum_tokens / (p.tp * p.cp)
+            saved = 2 * local_tokens * m.hidden_size * ctx.layers
+            if not config.gradient_checkpointing:
+                saved += (
+                    local_tokens
+                    * ctx.layers
+                    * (
+                        8 * m.hidden_size
+                        + 6 * m.intermediate_size
+                        + 2 * m.attention_heads * maximum_sequence
+                    )
                 )
+            workspace = local_tokens * (
+                8 * m.hidden_size + 4 * m.intermediate_size * m.top_k
             )
-            gpu_working_set = (
-                ("largest_parameter_group", largest_group / 1000000000.0),
-                ("largest_bf16_logits", largest_logits / 1000000000.0),
+            logits_tokens = maximum_tokens / p.cp
+            if config.enable_chunked_logits and config.lm_head_loss_chunk_size:
+                logits_tokens = min(logits_tokens, config.lm_head_loss_chunk_size)
+            logits = 4 * logits_tokens * m.vocab_size / p.tp if ctx.last else 0
+            # Unknown precision-aware master/remainder storage uses an explicit
+            # full-master capacity prior rather than silently treating it as zero.
+            unknown_master = (
+                4 * (sharded if config.distributed_optimizer else dense + expert)
+                if config.precision_aware_optimizer
+                and config.optimizer_master_storage_bytes is None
+                else 0
             )
-            impossible = (
-                impossible
-                or max(largest_group, largest_logits) / 1000000000.0
-                > self.hardware.memory_gb
+            peaks.append(
+                (stored + unknown_master + live * saved + workspace + logits) / 1e9
             )
+        impossible = max(peaks) > self.hardware.memory_gb
+        gpu_working_set = ()
         notes = plan.assumptions + (
             "Analytical kernels, routing and communication overlap; target measurements required",
             "Non-interleaved 1F1B dependency schedule; no interleaved/virtual pipeline",
-            "Static memory is a lower bound excluding activations and temporary buffers",
+            "Peak memory uses analytical saved-activation, routing/workspace and logits priors; no allocator trace calibration",
         )
         if config.overlap_grad_reduce:
             notes += (
@@ -1082,12 +1071,6 @@ class ExpertActorModel:
                     )
             else:
                 seconds = raw[name]
-                host = dict(host_components).get(name)
-                if host is not None and host.seconds is None:
-                    stages.append((name, replace(host, notes=host.notes + notes)))
-                    continue
-                if host is not None:
-                    seconds += host.require_seconds()
                 result = (
                     apply_calibration(
                         seconds,
@@ -1102,14 +1085,6 @@ class ExpertActorModel:
                         0.0, "assumed", notes=("Stage disabled by configuration",)
                     )
                 )
-                if host is not None:
-                    result = replace(
-                        result,
-                        notes=result.notes + host.notes,
-                        source_ids=tuple(
-                            dict.fromkeys(result.source_ids + host.source_ids)
-                        ),
-                    )
             provenance = observed_packing.source_ids if observed_packing else ()
             stages.append(
                 (
@@ -1145,10 +1120,8 @@ class ExpertActorModel:
             ADVANTAGE_BOUNDARY,
             advantage.components if advantage else (),
             advantage_features,
-            host_components,
-            host_work,
-            host_memory,
             gpu_working_set,
+            tuple(peaks),
         )
 
     @staticmethod
@@ -1201,7 +1174,24 @@ class ExpertActorModel:
 
     def estimate_advantage(self, config, workload, profile, advantage_workload):
         advantage = None
-        if isinstance(self.advantage_model, AggregateAdvantageModel):
+        if isinstance(self.advantage_model, Advantages):
+            seconds = self.advantage_model.estimate(
+                config,
+                workload.sequence_tokens,
+                Operators(self.hardware, self.efficiency),
+            )
+            advantage = AdvantageEstimate(
+                Estimate(
+                    seconds,
+                    "assumed",
+                    notes=(
+                        "Explicit bandwidth/launch advantage prior; trainer transport and host overhead are not calibrated",
+                    ),
+                ),
+                (),
+                (),
+            )
+        elif isinstance(self.advantage_model, AggregateAdvantageModel):
             if advantage_workload is not None:
                 raise ValueError(
                     "Aggregate advantage uses summary workload, not component observations"
@@ -1260,7 +1250,7 @@ class CalibratedActorModel:
         return self._actor(layout.actor_dp, layout.actor_tp, batch)
 
     def actor_memory(self, layout, batch):
-        """Expose the unchanged physical estimate for reconfigurator-only headroom checks."""
+        """Frozen campaign memory features, separate from analytical peak memory."""
         _, peak, limit, measured_oom = self._actor_estimate(
             layout.actor_dp, layout.actor_tp, batch
         )

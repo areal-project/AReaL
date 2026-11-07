@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ExecutionLayout:
-    """Actor DP and physical GPU placement for Actor and Rollout."""
+    """Actor world size and physical GPU leases for Actor and Rollout."""
 
     world_size: int
     actor_devices: tuple[int, ...]
@@ -25,7 +25,7 @@ class ExecutionLayout:
             or any(type(device) is not int or device < 0 for device in devices)
         ):
             raise ValueError(
-                "Require disjoint nonempty GPU leases and an Actor DP count fitting its lease"
+                "Require disjoint nonempty GPU leases and an Actor world size fitting its lease"
             )
 
     @classmethod

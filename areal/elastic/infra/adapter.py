@@ -11,7 +11,6 @@ from typing import Any
 
 from areal.elastic.contracts import ControlBusy, OnlineLayout
 from areal.elastic.infra.monitor.identity import measurement_identity
-from areal.elastic.layout import ExecutionLayout
 from areal.elastic.reconfigurator import build_reconfigurator, component_module
 from areal.utils.atomic import atomic_json
 
@@ -43,69 +42,16 @@ class NativePlacements:
         )
 
     def resolve(self, layout):
-        owner = self.owner
-        source = owner.execution_layout
         if layout == self.current():
-            return source
-        if (
-            layout.actor_tp != 1
-            or layout.rollout_tp != 1
-            or not owner.supports_resource_reconfiguration
-        ):
-            raise ValueError("Native candidate changes require FSDP DP and SGLang TP1")
-        if layout.actor_gpus + layout.rollout_gpus > len(owner.resource_reservation):
-            raise ValueError("Candidate exceeds the original native reservation")
-        if owner.config.train_dataset.batch_size % layout.actor_dp:
-            raise ValueError("Candidate DP must divide the logical batch")
-        if not owner.managed_rollout:
-            if layout.rollout_replicas != len(source.rollout_devices):
-                raise ValueError("Rollout pool changes require managed replicas")
-            target = ExecutionLayout(
-                layout.actor_dp, source.actor_devices, source.rollout_devices
-            )
-        else:
-            # Preserve current rank order, and then use only devices in this run's pool.
-            actor_order = source.actor_devices + tuple(
-                d for d in owner.resource_reservation if d not in source.actor_devices
-            )
-            actor = actor_order[: layout.actor_dp]
-            rollout_order = source.rollout_devices + tuple(
-                d for d in owner.resource_reservation if d not in source.rollout_devices
-            )
-            rollout = tuple(d for d in rollout_order if d not in actor)[
-                : layout.rollout_replicas
-            ]
-            target = ExecutionLayout(layout.actor_dp, actor, rollout)
-        owner.validate_execution_layout(target)
-        return target
+            return self.owner.execution_layout
+        raise ValueError(
+            "Native Megatron layout changes are not implemented; use CPU Simulation"
+        )
 
     def candidates(self, proposed=None):
-        owner = self.owner
-        current = self.current()
-        if proposed is None:
-            if not owner.supports_resource_reconfiguration:
-                return (current,)
-            proposed = (
-                OnlineLayout(dp, 1, replicas, 1)
-                for dp in range(1, min(16, len(owner.resource_reservation) - 1) + 1)
-                if owner.config.train_dataset.batch_size % dp == 0
-                for replicas in (
-                    range(1, min(16, len(owner.resource_reservation) - dp) + 1)
-                    if owner.managed_rollout
-                    else (len(owner.rollout_devices),)
-                )
-            )
-        result = []
-        for item in proposed:
-            try:
-                self.resolve(item)
-            except ValueError:
-                continue
-            if item not in result:
-                result.append(item)
-        if current not in result:
-            result.insert(0, current)
-        return tuple(result)
+        # Keep native observations available while dynamic Megatron execution
+        # is developed separately. No other-backend mapping is reused.
+        return (self.current(),)
 
     def prediction_handoff(self, handoff):
         from areal.elastic.contracts import NativePlacement

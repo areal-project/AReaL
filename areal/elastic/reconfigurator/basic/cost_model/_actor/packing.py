@@ -309,24 +309,13 @@ def _pad(lengths: list[int], config: ActorConfig, hidden_size: int) -> Microbatc
     )
     aligned = [align(n, seq_alignment) for n in lengths]
     total = sum(aligned)
-    # Shared utils.data uses 256 tokens; Archon additionally derives a 2MiB page.
-    page = max((2 << 20) // hidden_size // 2, 1) if config.backend == "archon" else 256
-    batch_alignment = (
-        math.lcm(page, 2 * p.cp * p.tp) if config.backend == "archon" else page
-    )
+    # Match the shared Megatron packed-token alignment.
     computed = (
-        config.max_tokens_per_mb
-        if config.pad_to_maximum
-        else align(align(sum(lengths), 256), batch_alignment)
+        config.max_tokens_per_mb if config.pad_to_maximum else align(sum(lengths), 256)
     )
-    if config.backend == "megatron":
-        computed = align(max(computed, total), math.lcm(seq_alignment, 256))
-    if computed < total or computed % (
-        p.cp * (p.tp if config.backend == "archon" else 1)
-    ):
-        raise ValueError(
-            "Aligned packed microbatch cannot fit the configured token limit/layout"
-        )
+    computed = align(max(computed, total), math.lcm(seq_alignment, 256))
+    if computed < total or computed % p.cp:
+        raise ValueError("Aligned packed microbatch cannot fit the token limit/layout")
     padding = computed - total
     # THD padding appends ONE real cu_seqlens segment before attention computation.
     return Microbatch(

@@ -14,10 +14,9 @@ from areal.utils.atomic import atomic_json, recovery_digest
 from .runtime_state import (
     capture_runtime_state,
     restore_random_state,
-    restore_runtime_state,
 )
 
-Backend = Literal["fsdp", "megatron"]
+Backend = Literal["megatron"]
 
 
 def _tracker() -> Any:
@@ -96,10 +95,9 @@ def inspect_full_checkpoint(
     identity_sha256: str,
     version: int,
     loading: bool = False,
-    restore_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Collective-free preflight; every rank must pass before any rank loads."""
-    if backend not in ("fsdp", "megatron") or type(version) is not int or version < 1:
+    if backend != "megatron" or type(version) is not int or version < 1:
         raise ValueError(
             "Full checkpoint requires a supported backend and positive version"
         )
@@ -120,14 +118,8 @@ def inspect_full_checkpoint(
             raise ValueError(
                 "Megatron requires full distributed optimizer/scheduler checkpoint support"
             )
-    if restore_plan is not None and (not loading or backend != "fsdp"):
-        raise ValueError(
-            "An explicit DP restore plan is only supported for FSDP loading"
-        )
     if loading:
-        state = _loading_state(
-            engine, root, backend, identity_sha256, version, restore_plan
-        )
+        state = json.loads((root / f"runtime-{engine.rank}.json").read_text())
         if (
             state.get("format_version"),
             state.get("rank"),
@@ -160,27 +152,6 @@ def inspect_full_checkpoint(
             raise ValueError("Worker version does not match the checkpoint update")
         state = _capture(engine, backend, identity_sha256)
     return _report(state)
-
-
-def _loading_state(
-    engine: Any,
-    root: Path,
-    backend: Backend,
-    identity_sha256: str,
-    version: int,
-    restore_plan: dict[str, Any] | None,
-) -> dict[str, Any]:
-    if restore_plan is not None:
-        from .dp_restore import mapped_runtime_state
-
-        return mapped_runtime_state(
-            engine,
-            path=root,
-            identity_sha256=identity_sha256,
-            version=version,
-            plan=restore_plan,
-        )
-    return json.loads((root / f"runtime-{engine.rank}.json").read_text())
 
 
 def save_full_checkpoint(
@@ -221,7 +192,6 @@ def load_full_checkpoint(
     backend: Backend,
     identity_sha256: str,
     version: int,
-    restore_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from areal.api.io_struct import SaveLoadMeta
 
@@ -232,21 +202,14 @@ def load_full_checkpoint(
         identity_sha256=identity_sha256,
         version=version,
         loading=True,
-        restore_plan=restore_plan,
     )
-    state = _loading_state(
-        engine, Path(path), backend, identity_sha256, version, restore_plan
-    )
+    state = json.loads((Path(path) / f"runtime-{engine.rank}.json").read_text())
     engine.load(
         SaveLoadMeta(path=str(Path(path) / "dcp"), weight_format="dcp", with_optim=True)
     )
-    if backend == "fsdp":
-        restore_runtime_state(engine, state)
-    else:
-        # Megatron's DCP loader already restores the scheduler. Its load method
-        # advances by the saved num_steps, so applying the sidecar a second time
-        # would double that progress. The digest below verifies the DCP restore.
-        engine.set_version(version)
+    # MCore DCP restores the scheduler; applying a sidecar scheduler twice
+    # would double its progress. The digest below verifies the loaded state.
+    engine.set_version(version)
     if [group["lr"] for group in engine.optimizer.param_groups] != state[
         "optimizer_group_lrs"
     ]:

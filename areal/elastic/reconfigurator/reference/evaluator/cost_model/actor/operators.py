@@ -35,7 +35,6 @@ class Efficiency:
     network: float = 0.65
     moe_imbalance: float = 1.15
     kernel_launch_us: float = 5.0
-    fsdp_overlap: float = 0.5
     ep_overlap: float = 0.25
 
     def __post_init__(self) -> None:
@@ -60,10 +59,11 @@ class Operators:
     group_gbps: dict[str, float] = field(default_factory=dict)
     stage_world_size: int | None = None
     cp_rank_span: int | None = None
+    expert_rank_span: int | None = None
 
     def __post_init__(self) -> None:
         for key, value in self.group_gbps.items():
-            if key not in {"tp", "cp", "ep", "dense_dp", "expert_dp", "pp"}:
+            if key not in {"tp", "cp", "ep", "etp", "dense_dp", "expert_dp", "pp"}:
                 raise ValueError(f"Unknown communication group {key}")
             positive(key, value)
 
@@ -97,6 +97,8 @@ class Operators:
             span = world
         elif group == "cp":
             span = self.cp_rank_span or size
+        elif group == "ep":
+            span = self.expert_rank_span or size
         remote = span > self.hardware.gpus_per_node
         peak = (
             self.hardware.inter_node_gbps if remote else self.hardware.intra_node_gbps
@@ -138,7 +140,7 @@ class Context:
 
 @dataclass(frozen=True)
 class Communications:
-    """Volume model: Megatron TP/CP/EP, or Archon Ulysses + FSDP2."""
+    """Megatron tensor, context, pipeline and expert communication volumes."""
 
     def pipeline_transfer(self, ctx: Context, mb: Microbatch) -> float:
         p = ctx.config.parallel
@@ -163,8 +165,8 @@ class Communications:
         if ctx.config.expert_dispatcher == "alltoall" or "ep" in op.group_gbps:
             exchange = op.collective(payload * m.top_k, p.ep, "ep", p.world_size)
         else:
-            local = min(p.ep, op.hardware.gpus_per_node)
-            nodes = math.ceil(p.ep / op.hardware.gpus_per_node)
+            local = min(p.ep, max(1, op.hardware.gpus_per_node // p.etp))
+            nodes = math.ceil(p.ep * p.etp / op.hardware.gpus_per_node)
             intra_copies = (local - 1) * (1 - (1 - 1 / p.ep) ** m.top_k)
             inter_copies = (nodes - 1) * (1 - (1 - 1 / nodes) ** m.top_k)
             intra = (
@@ -207,8 +209,19 @@ class Transformer:
             dense_params += ctx.layers * m.expert_parameters_per_layer
         if ctx.last:
             dense_params += m.head_parameters
-        dense = op.roofline(2 * t * dense_params, 2 * dense_params / p.tp, "dense")
-        moe_params = ctx.layers * m.expert_parameters_per_layer / p.ep
+        kv_replication = ctx.layers * (
+            m.attention_parameters_per_rank(p.tp)
+            - m.attention_parameters_per_layer / p.tp
+        )
+        local_dense = dense_params / p.tp + kv_replication
+        if m.mlp_type == "moe":
+            local_dense += ctx.layers * m.router_parameters_per_layer * (1 - 1 / p.tp)
+        dense = op.roofline(
+            2 * t * dense_params + 2 * mb.compute_tokens / p.cp * kv_replication,
+            2 * local_dense,
+            "dense",
+        )
+        moe_params = ctx.layers * m.expert_parameters_per_layer / (p.ep * p.etp)
         moe = (
             0.0
             if m.mlp_type == "dense"
@@ -239,14 +252,13 @@ class Transformer:
         )
         compute = dense + moe + attention + pointwise + launch
         comm = communications.forward(ctx, mb)
-        exposed = comm["tp"] + comm["cp"] + comm["pipeline_transfer"]
+        exposed = comm["tp"] + comm["cp"] + comm["etp"] + comm["pipeline_transfer"]
         ep_overlap = (
             op.efficiency.ep_overlap
             if ctx.config.expert_dispatcher == "hierarchical"
             else 0
         )
         exposed += (1 - ep_overlap) * comm["ep"]
-        exposed += max(comm["fsdp"] - op.efficiency.fsdp_overlap * compute, 0)
         return {
             "compute": compute,
             "communication_exposed": exposed,
@@ -277,11 +289,6 @@ class Transformer:
             recompute["raw_pipeline_transfer"] = 0.0
             for key, value in recompute.items():
                 result[key] += value * ctx.config.checkpoint_recompute_fraction
-        result["raw_fsdp"] = forward["raw_fsdp"] + (
-            communications.parameter_gather(ctx, backward=True)
-            if communications.gather_backward
-            else 0
-        )
         result["raw_gradient_sync"] = (
             communications.gradient_sync(ctx)
             if communications.sync_each_microbatch
@@ -294,15 +301,12 @@ class Transformer:
             else 0
         )
         result["communication_exposed"] = (
-            result["raw_tp"] + result["raw_cp"] + result["raw_pipeline_transfer"]
+            result["raw_tp"]
+            + result["raw_cp"]
+            + result["raw_etp"]
+            + result["raw_pipeline_transfer"]
         )
         result["communication_exposed"] += (1 - ep_overlap) * result["raw_ep"]
-        result["communication_exposed"] += max(
-            result["raw_fsdp"]
-            + result["raw_gradient_sync"]
-            - efficiency.fsdp_overlap * result["compute"],
-            0,
-        )
         return result
 
 
@@ -314,28 +318,36 @@ def partition_layers(config: ActorConfig, model: ModelShape) -> tuple[int, ...]:
     if config.parallel.pp == 1:
         return (model.layers,)
     pp = config.parallel.pp
+    # Mirror AReaL's non-interleaved stage partition: parameter-balanced
+    # decoder layers, with embedding/loss storage on the first/last stage.
     per_layer = (
-        model.hidden_size
-        * model.head_dim
-        * (model.attention_heads + 2 * model.kv_heads)
-        + model.hidden_size**2
+        model.attention_parameters_per_layer
         + 2 * model.hidden_size
         + model.router_parameters_per_layer
         + model.expert_parameters_per_layer / config.parallel.ep
     )
-    table = {0: (0.0, ())}
-    for stage in range(pp):
-        next_table = {}
-        for used, (cost, counts) in table.items():
-            for count in range(1, model.layers - used - (pp - stage - 1) + 1):
-                head = model.head_parameters * ((stage == 0) + (stage == pp - 1))
-                candidate = (max(cost, count * per_layer + head), counts + (count,))
-                if (
-                    used + count not in next_table
-                    or candidate < next_table[used + count]
-                ):
-                    next_table[used + count] = candidate
-        table = next_table
-    if model.layers not in table:
-        raise ValueError("Pipeline stages exceed model layers")
-    return table[model.layers][1]
+    layers = model.layers
+    costs = [[math.inf] * (layers + 1) for _ in range(pp + 1)]
+    splits = [[-1] * (layers + 1) for _ in range(pp + 1)]
+    costs[0][0] = 0.0
+    for stage in range(1, pp + 1):
+        head = model.head_parameters if stage in (1, pp) else 0
+        for end in range(layers + 1):
+            for start in range(end + 1):
+                if not math.isfinite(costs[stage - 1][start]):
+                    continue
+                if stage not in (1, pp) and start == end:
+                    continue
+                candidate = max(
+                    costs[stage - 1][start], head + (end - start) * per_layer
+                )
+                if candidate < costs[stage][end]:
+                    costs[stage][end], splits[stage][end] = candidate, start
+    if not math.isfinite(costs[pp][layers]):
+        raise ValueError("Pipeline stages exceed the model's layer/head partition")
+    counts, end = [], layers
+    for stage in range(pp, 0, -1):
+        start = splits[stage][end]
+        counts.append(end - start)
+        end = start
+    return tuple(reversed(counts))

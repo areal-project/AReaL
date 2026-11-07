@@ -31,7 +31,6 @@ class Efficiency:
     network: float = 0.65
     moe_imbalance: float = 1.15
     kernel_launch_us: float = 5.0
-    fsdp_overlap: float = 0.50
     ep_overlap: float = 0.25
 
     def __post_init__(self) -> None:
@@ -157,15 +156,13 @@ class Context:
         dense += ((self.first + self.last) * m.head_parameters) / p.tp
         if m.tied_embeddings and self.first and self.last:
             dense -= m.head_parameters / p.tp
-        if self.config.backend == "fsdp" and self.last:
-            dense += m.hidden_size  # Final root norm, outside decoder wrappers.
         expert = self.layers * m.expert_parameters_per_layer / p.ep
         return dense, expert
 
 
 @dataclass(frozen=True)
 class Communications:
-    """Volume model: Megatron TP/CP/EP, or Archon Ulysses + FSDP2."""
+    """Volume model: Megatron TP/CP/EP."""
 
     def forward(self, ctx: Context, mb: Microbatch) -> dict[str, float]:
         p, m, op = ctx.config.parallel, ctx.model, ctx.operators
@@ -178,21 +175,10 @@ class Communications:
             )
         )
         ep = self.expert_exchange(ctx, t / (p.tp * p.cp))
-        if ctx.config.backend == "archon":
-            # Ulysses Q/K/V redistribution and inverse output. KV heads may repeat.
-            kv = max(m.kv_heads, p.tp * p.cp)
-            cp_payload = (
-                t / (p.cp * p.tp) * m.head_dim * (2 * m.attention_heads + 2 * kv) * 2
-            )
-            cp = ctx.layers * op.collective(cp_payload, p.cp, "cp", p.world_size)
-        else:
-            cp_payload = t / (p.cp * p.tp) * m.kv_heads * m.head_dim * 4
-            cp = ctx.layers * op.collective(cp_payload * p.cp, p.cp, "cp", p.world_size)
-        fsdp = 0.0
-        if ctx.config.backend in {"archon", "fsdp"}:
-            fsdp = self.parameter_gather(ctx)
+        cp_payload = t / (p.cp * p.tp) * m.kv_heads * m.head_dim * 4
+        cp = ctx.layers * op.collective(cp_payload * p.cp, p.cp, "cp", p.world_size)
         pp = self.pipeline_transfer(ctx, mb) if not ctx.last else 0.0
-        return {"tp": tp, "cp": cp, "ep": ep, "fsdp": fsdp, "pipeline_transfer": pp}
+        return {"tp": tp, "cp": cp, "ep": ep, "pipeline_transfer": pp}
 
     def pipeline_transfer(self, ctx: Context, mb: Microbatch) -> float:
         p = ctx.config.parallel
@@ -241,20 +227,7 @@ class Communications:
     def gradient_sync(self, ctx: Context) -> float:
         dense, expert = ctx.owned_parameters
         p, op, cfg = ctx.config.parallel, ctx.operators, ctx.config
-        if cfg.backend == "fsdp":
-            groups = (
-                ctx.layers
-                + int(ctx.first and not ctx.model.tied_embeddings)
-                + int(ctx.last)
-            )
-            return (
-                op.collective(
-                    (dense + expert) * cfg.grad_bytes, p.dp, "dense_dp", p.world_size
-                )
-                + max(groups - 1, 0) * op.collective(0, p.dp, "dense_dp", p.world_size)
-                + op.memory(2 * (dense + expert) * cfg.grad_bytes)
-            )
-        sharded = cfg.distributed_optimizer or cfg.backend in {"archon", "fsdp"}
+        sharded = cfg.distributed_optimizer
         dense_sync = op.collective(
             dense * cfg.grad_bytes,
             p.dp * p.cp,
@@ -276,25 +249,6 @@ class Communications:
         dense, expert = ctx.owned_parameters
         head = ctx.final_dense_parameters
         p, op, cfg = ctx.config.parallel, ctx.operators, ctx.config
-        if cfg.backend == "fsdp":
-            if not cfg.reshard_after_forward or not cfg.fsdp_root_reshard_after_forward:
-                raise ValueError(
-                    "FSDP profile requires body/root reshard after forward"
-                )
-            groups = (
-                ctx.layers
-                + int(ctx.first and not ctx.model.tied_embeddings)
-                + int(ctx.last)
-            )
-            return (
-                op.collective((dense + expert) * 2, p.dp, "dense_dp", p.world_size)
-                + max(groups - 1, 0) * op.collective(0, p.dp, "dense_dp", p.world_size)
-                + op.memory(
-                    4
-                    * (dense + expert)
-                    * (1 + (1 + int(not cfg.offload_params and p.dp > 1)) / p.dp)
-                )
-            )
         if backward:
             body_needed = cfg.reshard_after_forward
             head_needed = cfg.reshard_head_after_forward
@@ -367,7 +321,7 @@ class Transformer:
         )
         compute = dense + moe + attention + pointwise + launch
         comm = self.communications.forward(ctx, mb)
-        # Only EP and FSDP have modeled overlap. Do not subtract from raw work twice.
+        # Only EP has modeled overlap. Keep raw work and exposed work separate.
         exposed = comm["tp"] + comm["cp"] + comm["pipeline_transfer"]
         ep_overlap = (
             op.efficiency.ep_overlap
@@ -375,7 +329,6 @@ class Transformer:
             else 0
         )
         exposed += (1 - ep_overlap) * comm["ep"]
-        exposed += max(comm["fsdp"] - op.efficiency.fsdp_overlap * compute, 0)
         return {
             "compute": compute,
             "communication_exposed": exposed,
@@ -406,18 +359,7 @@ class Transformer:
             for key, value in recompute.items():
                 result[key] += value * ctx.config.checkpoint_recompute_fraction
         # Checkpoint recompute reuses the gather required by backward.
-        result["raw_fsdp"] = forward["raw_fsdp"] + (
-            self.communications.parameter_gather(ctx, backward=True)
-            if ctx.config.backend in {"archon", "fsdp"}
-            else 0
-        )
-        # Current Archon SequentialRunner calls backward on EVERY microbatch
-        # without disabling FSDP gradient sync. Megatron defers sync to the update.
-        result["raw_gradient_sync"] = (
-            self.communications.gradient_sync(ctx)
-            if ctx.config.backend in {"archon", "fsdp"}
-            else 0.0
-        )
+        result["raw_gradient_sync"] = 0.0
         efficiency = ctx.operators.efficiency
         ep_overlap = (
             efficiency.ep_overlap
@@ -428,12 +370,6 @@ class Transformer:
             result["raw_tp"] + result["raw_cp"] + result["raw_pipeline_transfer"]
         )
         result["communication_exposed"] += (1 - ep_overlap) * result["raw_ep"]
-        result["communication_exposed"] += max(
-            result["raw_fsdp"]
-            + result["raw_gradient_sync"]
-            - efficiency.fsdp_overlap * result["compute"],
-            0,
-        )
         return result
 
 
@@ -444,21 +380,7 @@ class AdamUpdate:
     def estimate(self, ctx: Context) -> dict[str, float]:
         dense, expert = ctx.owned_parameters
         p, op, cfg = ctx.config.parallel, ctx.operators, ctx.config
-        if cfg.backend == "fsdp":
-            from ..fsdp import optimizer_bytes_per_element
-
-            # FSDP already reduces every microbatch. CPU Adam/clip belongs to
-            # the host component; GPU Adam/Kahan uses its own eager traffic.
-            owned = (dense + expert) / p.dp
-            return {
-                "optimizer": 0.0
-                if cfg.offload_params
-                else op.memory(owned * (optimizer_bytes_per_element(cfg) + 10)),
-                "gradient_norm_scalar": op.collective(
-                    4, p.dp, "dense_dp", p.world_size, allreduce=True
-                ),
-            }
-        sharded = cfg.distributed_optimizer or cfg.backend == "archon"
+        sharded = cfg.distributed_optimizer
         dense_dp, expert_dp = p.dp * p.cp, p.expert_dp
         owned = dense / (dense_dp if sharded else 1) + expert / (
             expert_dp if sharded else 1

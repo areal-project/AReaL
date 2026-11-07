@@ -20,7 +20,7 @@ from areal.autopilot.domains.elastic.cycle import (
 from areal.autopilot.domains.elastic.versions import protected_files
 from areal.autopilot.revision.contracts import RevisionReport, digest, source_digest
 from areal.autopilot.revision.execution import load_source
-from areal.elastic.contracts import OnlineLayout, Turn
+from areal.elastic.contracts import ExecutionConfig, OnlineLayout, Turn
 from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import (
     ServiceSlice,
 )
@@ -76,13 +76,13 @@ class HistoricalInput:
     """Causal component work at its actual layout, without private timing labels."""
 
     kind: str
-    layout: OnlineLayout
+    layout: ExecutionConfig | OnlineLayout
     execution_id: str
     timing_boundary: str
     batch: tuple[tuple[Turn, ...], ...] = ()
     kv_tokens: int = 0
     slices: tuple[ServiceSlice, ...] = ()
-    rollout_layouts: tuple[OnlineLayout, ...] = ()
+    rollout_layouts: tuple[ExecutionConfig | OnlineLayout, ...] = ()
     input_mode: str = "given_work"
 
     def __post_init__(self):

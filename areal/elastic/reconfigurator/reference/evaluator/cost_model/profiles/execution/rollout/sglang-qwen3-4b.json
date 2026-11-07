@@ -2,11 +2,12 @@
   "schema_version": 1,
   "kind": "execution/rollout",
   "id": "sglang-qwen3-4b",
-  "version": "1",
+  "version": "2",
   "values": {
     "config": {
       "max_batch_sequences": 64,
       "max_batch_tokens": 8192,
+      "prefill_chunk_tokens": 8192,
       "backend": "sglang",
       "weight_bytes": 2,
       "kv_bytes": 2,
@@ -46,7 +47,7 @@
   "provenance": {
     "evidence": "assumed",
     "scope": "Single-replica TP1/2/4/8 service priors. Catalog.assemble requires explicit per-TP KV capacity from max_total_num_tokens. No KV quantization or prefix reuse.",
-    "scheduler": "Legacy decode-first/full-reservation simulator policy is an explicit assumption, not verified SGLang0.5.10 scheduling.",
+    "scheduler": "Decode-first/full-reservation prior. The analytical path fixes chunk size at 8192, divides it among internal DP groups and separates PP prefill/decode microbatches. Replica routing and the full native scheduling policy remain uncalibrated.",
     "calibration_status": "pending GPU prefill/decode/mixed iteration labels; no inferred RPC or tool timings"
   }
 }

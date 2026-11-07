@@ -12,7 +12,7 @@ from areal.autopilot.domains.elastic.contracts import decode
 from areal.autopilot.revision.contracts import digest, source_digest
 from areal.autopilot.revision.execution import load_source
 from areal.autopilot.revision.loop import RevisionStore
-from areal.elastic.contracts import OnlineLayout
+from areal.elastic.contracts import ExecutionConfig, OnlineLayout
 from areal.elastic.reconfigurator import build_reconfigurator
 from areal.utils.atomic import atomic_json
 
@@ -241,7 +241,9 @@ def load_bundle(path):
     )
     reconfigurator = build_reconfigurator(
         "reference",
-        candidates=tuple(decode(OnlineLayout, c) for c in spec["candidates"]),
+        candidates=tuple(
+            decode(ExecutionConfig | OnlineLayout, c) for c in spec["candidates"]
+        ),
         settings=spec.get("reconfigurator"),
         replay=spec.get("replay"),
         forecast=spec.get("forecast"),

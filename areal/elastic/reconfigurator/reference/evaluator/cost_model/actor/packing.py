@@ -299,28 +299,15 @@ class PackingPlan:
 
 def _pad(lengths: list[int], config: ActorConfig, hidden_size: int) -> Microbatch:
     p = config.parallel
-    seq_alignment = (
-        (p.tp * p.cp * 2 if p.cp > 1 else p.tp) if config.backend == "megatron" else 1
-    )
+    seq_alignment = p.tp * p.cp * 2 if p.cp > 1 else p.tp
     aligned = [align(n, seq_alignment) for n in lengths]
     total = sum(aligned)
-    page = max((2 << 20) // hidden_size // 2, 1) if config.backend == "archon" else 256
-    batch_alignment = (
-        math.lcm(page, 2 * p.cp * p.tp) if config.backend == "archon" else page
-    )
     computed = (
-        config.max_tokens_per_mb
-        if config.pad_to_maximum
-        else align(align(sum(lengths), 256), batch_alignment)
+        config.max_tokens_per_mb if config.pad_to_maximum else align(sum(lengths), 256)
     )
-    if config.backend == "megatron":
-        computed = align(max(computed, total), math.lcm(seq_alignment, 256))
-    if computed < total or computed % (
-        p.cp * (p.tp if config.backend == "archon" else 1)
-    ):
-        raise ValueError(
-            "Aligned packed microbatch cannot fit the configured token limit/layout"
-        )
+    computed = align(max(computed, total), math.lcm(seq_alignment, 256))
+    if computed < total or computed % p.cp:
+        raise ValueError("Packed microbatch cannot fit the token limit/layout")
     padding = computed - total
     return Microbatch(
         sum(lengths), computed, sum(n * n for n in aligned) + padding * padding, padding
