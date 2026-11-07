@@ -10,7 +10,11 @@ import torch
 
 from examples.swe.arena_agent import ArenaStreamAgentWorkflow, _ArenaTaskWaitTimeout
 from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
-from tests.test_swe_arena_multi_stream import _core_review_failure_error
+from tests.test_swe_arena_abbreviated_receipt import _error as _runner_failure_error
+from tests.test_swe_arena_multi_stream import (
+    _core_review_failure_error,
+    _core_tool_budget_failure_error,
+)
 
 from areal.api import ModelResponse
 from areal.experimental.openai.cache import InteractionCache
@@ -71,6 +75,23 @@ class _RecordingFailingAgent(_FailingAgent):
 
     async def persist_episode_result(self, data, reward):
         self.persisted_rewards.append((data, reward))
+
+
+class _CoreToolBudgetFailingAgent(_RecordingFailingAgent):
+    def __init__(self):
+        super().__init__()
+        self.error = _core_tool_budget_failure_error()
+
+    async def run(self, data, **kwargs):
+        raise self.error
+
+    @staticmethod
+    def classify_proxy_failure(error, *, context_overflow, interaction_count):
+        return ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error,
+            context_overflow=context_overflow,
+            interaction_count=interaction_count,
+        )
 
 
 class _FakeProxyClient:
@@ -640,6 +661,59 @@ async def test_context_overflow_recovers_existing_interactions_with_zero_reward(
     stats = stats_tracker.export_all(reset=True)
     assert stats["rollout/context_overflow"] == 1.0
     assert stats["rollout/reward"] == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_kind", ["core", "review", "runner", "adopted_runner"])
+@pytest.mark.parametrize("interaction_count", [0, 1])
+@pytest.mark.parametrize("proxy_system_error", [False, True])
+async def test_core_tool_budget_failure_recovers_proxy_interactions_with_zero_reward(
+    monkeypatch, receipt_kind, interaction_count, proxy_system_error
+):
+    """Recover verified budget failures only with usable tokens and a healthy proxy."""
+    fake_client = _FakeProxyClient(interaction_count=interaction_count)
+    fake_client.context_overflow = False
+    fake_client.system_error = proxy_system_error
+    monkeypatch.setattr(
+        workflow_module, "OpenAIProxyClient", lambda *args, **kwargs: fake_client
+    )
+    agent = _CoreToolBudgetFailingAgent()
+    if receipt_kind == "review":
+        agent.error = _core_tool_budget_failure_error(continuations=2)
+    elif receipt_kind in {"runner", "adopted_runner"}:
+        agent.error = _runner_failure_error(
+            adopted=receipt_kind == "adopted_runner",
+            message="tool_call_budget_exceeded: argument_bytes (limit 65536, observed 69773)",
+        )
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
+    monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    stats_tracker.export_all(reset=True)
+    workflow_context.set(WorkflowContext(task_id=17))
+    try:
+        if proxy_system_error or interaction_count == 0:
+            with pytest.raises(ArenaTaskFailedError):
+                await workflow.arun_episode(engine=None, data={})
+            assert fake_client.last_reward is None
+            assert agent.failure_dispositions[0][2] == (
+                "system_failure_reject"
+                if proxy_system_error
+                else "unknown_failure_reject"
+            )
+            return
+        result = await workflow.arun_episode(engine=None, data={})
+        assert result == {"completion-1": fake_client.interaction}
+        assert fake_client.last_reward == 0.0
+        assert fake_client.interaction.reward == 0.0
+        assert agent.failure_dispositions[0][2] == "model_failure_zero"
+        assert agent.persisted_rewards == [({}, 0.0)]
+        stats = stats_tracker.export_all(reset=True)
+        assert stats["rollout/reward"] == 0.0
+    finally:
+        workflow_context.set(WorkflowContext())
+        stats_tracker.export_all(reset=True)
 
 
 @pytest.mark.asyncio

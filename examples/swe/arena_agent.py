@@ -583,6 +583,9 @@ class ArenaStreamAgentWorkflow:
         self._task_result_dumped: ContextVar[bool] = ContextVar(
             "arena_task_result_dumped", default=False
         )
+        self._task_failure_reason: ContextVar[str | None] = ContextVar(
+            "arena_task_failure_reason", default=None
+        )
         self._proxy_session_id: ContextVar[str] = ContextVar(
             "arena_proxy_session_id", default=""
         )
@@ -898,6 +901,27 @@ class ArenaStreamAgentWorkflow:
             and raw.get("failure") is None
         )
 
+    @staticmethod
+    def _has_harness_receipt_system_failure(receipt: dict[str, Any]) -> bool:
+        """Reject explicit runner, collection, or interruption failures."""
+        return (
+            receipt.get("failure") is not None
+            or any(
+                receipt.get(flag, False) is not False
+                for flag in (
+                    "observed_runner_timeout",
+                    "observed_external_interruption",
+                )
+            )
+            or (
+                "collection" in receipt
+                and (
+                    not isinstance(receipt["collection"], dict)
+                    or receipt["collection"].get("status") != "OK"
+                )
+            )
+        )
+
     @classmethod
     def _is_core_agent_zero_failure(
         cls, raw: Any, receipt: Any, *, invalid_tool_json: bool = False
@@ -923,22 +947,8 @@ class ArenaStreamAgentWorkflow:
             or receipt.get("summary") != raw["harness"]["summary"]
         ):
             return False
-        if budget_message is not None and (
-            receipt.get("failure") is not None
-            or (
-                "collection" in receipt
-                and (
-                    not isinstance(receipt["collection"], dict)
-                    or receipt["collection"].get("status") != "OK"
-                )
-            )
-            or any(
-                receipt.get(flag, False) is not False
-                for flag in (
-                    "observed_runner_timeout",
-                    "observed_external_interruption",
-                )
-            )
+        if budget_message is not None and cls._has_harness_receipt_system_failure(
+            receipt
         ):
             return False
         turns = receipt.get("turn_statuses")
@@ -1228,6 +1238,7 @@ class ArenaStreamAgentWorkflow:
             or receipt["exit_code"] != 1
             or receipt.get("delivery") is not None
             or receipt.get("turn_statuses") != ["failed"]
+            or cls._has_harness_receipt_system_failure(receipt)
         ):
             return False
         errors = receipt.get("error")
@@ -1244,6 +1255,7 @@ class ArenaStreamAgentWorkflow:
         return (
             message == "model stopped with reason: length"
             or message == "model stopped without visible output or tool calls"
+            or cls._is_tool_call_budget_exceeded_message(message)
             or re.fullmatch(
                 r"context window limit exceeded: compaction is disabled "
                 r"\([1-9][0-9]* bytes / [1-9][0-9]* estimated tokens\)",
@@ -1251,6 +1263,65 @@ class ArenaStreamAgentWorkflow:
             )
             is not None
         )
+
+    @staticmethod
+    def _is_tool_call_budget_exceeded_message(message: Any) -> bool:
+        """Recognize the runner's explicit tool-argument byte budget failure."""
+        if not isinstance(message, str):
+            return False
+        match = re.fullmatch(
+            r"tool_call_budget_exceeded: argument_bytes "
+            r"\(limit ([0-9]{1,20}), observed ([0-9]{1,20})\)",
+            message,
+        )
+        if match is None:
+            return False
+        limit, observed = map(int, match.groups())
+        return 0 < limit < observed
+
+    @classmethod
+    def _harness_failure_reason(cls, error: BaseException | None) -> str | None:
+        """Identify verified model failure causes before trajectory filtering.
+
+        The metric describes the Harness cause, not whether the proxy can export
+        usable interactions. Reuse admission checks to exclude unhealthy receipts.
+        """
+        if (
+            not isinstance(error, ArenaTaskFailedError)
+            or error.status != "HARNESS_FAILED"
+            or error.result is None
+            or not cls._is_model_attributed_harness_failure(error)
+        ):
+            return None
+        raw = error.result.raw
+        result_format = cls._harness_result_format(raw)
+        if result_format == "gameagent":
+            if cls._core_tool_argument_budget_failure_message(raw) is not None:
+                return "tool_call_argument_bytes_exceeded"
+            if (
+                cls._core_model_zero_failure_message(raw)
+                == (
+                    _CORE_MODEL_ZERO_FAILURE_MESSAGES[
+                        ("LLM_RESPONSE_FAILED", "empty_completion")
+                    ]
+                )
+            ):
+                return "empty_completion"
+        elif result_format == "native-runner" and cls._is_runner_model_failure(
+            raw, error.harness_result
+        ):
+            # Admission above validates a single terminal error in this receipt.
+            message = error.harness_result["error"][0]["message"]
+            if cls._is_tool_call_budget_exceeded_message(message):
+                return "tool_call_argument_bytes_exceeded"
+            if message == "model stopped without visible output or tool calls":
+                return "empty_completion"
+        return None
+
+    @classmethod
+    def _is_tool_call_budget_failure(cls, error: BaseException | None) -> bool:
+        """Retain the budget predicate for callers using the upstream helper."""
+        return cls._harness_failure_reason(error) == "tool_call_argument_bytes_exceeded"
 
     @staticmethod
     def _is_native_model_failure(raw: Any) -> bool:
@@ -1411,9 +1482,22 @@ class ArenaStreamAgentWorkflow:
         if result_format == "native-runner":
             if cls._is_abbreviated_runner_failure(raw) and result.score != 0.0:
                 return False
+            receipt = error.harness_result
+            if isinstance(receipt, dict) and cls._has_harness_receipt_system_failure(
+                receipt
+            ):
+                return False
+            # An earlier proxy overflow cannot override a conflicting terminal
+            # receipt. Without a receipt, retain the typed-overflow fallback.
             return (
-                context_overflow and cls._is_runner_context_failure(raw)
-            ) or cls._is_runner_model_failure(raw, error.harness_result)
+                context_overflow
+                and cls._is_runner_context_failure(raw)
+                and (
+                    receipt is None
+                    or isinstance(receipt, dict)
+                    and cls._is_runner_context_failure(receipt)
+                )
+            ) or cls._is_runner_model_failure(raw, receipt)
         if (
             result_format == "gameagent"
             and result is not None
@@ -1594,6 +1678,7 @@ class ArenaStreamAgentWorkflow:
         finally:
             self._task_result.set(None)
             self._task_result_dumped.set(False)
+            self._task_failure_reason.set(None)
 
     def get_episode_metadata(self) -> dict[str, str]:
         """Return bounded identifiers used to join rollout and Arena audits."""
@@ -1615,8 +1700,9 @@ class ArenaStreamAgentWorkflow:
             metadata["harness_outcome_code"] = self._gameagent_outcome_metric_code(
                 result.raw
             )
-            if self._core_tool_argument_budget_failure_message(result.raw) is not None:
-                metadata["harness_failure_reason"] = "tool_call_argument_bytes_exceeded"
+            reason = self._task_failure_reason.get()
+            if reason is not None:
+                metadata["harness_failure_reason"] = reason
         return metadata
 
     async def persist_episode_result(
@@ -1707,6 +1793,7 @@ class ArenaStreamAgentWorkflow:
         """Launch the row's task with the current rollout proxy session."""
         self._task_result.set(None)
         self._task_result_dumped.set(False)
+        self._task_failure_reason.set(None)
         self._proxy_session_id.set("")
         error: BaseException | None = None
         try:
@@ -1724,6 +1811,8 @@ class ArenaStreamAgentWorkflow:
         Keep them in the call denominator, outside the terminal-result denominator.
         """
         cancelled = isinstance(error, asyncio.CancelledError)
+        failure_reason = self._harness_failure_reason(error)
+        self._task_failure_reason.set(failure_reason)
         metrics = {
             "task_attempt/success": float(error is None),
             "task_attempt/error": float(error is not None and not cancelled),
@@ -1745,6 +1834,9 @@ class ArenaStreamAgentWorkflow:
             )
             metrics["harness_success"] = float(success)
             metrics["harness_error"] = float(is_harness_error)
+            metrics["harness_error/tool_call_budget_exceeded_rate"] = float(
+                failure_reason == "tool_call_argument_bytes_exceeded"
+            )
             metrics["task_error"] = float(not success)
             for terminal_status in sorted(terminal_statuses):
                 metrics[f"task_status/{terminal_status}"] = float(
@@ -1756,18 +1848,10 @@ class ArenaStreamAgentWorkflow:
                 is_harness_error and outcome_code not in _GAMEAGENT_OUTCOME_METRIC_CODES
             )
             metrics["harness_error/tool_call_argument_bytes_exceeded"] = float(
-                is_harness_error
-                and result is not None
-                and self._core_tool_argument_budget_failure_message(result.raw)
-                is not None
+                failure_reason == "tool_call_argument_bytes_exceeded"
             )
             metrics["harness_error/empty_completion"] = float(
-                is_harness_error
-                and result is not None
-                and self._core_model_zero_failure_message(result.raw)
-                == _CORE_MODEL_ZERO_FAILURE_MESSAGES[
-                    ("LLM_RESPONSE_FAILED", "empty_completion")
-                ]
+                failure_reason == "empty_completion"
             )
         _record_arena_metrics(**metrics)
 
