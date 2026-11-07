@@ -4,18 +4,15 @@
 
 from __future__ import annotations
 
-import asyncio
-import math
 import secrets
 import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from areal.experimental.openai.cache import (
     InteractionCache,
@@ -46,19 +43,11 @@ class StartSessionRequest(BaseModel):
     group_size: int = 1
 
 
-class EpisodeIdentity(BaseModel):
-    """Caller snapshot fencing delayed requests across episode boundaries."""
-
-    incarnation_id: str = Field(min_length=1)
-    trajectory_id: int = Field(ge=0, strict=True)
-
-
 class SessionCredentials(BaseModel):
     """One session's identity and authentication key."""
 
     session_id: str
     session_api_key: str
-    areal_episode: EpisodeIdentity | None = None
 
 
 class StartSessionResponse(BaseModel):
@@ -74,14 +63,6 @@ class SetRewardRequest(BaseModel):
     interaction_id: str | None = None
     reward: float
     model: str | None = None
-    areal_episode: EpisodeIdentity | None = None
-
-
-class AbortEpisodeRequest(EpisodeIdentity):
-    """Cancel a specific unrewarded episode, including lost-admission retries."""
-
-    episode_id: str | None = None
-    reason: str = "client_abort"
 
 
 class ExportTrajectoriesRequest(BaseModel):
@@ -101,18 +82,15 @@ class ExportTrajectoriesRequest(BaseModel):
     drop_retry_orphans: bool = False
     reward_normalization: bool = False
     discard_trajectory: bool = False
-    consume: bool = True
-    acknowledge_only: bool = False
-    inline_tensors: bool = False
-    episode_id: str | None = None
-    lease: str | None = None
-    handoff_digest: str | None = None
+
+    include_observation: bool = False
 
 
 class ExportTrajectoriesResponse(BaseModel):
     """Response containing merged serialized interactions."""
 
     traj: dict[str, Any]
+    observation: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -129,8 +107,6 @@ class RewardResult:
 class ReadyNotification:
     session_id: str
     trajectory_id: int
-    episode_id: str | None = None
-    lease: str | None = None
 
 
 @dataclass
@@ -145,9 +121,6 @@ class ReadyTrajectory:
     callback_delivered: bool = False
     export_options: tuple[float, str, bool] | None = None
     exported_interactions: dict[str, InteractionWithTokenLogpReward] | None = None
-    episode_id: str | None = None
-    lease: str | None = None
-    export_digest: str | None = None
 
 
 # =============================================================================
@@ -181,201 +154,28 @@ class SessionData:
         self._set_reward_finish_timeout = set_reward_finish_timeout
         self._prefix_matcher = prefix_matcher
         self._last_access_time = time.time()
+        self.created_at = self._last_access_time
         self._lock = threading.Lock()
         self._active_completions = self._new_interaction_cache()
         self._ready_trajectories: OrderedDict[int, ReadyTrajectory] = OrderedDict()
         self._next_trajectory_id = 0
         self._acknowledged_trajectories: set[int] = set()
-        self._acknowledged_episode_leases: dict[int, tuple[str | None, str | None]] = {}
-        self._acknowledged_digests: dict[int, str | None] = {}
         self._next_sampling_request_index = 0
         self._last_set_reward_time: float | None = None
         self._last_reward_interaction_id: str | None = None
-        self._admission_lock = asyncio.Lock()
-        self._active_episode: dict[str, str] | None = None
-        self._admission_attempted = False
-        self._generation_uncertain = False
-        self._aborting_episode: dict[str, Any] | None = None
-        self._aborted_episodes: dict[int, dict[str, Any]] = {}
-        self._reward_receipts: dict[int, tuple[str, float, int]] = {}
         self._inflight_generations = 0
-        self._online_notifications: dict[int, ReadyNotification] = {}
 
-    async def begin_generation(
-        self,
-        admit: Callable[[str, int], Awaitable[dict[str, Any]]] | None = None,
-        *,
-        episode: EpisodeIdentity | None = None,
-    ) -> InteractionCache:
-        """Concurrent tool calls share one credit and capture one active cache."""
-        # Check before waiting as well: a request queued behind an abort must
-        # never silently become the first request of the next episode.
+    async def begin_generation(self) -> InteractionCache:
+        """Pin the active cache until the current model call finishes."""
         with self._lock:
-            self._check_generation_locked(episode, require_identity=admit is not None)
-        async with self._admission_lock:
-            with self._lock:
-                self._check_generation_locked(
-                    episode, require_identity=admit is not None
-                )
-                trajectory_id = self._next_trajectory_id
-                needs_credit = admit is not None and self._active_episode is None
-                if needs_credit:
-                    # A failed admission response may still have allocated a
-                    # credit. Preserve this intent until explicit cancellation.
-                    self._admission_attempted = True
-            if needs_credit:
-                assert admit is not None
-                admission = await admit(self.session_id, trajectory_id)
-                with self._lock:
-                    self._active_episode = admission
-            with self._lock:
-                self._inflight_generations += 1
-                return self._active_completions
+            self._inflight_generations += 1
+            return self._active_completions
 
-    def _check_generation_locked(
-        self, episode: EpisodeIdentity | None, *, require_identity: bool
-    ) -> None:
-        if self._aborting_episode is not None:
-            raise ValueError("Episode abort is awaiting durable confirmation")
-        if self._generation_uncertain:
-            raise ValueError("A generation outcome is unknown; episode is quarantined")
-        if require_identity:
-            self._check_incarnation_locked(episode)
-            if episode.trajectory_id != self._next_trajectory_id:
-                raise ValueError(
-                    "Request targets a different or already sealed episode"
-                )
-
-    def _check_incarnation_locked(self, episode: EpisodeIdentity | None) -> None:
-        if episode is None or episode.incarnation_id != self.incarnation_id:
-            raise ValueError("areal_episode must identify this session incarnation")
-
-    def finish_generation(self, *, uncertain: bool = False) -> None:
+    def finish_generation(self) -> None:
         with self._lock:
             if self._inflight_generations < 1:
                 raise RuntimeError("Generation completion has no active request")
             self._inflight_generations -= 1
-            if uncertain and self._active_episode is not None:
-                self._generation_uncertain = True
-
-    @property
-    def has_online_episode(self) -> bool:
-        with self._lock:
-            return self._admission_attempted or self._active_episode is not None
-
-    def current_episode(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "incarnation_id": self.incarnation_id,
-                "trajectory_id": self._next_trajectory_id,
-                "episode_id": self._active_episode["episode_id"]
-                if self._active_episode
-                else None,
-                "inflight_generations": self._inflight_generations,
-                "state": (
-                    "quarantined"
-                    if self._generation_uncertain
-                    else "aborting"
-                    if self._aborting_episode is not None
-                    else "active"
-                    if self._active_episode is not None
-                    else "admission_unconfirmed"
-                    if self._admission_attempted
-                    else "idle"
-                ),
-            }
-
-    async def abort_episode(
-        self,
-        request: AbortEpisodeRequest,
-        cancel: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
-    ) -> dict[str, Any]:
-        """Fence new work, durably retire its credit, then advance the session.
-
-        An unknown backend outcome cannot be cancelled by this interface. An
-        admission timeout is safe: no generation was dispatched, and the CPU
-        ledger creates a tombstone before any delayed admit can take effect.
-        """
-        async with self._admission_lock:
-            with self._lock:
-                if (
-                    request.incarnation_id != self.incarnation_id
-                    or type(request.trajectory_id) is not int
-                    or request.trajectory_id < 0
-                ):
-                    raise ValueError("Episode does not match this session incarnation")
-                previous = self._aborted_episodes.get(request.trajectory_id)
-                if previous is not None:
-                    if request.episode_id not in (
-                        previous["requested_episode_id"],
-                        previous["episode_id"],
-                    ):
-                        raise ValueError("Abort retry targets a different episode")
-                    return {
-                        key: previous[key]
-                        for key in ("episode_id", "trajectory_id", "status")
-                    }
-                episode = self._active_episode
-                if (
-                    request.trajectory_id != self._next_trajectory_id
-                    or request.episode_id
-                    != (episode["episode_id"] if episode else None)
-                ):
-                    raise ValueError(
-                        "Abort targets a different or already sealed episode"
-                    )
-                if (
-                    not self._admission_attempted
-                    or self._inflight_generations
-                    or self._generation_uncertain
-                ):
-                    raise ValueError(
-                        "Abort requires an admitted episode with no in-flight or unknown generation"
-                    )
-                if self._last_set_reward_time is not None:
-                    raise ValueError(
-                        "A rewarded episode must finish its trajectory handoff"
-                    )
-                if not request.reason.strip() or len(request.reason) > 256:
-                    raise ValueError(
-                        "Abort requires a nonempty reason of at most 256 characters"
-                    )
-                if self._aborting_episode is None:
-                    self._aborting_episode = {
-                        "session_id": self.session_id,
-                        "trajectory_id": request.trajectory_id,
-                        "episode_id": request.episode_id,
-                        "lease": episode["lease"] if episode else None,
-                        "reason": request.reason,
-                    }
-                intent = dict(self._aborting_episode)
-            # Retain the closing fence on errors, cancellation and lost replies.
-            result = await cancel(intent)
-            if (
-                result.get("status") != "rejected"
-                or not result.get("episode_id")
-                or intent["episode_id"] is not None
-                and result["episode_id"] != intent["episode_id"]
-            ):
-                raise RuntimeError("Episode cancellation was not durably confirmed")
-            with self._lock:
-                receipt = {
-                    "episode_id": result["episode_id"],
-                    "trajectory_id": request.trajectory_id,
-                    "requested_episode_id": request.episode_id,
-                    "status": "aborted",
-                }
-                self._aborted_episodes[request.trajectory_id] = receipt
-                self._active_completions = self._new_interaction_cache()
-                self._active_episode = None
-                self._admission_attempted = False
-                self._aborting_episode = None
-                self._next_trajectory_id += 1
-                self._last_access_time = time.time()
-                return {
-                    key: receipt[key]
-                    for key in ("episode_id", "trajectory_id", "status")
-                }
 
     def next_sampling_request_index(self) -> int:
         """Reserve a request index before inference without serializing generation."""
@@ -449,27 +249,9 @@ class SessionData:
             completions=completions,
             created_at=now,
             needs_online_callback=True,
-            episode_id=self._active_episode["episode_id"]
-            if self._active_episode
-            else None,
-            lease=self._active_episode["lease"] if self._active_episode else None,
         )
         self._ready_trajectories[trajectory_id] = ready
-        if ready.episode_id is not None:
-            self._reward_receipts[trajectory_id] = (
-                resolved_interaction_id,
-                completions[resolved_interaction_id].reward,
-                len(completions),
-            )
-        if ready.episode_id is not None:
-            # A lost ack response must not erase the only retry trigger. Keep
-            # the notification until the receiver confirms the whole handoff.
-            self._online_notifications[trajectory_id] = ReadyNotification(
-                self.session_id, trajectory_id, ready.episode_id, ready.lease
-            )
         self._active_completions = self._new_interaction_cache()
-        self._active_episode = None
-        self._admission_attempted = False
         self._last_set_reward_time = None
         self._last_reward_interaction_id = None
 
@@ -484,12 +266,7 @@ class SessionData:
         self,
         now: float,
     ) -> RewardResult | None:
-        if (
-            self._last_set_reward_time is None
-            or self._inflight_generations
-            or self._generation_uncertain
-            or self._aborting_episode is not None
-        ):
+        if self._last_set_reward_time is None or self._inflight_generations:
             return None
         if now - self._last_set_reward_time < self._set_reward_finish_timeout:
             return None
@@ -499,41 +276,13 @@ class SessionData:
         self,
         interaction_id: str | None,
         reward: float,
-        *,
-        episode: EpisodeIdentity | None = None,
-        require_episode_identity: bool = False,
     ) -> RewardResult:
         """Record reward for the active trajectory."""
         with self._lock:
-            if require_episode_identity:
-                self._check_incarnation_locked(episode)
-                if not math.isfinite(reward):
-                    raise ValueError("Online episode reward must be finite")
-                if episode.trajectory_id != self._next_trajectory_id:
-                    receipt = self._reward_receipts.get(episode.trajectory_id)
-                    if receipt is None or (
-                        interaction_id not in (None, receipt[0]) or reward != receipt[1]
-                    ):
-                        raise ValueError(
-                            "Reward targets a different or already sealed episode"
-                        )
-                    return RewardResult(
-                        self.session_id, episode.trajectory_id, receipt[2], False
-                    )
             now = time.time()
             self._last_access_time = now
-            if self._generation_uncertain or self._aborting_episode is not None:
-                raise ValueError(
-                    "The active episode is quarantined or awaiting abort confirmation"
-                )
 
-            if require_episode_identity and self._active_episode is None:
-                raise ValueError("No active admitted episode to reward")
-            duplicate_ready = (
-                None
-                if require_episode_identity
-                else self._resolve_duplicate_ready_locked(interaction_id)
-            )
+            duplicate_ready = self._resolve_duplicate_ready_locked(interaction_id)
             if duplicate_ready is not None:
                 return RewardResult(
                     session_id=self.session_id,
@@ -574,25 +323,20 @@ class SessionData:
 
     def pending_online_callbacks(self) -> list[ReadyNotification]:
         with self._lock:
-            return list(self._online_notifications.values()) + [
+            return [
                 ReadyNotification(
                     session_id=self.session_id,
                     trajectory_id=ready.trajectory_id,
-                    episode_id=ready.episode_id,
-                    lease=ready.lease,
                 )
                 for ready in self._ready_trajectories.values()
-                if ready.needs_online_callback
-                and not ready.callback_delivered
-                and ready.episode_id is None
+                if ready.needs_online_callback and not ready.callback_delivered
             ]
 
     def mark_online_callback_delivered(self, trajectory_id: int) -> bool:
         with self._lock:
-            notification = self._online_notifications.pop(trajectory_id, None)
             ready = self._ready_trajectories.get(trajectory_id)
             if ready is None or not ready.needs_online_callback:
-                return notification is not None
+                return False
             if ready.callback_delivered:
                 return True
             ready.callback_delivered = True
@@ -674,71 +418,25 @@ class SessionData:
             if consume:
                 self._ready_trajectories.pop(target_trajectory_id)
                 self._acknowledged_trajectories.add(target_trajectory_id)
-                self._acknowledged_episode_leases[target_trajectory_id] = (
-                    ready.episode_id,
-                    ready.lease,
-                )
             return ready.trajectory_id, copy_interactions(ready.exported_interactions)
 
-    def validate_trajectory_identity(
-        self,
-        trajectory_id: int | None,
-        episode_id: str | None,
-        lease: str | None,
-    ) -> None:
-        """Fence delayed export/ack calls from a previous session incarnation."""
+    def trajectory_observation_times(self, trajectory_id: int) -> tuple[float, float]:
+        """Read timestamps without exporting or consuming trajectory data."""
         with self._lock:
-            ready = self._ready_trajectories.get(trajectory_id)
-            if ready is None and trajectory_id is None and self._ready_trajectories:
-                ready = next(reversed(self._ready_trajectories.values()))
-            expected = (
-                (ready.episode_id, ready.lease)
-                if ready is not None
-                else self._acknowledged_episode_leases.get(trajectory_id, (None, None))
-            )
-            if expected != (episode_id, lease):
-                raise ValueError(
-                    "Trajectory does not match this episode admission lease"
-                )
+            return self.created_at, self._ready_trajectories[trajectory_id].created_at
 
-    def record_export_digest(self, trajectory_id: int, digest: str) -> None:
-        with self._lock:
-            ready = self._ready_trajectories[trajectory_id]
-            if ready.episode_id is not None:
-                if ready.export_digest is not None and ready.export_digest != digest:
-                    raise ValueError("Retained export payload changed")
-                ready.export_digest = digest
-
-    def acknowledge_trajectory(
-        self,
-        trajectory_id: int,
-        handoff_digest: str | None = None,
-    ) -> None:
-        """Retire an exported trajectory; retries never retire a different one."""
+    def acknowledge_trajectory(self, trajectory_id: int) -> None:
+        """Retire a source trajectory after the native export is serialized."""
         with self._lock:
             if trajectory_id in self._acknowledged_trajectories:
-                expected = self._acknowledged_digests.get(trajectory_id)
-                if expected is not None and expected != handoff_digest:
-                    raise ValueError(
-                        "Acknowledgement does not match the durable receipt"
-                    )
                 return
             ready = self._ready_trajectories.get(trajectory_id)
             if ready is None:
                 raise KeyError(f"Trajectory {trajectory_id} not found")
             if ready.exported_interactions is None:
                 raise ValueError("Cannot acknowledge a trajectory before exporting it")
-            if ready.episode_id is not None and (
-                ready.export_digest is None or handoff_digest != ready.export_digest
-            ):
-                raise ValueError("Acknowledgement does not match the durable receipt")
             self._ready_trajectories.pop(trajectory_id)
             self._acknowledged_trajectories.add(trajectory_id)
-            self._acknowledged_episode_leases[trajectory_id] = (
-                ready.episode_id,
-                ready.lease,
-            )
-            self._acknowledged_digests[trajectory_id] = ready.export_digest
 
 
 # =============================================================================

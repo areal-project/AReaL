@@ -18,7 +18,6 @@ from areal.v2.inference_service.data_proxy.app import (
 )
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.session import (
-    EpisodeIdentity,
     SessionData,
     SessionStore,
 )
@@ -528,7 +527,10 @@ async def test_start_session_wrong_admin_key(client):
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_with_session_key(client, mock_areal_client):
+async def test_chat_completions_with_session_key(
+    client, mock_areal_client, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("AREAL_ROLLOUT_TRACE_DIR", str(tmp_path))
     # Start session first
     resp = await client.post(
         "/rl/start_session",
@@ -551,6 +553,15 @@ async def test_chat_completions_with_session_key(client, mock_areal_client):
     assert data["object"] == "chat.completion"
     assert data["choices"][0]["message"]["content"] == "Hello!"
     mock_areal_client.chat.completions.create.assert_called_once()
+    rows = [
+        json.loads(line)
+        for path in tmp_path.glob("model-calls-*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    assert len(rows) == 1 and rows[0]["status"] == "completed"
+    assert rows[0]["session_id"] and rows[0]["incarnation_id"]
+    assert rows[0]["admission_wait_seconds"] >= 0
+    assert "armed_monotonic" not in rows[0]
 
 
 @pytest.mark.asyncio
@@ -1755,654 +1766,130 @@ class TestRetainedTrajectory:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_generation_shares_credit_and_reward_waits_for_completion():
+async def test_resource_drain_rebind_preserves_session_and_sampling(
+    config, mock_tokenizer, mock_areal_client, monkeypatch
+):
     import asyncio
 
-    from areal.experimental.openai.types import InteractionWithTokenLogpReward
+    from areal.v2.inference_service.data_proxy import app as proxy_app
+    from areal.v2.inference_service.data_proxy.pause import PauseState
 
-    session = SessionData("concurrent-episode")
-
-    async def admit(session_id, trajectory_id):
-        await asyncio.sleep(0)
-        return {"episode_id": "episode-0", "lease": "lease-0", "status": "admitted"}
-
-    admission = AsyncMock(side_effect=admit)
-    episode = EpisodeIdentity(incarnation_id=session.incarnation_id, trajectory_id=0)
-    first, second = await asyncio.gather(
-        session.begin_generation(admission, episode=episode),
-        session.begin_generation(admission, episode=episode),
-    )
-    assert first is second
-    admission.assert_awaited_once_with("concurrent-episode", 0)
-    interaction = InteractionWithTokenLogpReward(
-        output_message_list=[{"role": "assistant", "content": "answer"}]
-    )
-    interaction.interaction_id = "first"
-    first["first"] = interaction
-    assert session.set_reward(None, 1.0).trajectory_id is None
-    session.finish_generation()
-    assert session.finalize_if_reward_timeout_elapsed() is None
-    session.finish_generation()
-    assert session.finalize_if_reward_timeout_elapsed().trajectory_id == 0
-    notification = session.pending_online_callbacks()[0]
-    assert notification.episode_id == "episode-0"
-    assert notification.lease == "lease-0"
-
-
-@pytest.mark.asyncio
-async def test_abort_lost_reply_fences_generation_reward_and_old_episode_requests():
-    import asyncio
-
-    from areal.experimental.openai.types import InteractionWithTokenLogpReward
-    from areal.v2.inference_service.data_proxy.session import AbortEpisodeRequest
-
-    session = SessionData("abort-race")
-    identity = EpisodeIdentity(incarnation_id=session.incarnation_id, trajectory_id=0)
-    admission = AsyncMock(return_value={"episode_id": "ep0", "lease": "lease0"})
-    cache = await session.begin_generation(admission, episode=identity)
-    interaction = InteractionWithTokenLogpReward(
-        output_message_list=[{"role": "assistant", "content": "unrewarded"}]
-    )
-    interaction.interaction_id = "old"
-    cache["old"] = interaction
-    request = AbortEpisodeRequest(**identity.model_dump(), episode_id="ep0")
-    cancel = AsyncMock(return_value={"status": "rejected", "episode_id": "ep0"})
-    with pytest.raises(ValueError, match="in-flight"):
-        await session.abort_episode(request, cancel)
-    session.finish_generation()
-
+    config.deterministic_sampling = True
+    app = create_app(config)
+    store = SessionStore()
+    store.set_admin_key(config.admin_api_key)
+    session_id, key = store.start_session("retained")
+    session = store.get_session(session_id)
+    app.state.session_store, app.state.config = store, config
+    app.state.tokenizer, app.state.pause_state = mock_tokenizer, PauseState()
+    app.state.version = 7
+    old_bridge = MagicMock(aclose=AsyncMock())
+    app.state.inf_bridge = old_bridge
+    app.state.areal_client = mock_areal_client
     entered, finish = asyncio.Event(), asyncio.Event()
+    old_create = mock_areal_client.chat.completions.create.side_effect
 
-    async def lost_reply(intent):
+    async def slow_create(**kwargs):
         entered.set()
         await finish.wait()
-        raise httpx.ReadError("Durably cancelled; lost response")
+        return await old_create(**kwargs)
 
-    pending = asyncio.create_task(session.abort_episode(request, lost_reply))
-    await entered.wait()
-    with pytest.raises(ValueError, match="abort"):
-        await session.begin_generation(admission, episode=identity)
-    with pytest.raises(ValueError, match="abort"):
-        session.set_reward(None, 1.0, episode=identity, require_episode_identity=True)
-    assert session.finalize_if_reward_timeout_elapsed() is None
-    finish.set()
-    with pytest.raises(httpx.ReadError):
-        await pending
-    assert session.current_episode()["state"] == "aborting"
-    receipt = await session.abort_episode(request, cancel)
-    assert receipt["status"] == "aborted"
-    next_identity = EpisodeIdentity(
-        incarnation_id=session.incarnation_id, trajectory_id=1
-    )
-    admission.return_value = {"episode_id": "ep1", "lease": "lease1"}
-    next_cache = await session.begin_generation(admission, episode=next_identity)
-    assert next_cache is not cache
-    assert len(next_cache) == 0
-    assert await session.abort_episode(request, cancel) == receipt
-    assert session.current_episode()["episode_id"] == "ep1"
-    with pytest.raises(ValueError, match="different or already sealed"):
-        await session.begin_generation(admission, episode=identity)
-    with pytest.raises(ValueError, match="different or already sealed"):
-        session.set_reward(None, 1.0, episode=identity, require_episode_identity=True)
-    session.finish_generation()
-    assert admission.await_count == 2
-    assert cancel.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_unknown_generation_retains_credit_and_session_until_terminal_proof():
-    from areal.v2.inference_service.data_proxy.session import AbortEpisodeRequest
-
-    store = SessionStore()
-    sid, _ = store.start_session("unknown")
-    session = store.get_session(sid)
-    identity = EpisodeIdentity(incarnation_id=session.incarnation_id, trajectory_id=0)
-    admission = AsyncMock(return_value={"episode_id": "ep0", "lease": "lease0"})
-    await session.begin_generation(admission, episode=identity)
-    session.finish_generation(uncertain=True)
-    # Even a later successful response cannot prove the earlier backend stopped.
-    assert session.current_episode()["state"] == "quarantined"
-    with pytest.raises(ValueError, match="quarantined"):
-        await session.begin_generation(admission, episode=identity)
-    with pytest.raises(ValueError, match="quarantined"):
-        session.set_reward(None, 1.0, episode=identity, require_episode_identity=True)
-    cancel = AsyncMock()
-    with pytest.raises(ValueError, match="unknown generation"):
-        await session.abort_episode(
-            AbortEpisodeRequest(**identity.model_dump(), episode_id="ep0"), cancel
+    mock_areal_client.chat.completions.create.side_effect = slow_create
+    new_client = MagicMock()
+    new_client.chat.completions.create = AsyncMock(side_effect=old_create)
+    new_bridge = MagicMock(aclose=AsyncMock())
+    monkeypatch.setattr(proxy_app, "_create_inf_bridge", lambda *args: new_bridge)
+    monkeypatch.setattr(proxy_app, "_create_areal_client", lambda *args: new_client)
+    body = {"model": "math", "messages": [{"role": "user", "content": "1+1?"}]}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = asyncio.create_task(
+            client.post("/chat/completions", headers=session_headers(key), json=body)
         )
-    session._last_access_time = 0
-    store.cleanup_stale()
-    assert store.get_session(sid) is session
-    cancel.assert_not_awaited()
-    admission.assert_awaited_once()
-    # Resident requests never allocated online credits and retain their API.
-    resident = SessionData("resident")
-    await resident.begin_generation()
-    resident.finish_generation(uncertain=True)
-    await resident.begin_generation()
-    resident.finish_generation()
-
-
-@pytest.mark.asyncio
-async def test_durable_abort_http_rejects_late_generation_and_reward(
-    client, config, monkeypatch, tmp_path, mock_areal_client
-):
-    import json
-
-    from areal.elastic.state.episode_inbox import OnlineInbox
-
-    inbox = OnlineInbox(tmp_path, batch_size=1, max_staleness=0)
-    config.online_training_admission = True
-    config.callback_server_addr = "http://ledger"
-
-    async def callback(request):
-        assert request.headers["authorization"] == f"Bearer {ADMIN_KEY}"
-        body = json.loads(request.content)
-        if request.url.path.endswith("online_admit"):
-            result = inbox.admit(
-                body["source_id"], body["session_id"], body["trajectory_id"]
+        await entered.wait()
+        drain = asyncio.create_task(
+            client.post(
+                "/reconfiguration/drain", headers=admin_headers(), json={"timeout": 5}
             )
-        else:
-            result = inbox.cancel_admission(**body)
-        return httpx.Response(200, json=result)
-
-    monkeypatch.setattr(
-        "areal.v2.inference_service.data_proxy.app.create_httpx_client",
-        lambda **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(callback)),
-    )
-    started = await client.post(
-        "/rl/start_session", json={"task_id": "abort-http"}, headers=admin_headers()
-    )
-    credentials = started.json()["sessions"][0]
-    headers = session_headers(credentials["session_api_key"])
-    identity = credentials["areal_episode"]
-    body = {"messages": [{"role": "user", "content": "q"}], "areal_episode": identity}
-    assert (
-        await client.post("/chat/completions", json={"messages": []}, headers=headers)
-    ).status_code == 409
-    assert inbox.status()["active_credits"] == 0
-    assert (
-        await client.post("/chat/completions", json=body, headers=headers)
-    ).status_code == 200
-    current = (await client.post("/rl/current_episode", headers=headers)).json()
-    assert current["state"] == "active"
-    cancelled = await client.post("/rl/abort_episode", json=current, headers=headers)
-    assert cancelled.status_code == 200
-    assert inbox.status()["active_credits"] == 0
-    next_identity = {**identity, "trajectory_id": 1}
-    assert (
-        await client.post(
-            "/chat/completions",
-            json={**body, "areal_episode": next_identity},
-            headers=headers,
         )
-    ).status_code == 200
-    before = mock_areal_client.chat.completions.create.await_count
-    assert (
-        await client.post("/chat/completions", json=body, headers=headers)
-    ).status_code == 409
-
-    assert (
-        await client.post(
-            "/rl/set_reward",
-            json={"reward": 1.0, "areal_episode": identity},
-            headers=headers,
+        await asyncio.sleep(0)
+        assert app.state.generation_gate.closed and not drain.done()
+        second = asyncio.create_task(
+            client.post("/chat/completions", headers=session_headers(key), json=body)
         )
-    ).status_code == 409
-    # A retry of the old abort cannot retire the new episode's credit.
-    assert (
-        await client.post("/rl/abort_episode", json=current, headers=headers)
-    ).status_code == 200
-    assert inbox.status()["active_credits"] == 1
-    assert mock_areal_client.chat.completions.create.await_count == before
-    rewarded = await client.post(
-        "/rl/set_reward",
-        json={"reward": 1.0, "areal_episode": next_identity},
-        headers=headers,
-    )
-    assert rewarded.status_code == 200
-    assert rewarded.json()["trajectory_id"] == 1
-    assert (
-        await client.post(
-            "/rl/set_reward",
-            json={"reward": 2.0, "areal_episode": next_identity},
-            headers=headers,
-        )
-    ).status_code == 409
-    # The training ledger may explicitly reject the received sample. The
-    # source still remembers its reward receipt after the next episode starts.
-    ledger_episode = (await client.post("/rl/current_episode", headers=headers)).json()
-    assert ledger_episode["trajectory_id"] == 2
-    episode_id = (
-        client._transport.app.state.session_store.get_session(credentials["session_id"])
-        .pending_online_callbacks()[0]
-        .episode_id
-    )
-    inbox.reject(episode_id, "test consumer rejection")
-    third_identity = {**identity, "trajectory_id": 2}
-    assert (
-        await client.post(
-            "/chat/completions",
-            json={**body, "areal_episode": third_identity},
-            headers=headers,
-        )
-    ).status_code == 200
-    replayed = await client.post(
-        "/rl/set_reward",
-        json={"reward": 1.0, "areal_episode": next_identity},
-        headers=headers,
-    )
-    assert replayed.status_code == 200
-    assert replayed.json()["ready_transition"] is False
-    assert (await client.post("/rl/current_episode", headers=headers)).json()[
-        "trajectory_id"
-    ] == 2
-    assert inbox.status()["active_credits"] == 1
-    # Key refresh must not strand a new episode behind an older ready sample.
-    assert (
-        await client.post(
-            "/rl/start_session",
-            json={"task_id": "replacement", "api_key": credentials["session_api_key"]},
-            headers=admin_headers(),
-        )
-    ).status_code == 409
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("phase", ["admission", "generation"])
-async def test_lost_online_reply_only_allows_abort_before_backend_dispatch(
-    client, config, monkeypatch, tmp_path, mock_areal_client, phase
-):
-    import json
-
-    from areal.elastic.state.episode_inbox import OnlineInbox
-
-    inbox = OnlineInbox(tmp_path, batch_size=1, max_staleness=0)
-    config.online_training_admission = True
-    config.callback_server_addr = "http://ledger"
-
-    async def callback(request):
-        body = json.loads(request.content)
-        if request.url.path.endswith("online_admit"):
-            result = inbox.admit(
-                body["source_id"], body["session_id"], body["trajectory_id"]
-            )
-            if phase == "admission":
-                raise httpx.ReadError("admitted, response lost", request=request)
-        else:
-            result = inbox.cancel_admission(**body)
-        return httpx.Response(200, json=result)
-
-    monkeypatch.setattr(
-        "areal.v2.inference_service.data_proxy.app.create_httpx_client",
-        lambda **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(callback)),
-    )
-    if phase == "generation":
-        mock_areal_client.chat.completions.create.side_effect = TimeoutError(
-            "backend outcome unknown"
-        )
-    credentials = (
-        await client.post(
-            "/rl/start_session", json={"task_id": "lost-reply"}, headers=admin_headers()
-        )
-    ).json()["sessions"][0]
-    headers = session_headers(credentials["session_api_key"])
-    generated = await client.post(
-        "/chat/completions",
-        json={"messages": [], "areal_episode": credentials["areal_episode"]},
-        headers=headers,
-    )
-    assert generated.status_code == (503 if phase == "admission" else 500)
-    assert inbox.status()["active_credits"] == 1
-    current = (await client.post("/rl/current_episode", headers=headers)).json()
-    assert current["state"] == (
-        "admission_unconfirmed" if phase == "admission" else "quarantined"
-    )
-    aborted = await client.post("/rl/abort_episode", json=current, headers=headers)
-    assert aborted.status_code == (200 if phase == "admission" else 409)
-    assert inbox.status()["active_credits"] == (0 if phase == "admission" else 1)
-    assert mock_areal_client.chat.completions.create.await_count == (
-        0 if phase == "admission" else 1
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("lose_ack", [False, True])
-async def test_durable_online_handoff_retries_without_dummy_workflows(
-    client, config, monkeypatch, tmp_path, lose_ack
-):
-    import json
-
-    from areal.api.cli_args import AgentConfig, InferenceEngineConfig
-    from areal.elastic.state.episode_inbox import OnlineInbox
-    from areal.v2.inference_service.controller.controller import RolloutControllerV2
-
-    monkeypatch.setattr("areal.utils.network.gethostip", lambda: "127.0.0.1")
-    inbox = OnlineInbox(tmp_path, batch_size=4, max_staleness=2)
-    controller = RolloutControllerV2(
-        config=InferenceEngineConfig(
-            backend="sglang:d1",
-            admin_api_key=ADMIN_KEY,
-            consumer_batch_size=4,
-            max_head_offpolicyness=2,
-            agent=AgentConfig(
-                mode="online",
-                agent_cls_path="areal.experimental.openai.proxy.online_agent._OnlineAgent",
-            ),
-        ),
-        scheduler=MagicMock(n_gpus_per_node=8),
-    )
-    controller.configure_online_training(inbox)
-    controller._gateway_addr = "http://proxy"
-    app = client._transport.app
-    exports, lost = [], False
-
-    async def export(request):
-        nonlocal lost
-        body = json.loads(request.content)
-        exports.append(body)
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
-        ) as proxy:
-            response = await proxy.post(
-                "/export_trajectories", json=body, headers=admin_headers()
-            )
-        if body.get("acknowledge_only") and lose_ack and not lost:
-            lost = True
-            raise httpx.ReadError(
-                "Source accepted ack; response was lost", request=request
-            )
-        return httpx.Response(
-            response.status_code, content=response.content, request=request
-        )
-
-    monkeypatch.setattr(
-        "areal.v2.inference_service.controller.controller.create_httpx_client",
-        lambda **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(export)),
-    )
-    controller._start_online_callback_server()
-    config.online_training_admission = True
-    config.callback_server_addr = f"http://{controller.callback_addr}"
-    try:
-        for number in range(4):
-            start = await client.post(
-                "/rl/start_session",
-                json={"task_id": f"durable-{number}"},
-                headers=admin_headers(),
-            )
-            credentials = start.json()["sessions"][0]
-            assert inbox.status()["active_credits"] == number
-            headers = session_headers(credentials["session_api_key"])
-            for _ in range(2):
-                generated = await client.post(
-                    "/chat/completions",
-                    json={
-                        "model": "sglang",
-                        "areal_episode": credentials["areal_episode"],
-                        "messages": [{"role": "user", "content": "q"}],
-                    },
-                    headers=headers,
-                )
-                assert generated.status_code == 200
-                assert inbox.status()["active_credits"] == number + 1
-            assert (
-                await client.post(
-                    "/rl/set_reward",
-                    json={"reward": 1.0, "areal_episode": credentials["areal_episode"]},
-                    headers=headers,
-                )
-            ).status_code == 200
-            notifications = app.state.session_store.pending_online_callbacks()
-            assert len(notifications) == 1
-            assert (
-                await client.post(
-                    "/export_trajectories",
-                    json={"session_ids": [credentials["session_id"]]},
-                    headers=admin_headers(),
-                )
-            ).status_code == 400
-            await _flush_ready_trajectories(app)
-            if number == 0 and lose_ack:
-                assert len(app.state.session_store.pending_online_callbacks()) == 1
-                await _flush_ready_trajectories(app)
-            assert app.state.session_store.pending_online_callbacks() == []
-            notification = notifications[0]
-            # Lost callback response causes a duplicate callback after source ack.
-            assert (
-                await controller._handle_online_ready_callback(
-                    {
-                        "session_id": notification.session_id,
-                        "trajectory_id": notification.trajectory_id,
-                        "episode_id": notification.episode_id,
-                        "lease": notification.lease,
-                    }
-                )
-            )["status"] == "ok"
-        assert inbox.status()["active_credits"] == 4
-        assert inbox.status()["counts"] == {"ready": 4}
-        assert inbox.seal_batch(0) is not None
-        assert len(exports) == 8 + int(lose_ack)
-        assert not controller._completed_online_results
-        assert controller._workflow_executor is None
-        # A reused textual session ID denotes a new incarnation, never old data.
-        old_notification = notification
-        old_session_id = credentials["session_id"]
-        app.state.session_store.remove_session(old_session_id)
-        restarted = await client.post(
-            "/rl/start_session", json={"task_id": "durable-3"}, headers=admin_headers()
-        )
-        credentials = restarted.json()["sessions"][0]
-        assert credentials["session_id"] == old_session_id
-        headers = session_headers(credentials["session_api_key"])
-        assert (
-            await client.post(
-                "/chat/completions",
-                json={
-                    "model": "sglang",
-                    "areal_episode": credentials["areal_episode"],
-                    "messages": [{"role": "user", "content": "new"}],
-                },
-                headers=headers,
-            )
-        ).status_code == 200
-        assert (
-            await client.post(
-                "/rl/set_reward",
-                json={"reward": 2.0, "areal_episode": credentials["areal_episode"]},
-                headers=headers,
-            )
-        ).status_code == 200
-        new_notification = app.state.session_store.pending_online_callbacks()[0]
-        assert new_notification.episode_id != old_notification.episode_id
-        assert inbox.status()["active_credits"] == 5
-        stale_ack = await client.post(
-            "/export_trajectories",
-            json={
-                "session_ids": [old_session_id],
-                "trajectory_id": 0,
-                "remove_session": False,
-                "acknowledge_only": True,
-                "episode_id": old_notification.episode_id,
-                "lease": old_notification.lease,
-                "handoff_digest": inbox.episode(old_notification.episode_id)["digest"],
-            },
-            headers=admin_headers(),
-        )
-        assert stale_ack.status_code == 409
-        await _flush_ready_trajectories(app)
-        assert inbox.status()["counts"] == {"reserved": 4, "ready": 1}
-        # Explicit abort uses the same real authenticated callback server.
-        async with httpx.AsyncClient() as callback_client:
-            unauthorized = await callback_client.post(
-                f"http://{controller.callback_addr}/callback/online_abort", json={}
-            )
-            assert unauthorized.status_code == 403
-        abandoned = (
-            await client.post(
-                "/rl/start_session",
-                json={"task_id": "abandoned"},
-                headers=admin_headers(),
-            )
-        ).json()["sessions"][0]
-        abandoned_headers = session_headers(abandoned["session_api_key"])
-        assert (
-            await client.post(
-                "/chat/completions",
-                json={"messages": [], "areal_episode": abandoned["areal_episode"]},
-                headers=abandoned_headers,
-            )
-        ).status_code == 200
-        assert inbox.status()["active_credits"] == 6
-        identity = (
-            await client.post("/rl/current_episode", headers=abandoned_headers)
-        ).json()
-        for _ in range(2):
-            assert (
-                await client.post(
-                    "/rl/abort_episode", json=identity, headers=abandoned_headers
-                )
-            ).status_code == 200
-            assert inbox.status()["active_credits"] == 5
-    finally:
-        controller._stop_online_callback_server()
-
-
-@pytest.mark.asyncio
-async def test_retained_export_requires_inline_payload_without_allocating_shards(
-    client, monkeypatch
-):
-    remotize = MagicMock()
-    monkeypatch.setattr(
-        "areal.v2.inference_service.data_proxy.app.RTensor.remotize", remotize
-    )
-    response = await client.post(
-        "/export_trajectories",
-        json={
-            "session_ids": ["missing"],
-            "trajectory_id": 0,
-            "remove_session": False,
-            "consume": False,
-        },
-        headers=admin_headers(),
-    )
-    assert response.status_code == 400
-    assert "inline_tensors" in response.text
-    remotize.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_retained_normalized_peek_preserves_original_rewards(client):
-    import torch
-
-    from areal.infra.rpc.serialization import deserialize_value
-
-    start = await client.post(
-        "/rl/start_session",
-        json={"task_id": "retained-group", "group_size": 2},
-        headers=admin_headers(),
-    )
-    sessions = start.json()["sessions"]
-    for session, reward in zip(sessions, (1.0, 3.0)):
-        headers = session_headers(session["session_api_key"])
-        assert (
-            await client.post(
-                "/chat/completions",
-                json={
-                    "model": "sglang",
-                    "messages": [{"role": "user", "content": "q"}],
-                },
-                headers=headers,
-            )
-        ).status_code == 200
-        assert (
-            await client.post(
-                "/rl/set_reward", json={"reward": reward}, headers=headers
-            )
-        ).status_code == 200
-    body = {
-        "session_ids": [session["session_id"] for session in sessions],
-        "trajectory_id": 0,
-        "remove_session": False,
-        "consume": False,
-        "inline_tensors": True,
-        "reward_normalization": True,
-    }
-    first = await client.post(
-        "/export_trajectories", json=body, headers=admin_headers()
-    )
-    second = await client.post(
-        "/export_trajectories", json=body, headers=admin_headers()
-    )
-    assert first.status_code == second.status_code == 200
-    assert first.json() == second.json()
-    normalized = deserialize_value(second.json()["traj"])
-    torch.testing.assert_close(
-        normalized["original_rewards"].flatten(),
-        torch.tensor([1.0, 3.0]),
-        rtol=0,
-        atol=0,
-    )
-    raw = await client.post(
-        "/export_trajectories",
-        json={**body, "reward_normalization": False},
-        headers=admin_headers(),
-    )
-    torch.testing.assert_close(
-        deserialize_value(raw.json()["traj"])["rewards"].flatten(),
-        torch.tensor([1.0, 3.0]),
-        rtol=0,
-        atol=0,
-    )
-
-
-@pytest.mark.asyncio
-async def test_retained_export_roundtrip_keeps_session_for_next_trajectory(client):
-    start = await client.post(
-        "/rl/start_session",
-        json={"task_id": "retained-roundtrip"},
-        headers=admin_headers(),
-    )
-    credentials = start.json()["sessions"][0]
-    key = credentials["session_api_key"]
-    session_id = credentials["session_id"]
-    for trajectory_id in range(2):
+        await asyncio.sleep(0)
+        finish.set()
+        assert (await first).status_code == 200
+        assert (await drain).json() == {"status": "drained", "active": 0}
+        assert not second.done()
+        assert session._next_sampling_request_index == 1
         response = await client.post(
-            "/chat/completions",
-            json={
-                "model": "sglang",
-                "messages": [{"role": "user", "content": "question"}],
-            },
-            headers=session_headers(key),
+            "/configure_backend",
+            headers=admin_headers(),
+            json={"backend_addr": "http://new-backend"},
         )
         assert response.status_code == 200
-        reward = await client.post(
-            "/rl/set_reward",
-            json={"reward": 1.0},
-            headers=session_headers(key),
+        new_bridge.set_version.assert_called_once_with(7)
+        old_bridge.aclose.assert_awaited_once()
+        armed = await client.post(
+            "/reconfiguration/observe",
+            headers=admin_headers(),
+            json={"transition_id": "resume-normal"},
         )
-        assert reward.json()["trajectory_id"] == trajectory_id
-        export = {
-            "session_ids": [session_id],
-            "trajectory_id": trajectory_id,
-            "style": "individual",
-            "remove_session": False,
-            "consume": False,
-            "inline_tensors": True,
-        }
-        first = await client.post(
-            "/export_trajectories", json=export, headers=admin_headers()
-        )
-        second = await client.post(
-            "/export_trajectories", json=export, headers=admin_headers()
-        )
-        assert first.status_code == second.status_code == 200
-        assert first.json() == second.json()
-        assert first.json()["traj"]
-        for _ in range(2):
-            ack = await client.post(
-                "/export_trajectories",
-                json={**export, "acknowledge_only": True},
+        assert armed.json()["status"] == "armed"
+        await client.post("/reconfiguration/open", headers=admin_headers())
+        assert (await second).status_code == 200
+        metrics = (
+            await client.get("/reconfiguration/metrics", headers=admin_headers())
+        ).json()
+        assert metrics["first_call"]["transition_id"] == "resume-normal"
+        assert metrics["first_call"]["status"] == "completed"
+        assert metrics["first_call"]["admitted_to_response_seconds"] >= 0
+        assert metrics["first_call"]["admission_wait_seconds"] >= 0
+    assert store.get_session_by_api_key(key) is session
+    assert session._next_sampling_request_index == 2
+    assert len(session.active_completions) == 2
+    assert mock_areal_client.chat.completions.create.await_count == 1
+    assert new_client.chat.completions.create.await_count == 1
+    assert app.state.generation_gate.active == 0
+
+
+@pytest.mark.asyncio
+async def test_resource_drain_waits_for_admin_stream_completion(config):
+    import asyncio
+
+    app = create_app(config)
+    store = SessionStore()
+    store.set_admin_key(config.admin_api_key)
+    app.state.session_store = store
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def chunks():
+        entered.set()
+        await finish.wait()
+        yield MagicMock(model_dump_json=lambda: '{"choices":[]}')
+
+    app.state.areal_client = MagicMock()
+    app.state.areal_client.chat.completions.create = AsyncMock(return_value=chunks())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        stream = asyncio.create_task(
+            client.post(
+                "/chat/completions",
                 headers=admin_headers(),
+                json={"model": "math", "messages": [], "stream": True},
             )
-            assert ack.status_code == 200
+        )
+        await entered.wait()
+        drain = asyncio.create_task(
+            client.post(
+                "/reconfiguration/drain", headers=admin_headers(), json={"timeout": 5}
+            )
+        )
+        await asyncio.sleep(0)
+        assert app.state.generation_gate.active == 1 and not drain.done()
+        finish.set()
+        assert (await stream).status_code == 200
+        assert (await drain).json() == {"status": "drained", "active": 0}

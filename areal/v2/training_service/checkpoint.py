@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,10 +14,9 @@ from areal.utils.atomic import atomic_json, recovery_digest
 from .runtime_state import (
     capture_runtime_state,
     restore_random_state,
-    restore_runtime_state,
 )
 
-Backend = Literal["fsdp", "megatron"]
+Backend = Literal["megatron"]
 
 
 def _tracker() -> Any:
@@ -66,6 +66,7 @@ def _report(state: dict[str, Any]) -> dict[str, Any]:
             )
         },
         "state_sha256": recovery_digest(state),
+        "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
 
 
@@ -96,7 +97,7 @@ def inspect_full_checkpoint(
     loading: bool = False,
 ) -> dict[str, Any]:
     """Collective-free preflight; every rank must pass before any rank loads."""
-    if backend not in ("fsdp", "megatron") or type(version) is not int or version < 1:
+    if backend != "megatron" or type(version) is not int or version < 1:
         raise ValueError(
             "Full checkpoint requires a supported backend and positive version"
         )
@@ -206,19 +207,18 @@ def load_full_checkpoint(
     engine.load(
         SaveLoadMeta(path=str(Path(path) / "dcp"), weight_format="dcp", with_optim=True)
     )
-    if backend == "fsdp":
-        restore_runtime_state(engine, state)
-    else:
-        # Megatron's DCP loader already restores the scheduler. Its load method
-        # advances by the saved num_steps, so applying the sidecar a second time
-        # would double that progress. The digest below verifies the DCP restore.
-        engine.set_version(version)
+    # MCore DCP restores the scheduler; applying a sidecar scheduler twice
+    # would double its progress. The digest below verifies the loaded state.
+    engine.set_version(version)
     if [group["lr"] for group in engine.optimizer.param_groups] != state[
         "optimizer_group_lrs"
     ]:
         raise ValueError("Restored optimizer learning rates disagree with checkpoint")
     _restore_rng(engine, state)
-    actual = _capture(engine, backend, identity_sha256)
+    # Optional RNG metadata was added without invalidating legacy sidecars.
+    # Compare/report exactly the fields that were validated in the preflight.
+    captured = _capture(engine, backend, identity_sha256)
+    actual = {key: captured[key] for key in state}
     if recovery_digest(actual) != recovery_digest(state):
         different_fields = sorted(
             key

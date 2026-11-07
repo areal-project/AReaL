@@ -34,6 +34,7 @@ def run_episode(
     model: str,
     sampling: dict[str, Any],
     episode: dict[str, Any] | None = None,
+    session_id: str | None = None,
     mock: bool = False,
     runtime: Any = None,
 ) -> dict[str, Any]:
@@ -91,8 +92,9 @@ def run_episode(
             "completed": bool(result.get("completed")),
             "model_calls": result.get("api_calls", 0),
             "model_mode": "mock" if mock else "external",
-            "training_eligible": not mock and episode is not None,
+            "training_eligible": not mock and bool(session_id or episode),
             "areal_episode": episode,
+            "areal_session_id": session_id,
             "sampling": sampling,
         }
         write_json(output / "answer.json", answer)
@@ -120,6 +122,7 @@ def main() -> None:
         model=os.environ["MODEL_NAME"],
         sampling=json.loads(os.environ["AUTOPILOT_SAMPLING_JSON"]),
         episode=episode,
+        session_id=os.environ.get("AUTOPILOT_AREAL_SESSION_ID"),
     )
     write_json(
         Path(os.environ["ARENA_OUTPUT_DIR"]) / "harness_result.json",

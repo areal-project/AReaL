@@ -226,6 +226,7 @@ class ArenaExecutor:
         api_key: str,
         model: str,
         episode: dict | None,
+        session_id: str | None = None,
     ) -> TaskExecution:
         row = self.config.match(task.task_id, task.message)
         if task.environment.kind != "python":
@@ -262,6 +263,8 @@ class ArenaExecutor:
             envs = {"AUTOPILOT_SAMPLING_JSON": json.dumps(value["sampling"])}
             if episode:
                 envs["AUTOPILOT_AREAL_EPISODE_JSON"] = json.dumps(episode)
+            if session_id:
+                envs["AUTOPILOT_AREAL_SESSION_ID"] = session_id
             launched = await self.api.call(
                 "stream",
                 "launch",
@@ -333,10 +336,11 @@ class ArenaExecutor:
         if (
             answer["model_mode"] != value["model_mode"]
             or answer.get("areal_episode") != episode
+            or answer.get("areal_session_id") != session_id
             or answer["sampling"] != value["sampling"]
         ):
             raise RuntimeError("Arena answer provenance differs from this episode")
-        if episode and (
+        if (session_id or episode) and (
             value["model_mode"] != "external" or not answer.get("training_eligible")
         ):
             raise RuntimeError("Scripted or unidentified samples cannot enter training")

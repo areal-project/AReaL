@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "kind": "systems",
+  "id": "h20-actor8-rollout8",
+  "version": "1",
+  "values": {
+    "hardware_profile": "h20",
+    "hardware": {
+      "name": "H20-node8-component-calibration-prior",
+      "intra_node_gbps": 450,
+      "inter_node_gbps": 1,
+      "gpus_per_node": 8,
+      "intra_latency_us": 3,
+      "inter_latency_us": 12
+    },
+    "max_nodes": 2,
+    "group_gbps": [],
+    "topology": {
+      "gpu_count": 16,
+      "role_node_local": true,
+      "actor_devices": [
+        "actor-node/gpu0",
+        "actor-node/gpu1",
+        "actor-node/gpu2",
+        "actor-node/gpu3",
+        "actor-node/gpu4",
+        "actor-node/gpu5",
+        "actor-node/gpu6",
+        "actor-node/gpu7"
+      ],
+      "rollout_devices": [
+        "rollout-node/gpu0",
+        "rollout-node/gpu1",
+        "rollout-node/gpu2",
+        "rollout-node/gpu3",
+        "rollout-node/gpu4",
+        "rollout-node/gpu5",
+        "rollout-node/gpu6",
+        "rollout-node/gpu7"
+      ],
+      "device_nodes": {
+        "actor-node/gpu0": "actor-node",
+        "actor-node/gpu1": "actor-node",
+        "actor-node/gpu2": "actor-node",
+        "actor-node/gpu3": "actor-node",
+        "actor-node/gpu4": "actor-node",
+        "actor-node/gpu5": "actor-node",
+        "actor-node/gpu6": "actor-node",
+        "actor-node/gpu7": "actor-node",
+        "rollout-node/gpu0": "rollout-node",
+        "rollout-node/gpu1": "rollout-node",
+        "rollout-node/gpu2": "rollout-node",
+        "rollout-node/gpu3": "rollout-node",
+        "rollout-node/gpu4": "rollout-node",
+        "rollout-node/gpu5": "rollout-node",
+        "rollout-node/gpu6": "rollout-node",
+        "rollout-node/gpu7": "rollout-node"
+      }
+    }
+  },
+  "provenance": {
+    "evidence": "assumed",
+    "scope": "Actor<=8 H20 and Rollout<=8 H20, each within one node. Logical system assembled from independent component measurements; not a physical joint-run observation.",
+    "network": "450GB/s intra-node one-direction peak prior, not effective measured bandwidth. Required positive inter_node_gbps=1 is an unused placeholder; no off-node parallel groups allowed.",
+    "transitions": "Publication, restore, rebuild, optimizer redistribution and interference require separate explicit transition profiles; missing costs remain unsupported."
+  }
+}

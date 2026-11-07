@@ -1,40 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Elastic evaluators and revision adapters for AutoPilot."""
+"""Online Reference revision; generic revision machinery lives outside this domain."""
 
-from .cycle import PolicyRevisionCycle
-from .evaluator import AcceptanceCriteria, RevisionEvaluator
-from .joint_evaluator import JointOptimizerCriteria, JointOptimizerEvaluator
-from .loaders import apply_accepted_revision, load_accepted_model
-from .model_adapters import BasicHistoryPredictor
-from .model_evaluator import (
+from areal.autopilot.domains.elastic.cycle import (
+    ReconfiguratorRevisionCycle,
+)
+from areal.autopilot.domains.elastic.evaluation.evaluator import (
+    CostModelAcceptanceCriteria,
+    CostModelHistoryBenchmark,
+    EvaluatorRevisionBenchmark,
     HistoricalCase,
     HistoricalInput,
-    HistoricalModelEvaluator,
-    HistoricalPrediction,
-    HistoryReport,
     HistorySpan,
-    ModelAcceptanceCriteria,
-    ModelComparison,
 )
-from .model_execution import HistoricalSourceEvaluator
+from areal.autopilot.domains.elastic.evaluation.optimizer import (
+    OptimizerRevisionBenchmark,
+    OptimizerRevisionCriteria,
+)
+from areal.autopilot.domains.elastic.trigger import (
+    RevisionTrigger,
+    RevisionTriggerConfig,
+)
+from areal.autopilot.domains.elastic.versions import (
+    load_accepted_cost_models,
+    load_accepted_optimizer,
+)
 
 __all__ = [
-    "PolicyRevisionCycle",
-    "AcceptanceCriteria",
-    "RevisionEvaluator",
-    "JointOptimizerCriteria",
-    "JointOptimizerEvaluator",
-    "apply_accepted_revision",
-    "load_accepted_model",
-    "BasicHistoryPredictor",
+    "ReconfiguratorRevisionCycle",
+    "RevisionTrigger",
+    "RevisionTriggerConfig",
+    "load_accepted_cost_models",
+    "load_accepted_optimizer",
     "HistoricalCase",
     "HistoricalInput",
-    "HistoricalModelEvaluator",
-    "HistoricalPrediction",
-    "HistoryReport",
+    "CostModelHistoryBenchmark",
     "HistorySpan",
-    "ModelAcceptanceCriteria",
-    "ModelComparison",
-    "HistoricalSourceEvaluator",
+    "CostModelAcceptanceCriteria",
+    "EvaluatorRevisionBenchmark",
+    "OptimizerRevisionCriteria",
+    "OptimizerRevisionBenchmark",
 ]

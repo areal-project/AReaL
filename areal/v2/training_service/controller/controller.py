@@ -8,7 +8,8 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import asdict
 from functools import wraps
 from threading import Lock
 from typing import TYPE_CHECKING, Any
@@ -18,6 +19,7 @@ import aiohttp
 
 from areal.infra.utils.concurrent import get_executor, run_async_task
 from areal.infra.utils.http import create_httpx_client
+from areal.infra.utils.process import wait_for_gpu_release
 from areal.utils import logging
 from areal.utils.network import format_hostport, gethostip
 
@@ -168,8 +170,6 @@ class GatewayTrainController:
         ft_spec: FinetuneSpec | None = None,
         **kwargs: Any,
     ) -> None:
-        from dataclasses import asdict
-
         from areal.api.cli_args import SchedulingSpec
         from areal.api.scheduler_api import Job
 
@@ -845,7 +845,7 @@ class GatewayTrainController:
         identity_sha256: str,
         version: int,
     ) -> list[dict[str, Any]]:
-        """Preflight all ranks before a native collective save/load, with no retries."""
+        """Save/load full Megatron state; inspect all ranks before collectives."""
         self._ensure_initialized()
         if operation not in ("save", "load"):
             raise ValueError("Full checkpoint operation must be save or load")
@@ -1080,10 +1080,7 @@ class GatewayTrainController:
                 return
             # Preserve the old handle until both peers confirm cleanup. A
             # partially initialized pair must also pass through disconnect.
-            self._weight_update_ctrl.disconnect()
-            self._weight_update_ctrl.destroy()
-            self._weight_update_ctrl = None
-            self._weight_update_identity = None
+            self._disconnect_weight_update()
 
         self.rollout = rollout
         ctrl = WeightUpdateController(
@@ -1275,15 +1272,23 @@ class GatewayTrainController:
         run_async_task(_shutdown_all)
         logger.info("All training worker engines destroyed gracefully")
 
-    def _cleanup_runtime_state(self, *, training_stopped: bool = False) -> None:
+    @_exclusive_engine_operation
+    def disconnect_engine(self) -> None:
+        """Release weight-transfer peers while retaining training workers/state."""
+        self._disconnect_weight_update()
+
+    def _disconnect_weight_update(self, *, training_stopped: bool = False) -> None:
         if self._weight_update_ctrl is not None:
-            # A live inference generation must release its old communicator
-            # before the training peers disappear. Propagate uncertainty so
-            # callers cannot treat an unconfirmed release as reusable GPUs.
-            self._weight_update_ctrl.disconnect()
+            if training_stopped:
+                self._weight_update_ctrl.disconnect(training_stopped=True)
+            else:
+                self._weight_update_ctrl.disconnect()
             self._weight_update_ctrl.destroy()
             self._weight_update_ctrl = None
             self._weight_update_identity = None
+
+    def _cleanup_runtime_state(self, *, training_stopped: bool = False) -> None:
+        self._disconnect_weight_update()
 
         if self._router_addr and self._model_addr:
             try:
@@ -1355,11 +1360,19 @@ class GatewayTrainController:
             self._own_process_group = False
 
     @_exclusive_engine_operation
-    def destroy(self, *, training_stopped: bool = False) -> None:
+    def destroy(
+        self,
+        *,
+        training_stopped: bool = False,
+        release_devices: Sequence[int] | None = None,
+    ) -> None:
+        """Stop training services and optionally confirm declared local GPUs are free."""
         self.quiesce_initialization()
         if training_stopped:
             self.disconnect_stopped_training()
         self._cleanup_runtime_state(training_stopped=training_stopped)
+        if release_devices is not None:
+            wait_for_gpu_release(release_devices, timeout=self.config.setup_timeout)
 
     @_exclusive_engine_operation
     def disconnect_stopped_training(self) -> None:
@@ -1368,11 +1381,7 @@ class GatewayTrainController:
         The surviving inference peers must still acknowledge communicator
         teardown. A timeout or a failed worker RPC is never sufficient proof.
         """
-        if self._weight_update_ctrl is not None:
-            self._weight_update_ctrl.disconnect(training_stopped=True)
-            self._weight_update_ctrl.destroy()
-            self._weight_update_ctrl = None
-            self._weight_update_identity = None
+        self._disconnect_weight_update(training_stopped=True)
 
     def quiesce_initialization(self, timeout: float | None = None) -> None:
         """Wait for a running launch to stop before deleting its resources."""

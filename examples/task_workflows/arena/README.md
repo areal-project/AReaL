@@ -94,14 +94,19 @@ correctness. `run` repeats that check before submitting. `--inference-url` is th
 without `/v1`; `--inference-key-env` can select another environment variable. Removing
 `--limit` submits the supplied frozen file, not every question in the Stream.
 
-For online RL, start the existing v2 Rollout and Actor/Trainer, then use
-`--mode on_demand --state-root "$AREAL_TASK_STATE_ROOT"` on the Trainer host. The shared
-`EpisodeClient` creates one session, waits for admission, submits Arena with the session
-key and exact `areal_episode`, reads the separate Reward, calls AReaL's `set_reward`,
-and observes the existing inbox digest and source ACK. No Agent Service is started.
-`--mode resident` submits reward without verifying an inbox; both training modes require
-the gateway to return explicit episode identity. Actual Actor consumption and updates
-must be verified separately. Configure the existing reward finish timeout to zero.
+For online RL, start the existing v2 Rollout and Actor/Trainer and use
+`--mode resident`. The shared `EpisodeClient` creates one session, submits Arena with
+its session key and `AUTOPILOT_AREAL_SESSION_ID`, reads the separate Reward, and calls
+AReaL's `set_reward`. Native inference captures the session's tokens and hands the
+sealed trajectory to Trainer. No Agent Service is started. Configure the reward finish
+timeout to zero. The client checks the reward receipt; actual Actor consumption and
+updates require independent verification.
+
+The old `on_demand` mode, `--state-root`, `--handoff-timeout` and SQLite inbox audit
+were removed with the Elastic runtime refactor. Use a new run directory for the new
+session protocol. Rebuild and publish an immutable runner version that emits
+`areal_session_id`, then update the pinned Harness reference and spec digest; the
+previously published `0.1.3` runner does not implement this session provenance.
 
 The run directory snapshots configuration, selected tasks (including private labels),
 the index and stable request IDs. Per-episode `state.json` holds session credentials
@@ -113,10 +118,10 @@ processes resuming the same run simultaneously.
 
 Resume reuses saved identities and completed results. It never automatically resubmits
 an Arena launch whose acceptance is unknown. A session-creation intent with no saved
-response also requires operator inspection. For an identified online episode, an
-unconfirmed reward can be replayed using AReaL's existing idempotent receipt semantics.
-Resume cannot repair expired sessions, lost inference workers, or uncertain generations.
-Mock configurations are refused for training.
+response also requires operator inspection. With the native session protocol, an
+unconfirmed reward submission requires inspection before retrying; a saved reward
+receipt is reused. Resume cannot repair expired sessions, lost inference workers, or
+uncertain generations. Mock configurations are refused for training.
 
 Explicit Job IDs follow the legacy `short-name-YYMMDDHHMM` constraint. The client
 combines a request digest with a UTC timestamp and checkpoints the selected ID before
@@ -173,10 +178,12 @@ Reward, publish it as one `files` entry with a filename destination and execute 
 The external-model runner reads `ARENA_QUERY_PATH`, `ARENA_AGENT_OUTPUT_DIR`,
 `ARENA_OUTPUT_DIR`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `MODEL_NAME`.
 `AUTOPILOT_SAMPLING_JSON` must contain explicit `max_tokens`, `temperature` and `top_p`
-from the experiment configuration. Optional `AUTOPILOT_AREAL_EPISODE_JSON` contains the
-exact `incarnation_id` and integer `trajectory_id` returned by AReaL. It is bound to all
-SDK generation clients, including recreated/summary clients. Arena's own `session_id`
-alone does not perform this binding.
+from the experiment configuration. `AUTOPILOT_AREAL_SESSION_ID` records the native
+training session in the answer. All SDK generation clients use that session's
+`OPENAI_API_KEY`, including recreated/summary clients. The session ID is provenance
+metadata; authentication and token capture use the key. Optional
+`AUTOPILOT_AREAL_EPISODE_JSON` remains supported for legacy bindings and the scripted
+smoke. Arena's own `session_id` alone does not bind model calls to AReaL.
 
 The agent writes `answer.json`, `environment.json`, `call_trace.json`, and per-call
 `tools/.../tools.jsonl`. Declare those paths in `io_contract.artifact_globs`.
@@ -238,6 +245,6 @@ requests, the tool output and the request/tool/request trace edges. Smoke sample
 `model_mode=mock`, synthetic usage and `training_eligible=false`. They demonstrate
 integration and must not be used as model-quality or RL evidence.
 
-The real RL caller still owns session admission, reward submission, trajectory
-sealing/export and durable handoff. Verify actual model token capture and these
-boundaries against the running AReaL inference service before training.
+The real RL caller and native Trainer still own sessions, reward submission, trajectory
+sealing/export and consumption. Verify actual model token capture and these boundaries
+against the running AReaL inference service before training.

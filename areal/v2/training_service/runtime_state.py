@@ -3,6 +3,7 @@
 """Per-rank scheduler, version and RNG state for native training checkpoints."""
 
 import random
+import sys
 from typing import Any
 
 
@@ -11,6 +12,7 @@ def capture_runtime_state(engine: Any) -> dict[str, Any]:
     import torch
 
     np_state = np.random.get_state()
+    seeding = sys.modules.get("areal.utils.seeding")
     return {
         "format_version": 1,
         "rank": engine.rank,
@@ -25,26 +27,18 @@ def capture_runtime_state(engine: Any) -> dict[str, Any]:
             if engine.device.type == "cuda"
             else None
         ),
+        "seed_state": None
+        if seeding is None
+        else {
+            "seed": seeding._SEED,
+            "base_seed": seeding._BASE_SEED,
+            "shuffler": None
+            if seeding._SHUFFLER is None
+            else vars(seeding._SHUFFLER).copy(),
+        },
+        # Preserve the null field in existing Megatron sidecar digests.
+        "dtensor_rng": None,
     }
-
-
-def restore_runtime_state(engine: Any, state: dict[str, Any]) -> None:
-    if state["format_version"] != 1:
-        raise ValueError("Unsupported runtime state format")
-    if (state["rank"], state["world_size"]) != (engine.rank, engine.world_size):
-        raise ValueError("Runtime state rank/world size mismatch")
-    needs_cuda = engine.device.type == "cuda"
-    if needs_cuda != (state["cuda_rng"] is not None):
-        raise ValueError("Runtime state device type mismatch")
-    engine.lr_scheduler.load_state_dict(state["lr_scheduler"])
-    expected_lrs = engine.lr_scheduler.get_last_lr()
-    actual_lrs = [g["lr"] for g in engine.optimizer.param_groups]
-    if actual_lrs != expected_lrs:
-        raise ValueError(
-            f"Optimizer/scheduler learning rates disagree: {actual_lrs} != {expected_lrs}"
-        )
-    engine.set_version(state["policy_version"])
-    restore_random_state(engine, state)
 
 
 def restore_random_state(engine: Any, state: dict[str, Any]) -> None:
@@ -68,3 +62,12 @@ def restore_random_state(engine: Any, state: dict[str, Any]) -> None:
         torch.cuda.set_rng_state(
             torch.tensor(state["cuda_rng"], dtype=torch.uint8), engine.device
         )
+    if state.get("seed_state") is not None:
+        from areal.utils import seeding
+
+        metadata = state["seed_state"]
+        seeding._SEED, seeding._BASE_SEED = metadata["seed"], metadata["base_seed"]
+        seeding._SHUFFLER = None
+        if metadata["shuffler"] is not None:
+            seeding._SHUFFLER = seeding.Shuffler()
+            vars(seeding._SHUFFLER).update(metadata["shuffler"])

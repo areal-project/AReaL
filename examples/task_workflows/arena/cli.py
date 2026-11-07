@@ -78,10 +78,8 @@ async def run(args: argparse.Namespace) -> int:
             "inference_url": args.inference_url.rstrip("/"),
             "model": args.model,
             "inference_key_env": args.inference_key_env,
-            "state_root": str(args.state_root.resolve()) if args.state_root else None,
             "concurrency": args.concurrency,
             "request_timeout": args.request_timeout,
-            "handoff_timeout": args.handoff_timeout,
         }
         run_info = {
             "format_version": 1,
@@ -112,10 +110,8 @@ async def run(args: argparse.Namespace) -> int:
             model=options["model"],
             mode=options["mode"],
             output=output,
-            state_root=Path(options["state_root"]) if options["state_root"] else None,
             concurrency=options["concurrency"],
             request_timeout=options["request_timeout"],
-            handoff_timeout=options["handoff_timeout"],
             backend="arena",
         )
         api = ArenaCLI(config)
@@ -155,13 +151,9 @@ def main() -> None:
     )
     command.add_argument("--model", required=True)
     command.add_argument("--inference-key-env", default="AREAL_INFERENCE_ADMIN_KEY")
-    command.add_argument(
-        "--mode", choices=("eval", "resident", "on_demand"), default="eval"
-    )
-    command.add_argument("--state-root", type=Path)
+    command.add_argument("--mode", choices=("eval", "resident"), default="eval")
     command.add_argument("--concurrency", type=int, default=4)
     command.add_argument("--request-timeout", type=float, default=900)
-    command.add_argument("--handoff-timeout", type=float, default=180)
     command = commands.add_parser("resume")
     command.add_argument("--run-dir", type=Path, required=True)
     raise SystemExit(asyncio.run(run(parser.parse_args())))

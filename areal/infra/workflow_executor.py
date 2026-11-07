@@ -666,11 +666,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         input_generator: Generator[TInput, None, None],
         batch_size: int,
         dynamic_bs: bool = False,
+        on_wait: Callable[[], None] | None = None,
     ) -> list[TResult]:
         """Continuously submit tasks and wait until a full batch of results is ready.
 
         This method maintains overlap between submission and result collection
-        to maximize throughput.
+        to maximize throughput. Optional on_wait runs on the requesting coordinator
+        after an idle result wait, outside dispatcher locks, and does not consume data.
 
         Parameters
         ----------
@@ -733,6 +735,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 arrived = self.wait_results(count=batch_size - accepted_cnt, timeout=1)
             except TimeoutError:
                 arrived = []
+                if on_wait is not None:
+                    on_wait()
 
             for res in arrived:
                 is_accepted = res is not None
@@ -1435,6 +1439,7 @@ class WorkflowExecutor:
         workflow: RolloutWorkflow,
         should_accept_fn: Callable[[dict[str, Any]], bool] = None,
         dynamic_bs: bool = False,
+        on_wait: Callable[[], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare a batch with controlled staleness.
 
@@ -1482,7 +1487,10 @@ class WorkflowExecutor:
         # Delegate to dispatcher
         assert dataloader.batch_size is not None
         results = self.dispatcher.active_submit_and_wait(
-            self.data_generator, batch_size=dataloader.batch_size, dynamic_bs=dynamic_bs
+            self.data_generator,
+            batch_size=dataloader.batch_size,
+            dynamic_bs=dynamic_bs,
+            on_wait=on_wait,
         )
 
         # Return list of trajectory dicts (filter out None)

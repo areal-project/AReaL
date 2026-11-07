@@ -131,10 +131,11 @@ Proxy gateway available at http://X.X.X.X:PORT
 > [allocation mode reference](../../docs/en/reference/alloc_mode.md) for fields and GPU
 > layout.
 
-For opt-in on-demand Actor lifecycle and AutoPilot flags, see the
-[native elastic training contract](../autopilot/elastic/README.md#run-and-policy-integration).
-This requires an audited fixed GPU layout and persistent state root. GPU acceptance of
-the new lifecycle remains pending; the default resident flow is unchanged.
+For opt-in native reconfiguration, see the
+[native elastic training example](../autopilot/elastic/README.md#%E5%8E%9F%E7%94%9F%E8%AE%AD%E7%BB%83).
+This uses explicit local GPU pools and a state root, with the Actor kept resident.
+Automatic reconfiguration attaches through `ReconfiguratorAdapter`; Revision remains
+deferred. GPU reconfiguration acceptance is still pending.
 
 ### Step 2 — Start the Hermes Agent Service
 

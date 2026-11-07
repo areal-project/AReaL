@@ -221,11 +221,12 @@ examples/autopilot/elastic/validation/*.json
 !examples/autopilot/elastic/validation/consolidation-20261021.json
 !examples/autopilot/elastic/validation/architecture-20261021.json
 !examples/autopilot/elastic/validation/policy-layout-20261021.json
+!examples/autopilot/elastic/validation/online-v3-20261027.json
 examples/autopilot/actor_cost/public_validation.json
 examples/autopilot/actor_cost/trial_scenarios.json
 examples/autopilot/revising-validation-20261018.json
 examples/autopilot/revising-llm-validation-20261018.json
 
 # Historical Expert inputs remain in the external development archive.
-areal/elastic/policy/reference/trials/
-areal/elastic/policy/reference/figures/
+areal/elastic/reconfigurator/reference/trials/
+areal/elastic/reconfigurator/reference/figures/

@@ -47,11 +47,15 @@ from areal.utils import logging
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.seeding import derive_deterministic_seed
+from areal.utils.workload_trace import append_trace
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+from areal.v2.inference_service.data_proxy.generation_gate import GenerationGate
 from areal.v2.inference_service.data_proxy.pause import PauseState
+from areal.v2.inference_service.data_proxy.resume_observation import (
+    ResumeObservation,
+    current_observation,
+)
 from areal.v2.inference_service.data_proxy.session import (
-    AbortEpisodeRequest,
-    EpisodeIdentity,
     ExportTrajectoriesRequest,
     ExportTrajectoriesResponse,
     ReadyNotification,
@@ -319,14 +323,6 @@ async def _post_online_ready_callback(
                 json={
                     "session_id": notification.session_id,
                     "trajectory_id": notification.trajectory_id,
-                    **(
-                        {
-                            "episode_id": notification.episode_id,
-                            "lease": notification.lease,
-                        }
-                        if notification.episode_id is not None
-                        else {}
-                    ),
                 },
                 headers={"Authorization": f"Bearer {admin_api_key}"},
                 timeout=timeout,
@@ -469,44 +465,22 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         logger.info("Data proxy shutting down")
 
     app = FastAPI(title="AReaL Data Proxy", lifespan=lifespan)
+    app.state.generation_gate = GenerationGate()
+    app.state.resume_observation = ResumeObservation()
     _registered_models: dict[str, dict[str, str | None]] = {}
-    source_id = uuid.uuid4().hex
-
-    async def _admit_episode(
-        session_id: str,
-        trajectory_id: int,
-        incarnation_id: str,
-    ) -> dict[str, Any]:
-        if not config.callback_server_addr:
-            raise HTTPException(503, "Online training admission is unavailable")
-        async with create_httpx_client(timeout=config.request_timeout) as client:
-            response = await client.post(
-                f"{config.callback_server_addr.rstrip('/')}/callback/online_admit",
-                json={
-                    "source_id": f"{source_id}:{incarnation_id}",
-                    "session_id": session_id,
-                    "trajectory_id": trajectory_id,
-                },
-                headers={"Authorization": f"Bearer {config.admin_api_key}"},
-            )
-        if response.status_code == 429:
-            raise HTTPException(
-                429, "Online training capacity exhausted", headers={"Retry-After": "1"}
-            )
-        if response.status_code >= 400:
-            raise HTTPException(503, "Online training admission was not confirmed")
-        episode = response.json()
-        if episode.get("status") in ("published", "rejected"):
-            raise HTTPException(409, "This episode has already finished")
-        if not episode.get("episode_id") or not episode.get("lease"):
-            raise HTTPException(503, "Invalid admission response")
-        return episode
 
     class GenerationStream:
         """Retain the episode cache until a streaming request closes."""
 
-        def __init__(self, stream: Any, session: SessionData) -> None:
+        def __init__(
+            self,
+            stream: Any,
+            session: SessionData | None,
+            *,
+            release_gate: bool = False,
+        ) -> None:
             self.stream, self.session, self.closed = stream, session, False
+            self.release_gate = release_gate
 
         def __aiter__(self):
             return self
@@ -527,9 +501,12 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 finally:
                     # ArealOpenAI.create() has already awaited the complete
                     # backend response; this iterator only formats that result.
-                    self.session.finish_generation()
+                    if self.session is not None:
+                        self.session.finish_generation()
+                    if self.release_gate:
+                        await app.state.generation_gate.release()
 
-    async def _create_internal_chat_result(
+    async def _create_internal_chat_result_ungated(
         body_json: dict[str, Any],
         session: SessionData | None,
         episode: Any = None,
@@ -544,28 +521,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         is_streaming = bool(kwargs.get("stream", False))
         kwargs.setdefault("temperature", 1.0)
         kwargs.setdefault("top_p", 1.0)
-        try:
-            expected_episode = (
-                EpisodeIdentity.model_validate(episode)
-                if config.online_training_admission and session is not None
-                else None
-            )
-            areal_cache = (
-                await session.begin_generation(
-                    (lambda sid, tid: _admit_episode(sid, tid, session.incarnation_id))
-                    if config.online_training_admission
-                    else None,
-                    episode=expected_episode,
-                )
-                if session is not None
-                else None
-            )
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-        except httpx.HTTPError as exc:
-            raise HTTPException(
-                503, "Online training admission was not confirmed"
-            ) from exc
+        areal_cache = await session.begin_generation() if session is not None else None
 
         deterministic_sampling = session is not None and config.deterministic_sampling
         request_index = (
@@ -586,18 +542,18 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             )
         except ValueError as exc:
             if session is not None:
-                session.finish_generation(uncertain=True)
+                session.finish_generation()
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except Exception as exc:
             if session is not None:
-                session.finish_generation(uncertain=True)
+                session.finish_generation()
             raise HTTPException(
                 status_code=500,
                 detail=f"{type(exc).__name__}: {exc}",
             ) from exc
         except BaseException:
             if session is not None:
-                session.finish_generation(uncertain=True)
+                session.finish_generation()
             raise
         if session is not None:
             if is_streaming:
@@ -605,6 +561,111 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             else:
                 session.finish_generation()
         return result, is_streaming
+
+    async def _create_internal_chat_result(body_json, session, episode=None):
+        gate = app.state.generation_gate
+        received = time.monotonic()
+        await gate.acquire()
+        observation = app.state.resume_observation.claim(received)
+        collect = bool(os.environ.get("AREAL_ROLLOUT_TRACE_DIR"))
+        if collect and observation is None:
+            admitted = time.monotonic()
+            observation = {
+                "received_monotonic": received,
+                "admitted_monotonic": admitted,
+                "admission_wait_seconds": admitted - received,
+                "backend_attempts": [],
+                "status": "running",
+            }
+        if collect:
+            observation.update(
+                session_id=None if session is None else session.session_id,
+                incarnation_id=None if session is None else session.incarnation_id,
+                episode=episode,
+                received_wall=time.time() - (time.monotonic() - received),
+            )
+        token = current_observation.set(observation)
+        streaming = False
+        try:
+            # Resolve the bridge only after admission: queued calls must use the
+            # replacement backend and retain their original session/cache.
+            result, streaming = await _create_internal_chat_result_ungated(
+                body_json, session, episode
+            )
+            if observation is not None:
+                ready = time.monotonic()
+                observation.update(
+                    status="completed",
+                    response_ready_monotonic=ready,
+                    admitted_to_response_seconds=ready
+                    - observation["admitted_monotonic"],
+                )
+                if "armed_monotonic" in observation:
+                    observation["armed_to_response_seconds"] = (
+                        ready - observation["armed_monotonic"]
+                    )
+            if streaming:
+                result = GenerationStream(result, None, release_gate=True)
+            return result, streaming
+        except BaseException:
+            if observation is not None:
+                observation.update(
+                    status="failed", response_ready_monotonic=time.monotonic()
+                )
+            raise
+        finally:
+            current_observation.reset(token)
+            if not streaming:
+                await gate.release()
+            if collect:
+                await asyncio.to_thread(append_trace, "model-calls", observation)
+
+    @app.post("/reconfiguration/observe")
+    async def arm_resume_observation(request: Request):
+        _require_admin_key(request, app.state.session_store)
+        body = await request.json()
+        transition_id = body.get("transition_id")
+        if (
+            not isinstance(transition_id, str)
+            or not transition_id
+            or len(transition_id) > 96
+        ):
+            raise HTTPException(400, "Invalid transition identity")
+        app.state.resume_observation.arm(transition_id)
+        return {"status": "armed", "transition_id": transition_id}
+
+    @app.get("/reconfiguration/metrics")
+    async def resume_metrics(request: Request):
+        _require_admin_key(request, app.state.session_store)
+        return app.state.resume_observation.snapshot()
+
+    @app.post("/reconfiguration/drain")
+    async def drain_generation(request: Request):
+        _require_admin_key(request, app.state.session_store)
+        body = await request.json()
+        try:
+            await app.state.generation_gate.drain(float(body["timeout"]))
+        except TimeoutError as exc:
+            raise HTTPException(
+                409, "Model calls have not drained; admission remains closed"
+            ) from exc
+        return {"status": "drained", "active": 0}
+
+    @app.post("/reconfiguration/pause_state")
+    async def set_local_pause(request: Request):
+        _require_admin_key(request, app.state.session_store)
+        body = await request.json()
+        paused = body.get("paused")
+        if type(paused) is not bool:
+            raise HTTPException(400, "paused must be boolean")
+        await app.state.pause_state.set_paused(paused)
+        return {"status": "ok", "paused": paused}
+
+    @app.post("/reconfiguration/open")
+    async def open_generation(request: Request):
+        _require_admin_key(request, app.state.session_store)
+        await app.state.generation_gate.open()
+        return {"status": "open"}
 
     # =========================================================================
     # Health
@@ -616,7 +677,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         pause_state: PauseState = app.state.pause_state
         return DataProxyHealthResponse(
             status="ok",
-            backend=config.backend_addr,
+            backend=app.state.config.backend_addr,
             sessions=store.session_count,
             paused=await pause_state.is_paused(),
             version=app.state.version,
@@ -727,53 +788,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 SessionCredentials(
                     session_id=session_id,
                     session_api_key=session_api_key,
-                    areal_episode=EpisodeIdentity.model_validate(
-                        store.get_session(session_id).current_episode()
-                    )
-                    if config.online_training_admission
-                    else None,
                 )
             )
         return StartSessionResponse(group_id=group_id, sessions=credentials)
-
-    @app.post("/rl/current_episode")
-    async def current_episode(request: Request):
-        if not config.online_training_admission:
-            raise HTTPException(409, "Durable online training is not configured")
-        store: SessionStore = app.state.session_store
-        sid = _require_session_key(request, store)
-        session = store.get_session(sid)
-        if session is None:
-            raise HTTPException(401, "Session has expired")
-        return session.current_episode()
-
-    @app.post("/rl/abort_episode")
-    async def abort_episode(body: AbortEpisodeRequest, request: Request):
-        if not config.online_training_admission or not config.callback_server_addr:
-            raise HTTPException(409, "Durable online training is not configured")
-        store: SessionStore = app.state.session_store
-        session = store.get_session(_require_session_key(request, store))
-        if session is None:
-            raise HTTPException(401, "Session has expired")
-
-        async def cancel(intent: dict[str, Any]) -> dict[str, Any]:
-            payload = {**intent, "source_id": f"{source_id}:{session.incarnation_id}"}
-            async with create_httpx_client(timeout=config.request_timeout) as client:
-                response = await client.post(
-                    f"{config.callback_server_addr.rstrip('/')}/callback/online_abort",
-                    json=payload,
-                    headers={"Authorization": f"Bearer {config.admin_api_key}"},
-                )
-            if response.status_code >= 400:
-                raise HTTPException(503, "Episode abort was not durably confirmed")
-            return response.json()
-
-        try:
-            return await session.abort_episode(body, cancel)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-        except (httpx.HTTPError, RuntimeError) as exc:
-            raise HTTPException(503, "Episode abort was not durably confirmed") from exc
 
     @app.post("/rl/set_reward", response_model=SetRewardResponse)
     async def set_reward(body: SetRewardRequest, request: Request):
@@ -789,12 +806,10 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             reward_result = session.set_reward(
                 interaction_id=body.interaction_id,
                 reward=body.reward,
-                episode=body.areal_episode,
-                require_episode_identity=config.online_training_admission,
             )
         except ValueError as exc:
             raise HTTPException(
-                status_code=409 if config.online_training_admission else 400,
+                status_code=400,
                 detail=str(exc),
             ) from exc
 
@@ -836,10 +851,6 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         # -----------------------------------------------------------------
         ext_info = _registered_models.get(model_name) if model_name else None
         if ext_info is not None and ext_info.get("url"):
-            if config.online_training_admission and session is not None:
-                raise HTTPException(
-                    400, "Online training requires local token/logprob trajectories"
-                )
             ext_url = (ext_info["url"] or "").rstrip("/")
             ext_model = ext_info["model"]
             provider_api_key = ext_info.get("api_key")
@@ -1071,7 +1082,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     # Trajectory export (admin key required)
     # =========================================================================
 
-    @app.post("/export_trajectories")
+    @app.post("/export_trajectories", response_model_exclude_unset=True)
     async def export_trajectories(
         body: ExportTrajectoriesRequest, request: Request
     ) -> ExportTrajectoriesResponse:
@@ -1082,47 +1093,6 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             raise HTTPException(
                 status_code=400,
                 detail="session_ids must be a non-empty list",
-            )
-
-        if config.online_training_admission and (
-            len(body.session_ids) != 1
-            or body.remove_session
-            or (body.consume and not body.acknowledge_only)
-        ):
-            raise HTTPException(
-                400,
-                "Durable online episodes require retained export followed by receipt acknowledgement",
-            )
-
-        if not body.consume and body.remove_session:
-            raise HTTPException(400, "Retained exports require remove_session=False")
-        if body.acknowledge_only:
-            if body.trajectory_id is None or body.remove_session:
-                raise HTTPException(
-                    400,
-                    "Acknowledgement requires an explicit trajectory and retained session",
-                )
-            for sid in body.session_ids:
-                session = store.get_session(sid)
-                if session is None:
-                    raise HTTPException(404, "Session not found")
-                try:
-                    session.validate_trajectory_identity(
-                        body.trajectory_id, body.episode_id, body.lease
-                    )
-                    session.acknowledge_trajectory(
-                        body.trajectory_id, body.handoff_digest
-                    )
-                except KeyError as error:
-                    raise HTTPException(404, str(error)) from error
-                except ValueError as error:
-                    raise HTTPException(409, str(error)) from error
-            return ExportTrajectoriesResponse(traj={})
-
-        if not body.consume and (body.trajectory_id is None or not body.inline_tensors):
-            raise HTTPException(
-                400,
-                "Retained exports require an explicit trajectory_id and inline_tensors=True",
             )
 
         grouped_interactions: list[
@@ -1137,9 +1107,6 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 continue
 
             try:
-                session.validate_trajectory_identity(
-                    body.trajectory_id, body.episode_id, body.lease
-                )
                 trajectory_id, interactions = session.export_trajectory(
                     discount=body.discount,
                     style=body.style,
@@ -1171,32 +1138,38 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 merged.update(interactions)
 
         trace_masks = None
+        observation = None
         if all(v.has_tensor_data for v in merged.values()):
             traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
+            if (
+                body.include_observation
+                and merged
+                and traj["attention_mask"].device.type == "cpu"
+            ):
+                times = [s.trajectory_observation_times(tid) for s, tid in exported]
+                tokens = int(traj["attention_mask"].sum())
+                generated = int(traj["loss_mask"].sum())
+                observation = {
+                    "episode_id": ":".join(
+                        f"{s.session_id}/{tid}" for s, tid in exported
+                    ),
+                    "available_wall_time": min(t[0] for t in times),
+                    "completed_wall_time": max(t[1] for t in times),
+                    "input_tokens": max(1, tokens - generated),
+                    "output_tokens": max(1, generated),
+                }
             if merged and os.environ.get("AREAL_ROLLOUT_TRACE_DIR"):
                 trace_masks = {
                     key: traj[key] for key in ("attention_mask", "loss_mask")
                 }
-            if not body.inline_tensors:
-                traj = _remotize_trajectory(traj, node_addr=config.serving_addr)
+            traj = _remotize_trajectory(traj, node_addr=config.serving_addr)
         else:
             traj = concat_string_interactions(merged)
 
-        # Do not remove the source before tensor materialization and serialization
-        # succeed. On-demand consumers explicitly acknowledge only after their
-        # durable inbox contains the payload.
+        # Native exports retire source data only after serialization succeeds.
         serialized = serialize_value(traj)
-        if config.online_training_admission:
-            digest = hashlib.sha256(
-                json.dumps(
-                    serialized, sort_keys=True, separators=(",", ":"), allow_nan=False
-                ).encode()
-            ).hexdigest()
-            for session, trajectory_id in exported:
-                session.record_export_digest(trajectory_id, digest)
-        if body.consume:
-            for session, trajectory_id in exported:
-                session.acknowledge_trajectory(trajectory_id)
+        for session, trajectory_id in exported:
+            session.acknowledge_trajectory(trajectory_id)
         if body.remove_session:
             for sid in body.session_ids:
                 store.remove_session(sid)
@@ -1216,6 +1189,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 list(merged),
                 body.style,
             )
+        if observation is not None:
+            return ExportTrajectoriesResponse(traj=serialized, observation=observation)
         return ExportTrajectoriesResponse(traj=serialized)
 
     # =========================================================================
@@ -1231,37 +1206,38 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         new_addr = body.get("backend_addr")
         if not new_addr:
             raise HTTPException(status_code=400, detail="backend_addr is required")
-        pause_state: PauseState = app.state.pause_state
-        tok: TokenizerProxy = app.state.tokenizer
+        async with app.state.generation_gate.rebind():
+            pause_state: PauseState = app.state.pause_state
+            tok: TokenizerProxy = app.state.tokenizer
 
-        old_inf_bridge: InfBridge | None = app.state.inf_bridge
+            old_inf_bridge: InfBridge | None = app.state.inf_bridge
 
-        # Recreate InfBridge + ArealOpenAI with new backend address
-        new_inf_bridge = _create_inf_bridge(new_addr, pause_state, app.state.config)
-        try:
-            new_areal_client = _create_areal_client(
-                new_inf_bridge, tok, app.state.config
-            )
-        except Exception:
-            await new_inf_bridge.aclose()
-            raise
+            # Recreate InfBridge + ArealOpenAI with new backend address
+            new_inf_bridge = _create_inf_bridge(new_addr, pause_state, app.state.config)
+            new_inf_bridge.set_version(app.state.version)
+            try:
+                new_areal_client = _create_areal_client(
+                    new_inf_bridge, tok, app.state.config
+                )
+            except Exception:
+                await new_inf_bridge.aclose()
+                raise
 
-        # Build updated config copy, then swap all three state fields.
-        # Swap references first so new requests immediately use the new bridge.
-        from dataclasses import replace as _dc_replace
+            # Build updated config copy, then swap all three state fields.
+            # Swap references first so new requests immediately use the new bridge.
+            from dataclasses import replace as _dc_replace
 
-        new_config = _dc_replace(app.state.config, backend_addr=new_addr)
-        app.state.config = new_config
-        app.state.inf_bridge = new_inf_bridge
-        app.state.areal_client = new_areal_client
+            new_config = _dc_replace(app.state.config, backend_addr=new_addr)
+            app.state.config = new_config
+            app.state.inf_bridge = new_inf_bridge
+            app.state.areal_client = new_areal_client
 
-        # Close old InfBridge after the swap so in-flight requests that already
-        # hold a reference to the old bridge can still finish their HTTP calls.
-        if old_inf_bridge is not None:
-            await old_inf_bridge.aclose()
+            # No admitted call can hold the old bridge while this lock is held.
+            if old_inf_bridge is not None:
+                await old_inf_bridge.aclose()
 
-        logger.info("Backend reconfigured to %s", new_addr)
-        return ConfigureBackendResponse(status="ok", backend_addr=new_addr)
+            logger.info("Backend reconfigured to %s", new_addr)
+            return ConfigureBackendResponse(status="ok", backend_addr=new_addr)
 
     # =========================================================================
     # RTensor data storage endpoints

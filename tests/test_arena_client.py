@@ -3,7 +3,6 @@
 
 import hashlib
 import json
-import sqlite3
 import subprocess
 import sys
 from dataclasses import asdict
@@ -122,9 +121,10 @@ elif kind == "stream" and action == "launch":
 elif kind == "task":
     launch = json.loads((root / "launch.json").read_text())
     episode = json.loads(launch["envs"].get("AUTOPILOT_AREAL_EPISODE_JSON", "null"))
+    session_id = launch["envs"].get("AUTOPILOT_AREAL_SESSION_ID")
     artifacts = {
         "answer.json": {"answer": r"\boxed{42}", "completed": True, "model_mode": "external",
-                        "training_eligible": episode is not None, "areal_episode": episode,
+                        "training_eligible": bool(session_id or episode), "areal_episode": episode, "areal_session_id": session_id,
                         "sampling": json.loads(launch["envs"]["AUTOPILOT_SAMPLING_JSON"]), "model_calls": 2},
         "environment.json": {"calls": [{"status": "completed"}], "timing_calls": [{"started": 3, "finished": 4}]},
         "call_trace.json": {"nodes": [
@@ -138,7 +138,7 @@ elif kind == "task":
                 "harness_ref": fixture["harness"], "reward_ref": fixture["reward"]}
     elif action == "result":
         data = {"status": "OK", "score": float(os.environ.get("ARENA_FIXTURE_REWARD", "1")),
-                "raw": {"reason": "fixture_score", "model_mode": "external", "training_eligible": episode is not None}}
+                "raw": {"reason": "fixture_score", "model_mode": "external", "training_eligible": bool(session_id or episode)}}
     elif action == "artifacts":
         data = [{"name": name} for name in artifacts]
     elif action == "download":
@@ -205,33 +205,14 @@ async def test_pinned_combination_checks_registry_pages_and_exact_selected_promp
     assert [page["args"][-1] for page in pages] == ["offset=0", "offset=1"]
 
 
-def inbox_fixture(state_root):
-    """Only the existing client's read-only SQLite view; no trainer is simulated."""
-    directory = state_root / "inbox"
-    directory.mkdir(parents=True)
-    database = directory / "queue.sqlite3"
-    with sqlite3.connect(database) as db:
-        db.execute(
-            "CREATE TABLE online_episodes (episode_id TEXT,source_id TEXT,session_id TEXT,trajectory_id INTEGER,status TEXT,digest TEXT,source_acked INTEGER,min_version INTEGER,max_version INTEGER,batch_id TEXT,rejection TEXT)"
-        )
-        db.execute(
-            "CREATE TABLE online_progress (admission_open INTEGER,max_staleness INTEGER,batch_size INTEGER)"
-        )
-        db.execute("INSERT INTO online_progress VALUES (1,2,1)")
-    return database
-
-
-@pytest.mark.parametrize("mode", ["eval", "resident", "on_demand"])
+@pytest.mark.parametrize("mode", ["eval", "resident"])
 @pytest.mark.asyncio
-async def test_arena_client_preserves_episode_reward_trace_and_completed_resume(
+async def test_arena_client_preserves_session_reward_trace_and_completed_resume(
     tmp_path, monkeypatch, arena_fixture, mode
 ):
     config, tasks, _ = arena_fixture
     output = tmp_path / "output"
     output.mkdir()
-    state_root = tmp_path / "state"
-    database = inbox_fixture(state_root) if mode == "on_demand" else None
-    episode = {"incarnation_id": "worker-one", "trajectory_id": 0}
     observed = []
     # The client must use the separate Arena reward even when it disagrees
     # with local final-answer grading. This also exercises an ordinary zero score.
@@ -251,32 +232,13 @@ async def test_arena_client_preserves_episode_reward_trace_and_completed_resume(
                         {
                             "session_id": "session-one",
                             "session_api_key": "session-test-secret",
-                            "areal_episode": episode,
                         }
                     ]
                 },
             )
         assert request.url.path == "/rl/set_reward"
         assert request.headers["authorization"] == "Bearer session-test-secret"
-        assert body == {"reward": reward, "areal_episode": episode}
-        if database:
-            with sqlite3.connect(database) as db:
-                db.execute(
-                    "INSERT INTO online_episodes VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        "episode-one",
-                        "worker:worker-one",
-                        "session-one",
-                        0,
-                        "received",
-                        "fixture-digest",
-                        1,
-                        0,
-                        0,
-                        None,
-                        None,
-                    ),
-                )
+        assert body == {"reward": reward}
         return httpx.Response(
             200,
             json={
@@ -298,7 +260,6 @@ async def test_arena_client_preserves_episode_reward_trace_and_completed_resume(
         "small-model",
         mode,
         output,
-        state_root=state_root if database else None,
         backend="arena",
     )
     executor = ArenaExecutor(
@@ -323,7 +284,7 @@ async def test_arena_client_preserves_episode_reward_trace_and_completed_resume(
         result["timing"]["inference_seconds"] == 5
         and result["timing"]["tool_seconds"] == 1
     )
-    assert result.get("handoff", {}).get("verified", False) == (mode == "on_demand")
+    assert "handoff" not in result
     assert "test-secret" not in json.dumps(result)
     launch = json.loads((tmp_path / "launch.json").read_text())
     assert launch["api_key"] == (
@@ -333,7 +294,8 @@ async def test_arena_client_preserves_episode_reward_trace_and_completed_resume(
     assert launch["harness_ref"] == config.value["harness_ref"]
     assert "gold_answer" not in json.dumps(launch) and "question" not in launch
     if mode != "eval":
-        assert json.loads(launch["envs"]["AUTOPILOT_AREAL_EPISODE_JSON"]) == episode
+        assert launch["envs"]["AUTOPILOT_AREAL_SESSION_ID"] == "session-one"
+        assert "AUTOPILOT_AREAL_EPISODE_JSON" not in launch["envs"]
     saved = output / "math-stable/state.json"
     assert saved.stat().st_mode & 0o777 == 0o600
     assert json.loads(saved.read_text())["completed_result"] == result
@@ -354,26 +316,21 @@ async def test_arena_client_resumes_a_saved_completed_task_before_reward(
     output = tmp_path / "resumed"
     output.mkdir()
     task = tasks[0]
-    episode = {"incarnation_id": "worker-one", "trajectory_id": 0}
     credentials = {
         "session_id": "session-one",
         "session_api_key": "session-test-secret",
-        "areal_episode": episode,
     }
-    state_root = tmp_path / "state"
-    database = inbox_fixture(state_root)
-    identity = {"mode": "on_demand", "model": "small-model"}
+    identity = {"mode": "resident", "model": "small-model"}
     executor = ArenaExecutor(config, ArenaCLI(config), output, identity=identity)
-    await executor.save(
-        "math-planned", task_id=task.task_id, credentials=credentials, admitted=True
-    )
+    await executor.save("math-planned", task_id=task.task_id, credentials=credentials)
     execution = await executor.execute(
         DapoBenchmark().prepare(task),
         request_id="math-planned",
         base_url="http://inference/v1",
         api_key=credentials["session_api_key"],
         model="small-model",
-        episode=episode,
+        episode=None,
+        session_id=credentials["session_id"],
     )
     assert execution.score.reward == 1.0
     observed = []
@@ -381,24 +338,7 @@ async def test_arena_client_resumes_a_saved_completed_task_before_reward(
     def respond(request):
         observed.append(request.url.path)
         assert request.url.path == "/rl/set_reward"
-        assert json.loads(request.content) == {"reward": 1.0, "areal_episode": episode}
-        with sqlite3.connect(database) as db:
-            db.execute(
-                "INSERT INTO online_episodes VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    "episode-one",
-                    "worker:worker-one",
-                    "session-one",
-                    0,
-                    "received",
-                    "fixture-digest",
-                    1,
-                    0,
-                    0,
-                    None,
-                    None,
-                ),
-            )
+        assert json.loads(request.content) == {"reward": 1.0}
         return httpx.Response(
             200,
             json={
@@ -414,23 +354,16 @@ async def test_arena_client_resumes_a_saved_completed_task_before_reward(
         "",
         "admin-test-secret",
         "small-model",
-        "on_demand",
+        "resident",
         output,
-        state_root=state_root,
         backend="arena",
     )
     resumed = ArenaExecutor(config, ArenaCLI(config), output, identity=identity)
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
         client = EpisodeClient(settings, http, executor=resumed)
-        execute = resumed.execute
-
-        async def observe_reservation(*args, **kwargs):
-            assert client._starting == {credentials["session_id"]: credentials}
-            return await execute(*args, **kwargs)
-
-        monkeypatch.setattr(resumed, "execute", observe_reservation)
         summary = await client.run([task], request_ids=["math-planned"])
-    assert summary["completed"] == summary["durable_handoffs"] == 1
+    assert summary["completed"] == 1
+    assert "durable_handoffs" not in summary
     assert observed == ["/rl/set_reward"]
     calls = [
         json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()

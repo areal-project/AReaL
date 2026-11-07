@@ -3,11 +3,8 @@ from __future__ import annotations
 import argparse
 from unittest.mock import MagicMock, patch
 
-import pytest
 
-
-@pytest.mark.parametrize("online_training_admission", [False, True])
-def test_data_proxy_main_formats_ipv6_serving_addr(online_training_admission):
+def test_data_proxy_main_formats_ipv6_serving_addr():
     from areal.v2.inference_service.data_proxy import (
         __main__ as data_proxy_main,
     )
@@ -30,7 +27,6 @@ def test_data_proxy_main_formats_ipv6_serving_addr(online_training_admission):
         chat_template_type="hf",
         message_preprocessor=[],
         prefix_matcher=None,
-        online_training_admission=online_training_admission,
     )
 
     with (
@@ -51,7 +47,6 @@ def test_data_proxy_main_formats_ipv6_serving_addr(online_training_admission):
     assert config.deterministic_sampling is False
     assert config.message_preprocessors == ()
     assert config.prefix_matcher is None
-    assert config.online_training_admission is online_training_admission
     mock_run.assert_called_once()
 
 

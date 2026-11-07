@@ -127,11 +127,17 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "reward_normalization": self.reward_normalization,
             "discard_trajectory": discard_trajectory,
         }
+        observer = getattr(self.controller, "_trajectory_observer", None)
+        if observer is not None:
+            payload["include_observation"] = True
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             data = await resp.json()
 
-        return deserialize_value(data["traj"])
+        trajectory = deserialize_value(data["traj"])
+        if observer is not None and data.get("observation") is not None:
+            observer(trajectory, data["observation"])
+        return trajectory
 
     async def arun_episode(
         self,

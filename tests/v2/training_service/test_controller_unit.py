@@ -6,11 +6,65 @@ import httpx
 import pytest
 
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
+from areal.infra.utils import process as process_utils
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
 
 MODULE = "areal.v2.training_service.controller.controller"
+
+
+def test_disconnect_engine_retains_training_workers_and_reconnects_new_rollout():
+    """Rollout replacement releases only the weight-transfer connection."""
+    from areal.api.io_struct import WeightUpdateMeta
+    from areal.v2.inference_service.controller.controller import RolloutControllerV2
+    from areal.v2.weight_update.gateway.config import WeightUpdateResult
+
+    controller = _make_controller()
+    controller._ensure_initialized = MagicMock()
+    controller._worker_addrs = ["http://train-rank-0"]
+    controller._service_roles = ["actor-guard"]
+    controller._version = 3
+    weights = controller._weight_update_ctrl = MagicMock()
+    controller._weight_update_identity = ("old-rollout",)
+    controller.disconnect_engine()
+    weights.disconnect.assert_called_once_with()
+    weights.destroy.assert_called_once_with()
+    assert controller._worker_addrs == ["http://train-rank-0"]
+    assert controller._service_roles == ["actor-guard"]
+    assert controller._version == 3
+    assert controller._weight_update_ctrl is None
+    assert controller._weight_update_identity is None
+    controller.scheduler.delete_workers.assert_not_called()
+
+    rollout = MagicMock(spec=RolloutControllerV2)
+    rollout.inference_worker_urls = ["http://new-infer"]
+    rollout.inference_guard_addrs = ["http://guard"]
+    replacement = MagicMock()
+    replacement.update_weights.return_value = WeightUpdateResult(
+        status="ok", version=3, duration_ms=1.0
+    )
+    with (
+        patch(
+            "areal.v2.weight_update.controller.controller.WeightUpdateController",
+            return_value=replacement,
+        ),
+        patch("requests.post") as post,
+    ):
+        post.return_value.json.return_value = {"host": "127.0.0.1", "ports": [30000]}
+        controller.connect_engine(rollout, WeightUpdateMeta(type="awex", version=3))
+        controller.update_weights(WeightUpdateMeta(type="awex", version=3))
+    assert replacement.connect.call_args.kwargs["train_worker_urls"] == [
+        "http://train-rank-0"
+    ]
+    assert replacement.connect.call_args.kwargs["inference_worker_urls"] == [
+        "http://new-infer"
+    ]
+    replacement.update_weights.assert_called_once_with(version=3)
+    rollout.set_version.assert_called_once_with(3)
+    assert controller._service_roles == ["actor-guard"]
+    assert controller._version == 3
+    controller.scheduler.delete_workers.assert_not_called()
 
 
 def test_tracer_flush_uses_bounded_timeout_without_shortening_training_rpcs():
@@ -367,7 +421,7 @@ def test_full_checkpoint_preflight_failure_never_starts_collective_load():
         controller.full_checkpoint(
             "load",
             path="/checkpoint",
-            backend="fsdp",
+            backend="megatron",
             identity_sha256="a" * 64,
             version=2,
         )
@@ -375,6 +429,42 @@ def test_full_checkpoint_preflight_failure_never_starts_collective_load():
         (worker, "/checkpoint/inspect") for worker in controller._worker_addrs
     }
     assert controller.get_version() == 0
+
+
+@pytest.mark.parametrize("release_devices", [None, (0, 1)], ids=["standard", "release"])
+def test_destroy_confirms_requested_gpus_after_worker_cleanup(
+    monkeypatch, release_devices
+):
+    """Only explicit local release waits for GPU processes after normal teardown."""
+    controller = _make_controller()
+    controller._worker_addrs = ["http://rank0", "http://rank1"]
+    controller._service_roles = ["actor-guard"]
+    controller._graceful_shutdown_workers = MagicMock()
+    states = iter([{"GPU-0": [123], "GPU-other": [456]}, {"GPU-other": [456]}])
+
+    def processes():
+        assert controller._worker_addrs == []
+        assert controller._service_roles == []
+        controller._graceful_shutdown_workers.assert_called_once_with()
+        controller.scheduler.delete_workers.assert_called_once_with(role="actor-guard")
+        return next(states)
+
+    probe = MagicMock(side_effect=processes)
+    uuids = MagicMock(return_value=["GPU-0", "GPU-1"])
+    sleep = MagicMock()
+    monkeypatch.setattr(process_utils, "gpu_processes", probe)
+    monkeypatch.setattr(process_utils, "resolve_gpu_uuids", uuids)
+    monkeypatch.setattr(process_utils.time, "sleep", sleep)
+    controller.destroy(release_devices=release_devices)
+    assert controller._worker_addrs == []
+    if release_devices is None:
+        probe.assert_not_called()
+        uuids.assert_not_called()
+        sleep.assert_not_called()
+    else:
+        assert probe.call_count == 2
+        uuids.assert_called_once_with([0, 1])
+        sleep.assert_called_once_with(0.1)
 
 
 def test_version_rpc_failure_does_not_advance_controller_version():
@@ -409,7 +499,7 @@ def test_full_checkpoint_excludes_training_mutations_until_all_ranks_complete():
             "rank": rank,
             "world_size": 2,
             "policy_version": 1,
-            "backend": "fsdp",
+            "backend": "megatron",
             "identity_sha256": "a" * 64,
             "state_sha256": str(rank) * 64,
         }
@@ -434,7 +524,7 @@ def test_full_checkpoint_excludes_training_mutations_until_all_ranks_complete():
             controller.full_checkpoint,
             "save",
             path="/checkpoint",
-            backend="fsdp",
+            backend="megatron",
             identity_sha256="a" * 64,
             version=1,
         )

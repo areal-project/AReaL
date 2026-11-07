@@ -101,6 +101,7 @@ class TaskExecutor(Protocol):
         api_key: str,
         model: str,
         episode: dict[str, Any] | None,
+        session_id: str | None = None,
     ) -> TaskExecution: ...
 
 

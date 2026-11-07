@@ -10,6 +10,7 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from functools import wraps
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,7 @@ def snapshot_batch(batch: Any) -> dict[str, Any] | None:
         )
         for phase in ("prefill", "decode")
     }
+    requests = []
     for i, (req, length) in enumerate(zip(batch.reqs, lengths)):
         phase = "decode" if mode == "decode" or id(req) in decoding else "prefill"
         prompt = len(req.origin_input_ids)
@@ -56,8 +58,27 @@ def snapshot_batch(batch: Any) -> dict[str, Any] | None:
         stats["prompt_tokens"] += prompt
         stats["generated_tokens"] += generated
         stats["context_tokens"] += prompt + generated
-        stats["input_tokens"] += 1 if phase == "decode" else batch.extend_lens[i]
-    return {"forward_mode": mode, **phases}
+        query = 1 if phase == "decode" else int(batch.extend_lens[i])
+        stats["input_tokens"] += query
+        past = length - query
+        requests.append(
+            {
+                "request_id": getattr(req, "rid", None),
+                "phase": phase,
+                "prompt_tokens": prompt,
+                "sequence_tokens": length,
+                "query_tokens": query,
+                "past_tokens": past,
+                "scheduled_generated_tokens": generated,
+                "attention_pairs": query * past + query * (query + 1) // 2,
+            }
+        )
+    return {
+        "forward_mode": mode,
+        **phases,
+        "requests": requests,
+        "attention_pairs": sum(req["attention_pairs"] for req in requests),
+    }
 
 
 class BatchObserver:
@@ -69,6 +90,7 @@ class BatchObserver:
     """
 
     def __init__(self, scheduler: Any, directory: str) -> None:
+        self.scheduler = scheduler
         self.device = scheduler.device_module
         self.pending: deque = deque()
         self.origin = None
@@ -91,7 +113,7 @@ class BatchObserver:
         self._write(
             {
                 "record": "metadata",
-                "schema_version": 1,
+                "schema_version": 2,
                 **self.identity,
                 "timing": "CUDA events on the observed rank's forward stream",
                 "context_tokens": "full prompt plus scheduled generated positions",
@@ -123,6 +145,17 @@ class BatchObserver:
             row = snapshot_batch(batch)
             if row is None:
                 return None
+            capacity = getattr(self.scheduler, "max_total_num_tokens", None)
+            allocator = getattr(self.scheduler, "token_to_kv_pool_allocator", None)
+            available = allocator.available_size() if allocator is not None else None
+            row["kv_capacity_tokens"] = (
+                int(capacity) if isinstance(capacity, Integral) else None
+            )
+            row["kv_allocated_tokens_at_forward_entry"] = (
+                int(capacity - available)
+                if isinstance(capacity, Integral) and isinstance(available, Integral)
+                else None
+            )
             if self.origin is None:
                 self.origin = self.device.Event(enable_timing=True)
                 self.wall_lower = self._wall()

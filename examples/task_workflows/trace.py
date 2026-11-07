@@ -3,14 +3,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import threading
 import time
 from contextvars import ContextVar
-from functools import wraps
+from functools import lru_cache, wraps
 from typing import Any
 
 _tool_record: ContextVar[dict | None] = ContextVar("task_trace_tool", default=None)
+
+
+@lru_cache(maxsize=2)
+def _tokenizer(path: str) -> Any:
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(path, local_files_only=True)
 
 
 def mark_tool_execution(started: float, *, seconds: float | None = None) -> None:
@@ -25,7 +34,11 @@ def mark_tool_execution(started: float, *, seconds: float | None = None) -> None
 class CallTrace:
     """Observe serial model turns and tool fan-out; never infer edges from timestamps."""
 
-    def __init__(self) -> None:
+    def __init__(self, tokenizer: Any = None) -> None:
+        self.tokenizer_path = os.environ.get("AREAL_TASK_TOKENIZER_PATH")
+        self.tokenizer = tokenizer
+        if self.tokenizer is None and self.tokenizer_path:
+            self.tokenizer = _tokenizer(self.tokenizer_path)
         self.nodes: list[dict] = []
         self.requests: list[dict] = []
         self.pools: dict[str, int] = {}
@@ -34,7 +47,7 @@ class CallTrace:
         self.dependencies_complete = True
         self.lock = threading.Lock()
 
-    def request(self, record: dict) -> None:
+    def request(self, record: dict, *, messages: list | None = None) -> None:
         with self.lock:
             parents = self.tools or ([self.last_request] if self.last_request else [])
             if any(parent["finished"] is None for parent in parents):
@@ -46,7 +59,19 @@ class CallTrace:
                 input_tokens=None,
                 output_tokens=None,
                 cached_prefix_tokens=None,
+                monotonic=time.perf_counter(),
             )
+            if messages is not None:
+                record["tool_messages"] = [
+                    {
+                        "tool_call_id": message.get("tool_call_id"),
+                        "content": message["content"],
+                        "tokens": self._count_tokens(message["content"]),
+                    }
+                    for message in messages
+                    if message.get("role") == "tool"
+                    and isinstance(message.get("content"), str)
+                ]
             self.nodes.append(record)
             self.requests.append(record)
             self.last_request, self.tools = record, []
@@ -71,12 +96,15 @@ class CallTrace:
                     "started": None,
                     "finished": None,
                     "seconds": None,
+                    "output_tokens": None,
                 }
                 self.nodes.append(record)
                 self.tools.append(record)
             token = _tool_record.set(record)
+            result = None
             try:
-                return invoke(name, arguments)
+                result = invoke(name, arguments)
+                return result
             finally:
                 record["finished"] = time.time()
                 clock = record.pop("_clock", None)
@@ -85,12 +113,32 @@ class CallTrace:
                         "_service_seconds", time.perf_counter() - clock
                     )
                 _tool_record.reset(token)
+                if isinstance(result, str):
+                    content = result.encode("utf-8")
+                    record.update(
+                        returned_text=result,
+                        output_tokens=self._count_tokens(result),
+                        output_utf8_bytes=len(content),
+                        output_sha256=hashlib.sha256(content).hexdigest(),
+                    )
 
         runtime.invoke = observed
+
+    def _count_tokens(self, value: str) -> int | None:
+        if self.tokenizer is None:
+            return None
+        return len(self.tokenizer.encode(value, add_special_tokens=False))
 
     def snapshot(self) -> dict:
         return {
             "schema_version": 1,
+            "run_id": os.environ.get("AREAL_TRACE_RUN_ID"),
+            "tokenizer_path": self.tokenizer_path,
+            "tool_lengths_complete": all(
+                row.get("output_tokens") is not None
+                for row in self.nodes
+                if row["kind"] == "external"
+            ),
             "dependency_policy": "native_model_turns_with_tool_fanout",
             "dependencies_complete": self.dependencies_complete,
             "lengths_complete": all(

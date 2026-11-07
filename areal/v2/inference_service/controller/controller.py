@@ -20,6 +20,7 @@ import traceback
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
@@ -31,7 +32,6 @@ from areal.infra.utils.http import async_http_retry, create_httpx_client
 
 if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler, Worker
-    from areal.elastic.state.episode_inbox import OnlineInbox
 
 from areal.api.cli_args import InferenceEngineConfig
 from areal.api.io_struct import LocalInfServerInfo
@@ -145,11 +145,11 @@ class RolloutControllerV2:
 
         # WorkflowExecutor (created in initialize)
         self._workflow_executor = None
+        self._control_callback = None
+        self._trajectory_observer = None
 
         # Staleness manager (created in initialize)
         self._staleness_manager = None
-        self._online_inbox: OnlineInbox | None = None
-        self._online_export_options: dict[str, Any] = {}
 
         # Online callback server / waiter state
         self._online_waiters: deque[_OnlineWaiter] = deque()
@@ -171,6 +171,7 @@ class RolloutControllerV2:
         # Track services forked directly via RPCGuard /fork (raw_cmd mode).
         # Each entry: (guard_addr, role, worker_index) for /kill_forked_worker.
         self._forked_services: list[tuple[str, str, int]] = []
+        self._managed_replicas = None
 
         # Shared HTTP clients
         self._sync_client = httpx.Client(timeout=30.0)
@@ -362,6 +363,15 @@ class RolloutControllerV2:
 
             inf_spec.cmd = "python -m areal.v2.inference_service.guard"
 
+        if self._managed_replicas is not None:
+            total_workers = len(self._managed_replicas.reservation)
+            inf_spec.gpu = 0
+            inf_spec.env_vars = {
+                **inf_spec.env_vars,
+                "CUDA_VISIBLE_DEVICES": "",
+                "AREAL_ELASTIC_PROCESS_OWNER": "",
+            }
+
         inf_role = f"{self._worker_role}{self._INF_SUFFIX}"
         inf_job = Job(
             replicas=total_workers,
@@ -414,7 +424,10 @@ class RolloutControllerV2:
             )
         )
 
-        if self.external_mode:
+        if self._managed_replicas is not None:
+            self._managed_replicas.server_args = dict(server_args or {})
+            await self._managed_replicas.launch(self._managed_replicas.devices)
+        elif self.external_mode:
             logger.info("External mode — skipping inference server launch")
         elif server_infos is not None:
             self._server_infos = server_infos
@@ -482,8 +495,6 @@ class RolloutControllerV2:
             ]
         if cfg.deterministic_sampling:
             data_proxy_base_cmd.append("--deterministic-sampling")
-        if self._online_inbox is not None:
-            data_proxy_base_cmd.append("--online-training-admission")
         for preprocessor_path in agent_cfg.message_preprocessors:
             data_proxy_base_cmd += [
                 "--message-preprocessor",
@@ -510,7 +521,7 @@ class RolloutControllerV2:
             else:
                 dp_cmd = data_proxy_base_cmd + [
                     "--backend-addr",
-                    self._inf_addrs[group_idx],
+                    self._inf_addrs[group_idx % len(self._inf_addrs)],
                     "--backend-type",
                     inf_backend or "sglang",
                 ]
@@ -545,7 +556,12 @@ class RolloutControllerV2:
             )
         )
         dp_results = await asyncio.gather(
-            *[_fork_data_proxy(i) for i in range(dp_size)]
+            *[
+                _fork_data_proxy(i)
+                for i in range(
+                    total_workers if self._managed_replicas is not None else dp_size
+                )
+            ]
         )
 
         # Track data-proxies in group order, then gateway — deterministic cleanup.
@@ -841,64 +857,6 @@ class RolloutControllerV2:
 
         app = Flask("online_rollout_callback")
 
-        @app.route("/callback/online_admit", methods=["POST"])
-        def online_admit():
-            from areal.elastic.state.episode_inbox import (
-                AdmissionFull,
-                AdmissionPaused,
-            )
-
-            if (
-                request.headers.get("Authorization")
-                != f"Bearer {self.config.admin_api_key}"
-            ):
-                return jsonify({"error": "Invalid admin API key"}), 403
-            if self._online_inbox is None:
-                return jsonify(
-                    {"error": "Durable online admission is not configured"}
-                ), 409
-            payload = request.get_json() or {}
-            try:
-                return jsonify(
-                    self._online_inbox.admit(
-                        payload.get("source_id"),
-                        payload.get("session_id"),
-                        payload.get("trajectory_id"),
-                    )
-                )
-            except AdmissionFull as exc:
-                return jsonify({"error": str(exc)}), 429, {"Retry-After": "1"}
-            except AdmissionPaused as exc:
-                return jsonify({"error": str(exc)}), 503, {"Retry-After": "1"}
-            except ValueError as exc:
-                return jsonify({"error": str(exc)}), 400
-
-        @app.route("/callback/online_abort", methods=["POST"])
-        def online_abort():
-            if (
-                request.headers.get("Authorization")
-                != f"Bearer {self.config.admin_api_key}"
-            ):
-                return jsonify({"error": "Invalid admin API key"}), 403
-            if self._online_inbox is None:
-                return jsonify(
-                    {"error": "Durable online admission is not configured"}
-                ), 409
-            payload = request.get_json() or {}
-            try:
-                return jsonify(
-                    self._online_inbox.cancel_admission(
-                        payload.get("source_id"),
-                        payload.get("session_id"),
-                        payload.get("trajectory_id"),
-                        episode_id=payload.get("episode_id"),
-                        lease=payload.get("lease"),
-                        reason=payload.get("reason"),
-                    )
-                )
-            except ValueError as exc:
-                return jsonify({"error": str(exc)}), 409
-
         @app.route("/callback/online_ready", methods=["POST"])
         def online_ready():
             if request.headers.get("Authorization") != (
@@ -1010,9 +968,6 @@ class RolloutControllerV2:
         if not session_id or trajectory_id is None:
             raise RuntimeError("Missing session_id or trajectory_id")
 
-        if self._online_inbox is not None:
-            return await self._receive_online_episode(payload)
-
         export_request = {
             "session_id": session_id,
             "trajectory_id": int(trajectory_id),
@@ -1035,87 +990,125 @@ class RolloutControllerV2:
             "trajectory_id": int(trajectory_id),
         }
 
-    def configure_online_training(
-        self,
-        inbox: OnlineInbox,
-        *,
-        discount: float = 1.0,
-        export_style: str = "individual",
-        drop_retry_orphans: bool = False,
-    ) -> None:
-        """Bind the CPU-owned pipeline before launching any inference service."""
-        if self._callback_server is not None or self._worker_role:
-            raise RuntimeError("Configure durable online training before initialize()")
-        if self.config.agent is None or self.config.agent.mode != "online":
-            raise ValueError("Durable online training requires agent.mode='online'")
-        if (self.config.consumer_batch_size, self.config.max_head_offpolicyness) != (
-            inbox.batch_size,
-            inbox.max_staleness,
-        ):
+    @property
+    def resource_reconfiguration_enabled(self) -> bool:
+        return self._managed_replicas is not None
+
+    def configure_resource_pool(self, reservation, devices, state_root) -> None:
+        """Keep guards/proxies CPU-owned while rebuilding local TP1 replicas."""
+        from areal.infra.scheduler.local import LocalScheduler
+
+        from .replicas import ManagedReplicas
+
+        if self._worker_role or not isinstance(self.scheduler, LocalScheduler):
             raise ValueError(
-                "Rollout batch size and staleness must match the durable inbox"
+                "Resource reconfiguration requires an uninitialized local controller"
             )
-        if export_style not in ("individual", "concat"):
-            raise ValueError("Unsupported online trajectory export style")
-        self._online_inbox = inbox
-        self._online_export_options = {
-            "discount": discount,
-            "style": export_style,
-            "drop_retry_orphans": drop_retry_orphans,
-        }
-
-    async def _receive_online_episode(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from areal.infra.rpc.serialization import deserialize_value
-
-        inbox = self._online_inbox
-        assert inbox is not None
-        episode_id, lease = payload.get("episode_id"), payload.get("lease")
-        episode = await asyncio.to_thread(inbox.episode, episode_id)
+        alloc = self.rollout_alloc
         if (
-            episode["lease"] != lease
-            or episode["session_id"] != payload["session_id"]
-            or episode["trajectory_id"] != payload["trajectory_id"]
+            self.external_mode
+            or alloc.backend != "sglang"
+            or alloc.parallel.tp_size != 1
+            or alloc.parallel.pp_size != 1
         ):
-            raise ValueError("Ready notification does not match its admission lease")
-        request_body = {
-            **self._online_export_options,
-            "session_ids": [episode["session_id"]],
-            "trajectory_id": episode["trajectory_id"],
-            "episode_id": episode_id,
-            "lease": lease,
-            "consume": False,
-            "remove_session": False,
-            "inline_tensors": True,
-        }
-        headers = {"Authorization": f"Bearer {self.config.admin_api_key}"}
-        digest = episode["digest"]
-        # The callback loop has its own connections; version publication may
-        # concurrently use the controller's ordinary async client on another loop.
-        async with create_httpx_client(timeout=self.config.request_timeout) as client:
-            if episode["digest"] is None:
+            raise ValueError("Managed replicas require local SGLang TP1/PP1")
+        self._managed_replicas = ManagedReplicas(self, reservation, devices, state_root)
+
+    def drain_model_calls(self) -> None:
+        self._ensure_initialized()
+        self.pause()
+        from areal.infra.utils.concurrent import run_async_task
+
+        async def drain_all():
+            client = await self._get_async_client()
+
+            async def drain(address):
                 response = await client.post(
-                    f"{self._gateway_addr}/export_trajectories",
-                    json=request_body,
-                    headers=headers,
+                    f"{address}/reconfiguration/drain",
+                    json={"timeout": self.config.request_timeout},
+                    headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+                    timeout=self.config.request_timeout + 10,
                 )
                 response.raise_for_status()
-                trajectory = deserialize_value(response.json()["traj"])
-                digest = await asyncio.to_thread(
-                    inbox.receive, episode_id, lease, trajectory
+                if response.json() != {"status": "drained", "active": 0}:
+                    raise RuntimeError("Data proxy did not confirm model-call drain")
+
+            results = await asyncio.gather(
+                *[drain(address) for address in self._data_proxy_addrs],
+                return_exceptions=True,
+            )
+            errors = [result for result in results if isinstance(result, Exception)]
+            if errors:
+                raise ExceptionGroup("Model-call drain incomplete", errors)
+
+        run_async_task(drain_all)
+
+    def open_model_calls(self) -> None:
+        for address in self._data_proxy_addrs:
+            response = self._sync_client.post(
+                f"{address}/reconfiguration/open",
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
+            response.raise_for_status()
+            if response.json() != {"status": "open"}:
+                raise RuntimeError(
+                    "Data proxy did not acknowledge model-call admission"
                 )
-            if not episode["source_acked"]:
-                response = await client.post(
-                    f"{self._gateway_addr}/export_trajectories",
+        self.resume()
+
+    def stop_inference_replicas(self) -> None:
+        if self._managed_replicas is None:
+            raise RuntimeError("Rollout was not initialized with a resource pool")
+        self._managed_replicas.stop()
+
+    def rebuild_inference_replicas(self, devices, *, timing=None) -> None:
+        from areal.infra.utils.concurrent import run_async_task
+
+        if self._managed_replicas is None:
+            raise RuntimeError("Rollout was not initialized with a resource pool")
+        phase = timing or (lambda name: nullcontext())
+        with phase("rollout_start"):
+            run_async_task(self._managed_replicas.launch, tuple(devices))
+        # Preserve every session store and router assignment; only replace bridges.
+        with phase("proxy_rebind"):
+            for index, address in enumerate(self._data_proxy_addrs):
+                response = self._sync_client.post(
+                    f"{address}/configure_backend",
                     json={
-                        **request_body,
-                        "acknowledge_only": True,
-                        "handoff_digest": digest,
+                        "backend_addr": self._inf_addrs[index % len(self._inf_addrs)]
                     },
-                    headers=headers,
+                    headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
                 )
                 response.raise_for_status()
-                await asyncio.to_thread(inbox.acknowledge_source, episode_id, lease)
-        return {"status": "ok", "episode_id": episode_id}
+                if (
+                    response.json().get("backend_addr")
+                    != self._inf_addrs[index % len(self._inf_addrs)]
+                ):
+                    raise RuntimeError(
+                        "Data proxy did not acknowledge its replacement backend"
+                    )
+
+    def arm_reconfiguration_observation(self, transition_id: str) -> None:
+        for address in self._data_proxy_addrs:
+            response = self._sync_client.post(
+                f"{address}/reconfiguration/observe",
+                json={"transition_id": transition_id},
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
+            response.raise_for_status()
+            if response.json() != {"status": "armed", "transition_id": transition_id}:
+                raise RuntimeError("Data proxy did not acknowledge observation marker")
+
+    def reconfiguration_metrics(self) -> list[dict]:
+        rows = []
+        for address in self._data_proxy_addrs:
+            response = self._sync_client.get(
+                f"{address}/reconfiguration/metrics",
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
+            response.raise_for_status()
+            rows.append({"proxy": address, **response.json()})
+        return rows
 
     # -- Destroy -----------------------------------------------------------
 
@@ -1123,6 +1116,8 @@ class RolloutControllerV2:
         """Tear down all services and release resources."""
         if self._destroyed:
             return
+        if self._managed_replicas is not None:
+            self._managed_replicas.stop()
         self._destroyed = True
 
         self._shutdown_requested.set()
@@ -1402,6 +1397,11 @@ class RolloutControllerV2:
         # Return list of trajectories (matching RolloutController API)
         return [r for r in results if r is not None]
 
+    def configure_control_callbacks(self, *, on_wait=None, on_trajectory=None) -> None:
+        """Attach coordinator callbacks; data ownership stays in the native pipeline."""
+        self._control_callback = on_wait
+        self._trajectory_observer = on_trajectory
+
     def prepare_batch(
         self,
         dataloader: Any,
@@ -1466,11 +1466,15 @@ class RolloutControllerV2:
             reward_normalization,
         )
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+        control = {}
+        if self._control_callback is not None:
+            control["on_wait"] = self._control_callback
         results = self.workflow_executor.prepare_batch(
             dataloader=dataloader,
             workflow=resolved_workflow,
             should_accept_fn=resolved_accept_fn,
             dynamic_bs=dynamic_bs,
+            **control,
         )
         # Return list of trajectories (matching RolloutController API)
         return [r for r in results if r is not None]
@@ -1652,6 +1656,9 @@ class RolloutControllerV2:
         run_async_task(self._async_pause_generation)
 
     async def _async_pause_generation(self) -> None:
+        if self._managed_replicas is not None:
+            await self._async_managed_pause(True)
+            return
         if not self._data_proxy_addrs:
             return
         results = await asyncio.gather(
@@ -1675,6 +1682,9 @@ class RolloutControllerV2:
         run_async_task(self._async_continue_generation)
 
     async def _async_continue_generation(self) -> None:
+        if self._managed_replicas is not None:
+            await self._async_managed_pause(False)
+            return
         if not self._data_proxy_addrs:
             return
         results = await asyncio.gather(
@@ -1691,6 +1701,42 @@ class RolloutControllerV2:
             raise RuntimeError(
                 f"continue_generation failed on ALL {len(failed)} workers"
             )
+
+    async def _async_managed_pause(self, paused: bool) -> None:
+        client = await self._get_async_client()
+
+        async def post(address, endpoint):
+            response = await client.post(
+                f"{address}{endpoint}",
+                json={"paused": paused},
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
+            response.raise_for_status()
+            if response.json() != {"status": "ok", "paused": paused}:
+                raise RuntimeError(
+                    "Every proxy/engine must acknowledge generation control"
+                )
+
+        async def local_state():
+            await asyncio.gather(
+                *[
+                    post(address, "/reconfiguration/pause_state")
+                    for address in self._data_proxy_addrs
+                ]
+            )
+
+        # Pause all bridges before aborting a backend; resume each unique engine
+        # before releasing its proxy waiters. Require EVERY acknowledgment.
+        if paused:
+            await local_state()
+        await asyncio.gather(
+            *[
+                post(address, "/pause_generation" if paused else "/continue_generation")
+                for address in self._data_proxy_addrs[: len(self._inf_addrs)]
+            ]
+        )
+        if not paused:
+            await local_state()
 
     # -- Stats -------------------------------------------------------------
 
@@ -1721,6 +1767,11 @@ class RolloutControllerV2:
     @property
     def inference_guard_addrs(self) -> list[str]:
         self._ensure_initialized()
+        if self._managed_replicas is not None:
+            return [
+                self._managed_replicas.guard(device)
+                for device in self._managed_replicas.devices
+            ]
         return [
             f"http://{format_hostport(w.ip, int(w.worker_ports[0]))}"
             for w in self.workers

@@ -199,3 +199,37 @@ python examples/profile/postprocess_profile.py \
 - Qwen3-30B-A3B requires an eight-GPU profiling environment. Without suitable GPUs and
   model weights, only the scripts and postprocessing can be validated; CUDA traces and
   memory snapshots cannot be produced.
+
+## Actor and Rollout calibration
+
+The component calibration scripts run from the AReaL repository root. Actor uses a fixed
+model and seed, with one run per DP/TP layout:
+
+```bash
+torchrun --standalone --nproc_per_node=1 -m examples.profile.actor_calibration \
+  --model "$MODEL_PATH" --output "$RUN_DIR" --dp 1 --tp 1 \
+  --cases pilot --warmup 1 --repeat 2
+```
+
+For Rollout, start SGLang with batch tracing enabled, then submit calibration cases:
+
+```bash
+AREAL_ROLLOUT_TRACE_DIR="$TRACE_DIR" \
+python -m areal.v2.inference_service.sglang.launch_server \
+  --model-path "$MODEL_PATH" --tp-size 1 --dp-size 1 \
+  --host 127.0.0.1 --port "$PORT" --disable-radix-cache \
+  --dtype bfloat16 --context-length 65536 --mem-fraction-static 0.75
+
+python -m examples.profile.rollout_calibration \
+  --url "$INFERENCE_URL" --output "$RUN_DIR" --cases pilot --repeat 1
+```
+
+Set `AREAL_INFERENCE_ADMIN_KEY` for authentication. Actor writes per-rank phase, packing
+and memory records; Rollout checks token lengths and records request and engine batch
+timing. Use `--cases all` for the full case set. Measurement definitions and calibration
+scope are maintained in the workspace
+[calibration guide](../../../docs/implementation/calibration.md).
+
+`examples.profile.trace` parses existing Actor summary metrics, rank microbatch logs and
+Chrome/JSONL CPU spans. It reports per-step phase durations without adding runtime
+instrumentation.

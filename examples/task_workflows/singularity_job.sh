@@ -90,13 +90,13 @@ if [[ "$TASK_MODE" == train ]]; then
   : "${TASK_TRAIN_TASKS:?}"
   CUDA_VISIBLE_DEVICES="" "$TASK_PYTHON" -m examples.task_workflows.train \
     --config "examples/task_workflows/configs/$config" \
-    "trial_name=$service" scheduler.type=local actor_lifecycle.mode=resident \
+    "trial_name=$service" scheduler.type=local elastic.enabled=false \
     "total_train_epochs=$TASK_EPOCHS" "total_train_steps=$updates" \
     "train_dataset.batch_size=$TASK_BATCH" actor.optimizer.lr=1e-6 \
     rollout.backend=sglang:d4 "rollout.max_concurrent_rollouts=$TASK_CONCURRENCY" \
     'rollout.agent.reasoning_parser=""' +rollout.agent.engine_max_tokens=65536 \
     +sglang.dp_size=1 sglang.mem_fraction_static=0.5 \
-    'actor_lifecycle.rollout_devices=[4,5,6,7]' "saver.freq_steps=$save_every" \
+    'elastic.rollout_devices=[4,5,6,7]' "saver.freq_steps=$save_every" \
     perf_tracer.enabled=true +perf_tracer.save_interval=1 perf_tracer.session_tracer.enabled=true \
     > "$TASK_RUN_ROOT/trainer.log" 2>&1 &
   trainer_pid=$!

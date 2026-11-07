@@ -2,12 +2,19 @@
 
 """Domain-independent proposal, evaluation orchestration and revision storage."""
 
-from .agent import CommandRevisionAgent, RevisionAgent
-from .contracts import Proposal, ProposalRequest
-from .execution import CandidateRunner
-from .interfaces import RevisionEvaluator
-from .llm import LLMRevisionAgent
-from .loop import RevisionLoop, RevisionStore
+from areal.autopilot.revision.agent import (
+    CommandRevisionAgent,
+    LLMRevisionAgent,
+    RevisionAgent,
+)
+from areal.autopilot.revision.contracts import (
+    Proposal,
+    ProposalRequest,
+    RevisionBenchmark,
+    RevisionReport,
+)
+from areal.autopilot.revision.execution import CandidateRunner
+from areal.autopilot.revision.loop import RevisionLoop, RevisionStore
 
 __all__ = [
     "CommandRevisionAgent",
@@ -15,7 +22,8 @@ __all__ = [
     "Proposal",
     "ProposalRequest",
     "CandidateRunner",
-    "RevisionEvaluator",
+    "RevisionBenchmark",
+    "RevisionReport",
     "LLMRevisionAgent",
     "RevisionLoop",
     "RevisionStore",

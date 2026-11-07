@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Task workflows: FSDP4 + SGLang1 in an 8-GPU allocation; 16 episodes / 4 updates.
+# Task workflows: Megatron TP4 + SGLang1 in an 8-GPU allocation.
 experiment_name: task-workflows
 trial_name: trial0
 
@@ -52,7 +52,7 @@ gconfig:
   top_p: 1.0
 
 actor:
-  backend: "fsdp:d4"
+  backend: "megatron:d1t4"
   _version: v2
   admin_api_key: ${oc.env:AREAL_ACTOR_ADMIN_KEY}
   experiment_name: ${experiment_name}
@@ -90,7 +90,7 @@ actor:
   # the task-conditioned learning signal.
   reward_norm: null
   adv_norm: null
-  weight_update_mode: xccl
+  weight_update_mode: awex
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker
@@ -101,16 +101,14 @@ actor:
       env_vars:
         AREAL_ROLLOUT_TRACE_DIR: ${oc.env:AREAL_ROLLOUT_TRACE_DIR,""}
 
-# Local CPU coordinator; on_demand requires CUDA_VISIBLE_DEVICES="".
+# Local CPU coordinator; elastic.enabled requires CUDA_VISIBLE_DEVICES="".
 # Configure physical device indices within the current job allocation.
-actor_lifecycle:
-  mode: ${oc.env:AREAL_ACTOR_LIFECYCLE,resident}
-  policy: basic
+elastic:
+  enabled: ${oc.decode:${oc.env:AREAL_ELASTIC_ENABLED,false}}
+  reconfigurator: basic
   state_root: ${oc.env:AREAL_TASK_STATE_ROOT}
   actor_devices: [0, 1, 2, 3]
   rollout_devices: [4]
-  idle_timeout: 60.0
-  min_ready_seconds: 120.0
   checkpoint_estimated_bytes: ${oc.env:AREAL_CHECKPOINT_ESTIMATED_BYTES}
   checkpoint_keep: 2
 
@@ -123,14 +121,6 @@ sglang:
   max_running_requests: null
   context_length: 65536
   mem_fraction_static: 0.8
-
-vllm:
-  model: ${actor.path}
-  seed: ${seed}
-  skip_tokenizer_init: false
-  dtype: ${actor.dtype}
-  max_model_len: 65536
-  gpu_memory_utilization: 0.8
 
 # datasets
 train_dataset:

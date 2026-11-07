@@ -1,26 +1,63 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Propose, evaluate, accept or retry immutable simulator/optimizer revisions."""
+"""Propose code revisions, run the Revision Benchmark and store accepted versions."""
 
 import fcntl
 import json
 import os
 import uuid
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
 from areal.autopilot.revision.agent import RevisionAgent
-from areal.autopilot.revision.contracts import ProposalRequest, digest, source_digest
-from areal.autopilot.revision.interfaces import RevisionEvaluator
+from areal.autopilot.revision.contracts import (
+    ProposalRequest,
+    RevisionBenchmark,
+    digest,
+    source_digest,
+)
 from areal.utils.atomic import atomic_json
 
 
 class RevisionStore:
-    """One target and one fixed evaluation context per store; atomic active pointer."""
+    """Store one fixed revision context and index this training's attempt history."""
 
-    def __init__(self, root: Path):
-        self.root = root.resolve()
+    def __init__(self, root: Path, *, history_root: Path | None = None):
+        self.root = Path(root).resolve()
+        self.history_root = (
+            self.root if history_root is None else Path(history_root).resolve()
+        )
+        if not self.root.is_relative_to(self.history_root):
+            raise ValueError(
+                "Revision output must belong to its training history directory"
+            )
         self.root.mkdir(parents=True, exist_ok=True)
+
+    def history(self, target: str | None = None) -> tuple[dict, ...]:
+        """Read compact attempts from this training's explicitly scoped directory."""
+        path = self.history_root / "history.json"
+        if not path.exists():
+            return ()
+        attempts = json.loads(path.read_text())["attempts"]
+        return tuple(
+            item for item in attempts if target is None or item["target"] == target
+        )
+
+    def record_history(self, directory: Path, entry: dict) -> None:
+        """Upsert a completed attempt while preserving other cycles and targets."""
+        attempt = str(directory.relative_to(self.history_root))
+        with (self.history_root / "history.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            records = {item["attempt"]: item for item in self.history()}
+            value = {"attempt": attempt, **entry}
+            if records.get(attempt) == value:
+                return
+            records[attempt] = value
+            atomic_json(
+                self.history_root / "history.json",
+                {"attempts": list(records.values())},
+            )
 
     def active(self) -> tuple[Path, dict] | None:
         pointer = self.root / "active.json"
@@ -94,35 +131,42 @@ class RevisionStore:
 
 
 class RevisionLoop:
+    """Run proposals with caller-supplied Agent context and a Revision Benchmark."""
+
     def __init__(
         self,
         agent: RevisionAgent,
-        evaluator: RevisionEvaluator,
+        benchmark: RevisionBenchmark,
         root: Path,
         *,
         criteria=None,
         initial_source: str | None = None,
+        proposal_context: dict | None = None,
+        history_root: Path | None = None,
     ):
-        self.agent, self.evaluator = agent, evaluator
-        self.store = RevisionStore(root)
+        self.agent, self.benchmark = agent, benchmark
+        self.proposal_context = deepcopy(proposal_context or {})
+        self.store = RevisionStore(root, history_root=history_root)
         self.initial_source = (
-            initial_source if initial_source is not None else evaluator.initial_source
+            initial_source if initial_source is not None else benchmark.initial_source
         )
         if not isinstance(self.initial_source, str) or not self.initial_source.strip():
             raise ValueError(
                 "Component revisions require an explicit initial_source factory"
             )
-        self._evaluator_owns_acceptance = evaluator.owns_acceptance
-        if self._evaluator_owns_acceptance:
-            if criteria is not None and criteria != evaluator.criteria:
-                raise ValueError("Acceptance criteria are frozen by the evaluator")
-            self.criteria = evaluator.criteria
+        self._benchmark_owns_acceptance = benchmark.owns_acceptance
+        if self._benchmark_owns_acceptance:
+            if criteria is not None and criteria != benchmark.criteria:
+                raise ValueError(
+                    "Acceptance criteria are frozen by the Revision Benchmark"
+                )
+            self.criteria = benchmark.criteria
         else:
-            self.criteria = criteria or evaluator.criteria
+            self.criteria = criteria or benchmark.criteria
 
     def _public_feedback(self, outcome: dict) -> dict:
-        if not self._evaluator_owns_acceptance:
-            return outcome
+        if not self._benchmark_owns_acceptance:
+            return {k: v for k, v in outcome.items() if k != "baseline"}
         return {
             **outcome.get("feedback", {}),
             **{
@@ -138,6 +182,46 @@ class RevisionLoop:
             },
         }
 
+    def _report_feedback(self, report) -> dict:
+        if self._benchmark_owns_acceptance:
+            return self.benchmark.feedback(report)
+        return {"score": report.score, "metrics": report.metrics}
+
+    def _record_history(self, directory: Path, outcome: dict) -> None:
+        proposal_path = directory / "proposal.json"
+        proposal = (
+            json.loads(proposal_path.read_text()) if proposal_path.exists() else {}
+        )
+        request_path = directory / "proposal-request.json"
+        request = json.loads(request_path.read_text()) if request_path.exists() else {}
+        self.store.record_history(
+            directory,
+            {
+                "target": self.benchmark.target,
+                "benchmark_sha256": self.benchmark.benchmark_sha256,
+                "settings": request.get("settings", {}),
+                "context": {
+                    k: v
+                    for k, v in request.get("context", {}).items()
+                    if k not in {"reference_sources", "instructions"}
+                },
+                "rationale": proposal.get("rationale", ""),
+                "baseline": outcome.get("baseline"),
+                "outcome": self._public_feedback(outcome),
+            },
+        )
+
+    def restore_history(self) -> list[tuple[Path, dict]]:
+        """Index completed rounds, including outputs created before history support."""
+        completed = []
+        for directory in sorted((self.store.root / "attempts").glob("round-*")):
+            path = directory / "outcome.json"
+            if path.exists():
+                outcome = json.loads(path.read_text())
+                self._record_history(directory, outcome)
+                completed.append((directory, outcome))
+        return completed
+
     def run(self, *, max_rounds: int = 3, stop_after_accept: bool = True) -> dict:
         if type(max_rounds) is not int or max_rounds < 1:
             raise ValueError("Revision rounds must be positive")
@@ -149,16 +233,16 @@ class RevisionLoop:
     def context(self) -> dict:
         context = {
             "format_version": 1,
-            "target": self.evaluator.target,
-            "benchmark_sha256": self.evaluator.benchmark_sha256,
-            "deployment_context": self.evaluator.context,
+            "target": self.benchmark.target,
+            "benchmark_sha256": self.benchmark.benchmark_sha256,
+            "deployment_context": self.benchmark.context,
             "criteria": asdict(self.criteria),
         }
-        if self._evaluator_owns_acceptance:
+        if self._benchmark_owns_acceptance:
             context["initial_sha256"] = source_digest(
                 self.initial_source
                 if self.initial_source is not None
-                else self.evaluator.initial_source
+                else self.benchmark.initial_source
             )
         return context
 
@@ -180,11 +264,11 @@ class RevisionLoop:
             else (
                 self.initial_source
                 if self.initial_source is not None
-                else self.evaluator.initial_source
+                else self.benchmark.initial_source
             )
         )
         initial_sha256 = source_digest(source)
-        baseline = self.evaluator.evaluate(
+        baseline = self.benchmark.evaluate(
             source, root / f"baseline-{uuid.uuid4().hex}"
         )
         previous_report = (
@@ -192,9 +276,9 @@ class RevisionLoop:
             if active is not None
             else root / "baseline.json"
         )
-        if self._evaluator_owns_acceptance and previous_report.exists():
+        if self._benchmark_owns_acceptance and previous_report.exists():
             accepted_report = json.loads(previous_report.read_text())
-            fingerprints = self.evaluator.replay_fingerprints
+            fingerprints = self.benchmark.replay_fingerprints
             if accepted_report["valid"] and (
                 not baseline.valid
                 or baseline.candidate_sha256 != accepted_report["candidate_sha256"]
@@ -214,19 +298,14 @@ class RevisionLoop:
             raise ValueError(f"Incumbent failed evaluation: {baseline.errors}")
         previous = []
         previous_source = None
-        for directory in sorted(attempts.glob("round-*")):
-            if (directory / "outcome.json").exists():
-                previous.append(json.loads((directory / "outcome.json").read_text()))
-                if (directory / "proposal.json").exists():
-                    previous_source = json.loads(
-                        (directory / "proposal.json").read_text()
-                    )["source"]
+        for directory, outcome in self.restore_history():
+            previous.append(outcome)
+            if (directory / "proposal.json").exists():
+                previous_source = json.loads((directory / "proposal.json").read_text())[
+                    "source"
+                ]
         seen = {initial_sha256, *(item.get("candidate_sha256") for item in previous)}
-        baseline_feedback = (
-            self.evaluator.feedback(baseline)
-            if self._evaluator_owns_acceptance
-            else {"score": baseline.score, "metrics": baseline.metrics}
-        )
+        baseline_feedback = self._report_feedback(baseline)
         feedback = [
             {"status": "incumbent", **baseline_feedback},
             *(self._public_feedback(o) for o in previous[-3:]),
@@ -237,21 +316,23 @@ class RevisionLoop:
             directory = attempts / f"round-{round_number:04d}-{uuid.uuid4().hex[:8]}"
             directory.mkdir()
             request = ProposalRequest(
-                self.evaluator.target,
+                self.benchmark.target,
                 round_number,
                 source,
                 source_digest(source),
-                self.evaluator.calibration,
-                json.loads(json.dumps(self.evaluator.settings)),
+                self.benchmark.calibration,
+                json.loads(json.dumps(self.benchmark.settings)),
                 tuple(feedback[-4:]),
                 previous_source=previous_source if previous_source != source else None,
-                context=self.evaluator.proposal_context,
+                context=deepcopy(self.proposal_context),
+                revision_history=self.store.history(self.benchmark.target),
             )
             atomic_json(directory / "proposal-request.json", request.to_dict())
             outcome = {
                 "round": round_number,
                 "status": "rejected",
                 "parent_sha256": source_digest(source),
+                "baseline": self._report_feedback(baseline),
             }
             try:
                 proposal = self.agent.propose(request)
@@ -267,11 +348,11 @@ class RevisionLoop:
                         outcome["reason"] = "Duplicate candidate"
                     else:
                         seen.add(candidate_sha)
-                        report = self.evaluator.evaluate(proposal.source, directory)
+                        report = self.benchmark.evaluate(proposal.source, directory)
                         atomic_json(directory / "evaluation.json", asdict(report))
                         accepted, reason = (
-                            self.evaluator.compare(report, baseline)
-                            if self._evaluator_owns_acceptance
+                            self.benchmark.compare(report, baseline)
+                            if self._benchmark_owns_acceptance
                             else self.criteria.compare(report, baseline)
                         )
                         outcome.update(
@@ -280,8 +361,8 @@ class RevisionLoop:
                             metrics=report.metrics,
                             errors=list(report.errors),
                         )
-                        if self._evaluator_owns_acceptance:
-                            outcome["feedback"] = self.evaluator.feedback(report)
+                        if self._benchmark_owns_acceptance:
+                            outcome["feedback"] = self.benchmark.feedback(report)
                         if accepted:
                             path = directory / "candidate.py"
                             # Runner materializes the exact source that was evaluated.
@@ -308,14 +389,15 @@ class RevisionLoop:
                 except Exception as error:
                     outcome.update(reason=f"{type(error).__name__}: {error}")
             atomic_json(directory / "outcome.json", outcome)
+            self._record_history(directory, outcome)
             feedback.append(self._public_feedback(outcome))
             outcomes.append(outcome)
             if outcome["status"] == "accepted" and stop_after_accept:
                 break
         active = self.store.active()
         result = {
-            "target": self.evaluator.target,
-            "benchmark_sha256": self.evaluator.benchmark_sha256,
+            "target": self.benchmark.target,
+            "benchmark_sha256": self.benchmark.benchmark_sha256,
             "initial_sha256": initial_sha256,
             "incumbent_sha256": source_digest(source),
             "active_source": None if active is None else str(active[0]),
