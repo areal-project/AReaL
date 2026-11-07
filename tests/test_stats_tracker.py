@@ -12,6 +12,49 @@ from areal.utils.stats_tracker import (
 )
 
 
+@pytest.mark.parametrize("raise_error", [False, True])
+def test_disable_scope_restores_outer_scope_after_exit(raise_error):
+    """Temporary unscoped recording must not damage the enclosing context."""
+    tracker = DistributedStatsTracker("train")
+    error = RuntimeError("recording failed")
+
+    with tracker.scope("step"):
+        try:
+            with tracker.disable_scope():
+                tracker.scalar(unscoped=1.0)
+                if raise_error:
+                    raise error
+        except RuntimeError as caught:
+            assert caught is error
+        tracker.scalar(after=2.0)
+    tracker.scalar(outside=3.0)
+
+    assert tracker.export() == {
+        "unscoped": 1.0,
+        "unscoped__count": 1,
+        "train/step/after": 2.0,
+        "train/step/after__count": 1,
+        "train/outside": 3.0,
+        "train/outside__count": 1,
+    }
+
+
+def test_nested_disable_scope_preserves_original_exception():
+    """Nested scope cleanup must propagate the original recording error."""
+    tracker = DistributedStatsTracker("train")
+    error = RuntimeError("recording failed")
+
+    with pytest.raises(RuntimeError) as caught:
+        with tracker.scope("step"):
+            with tracker.disable_scope():
+                with tracker.disable_scope():
+                    raise error
+
+    assert caught.value is error
+    tracker.scalar(after=1.0)
+    assert tracker.export() == {"train/after": 1.0, "train/after__count": 1}
+
+
 def test_compact_stats_match_masked_tensor_reductions_across_unequal_batches():
     tracker = DistributedStatsTracker()
     tracker.stat_compact(
