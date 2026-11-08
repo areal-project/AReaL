@@ -144,6 +144,16 @@ python3 examples/experimental/inference_service/human_in_the_loop_demo.py \
     --external-model gpt-4o
 ```
 
+You can also route the demo through [OrcaRouter](https://www.orcarouter.ai), an
+OpenAI-compatible AI gateway that aggregates many models behind one endpoint:
+
+```bash
+python3 examples/experimental/inference_service/human_in_the_loop_demo.py \
+    --external-url https://api.orcarouter.ai/v1 \
+    --external-api-key YOUR_ORCAROUTER_API_KEY \
+    --external-model <any-orcarouter-model>
+```
+
 When `--external-url` is set, the controller enables external model mode and routes chat
 traffic through the unified `/chat/completions` + `/export_trajectories` external flow.
 
