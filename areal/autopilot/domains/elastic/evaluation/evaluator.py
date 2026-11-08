@@ -8,7 +8,7 @@ import copy
 import json
 import math
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -676,7 +676,13 @@ def calibrated_cost_models(settings):
 def validate_cost_models(cost_models):
     if not getattr(cost_models, "source_ids", ()) or not all(
         callable(getattr(cost_models, name, None))
-        for name in ("rollout_config", "service", "actor", "publication")
+        for name in (
+            "rollout_config",
+            "service",
+            "decode_interval",
+            "actor",
+            "publication",
+        )
     ):
         raise ValueError(
             "build_cost_models must return the complete CostModels interface"
@@ -692,9 +698,8 @@ class FrozenCostModels:
     """Keep factory behavior when evaluating accepted CostModels.
 
     A baseline bundle worker_spec reloads baseline code, not the revised factory.
-    An inherited decode-affine shortcut may likewise bypass a revised service().
-    Until those exports have factory-aware reconstruction/probes, use the actual
-    component callbacks for both historical and candidate execution.
+    Factories provide decode_interval() together with their service() callback;
+    both historical and candidate execution use those factory-owned methods.
     """
 
     def __init__(self, cost_models):
@@ -704,6 +709,28 @@ class FrozenCostModels:
         if name in {"worker_spec", "decode_affine"}:
             raise AttributeError(name)
         return getattr(self._cost_models, name)
+
+    def decode_interval(self, layout, kv, slices, max_steps):
+        """Check factory intervals against its revised service callback."""
+        first, increment, steps = self._cost_models.decode_interval(
+            layout, kv, slices, max_steps
+        )
+        if not 1 <= steps <= max_steps:
+            raise ValueError("decode_interval returned an invalid segment length")
+        for offset in {0, steps // 2, steps - 1}:
+            advanced = tuple(
+                replace(s, context_tokens=s.context_tokens + offset) for s in slices
+            )
+            expected = self._cost_models.service(
+                layout, kv + offset * len(slices), advanced
+            )
+            if not math.isclose(
+                first + offset * increment, expected, rel_tol=1e-10, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    "decode_interval disagrees with the revised service callback"
+                )
+        return first, increment, steps
 
 
 class CostModelHistoryPredictor:

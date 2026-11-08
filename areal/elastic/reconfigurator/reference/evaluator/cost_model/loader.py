@@ -554,6 +554,11 @@ class AnalyticalCostModels:
             self.rollout_config(layout), ServiceState(kv), tuple(slices)
         ).duration.require_seconds()
 
+    def decode_interval(self, layout, kv, slices, max_steps):
+        return self.rollout_model.decode_interval(
+            self.rollout_config(layout), kv, tuple(slices), max_steps
+        )
+
     @lru_cache(maxsize=512)
     def actor_estimate(self, layout, batch):
         config = self.actor_config(layout)
@@ -745,6 +750,10 @@ class CalibratedCostModels:
         return self.rollout_model.decode_affine(
             self._covered_layout(layout), kv, slices
         )
+
+    def decode_interval(self, layout, kv, slices, max_steps):
+        first, increment = self.decode_affine(layout, kv, slices)
+        return first, increment, max_steps
 
     def actor(self, layout, batch):
         return self.actor_model.actor(self._covered_layout(layout), batch)

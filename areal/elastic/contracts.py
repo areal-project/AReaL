@@ -938,6 +938,16 @@ class CostModels(Protocol):
         kv: int,
         slices: tuple[ServiceSlice, ...],
     ) -> float: ...
+    def decode_interval(
+        self,
+        layout: ExecutionConfig | OnlineLayout,
+        kv: int,
+        slices: tuple[ServiceSlice, ...],
+        max_steps: int,
+    ) -> tuple[float, float, int]:
+        """First iteration seconds, per-step increment and valid segment length."""
+        ...
+
     def actor(
         self,
         layout: ExecutionConfig | OnlineLayout,

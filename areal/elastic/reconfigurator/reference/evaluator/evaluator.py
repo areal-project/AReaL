@@ -220,7 +220,6 @@ class Evaluator:
         decision_delay_seconds: float = 0.0,
         *,
         prune_irreversible_slo: bool = True,
-        coalesce_decode: bool = True,
         executor: Executor | None = None,
         optimizer=None,
         actor_memory_reserve_fraction: float = 0.0,
@@ -234,7 +233,6 @@ class Evaluator:
         )
         self.delay = decision_delay_seconds
         self.prune_irreversible_slo = prune_irreversible_slo
-        self.coalesce_decode = coalesce_decode
         self.executor = executor
         self.optimizer = optimizer or OnlineOptimizer()
         if not 0 <= actor_memory_reserve_fraction < 1:
@@ -585,7 +583,6 @@ class Evaluator:
                     self.config,
                     self.handoff,
                     self.slo,
-                    coalesce_decode=self.coalesce_decode,
                     _prepared=prepared,
                 )
                 simulation._forecast_target = layout
@@ -912,7 +909,6 @@ class Evaluator:
             self.slo,
             self.delay,
             self.prune_irreversible_slo,
-            self.coalesce_decode,
             view,
             forecasts,
             self.context_id,
@@ -952,7 +948,6 @@ class Evaluator:
         reconfigurator: object | None = None,
         event_sink: Callable[[dict], None] | None = None,
         start_time: float = 0.0,
-        coalesce_decode: bool = False,
         candidate_executor: Executor | None = None,
         _work: WorkInputs | None = None,
     ):
@@ -1039,7 +1034,6 @@ class Evaluator:
         self.processed_events = 0
         self.status, self.reason = ("running", "")
         self.training_limit: int | None = None
-        self.coalesce_decode = coalesce_decode
         self.candidate_executor = candidate_executor
         self.decode_steps_skipped = self.decode_segments = 0
         self.decode_plan_builds = self.decode_plan_hits = 0
@@ -1099,7 +1093,6 @@ class Evaluator:
         handoff: HandoffConfig,
         slo=None,
         *,
-        coalesce_decode: bool = False,
         _prepared: ReplayInputs | None = None,
         **simulation_options,
     ):
@@ -1124,7 +1117,6 @@ class Evaluator:
             slo,
             input_closes_at=forecast.input_closes_at,
             start_time=view.now,
-            coalesce_decode=coalesce_decode,
             _work=prepared.work,
             **simulation_options,
         )
@@ -1329,7 +1321,7 @@ class Evaluator:
 
     def emit(self, kind: str, **data):
         self.counters[kind] += 1
-        if kind == "service_batch" and self.sink is None:
+        if kind == "service_batch":
             return
         event = dict(time=self.now, kind=kind, **data)
         if self.sink:
@@ -1378,10 +1370,9 @@ class Evaluator:
                         else "No event can make progress",
                     )
                     break
-                if self.coalesce_decode:
-                    from areal.elastic.simulation_primitives import advance_decode
+                from areal.elastic.simulation_primitives import advance_decode
 
-                    advance_decode(self, until)
+                advance_decode(self, until)
                 when = self.heap[0][0]
                 if until is not None and when > until:
                     self.advance(until)
@@ -1400,11 +1391,8 @@ class Evaluator:
                     break
                 self.advance(when)
                 local_services = set()
-                service_only = (
-                    self.coalesce_decode
-                    and self.sink is None
-                    and (self.pending_handoff is None)
-                    and (self.publication == "idle")
+                service_only = (self.pending_handoff is None) and (
+                    self.publication == "idle"
                 )
                 completed = self.counters["request_complete"]
                 while self.heap and self.heap[0][0] == self.now:
@@ -1613,10 +1601,7 @@ class Evaluator:
                     continue
                 plan = group.decode_plan
                 continuation = (
-                    self.coalesce_decode
-                    and self.sink is None
-                    and (not self.prediction_guard_active())
-                    and (plan is not None)
+                    (plan is not None)
                     and plan.continuation
                     and (plan.revision == group.revision)
                     and (plan.version == deployment.version)
@@ -1695,10 +1680,7 @@ class Evaluator:
         group = deployment.replicas[replica]
         plan = group.decode_plan
         defer = (
-            self.coalesce_decode
-            and self.sink is None
-            and (not self.prediction_guard_active())
-            and (plan is not None)
+            (plan is not None)
             and (plan.batch is batch)
             and (plan.revision == group.revision)
             and (plan.version == deployment.version)
@@ -1734,10 +1716,7 @@ class Evaluator:
                 if view.generated == truth.output_tokens:
                     self.finish_request(request)
         if (
-            self.coalesce_decode
-            and self.sink is None
-            and (not self.prediction_guard_active())
-            and (plan is not None)
+            (plan is not None)
             and (plan.batch is batch)
             and (plan.revision == group.revision)
             and (plan.version == deployment.version)
@@ -2255,9 +2234,6 @@ class Evaluator:
             return self._cold_handle_transition_event(*args, **kwargs)
         return self._hot_handle_transition_event(*args, **kwargs)
 
-    def prediction_guard_active(self):
-        return self._forecast_slo_guard is not None
-
     def request_finished(self, view):
         guard = self._forecast_slo_guard
         if (
@@ -2294,6 +2270,7 @@ class Evaluator:
         if guard is None or self.done or self.now < guard.check_after:
             return
         guard.check_after = self.now + 1.0
+        self.flush_decode()
         failed = len(guard.failed) + sum(
             self.request_has_failed(r.view) for r in self._live_requests.values()
         )

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import math
+
 from areal.elastic.contracts import RollingSLO
 from areal.elastic.reconfigurator.reference.forecast import HistoricalReplay
 from areal.elastic.serving import rolling_slo
@@ -66,15 +68,23 @@ def redundant_search(owner, view, evaluator):
     )
 
 
-def allowed_roles(owner, when: float) -> dict[str, bool]:
-    seconds = max(
-        owner.config.cooldown_seconds,
+def history_wait(owner, last_switch: float) -> float:
+    history = (
         owner.forecaster.config.history_seconds
         if isinstance(owner.forecaster, HistoricalReplay)
-        else 0.0,
+        else 0.0
     )
+    wait = owner.config.post_switch_wait_seconds
+    # Keep startup warmup independent of the wait after later reconfigurations.
+    return max(
+        owner.config.cooldown_seconds,
+        history if wait is None or not math.isfinite(last_switch) else wait,
+    )
+
+
+def allowed_roles(owner, when: float) -> dict[str, bool]:
     return {
-        role: when - max(0.0, completed) >= seconds
+        role: when - max(0.0, completed) >= history_wait(owner, completed)
         for role, completed in owner.last_role_switch.items()
     }
 

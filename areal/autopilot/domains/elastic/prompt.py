@@ -17,6 +17,9 @@ def proposal_context(target, *, workload_change=None, objective=None):
             "Revise the Evaluator's CostModels subcomponent. Return frozen CostModels with "
             "source_ids, rollout_config(layout), "
             "service(layout, kv_tokens, slices), actor(layout, batch), publication(actor_layout, rollout_layouts). "
+            "Also implement decode_interval(layout, kv_tokens, slices, max_steps), returning "
+            "(first_seconds, per_step_increment, valid_steps) exactly matching service() "
+            "within a stable pure-decode segment. "
             "Calibration labels are public; validation and final-holdout labels are private. "
             "Preserve unknown coverage and fixed training semantics."
         )

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Online reconfiguration: observe, search, revalidate and apply on one timeline."""
+"""Online reconfiguration: observe, search and apply on one timeline."""
 
 from __future__ import annotations
 
@@ -50,6 +50,10 @@ class OnlineReconfiguratorConfig:
     actor_memory_scope: str = "all_completed"
     independent_role_history: bool = False
     max_search_seconds: float = 30.0
+    # Wait after a completed switch; None reuses the forecast history length.
+    post_switch_wait_seconds: float | None = None
+    # Spend at most one search per detected workload regime, including rejected results.
+    search_once_per_regime: bool = False
 
     def __post_init__(self):
         for name in ("check_interval_seconds", "slo_window_seconds"):
@@ -57,6 +61,8 @@ class OnlineReconfiguratorConfig:
         nonnegative("max_search_seconds", self.max_search_seconds, positive=True)
         for name in ("cooldown_seconds", "decision_delay_seconds"):
             nonnegative(name, getattr(self, name))
+        if self.post_switch_wait_seconds is not None:
+            nonnegative("post_switch_wait_seconds", self.post_switch_wait_seconds)
         if not 0 <= self.pressure_request_fraction < self.slack_request_fraction <= 1:
             raise ValueError(
                 "Require 0 <= pressure_request_fraction < slack_request_fraction <= 1"
@@ -80,14 +86,8 @@ class _Search:
     view: object
     decision: object
     record: dict
-    regime: int | None
     stage: str = "search"
-    validation: tuple = ()
-    validation_view: object = None
-    validation_features: object = None
-    elapsed: float = 0.0
     publication_wait_started: float | None = None
-    publication_resume_stage: str | None = None
 
 
 class OnlineReconfigurator:
@@ -102,6 +102,10 @@ class OnlineReconfigurator:
     ):
         if not candidates:
             raise ValueError("Explicit online candidates are required")
+        if config.search_once_per_regime and not isinstance(
+            forecaster, HistoricalReplay
+        ):
+            raise ValueError("One search per regime requires HistoricalReplay")
         self.candidates = tuple(dict.fromkeys(candidates))
         self.optimizer = OnlineOptimizer(
             max_queries=config.max_evaluations, max_seconds=config.max_search_seconds
@@ -112,6 +116,7 @@ class OnlineReconfigurator:
         self.last_role_switch = {"actor": -math.inf, "rollout": -math.inf}
         self.last_search = -math.inf
         self._last_search_state = None
+        self._searched_regimes: set[int] = set()
         self._winners = []
         self.environment = None
 
@@ -184,7 +189,7 @@ class OnlineReconfigurator:
             and historical
             and (
                 view.now - max(0.0, self.last_switch)
-                < self.forecaster.config.history_seconds
+                < trigger_rules.history_wait(self, self.last_switch)
             )
         ):
             return keep(
@@ -198,6 +203,11 @@ class OnlineReconfigurator:
         trigger = self._trigger(stats)
         if trigger == "none":
             return keep("No SLO pressure or slack trigger")
+        if (
+            cfg.search_once_per_regime
+            and self.forecaster.regime_index in self._searched_regimes
+        ):
+            return keep("Already searched this detected workload regime", trigger)
         if (
             historical
             and cfg.deduplicate_searches
@@ -238,6 +248,9 @@ class OnlineReconfigurator:
                 )[1],
             )
         preferred = tuple(c for c in preferred if c in layouts)
+        if cfg.search_once_per_regime:
+            # A search consumes this regime's opportunity even if application is rejected.
+            self._searched_regimes.add(self.forecaster.regime_index)
         predictions = tuple(
             self.optimizer.search(
                 evaluator,
@@ -303,13 +316,9 @@ class OnlineReconfigurator:
         self.pending: _Search | None = None
         self.sequence = 0
         self.delay_estimate = self.config.decision_delay_seconds
-        self.verification_estimate = self.delay_estimate
         self.stats = dict(
             searches=0,
             search_wall_seconds=0.0,
-            verifications=0,
-            verification_wall_seconds=0.0,
-            application_wait_seconds=0.0,
             publication_waits=0,
             publication_wait_seconds=0.0,
             applied=0,
@@ -337,15 +346,6 @@ class OnlineReconfigurator:
             forecaster.observe(view, confirm_change=confirm_change)
         return getattr(forecaster, "regime_index", None)
 
-    def changed_features(self, features):
-        history = self.forecaster
-        return (
-            isinstance(history, HistoricalReplay)
-            and features is not None
-            and (history.features is not None)
-            and (features.distance(history.features) >= history.config.change_ratio)
-        )
-
     def poll(self):
         sim = self.environment
         view = sim.observe()
@@ -365,6 +365,7 @@ class OnlineReconfigurator:
                 delay_estimate_seconds=self.delay_estimate,
                 actor_running=view.actor.running,
                 role_history=self.role_history_status(view.now),
+                workload_regime=regime,
             )
             if not decision.predictions:
                 record["application_status"] = "no_search"
@@ -372,7 +373,7 @@ class OnlineReconfigurator:
                 sim.emit("decision", **record)
             else:
                 self.sequence += 1
-                self.pending = _Search(self.sequence, view, decision, record, regime)
+                self.pending = _Search(self.sequence, view, decision, record)
                 self.stats["searches"] += 1
                 self.stats["search_wall_seconds"] += elapsed
                 sim.emit(
@@ -399,191 +400,34 @@ class OnlineReconfigurator:
             observed_at=job.view.now,
             seconds=self.delay_estimate,
         )
-        self.verify(identity)
+        job.stage = "application"
+        self.apply(identity)
 
-    def verify(self, identity):
+    def apply(self, identity):
         job, sim = (self.pending, self.environment)
-        if job is None or job.identity != identity or job.stage != "search":
+        if job is None or job.identity != identity or job.stage != "application":
             return
         view = sim.observe()
-        regime = self.observe_history(view, confirm_change=False)
+        # Check execution ownership without predicting or ranking candidates again.
         if (
             sim.pending_handoff is not None
             or sim.decision_pending
             or view.layout != job.view.layout
             or (view.leases != job.view.leases)
-            or (regime != job.regime)
-            or self.changed_features(job.decision.workload_features)
         ):
             self.finish(
                 "discarded",
                 view.layout,
-                "Deployment or workload regime changed during search",
+                "Source deployment or resources changed before application",
             )
             return
-        if job.decision.target == view.layout:
+        target = job.decision.target
+        if target == view.layout:
             self.finish("retained", view.layout, "Search retained current deployment")
             return
-        if self.wait_for_publication("search"):
+        if self.wait_for_publication():
             return
-        forecaster = self.forecaster
-        forecasts = (
-            forecaster.predict(view, self.decision_index, confirm_change=False)
-            if isinstance(forecaster, HistoricalReplay)
-            else forecaster.predict(view, self.decision_index)
-        )
-        if not forecasts:
-            self.finish(
-                "discarded",
-                view.layout,
-                "No causal history for latest-state verification",
-            )
-            return
-        started = self.clock()
-        evaluator = self.evaluator(self.verification_estimate)
-        job.validation = evaluator.evaluate_many(
-            view, forecasts, (view.layout, job.decision.target)
-        )
-        job.elapsed = max(0.0, self.clock() - started)
-        job.validation_view, job.stage = (view, "verification")
-        job.record["verification_observation_id"] = fingerprint(view)
-        job.record["verification_started_at"] = sim.now
-        job.record["verification_wall_seconds"] = job.elapsed
-        job.record["verification_delay_estimate_seconds"] = self.verification_estimate
-        job.record["verification_input_closes_at"] = min(
-            forecast.input_closes_at for forecast in forecasts
-        )
-        job.validation_features = getattr(forecaster, "features", None)
-        job.record["verification_features"] = (
-            asdict(job.validation_features)
-            if job.validation_features is not None
-            else None
-        )
-        job.record["verification_evaluation"] = dict(evaluator.execution_stats)
-        job.record["validation_predictions"] = tuple(asdict(p) for p in job.validation)
-        self.stats["verifications"] += 1
-        self.stats["verification_wall_seconds"] += job.elapsed
-        sim.emit(
-            "verification_start", search=identity, observation_id=fingerprint(view)
-        )
-        sim.schedule_at(
-            sim.now + job.elapsed, "verification_complete", identity, priority=9
-        )
-
-    @staticmethod
-    def preconditions(view):
-        return (
-            view.layout,
-            view.leases,
-            view.actor.waiting,
-            view.input_closed,
-            view.actor.running,
-        )
-
-    def wait_for_publication(self, resume_stage):
-        job, sim = (self.pending, self.environment)
-        if sim.publication == "idle":
-            return False
-        job.publication_wait_started = sim.now
-        job.publication_resume_stage = resume_stage
-        job.stage = "publication_wait"
-        self.stats["publication_waits"] += 1
-        sim.emit("decision_publication_wait", search=job.identity, stage=resume_stage)
-        return True
-
-    def publication_complete(self):
-        job, sim = (self.pending, self.environment)
-        if job is None or job.stage != "publication_wait":
-            return
-        seconds = sim.now - job.publication_wait_started
-        stage = job.publication_resume_stage
-        key = (
-            "verification_publication_wait_seconds"
-            if stage == "search"
-            else "application_publication_wait_seconds"
-        )
-        job.record[key] = job.record.get(key, 0.0) + seconds
-        self.stats["publication_wait_seconds"] += seconds
-        job.stage = stage
-        job.publication_wait_started = job.publication_resume_stage = None
-        sim.emit(
-            "decision_publication_resume",
-            search=job.identity,
-            stage=stage,
-            seconds=seconds,
-            version=sim.provider_version,
-            cursor=sim.consumed,
-        )
-        if stage == "search":
-            self.verify(job.identity)
-        else:
-            self.ready(job.identity)
-
-    def verified(self, identity):
-        job, sim = (self.pending, self.environment)
-        if job is None or job.identity != identity or job.stage != "verification":
-            return
-        self.verification_estimate = max(
-            self.config.decision_delay_seconds, job.elapsed * 1.25
-        )
-        sim.emit("verification_complete", search=identity, seconds=job.elapsed)
-        job.record["verification_completed_at"] = sim.now
-        if job.elapsed > job.record["verification_delay_estimate_seconds"] + 1e-09:
-            self.finish(
-                "discarded",
-                sim.layout,
-                "Verification exceeded its modeled CPU delay; retain serving deployment",
-            )
-            return
-        planned = (
-            job.record["verification_started_at"]
-            + job.record["verification_delay_estimate_seconds"]
-        )
-        job.record["application_scheduled_at"] = planned
-        self.stats["application_wait_seconds"] += max(0.0, planned - sim.now)
-        job.stage = "application_wait"
-        sim.schedule_at(max(sim.now, planned), "decision_ready", identity, priority=9)
-
-    def ready(self, identity):
-        job, sim = (self.pending, self.environment)
-        if job is None or job.identity != identity or job.stage != "application_wait":
-            return
-        view = sim.observe()
-        regime = self.observe_history(view, confirm_change=False)
-        if (
-            sim.pending_handoff is not None
-            or sim.decision_pending
-            or regime != job.regime
-            or self.changed_features(job.validation_features)
-            or (self.preconditions(view) != self.preconditions(job.validation_view))
-            or (
-                sim.now
-                - job.validation_view.now
-                - job.record.get("application_publication_wait_seconds", 0.0)
-                > self.config.check_interval_seconds
-            )
-        ):
-            self.finish(
-                "discarded",
-                view.layout,
-                "Verification preconditions changed or expired; retain serving deployment",
-            )
-            return
-        best = self.optimizer.select(
-            job.validation,
-            view.layout,
-            sim.slo.minimum_request_fraction,
-            trigger=job.decision.trigger,
-        )
-        if best is None or best.layout == view.layout:
-            self.finish(
-                "retained",
-                view.layout,
-                "Latest-state verification retained current deployment",
-            )
-        elif self.wait_for_publication("application_wait"):
-            return
-        elif sim.request_handoff(best.layout):
+        if sim.request_handoff(target):
             job.record["application_state"] = dict(
                 training_version=view.training_version,
                 provider_version=view.provider_version,
@@ -591,12 +435,41 @@ class OnlineReconfigurator:
             )
             self.stats["applied"] += 1
             self.finish(
-                "applied", best.layout, "Latest-state verification accepted target"
+                "applied", target, "Search target submitted for reconfiguration"
             )
         else:
             self.finish(
                 "discarded", view.layout, "Target resources unavailable at application"
             )
+
+    def wait_for_publication(self):
+        job, sim = (self.pending, self.environment)
+        if sim.publication == "idle":
+            return False
+        job.publication_wait_started = sim.now
+        job.stage = "publication_wait"
+        self.stats["publication_waits"] += 1
+        sim.emit("decision_publication_wait", search=job.identity)
+        return True
+
+    def publication_complete(self):
+        job, sim = (self.pending, self.environment)
+        if job is None or job.stage != "publication_wait":
+            return
+        seconds = sim.now - job.publication_wait_started
+        key = "application_publication_wait_seconds"
+        job.record[key] = job.record.get(key, 0.0) + seconds
+        self.stats["publication_wait_seconds"] += seconds
+        job.stage = "application"
+        job.publication_wait_started = None
+        sim.emit(
+            "decision_publication_resume",
+            search=job.identity,
+            seconds=seconds,
+            version=sim.provider_version,
+            cursor=sim.consumed,
+        )
+        self.apply(job.identity)
 
     def finish(self, status, target, reason):
         job, sim = (self.pending, self.environment)

@@ -429,17 +429,15 @@ def advance_decode(sim: Any, until: float | None) -> None:
     completions need not wake the other replicas, but any request completion,
     prefill, arrival, tool, Actor/publication or handoff event does.
     """
-    affine = getattr(sim.cost_models, "decode_affine", None)
-    if (
-        affine is None
-        or sim.sink is not None
-        or sim.publication != "idle"
-        or sim.prediction_guard_active()
-    ):
+    if sim.publication != "idle":
         return
     boundary = min(
         until if until is not None else math.inf, sim.config.max_simulated_seconds
     )
+    for name in ("_forecast_slo_guard", "_candidate_guard"):
+        guard = getattr(sim, name, None)
+        if guard is not None:
+            boundary = min(boundary, guard.check_after)
     runs = []
     for event in sim.heap:
         when, _, _, kind, data = event
@@ -459,6 +457,7 @@ def advance_decode(sim: Any, until: float | None) -> None:
             or plan.batch is not batch
             or plan.revision != group.revision
             or plan.version != deployment.version
+            or plan.limit < 1
         ):
             group.flush_decode()
             if not all(s[3] == "decode" for s in batch.slices):
@@ -494,11 +493,20 @@ def advance_decode(sim: Any, until: float | None) -> None:
                     remaining,
                     (cfg.kv_capacity_tokens - group.kv_tokens) // len(selected),
                 )
-                plan.first_seconds, plan.increment = affine(
-                    deployment.layout,
-                    group.kv_tokens,
-                    tuple(ServiceSlice(*s) for s in batch.slices),
-                )
+                slices = tuple(ServiceSlice(*s) for s in batch.slices)
+                interval = getattr(sim.cost_models, "decode_interval", None)
+                if interval is not None:
+                    plan.first_seconds, plan.increment, plan.limit = interval(
+                        deployment.layout, group.kv_tokens, slices, plan.limit
+                    )
+                else:
+                    # Basic's frozen linear model uses the same interval math.
+                    affine = getattr(sim.cost_models, "decode_affine", None)
+                    if affine is None:
+                        raise ValueError("CostModels must provide decode_interval()")
+                    plan.first_seconds, plan.increment = affine(
+                        deployment.layout, group.kv_tokens, slices
+                    )
         else:
             sim.decode_plan_hits += 1
             if plan.run is not None and plan.run.event is event:

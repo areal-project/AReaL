@@ -39,9 +39,15 @@ def evaluate_chunk(job):
     CalibratedCostModels = component_module(
         implementation, "cost_models"
     ).CalibratedCostModels
-    spec, expected, config, handoff, slo, delay, prune, coalesce, view, forecasts = (
-        payload[:10]
-    )
+    spec, expected, config, handoff, slo, delay, prune = payload[:7]
+    if implementation == "basic":
+        coalesce, view, forecasts = payload[7:10]
+        options = payload[10:]
+        legacy = (coalesce,)
+    else:
+        view, forecasts = payload[7:9]
+        options = payload[9:]
+        legacy = ()
     identity = implementation, spec, expected
     if identity != _identity:
         if spec[0] == "analytical":
@@ -74,9 +80,9 @@ def evaluate_chunk(job):
             raise ValueError("CPU worker loaded different component models")
         _identity = identity
         _search = None
-    context = payload[10] if len(payload) > 10 else None
-    reserve = payload[11] if len(payload) > 11 else 0.0
-    scope = payload[12] if len(payload) > 12 else "all_completed"
+    context = options[0] if options else None
+    reserve = options[1] if len(options) > 1 else 0.0
+    scope = options[2] if len(options) > 2 else "all_completed"
     key = (
         identity,
         config,
@@ -84,7 +90,7 @@ def evaluate_chunk(job):
         slo,
         delay,
         prune,
-        coalesce,
+        legacy,
         context,
         reserve,
         scope,
@@ -97,11 +103,10 @@ def evaluate_chunk(job):
             slo,
             delay,
             prune_irreversible_slo=prune,
-            coalesce_decode=coalesce,
             **(
                 dict(actor_memory_reserve_fraction=reserve, actor_memory_scope=scope)
                 if implementation == "reference"
-                else {}
+                else dict(coalesce_decode=coalesce)
             ),
         )
         if context is not None:
@@ -112,8 +117,8 @@ def evaluate_chunk(job):
         _, evaluator, view, forecasts = _search
     before = getattr(evaluator, "input_preparations", 0)
     predictions = tuple(
-        evaluator.evaluate(view, forecasts, layout, bound=payload[13])
-        if len(payload) > 13
+        evaluator.evaluate(view, forecasts, layout, bound=options[3])
+        if len(options) > 3
         else evaluator.evaluate(view, forecasts, layout)
         for _, layout in indexed
     )

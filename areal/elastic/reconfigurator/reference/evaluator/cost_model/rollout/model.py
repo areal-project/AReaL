@@ -37,6 +37,8 @@ def iteration_cost(
     config: RolloutConfig,
     slices: tuple[ServiceSlice, ...],
     kv_after: int,
+    *,
+    _decode_lines: list[tuple[float, float]] | None = None,
 ) -> tuple[float, float]:
     if (
         config.pp != 1
@@ -45,7 +47,7 @@ def iteration_cost(
         or config.tp > model.kv_heads
     ):
         return _distributed_iteration_cost(
-            model, hardware, rates, config, slices, kv_after
+            model, hardware, rates, config, slices, kv_after, _decode_lines
         )
     m, h, r, tp = (model, hardware, rates, config.tp)
     tokens = sum(s.query_tokens for s in slices)
@@ -94,6 +96,26 @@ def iteration_cost(
             * (2 * (tp - 1) / tp * payload / bandwidth + (tp - 1) * latency)
         )
     seconds = max(compute, memory) + network + m.layers * r.launch_seconds
+    if _decode_lines is not None:
+        fixed = network + m.layers * r.launch_seconds
+        _decode_lines.extend(
+            (
+                (
+                    compute + fixed,
+                    4
+                    * m.layers
+                    * m.attention_heads
+                    * m.head_dim
+                    * len(slices)
+                    / tp
+                    / (h.bf16_tflops * 1e12 * r.attention),
+                ),
+                (
+                    memory + fixed,
+                    len(slices) * kv_width / (h.hbm_gbps * 1e9 * r.hbm),
+                ),
+            )
+        )
     lower_bound = m.total_parameters * config.weight_bytes / tp + kv_after * kv_width
     return (seconds, lower_bound)
 
@@ -121,7 +143,9 @@ def memory_per_rank(model, config):
     return weights, kv
 
 
-def _distributed_iteration_cost(model, hardware, rates, config, slices, kv_after):
+def _distributed_iteration_cost(
+    model, hardware, rates, config, slices, kv_after, decode_lines=None
+):
     """SGLang PP/DP-Attention/EP roofline prior with explicit grouping costs."""
     from .scheduling import SGLangScheduler
 
@@ -220,6 +244,47 @@ def _distributed_iteration_cost(model, hardware, rates, config, slices, kv_after
     seconds = (
         max(compute, memory) + network + m.layers * r.launch_seconds * microbatches
     ) * bubble + pipeline
+    if decode_lines is not None:
+        fixed = (
+            network + m.layers * r.launch_seconds * microbatches
+        ) * bubble + pipeline
+        for row in groups:
+            group_pairs = sum(s.context_tokens + 1 for s in row)
+            group_attention = (
+                4
+                * m.layers
+                * m.attention_heads
+                * m.head_dim
+                * group_pairs
+                / c.attention_tp
+            )
+            group_compute = linear / (
+                h.bf16_tflops * 1e12 * r.dense
+            ) + group_attention / (h.bf16_tflops * 1e12 * r.attention)
+            decode_lines.append(
+                (
+                    group_compute * bubble + fixed,
+                    4
+                    * m.layers
+                    * m.attention_heads
+                    * m.head_dim
+                    * len(row)
+                    / c.attention_tp
+                    / (h.bf16_tflops * 1e12 * r.attention)
+                    * bubble,
+                )
+            )
+        decode_lines.append(
+            (
+                memory * bubble + fixed,
+                len(slices)
+                * kv_width
+                * c.pp
+                / c.dp_size
+                / (h.hbm_gbps * 1e9 * r.hbm)
+                * bubble,
+            )
+        )
     return seconds, weights + kv_after / c.dp_size * kv_width
 
 
@@ -265,6 +330,57 @@ class ExpertRolloutModel:
         if self.execution_identity:
             identity += (self.execution_identity,)
         return fingerprint(*identity)
+
+    def decode_interval(self, config, kv_tokens, slices, max_steps):
+        """Return (first seconds, increment, steps) within one roofline segment.
+
+        A stable pure-decode batch has affine compute/memory branches. Stop
+        before another branch wins; never extrapolate across a bottleneck change.
+        """
+        if not slices or any(s.kind != "decode" or s.query_tokens != 1 for s in slices):
+            raise ValueError("Decode intervals require a stable pure-decode batch")
+        if self.calibration:
+            raise ValueError(
+                "Use the frozen calibrated model's interval implementation"
+            )
+        if max_steps < 1:
+            raise ValueError("Decode interval needs at least one step")
+        first = self.estimate(
+            config, ServiceState(kv_tokens), slices
+        ).duration.require_seconds()
+        lines = []
+        _, lower = iteration_cost(
+            self.model,
+            self.hardware,
+            self.rates,
+            config,
+            slices,
+            kv_tokens + len(slices),
+            _decode_lines=lines,
+        )
+        # KV occupancy and the per-rank memory bound remain linear even when
+        # the timing roofline changes. Stop before either capacity is exceeded.
+        _, next_lower = iteration_cost(
+            self.model,
+            self.hardware,
+            self.rates,
+            config,
+            slices,
+            kv_tokens + 2 * len(slices),
+        )
+        room = self.hardware.memory_gb * 1e9 * config.mem_fraction_static - lower
+        max_steps = min(
+            max_steps,
+            (config.kv_capacity_tokens - kv_tokens) // len(slices),
+            1 + math.floor(max(0.0, room) / (next_lower - lower)),
+        )
+        base, slope = max(lines, key=lambda line: (line[0], line[1]))
+        steps = max_steps
+        for other_base, other_slope in lines:
+            if other_slope > slope:
+                crossing = max(0.0, (base - other_base) / (other_slope - slope))
+                steps = min(steps, max(1, math.ceil(crossing)))
+        return first, slope, steps
 
     def estimate(
         self,
