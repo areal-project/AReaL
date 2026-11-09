@@ -61,6 +61,7 @@ def test_arena_training_preserves_rows_and_cycles_tail(batch_size, monkeypatch):
     )
     monkeypatch.delenv("QWEN_ARENA_TASK_IDS_FILE", raising=False)
     monkeypatch.delenv("QWEN_REQUIRE_RECOVER", raising=False)
+    monkeypatch.delenv("QWEN_EQUAL_STREAM_SAMPLING", raising=False)
 
     class TrainerBoundaryReached(Exception):
         pass
