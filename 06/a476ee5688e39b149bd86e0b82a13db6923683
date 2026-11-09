@@ -1,0 +1,25 @@
+areal/infra/workflow_executor.py
+  s_6b814fc8a9d033::t_dfd96ef2b44fd6 681-693,695
+  s_6b814fc8a9d033::t_523cf7c0f561f2 45,820-828
+areal/trainer/rl_trainer.py
+  s_6b814fc8a9d033::t_0f1bbeac3fb1de 9,73,921-940,962-963,966-970,1003-1031,1455-1457
+areal/infra/controller/rollout_controller.py
+  s_6b814fc8a9d033::t_ecf74a655b0c6a 50
+  s_6b814fc8a9d033::t_523cf7c0f561f2 1346-1354
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "06a476ee5688e39b149bd86e0b82a13db6923683",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
