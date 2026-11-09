@@ -10,7 +10,11 @@ import torch
 
 from examples.swe.arena_agent import ArenaStreamAgentWorkflow, _ArenaTaskWaitTimeout
 from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
-from tests.test_swe_arena_multi_stream import _core_review_failure_error
+from tests.test_swe_arena_abbreviated_receipt import _error as _runner_failure_error
+from tests.test_swe_arena_multi_stream import (
+    _core_review_failure_error,
+    _core_tool_budget_failure_error,
+)
 
 from areal.api import ModelResponse
 from areal.experimental.openai.cache import InteractionCache
@@ -73,6 +77,23 @@ class _RecordingFailingAgent(_FailingAgent):
         self.persisted_rewards.append((data, reward))
 
 
+class _CoreToolBudgetFailingAgent(_RecordingFailingAgent):
+    def __init__(self):
+        super().__init__()
+        self.error = _core_tool_budget_failure_error()
+
+    async def run(self, data, **kwargs):
+        raise self.error
+
+    @staticmethod
+    def classify_proxy_failure(error, *, context_overflow, interaction_count):
+        return ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error,
+            context_overflow=context_overflow,
+            interaction_count=interaction_count,
+        )
+
+
 class _FakeProxyClient:
     context_overflow = True
     context_overflow_message = "prompt exceeds context window"
@@ -106,7 +127,9 @@ class _FakeProxyClient:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["invalid_tool_json", "context_limit"])
+@pytest.mark.parametrize(
+    "failure", ["invalid_tool_json", "context_limit", "tool_argument_budget"]
+)
 @pytest.mark.parametrize("proxy_system_error", [False, True])
 async def test_tw_review_failure_recovers_zero_with_system_error_veto(
     monkeypatch, failure, proxy_system_error
@@ -404,11 +427,15 @@ async def test_recovered_overflow_keeps_all_eleven_siblings(monkeypatch, failure
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("valid_siblings", [7, 11])
-@pytest.mark.parametrize("reward_normalization", [False, True])
-async def test_local_task_deadline_preserves_healthy_siblings(
-    monkeypatch, valid_siblings, reward_normalization
+@pytest.mark.parametrize("valid_siblings", [7, 8, 11])
+@pytest.mark.parametrize("normalization", ["none", "mean", "std"])
+@pytest.mark.parametrize(
+    "status", ["LOCAL_WAIT_TIMEOUT", "FAILED", "ERROR", "CANCELLED"]
+)
+async def test_arena_terminal_failure_preserves_healthy_siblings(
+    monkeypatch, valid_siblings, normalization, status
 ):
+    """Unscored task failures keep siblings and the configured group threshold."""
     from areal.api import RolloutWorkflow
     from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
 
@@ -425,9 +452,21 @@ async def test_local_task_deadline_preserves_healthy_siblings(
     agent = ArenaStreamAgentWorkflow(reject_terminal_task_failures=True)
     proxy = OpenAIProxyWorkflow(mode="inline", agent=agent)
     monkeypatch.setattr(proxy, "_grant_capacity", AsyncMock())
-    monkeypatch.setattr(
-        proxy, "_run_agent", AsyncMock(side_effect=_ArenaTaskWaitTimeout("task", 15000))
+    error = (
+        _ArenaTaskWaitTimeout("task", 15000)
+        if status == "LOCAL_WAIT_TIMEOUT"
+        else ArenaTaskFailedError(
+            task_id="task",
+            status=status,
+            result=ArenaTaskResult(
+                task_id="task",
+                status=status,
+                score=None,
+                raw={"error": "reward exec (http_5xx): reward exited with code 1"},
+            ),
+        )
     )
+    monkeypatch.setattr(proxy, "_run_agent", AsyncMock(side_effect=error))
     finished = []
     healthy = {}
     rejected = asyncio.Event()
@@ -460,8 +499,8 @@ async def test_local_task_deadline_preserves_healthy_siblings(
         group_size=12,
         min_usable_group_size=8,
         logger=MagicMock(),
-        reward_normalization=reward_normalization,
-        reward_normalization_use_std=True,
+        reward_normalization=normalization != "none",
+        reward_normalization_use_std=normalization == "std",
     )
     try:
         result = await grouped.arun_episode(None, {})
@@ -476,10 +515,10 @@ async def test_local_task_deadline_preserves_healthy_siblings(
                 [float(index % 2) for index in range(failed_siblings, 12)]
             )
             expected = raw_rewards
-            if reward_normalization:
-                expected = (raw_rewards - raw_rewards.mean()) / raw_rewards.std(
-                    unbiased=False
-                )
+            if normalization != "none":
+                expected = raw_rewards - raw_rewards.mean()
+                if normalization == "std":
+                    expected = expected / raw_rewards.std(unbiased=False)
             actual = torch.tensor([result[key].reward for key in healthy])
             torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
             for index in range(failed_siblings, 12):
@@ -638,6 +677,59 @@ async def test_context_overflow_recovers_existing_interactions_with_zero_reward(
     stats = stats_tracker.export_all(reset=True)
     assert stats["rollout/context_overflow"] == 1.0
     assert stats["rollout/reward"] == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_kind", ["core", "review", "runner", "adopted_runner"])
+@pytest.mark.parametrize("interaction_count", [0, 1])
+@pytest.mark.parametrize("proxy_system_error", [False, True])
+async def test_core_tool_budget_failure_recovers_proxy_interactions_with_zero_reward(
+    monkeypatch, receipt_kind, interaction_count, proxy_system_error
+):
+    """Recover verified budget failures only with usable tokens and a healthy proxy."""
+    fake_client = _FakeProxyClient(interaction_count=interaction_count)
+    fake_client.context_overflow = False
+    fake_client.system_error = proxy_system_error
+    monkeypatch.setattr(
+        workflow_module, "OpenAIProxyClient", lambda *args, **kwargs: fake_client
+    )
+    agent = _CoreToolBudgetFailingAgent()
+    if receipt_kind == "review":
+        agent.error = _core_tool_budget_failure_error(continuations=2)
+    elif receipt_kind in {"runner", "adopted_runner"}:
+        agent.error = _runner_failure_error(
+            adopted=receipt_kind == "adopted_runner",
+            message="tool_call_budget_exceeded: argument_bytes (limit 65536, observed 69773)",
+        )
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
+    monkeypatch.setattr(workflow, "_grant_capacity", AsyncMock())
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=object())
+    )
+    stats_tracker.export_all(reset=True)
+    workflow_context.set(WorkflowContext(task_id=17))
+    try:
+        if proxy_system_error or interaction_count == 0:
+            with pytest.raises(ArenaTaskFailedError):
+                await workflow.arun_episode(engine=None, data={})
+            assert fake_client.last_reward is None
+            assert agent.failure_dispositions[0][2] == (
+                "system_failure_reject"
+                if proxy_system_error
+                else "unknown_failure_reject"
+            )
+            return
+        result = await workflow.arun_episode(engine=None, data={})
+        assert result == {"completion-1": fake_client.interaction}
+        assert fake_client.last_reward == 0.0
+        assert fake_client.interaction.reward == 0.0
+        assert agent.failure_dispositions[0][2] == "model_failure_zero"
+        assert agent.persisted_rewards == [({}, 0.0)]
+        stats = stats_tracker.export_all(reset=True)
+        assert stats["rollout/reward"] == 0.0
+    finally:
+        workflow_context.set(WorkflowContext())
+        stats_tracker.export_all(reset=True)
 
 
 @pytest.mark.asyncio
@@ -883,6 +975,9 @@ async def test_concat_per_completion_rewards_do_not_fill_unscored_branch(monkeyp
         ("EVAL_FAILED", True),
         ("SETUP_FAILED", True),
         ("COLLECT_FAILED", True),
+        ("FAILED", True),
+        ("ERROR", True),
+        ("CANCELLED", True),
         ("LOCAL_WAIT_TIMEOUT", True),
         ("CLIENT_TIMEOUT", False),
     ],
