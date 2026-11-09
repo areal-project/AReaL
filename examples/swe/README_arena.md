@@ -203,14 +203,17 @@ rejections. The corresponding `accepted`, `rejected`, and `filter_rejected` metr
 fractions of all consumed group attempts. Prefetched results remain outside this window
 until consumed. These counts also have aggregate `rollout/` counterparts.
 
-After a successful actor update, `ppo_actor/stream/<name>/{groups,rollouts,sequences}`
+After a successful actor update, `ppo_actor/stream/<name>/{groups,rollouts,tokens}`
 reports the actual training input per Arena stream: prompt groups, logical rollout
-samples, and exported sequence rows respectively. An individual-turn export may
-contribute several sequences per rollout. Counts sum over DP ranks, without multiplying
-by Megatron TP/PP/CP replicas or PPO minibatches. They include inputs with zero
-advantage or masked loss; they do not measure nonzero gradient contributions. Filtered
-rollouts, pending rollouts, and transport padding do not contribute. All counts use the
-current metrics export window, not a lifetime cumulative total.
+samples, and tokens with a nonzero preprocessed `loss_mask`, respectively. Tokens
+exclude prompt/context, padding, and positions masked out before the PPO update; they
+include zero-advantage tokens and do not measure nonzero gradient contributions or
+additional filtering performed inside the loss function. Groups and rollouts still count
+inputs whose loss mask is entirely zero. Counts sum over DP ranks, without multiplying
+by Megatron TP/PP/CP replicas or PPO minibatches. Filtered rollouts, pending rollouts,
+and transport padding do not contribute. All counts use the current metrics export
+window, not a lifetime cumulative total. The `tokens` metric replaces the previous
+`sequences` row count.
 
 ### Filtering groups by accuracy
 

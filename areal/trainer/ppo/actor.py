@@ -415,7 +415,7 @@ class PPOActor:
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
         batched, meta = concat_batch(data)
         self._ppo_update(batched, meta)
-        log_arena_stream_training_counts(meta)
+        log_arena_stream_training_counts(meta, batched["loss_mask"])
 
     def _ppo_update(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None

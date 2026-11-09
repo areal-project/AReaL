@@ -32,6 +32,7 @@ def _trajectory(stream="a", counts=(2, 1)):
     return {
         "input_ids": torch.ones((rows, 4), dtype=torch.long),
         "attention_mask": torch.ones((rows, 4), dtype=torch.bool),
+        "loss_mask": torch.tensor([False, True, True, False]).repeat(rows, 1),
         "rollout_group": RolloutGroup(counts, arena_stream_name=stream),
     }
 
@@ -140,7 +141,7 @@ async def test_accuracy_predicate_rejections_reach_arena_stream_counts(correct_c
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_actor_counts_successful_training_inputs_once(fails):
-    """Count groups, logical rollouts and rows separately, after update success."""
+    """Count groups, logical rollouts and loss tokens once, after update success."""
     actor = object.__new__(PPOActor)
     actor._ppo_update = MagicMock(
         side_effect=RuntimeError("update failed") if fails else None
@@ -155,10 +156,40 @@ def test_actor_counts_successful_training_inputs_once(fails):
     stats = stats_tracker.export_all()
     assert stats["ppo_actor/stream/a/groups"] == 2
     assert stats["ppo_actor/stream/a/rollouts"] == 3
-    assert stats["ppo_actor/stream/a/sequences"] == 4
+    assert stats["ppo_actor/stream/a/tokens"] == 8
     assert stats["ppo_actor/stream/b/groups"] == 1
     assert stats["ppo_actor/stream/b/rollouts"] == 1
-    assert stats["ppo_actor/stream/b/sequences"] == 3
+    assert stats["ppo_actor/stream/b/tokens"] == 6
+    assert not any(key.endswith("/sequences") for key in stats)
+
+
+def test_actor_token_counts_exclude_masked_and_unnamed_rows_after_padding():
+    actor = object.__new__(PPOActor)
+    actor._ppo_update = MagicMock()
+    short = _trajectory("a", (2,))
+    for key in ("input_ids", "attention_mask", "loss_mask"):
+        short[key] = short[key][:, :2]
+    unnamed = _trajectory(None, (3,))
+    unnamed.pop("rollout_group")
+    masked = _trajectory("b", (3,))
+    masked["loss_mask"].zero_()
+    repeated = _trajectory("a", (1,))
+    data = [short, unnamed, masked, repeated]
+    for trajectory in data:
+        trajectory["advantages"] = torch.zeros_like(
+            trajectory["loss_mask"], dtype=torch.float32
+        )
+
+    actor.ppo_update(data)
+
+    stats = stats_tracker.export_all()
+    assert stats["ppo_actor/stream/a/tokens"] == 4
+    assert stats["ppo_actor/stream/a/groups"] == 2
+    assert stats["ppo_actor/stream/a/rollouts"] == 2
+    assert stats["ppo_actor/stream/b/tokens"] == 0
+    assert stats["ppo_actor/stream/b/groups"] == 1
+    assert stats["ppo_actor/stream/b/rollouts"] == 1
+    assert not any("None" in key for key in stats)
 
 
 def _arena_stream_counts_worker(rank, init_method):
@@ -177,14 +208,17 @@ def _arena_stream_counts_worker(rank, init_method):
         meta = TrajBatchMeta(
             len(groups), [sum(g.row_counts) for g in groups], [4] * len(groups), groups
         )
+        loss_mask = torch.tensor([False, True, True, False]).repeat(
+            sum(meta.traj_group_sizes), 1
+        )
         with stats_tracker.scope("ppo_actor"):
-            log_arena_stream_training_counts(meta)
+            log_arena_stream_training_counts(meta, loss_mask)
         stats = stats_tracker.export_all(reduce_group=dist.group.WORLD)
         assert stats["ppo_actor/stream/a/groups"] == 2
         assert stats["ppo_actor/stream/a/rollouts"] == 4
-        assert stats["ppo_actor/stream/a/sequences"] == 6
+        assert stats["ppo_actor/stream/a/tokens"] == 12
         assert stats["ppo_actor/stream/b/groups"] == 1
-        assert stats["ppo_actor/stream/b/sequences"] == 2
+        assert stats["ppo_actor/stream/b/tokens"] == 4
 
     finally:
         dist.destroy_process_group()

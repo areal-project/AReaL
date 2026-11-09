@@ -13,31 +13,46 @@ from areal.utils.data import TrajBatchMeta
 from areal.utils.stats_tracker import ReduceType
 
 
-def log_arena_stream_training_counts(meta: TrajBatchMeta) -> None:
+def log_arena_stream_training_counts(
+    meta: TrajBatchMeta, loss_mask: torch.Tensor
+) -> None:
     """Count training inputs per Arena stream once per successful update.
 
     Export sums over the engine's DP group without model-parallel duplication.
-    Logical rollouts can occupy multiple sequence rows (e.g. individual turn
-    export); neither is a unique task count.
+    Tokens count nonzero entries in the preprocessed, next-token-aligned loss
+    mask, excluding prompt/context and padding. Zero-advantage tokens still count;
+    this measures training inputs, not nonzero gradient contributions.
     """
+    if not meta.rollout_groups or not any(
+        group is not None and group.arena_stream_name is not None
+        for group in meta.rollout_groups
+    ):
+        return
+    row_tokens = loss_mask.bool().sum(dim=-1, dtype=torch.float64)
     counts: dict[str, Counter[str]] = {}
-    for group in meta.rollout_groups or []:
+    tokens: dict[str, torch.Tensor] = {}
+    for group, group_tokens in zip(
+        meta.rollout_groups, row_tokens.split(meta.traj_group_sizes), strict=True
+    ):
         if group is None or group.arena_stream_name is None:
             continue
-        stream = counts.setdefault(group.arena_stream_name, Counter())
-        stream.update(
-            groups=1, rollouts=len(group.row_counts), sequences=sum(group.row_counts)
+        name = group.arena_stream_name
+        counts.setdefault(name, Counter()).update(
+            groups=1, rollouts=len(group.row_counts)
         )
+        total = group_tokens.sum().reshape(1)
+        tokens[name] = tokens[name] + total if name in tokens else total
     for name, stream in counts.items():
         stats_tracker.stat_compact(
-            torch.ones(1, dtype=torch.bool, device="cpu"),
+            torch.ones(1, dtype=torch.bool, device=loss_mask.device),
             ReduceType.SUM,
             **{
                 f"stream/{name}/{key}": torch.tensor(
-                    [value], dtype=torch.float64, device="cpu"
+                    [value], dtype=torch.float64, device=loss_mask.device
                 )
                 for key, value in stream.items()
             },
+            **{f"stream/{name}/tokens": tokens[name]},
         )
 
 
