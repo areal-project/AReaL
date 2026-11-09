@@ -1178,6 +1178,7 @@ class GatewayTrainController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if self.rollout is None:
             raise RuntimeError("connect_engine() must be called before prepare_batch()")
@@ -1186,6 +1187,7 @@ class GatewayTrainController:
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             group_size=group_size,
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
@@ -1203,6 +1205,7 @@ class GatewayTrainController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if self.rollout is None:
             raise RuntimeError("connect_engine() must be called before rollout_batch()")
@@ -1211,6 +1214,7 @@ class GatewayTrainController:
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             group_size=group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,

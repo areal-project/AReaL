@@ -36,6 +36,12 @@ class _DatasetConfig:
 def test_recipe_required_recovery_checks_loaded_state_before_training(
     monkeypatch, tmp_path, profile, require_recover, checkpoint_loaded, should_fail
 ):
+    # Dataset replacement is covered separately; this test stops at training.
+    monkeypatch.setattr(
+        train_rl,
+        "prepare_arena_training_dataset",
+        lambda dataset, streams, config: dataset,
+    )
     events = []
     recovered_state = (
         SimpleNamespace(last_step_info=SimpleNamespace(global_step=5))
@@ -44,6 +50,7 @@ def test_recipe_required_recovery_checks_loaded_state_before_training(
     )
     config = SimpleNamespace(
         experiment_name="arena-recovery-test",
+        trial_name="trial",
         econfig=_ArenaConfig(),
         train_dataset=_DatasetConfig(),
         gconfig=SimpleNamespace(
@@ -60,6 +67,7 @@ def test_recipe_required_recovery_checks_loaded_state_before_training(
             mb_spec=SimpleNamespace(n_mbs=1, n_mbs_divisor=1),
         ),
         should_accept_fn="filter",
+        should_accept_kwargs={"min_accuracy": 0.4, "max_accuracy": 0.8},
     )
 
     class Trainer:
@@ -76,6 +84,7 @@ def test_recipe_required_recovery_checks_loaded_state_before_training(
             return False
 
         def train(self, **kwargs):
+            assert kwargs["dynamic_filter_kwargs"] == config.should_accept_kwargs
             events.append("trained")
 
     class RemoteEngine:
@@ -89,7 +98,7 @@ def test_recipe_required_recovery_checks_loaded_state_before_training(
             "get_arena_mixture_dataset": lambda *args, **kwargs: (
                 [{"data_id": "env:task@v1"}],
                 ["stream"],
-            )
+            ),
         },
         "examples.swe.utils": {"SWEPPOConfig": object},
         "areal": {"PPOTrainer": Trainer},
@@ -106,6 +115,7 @@ def test_recipe_required_recovery_checks_loaded_state_before_training(
         module.__dict__.update(attributes)
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.delenv("QWEN_ARENA_TASK_IDS_FILE", raising=False)
+    monkeypatch.delenv("QWEN_EQUAL_STREAM_SAMPLING", raising=False)
     if profile == "swe-eval":
         selection = tmp_path / "tasks.json"
         selection.write_text('["env:task@v1"]')

@@ -851,7 +851,10 @@ class PPOTrainer:
         eval_workflow_kwargs: dict[str, Any] | None = None,
         dynamic_filter_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         total_epochs: int | None = None,
+        dynamic_filter_kwargs: dict[str, Any] | None = None,
     ):
+        if dynamic_filter_kwargs and dynamic_filter_fn is None:
+            raise ValueError("dynamic_filter_kwargs requires dynamic_filter_fn")
         config = self.config
         is_v1_rollout = config.rollout._version == "v1"
         if (
@@ -958,6 +961,8 @@ class PPOTrainer:
                     drop_incomplete_group=config.gconfig.drop_incomplete_group,
                     min_usable_group_size=min_usable_group_size,
                 )
+                if dynamic_filter_kwargs:
+                    prepare_kwargs["should_accept_kwargs"] = dynamic_filter_kwargs
                 if is_v1_rollout:
                     prepare_kwargs["reward_normalization_use_std"] = (
                         config.gconfig.reward_normalization_use_std

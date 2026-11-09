@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 from areal.api.cli_args import InferenceEngineConfig
 from areal.api.io_struct import LocalInfServerInfo
 from areal.utils import logging, stats_tracker
+from areal.utils.dynamic_import import bind_filter_kwargs
 from areal.utils.network import format_hostport
 
 logger = logging.getLogger("RolloutControllerV2")
@@ -1257,6 +1258,7 @@ class RolloutControllerV2:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> int:
         self._ensure_initialized()
         validate_rollout_group_sizes(group_size, min_usable_group_size)
@@ -1268,7 +1270,9 @@ class RolloutControllerV2:
             drop_incomplete_group,
             min_usable_group_size,
         )
-        resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+        resolved_accept_fn = bind_filter_kwargs(
+            self._resolve_should_accept_fn(should_accept_fn), should_accept_kwargs
+        )
         return self.workflow_executor.submit(
             data,
             workflow=resolved_workflow,
@@ -1311,6 +1315,7 @@ class RolloutControllerV2:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Submit a batch of data items and wait for all results.
 
@@ -1364,7 +1369,9 @@ class RolloutControllerV2:
             drop_incomplete_group,
             min_usable_group_size,
         )
-        resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+        resolved_accept_fn = bind_filter_kwargs(
+            self._resolve_should_accept_fn(should_accept_fn), should_accept_kwargs
+        )
         for item in data:
             self.workflow_executor.submit(
                 data=item,
@@ -1387,6 +1394,7 @@ class RolloutControllerV2:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare a full training batch by consuming data from a dataloader.
 
@@ -1438,7 +1446,9 @@ class RolloutControllerV2:
             drop_incomplete_group,
             min_usable_group_size,
         )
-        resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+        resolved_accept_fn = bind_filter_kwargs(
+            self._resolve_should_accept_fn(should_accept_fn), should_accept_kwargs
+        )
         results = self.workflow_executor.prepare_batch(
             dataloader=dataloader,
             workflow=resolved_workflow,
