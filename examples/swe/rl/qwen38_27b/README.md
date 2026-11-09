@@ -80,6 +80,75 @@ Arena and Slurm cleanup remain scoped to this trial. Native SGLang logs rotate u
 trial's `native/` log directory. Existing NUMA settings in `train.yaml` are preserved,
 including `SGLANG_NUMA_BIND_V2=0`.
 
+## Opt-in v1 rollout timing
+
+Copy the selected training YAML to a new recipe-local name, such as
+`train_trace.yaml`, set `QWEN_TRAIN_CONFIG=train_trace.yaml` in `site.env`, and add this
+block under `rollout.agent` in the copied YAML:
+
+```yaml
+    rollout_trace:
+      enabled: true
+      collect_interval_seconds: 60
+      log_interval_seconds: 600
+      log_mode: progress
+      top_n: 20
+      show_all_sessions: false
+```
+
+With `log_mode: progress`, the controller appends a `Rollout progress` snapshot to
+`main.log` every `log_interval_seconds`. The header shows currently running sessions
+and finished sessions accumulated since this observer started; queued sessions are
+not counted. `finished` means the proxy session ended, not that its trajectory was
+accepted for training. Each active session line shows its AReaL workflow group ID,
+finished/expected group members, elapsed time, current `generate` or `non_generate`
+phase and its age,
+completed plus ongoing generation time, remaining non-generation time, the last
+generation end, and request count. Each line also includes the trace-only
+`session_uuid` and, when linked, the Arena task and attempt IDs. The longest-running
+`top_n` sessions are shown
+by default; set `show_all_sessions: true` to print every running session. No minimum
+age applies in this mode. These fields come from AReaL proxy events alone; reward,
+tool calls, and session-level pause cannot currently be separated from
+`non_generate`. Here `generate` measures the proxy's `engine.agenerate()` wait,
+excluding local input preparation and output parsing. `collect_interval_seconds` bounds how far behind the
+live display may be; intermediate phase changes are retained as timestamped events.
+The group ID is an AReaL task key, not an Arena task ID.
+
+The default `log_mode: long_tail` preserves the previous `Rollout long tails` log.
+It shows only sessions older than `long_tail_seconds` (default 300) and may include
+Arena task and phase information when available.
+
+Each completed training step emits `timeperf/rollout/schedule_requests`,
+`pre_process`, `generate`, `post_process`, `reward`, `pause_wait`, `data_collect`,
+and `other`; `toolcall` appears only if an explicit tool interval is available.
+The child values add to the existing `timeperf/rollout` step wall time.
+Concurrent sessions share each wall-clock slice in proportion to active session
+counts. The controller measures request submission and result selection/assembly
+as `schedule_requests` and `data_collect`. Input normalization, tokenization and
+payload preparation inside the proxy client are `pre_process`; detokenization,
+reasoning/tool-call parsing and response construction are `post_process`.
+`generate` covers the proxy's inference-engine call, including backend queue/RPC
+and response wait; it is not SGLang kernel time. Arena reward includes waiting for
+the reward sandbox, creating it, and evaluating, using the Task event timestamps.
+Unobserved time, including tool execution, proxy request ingress/stream delivery,
+and pause without explicit timestamps, stays in `other`. The current Arena Task trace exposes no dedicated tool spans, so
+this recipe does not produce `toolcall`; it also has no session-level pause signal.
+Cross-node clocks must be synchronized for accurate attribution. `data_collect`
+does not include later lazy `RTensor.localize()` calls in training scopes.
+
+For a small local one-step proxy smoke run, use
+`bash examples/agent_workflow/verify_rollout_trace_minimal.sh` on a configured CUDA
+host. The expected result is a completed step with additive
+`timeperf/rollout/*` values and at least one `Rollout progress` line.
+For this Qwen/Arena chain, use
+`QWEN_EXPECT_PROGRESS_LOG=1 bash examples/swe/rl/qwen38_27b/verify_rollout_trace_e2e.sh`
+after preparing the opt-in YAML and site profile. The expected log contains AReaL
+group and session progress. After a completed Arena reward trace, the step's
+`reward` time reflects its explicit reward interval. The end-to-end script submits
+the job and waits up to five hours for the first step's timing fields; the submitted
+training job continues after that check. These scripts have not been run locally.
+
 ## Recovery
 
 Reuse the same profile, trial, run directory and source snapshot. For an explicit
