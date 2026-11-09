@@ -1691,21 +1691,8 @@ class RolloutController:
             )
         consumed = self.consumed_metrics.export()
         merged = _merge_worker_stats([*all_raw_stats, consumed])
-        # Expose denominators for batch-aligned quality metrics.
-        merged.update(
-            {
-                k: v
-                for k, v in consumed.items()
-                if k.endswith("__count")
-                or k
-                in {
-                    "rollout/reward_sample_count",
-                    "rollout/group_attempt_count",
-                    "rollout/task_attempt_count",
-                    "rollout/task_result_count",
-                }
-            }
-        )
+        # Expose batch-aligned denominators and counters, including stream scopes.
+        merged.update({k: v for k, v in consumed.items() if k.endswith("_count")})
         return merged
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:

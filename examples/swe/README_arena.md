@@ -158,6 +158,63 @@ Local timeouts and cancellations without a remote terminal result contribute onl
 call metrics. Reward metrics retain their valid-export denominator, exposed as
 `rollout/reward_sample_count`; they must not be used as the task-failure denominator.
 
+The same attempt and terminal-result metrics are available under
+`rollout/stream/<name>/`, including `harness_error`, `task_error`, outcome codes,
+`task_attempt_count`, and `task_result_count`. Each stream uses its own denominator.
+`<name>` is the dataset's `arena_stream_name`, falling back to `stream_id` for rows
+without a configured name.
+
+Per-stream `accepted_count`, `rejected_count`, and `group_attempt_count` count prompt
+groups consumed while forming the current batch, including failed attempts.
+`filter_rejected_count` counts only groups for which `should_accept_fn` returned false;
+missing trajectories and workflow/predicate exceptions are rejected but are not filter
+rejections. The corresponding `accepted`, `rejected`, and `filter_rejected` metrics are
+fractions of all consumed group attempts. Prefetched results remain outside this window
+until consumed. These counts also have aggregate `rollout/` counterparts.
+
+After a successful actor update, `ppo_actor/stream/<name>/{groups,rollouts,sequences}`
+reports the actual training input: prompt groups, logical rollout samples, and exported
+sequence rows respectively. An individual-turn export may contribute several sequences
+per rollout. Counts sum over DP ranks, without multiplying by Megatron TP/PP/CP replicas
+or PPO minibatches. They include inputs with zero advantage or masked loss; they do not
+measure nonzero gradient contributions. Filtered rollouts, pending rollouts, and
+transport padding do not contribute. All counts use the current metrics export window,
+not a lifetime cumulative total.
+
+### Filtering groups by accuracy
+
+To reject groups with accuracy at or below 20%, as well as all-correct groups, set:
+
+```yaml
+should_accept_fn: examples.swe.filter_function.filter_by_accuracy
+```
+
+This keeps only `0.2 < accuracy < 1.0`: one correct rollout out of five is rejected; two
+out of five are kept. Each logical rollout contributes one vote, even when it exports
+several turns. Accuracy uses `original_rewards` when present, otherwise `rewards`; a
+reward at least `1 - 1e-3` is correct by default. This is a fraction of correct
+rollouts, not the mean of fractional rewards. Rows within one logical rollout must agree
+on correctness; ambiguous split rewards raise an error.
+
+For other bounds or a dataset with another success score, define an importable wrapper:
+
+```python
+from examples.swe.filter_function import filter_by_accuracy
+
+
+def accept_mid_accuracy(sample):
+    return filter_by_accuracy(
+        sample, min_accuracy=0.4, max_accuracy=1.0, correct_reward_threshold=1.0
+    )
+```
+
+Point `should_accept_fn` to that wrapper's module path. Bounds are exclusive for
+acceptance; `min_accuracy=0, max_accuracy=1` keeps only groups containing both correct
+and incorrect rollouts. The existing `filter_function` retains its reward-variation
+behavior. Rejections from the new function contribute to the per-stream
+`filter_rejected_count` described above; `filter_accuracy`, `rejected_by_low_accuracy`,
+and `rejected_by_high_accuracy` expose its decisions globally and per stream.
+
 ### Reward components in W&B
 
 The client preserves the result envelope's `sub_scores`. Finite named entries are logged

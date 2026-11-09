@@ -444,10 +444,13 @@ class RolloutGroup:
 
     Workflows own optional raw reward references. A reference is required when
     reward normalization consumes a rollout whose row rewards differ.
+    ``stream_name`` identifies the source dataset for training counts without
+    adding non-tensor fields to packed model inputs.
     """
 
     row_counts: tuple[int, ...]
     rewards: tuple[float | None, ...] = ()
+    stream_name: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "row_counts", tuple(self.row_counts))
@@ -469,7 +472,7 @@ class RolloutGroup:
     def validate_rows(self, rows: int) -> "RolloutGroup":
         # RPC restores dataclass fields without running the constructor and
         # encodes tuples as lists. Revalidate at the consuming boundary.
-        group = RolloutGroup(self.row_counts, self.rewards)
+        group = RolloutGroup(self.row_counts, self.rewards, self.stream_name)
         if sum(group.row_counts) != rows:
             raise ValueError(
                 f"rollout row_counts sum to {sum(group.row_counts)}, expected {rows}"
