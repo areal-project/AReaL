@@ -741,6 +741,8 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         self._set_individual_rollout_reward(interactions)
         episode_metadata = await self._get_agent_episode_metadata()
         episode_metadata["session_id"] = proxy_client.session_id
+        if proxy_client.session_uuid is not None:
+            episode_metadata["session_uuid"] = proxy_client.session_uuid
         self._stamp_interaction_metadata(interactions, episode_metadata)
 
         # Record stats

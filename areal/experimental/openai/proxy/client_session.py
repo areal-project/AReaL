@@ -111,6 +111,7 @@ class OpenAIProxyClient:
         if processor_cache_group_id is not None and shared_tensor_resolver is None:
             self._shared_tensor_resolver = SharedTensorResolver()
         self.session_id: str | None = None
+        self.session_uuid: str | None = None
         self._session_api_key: str | None = None
         self.interaction_count = 0
         self.context_overflow = False
@@ -273,6 +274,7 @@ class OpenAIProxyClient:
             headers=self._admin_auth_headers(),
         )
         self.session_id = data["session_id"]
+        self.session_uuid = data.get("session_uuid")
         self._session_api_key = data["api_key"]
         return self
 
