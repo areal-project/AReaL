@@ -6,7 +6,8 @@ import json
 import os
 import re
 import uuid
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast, overload
@@ -80,6 +81,13 @@ from areal.utils.qwen_vl_image import (
 if TYPE_CHECKING:
     from transformers.processing_utils import ProcessorMixin
     from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+
+
+# Set only by the opt-in v1 proxy trace. Direct client callers retain their
+# existing behavior and never record rollout phase events.
+rollout_request_phase: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "rollout_request_phase", default=None
+)
 
 
 class _AsyncGenerateEngine(Protocol):
@@ -1432,7 +1440,12 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         )
 
         # Call inference engine
+        phase_transition = rollout_request_phase.get()
+        if phase_transition is not None:
+            phase_transition("generate")
         response = await self.engine.agenerate(model_request)
+        if phase_transition is not None:
+            phase_transition("post_process")
         output_text = self.tokenizer.decode(response.output_tokens_without_stop)
         reasoning_prefilled = (
             not self.tool_call_parser_allow_recovery
@@ -1928,7 +1941,12 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         )
 
         # Call inference engine
+        phase_transition = rollout_request_phase.get()
+        if phase_transition is not None:
+            phase_transition("generate")
         engine_resp = await self.engine.agenerate(model_request)
+        if phase_transition is not None:
+            phase_transition("post_process")
         output_text = self.tokenizer.decode(engine_resp.output_tokens_without_stop)
         reasoning_prefilled = (
             not self.tool_call_parser_allow_recovery
