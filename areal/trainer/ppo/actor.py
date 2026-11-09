@@ -1009,8 +1009,12 @@ def grpo_loss_fn(
     if pure_distill:
         # Pure KD: the per-token reverse-KL reward log pi_T - log pi_theta replaces
         # the task advantage, so the policy loss below clips its importance ratio
-        # and applies rejection sampling exactly as it does for RL.
+        # and applies rejection sampling exactly as it does for RL. When rejection
+        # sampling is disabled, anchor the policy ratio on the rollout behavior
+        # logprobs so decoupled updates retain bounded behavior-policy correction.
         advantages = (teacher_logp.detach() - logprobs.detach()) * loss_mask
+        if rejection_sampling is None:
+            prox_logp = old_logp
 
     # Score centering uses the explicit REINFORCE surrogate, not clipped PPO.
     if use_score_centering:

@@ -644,14 +644,14 @@ def test_single_teacher_m2_filtering_preserves_loss_and_gradient_across_microbat
         rl_mask[0, 0] = False
     n_tokens = original_mask.count_nonzero()
     detached_logprobs = logprobs.detach()
-    # Surviving rejection-weighted tokens have proximal and behavior logp 0;
-    # without rejection, PPO uses its proximal ratio.
-    ratio = (detached_logprobs - proximal_logp).exp()
     if rl_loss_weight == 0:
+        # Without rejection sampling, pure KD anchors its ratio on old_logp (0);
+        # with rejection sampling, the surviving token also has prox_logp == 0.
+        kd_ratio = detached_logprobs.exp()
         # The reverse-KL reward is the advantage of the clipped PPO surrogate.
         advantages = (teacher_logp - detached_logprobs) * teacher_mask
-        unclipped = -advantages * ratio
-        clipped = -advantages * ratio.clamp(0.8, 1.2)
+        unclipped = -advantages * kd_ratio
+        clipped = -advantages * kd_ratio.clamp(0.8, 1.2)
         expected_loss = (
             distill_loss_weight
             * (torch.maximum(unclipped, clipped) * rl_mask).sum()
@@ -663,6 +663,9 @@ def test_single_teacher_m2_filtering_preserves_loss_and_gradient_across_microbat
             / n_tokens
         )
     else:
+        # Surviving rejection-weighted tokens have proximal and behavior logp 0;
+        # without rejection, PPO uses its proximal ratio.
+        ratio = (detached_logprobs - proximal_logp).exp()
         # RL advantages are positive and below the clip bound, so RL never clips.
         rl_terms = -ratio * rl_mask
         log_ratio = detached_logprobs - teacher_logp

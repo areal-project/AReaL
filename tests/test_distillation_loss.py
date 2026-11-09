@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -163,3 +164,28 @@ def test_pure_distillation_applies_rejection_sampling():
 
     assert grad[0, 0] == 0
     assert grad[0, 1] != 0
+
+
+def test_pure_distillation_decoupled_without_rejection_retains_bounded_behavior_ratio():
+    """With old_logp != prox_logp and no rejection sampling, pure KD clips pi/pi_old."""
+    student = [[-2.0, -1.0]]
+    old = [[-8.0, -1.1]]
+    input_data = _input_data(
+        student,
+        [[-0.5, -2.0]],
+        0.0,
+        logprobs=_tensor(old),
+        prox_logp=_tensor(student),
+    )
+    _, grad = _loss_and_grad(
+        student,
+        input_data,
+        use_decoupled_loss=True,
+        rejection_sampling=None,
+    )
+
+    assert torch.isfinite(grad).all()
+    # Token 0 has logprobs == prox_logp but exp(logprobs - old_logp) = e^6 > 1.2.
+    assert grad[0, 0] == 0
+    # Token 1 has in-band behavior ratio e^0.1 rather than collapsing to ratio 1.
+    assert grad[0, 1] == pytest.approx(-DISTILL * math.exp(0.1) * (-2.0 - -1.0) / 2)
