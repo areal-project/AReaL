@@ -1,0 +1,19 @@
+areal/api/cli_args.py
+  s_6b814fc8a9d033::t_20d456ee1f576a 2974-3028,3195-3198
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8e2ef9b1ba0878dda13b8db5e9dd7b55234dede4",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
