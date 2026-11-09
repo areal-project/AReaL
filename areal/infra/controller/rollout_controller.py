@@ -49,6 +49,7 @@ from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
 from areal.utils.rollout_metrics import ConsumedMetrics
+from areal.utils.rollout_phase_context import track_step_phase
 
 from ..staleness_manager import StalenessManager
 from ..workflow_executor import (
@@ -1451,18 +1452,15 @@ class RolloutController:
 
         # Delegate to dispatcher
         assert dataloader.batch_size is not None
-        results = [
-            unwrap_workflow_result(result)
-            for result in self.dispatcher.active_submit_and_wait(
-                self.data_generator,
-                batch_size=dataloader.batch_size,
-                dynamic_bs=dynamic_bs,
-            )
-        ]
-
-        # Return list of trajectories
-        trajectories = [r.trajectory if r is not None else None for r in results]
-        return [t for t in trajectories if t is not None]
+        raw_results = self.dispatcher.active_submit_and_wait(
+            self.data_generator,
+            batch_size=dataloader.batch_size,
+            dynamic_bs=dynamic_bs,
+        )
+        with track_step_phase("data_collect"):
+            results = [unwrap_workflow_result(result) for result in raw_results]
+            trajectories = [r.trajectory if r is not None else None for r in results]
+            return [t for t in trajectories if t is not None]
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[Any]:
         """Compute token log-probabilities for trajectories via remote workers."""

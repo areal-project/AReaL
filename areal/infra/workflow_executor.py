@@ -44,6 +44,7 @@ from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
 from areal.utils.data import RolloutGroup, cycle_dataloader
 from areal.utils.perf_tracer import trace_perf, trace_session_event
+from areal.utils.rollout_phase_context import track_step_phase
 from logging import Logger
 
 if TYPE_CHECKING:
@@ -685,20 +686,21 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             drained: list[TimedResult[TResult]] = list(self._pending_results.values())
             self._pending_results.clear()
 
-        selected, pending = _select_results(
-            drained,
-            count,
-            self.deterministic_order,
-        )
-        with self._result_cv:
-            if pending:
-                for result in pending:
-                    self._pending_results[result.task_id] = result
-                self._result_cv.notify_all()
-            for r in selected:
-                self._active_task_ids.discard(r.task_id)
+        with track_step_phase("data_collect"):
+            selected, pending = _select_results(
+                drained,
+                count,
+                self.deterministic_order,
+            )
+            with self._result_cv:
+                if pending:
+                    for result in pending:
+                        self._pending_results[result.task_id] = result
+                    self._result_cv.notify_all()
+                for r in selected:
+                    self._active_task_ids.discard(r.task_id)
 
-        return [self.consume_result(r.data) for r in selected]
+            return [self.consume_result(r.data) for r in selected]
 
     def wait_for_task(
         self,
@@ -827,14 +829,15 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                         category="scheduler",
                         args={"data": capacity},
                     )
-                for _ in range(min(batch_size, capacity)):
-                    try:
-                        self.submit_task_input(next(input_generator))
-                    except StopIteration:
-                        raise RuntimeError(
-                            "Input generator exhausted before batch completion. "
-                            "Use cycle_dataloader() or provide an infinite generator."
-                        ) from None
+                with track_step_phase("schedule_requests"):
+                    for _ in range(min(batch_size, capacity)):
+                        try:
+                            self.submit_task_input(next(input_generator))
+                        except StopIteration:
+                            raise RuntimeError(
+                                "Input generator exhausted before batch completion. "
+                                "Use cycle_dataloader() or provide an infinite generator."
+                            ) from None
             try:
                 arrived = self.wait_results(count=batch_size - accepted_cnt, timeout=1)
             except TimeoutError:
