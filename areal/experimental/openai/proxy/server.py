@@ -71,6 +71,7 @@ class StartSessionResponse(BaseModel):
 
     session_id: str
     api_key: str
+    session_uuid: str | None = None
 
 
 class ProcessorCacheGroupRequest(BaseModel):

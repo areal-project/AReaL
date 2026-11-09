@@ -7,6 +7,7 @@ import asyncio
 import hmac
 import inspect
 import json
+import math
 import os
 import secrets
 import threading
@@ -33,7 +34,11 @@ from areal.experimental.openai.anthropic import (
     translate_anthropic_response,
     translate_anthropic_stream,
 )
-from areal.experimental.openai.client import ArealOpenAI, ContextLengthExceededError
+from areal.experimental.openai.client import (
+    ArealOpenAI,
+    ContextLengthExceededError,
+    rollout_request_phase,
+)
 from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry
@@ -72,6 +77,12 @@ from .server import (
     derive_session_gateway_api_key,
     derive_session_gateway_token,
     serialize_interactions,
+)
+from .session_trace import (
+    RL_SESSION_TRACE_EVENTS_PATHNAME,
+    RL_SESSION_TRACE_PHASE_PATHNAME,
+    RL_SESSION_TRACE_TASK_PATHNAME,
+    ProxySessionTrace,
 )
 from .tensor_reference import GroupTensorStoreRegistry
 
@@ -129,6 +140,7 @@ _lock = threading.Lock()
 _capacity = 0
 _last_cleanup_time: float = 0
 _session_timeout_seconds: int = 3600  # Default timeout (overridden by config)
+_session_trace: ProxySessionTrace | None = None
 _processor_cache_registry = ProcessorCacheRegistry()
 _group_tensor_store_registry = GroupTensorStoreRegistry()
 
@@ -411,7 +423,7 @@ async def alloc_ports(raw_request: Request):
 def _setup_openai_client():
     global _openai_client, _session_timeout_seconds, _admin_api_key
     global _message_preprocessors, _prefix_matcher, _deterministic_sampling
-    global _prm_runner
+    global _prm_runner, _session_trace
     config = _engine.config
     _deterministic_sampling = bool(getattr(config, "deterministic_sampling", False))
     processor, tokenizer = load_hf_processor_and_tokenizer(config.tokenizer_path)
@@ -434,6 +446,7 @@ def _setup_openai_client():
     )
     # Set session timeout from config
     _session_timeout_seconds = agent_cfg.session_timeout_seconds
+    _session_trace = ProxySessionTrace() if agent_cfg.rollout_trace.enabled else None
     # Validate admin API key BEFORE assigning it to the global, so a
     # failed validation cannot leave the default key live on the server.
     # The default admin key is publicly known; refuse to use it when the
@@ -589,6 +602,8 @@ def _cleanup_stale_sessions() -> list[str]:
     for session_id in stale_sessions:
         logger.warning(f"Removing stale session: {session_id}")
         session_data = _session_cache.pop(session_id, None)
+        if _session_trace is not None:
+            _session_trace.end_session(session_id)
         _session_invalid_tool_errors.pop(session_id, None)
         if session_data is not None:
             if getattr(_engine, "route_client", None) is not None:
@@ -620,7 +635,11 @@ def _cleanup_stale_sessions() -> list[str]:
     return closed_backend_sessions
 
 
-@app.post(f"/{RL_START_SESSION_PATHNAME}", dependencies=[Depends(_require_admin_key)])
+@app.post(
+    f"/{RL_START_SESSION_PATHNAME}",
+    dependencies=[Depends(_require_admin_key)],
+    response_model_exclude_none=True,
+)
 async def start_session(request: StartSessionRequest) -> StartSessionResponse:
     """Start a new RL session and allocate a unique session API key.
 
@@ -706,8 +725,19 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
         _session_invalid_tool_errors.pop(session_id, None)
         _api_key_to_session[session_api_key] = session_id
         _session_to_api_key[session_id] = session_api_key
+        session_uuid = None
+        if _session_trace is not None:
+            session_uuid = _session_trace.start_session(
+                session_id,
+                task_id=request.task_id,
+                group_size=request.processor_cache_group_size,
+            )
 
-    return StartSessionResponse(session_id=session_id, api_key=session_api_key)
+    return StartSessionResponse(
+        session_id=session_id,
+        api_key=session_api_key,
+        session_uuid=session_uuid,
+    )
 
 
 @app.post(f"/{RL_END_SESSION_PATHNAME}")
@@ -731,6 +761,8 @@ async def end_session(session_id: str = Depends(_require_session_key)):
         await _engine.close_backend_session(session.backend_session_id)
     # finish() outside lock to avoid holding lock during potential I/O
     session.finish()
+    if _session_trace is not None:
+        _session_trace.end_session(session_id)
     cache_group_id = session.take_processor_cache_group_id()
     if cache_group_id is not None:
         _processor_cache_registry.release(cache_group_id)
@@ -744,6 +776,73 @@ async def end_session(session_id: str = Depends(_require_session_key)):
         "system_error": session.system_error,
         "system_error_message": session.system_error_message,
     }
+
+
+class _ArenaTaskLink(BaseModel):
+    task_id: str
+    attempt_id: str | None = None
+
+
+class _ArenaPhaseInterval(BaseModel):
+    phase: str
+    started_at: float
+    ended_at: float | None = None
+    attempt_id: str | None = None
+
+
+@app.get(
+    f"/{RL_SESSION_TRACE_EVENTS_PATHNAME}",
+    dependencies=[Depends(_require_admin_key)],
+)
+def session_trace_events(after: int = 0) -> dict[str, Any]:
+    """Read v1 timing transitions for the controller's live observer."""
+    if _session_trace is None:
+        return {"events": [], "next_cursor": after, "lost": False, "latest_seq": 0}
+    if after < 0:
+        raise HTTPException(status_code=400, detail="after must be non-negative")
+    return _session_trace.events_after(after)
+
+
+@app.post(f"/{RL_SESSION_TRACE_TASK_PATHNAME}")
+def session_trace_task(
+    request: _ArenaTaskLink, session_id: str = Depends(_require_session_key)
+) -> dict[str, str]:
+    """Join a launched Arena task to the authenticated proxy session."""
+    if _session_trace is None:
+        return {"status": "disabled"}
+    if not request.task_id.strip():
+        raise HTTPException(status_code=400, detail="task_id must be non-empty")
+    if not _session_trace.bind_arena_task(
+        session_id, request.task_id, request.attempt_id
+    ):
+        raise HTTPException(status_code=410, detail="session trace is no longer active")
+    return {"status": "ok"}
+
+
+@app.post(f"/{RL_SESSION_TRACE_PHASE_PATHNAME}")
+def session_trace_phase(
+    request: _ArenaPhaseInterval, session_id: str = Depends(_require_session_key)
+) -> dict[str, str]:
+    """Accept an explicitly timestamped phase observed by the Arena client."""
+    if _session_trace is None:
+        return {"status": "disabled"}
+    if request.phase not in {"reward", "pause_wait", "toolcall"}:
+        raise HTTPException(status_code=400, detail="unsupported Arena phase")
+    if (
+        not math.isfinite(request.started_at)
+        or (request.ended_at is not None and not math.isfinite(request.ended_at))
+        or (request.ended_at is not None and request.ended_at < request.started_at)
+    ):
+        raise HTTPException(status_code=400, detail="invalid phase timestamps")
+    if not _session_trace.record_phase(
+        session_id,
+        request.phase,
+        request.started_at,
+        request.ended_at,
+        request.attempt_id,
+    ):
+        raise HTTPException(status_code=400, detail="unsupported or inactive phase")
+    return {"status": "ok"}
 
 
 @app.post(
@@ -1125,6 +1224,50 @@ async def _call_client_create(
     if stream:
         kwargs["stream"] = True
 
+    trace = _session_trace
+    phase_token = None
+    phase_name = "pre_process"
+    phase_started_at = 0.0
+    phase_source_id = ""
+    if trace is not None:
+        phase_started_at = time.time()
+        phase_source_id = uuid.uuid4().hex
+        trace.record_request(session_id)
+        trace.record_phase(
+            session_id,
+            phase_name,
+            phase_started_at,
+            None,
+            source_id=phase_source_id,
+        )
+
+        def transition_phase(next_phase: str) -> None:
+            nonlocal phase_name, phase_started_at
+            now = time.time()
+            if phase_name in {"pre_process", "post_process"}:
+                trace.record_phase(
+                    session_id,
+                    phase_name,
+                    phase_started_at,
+                    now,
+                    source_id=phase_source_id,
+                )
+            elif phase_name == "generate":
+                trace.end_generate(session_id)
+            phase_name = next_phase
+            phase_started_at = now
+            if next_phase == "generate":
+                trace.begin_generate(session_id, record_request=False)
+            elif next_phase == "post_process":
+                trace.record_phase(
+                    session_id,
+                    next_phase,
+                    now,
+                    None,
+                    source_id=phase_source_id,
+                )
+
+        phase_token = rollout_request_phase.set(transition_phase)
     try:
         client_kwargs: dict[str, Any] = {
             "areal_cache": session_data.completions,
@@ -1182,6 +1325,19 @@ async def _call_client_create(
         session_data.mark_system_error(f"{type(e).__name__}: {e}")
         logger.exception("AReaL client request failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    finally:
+        if phase_token is not None:
+            rollout_request_phase.reset(phase_token)
+            if phase_name in {"pre_process", "post_process"}:
+                trace.record_phase(
+                    session_id,
+                    phase_name,
+                    phase_started_at,
+                    time.time(),
+                    source_id=phase_source_id,
+                )
+            elif phase_name == "generate":
+                trace.end_generate(session_id)
 
 
 @app.post(
