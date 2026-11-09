@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from numbers import Real
 from typing import Any, Literal
 from urllib.parse import parse_qs, quote, urlsplit
@@ -970,6 +971,91 @@ class ArenaOpenAPIClient:
             await response.aclose()
             await asyncio.sleep(min(2**attempt, 10))
         raise AssertionError("unreachable")
+
+    async def get_task_trace_async(
+        self, task_id: str, *, client: httpx.AsyncClient
+    ) -> dict[str, Any]:
+        """Read the same Task event timeline exposed by ``arena task trace``."""
+        response = await self._async_request(
+            client,
+            "GET",
+            f"{self.base_url}/openapi/v1/tasks/{quote(task_id, safe='')}/trace",
+            headers=self._headers,
+            timeout=min(self.timeout, 15.0),
+        )
+        payload = _response_json(response)
+        if not isinstance(payload, Mapping):
+            raise ArenaAPIError("Arena task trace must be a JSON object")
+        trace = payload.get("data", payload)
+        if not isinstance(trace, Mapping):
+            raise ArenaAPIError("Arena task trace has no data object")
+        return dict(trace)
+
+    @staticmethod
+    def reward_phase_intervals(trace: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Extract explicit reward-pipeline boundaries from Arena events.
+
+        Reward includes waiting for a reward sandbox, creating it, and
+        evaluating. Other phases remain unattributed. An unfinished interval
+        is reported as active only when a reward-phase start event exists.
+        """
+        events = trace.get("events")
+        if not isinstance(events, list):
+            return []
+        attempts: dict[str, dict[str, float | str | None]] = {}
+        for event in events:
+            if not isinstance(event, Mapping):
+                continue
+            phase = event.get("phase")
+            status = event.get("status")
+            if phase not in {
+                "WAITING_REWARD_SBX_SLOT",
+                "CREATING_REWARD_SBX",
+                "EVALUATING",
+            }:
+                continue
+            timestamp = event.get("timestamp")
+            if not isinstance(timestamp, str):
+                continue
+            try:
+                at = datetime.fromisoformat(
+                    timestamp.replace("Z", "+00:00")
+                ).timestamp()
+            except ValueError:
+                continue
+            attempt_id = str(event.get("attempt") or "unknown")
+            interval = attempts.setdefault(
+                attempt_id,
+                {
+                    "phase": "reward",
+                    "attempt_id": attempt_id,
+                    "started_at": None,
+                    "ended_at": None,
+                },
+            )
+            if status == "started" and interval["started_at"] is None:
+                interval["started_at"] = at
+            if phase == "EVALUATING" and status == "done":
+                interval["ended_at"] = at
+        return [
+            interval
+            for interval in attempts.values()
+            if interval["started_at"] is not None
+        ]
+
+    @staticmethod
+    def latest_attempt_id(trace: Mapping[str, Any]) -> str | None:
+        events = trace.get("events")
+        if not isinstance(events, list):
+            return None
+        attempts = [
+            event["attempt"]
+            for event in events
+            if isinstance(event, Mapping)
+            and isinstance(event.get("attempt"), int)
+            and event["attempt"] > 0
+        ]
+        return str(max(attempts)) if attempts else None
 
     async def launch_one_task(
         self,
