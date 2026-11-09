@@ -74,7 +74,11 @@ async def test_grouped_rollout_keeps_each_usable_member_once(rollout_stats):
     assert result is not None
     assert workflow.calls == 3
     torch.testing.assert_close(result["input_ids"], torch.tensor([[11], [22]]))
-    rollout_stats.scalar.assert_called_once_with(
+    assert rollout_stats.scalar.call_count == 2
+    rollout_stats.scalar.assert_any_call(
+        incomplete_trajectories=1, incomplete_group=1.0
+    )
+    rollout_stats.scalar.assert_any_call(
         target_slot_count=3,
         usable_slot_count=2,
         trainable_slot_count=2,
@@ -96,7 +100,11 @@ async def test_grouped_rollout_marks_empty_group_unusable(rollout_stats):
     result = await grouped.arun_episode(MagicMock(), {})
 
     assert result is None
-    rollout_stats.scalar.assert_called_once_with(
+    assert rollout_stats.scalar.call_count == 2
+    rollout_stats.scalar.assert_any_call(
+        incomplete_trajectories=3, incomplete_group=1.0
+    )
+    rollout_stats.scalar.assert_any_call(
         target_slot_count=3,
         usable_slot_count=0,
         trainable_slot_count=0,
@@ -119,7 +127,11 @@ async def test_grouped_rollout_applies_estimator_minimum(rollout_stats):
     result = await grouped.arun_episode(MagicMock(), {})
 
     assert result is None
-    rollout_stats.scalar.assert_called_once_with(
+    assert rollout_stats.scalar.call_count == 2
+    rollout_stats.scalar.assert_any_call(
+        incomplete_trajectories=2, incomplete_group=1.0
+    )
+    rollout_stats.scalar.assert_any_call(
         target_slot_count=3,
         usable_slot_count=1,
         trainable_slot_count=0,

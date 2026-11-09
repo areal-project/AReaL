@@ -1228,6 +1228,7 @@ def test_parametrized_capacity_settings(
 @pytest.mark.sglang
 @pytest.mark.slow
 @pytest.mark.ci
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
 def test_rollout_controller_integration(tmp_path):
     from tests.utils import get_model_path
 

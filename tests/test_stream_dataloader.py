@@ -200,3 +200,20 @@ def test_restore_flat_checkpoint_explains_missing_stream_state():
     loader = make_loader()
     with pytest.raises(ValueError, match="per-stream cursors and replacement debt"):
         loader.load_state_dict(loader.state_dict()["base"])
+
+
+@pytest.mark.parametrize("schedule,batch_size", [("aaaabbbb", 4), ("abababab", 2)])
+def test_restore_rejects_changed_schedule_or_batch_size(schedule, batch_size):
+    loader = make_loader()
+    loader.next_rollout(0)
+    loader.complete_rollout(0, True)
+    restored = make_loader(schedule=schedule, batch_size=batch_size)
+    with pytest.raises(ValueError, match="source schedule, or batch size"):
+        restored.load_state_dict(loader.state_dict())
+
+
+def test_restore_rejects_checkpoint_without_schedule_identity():
+    state = make_loader().state_dict()
+    del state["schedule_fingerprint"]
+    with pytest.raises(ValueError, match="original sampling configuration"):
+        make_loader().load_state_dict(state)

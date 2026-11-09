@@ -314,6 +314,20 @@ def _resolve_aweagent_root(econfig) -> str:
     )
 
 
+def wrap_arena_training_dataset(
+    dataset: Dataset, streams: list[ArenaStreamConfig], config: SWEPPOConfig
+) -> Dataset | StreamDataset:
+    """Enable source replacement feedback for supported Arena training paths."""
+    if len(streams) > 1 and config.rollout._version == "v1" and is_single_controller():
+        return StreamDataset(dataset, stream_key="arena_stream_name")
+    if len(streams) > 1:
+        logger.warning(
+            "Per-stream rejection compensation requires the v1 single-controller "
+            "rollout path; using the ordinary mixture dataloader."
+        )
+    return dataset
+
+
 def main(args):
     from areal import PPOTrainer
 
@@ -334,17 +348,9 @@ def main(args):
             econfig, size_multiple=config.train_dataset.batch_size
         )
         valid_dataset = train_dataset
-        if (
-            len(resolved_streams) > 1
-            and config.rollout._version == "v1"
-            and is_single_controller()
-        ):
-            train_dataset = StreamDataset(train_dataset, stream_key="arena_stream_name")
-        elif len(resolved_streams) > 1:
-            logger.warning(
-                "Per-stream rejection compensation requires the v1 single-controller "
-                "rollout path; using the ordinary mixture dataloader."
-            )
+        train_dataset = wrap_arena_training_dataset(
+            train_dataset, resolved_streams, config
+        )
         econfig.arena_streams = resolved_streams
         econfig.arena_streams_yaml_b64 = ""
         econfig.arena_streams_file = ""

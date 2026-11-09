@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 from collections import deque
 from threading import Lock
@@ -44,6 +46,9 @@ class StreamDataLoader:
         self.batch_size = base_loader.batch_size
         self.sampler = base_loader.sampler
         self._base_loader = base_loader
+        self._schedule_fingerprint = hashlib.sha256(
+            json.dumps(dataset.streams, separators=(",", ":")).encode()
+        ).hexdigest()
         self._base_iterator = None
         self._pending_streams: deque[str] = deque()
         self._shuffle = shuffle
@@ -134,6 +139,8 @@ class StreamDataLoader:
                 "base": self._base_loader.state_dict(),
                 "pending_streams": list(self._pending_streams),
                 "stream_key": self.dataset.stream_key,
+                "schedule_fingerprint": self._schedule_fingerprint,
+                "batch_size": self.batch_size,
                 "stream_sizes": {
                     stream: len(indices)
                     for stream, indices in self.dataset.indices.items()
@@ -163,12 +170,16 @@ class StreamDataLoader:
             }
             if (
                 state.get("stream_key") != self.dataset.stream_key
+                or state.get("schedule_fingerprint") != self._schedule_fingerprint
+                or state.get("batch_size") != self.batch_size
                 or state.get("stream_sizes") != sizes
                 or state.get("shuffle") != self._shuffle
                 or state.get("seed") != self._seed
             ):
                 raise ValueError(
-                    "Stream sampling checkpoint does not match the dataset"
+                    "Stream sampling checkpoint does not match the dataset, source "
+                    "schedule, or batch size; resume with the original sampling "
+                    "configuration or start a new run"
                 )
             self._base_loader.load_state_dict(state["base"])
             self._pending_streams = deque(state["pending_streams"])
