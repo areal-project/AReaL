@@ -69,7 +69,6 @@ from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.perf_tracer import Category
 from areal.utils.recover import RecoverHandler
-from areal.utils.rollout_metrics import reduce_rollout_metrics
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 from areal.v2.inference_service.controller.controller import (
@@ -724,7 +723,7 @@ class PPOTrainer:
         if not self._is_v1_awex_colocate(self.config):
             return None
         stats = self.actor.export_stats()
-        stats.update(self._export_rollout_stats())
+        stats.update(self.rollout.export_stats())
         self._restore_awex_rollout_after_stats()
         return stats
 
@@ -2009,16 +2008,6 @@ class PPOTrainer:
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
-    def _export_rollout_stats(self) -> dict[str, float]:
-        stats = self.rollout.export_stats()
-        if not is_single_controller():
-            stats = reduce_rollout_metrics(
-                stats,
-                group=self.actor.cpu_group,
-                is_data_parallel_head=self.actor.is_data_parallel_head(),
-            )
-        return stats
-
     def _export_and_commit_stats(
         self,
         epoch: int,
@@ -2029,7 +2018,7 @@ class PPOTrainer:
         # Upload statistics to the logger (e.g., wandb)
         stats = dict(actor_stats_before_exchange or {})
         stats.update(self.actor.export_stats())
-        stats.update(self._export_rollout_stats())
+        stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
         self._commit_stats(epoch, epoch_step, global_step, stats)

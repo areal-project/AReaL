@@ -34,7 +34,7 @@ from areal.utils.rollout_metrics import (
     ConsumedMetrics,
     Metrics,
     capture_metrics,
-    rollout_stream_name,
+    get_arena_stream_name,
 )
 from areal.infra import workflow_context
 from .workflow_context import WorkflowContext
@@ -1344,20 +1344,21 @@ class WorkflowExecutor:
             filtering/validation.
         """
 
-        stream_name = rollout_stream_name(pending_task.data)
+        arena_stream_name = get_arena_stream_name(pending_task.data)
 
-        def record_disposition(
+        def record_arena_stream_disposition(
             accepted: bool, *, filter_rejected: bool = False
         ) -> None:
+            """Record global and per-Arena-stream acceptance and filtering."""
             metrics = dict(
                 accepted=int(accepted),
                 rejected=int(not accepted),
                 filter_rejected=int(filter_rejected),
             )
-            if stream_name:
+            if arena_stream_name:
                 metrics.update(
                     {
-                        f"stream/{stream_name}/{key}": value
+                        f"stream/{arena_stream_name}/{key}": value
                         for key, value in metrics.items()
                     }
                 )
@@ -1447,8 +1448,8 @@ class WorkflowExecutor:
                         if not isinstance(group, RolloutGroup):
                             raise ValueError("rollout_group must be a RolloutGroup")
                         group = group.validate_rows(rows)
-                        if stream_name:
-                            group = replace(group, stream_name=stream_name)
+                        if arena_stream_name:
+                            group = replace(group, arena_stream_name=arena_stream_name)
                         traj = {k: v for k, v in traj.items() if k != "rollout_reward"}
                         traj["rollout_group"] = group
                     except (TypeError, ValueError) as exc:
@@ -1481,7 +1482,7 @@ class WorkflowExecutor:
 
                 if should_accept_traj:
                     manager.on_rollout_accepted()
-                    record_disposition(True)
+                    record_arena_stream_disposition(True)
                     trace_session_event(
                         "mark_finalized",
                         task_id=task_id,
@@ -1495,7 +1496,9 @@ class WorkflowExecutor:
                     return _RolloutResult(task_id=task_id, trajectory=traj)
 
                 manager.on_rollout_rejected()
-                record_disposition(False, filter_rejected=reason == "rejected")
+                record_arena_stream_disposition(
+                    False, filter_rejected=reason == "rejected"
+                )
                 trace_session_event(
                     "mark_finalized",
                     task_id=task_id,
@@ -1511,7 +1514,7 @@ class WorkflowExecutor:
 
             except (WorkflowContractError, RoutingError) as exc:
                 manager.on_rollout_rejected()
-                record_disposition(False)
+                record_arena_stream_disposition(False)
                 trace_session_event(
                     "mark_finalized",
                     task_id=task_id,
@@ -1525,7 +1528,7 @@ class WorkflowExecutor:
                 return WorkflowContractFailure(message=str(exc))
             except Exception as exc:  # pragma: no cover - workflow execution errors
                 manager.on_rollout_rejected()
-                record_disposition(False)
+                record_arena_stream_disposition(False)
                 trace_session_event(
                     "mark_finalized",
                     task_id=task_id,

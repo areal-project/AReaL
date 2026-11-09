@@ -13,17 +13,18 @@ from areal.utils.data import TrajBatchMeta
 from areal.utils.stats_tracker import ReduceType
 
 
-def log_stream_training_counts(meta: TrajBatchMeta) -> None:
-    """Count each input group once per update, summing only over data parallelism.
+def log_arena_stream_training_counts(meta: TrajBatchMeta) -> None:
+    """Count training inputs per Arena stream once per successful update.
 
-    Export sums over the engine's DP group. Logical rollouts can occupy multiple
-    sequence rows (e.g. individual turn export); neither is a unique task count.
+    Export sums over the engine's DP group without model-parallel duplication.
+    Logical rollouts can occupy multiple sequence rows (e.g. individual turn
+    export); neither is a unique task count.
     """
     counts: dict[str, Counter[str]] = {}
     for group in meta.rollout_groups or []:
-        if group is None or group.stream_name is None:
+        if group is None or group.arena_stream_name is None:
             continue
-        stream = counts.setdefault(group.stream_name, Counter())
+        stream = counts.setdefault(group.arena_stream_name, Counter())
         stream.update(
             groups=1, rollouts=len(group.row_counts), sequences=sum(group.row_counts)
         )

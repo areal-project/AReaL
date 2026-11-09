@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from datetime import timedelta
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,10 +13,10 @@ from tests.test_workflow_executor_filtering import _executor, _TrajectoryWorkflo
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.workflow_executor import _RolloutTaskInput
 from areal.trainer.ppo.actor import PPOActor
-from areal.trainer.ppo.stats import log_stream_training_counts
+from areal.trainer.ppo.stats import log_arena_stream_training_counts
 from areal.utils import stats_tracker
 from areal.utils.data import RolloutGroup, TrajBatchMeta, concat_batch, split_batch
-from areal.utils.rollout_metrics import ConsumedMetrics, reduce_rollout_metrics
+from areal.utils.rollout_metrics import ConsumedMetrics, get_arena_stream_name
 
 
 @pytest.fixture(autouse=True)
@@ -33,8 +32,22 @@ def _trajectory(stream="a", counts=(2, 1)):
     return {
         "input_ids": torch.ones((rows, 4), dtype=torch.long),
         "attention_mask": torch.ones((rows, 4), dtype=torch.bool),
-        "rollout_group": RolloutGroup(counts, stream_name=stream),
+        "rollout_group": RolloutGroup(counts, arena_stream_name=stream),
     }
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (None, None),
+        ({"dataset": "ordinary"}, None),
+        ({"arena_stream_name": "swe", "stream_id": "remote-id"}, "swe"),
+        ({"stream_id": "remote-id"}, "remote-id"),
+        ({"arena_stream_name": "", "stream_id": "remote-id"}, "remote-id"),
+    ],
+)
+def test_arena_stream_name_uses_configured_name_then_id(data, expected):
+    assert get_arena_stream_name(data) == expected
 
 
 @pytest.mark.asyncio
@@ -64,7 +77,7 @@ async def test_filter_counts_only_explicit_rejections_and_consumed_results():
         )()
         consumed.consume(result)
         if result.trajectory is not None:
-            assert result.trajectory["rollout_group"].stream_name == stream
+            assert result.trajectory["rollout_group"].arena_stream_name == stream
 
     # An accepted prefetched result has not yet entered the consumer's window.
     await executor._create_workflow_task(
@@ -88,18 +101,20 @@ async def test_filter_counts_only_explicit_rejections_and_consumed_results():
 
 
 @pytest.mark.parametrize("stream", ["a", "org/dataset", None])
-def test_stream_metadata_survives_rpc_concat_and_split(stream):
-    """Stream provenance stays outside model tensors across transport boundaries."""
+def test_arena_stream_metadata_survives_rpc_concat_and_split(stream):
+    """Arena stream provenance stays outside model tensors across transport boundaries."""
     trajectory = deserialize_value(serialize_value(_trajectory(stream)))
     batched, meta = concat_batch([trajectory])
     assert "rollout_group" not in batched
     restored = split_batch(batched, meta)
-    assert restored[0]["rollout_group"] == RolloutGroup((2, 1), stream_name=stream)
+    assert restored[0]["rollout_group"] == RolloutGroup(
+        (2, 1), arena_stream_name=stream
+    )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("correct_count", [1, 2])
-async def test_accuracy_predicate_rejections_reach_stream_counts(correct_count):
+async def test_accuracy_predicate_rejections_reach_arena_stream_counts(correct_count):
     from examples.swe.filter_function import filter_by_accuracy
 
     executor, _ = _executor()
@@ -146,7 +161,7 @@ def test_actor_counts_successful_training_inputs_once(fails):
     assert stats["ppo_actor/stream/b/sequences"] == 3
 
 
-def _stream_counts_worker(rank, init_method):
+def _arena_stream_counts_worker(rank, init_method):
     dist.init_process_group(
         "gloo",
         rank=rank,
@@ -156,14 +171,14 @@ def _stream_counts_worker(rank, init_method):
     )
     try:
         # Both DP ranks have a; only rank 0 has b. Keys must still synchronize.
-        groups = [RolloutGroup((2, 1), stream_name="a")]
+        groups = [RolloutGroup((2, 1), arena_stream_name="a")]
         if rank == 0:
-            groups.append(RolloutGroup((2,), stream_name="b"))
+            groups.append(RolloutGroup((2,), arena_stream_name="b"))
         meta = TrajBatchMeta(
             len(groups), [sum(g.row_counts) for g in groups], [4] * len(groups), groups
         )
         with stats_tracker.scope("ppo_actor"):
-            log_stream_training_counts(meta)
+            log_arena_stream_training_counts(meta)
         stats = stats_tracker.export_all(reduce_group=dist.group.WORLD)
         assert stats["ppo_actor/stream/a/groups"] == 2
         assert stats["ppo_actor/stream/a/rollouts"] == 4
@@ -171,39 +186,6 @@ def _stream_counts_worker(rank, init_method):
         assert stats["ppo_actor/stream/b/groups"] == 1
         assert stats["ppo_actor/stream/b/sequences"] == 2
 
-        consumed = ConsumedMetrics()
-        accepted = [1.0] if rank == 0 else [0.0, 0.0, 1.0]
-        consumed.consume(
-            SimpleNamespace(
-                trajectory=None,
-                metrics={
-                    "rollout/stream/a/accepted": accepted,
-                    "rollout/stream/a/filter_rejected": [1 - x for x in accepted],
-                    "rollout/stream/a/harness_success": accepted,
-                    "rollout/stream/a/task_error": [1 - x for x in accepted],
-                },
-            )
-        )
-        local_stats = consumed.export()
-        local_stats["rollout/arena/latency"] = rank + 1
-        local_stats["rollout/arena/latency__count"] = 1
-        merged = reduce_rollout_metrics(
-            local_stats, group=dist.group.WORLD, is_data_parallel_head=True
-        )
-        assert merged["rollout/stream/a/accepted"] == 0.5
-        assert merged["rollout/stream/a/group_attempt_count"] == 4
-        assert merged["rollout/stream/a/task_result_count"] == 4
-        assert merged["rollout/stream/a/task_error"] == 0.5
-        assert merged["rollout/stream/a/filter_rejected_count"] == 2
-        assert merged["rollout/arena/latency"] == rank + 1
-
-        # A model-parallel replica must not add observations to the DP head.
-        merged = reduce_rollout_metrics(
-            local_stats, group=dist.group.WORLD, is_data_parallel_head=rank == 0
-        )
-        assert merged["rollout/stream/a/accepted"] == 1
-        assert merged["rollout/stream/a/group_attempt_count"] == 1
-        assert merged["rollout/stream/a/filter_rejected_count"] == 0
     finally:
         dist.destroy_process_group()
 
@@ -211,9 +193,9 @@ def _stream_counts_worker(rank, init_method):
 @pytest.mark.slow
 @pytest.mark.ci
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is unavailable")
-def test_stream_training_counts_sum_across_dp_with_missing_stream(tmp_path):
+def test_arena_stream_training_counts_sum_across_dp_with_missing_stream(tmp_path):
     mp.spawn(
-        _stream_counts_worker,
+        _arena_stream_counts_worker,
         args=(f"file://{tmp_path / 'init'}",),
         nprocs=2,
         join=True,

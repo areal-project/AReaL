@@ -40,7 +40,7 @@ from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.infra import workflow_context
 from areal.utils import logging, stats_tracker
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.rollout_metrics import rollout_stream_name
+from areal.utils.rollout_metrics import get_arena_stream_name
 
 logger = logging.getLogger("ArenaStreamAgent")
 
@@ -1712,7 +1712,7 @@ class ArenaStreamAgentWorkflow:
             metrics["harness_error/OTHER"] = float(
                 is_harness_error and outcome_code not in _GAMEAGENT_OUTCOME_METRIC_CODES
             )
-        stream_name = rollout_stream_name(data) or self.default_stream_name
+        stream_name = get_arena_stream_name(data) or self.default_stream_name
         if stream_name:
             metrics.update(
                 {f"stream/{stream_name}/{key}": value for key, value in metrics.items()}

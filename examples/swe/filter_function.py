@@ -92,6 +92,7 @@ def filter_by_accuracy(
     all-correct groups. Correctness uses original rewards when available, with
     one vote per logical rollout rather than per exported turn/sequence. A
     custom importable wrapper can override the bounds or the success threshold.
+    When Arena stream provenance is present, record per-Arena-stream metrics too.
     """
     if not 0 <= min_accuracy < max_accuracy <= 1:
         raise ValueError("accuracy bounds must satisfy 0 <= min < max <= 1")
@@ -121,10 +122,10 @@ def filter_by_accuracy(
         "rejected_by_low_accuracy": int(too_low),
         "rejected_by_high_accuracy": int(too_high),
     }
-    if group is not None and group.stream_name:
+    if group is not None and group.arena_stream_name:
         metrics.update(
             {
-                f"stream/{group.stream_name}/{key}": value
+                f"stream/{group.arena_stream_name}/{key}": value
                 for key, value in metrics.items()
             }
         )

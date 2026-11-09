@@ -158,14 +158,14 @@ Local timeouts and cancellations without a remote terminal result contribute onl
 call metrics. Reward metrics retain their valid-export denominator, exposed as
 `rollout/reward_sample_count`; they must not be used as the task-failure denominator.
 
-The same attempt and terminal-result metrics are available under
-`rollout/stream/<name>/`, including `harness_error`, `task_error`, outcome codes,
-`task_attempt_count`, and `task_result_count`. Each stream uses its own denominator.
-`<name>` is the dataset's `arena_stream_name`, falling back to `stream_id` for rows
-without a configured name.
+For single-controller Arena training, the same attempt and terminal-result metrics are
+available under `rollout/stream/<name>/`, including `harness_error`, `task_error`,
+outcome codes, `task_attempt_count`, and `task_result_count`. Each Arena stream uses its
+own denominator. `<name>` is the dataset's `arena_stream_name`, falling back to
+`stream_id` for rows without a configured name.
 
-Per-stream `accepted_count`, `rejected_count`, and `group_attempt_count` count prompt
-groups consumed while forming the current batch, including failed attempts.
+Per-Arena-stream `accepted_count`, `rejected_count`, and `group_attempt_count` count
+prompt groups consumed while forming the current batch, including failed attempts.
 `filter_rejected_count` counts only groups for which `should_accept_fn` returned false;
 missing trajectories and workflow/predicate exceptions are rejected but are not filter
 rejections. The corresponding `accepted`, `rejected`, and `filter_rejected` metrics are
@@ -173,13 +173,13 @@ fractions of all consumed group attempts. Prefetched results remain outside this
 until consumed. These counts also have aggregate `rollout/` counterparts.
 
 After a successful actor update, `ppo_actor/stream/<name>/{groups,rollouts,sequences}`
-reports the actual training input: prompt groups, logical rollout samples, and exported
-sequence rows respectively. An individual-turn export may contribute several sequences
-per rollout. Counts sum over DP ranks, without multiplying by Megatron TP/PP/CP replicas
-or PPO minibatches. They include inputs with zero advantage or masked loss; they do not
-measure nonzero gradient contributions. Filtered rollouts, pending rollouts, and
-transport padding do not contribute. All counts use the current metrics export window,
-not a lifetime cumulative total.
+reports the actual training input per Arena stream: prompt groups, logical rollout
+samples, and exported sequence rows respectively. An individual-turn export may
+contribute several sequences per rollout. Counts sum over DP ranks, without multiplying
+by Megatron TP/PP/CP replicas or PPO minibatches. They include inputs with zero
+advantage or masked loss; they do not measure nonzero gradient contributions. Filtered
+rollouts, pending rollouts, and transport padding do not contribute. All counts use the
+current metrics export window, not a lifetime cumulative total.
 
 ### Filtering groups by accuracy
 

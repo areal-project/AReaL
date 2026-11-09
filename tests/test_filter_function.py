@@ -179,7 +179,7 @@ def test_accuracy_filter_counts_rollouts_without_turn_weighting(recorded_stats):
     # Five logical rollouts: one successful 3-row rollout, four failures.
     # References can already be normalized; use original row rewards instead.
     sample["rollout_group"] = RolloutGroup(
-        (3, 1, 1, 1, 1), (2.0, -0.5, -0.5, -0.5, -0.5), stream_name="swe"
+        (3, 1, 1, 1, 1), (2.0, -0.5, -0.5, -0.5, -0.5), arena_stream_name="swe"
     )
     assert not filter_module.filter_by_accuracy(sample)
     assert recorded_stats.values["filter_accuracy"] == 0.2
