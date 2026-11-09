@@ -47,6 +47,7 @@ from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
 from areal.utils.rollout_metrics import ConsumedMetrics
+from areal.utils.stream_dataloader import StreamDataLoader
 
 from ..staleness_manager import StalenessManager
 from ..workflow_executor import (
@@ -160,6 +161,7 @@ class _RemoteRolloutTaskInput:
     reward_normalization: bool = False
     reward_normalization_use_std: bool = True
     drop_incomplete_group: bool = False
+    stream_dataloader: StreamDataLoader | None = None
 
 
 class RolloutController:
@@ -1093,10 +1095,6 @@ class RolloutController:
 
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
         async def _submit_then_wait() -> WorkflowTaskResult | None:
-            # Choose worker via round-robin
-            worker, rank = self._choose_worker()
-            engine_name = self._engine_name(rank)
-
             # NOTE: No need to call `on_rollout_submitted` here.
             # This function will be passed to `BatchTaskDispather` where
             # `on_rollout_submitted` will be called upon dispatching
@@ -1105,6 +1103,9 @@ class RolloutController:
             manager = self.staleness_manager
 
             try:
+                # Choose worker via round-robin.
+                worker, rank = self._choose_worker()
+                engine_name = self._engine_name(rank)
                 # Set future for this task
                 future = asyncio.get_event_loop().create_future()
                 with self._futures_lock:
@@ -1187,7 +1188,29 @@ class RolloutController:
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
                 return None
 
-        return _submit_then_wait
+        if pending_task.stream_dataloader is None:
+            return _submit_then_wait
+
+        async def _submit_with_stream_feedback() -> WorkflowTaskResult | None:
+            accepted = None
+            try:
+                result = await _submit_then_wait()
+                accepted = (
+                    isinstance(result, _RolloutResult) and result.trajectory is not None
+                )
+                return result
+            except Exception:
+                accepted = False
+                raise
+            finally:
+                # Cancellation releases a reservation without declaring an
+                # unfinished base task rejected. Feedback precedes consumption
+                # so a partial batch can immediately replenish its source.
+                pending_task.stream_dataloader.complete_rollout(
+                    pending_task.task_id, accepted
+                )
+
+        return _submit_with_stream_feedback
 
     def get_capacity(self):
         return self.staleness_manager.get_capacity()
@@ -1293,7 +1316,7 @@ class RolloutController:
     @trace_perf("rollout_controller.prepare_batch", category="scheduler")
     def prepare_batch(
         self,
-        dataloader: StatefulDataLoader,
+        dataloader: StatefulDataLoader | StreamDataLoader,
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         should_accept_fn: str | None = None,
@@ -1317,25 +1340,44 @@ class RolloutController:
         if workflow_kwargs is None:
             workflow_kwargs = {}
 
+        stream_dataloader = (
+            dataloader if isinstance(dataloader, StreamDataLoader) else None
+        )
+
         def task_input_generator():
-            for data in cycle_dataloader(dataloader):
-                for item in data:
+            base_items = (
+                item for data in cycle_dataloader(dataloader) for item in data
+            )
+            while True:
+                task_id = self._task_id_generator.next()
+                item = (
+                    stream_dataloader.next_rollout(task_id)
+                    if stream_dataloader is not None
+                    else next(base_items)
+                )
+                try:
                     workflow_data, mopd_route = self._extract_mopd_route(
                         item, required=self._mopd_routing_enabled
                     )
-                    yield _RemoteRolloutTaskInput(
+                    task = _RemoteRolloutTaskInput(
                         data=workflow_data,
                         workflow=workflow_str,
                         workflow_kwargs=workflow_kwargs,
                         should_accept_fn=should_accept_fn,
-                        task_id=self._task_id_generator.next(),
+                        task_id=task_id,
                         mopd_route=mopd_route,
                         group_size=group_size,
                         min_usable_group_size=min_usable_group_size,
                         reward_normalization=reward_normalization,
                         reward_normalization_use_std=reward_normalization_use_std,
                         drop_incomplete_group=drop_incomplete_group,
+                        stream_dataloader=stream_dataloader,
                     )
+                except BaseException:
+                    if stream_dataloader is not None:
+                        stream_dataloader.complete_rollout(task_id, None)
+                    raise
+                yield task
 
         if not hasattr(self, "data_generator"):
             self.data_generator = task_input_generator()
