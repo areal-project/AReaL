@@ -1,0 +1,32 @@
+areal/experimental/openai/client.py
+  s_6b814fc8a9d033::t_ecf74a655b0c6a 9
+  s_6b814fc8a9d033::t_2450c1cd0e26f4 10,86-92,1443-1445,1447-1448,1944-1946,1948-1949
+areal/experimental/openai/proxy/server.py
+  s_6b814fc8a9d033::t_6a0cc932c0f875 73
+areal/experimental/openai/proxy/proxy_rollout_server.py
+  s_6b814fc8a9d033::t_9a80e6f109c125 1216-1217,1219-1220
+  s_6b814fc8a9d033::t_2450c1cd0e26f4 37-41,1214-1215,1222-1240,1243-1244,1248-1256,1308-1317
+  s_6b814fc8a9d033::t_6a0cc932c0f875 10,79-84,141,424,447,602-603,629-633,716-722,724-728,750-751,767-814,817-833,1213,1218,1264-1265,1307
+  s_6b814fc8a9d033::t_0ac3f3a6070fa2 815-816
+  s_6b814fc8a9d033::t_794f1c6749871a 1221,1241-1242,1245-1247,1318-1319
+areal/experimental/openai/proxy/session_trace.py
+  s_6b814fc8a9d033::t_c23566958ae371 1-93,95,101-104,107-155,157,163-195
+  s_6b814fc8a9d033::t_794f1c6749871a 94,96-100,105-106
+  s_6b814fc8a9d033::t_82d364bba1cdae 156,158-162
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8e5b3381735d807cbcbe32f16a20d91f552c0571",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
