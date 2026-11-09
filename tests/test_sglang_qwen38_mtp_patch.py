@@ -8,7 +8,6 @@ import pytest
 
 from areal.engine import _sglang_source_patch as installer
 from areal.engine import sglang_model_patches as startup
-from areal.engine import sglang_qwen38_mtp as patch
 
 SHAPE = {
     "hidden_size": 5120,
@@ -29,24 +28,25 @@ def runtime(tmp_path, monkeypatch):
     # Small compilable call sites; the real source guard and installer run.
     # Production file fingerprints are separately checked against SGLang sources.
     sources = [
-        "def positions():\n    if True:\n        if True:\n" + patch.MROPE_OLD,
-        "class BaseFinishReason:\n    pass\n\n" + patch.ABORT_INIT_OLD,
+        "def positions():\n    if True:\n        if True:\n"
+        + startup._QWEN38_MROPE_OLD,
+        "class BaseFinishReason:\n    pass\n\n" + startup._QWEN38_ABORT_INIT_OLD,
         "class Req:\n    def update_finish_state(self, new_accepted_len=1):\n"
-        + patch.FINISH_OLD
+        + startup._QWEN38_FINISH_OLD
         + "        if self.natural_finish:\n"
         + "            self.finished_reason = 'stop'\n"
         + "            return\n\n"
-        + patch.FINISH_END_OLD
+        + startup._QWEN38_FINISH_END_OLD
         + "        pass\n",
         "def abort_request():\n    if True:\n        if True:\n            if True:\n                if True:\n"
-        + patch.SCHEDULER_OLD,
+        + startup._QWEN38_SCHEDULER_OLD,
     ]
     root = tmp_path / "sglang"
     definitions = []
     before = {}
     after = {}
     for (relative, _, _, replacements), text in zip(
-        patch.PATCHES, sources, strict=True
+        startup._QWEN38_PATCHES, sources, strict=True
     ):
         source = text.encode()
         patched = source
@@ -65,7 +65,7 @@ def runtime(tmp_path, monkeypatch):
                 replacements,
             )
         )
-    monkeypatch.setattr(patch, "PATCHES", tuple(definitions))
+    monkeypatch.setattr(startup, "_QWEN38_PATCHES", tuple(definitions))
     monkeypatch.setattr(startup, "installed_sglang_root", lambda: root)
     monkeypatch.delenv("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", raising=False)
     model = tmp_path / "checkpoint-epoch-7-step-32"
@@ -143,7 +143,7 @@ def test_other_model_sizes_are_not_patched(runtime, monkeypatch, field):
     ],
 )
 def test_incomplete_or_other_architectures_do_not_match(config):
-    assert not patch.matches_model(config)
+    assert not startup._matches_qwen38_27b(config)
 
 
 def test_external_abort_defers_to_natural_finish_but_internal_errors_win(runtime):
