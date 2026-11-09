@@ -785,6 +785,7 @@ class RemoteSGLangEngine(InferenceEngine):
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a request to the inference engine."""
         return self._engine.submit(
@@ -792,6 +793,7 @@ class RemoteSGLangEngine(InferenceEngine):
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             group_size=group_size,
             min_usable_group_size=min_usable_group_size,
             task_id=task_id,
@@ -865,6 +867,7 @@ class RemoteSGLangEngine(InferenceEngine):
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ):
         """Asynchronously submit and wait until a full batch is ready."""
         return self._engine.prepare_batch(
@@ -872,6 +875,7 @@ class RemoteSGLangEngine(InferenceEngine):
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             group_size=group_size,
             min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,

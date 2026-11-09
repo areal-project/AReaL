@@ -19,9 +19,10 @@ def log_arena_stream_training_counts(
     """Count training inputs per Arena stream once per successful update.
 
     Export sums over the engine's DP group without model-parallel duplication.
-    Tokens count nonzero entries in the preprocessed, next-token-aligned loss
-    mask, excluding prompt/context and padding. Zero-advantage tokens still count;
-    this measures training inputs, not nonzero gradient contributions.
+    Names and definitions match the global PPO input denominators: n_groups
+    counts input groups, n_seqs counts tensor rows, n_tokens includes all padded
+    positions, and n_valid_tokens counts nonzero preprocessed loss-mask entries.
+    Zero-advantage tokens still count; these are not gradient contribution counts.
     """
     if not meta.rollout_groups or not any(
         group is not None and group.arena_stream_name is not None
@@ -38,7 +39,9 @@ def log_arena_stream_training_counts(
             continue
         name = group.arena_stream_name
         counts.setdefault(name, Counter()).update(
-            groups=1, rollouts=len(group.row_counts)
+            n_groups=1,
+            n_seqs=group_tokens.numel(),
+            n_tokens=group_tokens.numel() * loss_mask.shape[-1],
         )
         total = group_tokens.sum().reshape(1)
         tokens[name] = tokens[name] + total if name in tokens else total
@@ -52,7 +55,7 @@ def log_arena_stream_training_counts(
                 )
                 for key, value in stream.items()
             },
-            **{f"stream/{name}/tokens": tokens[name]},
+            **{f"stream/{name}/n_valid_tokens": tokens[name]},
         )
 
 

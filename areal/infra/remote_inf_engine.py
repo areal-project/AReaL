@@ -48,7 +48,7 @@ from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names, stats_tracker
 from areal.utils.data import RolloutGroup, concat_padded_tensors, get_batch_size
-from areal.utils.dynamic_import import import_from_string
+from areal.utils.dynamic_import import bind_filter_kwargs, import_from_string
 from areal.utils.network import (
     find_free_ports,
     format_hostport,
@@ -1012,7 +1012,9 @@ class RemoteInfEngine(InferenceEngine):
         return resolved
 
     def _resolve_should_accept_fn(
-        self, should_accept_fn: Callable[[dict[str, Any]], bool] | str | None
+        self,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> Callable[[dict[str, Any]], bool] | None:
         """Resolve should_accept_fn parameter to a callable or None.
 
@@ -1033,6 +1035,10 @@ class RemoteInfEngine(InferenceEngine):
         TypeError
             If imported object is not callable
         """
+        if should_accept_kwargs:
+            return bind_filter_kwargs(
+                self._resolve_should_accept_fn(should_accept_fn), should_accept_kwargs
+            )
         if should_accept_fn is None or callable(should_accept_fn):
             return should_accept_fn
 
@@ -1529,6 +1535,7 @@ class RemoteInfEngine(InferenceEngine):
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -1577,7 +1584,9 @@ class RemoteInfEngine(InferenceEngine):
             reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
-        resolved_should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+        resolved_should_accept_fn = self._resolve_should_accept_fn(
+            should_accept_fn, should_accept_kwargs
+        )
 
         return self.workflow_executor.submit(
             data,
@@ -1705,6 +1714,7 @@ class RemoteInfEngine(InferenceEngine):
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready.
 
@@ -1746,7 +1756,9 @@ class RemoteInfEngine(InferenceEngine):
             reward_normalization_use_std=reward_normalization_use_std,
             drop_incomplete_group=drop_incomplete_group,
         )
-        resolved_should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+        resolved_should_accept_fn = self._resolve_should_accept_fn(
+            should_accept_fn, should_accept_kwargs
+        )
 
         return self.workflow_executor.prepare_batch(
             dataloader=dataloader,

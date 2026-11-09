@@ -79,6 +79,19 @@ def filter_function(sample):
     return accept
 
 
+def validate_accuracy_filter(
+    *,
+    min_accuracy: float = 0.2,
+    max_accuracy: float = 1.0,
+    correct_reward_threshold: float = 1.0 - 1e-3,
+) -> None:
+    """Validate accuracy-filter options before starting rollout workers."""
+    if not 0 <= min_accuracy < max_accuracy <= 1:
+        raise ValueError("accuracy bounds must satisfy 0 <= min < max <= 1")
+    if not math.isfinite(correct_reward_threshold):
+        raise ValueError("correct_reward_threshold must be finite")
+
+
 def filter_by_accuracy(
     sample: dict[str, Any],
     *,
@@ -91,13 +104,14 @@ def filter_by_accuracy(
     The importable default rejects groups with at most 20% correct rollouts and
     all-correct groups. Correctness uses original rewards when available, with
     one vote per logical rollout rather than per exported turn/sequence. A
-    custom importable wrapper can override the bounds or the success threshold.
+    SWEPPOConfig.should_accept_kwargs mapping can override these options.
     When Arena stream provenance is present, record per-Arena-stream metrics too.
     """
-    if not 0 <= min_accuracy < max_accuracy <= 1:
-        raise ValueError("accuracy bounds must satisfy 0 <= min < max <= 1")
-    if not math.isfinite(correct_reward_threshold):
-        raise ValueError("correct_reward_threshold must be finite")
+    validate_accuracy_filter(
+        min_accuracy=min_accuracy,
+        max_accuracy=max_accuracy,
+        correct_reward_threshold=correct_reward_threshold,
+    )
 
     correct = _get_rewards(sample) >= correct_reward_threshold
     group = sample.get("rollout_group")

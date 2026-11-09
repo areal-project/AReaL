@@ -141,7 +141,7 @@ async def test_accuracy_predicate_rejections_reach_arena_stream_counts(correct_c
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_actor_counts_successful_training_inputs_once(fails):
-    """Count groups, logical rollouts and loss tokens once, after update success."""
+    """Count input denominators once, after update success."""
     actor = object.__new__(PPOActor)
     actor._ppo_update = MagicMock(
         side_effect=RuntimeError("update failed") if fails else None
@@ -154,13 +154,17 @@ def test_actor_counts_successful_training_inputs_once(fails):
         return
     actor.ppo_update(data)
     stats = stats_tracker.export_all()
-    assert stats["ppo_actor/stream/a/groups"] == 2
-    assert stats["ppo_actor/stream/a/rollouts"] == 3
-    assert stats["ppo_actor/stream/a/tokens"] == 8
-    assert stats["ppo_actor/stream/b/groups"] == 1
-    assert stats["ppo_actor/stream/b/rollouts"] == 1
-    assert stats["ppo_actor/stream/b/tokens"] == 6
-    assert not any(key.endswith("/sequences") for key in stats)
+    assert stats["ppo_actor/stream/a/n_groups"] == 2
+    assert stats["ppo_actor/stream/a/n_seqs"] == 4
+    assert stats["ppo_actor/stream/a/n_valid_tokens"] == 8
+    assert stats["ppo_actor/stream/b/n_groups"] == 1
+    assert stats["ppo_actor/stream/b/n_seqs"] == 3
+    assert stats["ppo_actor/stream/b/n_valid_tokens"] == 6
+    assert stats["ppo_actor/stream/a/n_tokens"] == 16
+    assert stats["ppo_actor/stream/b/n_tokens"] == 12
+    assert not any(
+        key.endswith(("/groups", "/rollouts", "/tokens", "/sequences")) for key in stats
+    )
 
 
 def test_actor_token_counts_exclude_masked_and_unnamed_rows_after_padding():
@@ -183,12 +187,14 @@ def test_actor_token_counts_exclude_masked_and_unnamed_rows_after_padding():
     actor.ppo_update(data)
 
     stats = stats_tracker.export_all()
-    assert stats["ppo_actor/stream/a/tokens"] == 4
-    assert stats["ppo_actor/stream/a/groups"] == 2
-    assert stats["ppo_actor/stream/a/rollouts"] == 2
-    assert stats["ppo_actor/stream/b/tokens"] == 0
-    assert stats["ppo_actor/stream/b/groups"] == 1
-    assert stats["ppo_actor/stream/b/rollouts"] == 1
+    assert stats["ppo_actor/stream/a/n_valid_tokens"] == 4
+    assert stats["ppo_actor/stream/a/n_groups"] == 2
+    assert stats["ppo_actor/stream/a/n_seqs"] == 3
+    assert stats["ppo_actor/stream/b/n_valid_tokens"] == 0
+    assert stats["ppo_actor/stream/b/n_groups"] == 1
+    assert stats["ppo_actor/stream/b/n_seqs"] == 3
+    assert stats["ppo_actor/stream/a/n_tokens"] == 12
+    assert stats["ppo_actor/stream/b/n_tokens"] == 12
     assert not any("None" in key for key in stats)
 
 
@@ -214,11 +220,14 @@ def _arena_stream_counts_worker(rank, init_method):
         with stats_tracker.scope("ppo_actor"):
             log_arena_stream_training_counts(meta, loss_mask)
         stats = stats_tracker.export_all(reduce_group=dist.group.WORLD)
-        assert stats["ppo_actor/stream/a/groups"] == 2
-        assert stats["ppo_actor/stream/a/rollouts"] == 4
-        assert stats["ppo_actor/stream/a/tokens"] == 12
-        assert stats["ppo_actor/stream/b/groups"] == 1
-        assert stats["ppo_actor/stream/b/tokens"] == 4
+        assert stats["ppo_actor/stream/a/n_groups"] == 2
+        assert stats["ppo_actor/stream/a/n_seqs"] == 6
+        assert stats["ppo_actor/stream/a/n_tokens"] == 24
+        assert stats["ppo_actor/stream/b/n_seqs"] == 2
+        assert stats["ppo_actor/stream/b/n_tokens"] == 8
+        assert stats["ppo_actor/stream/a/n_valid_tokens"] == 12
+        assert stats["ppo_actor/stream/b/n_groups"] == 1
+        assert stats["ppo_actor/stream/b/n_valid_tokens"] == 4
 
     finally:
         dist.destroy_process_group()
@@ -234,3 +243,32 @@ def test_arena_stream_training_counts_sum_across_dp_with_missing_stream(tmp_path
         nprocs=2,
         join=True,
     )
+
+
+def test_stream_counts_sum_to_global_ppo_denominators():
+    from areal.trainer.ppo.actor import _group_training_metrics
+    from areal.trainer.ppo.stats import infer_token_denominator
+
+    short = _trajectory("a", (2, 1))
+    for key in ("input_ids", "attention_mask", "loss_mask"):
+        short[key] = short[key][:, :2]
+    masked = _trajectory("b", (2,))
+    masked["loss_mask"].zero_()
+    batched, meta = concat_batch([short, masked, _trajectory("a", (1,))])
+    mask = batched["loss_mask"]
+    with stats_tracker.scope("ppo_actor"):
+        stats_tracker.denominator(
+            n_groups=_group_training_metrics(mask, meta.traj_group_sizes)[0],
+            n_seqs=torch.ones(mask.shape[0], dtype=torch.bool),
+            n_tokens=infer_token_denominator(batched, mask),
+            n_valid_tokens=mask.bool(),
+        )
+        log_arena_stream_training_counts(meta, mask)
+    stats = stats_tracker.export_all()
+    for name in ("n_groups", "n_seqs", "n_tokens", "n_valid_tokens"):
+        assert (
+            sum(stats[f"ppo_actor/stream/{stream}/{name}"] for stream in ("a", "b"))
+            == stats[f"ppo_actor/{name}"]
+        )
+    assert stats["ppo_actor/n_tokens"] == 24
+    assert stats["ppo_actor/n_valid_tokens"] == 5

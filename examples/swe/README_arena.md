@@ -172,17 +172,24 @@ rejections. The corresponding `accepted`, `rejected`, and `filter_rejected` metr
 fractions of all consumed group attempts. Prefetched results remain outside this window
 until consumed. These counts also have aggregate `rollout/` counterparts.
 
-After a successful actor update, `ppo_actor/stream/<name>/{groups,rollouts,tokens}`
-reports the actual training input per Arena stream: prompt groups, logical rollout
-samples, and tokens with a nonzero preprocessed `loss_mask`, respectively. Tokens
-exclude prompt/context, padding, and positions masked out before the PPO update; they
-include zero-advantage tokens and do not measure nonzero gradient contributions or
-additional filtering performed inside the loss function. Groups and rollouts still count
-inputs whose loss mask is entirely zero. Counts sum over DP ranks, without multiplying
-by Megatron TP/PP/CP replicas or PPO minibatches. Filtered rollouts, pending rollouts,
-and transport padding do not contribute. All counts use the current metrics export
-window, not a lifetime cumulative total. The `tokens` metric replaces the previous
-`sequences` row count.
+After a successful actor update, `ppo_actor/stream/<name>/` reports the same input-count
+metrics as the global `ppo_actor/` scope:
+
+| Metric           | Definition                                                                                                             |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `n_groups`       | Input prompt groups, including fully masked groups.                                                                    |
+| `n_seqs`         | Tensor rows; a multi-turn logical rollout can contain several rows.                                                    |
+| `n_tokens`       | All padded tensor positions, including prompt/context and padding, matching the global denominator.                    |
+| `n_valid_tokens` | Nonzero preprocessed `loss_mask` positions, excluding prompt/context, padding, and positions masked before the update. |
+
+Use `n_valid_tokens` to compare training token volume across datasets. Zero-advantage
+tokens still count; this does not measure nonzero gradient contributions or additional
+filtering inside the loss function. When all inputs have stream provenance, per-stream
+sums match the corresponding global counts. Counts sum over DP ranks once per successful
+update, without multiplying by Megatron TP/PP/CP replicas or PPO minibatches. Rejected
+or pending rollouts do not contribute. These are counts in the current metrics export
+window, not lifetime totals. These names replace the earlier `groups/rollouts/tokens`;
+logical rollout counts are not interchangeable with `n_seqs`.
 
 ### Filtering groups by accuracy
 
@@ -190,6 +197,10 @@ To reject groups with accuracy at or below 20%, as well as all-correct groups, s
 
 ```yaml
 should_accept_fn: examples.swe.filter_function.filter_by_accuracy
+should_accept_kwargs:
+  min_accuracy: 0.2
+  max_accuracy: 1.0
+  correct_reward_threshold: 0.999
 ```
 
 This keeps only `0.2 < accuracy < 1.0`: one correct rollout out of five is rejected; two
@@ -199,24 +210,20 @@ reward at least `1 - 1e-3` is correct by default. This is a fraction of correct
 rollouts, not the mean of fractional rewards. Rows within one logical rollout must agree
 on correctness; ambiguous split rewards raise an error.
 
-For other bounds or a dataset with another success score, define an importable wrapper:
+Both SWE training entrypoints, including the Qwen Arena recipe, forward
+`should_accept_kwargs` to the rollout workers in controller and SPMD modes. Override
+these YAML values directly or via CLI, for example
+`should_accept_kwargs.min_accuracy=0.4 should_accept_kwargs.max_accuracy=0.8`. This
+keeps only `0.4 < accuracy < 0.8`; both endpoints are rejected. Invalid bounds fail
+during configuration loading. Omit `should_accept_kwargs` to retain the function's
+defaults. Options require a non-null `should_accept_fn`.
 
-```python
-from examples.swe.filter_function import filter_by_accuracy
-
-
-def accept_mid_accuracy(sample):
-    return filter_by_accuracy(
-        sample, min_accuracy=0.4, max_accuracy=1.0, correct_reward_threshold=1.0
-    )
-```
-
-Point `should_accept_fn` to that wrapper's module path. Bounds are exclusive for
-acceptance; `min_accuracy=0, max_accuracy=1` keeps only groups containing both correct
-and incorrect rollouts. The existing `filter_function` retains its reward-variation
-behavior. Rejections from the new function contribute to the per-stream
-`filter_rejected_count` described above; `filter_accuracy`, `rejected_by_low_accuracy`,
-and `rejected_by_high_accuracy` expose its decisions globally and per stream.
+Bounds are exclusive for acceptance; `min_accuracy=0, max_accuracy=1` keeps only groups
+containing both correct and incorrect rollouts. The existing `filter_function` retains
+its reward-variation behavior. Rejections from the new function contribute to the
+per-stream `filter_rejected_count` described above; `filter_accuracy`,
+`rejected_by_low_accuracy`, and `rejected_by_high_accuracy` expose its decisions
+globally and per stream.
 
 ### Reward components in W&B
 

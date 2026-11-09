@@ -53,7 +53,8 @@ def test_arena_training_preserves_rows_and_cycles_tail(batch_size, monkeypatch):
     config.experiment_name = "arena-test-experiment"
     config.trial_name = "arena-test-trial"
     config.train_dataset.batch_size = batch_size
-    config.should_accept_fn = "examples.swe.filter_function.filter_function"
+    config.should_accept_fn = "examples.swe.filter_function.filter_by_accuracy"
+    config.should_accept_kwargs = {"min_accuracy": 0.4, "max_accuracy": 0.8}
     monkeypatch.setattr(cli_args, "load_expr_config", lambda *_: (config, None))
     monkeypatch.setattr(
         train_swe_rl, "get_arena_mixture_dataset", lambda *_, **__: (source, [])
@@ -78,6 +79,7 @@ def test_arena_training_preserves_rows_and_cycles_tail(batch_size, monkeypatch):
 
         def train(self, **kwargs):
             assert kwargs["dynamic_filter_fn"] == config.should_accept_fn
+            assert kwargs["dynamic_filter_kwargs"] == config.should_accept_kwargs
             assert (
                 kwargs["workflow_kwargs"]["experiment_name"]
                 == "arena-test-experiment-arena-test-trial"
