@@ -696,6 +696,9 @@ class TestEndSessionInteractionCount:
         [
             ("local_context", True),
             ("backend_context", True),
+            ("backend_multimodal_context", True),
+            ("backend_multimodal_500", False),
+            ("backend_multimodal_other_400", False),
             ("backend_other_400", False),
             ("backend_500", False),
         ],
@@ -709,6 +712,14 @@ class TestEndSessionInteractionCount:
             "207963 tokens from the input messages and 54189 tokens for the "
             "completion."
         )
+        if failure in ("backend_multimodal_context", "backend_multimodal_500"):
+            message = (
+                "Multimodal prompt is too long after expanding multimodal tokens. "
+                "After expanding len(req.origin_input_ids_unpadded)=131070 "
+                "=> 131070 >= 131066."
+            )
+        elif failure == "backend_multimodal_other_400":
+            message = "Multimodal image decoding failed"
 
         async def fail_create(*, areal_cache, **_kwargs):
             del areal_cache
@@ -724,7 +735,9 @@ class TestEndSessionInteractionCount:
                     real_url="http://backend.invalid/generate"
                 ),
                 history=(),
-                status=500 if failure == "backend_500" else 400,
+                status=(
+                    500 if failure in ("backend_500", "backend_multimodal_500") else 400
+                ),
                 message="Bad Request. Response body: "
                 + json.dumps({"error": {"message": backend_message}}),
             )
