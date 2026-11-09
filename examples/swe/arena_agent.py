@@ -35,6 +35,10 @@ from examples.swe.arena_reward_breakdown import arena_reward_metrics
 from examples.swe.arena_reward_mapping import load_harness_mapping, load_reward_mapping
 from examples.swe.arena_types import ArenaRewardRefConfig, ArenaStreamConfig
 
+from areal.experimental.openai.proxy.session_trace import (
+    RL_SESSION_TRACE_PHASE_PATHNAME,
+    RL_SESSION_TRACE_TASK_PATHNAME,
+)
 from areal.experimental.openai.proxy.workflow import HARNESS_OUTCOME_METRIC_CODES
 from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.infra import workflow_context
@@ -507,6 +511,81 @@ class _ArenaTaskWaitTimeout(TimeoutError):
 
 class ArenaStreamAgentWorkflow:
     """Launch an Arena online task and use its returned reward for RL."""
+
+    async def _publish_arena_trace(
+        self,
+        task_id: str,
+        proxy_base_url: str,
+        proxy_api_key: str,
+        client: httpx.AsyncClient,
+    ) -> None:
+        """Publish only Arena reward intervals with explicit event timestamps."""
+        try:
+            trace = await self.client.get_task_trace_async(task_id, client=client)
+            attempt_id = self.client.latest_attempt_id(trace)
+            if attempt_id is not None:
+                response = await client.post(
+                    f"{proxy_base_url.rstrip('/')}/{RL_SESSION_TRACE_TASK_PATHNAME}",
+                    json={"task_id": task_id, "attempt_id": attempt_id},
+                    headers={"Authorization": f"Bearer {proxy_api_key}"},
+                    timeout=5.0,
+                )
+                response.raise_for_status()
+            for interval in self.client.reward_phase_intervals(trace):
+                response = await client.post(
+                    f"{proxy_base_url.rstrip('/')}/{RL_SESSION_TRACE_PHASE_PATHNAME}",
+                    json=interval,
+                    headers={"Authorization": f"Bearer {proxy_api_key}"},
+                    timeout=5.0,
+                )
+                response.raise_for_status()
+        except Exception:
+            # Tracing must never change the task outcome. The unknown time is
+            # assigned to other by the controller.
+            logger.debug(
+                "Arena reward trace unavailable for task_id=%s", task_id, exc_info=True
+            )
+
+    async def _monitor_arena_trace(
+        self,
+        task_id: str,
+        proxy_base_url: str,
+        proxy_api_key: str,
+        client: httpx.AsyncClient,
+        interval_seconds: float,
+    ) -> None:
+        while not await self._bind_arena_task(
+            task_id, proxy_base_url, proxy_api_key, client
+        ):
+            await asyncio.sleep(interval_seconds)
+        while True:
+            await self._publish_arena_trace(
+                task_id, proxy_base_url, proxy_api_key, client
+            )
+            await asyncio.sleep(interval_seconds)
+
+    async def _bind_arena_task(
+        self,
+        task_id: str,
+        proxy_base_url: str,
+        proxy_api_key: str,
+        client: httpx.AsyncClient,
+    ) -> bool:
+        task_url = f"{proxy_base_url.rstrip('/')}/{RL_SESSION_TRACE_TASK_PATHNAME}"
+        try:
+            response = await client.post(
+                task_url,
+                json={"task_id": task_id},
+                headers={"Authorization": f"Bearer {proxy_api_key}"},
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            return True
+        except Exception:
+            logger.debug(
+                "Arena task trace binding unavailable: %s", task_id, exc_info=True
+            )
+            return False
 
     _SYSTEM_FAILURE_STATUSES = ArenaOpenAPIClient.FAILED_TASK_STATUSES - {
         "HARNESS_FAILED",
@@ -1847,6 +1926,11 @@ class ArenaStreamAgentWorkflow:
         ).strip()
         proxy_session_token = str(extra_kwargs.get("proxy_session_token") or "").strip()
         worker_runtime = extra_kwargs.get("worker_runtime")
+        agent_config = getattr(getattr(worker_runtime, "config", None), "agent", None)
+        rollout_trace_config = getattr(agent_config, "rollout_trace", None)
+        rollout_trace_enabled = bool(
+            rollout_trace_config is not None and rollout_trace_config.enabled
+        )
         get_version = getattr(worker_runtime, "get_version", None)
         # Snapshot the rollout weight version before asynchronous setup can advance
         # it. Arena's metadata values must be strings.
@@ -1893,13 +1977,24 @@ class ArenaStreamAgentWorkflow:
         client = arena_http_client or httpx.AsyncClient(timeout=self.timeout)
         launch_recorded = False
         launched_task_id: str | None = None
+        trace_monitor_task: asyncio.Task[None] | None = None
 
         def record_launch_success(task_id: str | None) -> None:
-            nonlocal launch_recorded, launched_task_id
+            nonlocal launch_recorded, launched_task_id, trace_monitor_task
             launched_task_id = task_id
             if not launch_recorded:
                 _record_arena_metrics(**{"arena/launch_success": 1.0})
                 launch_recorded = True
+            if rollout_trace_enabled and task_id and trace_monitor_task is None:
+                trace_monitor_task = asyncio.create_task(
+                    self._monitor_arena_trace(
+                        task_id,
+                        str(proxy_base_url),
+                        str(proxy_api_key),
+                        client,
+                        rollout_trace_config.collect_interval_seconds,
+                    )
+                )
 
         async def audit_incomplete_task(status: str) -> None:
             if not launched_task_id:
@@ -2199,6 +2294,26 @@ class ArenaStreamAgentWorkflow:
             _record_arena_metrics(**{"arena/terminal_success": 1.0})
             _record_arena_metrics(**{"arena/call_success": 1.0})
         finally:
+            if trace_monitor_task is not None:
+                trace_monitor_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    try:
+                        await trace_monitor_task
+                    except Exception:
+                        logger.debug("Arena trace monitor stopped", exc_info=True)
+            if rollout_trace_enabled and launched_task_id:
+                await self._bind_arena_task(
+                    launched_task_id,
+                    str(proxy_base_url),
+                    str(proxy_api_key),
+                    client,
+                )
+                await self._publish_arena_trace(
+                    launched_task_id,
+                    str(proxy_base_url),
+                    str(proxy_api_key),
+                    client,
+                )
             if registration_keepalive is not None:
                 # Stop renewal/restoration before DELETE, including cancellation,
                 # so the background task cannot resurrect a finished route.
