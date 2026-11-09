@@ -8,6 +8,7 @@ import time
 import uuid
 
 import pytest
+from omegaconf import OmegaConf
 
 from tests.utils import get_dataset_path, get_model_path
 
@@ -67,8 +68,12 @@ async def run_example(
         # Read output by line
         while True:
             try:
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=0.1)
-                line = line.decode().rstrip()
+                raw_line = await asyncio.wait_for(
+                    process.stdout.readline(), timeout=0.1
+                )
+                if not raw_line:
+                    break
+                line = raw_line.decode().rstrip()
                 # Skip empty lines (e.g., from tqdm progress bar cleanup)
                 if line:
                     logger.info(f"[Example Output] {line}")
@@ -486,6 +491,87 @@ def test_gsm8k_grpo_awex_colocate(tmp_path_factory, monkeypatch):
         timeout=900,
     )
     assert success, "GSM8K GRPO AWEX colocated example failed"
+
+
+@pytest.mark.sglang
+@pytest.mark.multi_gpu
+def test_gsm8k_grpo_awex_v2_colocate_20_steps(tmp_path_factory, monkeypatch):
+    """Run 20 v2 train-and-transfer steps with actor and rollout sharing GPUs."""
+    experiments_path = tmp_path_factory.mktemp("experiments")
+    name_resolve_path = tmp_path_factory.mktemp("name_resolve")
+    cache_path = tmp_path_factory.mktemp("cache")
+    model_path = get_model_path(
+        os.environ.get("AREAL_TEST_QWEN3_MODEL_PATH", ""), "Qwen/Qwen3-0.6B"
+    )
+    dataset_path = get_dataset_path(
+        os.environ.get("AREAL_TEST_GSM8K_PATH", ""), "openai/gsm8k"
+    )
+
+    config = OmegaConf.load("examples/math/gsm8k_grpo.yaml")
+    config.actor.scheduling_spec[0].env_vars.update(
+        {
+            "TORCHINDUCTOR_CACHE_DIR": str(cache_path / "torchinductor"),
+            "TRITON_CACHE_DIR": str(cache_path / "triton"),
+            "PYTORCH_KERNEL_CACHE_PATH": str(cache_path / "torch-kernels"),
+            "VLLM_CACHE_ROOT": str(cache_path / "vllm"),
+        }
+    )
+    config.rollout.scheduling_spec = OmegaConf.to_container(
+        config.actor.scheduling_spec, resolve=True
+    )
+    config.rollout.scheduling_spec[0].env_vars.update(
+        {
+            "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+        }
+    )
+    config_path = experiments_path / "config.yaml"
+    OmegaConf.save(config, config_path)
+
+    monkeypatch.setenv("AREAL_ALLOW_DEFAULT_ADMIN_KEY", "1")
+
+    success = run_async_task(
+        run_example,
+        "examples/math/gsm8k_rl.py",
+        str(config_path),
+        "+total_train_steps=20",
+        "rollout.backend=sglang:d1t2p1",
+        "actor.backend=megatron:d2",
+        "actor.weight_update_mode=awex",
+        "+actor._version=v2",
+        "+rollout._version=v2",
+        "+actor.scheduling_strategy.type=colocation",
+        "+actor.scheduling_strategy.target=rollout",
+        "ref=null",
+        "gconfig.n_samples=2",
+        "gconfig.max_new_tokens=128",
+        "gconfig.max_tokens=1024",
+        "rollout.max_concurrent_rollouts=8",
+        "+rollout.setup_timeout=900",
+        "sglang.context_length=2048",
+        "sglang.mem_fraction_static=0.3",
+        "+sglang.enable_memory_saver=True",
+        "+sglang.disable_cuda_graph=True",
+        "actor.mb_spec.max_tokens_per_mb=1024",
+        "train_dataset.batch_size=2",
+        "train_dataset.num_workers=0",
+        "valid_dataset.batch_size=2",
+        "valid_dataset.num_workers=0",
+        f"train_dataset.path={dataset_path}",
+        f"valid_dataset.path={dataset_path}",
+        "cluster.n_gpus_per_node=2",
+        f"cluster.fileroot={str(experiments_path)}",
+        f"cluster.name_resolve.nfs_record_root={str(name_resolve_path)}",
+        f"actor.path={model_path}",
+        "scheduler.type=local",
+        "saver.freq_epochs=null",
+        "recover.freq_epochs=null",
+        "recover.freq_secs=null",
+        "evaluator.freq_epochs=null",
+        timeout=3600,
+        success_pattern=re.compile(r"Train step 20/\d+ done\."),
+    )
+    assert success, "GSM8K GRPO v2 AWEX colocated 20-step example failed"
 
 
 @pytest.mark.ci

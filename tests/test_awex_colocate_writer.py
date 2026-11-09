@@ -18,11 +18,16 @@ pytestmark = pytest.mark.skipif(
     "completion",
     [True, {"ok": False, "error": "reader failed"}, TimeoutError("reader timeout")],
 )
-def test_colocate_export_lifetime_follows_reader_ack(monkeypatch, completion):
+@pytest.mark.parametrize("colocate_v2", [False, True])
+def test_colocate_export_lifetime_follows_reader_ack(
+    monkeypatch, completion, colocate_v2
+):
     """Free packed GPU storage before write_finished only after a successful ACK."""
     model = torch.nn.Linear(8, 8, bias=False, device="cuda")
     engine = SimpleNamespace(model=[model], cpu_group=object())
-    residency = SimpleNamespace(release_memory=lambda tags: None)
+    residency = SimpleNamespace(
+        release_memory=lambda tags: None, is_released=lambda tag: False
+    )
     publisher = AwexMegatronAdapter(engine, residency=residency)
     publisher._legacy_ip_address = "127.0.0.1"
     publisher._legacy_physical_gpu_id = 0
@@ -30,6 +35,12 @@ def test_colocate_export_lifetime_follows_reader_ack(monkeypatch, completion):
     publisher._legacy_num_infer_engines = 1
     publisher._legacy_timeout_s = 1
     publisher._rank_info = SimpleNamespace()
+    publisher._colocate_init_fingerprint = ("test",)
+    update = (
+        publisher.execute_colocate_weight_update
+        if colocate_v2
+        else publisher.execute_legacy_colocate_weight_update
+    )
     publisher._prepare_residency_for_publish = lambda: None
     publisher._lazy_initialize_legacy_colocate = lambda: None
     publisher.get_local_shard_parameters = lambda: {
@@ -72,11 +83,21 @@ def test_colocate_export_lifetime_follows_reader_ack(monkeypatch, completion):
     monkeypatch.setattr(megatron_adapter, "cuda_ipc_serialize", serialize)
     monkeypatch.setattr(megatron_adapter.dist, "get_rank", lambda group=None: 0)
     monkeypatch.setattr(megatron_adapter.dist, "barrier", lambda group: None)
+    monkeypatch.setattr(megatron_adapter.dist, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(
+        megatron_adapter.dist, "get_global_rank", lambda group, rank: rank
+    )
+    monkeypatch.setattr(
+        megatron_adapter.dist, "broadcast_object_list", lambda status, src, group: None
+    )
 
     if completion is True:
         for version in range(3):
-            publisher.execute_legacy_colocate_weight_update(version)
-            publisher.finish_legacy_colocate_weight_update(training_world_size=1)
+            update(version)
+            if colocate_v2:
+                publisher.finish_colocate_weight_update(training_world_size=1)
+            else:
+                publisher.finish_legacy_colocate_weight_update(training_world_size=1)
         assert signals.count("finished_weights_update_engines") == 3
     else:
         error_type = TimeoutError if isinstance(completion, Exception) else RuntimeError
@@ -84,7 +105,14 @@ def test_colocate_export_lifetime_follows_reader_ack(monkeypatch, completion):
             "reader timeout" if isinstance(completion, Exception) else "reader failed"
         )
         with pytest.raises(error_type, match=error_text):
-            publisher.execute_legacy_colocate_weight_update(0)
+            update(0)
         assert publisher._pending_ipc_export is not None
         assert all(ref() is not None for ref in exports)
         assert not any(key.startswith("write_finished") for key in signals)
+
+        with pytest.raises(RuntimeError, match="awaiting reader acknowledgement"):
+            update(1)
+        with pytest.raises(RuntimeError, match="awaits reader acknowledgement"):
+            publisher.teardown_colocate_weight_update()
+        assert publisher._pending_ipc_export is not None
+        assert all(ref() is not None for ref in exports)
