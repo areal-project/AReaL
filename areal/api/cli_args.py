@@ -2972,6 +2972,61 @@ class PRMConfig:
 
 
 @dataclass
+class RolloutTraceConfig:
+    """Opt-in v1 proxy session timing and rollout progress reporting."""
+
+    enabled: bool = field(
+        default=False,
+        metadata={"help": "Track v1 agent sessions for rollout timing and live logs."},
+    )
+    collect_interval_seconds: float = field(
+        default=60.0,
+        metadata={"help": "Seconds between controller reads of proxy timing events."},
+    )
+    log_interval_seconds: float = field(
+        default=600.0,
+        metadata={"help": "Seconds between rollout trace snapshots in main.log."},
+    )
+    # The pinned OmegaConf version rejects Literal in structured configs.
+    log_mode: str = field(
+        default="long_tail",
+        metadata={
+            "help": "Use the existing long-tail log or AReaL-only session progress snapshots."
+        },
+    )
+    long_tail_seconds: float = field(
+        default=300.0,
+        metadata={"help": "Minimum active age for long_tail mode, in seconds."},
+    )
+    top_n: int = field(
+        default=20,
+        metadata={"help": "Maximum session details in each main.log snapshot."},
+    )
+    show_all_sessions: bool = field(
+        default=False,
+        metadata={"help": "Show every running session in progress mode."},
+    )
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.collect_interval_seconds)
+            or self.collect_interval_seconds <= 0
+        ):
+            raise ValueError("rollout_trace.collect_interval_seconds must be positive")
+        if (
+            not math.isfinite(self.log_interval_seconds)
+            or self.log_interval_seconds <= 0
+        ):
+            raise ValueError("rollout_trace.log_interval_seconds must be positive")
+        if not math.isfinite(self.long_tail_seconds) or self.long_tail_seconds < 0:
+            raise ValueError("rollout_trace.long_tail_seconds must be non-negative")
+        if self.log_mode not in {"long_tail", "progress"}:
+            raise ValueError("rollout_trace.log_mode must be long_tail or progress")
+        if self.top_n < 1:
+            raise ValueError("rollout_trace.top_n must be positive")
+
+
+@dataclass
 class AgentConfig:
     """Configuration for agent workflows and the experimental agent service controller.
 
@@ -3136,6 +3191,10 @@ class AgentConfig:
             "help": "Process-reward shaping applied by the v1 or v2 proxy on concat "
             "trajectory export, before interactions are serialized."
         },
+    )
+    rollout_trace: RolloutTraceConfig = field(
+        default_factory=RolloutTraceConfig,
+        metadata={"help": "Optional v1 session timing and long-tail reporting."},
     )
 
     def __post_init__(self) -> None:
