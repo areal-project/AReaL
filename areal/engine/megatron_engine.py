@@ -3781,6 +3781,12 @@ class MegatronEngine(TrainEngine):
                     base_model_name_or_path=base_model_path or self.config.path,
                 )
             else:
+                if self._mtp_head_dropped and os.path.realpath(
+                    path
+                ) == os.path.realpath(self.bridge.hf_pretrained.state.source.path):
+                    raise ValueError(
+                        "HF export must not overwrite the frozen MTP source directory"
+                    )
                 # When the MTP head was dropped (enable_mtp=False), the export
                 # yields no mtp.* tensors and strict=True would silently skip
                 # every source shard containing an MTP key -- discarding the
@@ -3854,9 +3860,19 @@ class MegatronEngine(TrainEngine):
                 tokenizer.save_pretrained(path)
             if processor is not None:
                 processor.save_pretrained(path)
-            if self._mtp_head_dropped:
-                self._scrub_mtp_from_saved_config(path)
-                self._rebuild_index_from_saved_shards(path)
+            if self._mtp_head_dropped and not self.config.use_lora:
+                from areal.utils.mtp_checkpoint import restore_frozen_mtp_weights
+
+                restored = False
+                if self.bridge_cls == "megatron-bridge":
+                    # The bridge resolves Hub IDs to the actual local weights.
+                    # base_model_path controls exported assets, not provenance.
+                    restored = restore_frozen_mtp_weights(
+                        str(self.bridge.hf_pretrained.state.source.path), path
+                    )
+                if not restored:
+                    self._scrub_mtp_from_saved_config(path)
+                    self._rebuild_index_from_saved_shards(path)
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
