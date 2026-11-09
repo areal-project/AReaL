@@ -11,6 +11,7 @@ import pytest
 import torch
 from flask.testing import FlaskClient
 
+from areal.api.cli_args import PPOConfig
 from areal.infra.controller.train_controller import TrainController
 from areal.infra.rpc import rtensor as rt
 from areal.infra.rpc.guard import engine_blueprint as eb
@@ -133,7 +134,7 @@ def test_ppo_evaluation_repeated_rounds_release_only_owned_shards(
     baseline = rt.storage_stats()
     trainer = PPOTrainer.__new__(PPOTrainer)
     trainer.actor = _controller(monkeypatch)
-    trainer.config = SimpleNamespace(eval_gconfig=SimpleNamespace(n_samples=1))
+    trainer.config = PPOConfig()
     trainer.valid_dataloader = [[{}] * 4, [{}] * 2]
     trainer.eval_rollout = _EvalRollout(rpc_storage)
 
@@ -151,6 +152,7 @@ def test_ppo_evaluation_empty_loader_does_not_wait(
     trainer = PPOTrainer.__new__(PPOTrainer)
     trainer.actor = Mock()
     trainer.actor.is_data_parallel_head.return_value = True
+    trainer.config = PPOConfig()
     trainer.valid_dataloader = []
     trainer.eval_rollout = Mock()
 
@@ -171,7 +173,7 @@ def test_ppo_evaluation_spmd_uses_local_results_without_remote_cleanup(
     trainer = PPOTrainer.__new__(PPOTrainer)
     trainer.actor = Mock()
     trainer.actor.is_data_parallel_head.return_value = True
-    trainer.config = SimpleNamespace(eval_gconfig=SimpleNamespace(n_samples=1))
+    trainer.config = PPOConfig()
     trainer.valid_dataloader = [[{}]]
     trainer.eval_rollout = Mock()
     trainer.eval_rollout.wait.return_value = [_trajectory()]
