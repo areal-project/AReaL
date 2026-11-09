@@ -444,7 +444,7 @@ class PPOActor:
     ) -> None:
         batched, meta = concat_batch(data)
         self._ppo_update(batched, meta, max_head_offpolicyness=max_head_offpolicyness)
-        log_arena_stream_training_counts(meta)
+        log_arena_stream_training_counts(meta, batched["loss_mask"])
 
     def _ppo_update(
         self,
