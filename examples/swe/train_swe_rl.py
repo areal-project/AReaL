@@ -28,7 +28,9 @@ from examples.swe.arena_reward_mapping import (
 from examples.swe.utils import ArenaRewardRefConfig, ArenaStreamConfig, SWEPPOConfig
 
 from areal.api.cli_args import load_expr_config
+from areal.dataset.stream import StreamDataset
 from areal.utils import logging
+from areal.utils.environ import is_single_controller
 
 logger = logging.getLogger("SWETrain")
 
@@ -338,6 +340,17 @@ def main(args):
             econfig, size_multiple=config.train_dataset.batch_size
         )
         valid_dataset = train_dataset
+        if (
+            len(resolved_streams) > 1
+            and config.rollout._version == "v1"
+            and is_single_controller()
+        ):
+            train_dataset = StreamDataset(train_dataset, stream_key="arena_stream_name")
+        elif len(resolved_streams) > 1:
+            logger.warning(
+                "Per-stream rejection compensation requires the v1 single-controller "
+                "rollout path; using the ordinary mixture dataloader."
+            )
         econfig.arena_streams = resolved_streams
         econfig.arena_streams_yaml_b64 = ""
         econfig.arena_streams_file = ""

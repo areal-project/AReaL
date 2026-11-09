@@ -83,10 +83,41 @@ Workers source the file again, so remove unrelated deployment settings from it.
 For one Stream, set `ARENA_STREAM_ID`. For multiple Streams, edit the literal
 `econfig.arena_streams` entries in `arena_multi_stream.yaml` and select that config. Pin
 each Stream's actual Harness and reward key/version. Every group of `n_samples` uses one
-Stream. The default epoch interleaves all source rows without replacement; a positive
+Stream. The base mixture interleaves all source rows; a positive
 `arena_mixture_epoch_size` selects a weighted subset, must not exceed the union, and
-must be divisible by the training batch size. Rejection can change the mixture that
-actually reaches training.
+must be divisible by the training batch size.
+
+Multi-Stream training with the v1 single-controller rollout path automatically
+compensates for rejected rollout groups at dispatch time. Each rejected group creates
+one replacement debt in its Stream. The controller prioritizes the largest unreserved
+debt, draws the next prompt from that Stream, and reserves the debt while the
+replacement is queued or running. Successful replacements settle debt; rejected
+replacements release the reservation for another attempt. Worker failures and timeouts
+use the same replacement policy. For example, three rejected groups from A and one from
+B trigger three A replacements and one B replacement, without advancing the base mixture
+schedule for those extra draws.
+
+After at most `train_dataset.batch_size` consecutive replacements, the controller admits
+one normal base draw. This keeps healthy Streams reachable when another Stream
+continually rejects. All unpaid debt is retained, and this dispatch counter persists
+across training batches and checkpoints; it does not constrain training batch contents.
+
+Base and replacement draws share an independent cursor per Stream. Exhausted Streams
+cycle and reshuffle if `train_dataset.shuffle` is enabled. With replacements, a nominal
+epoch may therefore revisit prompts; its configured training-step count and base Stream
+proportions remain unchanged. The policy compensates the existing mixture, including
+dataset sizes and `sampling_weight`; it does not redefine these weights as strict
+per-batch quotas. Accepted results still enter training in arrival order (or the
+configured deterministic order), so a fast Stream need not wait for a slow one and
+individual batches may have different proportions.
+
+Stream cursors, base schedule position, and unpaid debt are saved in the dataloader
+checkpoint. Reservations are released on recovery because queued/running tasks are not
+restored. As with existing asynchronous recovery, completed but unconsumed trajectories
+are not replayed. Checkpoints from the old flat dataloader are not compatible with the
+new Stream loader: start a new run or resume with the original unwrapped dataset. V2,
+SPMD, single-Stream training, and validation retain their ordinary dataloaders and do
+not enable this compensation.
 
 Before submission, extract the Stream list and validate it without launching tasks:
 
