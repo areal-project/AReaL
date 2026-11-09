@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import Mock
 
 import pytest
 
@@ -97,14 +99,60 @@ def test_repeated_start_needs_no_writes_or_lock(runtime, monkeypatch):
     assert all(path.stat().st_mtime_ns == value for path, value in mtimes.items())
 
 
-def test_unknown_runtime_rejects_entire_patch_set_before_writing(runtime):
-    _, model, before, _ = runtime
-    last = list(before)[-1]
-    last.write_bytes(before[last] + b"\n# unverified fork\n")
-    before[last] = last.read_bytes()
-    with pytest.raises(RuntimeError, match="Unknown SGLang"):
-        startup.apply_model_patches(["--model", str(model)])
+@pytest.mark.parametrize("mtp_on", [True, False])
+@pytest.mark.parametrize(
+    "layout", ["missing-first", "missing-req-types", "unknown-last"]
+)
+def test_unsupported_runtime_starts_without_partial_patches(
+    runtime, monkeypatch, mtp_on, layout
+):
+    from areal.utils import logging
+
+    root, model, before, _ = runtime
+    if layout == "unknown-last":
+        target = list(before)[-1]
+        target.write_bytes(before[target] + b"\n# unverified fork\n")
+        before[target] = target.read_bytes()
+        reason = "unrecognized source fingerprint"
+    else:
+        target = (
+            next(iter(before))
+            if layout == "missing-first"
+            else root / "srt/managers/req_types.py"
+        )
+        target.unlink()
+        del before[target]
+        reason = "missing"
+
+    logger = Mock()
+    monkeypatch.setattr(logging, "getLogger", lambda *args: logger)
+    monkeypatch.setattr(
+        startup,
+        "install_source_patches",
+        lambda *args, **kwargs: pytest.fail("installed"),
+    )
+    args = ["--model-path", str(model)]
+    if mtp_on:
+        args += ["--speculative-algorithm", "EAGLE"]
+    monkeypatch.setattr(
+        sys, "argv", ["bootstrap", "--entrypoint", "sglang.launch_server", "--", *args]
+    )
+    executions = []
+    monkeypatch.setattr(startup.os, "execv", lambda *args: executions.append(args))
+
+    startup.main()
+
+    assert executions == [
+        (sys.executable, [sys.executable, "-m", "sglang.launch_server", *args])
+    ]
     assert all(path.read_bytes() == content for path, content in before.items())
+    assert not (root / ".areal-sglang-patches.lock").exists()
+    if layout != "unknown-last":
+        assert not target.exists()
+    logger.warning.assert_called_once()
+    assert "Skipping optional" in logger.warning.call_args.args[0]
+    assert reason in logger.warning.call_args.args[1]
+    logger.info.assert_not_called()
 
 
 def test_concurrent_matching_starts_install_one_consistent_patch_set(runtime):

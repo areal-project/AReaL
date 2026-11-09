@@ -2,6 +2,7 @@
 """Apply validated model-specific patches before starting an SGLang server."""
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -153,6 +154,40 @@ def _qwen38_patch_targets(root: Path) -> list[tuple[Path, Callable[[bytes], byte
     ]
 
 
+def _apply_qwen38_runtime_patches(root: Path) -> None:
+    from areal.utils import logging
+
+    logger = logging.getLogger("SGLangWrapper")
+    # These optional fixes target a validated SGLang fork. The repository's
+    # pinned release has a different layout (e.g. no managers/req_types.py).
+    # Check the entire set before invoking the strict installer so ordinary
+    # release installations still start, without applying a partial patch.
+    for relative, expected, patched, _ in _QWEN38_PATCHES:
+        target = root / relative
+        if not target.is_file():
+            reason = f"missing {relative}"
+        elif hashlib.sha256(target.read_bytes()).hexdigest() not in (expected, patched):
+            reason = f"unrecognized source fingerprint for {relative}"
+        else:
+            continue
+        logger.warning(
+            "Skipping optional Qwen3.8-27B runtime patches: %s. "
+            "Continuing SGLang startup without installing the mRoPE copy and "
+            "external-abort completion fixes; this runtime has not been validated.",
+            reason,
+        )
+        return
+
+    install_source_patches(
+        _qwen38_patch_targets(root),
+        lock_path=root / ".areal-sglang-patches.lock",
+    )
+    logger.info(
+        "Qwen3.8-27B runtime patches verified: nonblocking speculative "
+        "mRoPE copies and external-abort completion handling."
+    )
+
+
 def wrap_server_command(command: list[str]) -> list[str]:
     """Run preparation in the server's interpreter, preserving its chosen entry."""
     if len(command) < 3 or command[1] != "-m" or command[2] not in _ENTRYPOINTS:
@@ -203,17 +238,7 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
     from areal.engine import sglang_qwen_vl_cpu
 
     if _matches_qwen38_27b(config):
-        root = installed_sglang_root()
-        install_source_patches(
-            _qwen38_patch_targets(root),
-            lock_path=root / ".areal-sglang-patches.lock",
-        )
-        from areal.utils import logging
-
-        logging.getLogger("SGLangWrapper").info(
-            "Qwen3.8-27B runtime patches verified: nonblocking speculative "
-            "mRoPE copies and external-abort completion handling."
-        )
+        _apply_qwen38_runtime_patches(installed_sglang_root())
 
     if config.get("model_type") in sglang_qwen_vl_cpu.MODEL_TYPES:
         # Let existing SGLang installations and third-party processors run
