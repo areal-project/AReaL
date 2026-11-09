@@ -1,4 +1,4 @@
-"""Pixel image/video rollouts with persistent thinking and official visual tools."""
+"""Multi-turn Pixel visual-tool episodes for GRPO training."""
 
 import asyncio
 import itertools
@@ -6,21 +6,30 @@ import json
 import math
 import re
 import subprocess
-import time
+import tempfile
 import unicodedata
-import uuid
 from pathlib import Path
 from typing import Any
 
+import torch
 from PIL import Image
+from transformers import AutoProcessor
 
+from areal import workflow_context
 from areal.api.cli_args import GenerationHyperparameters
 from areal.api.io_struct import ModelRequest
+from areal.api.reward_api import AsyncRewardWrapper
 from areal.api.workflow_api import RolloutWorkflow
-from areal.utils import logging, stats_tracker
+from areal.experimental.openai.client import _process_multimodal_prompt
+from areal.experimental.openai.types import InteractionWithTokenLogpReward
+from areal.utils import stats_tracker
 from areal.utils.image import image2base64
+from areal.utils.qwen_vl_image import (
+    prepare_sglang_qwen_images,
+    sglang_qwen_image_kwargs,
+)
+from areal.utils.sglang_image import image_prompt_metadata
 
-logger = logging.getLogger("PixelReasonerWorkflow")
 SYSTEM = r"""Inspect the images and answer the question. You may use
 crop_image_normalized with bbox_2d=[x1,y1,x2,y2] in [0,1] and target_image
 (a 1-based image index). Returned crops receive new image indices and may
@@ -234,7 +243,7 @@ def boxed_answer(text: str) -> str | None:
 
 
 def verify(content: str, answers: list[str]) -> dict:
-    """Conservative final-label matching; mismatches require review, not rejection."""
+    """Normalized boxed-answer exact match for a single reference label."""
     prediction = boxed_answer(content)
     if prediction is None or len(answers) != 1:
         return {"status": "needs_review", "prediction": prediction}
@@ -252,253 +261,307 @@ def verify(content: str, answers: list[str]) -> dict:
     }
 
 
+def pixel_reward_fn(completions: str, answer: list[str]) -> float:
+    """Example outcome reward, without Pixel's curiosity/exploration bonuses."""
+    return float(verify(completions, answer)["status"] == "matched")
+
+
 class PixelReasonerWorkflow(RolloutWorkflow):
-    """Collect traces only; return None rather than training tensors."""
+    """One independent training row per turn, one logical rollout per episode.
+
+    Re-rendered history need not preserve the sampled token prefix. Earlier
+    responses are masked as context in later rows; their actions are trained
+    exactly once in the row that generated them.
+    """
 
     def __init__(
         self,
-        processor,
+        processor: Any,
         gconfig: GenerationHyperparameters,
         data_root: str,
-        dump_dir: str,
         max_turns: int | None = None,
-        max_output_tokens: int = 262144,
+        max_output_tokens: int | None = None,
         original_max_pixels: int = 1568000,
         crop_max_pixels: int = 784000,
+        video_temp_root: str | None = None,
     ):
+        if max_turns is not None and max_turns < 1:
+            raise ValueError("max_turns must be positive or null")
+        if max_output_tokens is not None and max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be positive or null")
+        if min(original_max_pixels, crop_max_pixels) < 1:
+            raise ValueError("Pixel limits must be positive")
+        if isinstance(processor, str):
+            processor = AutoProcessor.from_pretrained(processor)
         self.processor = processor
         self.tokenizer = processor.tokenizer
-        self.gconfig = gconfig
+        self.gconfig = gconfig.new_with_stop_and_pad_token_ids(self.tokenizer)
         self.data_root = Path(data_root).resolve()
-        self.dump_dir = Path(dump_dir)
         self.max_turns = max_turns
         self.max_output_tokens = max_output_tokens
         self.original_max_pixels = original_max_pixels
         self.crop_max_pixels = crop_max_pixels
-        if max_turns is not None and max_turns < 1:
-            raise ValueError("max_turns must be positive or null")
-        if min(max_output_tokens, original_max_pixels, crop_max_pixels) < 1:
-            raise ValueError("Budgets must be positive")
+        self.video_temp_root = video_temp_root
+        self.reward_fn = AsyncRewardWrapper(pixel_reward_fn)
 
     def prepare(self, messages: list[dict], images: list[Image.Image], video=None):
+        """Prepare exact actor tokens/features and separate native video wire IDs."""
+        template_kwargs = dict(enable_thinking=True, preserve_thinking=True)
         prompt = self.processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True,
-            preserve_thinking=True,
+            messages, tokenize=False, add_generation_prompt=True, **template_kwargs
         )
-        # Fail visibly if a different template silently drops thinking history.
         for message in messages:
             reasoning = message.get("reasoning_content", "").strip()
             if reasoning and reasoning not in prompt:
                 raise ValueError("Chat template removed reasoning_content")
-        video_kwargs = (
-            {}
-            if video is None
-            else {
-                "videos": [video["pixels"]],
-                "video_metadata": [video["metadata"]],
-                "do_sample_frames": False,
-            }
+        image_data = image2base64(images)
+        if video is None:
+            prepared = _process_multimodal_prompt(
+                self.processor,
+                self.tokenizer,
+                messages,
+                image_data,
+                None,
+                template_kwargs,
+                align_sglang_images=True,
+            )
+            return (
+                prepared.input_ids,
+                prepared.image_data or image_data,
+                prepared.mm_token_type_ids,
+                prepared.multi_modal_input,
+                None,
+            )
+
+        # Native video expands timestamps and frame tokens on the server. Keep
+        # its compact template separately; actor training needs the expanded IDs.
+        # The image-only explicit-spans transport cannot disambiguate video text.
+        visual_tokens = (
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
         )
-        inputs = self.processor(
-            text=[prompt],
-            images=images or None if video else images,
-            return_tensors="pt",
-            **video_kwargs,
-        )
-        expanded_ids = inputs["input_ids"][0].tolist()
-        # SGLang expands image placeholders itself. Sending the HF-expanded
-        # tokens makes one image look like hundreds of separate image inputs.
-        input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-        image_token = getattr(self.processor, "image_token", "<|image_pad|>")
-        image_id = self.tokenizer.convert_tokens_to_ids(image_token)
-        if input_ids.count(image_id) != len(images):
-            raise ValueError("Expected one image placeholder per supplied image")
-        if video is not None:
-            video_id = self.tokenizer.convert_tokens_to_ids(self.processor.video_token)
-            if input_ids.count(video_id) != 1:
+        for message in messages:
+            text = message.get("reasoning_content", "")
+            content = message.get("content", "")
+            text += (
+                content
+                if isinstance(content, str)
+                else "".join(part.get("text", "") for part in content)
+            )
+            if any(token in text for token in visual_tokens):
                 raise ValueError(
-                    "Expected one video placeholder for the supplied video"
+                    "Literal visual special tokens in video text are unsupported"
                 )
-        return input_ids, image2base64(images), expanded_ids
+        aligned = prepare_sglang_qwen_images(self.processor, images)
+        processed = self.processor(
+            text=[prompt],
+            images=(aligned[0] if aligned else images) or None,
+            videos=[video["pixels"]],
+            video_metadata=[video["metadata"]],
+            do_sample_frames=False,
+            padding=False,
+            return_tensors="pt",
+            **(
+                {"images_kwargs": sglang_qwen_image_kwargs(self.processor)}
+                if aligned
+                else {}
+            ),
+        )
+        input_ids = processed["input_ids"][0].tolist()
+        token_types = processed.get("mm_token_type_ids")
+        if token_types is None:
+            token_types = torch.tensor(
+                [
+                    [
+                        1
+                        if token == self.processor.image_token_id
+                        else 2
+                        if token == self.processor.video_token_id
+                        else 0
+                        for token in input_ids
+                    ]
+                ]
+            )
+        payload = {
+            key: processed[key].detach().cpu()
+            for key in (
+                "pixel_values",
+                "image_grid_thw",
+                "pixel_values_videos",
+                "video_grid_thw",
+            )
+            if key in processed
+        }
+        if not {"pixel_values_videos", "video_grid_thw"} <= payload.keys():
+            raise ValueError("Video processor must return pixels and video_grid_thw")
+        wire_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        if wire_ids.count(self.processor.video_token_id) != 1 or wire_ids.count(
+            self.processor.image_token_id
+        ) != len(images):
+            raise ValueError(
+                "Native video template must have one placeholder per visual input"
+            )
+        return input_ids, image_data, token_types[0].tolist(), payload, wire_ids
 
-    @staticmethod
-    def save(directory: Path, episode: dict):
-        temporary = directory / "episode.json.tmp"
-        temporary.write_text(json.dumps(episode, ensure_ascii=False) + "\n")
-        temporary.replace(directory / "episode.json")
+    async def load_image(self, name: str) -> Image.Image:
+        path = (self.data_root / name).resolve()
+        if not path.is_relative_to(self.data_root):
+            raise ValueError("Image path outside data_root")
 
-    async def arun_episode(self, engine, data: dict[str, Any]) -> None:
-        directory = self.dump_dir / uuid.uuid4().hex
-        await asyncio.to_thread(directory.mkdir, parents=True)
-        started = time.monotonic()
-        episode = {"source": data, "status": "running", "turns": [], "tools": []}
-        messages, originals, images = [], [], []
-        used = 0
-        video, video_frames = None, []
+        def load():
+            with Image.open(path) as image:
+                return image.convert("RGB")
+
+        return await asyncio.to_thread(load)
+
+    async def arun_episode(
+        self, engine, data: dict[str, Any]
+    ) -> dict[str, InteractionWithTokenLogpReward] | None:
+        if not data.get("is_video", False):
+            return await self._run_episode(engine, data, None)
+        # Temporary native-video files live through all awaited requests, then
+        # disappear. Training trajectories/checkpoints are owned by PPOTrainer.
+        if self.video_temp_root is not None:
+            await asyncio.to_thread(
+                Path(self.video_temp_root).mkdir, parents=True, exist_ok=True
+            )
+        directory = await asyncio.to_thread(
+            tempfile.TemporaryDirectory, dir=self.video_temp_root
+        )
         try:
-            if not data.get("image"):
-                raise ValueError("Task has no visual inputs")
-            content = [{"type": "text", "text": data["question"]}]
-            for name in data["image"]:
-                path = (self.data_root / name).resolve()
-                if not path.is_relative_to(self.data_root):
-                    raise ValueError("Image path outside data_root")
+            return await self._run_episode(engine, data, Path(directory.name))
+        finally:
+            await asyncio.to_thread(directory.cleanup)
 
-                def load(path=path):
-                    with Image.open(path) as image:
-                        return image.convert("RGB")
-
-                original = await asyncio.to_thread(load)
-                if data.get("is_video"):
-                    video_frames.append(original)
-                    continue
-                originals.append(original)
-                image = await asyncio.to_thread(
-                    bounded_image, original, self.original_max_pixels
+    async def _run_episode(self, engine, data: dict[str, Any], directory: Path | None):
+        if not data.get("image"):
+            raise ValueError("Task has no visual inputs")
+        originals = [await self.load_image(name) for name in data["image"]]
+        video_frames = originals if data.get("is_video", False) else []
+        video = None
+        images = []
+        content = [{"type": "text", "text": data["question"]}]
+        if video_frames:
+            assert directory is not None
+            video = await prepare_video_data(video_frames, directory / "video.mkv")
+            originals = []
+            content = [
+                {"type": "video", "video": str(directory / "video.mkv")},
+                {
+                    "type": "text",
+                    "text": data["question"]
+                    + f"\nThe original video contains {len(video_frames)} frames.",
+                },
+            ]
+        else:
+            for original in originals:
+                images.append(
+                    await asyncio.to_thread(
+                        bounded_image, original, self.original_max_pixels
+                    )
                 )
-                images.append(image)
-                relative = f"image-{len(images)}.png"
-                await asyncio.to_thread(image.save, directory / relative)
                 content.extend(
                     [
                         {"type": "text", "text": f"Image {len(images)}:"},
-                        {"type": "image", "image": relative},
+                        {"type": "image"},
                     ]
                 )
-            if video_frames:
-                video = await prepare_video_data(video_frames, directory / "video.mkv")
-                episode["video_transport"] = video["transport"]
-                content = [
-                    {"type": "video", "video": "video.mkv"},
-                    {
-                        "type": "text",
-                        "text": data["question"]
-                        + f"\nThe original video contains {len(video_frames)} frames.",
-                    },
-                ]
-            messages = [
-                {"role": "system", "content": VIDEO_SYSTEM if video else SYSTEM},
-                {"role": "user", "content": content},
-            ]
-            turns = (
-                itertools.count() if self.max_turns is None else range(self.max_turns)
+        messages = [
+            {"role": "system", "content": VIDEO_SYSTEM if video else SYSTEM},
+            {"role": "user", "content": content},
+        ]
+        interactions = {}
+        used = 0
+        reward = 0.0
+        truncated = True
+        turns = itertools.count() if self.max_turns is None else range(self.max_turns)
+        for turn in turns:
+            (
+                input_ids,
+                image_data,
+                token_types,
+                mm_input,
+                wire_ids,
+            ) = await asyncio.to_thread(self.prepare, messages, images, video)
+            budget = min(
+                self.gconfig.max_new_tokens,
+                self.gconfig.max_tokens - len(input_ids),
             )
-            for turn in turns:
-                input_ids, image_data, expanded_ids = await asyncio.to_thread(
-                    self.prepare, messages, images, video
+            if self.max_output_tokens is not None:
+                budget = min(budget, self.max_output_tokens - used)
+            if budget <= 0:
+                break
+            metadata = (
+                image_prompt_metadata(
+                    {}, input_ids, token_types, image_data, self.processor
                 )
-                budget = min(
-                    self.gconfig.max_new_tokens,
-                    self.max_output_tokens - used,
-                    self.gconfig.max_tokens - len(expanded_ids),
-                )
-                if budget <= 0:
-                    episode["status"] = "token_budget_exhausted"
-                    break
-                request = ModelRequest(
-                    input_ids=input_ids,
-                    image_data=image_data,
-                    video_data=[video["path"]] if video else None,
-                    processor=self.processor,
-                    tokenizer=self.tokenizer,
-                    gconfig=self.gconfig.new(max_new_tokens=budget, n_samples=1),
-                )
-                turn_record = {
-                    "input_ids": input_ids,
-                    "expanded_input_ids": expanded_ids,
-                    "prompt_tokens": len(expanded_ids),
-                    "prompt_tokens_source": "client_processor",
-                    "images": [f"image-{i + 1}.png" for i in range(len(images))],
-                    "max_new_tokens": budget,
+                if video is None
+                else {
+                    "sglang_video_input_ids": wire_ids,
+                    "sglang_video_prompt_length": len(input_ids),
                 }
-                if video:
-                    turn_record["video"] = "video.mkv"
-                episode["turns"].append(turn_record)
-                episode["messages"] = messages
-                await asyncio.to_thread(self.save, directory, episode)
-                response = await engine.agenerate(request)
-                raw = self.tokenizer.decode(
-                    response.output_tokens, skip_special_tokens=False
+            )
+            request = ModelRequest(
+                input_ids=input_ids,
+                image_data=image_data,
+                metadata=metadata,
+                video_data=[video["path"]] if video else None,
+                processor=self.processor,
+                tokenizer=self.tokenizer,
+                gconfig=self.gconfig.new(max_new_tokens=budget, n_samples=1),
+            )
+            response = await engine.agenerate(request)
+            if response.input_tokens != input_ids:
+                raise ValueError(
+                    "Rollout response does not preserve actor prompt tokens"
                 )
-                text = self.tokenizer.decode(
-                    response.output_tokens_without_stop, skip_special_tokens=False
+            if not response.output_tokens or response.stop_reason == "abort":
+                # Engine failures are not negative answer examples.
+                return None
+            if not (
+                response.output_len
+                == len(response.output_logprobs)
+                == len(response.output_versions)
+            ):
+                raise ValueError(
+                    "Sampled tokens, logprobs and weight versions must align"
                 )
-                reasoning, answer = split_reasoning(text)
-                used += response.output_len
-                turn_record.update(
-                    {
-                        "output_ids": response.output_tokens,
-                        "raw_text": raw,
-                        "reasoning_content": reasoning,
-                        "content": answer,
-                        "finish_reason": response.stop_reason,
-                        "latency": response.latency,
-                        "completion_tokens": response.output_len,
-                    }
-                )
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "reasoning_content": reasoning,
-                        "content": answer,
-                    }
-                )
-                # Checkpoint every response before executing its tool.
-                episode["messages"] = messages
-                await asyncio.to_thread(self.save, directory, episode)
-                if response.stop_reason != "stop":
-                    episode["status"] = "incomplete_generation"
+            interaction = InteractionWithTokenLogpReward(
+                model_response=response,
+                prompt_token_ids=input_ids,
+                mm_token_type_ids=token_types,
+                multi_modal_input=mm_input,
+                metadata={"pixel": {"is_video": video is not None, "turn": turn}},
+            )
+            interactions[request.rid] = interaction
+            used += response.output_len
+            text = self.tokenizer.decode(
+                response.output_tokens_without_stop, skip_special_tokens=False
+            )
+            reasoning, answer = split_reasoning(text)
+            messages.append(
+                {"role": "assistant", "reasoning_content": reasoning, "content": answer}
+            )
+            if response.stop_reason == "length":
+                break
+            try:
+                action = get_action(answer)
+                if action is None:
+                    truncated = False
+                    reward = await self.reward_fn(
+                        completions=answer, answer=data["answer"]
+                    )
                     break
-                try:
-                    action = get_action(answer)
-                    if action is None:
-                        episode["status"] = (
-                            "completed" if answer.strip() else "missing_final"
-                        )
-                        episode["final_content"] = answer
-                        episode["verification"] = verify(answer, data.get("answer", []))
-                        break
-                    arguments = action["arguments"]
-                    if action["name"] == "select_frames":
-                        if not video:
-                            raise ValueError("select_frames requires video input")
-                        selected = select_frames(
-                            video_frames, arguments.get("target_frames")
-                        )
-                        tool_started = time.monotonic()
-                        first_index = len(images) + 2
-                        feedback, files = [], []
-                        for original in selected:
-                            image = await asyncio.to_thread(
-                                bounded_image, original, self.crop_max_pixels
-                            )
-                            relative = f"image-{len(images) + 1}.png"
-                            await asyncio.to_thread(image.save, directory / relative)
-                            originals.append(original)
-                            images.append(image)
-                            files.append(relative)
-                            feedback.append({"type": "image", "image": relative})
-                        feedback.insert(
-                            0,
-                            {
-                                "type": "text",
-                                "text": f"Here are the selected frames (Numbered {first_index} to {len(images) + 1}):",
-                            },
-                        )
-                        episode["tools"].append(
-                            {
-                                "turn": turn,
-                                "action": action,
-                                "images": files,
-                                "frame_indices": arguments["target_frames"],
-                                "elapsed_seconds": time.monotonic() - tool_started,
-                            }
-                        )
-                        messages.append({"role": "user", "content": feedback})
-                        continue
+                arguments = action["arguments"]
+                if action["name"] == "select_frames":
+                    if not video:
+                        raise ValueError("select_frames requires video input")
+                    selected = select_frames(
+                        video_frames, arguments.get("target_frames")
+                    )
+                else:
                     index = arguments.get("target_image")
                     if not video and (
                         type(index) is not int or not 1 <= index <= len(originals)
@@ -506,64 +569,47 @@ class PixelReasonerWorkflow(RolloutWorkflow):
                         raise ValueError(
                             "target_image is outside available image indices"
                         )
-                    tool_started = time.monotonic()
-                    crop = await asyncio.to_thread(
-                        crop_image,
+                    original = (
                         video_crop_source(video_frames, originals, index)
                         if video
-                        else originals[index - 1],
-                        arguments,
+                        else originals[index - 1]
                     )
-                    crop = await asyncio.to_thread(
-                        bounded_image, crop, self.crop_max_pixels
-                    )
-                    relative = f"image-{len(images) + 1}.png"
-                    await asyncio.to_thread(crop.save, directory / relative)
-                    originals.append(crop)
-                    images.append(crop)
-                    episode["tools"].append(
-                        {
-                            "turn": turn,
-                            "action": action,
-                            "image": relative,
-                            "elapsed_seconds": time.monotonic() - tool_started,
-                        }
-                    )
-                    feedback = [
-                        {
-                            "type": "text",
-                            "text": f"Tool result: Image {len(images) + int(video is not None)}, cropped from Image {index}.",
-                        },
-                        {"type": "image", "image": relative},
+                    selected = [
+                        await asyncio.to_thread(crop_image, original, arguments)
                     ]
-                except (ValueError, KeyError, TypeError) as error:
-                    episode["tools"].append({"turn": turn, "error": str(error)})
-                    feedback = [{"type": "text", "text": f"Execution error: {error}"}]
-                messages.append({"role": "user", "content": feedback})
-            else:
-                episode["status"] = "turn_budget_exhausted"
-        except Exception as error:
-            episode.update(status="failed", error=f"{type(error).__name__}: {error}")
-            logger.exception("Pixel rollout failed: %s", directory)
-        finally:
-            episode.update(
-                messages=messages,
-                completion_tokens_sum=used,
-                prompt_tokens_sum=sum(t["prompt_tokens"] for t in episode["turns"]),
-                peak_context_tokens=max(
-                    (
-                        t["prompt_tokens"] + len(t.get("output_ids", []))
-                        for t in episode["turns"]
-                    ),
-                    default=0,
-                ),
-                successful_crops=sum("image" in tool for tool in episode["tools"]),
-                elapsed_seconds=time.monotonic() - started,
-            )
-            await asyncio.to_thread(self.save, directory, episode)
-            stats_tracker.get("pixel").scalar(
-                completed=int(episode["status"] == "completed"),
-                output_tokens=used,
-                rounds=len(episode["turns"]),
-            )
-        return None
+                feedback = []
+                for original in selected:
+                    image = await asyncio.to_thread(
+                        bounded_image, original, self.crop_max_pixels
+                    )
+                    originals.append(original)
+                    images.append(image)
+                    feedback.extend(
+                        [
+                            {
+                                "type": "text",
+                                "text": f"Tool result: Image {len(images) + int(video is not None)}.",
+                            },
+                            {"type": "image"},
+                        ]
+                    )
+            except (ValueError, KeyError, TypeError) as error:
+                feedback = [{"type": "text", "text": f"Execution error: {error}"}]
+            # A real tool response keeps the last user query fixed in Qwen's
+            # Thinking template, preserving prior reasoning without re-training it.
+            messages.append({"role": "tool", "content": feedback})
+        if not interactions:
+            return None
+        for turn, interaction in enumerate(interactions.values()):
+            interaction.reward = interaction.rollout_reward = reward
+            tensors = interaction.to_tensor_dict()
+            tensors["is_truncated"] = torch.tensor([truncated], dtype=torch.bool)
+            # Each row has its own context, while turn_ids retain episode order.
+            tensors["turn_ids"][tensors["loss_mask"].bool()] = turn
+        stats_tracker.get(workflow_context.stat_scope()).scalar(
+            reward=reward,
+            num_turns=len(interactions),
+            truncated=int(truncated),
+            output_tokens=used,
+        )
+        return interactions

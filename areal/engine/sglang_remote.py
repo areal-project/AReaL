@@ -152,6 +152,28 @@ class SGLangBackend:
 
         if req.video_data is not None:
             payload["video_data"] = req.video_data
+            # Video timestamp/frame expansion starts from the compact template,
+            # while req.input_ids retains the actor's expanded training context.
+            wire_ids = req.metadata.get("sglang_video_input_ids")
+            if wire_ids is not None:
+                if (
+                    not isinstance(wire_ids, list)
+                    or not wire_ids
+                    or any(type(token) is not int or token < 0 for token in wire_ids)
+                ):
+                    raise ValueError(
+                        "sglang_video_input_ids must be nonempty token IDs"
+                    )
+                prompt_length = req.metadata.get("sglang_video_prompt_length")
+                if type(prompt_length) is not int or not 0 < prompt_length <= len(
+                    req.input_ids
+                ):
+                    raise ValueError(
+                        "sglang_video_prompt_length must identify the expanded prompt"
+                    )
+                # Partial rollout appends accepted output to req.input_ids before
+                # resubmitting. Preserve that suffix across the wire conversion.
+                payload["input_ids"] = wire_ids + req.input_ids[prompt_length:]
 
         if gconfig.score_centering_top_k:
             from areal.utils.score_centering import validate_sampling
