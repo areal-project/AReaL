@@ -68,7 +68,20 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
             )
         except (OSError, ValueError):
             return  # Let the original entry point handle other config formats.
-    from areal.engine import sglang_qwen_vl_cpu
+    from areal.engine import sglang_qwen38_mtp, sglang_qwen_vl_cpu
+
+    if sglang_qwen38_mtp.matches_model(config):
+        root = installed_sglang_root()
+        install_source_patches(
+            sglang_qwen38_mtp.patch_targets(root),
+            lock_path=root / ".areal-sglang-patches.lock",
+        )
+        from areal.utils import logging
+
+        logging.getLogger("SGLangWrapper").info(
+            "Qwen3.8-27B runtime patches verified: nonblocking speculative "
+            "mRoPE copies and external-abort completion handling."
+        )
 
     if config.get("model_type") in sglang_qwen_vl_cpu.MODEL_TYPES:
         # Let existing SGLang installations and third-party processors run
