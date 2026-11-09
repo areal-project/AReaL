@@ -1609,10 +1609,13 @@ def test_arena_failure_reason_rates_include_successes_in_denominator(
         else ArenaTaskResult(task_id="success", status="OK", score=0.5)
     )
     agent._task_result.set(result)
-    agent._record_attempt_metrics(error)
+    agent._record_attempt_metrics({"arena_stream_name": "test"}, error)
     for reason in ("tool_call_argument_bytes_exceeded", "empty_completion"):
         expected = "tool_argument_budget" if reason.startswith("tool_call") else reason
         assert metrics[f"harness_error/{reason}"] == float(failure == expected)
+        assert metrics[f"stream/test/harness_error/{reason}"] == float(
+            failure == expected
+        )
     metadata = agent.get_episode_metadata()
     assert metadata.get("harness_failure_reason") == (
         "tool_call_argument_bytes_exceeded"

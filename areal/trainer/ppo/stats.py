@@ -3,12 +3,42 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from typing import Any
 
 import torch
 
 from areal.utils import stats_tracker
+from areal.utils.data import TrajBatchMeta
 from areal.utils.stats_tracker import ReduceType
+
+
+def log_arena_stream_training_counts(meta: TrajBatchMeta) -> None:
+    """Count training inputs per Arena stream once per successful update.
+
+    Export sums over the engine's DP group without model-parallel duplication.
+    Logical rollouts can occupy multiple sequence rows (e.g. individual turn
+    export); neither is a unique task count.
+    """
+    counts: dict[str, Counter[str]] = {}
+    for group in meta.rollout_groups or []:
+        if group is None or group.arena_stream_name is None:
+            continue
+        stream = counts.setdefault(group.arena_stream_name, Counter())
+        stream.update(
+            groups=1, rollouts=len(group.row_counts), sequences=sum(group.row_counts)
+        )
+    for name, stream in counts.items():
+        stats_tracker.stat_compact(
+            torch.ones(1, dtype=torch.bool, device="cpu"),
+            ReduceType.SUM,
+            **{
+                f"stream/{name}/{key}": torch.tensor(
+                    [value], dtype=torch.float64, device="cpu"
+                )
+                for key, value in stream.items()
+            },
+        )
 
 
 def log_train_inference_stats(

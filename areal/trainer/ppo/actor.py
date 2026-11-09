@@ -36,7 +36,10 @@ from areal.trainer.ppo.loss_reduction import (
     PreparedLossStep,
     prepare_policy_gradient_batch,
 )
-from areal.trainer.ppo.stats import infer_token_denominator
+from areal.trainer.ppo.stats import (
+    infer_token_denominator,
+    log_arena_stream_training_counts,
+)
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
     PROX_APPROX_METHOD_LINEAR,
@@ -412,6 +415,7 @@ class PPOActor:
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
         batched, meta = concat_batch(data)
         self._ppo_update(batched, meta)
+        log_arena_stream_training_counts(meta)
 
     def _ppo_update(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None

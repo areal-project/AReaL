@@ -67,6 +67,10 @@ async def test_rejected_terminal_failure_is_counted_without_export(
     assert metrics["rollout/task_error"] == [1.0]
     assert metrics[f"rollout/task_status/{status}"] == [1.0]
     assert metrics["rollout/harness_error"] == [float(status == "HARNESS_FAILED")]
+    assert metrics["rollout/stream/stream-1/task_error"] == [1.0]
+    assert metrics["rollout/stream/stream-1/harness_error"] == [
+        float(status == "HARNESS_FAILED")
+    ]
     assert "rollout/training_score" not in metrics
 
 
@@ -331,10 +335,13 @@ def test_budget_failure_metrics_and_metadata_require_healthy_receipt(
 
     workflow._task_result.set(error.result)
     with capture_metrics() as metrics:
-        workflow._record_attempt_metrics(error)
+        workflow._record_attempt_metrics({"arena_stream_name": "budget-stream"}, error)
 
     for name in ("tool_call_budget_exceeded_rate", "tool_call_argument_bytes_exceeded"):
         assert metrics[f"rollout/harness_error/{name}"] == [float(fault is None)]
+        assert metrics[f"rollout/stream/budget-stream/harness_error/{name}"] == [
+            float(fault is None)
+        ]
     assert metrics["rollout/harness_error/empty_completion"] == [0.0]
     assert workflow.get_episode_metadata().get("harness_failure_reason") == (
         "tool_call_argument_bytes_exceeded" if fault is None else None
@@ -416,12 +423,16 @@ async def test_concurrent_failure_reasons_keep_metadata_and_terminal_denominator
     stats = consumed.export()
     assert stats["rollout/task_attempt_count"] == 8
     assert stats["rollout/task_result_count"] == 7
+    assert stats["rollout/stream/stream-1/task_result_count"] == 7
     for reason in (
         "tool_call_budget_exceeded_rate",
         "tool_call_argument_bytes_exceeded",
         "empty_completion",
     ):
         assert stats[f"rollout/harness_error/{reason}"] == pytest.approx(1 / 7)
+        assert stats[
+            f"rollout/stream/stream-1/harness_error/{reason}"
+        ] == pytest.approx(1 / 7)
 
 
 @pytest.mark.asyncio
@@ -442,6 +453,7 @@ async def test_local_failure_does_not_invent_terminal_result(
         float(isinstance(error, asyncio.CancelledError))
     ]
     assert "rollout/harness_error" not in metrics
+    assert "rollout/stream/stream-1/harness_error" not in metrics
 
 
 @pytest.mark.asyncio
@@ -477,3 +489,44 @@ async def test_concurrent_rejected_group_preserves_terminal_denominator(
     assert stats["rollout/task_error"] == pytest.approx(2 / 3)
     assert "rollout/reward_sample_count" not in stats
     assert consumed.export() == {}
+
+
+@pytest.mark.asyncio
+async def test_stream_attempts_keep_independent_terminal_denominators(workflow):
+    """Concurrent streams retain failures even when no trajectory is accepted."""
+
+    async def attempt(stream, status):
+        result = (
+            ArenaTaskResult(task_id=stream, status=status, score=1.0)
+            if status == "DONE"
+            else None
+        )
+        error = (
+            asyncio.CancelledError()
+            if status == "cancelled"
+            else ArenaTaskFailedError(stream, status)
+            if result is None
+            else None
+        )
+        workflow._task_result.set(result)
+        await asyncio.sleep(0)
+        workflow._record_attempt_metrics({"arena_stream_name": stream}, error)
+
+    with capture_metrics() as metrics:
+        await asyncio.gather(
+            attempt("a", "DONE"),
+            attempt("a", "HARNESS_FAILED"),
+            attempt("b", "EVAL_FAILED"),
+            attempt("b", "cancelled"),
+        )
+    consumed = ConsumedMetrics()
+    consumed.consume(SimpleNamespace(trajectory=None, metrics=metrics))
+    stats = consumed.export()
+    assert stats["rollout/stream/a/harness_error"] == 0.5
+    assert stats["rollout/stream/a/task_error"] == 0.5
+    assert stats["rollout/stream/a/task_result_count"] == 2
+    assert stats["rollout/stream/b/harness_error"] == 0
+    assert stats["rollout/stream/b/task_error"] == 1
+    assert stats["rollout/stream/b/task_result_count"] == 1
+    assert stats["rollout/stream/b/task_attempt_count"] == 2
+    assert stats["rollout/task_result_count"] == 3
