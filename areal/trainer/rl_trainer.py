@@ -6,6 +6,7 @@ import functools
 import os
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
 
@@ -69,6 +70,7 @@ from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.perf_tracer import Category
 from areal.utils.recover import RecoverHandler
+from areal.utils.rollout_timeperf import RolloutTraceObserver
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 from areal.v2.inference_service.controller.controller import (
@@ -916,6 +918,26 @@ class PPOTrainer:
         elif self._requires_proxy_workflow(workflow):
             self._ensure_proxy_started()
 
+        trace_config = (
+            config.rollout.agent.rollout_trace
+            if config.rollout.agent is not None
+            else None
+        )
+        if (
+            is_v1_rollout
+            and trace_config is not None
+            and trace_config.enabled
+            and isinstance(self.rollout, RolloutController)
+            and self.rollout.proxy_addrs
+        ):
+            self._rollout_trace_observer = RolloutTraceObserver(
+                self.rollout.proxy_addrs,
+                config.rollout.agent.admin_api_key,
+                trace_config,
+                logger,
+            )
+            self._rollout_trace_observer.start()
+
         if self.recover_info is None and self._evaluate_before_train(
             eval_workflow=eval_workflow,
             eval_workflow_kwargs=eval_workflow_kwargs,
@@ -937,8 +959,15 @@ class PPOTrainer:
 
             if self._should_offload_rollout:
                 self._onload_rollout()
+            rollout_started_at = time.time()
+            trace_observer = getattr(self, "_rollout_trace_observer", None)
             with (
                 stats_tracker.record_timing("rollout"),
+                (
+                    trace_observer.active_step()
+                    if trace_observer is not None
+                    else nullcontext()
+                ),
                 perf_tracer.trace_scope(
                     "train.rollout",
                     category=Category.COMPUTE,
@@ -971,6 +1000,35 @@ class PPOTrainer:
                     dynamic_bs=config.dynamic_bs,
                     min_batch_size=min_consumer_batch_size,
                 )
+            rollout_ended_at = time.time()
+            if trace_observer is not None:
+                tracker = stats_tracker.get()
+                with tracker.lock:
+                    rollout_seconds = tracker.stats["timeperf/rollout"][-1]
+                try:
+                    if trace_observer.poll_once():
+                        attributed = trace_observer.attribute_step(
+                            rollout_started_at, rollout_ended_at, rollout_seconds
+                        )
+                    else:
+                        attributed = {
+                            name: rollout_seconds if name == "other" else 0.0
+                            for name in trace_observer.PHASES
+                        }
+                except Exception:
+                    logger.exception("Rollout trace attribution failed")
+                    attributed = {
+                        name: rollout_seconds if name == "other" else 0.0
+                        for name in trace_observer.PHASES
+                    }
+                tracker.scalar(
+                    **{
+                        f"timeperf/rollout/{phase}": seconds
+                        for phase, seconds in attributed.items()
+                        if phase != "toolcall" or seconds > 0
+                    }
+                )
+                trace_observer.prune_completed(rollout_ended_at)
             if self._should_offload_rollout:
                 self._offload_rollout()
             elif self._is_v1_awex_colocate(self.config):
@@ -1394,6 +1452,9 @@ class PPOTrainer:
         # P87: must tolerate a partially-constructed trainer (called from
         # __init__'s failure path), and one engine's destroy() failure must
         # not keep the remaining workers alive.
+        trace_observer = getattr(self, "_rollout_trace_observer", None)
+        if trace_observer is not None:
+            trace_observer.close()
         saver = getattr(self, "saver", None)
         if saver is not None:
             try:
