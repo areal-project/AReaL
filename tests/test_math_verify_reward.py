@@ -2,7 +2,7 @@ from areal.reward import geometry3k_reward_fn, get_math_verify_worker, gsm8k_rew
 
 
 def test_hermes_math_frozen_splits_keep_gold_out_of_prompts(tmp_path):
-    from examples.task_workflows.benchmarks.dapo_math import (
+    from examples.v2_online_workflows.benchmarks.dapo_math import (
         load_tasks,
         tasks_from_rows,
         write_splits,
@@ -39,7 +39,7 @@ def test_hermes_math_frozen_splits_keep_gold_out_of_prompts(tmp_path):
 
 
 def test_hermes_math_grades_only_the_last_final_answer():
-    from examples.task_workflows.benchmarks.dapo_math import score_answer
+    from examples.v2_online_workflows.benchmarks.dapo_math import score_answer
 
     assert score_answer(r"Calculation: 42. Final answer: \boxed{41}", "42").reward == 0
     assert (
@@ -54,7 +54,7 @@ def test_hermes_math_grades_only_the_last_final_answer():
 
 
 def test_hermes_math_keeps_processed_records_and_groups_format_variants(tmp_path):
-    from examples.task_workflows.benchmarks.dapo_math import (
+    from examples.v2_online_workflows.benchmarks.dapo_math import (
         load_tasks,
         tasks_from_rows,
         write_splits,

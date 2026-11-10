@@ -4,8 +4,8 @@
 
 ```bash
 CUDA_VISIBLE_DEVICES="" \
-python -m examples.task_workflows.train \
-  --config examples/task_workflows/configs/dapo.yaml \
+python -m examples.v2_online_workflows.train \
+  --config examples/v2_online_workflows/configs/dapo.yaml \
   elastic.enabled=true
 ```
 

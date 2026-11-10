@@ -12,7 +12,7 @@ _CONFIG_PATH = Path(__file__).resolve().parents[1] / "examples/hermes/config.yam
 
 
 def test_hermes_math_tool_captures_real_python_output():
-    from examples.task_workflows.environments.python import run_limited
+    from examples.v2_online_workflows.environments.python import run_limited
 
     result = run_limited(
         [sys.executable, "-c", "print(6 * 7)"], timeout=10, output_bytes=1024
@@ -27,10 +27,10 @@ def test_hermes_math_sampling_keeps_episode_on_direct_and_recreated_clients(
 ):
     from types import SimpleNamespace
 
-    from examples.task_workflows import service
-    from examples.task_workflows.environments import python as python_environment
-    from examples.task_workflows.harnesses import hermes, hermes_runtime
-    from examples.task_workflows.harnesses.hermes import _Upstream
+    from examples.v2_online_workflows import service
+    from examples.v2_online_workflows.environments import python as python_environment
+    from examples.v2_online_workflows.harnesses import hermes, hermes_runtime
+    from examples.v2_online_workflows.harnesses.hermes import _Upstream
 
     requests = []
     clock = SimpleNamespace(value=0.0)
@@ -124,8 +124,8 @@ def test_hermes_math_sampling_keeps_episode_on_direct_and_recreated_clients(
 async def test_hermes_math_client_scores_and_submits_native_reward(tmp_path):
     import httpx
 
-    from examples.task_workflows.benchmarks.dapo_math import MathTask, question_id
-    from examples.task_workflows.client import ClientSettings, EpisodeClient
+    from examples.v2_online_workflows.benchmarks.dapo_math import MathTask, question_id
+    from examples.v2_online_workflows.client import ClientSettings, EpisodeClient
 
     output = tmp_path / "client"
     output.mkdir()
@@ -242,8 +242,8 @@ def test_hermes_math_config_shares_training_settings_with_elastic_enabled(
 async def test_hermes_math_eval_does_not_create_or_reward_training_sessions(tmp_path):
     import httpx
 
-    from examples.task_workflows.benchmarks.dapo_math import MathTask, question_id
-    from examples.task_workflows.client import ClientSettings, EpisodeClient
+    from examples.v2_online_workflows.benchmarks.dapo_math import MathTask, question_id
+    from examples.v2_online_workflows.client import ClientSettings, EpisodeClient
 
     paths = []
 

@@ -419,7 +419,12 @@ async def forward_sse_stream(
                     except Exception:
                         detail = error_body.decode("utf-8", errors="replace")
                     error_event = _json.dumps(
-                        {"error": detail, "status_code": resp.status_code}
+                        {
+                            "error": _stream_error(
+                                detail, f"Upstream HTTP {resp.status_code}"
+                            ),
+                            "status_code": resp.status_code,
+                        }
                     )
                     yield f"data: {error_event}\n\n".encode()
                     return
@@ -427,12 +432,30 @@ async def forward_sse_stream(
                     yield chunk
     except httpx.TransportError as exc:
         logger.error("SSE transport error from %s: %s", upstream_url, exc)
-        error_event = _json.dumps({"error": str(exc)})
+        error_event = _json.dumps(
+            {"error": _stream_error(str(exc), type(exc).__name__)}
+        )
         yield f"data: {error_event}\n\n".encode()
     except Exception as exc:
         logger.error("SSE stream error from %s: %s", upstream_url, exc)
-        error_event = _json.dumps({"error": str(exc)})
+        error_event = _json.dumps(
+            {"error": _stream_error(str(exc), type(exc).__name__)}
+        )
         yield f"data: {error_event}\n\n".encode()
+
+
+def _stream_error(detail: Any, fallback: str) -> dict[str, Any]:
+    """Keep SSE errors truthy and readable for OpenAI-compatible SDKs."""
+    if isinstance(detail, dict):
+        nested = detail.get("error", detail)
+        error = dict(nested) if isinstance(nested, dict) else {"message": nested}
+        error["message"] = str(error.get("message") or fallback).strip() or fallback
+        error.setdefault("type", "upstream_error")
+        return error
+    return {
+        "message": str(detail or fallback).strip() or fallback,
+        "type": "upstream_error",
+    }
 
 
 @async_httpx_retry

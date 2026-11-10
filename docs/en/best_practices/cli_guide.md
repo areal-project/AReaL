@@ -320,6 +320,7 @@ service = "default"
 gateway_host = "127.0.0.1"
 gateway_port = 8080
 routing_strategy = "round_robin"
+forward_timeout = 120.0
 
 [scheduler]
 type = "local"
@@ -330,6 +331,11 @@ model_health_timeout = 600
 engine_args = "--mem-fraction-static 0.8"
 proxy_args = "--request-timeout 120 --chat-template-type hf"
 ```
+
+For long generations, set `areal inf run --forward-timeout 1800` (or
+`[launch].forward_timeout`) as well as the data proxy's `--request-timeout`. The Gateway
+timeout defaults to 120 seconds independently of proxy settings. It controls upstream
+HTTP waits; it does not cancel backend generation after a disconnect.
 
 ## Agent Service CLI (`areal agent`)
 

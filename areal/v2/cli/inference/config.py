@@ -49,6 +49,7 @@ INF_BINDINGS: BindingMap = {
     ("launch", "gateway_port"): ("run", "port"),
     ("launch", "routing_strategy"): ("run", "routing_strategy"),
     ("launch", "launch_timeout"): ("run", "launch_timeout"),
+    ("launch", "forward_timeout"): ("run", "forward_timeout"),
     # [scheduler] — applied to `run` only; other verbs read from ServiceState
     ("scheduler", "type"): ("run", "scheduler"),
     # [register.internal] — applied to `register`

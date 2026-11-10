@@ -14,7 +14,7 @@ import traceback
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -40,6 +40,7 @@ from areal.v2.inference_service.gateway.streaming import (
     resolve_worker_addr,
     revoke_session_in_router,
 )
+from areal.v2.inference_service.session_auth import gateway_session_id
 
 logger = logging.getLogger("InferenceGateway")
 
@@ -120,6 +121,10 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     async def _forward_generation_request(request: Request, path: str) -> Response:
         token = extract_bearer_token(request)
+        try:
+            session_id = gateway_session_id(request.headers, config.admin_api_key)
+        except ValueError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
         body = await request.body()
         headers = _forwarding_headers(dict(request.headers))
 
@@ -140,6 +145,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 config.router_timeout,
                 admin_api_key=config.admin_api_key,
                 model=model_name,
+                session_id=session_id,
                 client=_client(),
             )
         except (RouterUnreachableError, RouterKeyRejectedError) as exc:
