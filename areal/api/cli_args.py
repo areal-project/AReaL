@@ -3933,12 +3933,6 @@ class PPOConfig(BaseExperimentConfig):
                     f"backend; got {rollout_backend!r}. The SGLang path does not "
                     "collect sampler heads."
                 )
-            agent = getattr(self.rollout, "agent", None)
-            if getattr(agent, "chat_template_type", "hf") == "concat":
-                logger.warning(
-                    "Score centering does not carry sampler heads across concat "
-                    "multi-turn turns; multi-turn concat raises at run time."
-                )
             # The v2 rollout controller never carries top-k heads.
             if str(getattr(self.rollout, "_version", "v1")) == "v2":
                 raise ValueError(

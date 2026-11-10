@@ -15,6 +15,7 @@ from openai.types.responses.response_input_param import ResponseInputParam
 from areal.api import ModelResponse
 from areal.utils import logging
 from areal.utils.topk_padding import (
+    NEG_INF_PAD,
     pad_topk_ids,
     pad_topk_logps,
     truncate_topk,
@@ -205,6 +206,9 @@ class InteractionWithTokenLogpReward:
         resp = self.model_response
         assert resp is not None, "Model response is not set."
         self.seq_tokens = seq = resp.input_tokens + resp.output_tokens
+        # SC: a concat child reuses the parent's head rows for the prefix they share.
+        stitched_parent = False
+        parent_heads = None
         if self.chat_template_type == "concat" and self.parent is not None:
             parent_res = self.parent.to_tensor_dict()
             parent_logprobs = parent_res["logprobs"].squeeze(0).tolist()
@@ -213,6 +217,12 @@ class InteractionWithTokenLogpReward:
             parent_len = len(parent_logprobs)
             assert parent_len == len(parent_loss_mask) == len(parent_versions)
             if resp.input_len > parent_len:
+                stitched_parent = True
+                if "sampler_head_ids" in parent_res:
+                    parent_heads = (
+                        parent_res["sampler_head_ids"].squeeze(0),
+                        parent_res["sampler_head_logprobs"].squeeze(0),
+                    )
                 logprobs = (
                     parent_logprobs
                     + [0.0] * (resp.input_len - parent_len)
@@ -270,14 +280,8 @@ class InteractionWithTokenLogpReward:
                 dtype=torch.long,
             ).unsqueeze(0)
         # SC: input positions get zero top-k, output positions get the sampler heads.
+        own_heads = None
         if resp.sampler_head_ids is not None and resp.sampler_head_logprobs is not None:
-            if self.chat_template_type == "concat" and self.parent is not None:
-                raise NotImplementedError(
-                    "Score Centering is not supported with chat_template_type="
-                    "'concat' multi-turn interactions: the parent's top-k sampler "
-                    "data is not propagated into the child trajectory. Use "
-                    "chat_template_type='hf' or disable Score Centering."
-                )
             pad_k = (
                 max(len(k) for k in resp.sampler_head_ids)
                 if resp.sampler_head_ids
@@ -310,25 +314,39 @@ class InteractionWithTokenLogpReward:
                         k_dim,
                         narrow,
                     )
-                # Input tokens have no sampler data. Pad ids with 0 and
-                # log-probs with -inf so they contribute zero mass.
-                input_topk_ids = [
-                    pad_topk_ids([], k_dim) for _ in range(resp.input_len)
-                ]
-                input_topk_logps = [
-                    pad_topk_logps([], k_dim) for _ in range(resp.input_len)
-                ]
                 # Output tokens: cap by logprob, then pad each row to k_dim.
-                sampler_head_ids = [pad_topk_ids(ids, k_dim) for ids, _ in kept]
-                sampler_head_logprobs = [
-                    pad_topk_logps(logps, k_dim) for _, logps in kept
-                ]
-                result["sampler_head_ids"] = torch.tensor(
-                    input_topk_ids + sampler_head_ids, dtype=torch.int32
-                ).unsqueeze(0)  # [1, seq_len, k]
-                result["sampler_head_logprobs"] = torch.tensor(
-                    input_topk_logps + sampler_head_logprobs, dtype=torch.float32
-                ).unsqueeze(0)  # [1, seq_len, k]
+                own_heads = (
+                    k_dim,
+                    [pad_topk_ids(ids, k_dim) for ids, _ in kept],
+                    [pad_topk_logps(logps, k_dim) for _, logps in kept],
+                )
+        if stitched_parent and (parent_heads is None) != (own_heads is None):
+            raise ValueError(
+                "Every turn of a concat trajectory must carry sampler heads, or none "
+                "of them: a turn without heads leaves its generated tokens with no "
+                "sampler distribution to center against."
+            )
+        if own_heads is not None:
+            k_dim, own_ids, own_logps = own_heads
+            # Prompt and tool-output tokens have no sampler data: id 0 and -inf
+            # give them zero mass. Generated tokens keep the head of the turn that
+            # sampled them, so a concat child copies its parent's rows.
+            head_ids = torch.zeros((len(seq), k_dim), dtype=torch.int32)
+            head_logps = torch.full((len(seq), k_dim), NEG_INF_PAD, dtype=torch.float32)
+            if parent_heads is not None:
+                parent_ids, parent_logps = parent_heads
+                if parent_ids.shape[-1] != k_dim:
+                    raise ValueError(
+                        "Sampler heads differ in width across concat turns "
+                        f"({parent_ids.shape[-1]} vs {k_dim}); set "
+                        "score_centering_top_k so every turn keeps the same width."
+                    )
+                head_ids[: len(parent_ids)] = parent_ids
+                head_logps[: len(parent_logps)] = parent_logps
+            head_ids[resp.input_len :] = torch.tensor(own_ids, dtype=torch.int32)
+            head_logps[resp.input_len :] = torch.tensor(own_logps, dtype=torch.float32)
+            result["sampler_head_ids"] = head_ids.unsqueeze(0)  # [1, seq_len, k]
+            result["sampler_head_logprobs"] = head_logps.unsqueeze(0)  # [1, seq_len, k]
         self._cache = result
         return result
 
