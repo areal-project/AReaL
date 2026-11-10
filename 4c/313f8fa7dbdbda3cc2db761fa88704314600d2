@@ -1,0 +1,21 @@
+areal/trainer/rl_trainer.py
+  s_6b814fc8a9d033::t_3d3952675791e0 944-949,954-956
+  s_6b814fc8a9d033::t_aafe92b7f9dfb1 959
+  s_6b814fc8a9d033::t_0b2bac8f7f2d0b 933-939,943,950,961-962,1032-1036
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4c313f8fa7dbdbda3cc2db761fa88704314600d2",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}

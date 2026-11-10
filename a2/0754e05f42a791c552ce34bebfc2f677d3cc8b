@@ -1,0 +1,26 @@
+examples/agent_workflow/check_sglang_session_rids.py
+  s_6b814fc8a9d033::t_52cf837ee73d3e 30
+  s_6b814fc8a9d033::t_626c5792ea6ae5 1-8,10-29,31-34,44-57
+  s_6b814fc8a9d033::t_f83ea01cf64c10 9,35-43
+examples/agent_workflow/README.md
+  s_6b814fc8a9d033::t_337bed99128e72 21
+  s_6b814fc8a9d033::t_8a3bd33a2b4dc5 18-20,22-25
+examples/agent_workflow/verify_rollout_trace_minimal.sh
+  s_6b814fc8a9d033::t_626c5792ea6ae5 30-31,50-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a20754e05f42a791c552ce34bebfc2f677d3cc8b",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}

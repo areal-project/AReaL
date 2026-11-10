@@ -1,0 +1,23 @@
+examples/agent_workflow/verify_rollout_trace_minimal.sh
+  s_6b814fc8a9d033::t_5c917a25936ce4 1-47
+examples/swe/rl/qwen38_27b/verify_rollout_trace_e2e.sh
+  s_6b814fc8a9d033::t_5c917a25936ce4 1-74
+examples/swe/rl/qwen38_27b/README.md
+  s_6b814fc8a9d033::t_5c917a25936ce4 83-151
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ae1f7ac9b9dd77268427fa68e7837716b01dc3d4",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}

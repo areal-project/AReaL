@@ -1,0 +1,23 @@
+areal/experimental/openai/proxy/workflow.py
+  s_6b814fc8a9d033::t_cfaabb77435aa4 20-24,546,583
+areal/utils/perf_tracer.py
+  s_6b814fc8a9d033::t_c4b39177c3e8df 28,486,634,996,1011,1016-1022,2015-2019,2023-2030,2144
+areal/experimental/openai/proxy/client_session.py
+  s_6b814fc8a9d033::t_cfaabb77435aa4 234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "817884353cc9a6a58ff81dc9c71ad9accf25fa92",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}

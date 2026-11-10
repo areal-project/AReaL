@@ -1,0 +1,23 @@
+examples/swe/arena_agent.py
+  s_6b814fc8a9d033::t_37a9a34e9f87e0 38-41,515-589,1929-1933,1980,1983,1988-1997,2297-2316
+examples/swe/arena_client.py
+  s_6b814fc8a9d033::t_1ddb592fb411e3 12,975-1059
+tests/test_swe_arena_trace.py
+  s_6b814fc8a9d033::t_495556777d48c1 1-71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2f4676f9f9c89d33429fa833b2eea271245ed23d",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}

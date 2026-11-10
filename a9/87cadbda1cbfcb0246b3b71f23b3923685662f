@@ -1,0 +1,22 @@
+tests/test_http_error_diagnostics.py
+  s_6b814fc8a9d033::t_a312c0577eb6e4 158-186
+  s_6b814fc8a9d033::t_b312f0ae1401bd 157
+areal/infra/utils/http.py
+  s_6b814fc8a9d033::t_8ca806dd5ad81a 5,163,193-195,201,203,205
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a987cadbda1cbfcb0246b3b71f23b3923685662f",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}

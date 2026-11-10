@@ -1,0 +1,34 @@
+areal/infra/controller/rollout_controller.py
+  s_6b814fc8a9d033::t_b036921fa11537 1748,1750-1751,1753,1755
+  s_6b814fc8a9d033::t_d378c6a7090ab8 54,1557-1560,1562
+  s_6b814fc8a9d033::t_9ad768584d0a5c 1749,1752,1754
+  s_6b814fc8a9d033::t_9513e7b6af7c7f 1561
+  s_6b814fc8a9d033::t_52cf837ee73d3e 8
+  s_6b814fc8a9d033::t_67234cc0ba83ae 1567,1573-1583
+  s_6b814fc8a9d033::t_03a5a2a12d2408 1756
+tests/test_grouped_rollout_workflow.py
+  s_6b814fc8a9d033::t_52cf837ee73d3e 94-95
+  s_6b814fc8a9d033::t_1feb2cafa55ce8 6,16-17,72-93,96-106
+  s_6b814fc8a9d033::t_9f9fae52834223 107-108
+areal/infra/workflow_executor.py
+  s_6b814fc8a9d033::t_c212cc97cdb2c2 1375-1377
+  s_6b814fc8a9d033::t_c4b39177c3e8df 16,48,1353,1371-1374,1378,1391,1395
+  s_6b814fc8a9d033::t_9ad768584d0a5c 1380-1385
+  s_6b814fc8a9d033::t_6eaceea9ca299f 1366,1386-1390,1392-1394,1553-1559
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3b890d15babbba9399f80a9c9b612262563fc6f0",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
