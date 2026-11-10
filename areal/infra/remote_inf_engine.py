@@ -461,6 +461,32 @@ class RemoteInfBackendProtocol(Protocol):
         ...
 
 
+def validate_head_alignment(n_ids: int, n_logps: int, n_tokens: int) -> None:
+    """Raise when per-token sampler heads do not line up with the generated tokens."""
+    if not (n_ids == n_logps == n_tokens):
+        raise ValueError(
+            "Score centering heads are misaligned with the generated tokens "
+            f"({n_ids} ids / {n_logps} log-probs vs {n_tokens} tokens); "
+            "a chunk dropped its top-k alternatives."
+        )
+
+
+def require_topk_heads(accumulated_head_ids, top_k: int, *, requested: bool) -> None:
+    """Raise when score centering is on but no chunk returned sampler top-k heads.
+
+    ``requested`` is ``InferenceEngineConfig.use_score_centering``; ``top_k`` alone
+    is not enough because it stays set while score centering is disabled.
+    """
+    if requested and top_k > 0 and not accumulated_head_ids:
+        raise RuntimeError(
+            "Score Centering is enabled but no chunk returned sampler top-k heads. "
+            "The training step would then fail with an opaque missing-key error, so "
+            "the rollout stops here instead. The vLLM response schema must carry "
+            "token ids for top alternatives; see "
+            "VLLMBackend._parse_top_logprobs for the accepted shapes."
+        )
+
+
 class RemoteInfEngine(InferenceEngine):
     """
     Base implementation for HTTP-based remote inference engines.
@@ -1086,6 +1112,8 @@ class RemoteInfEngine(InferenceEngine):
         accumulated_output_logprobs = []
         accumulated_versions = []
         accumulated_routed_experts: list[np.ndarray] = []
+        accumulated_topk_ids = []
+        accumulated_topk_logps = []
 
         # A single "rid" shares the same server to allow KV cache reuse
         if req.rid in self.rid_to_address:
@@ -1168,6 +1196,25 @@ class RemoteInfEngine(InferenceEngine):
             # Accumulate routed_experts for MoE models
             if gen_result.routed_experts is not None:
                 accumulated_routed_experts.append(gen_result.routed_experts)
+            # Accumulate SC top-k fields
+            if gen_result.sampler_head_ids is not None:
+                # Assert per-chunk length to catch truncation early.
+                if len(gen_result.sampler_head_ids) != len(gen_result.output_tokens):
+                    raise ValueError(
+                        f"sampler_head_ids len {len(gen_result.sampler_head_ids)} "
+                        f"!= output_tokens len {len(gen_result.output_tokens)}"
+                    )
+                accumulated_topk_ids.extend(gen_result.sampler_head_ids)
+            if gen_result.sampler_head_logprobs is not None:
+                if len(gen_result.sampler_head_logprobs) != len(
+                    gen_result.output_tokens
+                ):
+                    raise ValueError(
+                        f"sampler_head_logprobs len "
+                        f"{len(gen_result.sampler_head_logprobs)} "
+                        f"!= output_tokens len {len(gen_result.output_tokens)}"
+                    )
+                accumulated_topk_logps.extend(gen_result.sampler_head_logprobs)
 
             # Update request for next iteration
             req.extend_prompt(gen_result.output_tokens)
@@ -1177,6 +1224,23 @@ class RemoteInfEngine(InferenceEngine):
                 len(gen_result.output_tokens),
                 len(req.input_ids),
             )
+
+        # Every chunk must contribute heads or none at all; a single chunk that
+        # dropped them would shift the rows relative to the tokens they describe.
+        if accumulated_topk_ids or accumulated_topk_logps:
+            validate_head_alignment(
+                len(accumulated_topk_ids),
+                len(accumulated_topk_logps),
+                len(accumulated_output_tokens),
+            )
+
+        # Score centering was requested but nothing ever carried heads: without this
+        # the run continues headless and dies later with a bare KeyError.
+        require_topk_heads(
+            accumulated_topk_ids,
+            gconfig.score_centering_top_k,
+            requested=getattr(self.config, "use_score_centering", False),
+        )
 
         # Final abort handling
         if stop_reason == "abort":
@@ -1207,6 +1271,10 @@ class RemoteInfEngine(InferenceEngine):
             tokenizer=req.tokenizer,
             processor=req.processor,
             routed_experts=accumulated_routed_experts,
+            sampler_head_ids=accumulated_topk_ids if accumulated_topk_ids else None,
+            sampler_head_logprobs=accumulated_topk_logps
+            if accumulated_topk_logps
+            else None,
         )
         return response
 

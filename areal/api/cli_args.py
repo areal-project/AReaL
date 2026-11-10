@@ -196,6 +196,15 @@ class GenerationHyperparameters:
         default=1.0,
         metadata={"help": "Sampling temperature. Higher values increase diversity."},
     )
+    # Score Centering: number of top-k logprobs to request from sampler
+    score_centering_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "Number of top-k logprobs to request for Score Centering. "
+            "0 disables collection; enabling use_score_centering requires a "
+            "value in [1, 1024] that also fits vLLM's max_logprobs."
+        },
+    )
     stop_token_ids: list[int] = field(
         default_factory=list,
         metadata={"help": "Stop generation when encountering these token IDs."},
@@ -271,6 +280,7 @@ class GenerationHyperparameters:
         )
 
     _OPENAI_UNSUPPORTED_ARGS: ClassVar[set[str]] = {
+        "score_centering_top_k",  # Carried by the SC-aware proxy, not the SDK
         "min_new_tokens",  # Not supported by OpenAI
         "greedy",  # Not directly supported by OpenAI
         "top_k",  # Not supported by OpenAI
@@ -1624,7 +1634,8 @@ class RejectionSamplingConfig:
             "help": "Lower bound for filtering (optional). "
             "None means no lower bound. "
             "For 'ratio' metric: typical value is 0.5 (filter out tokens where policy "
-            "probability dropped significantly). Must be > 0. "
+            "probability dropped significantly). Must be > 0, except with "
+            "action='clamp' where a zero floor is allowed. "
             "For 'kl_k1' metric: can be used to filter negative KL estimates."
         },
     )
@@ -1667,9 +1678,16 @@ class RejectionSamplingConfig:
                     f"upper must be > 1.0 for 'ratio' metric (otherwise all non-identical "
                     f"policy tokens will be filtered), got {self.upper}"
                 )
-            if self.lower is not None and self.lower <= 0:
+            # Clamp floors may be zero; masking still requires a positive bound.
+            if self.lower is not None and self.action != "clamp" and self.lower <= 0:
                 raise ValueError(
                     f"lower must be positive for 'ratio' metric, got {self.lower}"
+                )
+            # A clamp floors the weight, so zero is meaningful there; a negative floor
+            # is not.
+            if self.lower is not None and self.action == "clamp" and self.lower < 0:
+                raise ValueError(
+                    f"lower must be non-negative for 'clamp', got {self.lower}"
                 )
         # For KL metrics, upper must be > 0.
         # Note: kl_k1 is excluded because it is a forward KL unbiased estimator that
@@ -1875,6 +1893,68 @@ class PPOActorConfig(TrainEngineConfig):
             "Unused by other loss aggregation modes.",
         },
     )
+    # Score Centering (arXiv:2609.20807) — additive drift correction
+    use_score_centering: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable Score Centering (SC) additive drift correction. "
+            "When True, requires sampler top-k logprobs in input_data."
+        },
+    )
+    sc_reinforce_baseline: bool = field(
+        default=False,
+        metadata={
+            "help": "When True, use pure REINFORCE (-A·log p(a)) as the "
+            "baseline loss for SC-off comparisons, instead of PPO clipped "
+            "surrogate. This enables a fair A1 ablation: SC-on and SC-off "
+            "both use REINFORCE (no PPO ratio), so the difference is the SC "
+            "correction term. Only valid when "
+            "use_score_centering=False; combining both raises at load time."
+        },
+    )
+    # str + choices: OmegaConf cannot rebuild Literal-annotated fields.
+    sc_loss_mode: str = field(
+        default="reinforce",
+        metadata={
+            "help": "Loss integration mode for Score Centering: "
+            "'reinforce' (Plan A, default) — replace PPO with REINFORCE+SC; "
+            "'ppo_additive' (Plan B) — keep the PPO clipped surrogate and add "
+            "the SC correction as an additive term. Both plans require "
+            "recompute_logprob=False and temperature=1, so behavior "
+            "log-probabilities stay sampler-origin: with recompute_logprob the "
+            "PPO ratio and the SC correction would both measure θ_now/θ_rollout, "
+            "which is why the decoupled/async variant is not offered here. "
+            "Plan A is for paper reproduction / strong-TIM scenarios; Plan B "
+            "keeps clipping in the loss for runs that should not rely on the "
+            "REINFORCE term alone.",
+            "choices": ["reinforce", "ppo_additive"],
+        },
+    )
+    # str + choices: OmegaConf cannot rebuild Literal-annotated fields.
+    sc_mode: str = field(
+        default="none",
+        metadata={
+            "help": "Head-weight mode for Score Centering: 'none' (default, pure "
+            "centering), 'tis' (ratio clipped into [sc_clip_low, sc_clip_high]) or "
+            "'mis' (ratio kept inside the band and zeroed outside it).",
+            "choices": ["none", "tis", "mis"],
+        },
+    )
+    sc_clip_low: float = field(
+        default=0.5,
+        metadata={
+            "help": "Lower bound of the sampled-token ratio band for sc_mode='tis' "
+            "and sc_mode='mis'. Default 0.5."
+        },
+    )
+    sc_clip_high: float = field(
+        default=5.0,
+        metadata={
+            "help": "Upper bound of the sampled-token ratio band for sc_mode='tis' "
+            "and sc_mode='mis'. Default 5.0."
+        },
+    )
+
     # Logging Agent Trajectories
     log_agent_stats: bool = field(
         default=False,
@@ -1952,9 +2032,10 @@ class PPOActorConfig(TrainEngineConfig):
                 "boundaries, which tree-packed batches do not carry; tree "
                 "training supports only 'token-mean'."
             )
-        # Warn if rejection_sampling is configured but use_decoupled_loss is False
+        # Only rejection_sampling is exempt while score centering is on.
         if not self.use_decoupled_loss and (
-            self.rejection_sampling is not None or self.importance_sampling is not None
+            (self.rejection_sampling is not None and not self.use_score_centering)
+            or self.importance_sampling is not None
         ):
             logger.warning(
                 "rollout correction is configured but use_decoupled_loss=False. "
@@ -2006,7 +2087,85 @@ class PPOActorConfig(TrainEngineConfig):
                     "SAPO is not compatible with `use_decoupled_loss=True`. "
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
                 )
+            if self.sc_reinforce_baseline:
+                raise ValueError(
+                    "sc_reinforce_baseline=True is not compatible with "
+                    "use_sapo_loss=True. SAPO and REINFORCE baseline are "
+                    "mutually exclusive main losses. Set sc_reinforce_baseline=False "
+                    "or use_sapo_loss=False."
+                )
 
+        # Score-centering validation; runs for every config and is cheap.
+        if self.sc_loss_mode not in ("reinforce", "ppo_additive"):
+            raise ValueError(
+                f"sc_loss_mode must be 'reinforce' or 'ppo_additive'; "
+                f"got {self.sc_loss_mode!r}."
+            )
+        # SC supports token-wise REINFORCE with an optional TIS cap only.
+        if self.use_score_centering:
+            if (
+                not self.backend.startswith("fsdp:")
+                or self.enable_tree_training
+                or self.is_critic
+            ):
+                raise ValueError("Score centering requires an ordinary FSDP actor.")
+            if self.temperature != 1.0 or self.recompute_logprob:
+                raise ValueError(
+                    "Score centering requires temperature=1 and "
+                    "recompute_logprob=False to preserve sampler probabilities."
+                )
+            if (
+                self.rejection_sampling is not None
+                or self.importance_sampling is not None
+            ):
+                raise ValueError(
+                    "Score centering owns its head weighting: configure sc_mode/"
+                    "sc_clip_low/sc_clip_high and leave rejection_sampling and "
+                    "importance_sampling unset, or disable use_score_centering."
+                )
+            if (
+                self.use_sapo_loss
+                or getattr(self, "use_cispo_loss", False)
+                or self.use_decoupled_loss
+                or self.m2_threshold is not None
+                or self.importance_sampling_level != "token"
+            ):
+                raise ValueError(
+                    "Score centering selects token-wise REINFORCE with optional "
+                    "TIS/MIS weighting; other policy surrogates are unsupported."
+                )
+            if self.sc_mode not in ("none", "tis", "mis"):
+                raise ValueError(
+                    f"sc_mode must be 'none', 'tis' or 'mis'; got {self.sc_mode!r}."
+                )
+            if self.sc_mode == "tis":
+                if not math.isfinite(self.sc_clip_high) or not (
+                    0 <= self.sc_clip_low < self.sc_clip_high
+                ):
+                    raise ValueError(
+                        "sc_mode='tis' requires 0 <= sc_clip_low < sc_clip_high with "
+                        f"a finite upper bound; got sc_clip_low={self.sc_clip_low}, "
+                        f"sc_clip_high={self.sc_clip_high}."
+                    )
+            elif self.sc_mode == "mis":
+                if not (
+                    self.sc_clip_low >= 0
+                    and self.sc_clip_high > 0
+                    and self.sc_clip_low < self.sc_clip_high
+                ):
+                    raise ValueError(
+                        "sc_mode='mis' requires sc_clip_low >= 0, sc_clip_high > 0 "
+                        f"and sc_clip_low < sc_clip_high; got sc_clip_low="
+                        f"{self.sc_clip_low}, sc_clip_high={self.sc_clip_high}."
+                    )
+
+            # Only meaningful with SC off; with SC on the flag would be ignored.
+            if self.sc_reinforce_baseline:
+                raise ValueError(
+                    "sc_reinforce_baseline=True is only valid when "
+                    "use_score_centering=False. Set sc_reinforce_baseline=False "
+                    "or use_score_centering=False."
+                )
         super().__post_init__()
 
 
@@ -2066,6 +2225,13 @@ class vLLMConfig:
     # original
     max_num_batched_tokens: int = 2048
     max_num_seqs: int = 256
+    max_logprobs: int = field(
+        default=20,
+        metadata={
+            "help": "vLLM cap on returned log-probs. Auto-raised to "
+            "gconfig.score_centering_top_k when score centering asks for more."
+        },
+    )
     # kv_cache_type: str = "auto"
     block_size: int = 16
     cpu_offload_gb: float = 0
@@ -2705,6 +2871,25 @@ class InferenceEngineConfig:
             "requests select the adapter by this name (plus the weight version). "
             "Usually left empty and auto-filled from gconfig.lora_name by "
             "PPOConfig.__post_init__ so load and request sides stay in sync."
+        },
+    )
+    score_centering_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "Score Centering: number of top-k logprobs to request from "
+            "the vLLM sampler. Auto-filled from gconfig.score_centering_top_k by "
+            "PPOConfig.__post_init__. 0 = disabled (no top-k logprobs)."
+        },
+    )
+    use_score_centering: bool = field(
+        default=False,
+        metadata={
+            "help": "Mirror of actor.use_score_centering, filled by "
+            "PPOConfig.__post_init__. The rollout worker uses it to tell "
+            "'heads were requested and are required' (SC on) from 'heads were "
+            "requested but nobody consumes them' (SC off with a leftover "
+            "score_centering_top_k), so a headless rollout only aborts when "
+            "the trainer would actually need the heads."
         },
     )
     agent: AgentConfig = field(
@@ -3705,6 +3890,63 @@ class PPOConfig(BaseExperimentConfig):
         # the engine config. Single source of truth: gconfig.lora_name.
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
+        # Mirror gconfig.score_centering_top_k into the rollout config.
+        if self.actor.use_score_centering and self.gconfig.score_centering_top_k <= 0:
+            raise ValueError(
+                "use_score_centering=True requires "
+                "generation.score_centering_top_k > 0."
+            )
+        if self.gconfig.score_centering_top_k > 0:
+            if not self.rollout.score_centering_top_k:
+                self.rollout.score_centering_top_k = self.gconfig.score_centering_top_k
+            elif (
+                self.rollout.score_centering_top_k != self.gconfig.score_centering_top_k
+            ):
+                raise ValueError(
+                    "generation.score_centering_top_k and "
+                    "rollout.score_centering_top_k must agree; got "
+                    f"{self.gconfig.score_centering_top_k} and "
+                    f"{self.rollout.score_centering_top_k}."
+                )
+            vllm_cfg = self.vllm
+            if vllm_cfg.max_logprobs < self.gconfig.score_centering_top_k:
+                logger.info(
+                    "Raising vllm.max_logprobs from %d to %d so the sampler can "
+                    "return score-centering heads.",
+                    vllm_cfg.max_logprobs,
+                    self.gconfig.score_centering_top_k,
+                )
+                vllm_cfg.max_logprobs = self.gconfig.score_centering_top_k
+
+        # Mirror actor.use_score_centering into the engine config.
+        self.rollout.use_score_centering = self.actor.use_score_centering
+        # SC requires the untruncated, unpenalised sampler support.
+        if self.actor.use_score_centering:
+            # Head width: integer in [1, 1024].
+            from areal.utils.score_centering import validate_sampling
+
+            validate_sampling(self.gconfig)
+            rollout_backend = str(getattr(self.rollout, "backend", "") or "")
+            if not rollout_backend.startswith("vllm:"):
+                raise ValueError(
+                    "Score centering on this branch requires a vLLM rollout "
+                    f"backend; got {rollout_backend!r}. The SGLang path does not "
+                    "collect sampler heads."
+                )
+            agent = getattr(self.rollout, "agent", None)
+            if getattr(agent, "chat_template_type", "hf") == "concat":
+                logger.warning(
+                    "Score centering does not carry sampler heads across concat "
+                    "multi-turn turns; multi-turn concat raises at run time."
+                )
+            # The v2 rollout controller never carries top-k heads.
+            if str(getattr(self.rollout, "_version", "v1")) == "v2":
+                raise ValueError(
+                    "Score centering is not wired for the v2 rollout controller "
+                    "(rollout._version='v2'): its bridge does not request or carry "
+                    "sampler top-k heads. Use rollout._version='v1' or disable "
+                    "score centering."
+                )
         super().__post_init__()
 
 
