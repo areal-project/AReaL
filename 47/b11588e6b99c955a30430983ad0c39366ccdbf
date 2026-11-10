@@ -9,6 +9,9 @@ areal/infra/remote_inf_engine.py
   s_6b814fc8a9d033::t_f6d5a9209597b2 1356,1359
   s_6b814fc8a9d033::t_a72250ba450c6f 1273
   s_6b814fc8a9d033::t_65f433901b7cb2 1364
+  s_6b814fc8a9d033::t_34ecd37fd315ad 1338,1345-1347,1349,1371-1375,1384-1388,1394
+  s_6b814fc8a9d033::t_ca17e1cd26ebf4 163-164
+  s_6b814fc8a9d033::t_36de6ece94ce9b 1284-1304
 areal/engine/sglang_remote.py
   s_6b814fc8a9d033::t_fa053682cbea7b 107-108
 tests/infra/test_remote_inf_engine.py
