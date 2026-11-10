@@ -1,0 +1,33 @@
+areal/infra/remote_inf_engine.py
+  s_6b814fc8a9d033::t_9ad768584d0a5c 639-645,653,655,665,670
+  s_6b814fc8a9d033::t_685d2eafe53da4 1295-1297
+  s_6b814fc8a9d033::t_96218d7ac9e620 143
+  s_6b814fc8a9d033::t_c212cc97cdb2c2 50,78-79,141-142,144-154,158-163
+  s_6b814fc8a9d033::t_306dde12fcee6f 621-623,625-638,646-652,654,656-659,664,666-669
+  s_6b814fc8a9d033::t_67234cc0ba83ae 14,155-157,624,660-663,1213-1229,1232-1233,1235-1239,1301-1304,1306,1427-1428
+  s_6b814fc8a9d033::t_fa053682cbea7b 60,1211-1212,1231,1234,1275-1279
+  s_6b814fc8a9d033::t_f6d5a9209597b2 1288-1294,1298-1300,1305,1307
+  s_6b814fc8a9d033::t_a72250ba450c6f 1230
+  s_6b814fc8a9d033::t_65f433901b7cb2 1308
+areal/engine/sglang_remote.py
+  s_6b814fc8a9d033::t_fa053682cbea7b 107-108
+tests/infra/test_remote_inf_engine.py
+  s_6b814fc8a9d033::t_08bb771564c731 12-16,18-22,24-28
+  s_6b814fc8a9d033::t_52cf837ee73d3e 17,23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8dd36f3770d483a79b903e9f11cdaa85c58d00e9",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
