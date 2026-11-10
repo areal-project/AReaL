@@ -2214,7 +2214,7 @@ class PPOActorConfig(TrainEngineConfig):
     use_score_centering: bool = field(
         default=False,
         metadata={
-            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Initial support: SGLang, FSDP (TP/CP), temperature=1, no sampling truncation."
+            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Support: SGLang, FSDP (TP/CP) or Megatron (TP/CP/PP), temperature=1, no sampling truncation."
         },
     )
 
@@ -2427,11 +2427,21 @@ class PPOActorConfig(TrainEngineConfig):
         super().__post_init__()
         if self.use_score_centering:
             if (
-                not self.backend.startswith("fsdp:")
+                not self.backend.startswith(("fsdp:", "megatron:"))
                 or self.enable_tree_training
                 or self.is_critic
             ):
-                raise ValueError("Score centering requires an ordinary FSDP actor.")
+                raise ValueError(
+                    "Score centering requires an ordinary FSDP or Megatron actor."
+                )
+            if self.backend.startswith("megatron:") and (
+                self.megatron.lm_head_loss_chunk_size > 0
+                or self.megatron.enable_mtp_training
+                or self.megatron.entropy_requires_grad
+            ):
+                raise ValueError(
+                    "Megatron score centering requires ordinary logits, no MTP, and diagnostic-only entropy."
+                )
             if self.temperature != 1.0 or self.recompute_logprob:
                 raise ValueError(
                     "Score centering requires temperature=1 and recompute_logprob=False to preserve sampler probabilities."
@@ -3163,6 +3173,48 @@ class AgentConfig:
 
 
 @dataclass
+class BackendRoutingConfig:
+    """Optional v1 trajectory routing through the shared v2 Router service.
+
+    Set `rollout.backend_routing.enabled: true` with SGLang in single-controller
+    mode. The controller starts a router automatically unless `router_addr` and
+    its `admin_api_key` are supplied through private configuration.
+
+    New sessions choose a healthy backend with the fewest outstanding execution
+    leases divided by capacity; ties are random. Subsequent requests retain the
+    same backend for cache locality. This score counts in-flight requests, not
+    tokens, active trajectories, or GPU utilization. Capacity normalizes the
+    score without changing native concurrency. Generation goes directly to the
+    backend; the router only handles metadata.
+
+    Pausing fences admission and drains executions before native generation is
+    paused for weight publication. An ambiguous execution fails the pool and
+    requires restarting the experiment; it is never automatically replayed.
+    """
+
+    enabled: bool = False
+    """Route each generation execution; retain existing routing when false."""
+    router_addr: str | None = None
+    """Reachable existing Router URL; None starts one on the Controller node."""
+    admin_api_key: str | None = None
+    """Existing Router credential; generated per run for an owned subprocess."""
+    capacity: int | None = None
+    """Positive normalization capacity; defaults to SGLang max_running_requests."""
+    metadata_timeout: float = 30.0
+    """Maximum seconds to resolve a metadata operation with idempotent retries."""
+    control_timeout: float = 1800.0
+    """Maximum seconds of backend unavailability or draining; excludes training pauses."""
+
+    def __post_init__(self):
+        if self.capacity is not None and self.capacity <= 0:
+            raise ValueError("backend_routing.capacity must be positive")
+        if self.metadata_timeout <= 0 or self.control_timeout <= 0:
+            raise ValueError("backend routing timeouts must be positive")
+        if self.router_addr and not self.admin_api_key:
+            raise ValueError("An existing backend Router requires admin_api_key")
+
+
+@dataclass
 class InferenceEngineConfig:
     """Configuration for inference servers, including offpolicyness control."""
 
@@ -3336,6 +3388,8 @@ class InferenceEngineConfig:
         default="round_robin",
         metadata={"help": "Routing strategy for the inference-service router."},
     )
+    backend_routing: BackendRoutingConfig = field(default_factory=BackendRoutingConfig)
+    """v1 direct generation routing; independent of DataProxy owner routing."""
     poll_interval: float = field(
         default=5.0,
         metadata={

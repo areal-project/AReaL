@@ -57,10 +57,17 @@ def record(directory, phase, task_id):
 
 class ParallelRecipe:
     def __init__(
-        self, count=8, directory=None, delay=0, fail_task="3", fail_phase="clean"
+        self,
+        count=8,
+        directory=None,
+        delay=0,
+        fail_task="3",
+        fail_phase="clean",
+        barrier_phases=(),
     ):
         self.count, self.directory, self.delay = count, directory, delay
         self.fail_task, self.fail_phase = fail_task, fail_phase
+        self.barrier_phases = barrier_phases
 
     def generate(self, context):
         record(self.directory, "generate", context.batch_index)
@@ -69,6 +76,15 @@ class ParallelRecipe:
 
     def visit(self, phase, sample):
         record(self.directory, phase + ".start", sample.task.task_id)
+        if phase in self.barrier_phases:
+            # Short sleeps cannot guarantee overlap while spawned workers import.
+            # Publish readiness after the start record, then wait for a peer.
+            directory = Path(self.directory)
+            (directory / f"{phase}.{sample.task.task_id}.ready").touch()
+            deadline = time.monotonic() + 30
+            while len(list(directory.glob(f"{phase}.*.ready"))) < 2:
+                assert time.monotonic() < deadline, f"No parallel worker in {phase}"
+                time.sleep(0.01)
         if self.delay:
             time.sleep(self.delay)
         if (
@@ -241,7 +257,7 @@ async def test_parallel_workers_overlap_and_keep_output_order(tmp_path, backend)
     """Real local workers overlap; completion timing never chooses dataset order."""
     cfg = replace(
         config(tmp_path),
-        params={"directory": str(tmp_path), "delay": 0.03},
+        params={"directory": str(tmp_path), "barrier_phases": ("clean",)},
         execution=ExecutionConfig(max_workers=2, batch_size=1, backend=backend),
     )
     snapshot = await run_data_job(cfg, tmp_path / "job")
