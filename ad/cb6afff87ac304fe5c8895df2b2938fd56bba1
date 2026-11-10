@@ -1,0 +1,30 @@
+areal/utils/rollout_timeperf.py
+  s_6b814fc8a9d033::t_45509a5c34bf90 126-127,131-136,301
+  s_6b814fc8a9d033::t_b5da53de2441a2 302-329
+  s_6b814fc8a9d033::t_e4b6855da080ce 155-159,161-164
+  s_6b814fc8a9d033::t_ba0570daa5e504 121-123,125,128-130,147-149,192-198,217-221,443-447,475,506-508,541
+  s_6b814fc8a9d033::t_d43ffec2e6cbc1 171-173,176-177,227,604-606,608-610
+  s_6b814fc8a9d033::t_aafe92b7f9dfb1 264,270,568-570
+  s_6b814fc8a9d033::t_194ed092bda6c0 330
+tests/test_rollout_timeperf.py
+  s_6b814fc8a9d033::t_d82893d62a453e 118-136,138-139,141-142
+  s_6b814fc8a9d033::t_a6a1e1be15b3af 84-117
+  s_6b814fc8a9d033::t_572effd15bf064 11-14,55-83,137,140,143
+  s_6b814fc8a9d033::t_d61b01696cedfc 144-145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "adcb6afff87ac304fe5c8895df2b2938fd56bba1",
+  "prompts": {},
+  "sessions": {
+    "s_6b814fc8a9d033": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5c2-6769-7243-ba74-225925da77eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
