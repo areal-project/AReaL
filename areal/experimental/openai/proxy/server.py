@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.finalization import finalize_interactions
+from areal.utils.session_request_ids import SessionRequestIds
 
 if TYPE_CHECKING:
     from areal.experimental.openai.types import InteractionWithTokenLogpReward
@@ -118,6 +119,7 @@ class ExportTrajectoriesResponse(BaseModel):
 
     interactions: dict[str, Any]
     tensor_reference_group_id: str | None = None
+    session_uuid: str | None = None
 
 
 # =============================================================================
@@ -141,6 +143,7 @@ class SessionData:
         # Public task/session names may be reused after export. Backend CLOSED
         # tombstones are run-long, so each physical trajectory needs a nonce.
         self.backend_session_id = uuid.uuid4().hex
+        self.sglang_request_ids = SessionRequestIds()
         self.sampling_seed_identity = sampling_seed_identity or session_id
         self.processor_cache = processor_cache
         self.processor_cache_group_id = processor_cache_group_id

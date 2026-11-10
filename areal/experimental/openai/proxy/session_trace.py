@@ -54,11 +54,16 @@ class ProxySessionTrace:
         self._next_seq += 1
 
     def start_session(
-        self, session_id: str, *, task_id: str | None = None, group_size: int = 1
+        self,
+        session_id: str,
+        *,
+        task_id: str | None = None,
+        group_size: int = 1,
+        session_uuid: str | None = None,
     ) -> str:
         with self._lock:
             self._active_sessions.add(session_id)
-            session_uuid = uuid.uuid4().hex
+            session_uuid = session_uuid or uuid.uuid4().hex
             group_id = task_id
             sample_idx = None
             if task_id is not None and group_size > 1:
@@ -160,6 +165,7 @@ class ProxySessionTrace:
             "toolcall",
             "pre_process",
             "post_process",
+            "server_generate",
         }:
             return False
         with self._lock:
