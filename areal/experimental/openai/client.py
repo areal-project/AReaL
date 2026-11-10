@@ -255,7 +255,13 @@ def drop_vision_pad_tokens(response: Any, pad_ids: frozenset[int]) -> None:
     if not n_dropped:
         return
     response.output_tokens = [response.output_tokens[i] for i in keep]
-    for attr in ("output_logprobs", "output_versions"):
+    for attr in (
+        "output_logprobs",
+        "output_versions",
+        # Heads are row-parallel with tokens; drop the rows with the tokens.
+        "sampler_head_ids",
+        "sampler_head_logprobs",
+    ):
         seq = getattr(response, attr, None)
         if seq is not None and len(seq) == n_dropped + len(keep):
             setattr(response, attr, [seq[i] for i in keep])
@@ -865,6 +871,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
         processor: Any | None = None,
+        score_centering_top_k: int = 0,
     ):
         super().__init__(client)
         self.engine = engine
@@ -878,6 +885,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self.lora_name = lora_name
         self.processor = processor
         self.vision_pad_ids = vision_pad_token_ids(tokenizer, processor=processor)
+        self.score_centering_top_k = score_centering_top_k
 
     def _retains_collapsed_prompts(self) -> bool:
         """Whether a future concat child could read the collapsed prompt."""
@@ -1041,6 +1049,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             interaction = InteractionWithTokenLogpReward(
                 messages=deepcopy(messages_list),  # Store a copy of the input messages
                 chat_template_type=self.chat_template_type,
+                score_centering_top_k=self.score_centering_top_k,
             )
             cache[completion_id] = interaction
 
@@ -1228,6 +1237,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
+            score_centering_top_k=self.score_centering_top_k,
             stop_token_ids=list(
                 set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
             ),
@@ -1438,6 +1448,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
         processor: Any | None = None,
+        score_centering_top_k: int = 0,
     ):
         super().__init__(client)
         self.engine = engine
@@ -1451,6 +1462,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         self.lora_name = lora_name
         self.processor = processor
         self.vision_pad_ids = vision_pad_token_ids(tokenizer, processor=processor)
+        self.score_centering_top_k = score_centering_top_k
 
     def _retains_collapsed_prompts(self) -> bool:
         """Whether a future concat child could read the collapsed prompt."""
@@ -1521,6 +1533,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         interaction = InteractionWithTokenLogpReward(
             messages=deepcopy(messages_list),  # Store a copy of the input messages
             chat_template_type=self.chat_template_type,
+            score_centering_top_k=self.score_centering_top_k,
             input_data=(
                 deepcopy(input) if not is_omitted(input) else ""
             ),  # Store a copy of the input data
@@ -1663,6 +1676,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
+            score_centering_top_k=self.score_centering_top_k,
             stop_token_ids=list(
                 set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
             ),
@@ -1815,6 +1829,7 @@ class ArealOpenAI(AsyncOpenAI):
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
         processor: Any | None = None,
+        score_centering_top_k: int = 0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1824,6 +1839,7 @@ class ArealOpenAI(AsyncOpenAI):
         self.reasoning_parser = reasoning_parser
         self.lora_name = lora_name
         self.processor = processor
+        self.score_centering_top_k = score_centering_top_k
 
         # Use an ordered dict to maintain insertion order of completions/responses
         self._cache: InteractionCache = InteractionCache()
@@ -1841,6 +1857,7 @@ class ArealOpenAI(AsyncOpenAI):
             chat_template_kwargs=chat_template_kwargs,
             lora_name=lora_name,
             processor=processor,
+            score_centering_top_k=self.score_centering_top_k,
         )
 
         # Override chat.completions with our extended implementation
@@ -1856,6 +1873,7 @@ class ArealOpenAI(AsyncOpenAI):
             chat_template_kwargs=chat_template_kwargs,
             lora_name=lora_name,
             processor=processor,
+            score_centering_top_k=self.score_centering_top_k,
         )
 
     def get_interaction(self, id: str) -> InteractionWithTokenLogpReward | None:

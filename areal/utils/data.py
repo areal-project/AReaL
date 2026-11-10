@@ -205,6 +205,9 @@ def pad_input(hidden_states, indices, batch, seqlen):
 def _pad_cat_dim0(tensors: list[torch.Tensor], pad_value: float = 0.0) -> torch.Tensor:
     """Pad tensors to the same non-batch dims and concatenate along dim 0.
 
+    Padding is zero except for `sampler_head_logprobs`, which is filled with
+    ``-inf`` so the padded slots carry no sampler probability mass.
+
     For 0D/1D tensors no padding is needed — they are simply concatenated.
     For ≥2D tensors, dimensions 1…N-1 are right-padded to the per-dimension
     maximum across *tensors* before concatenation along dim 0.
@@ -347,7 +350,13 @@ def concat_padded_tensors(
             continue
         values = [td[key] for td in tensor_dicts]
         if isinstance(values[0], torch.Tensor):
-            pv = 0.0 if key == "attention_mask" else pad_value
+            if key == "attention_mask":
+                pv = 0.0
+            elif key == "sampler_head_logprobs":
+                # Only sampler log-probs pad with -inf (exp(-inf) == 0); other keys keep 0.0.
+                pv = float("-inf")
+            else:
+                pv = pad_value
             result[key] = _pad_cat_dim0(values, pad_value=pv)
         elif isinstance(values[0], list):
             result[key] = [item for v in values for item in v]
@@ -358,15 +367,24 @@ def concat_padded_tensors(
 
 
 def _unpad_splits(
-    splits: list[torch.Tensor], traj_seqlens: list[int] | None
+    splits: list[torch.Tensor], traj_seqlens: list[int] | None, *, seq_dim: int = -1
 ) -> list[torch.Tensor]:
-    """Trim each split tensor's last dim to its original sequence length."""
+    """Trim each split tensor's sequence dimension to its original length."""
     if traj_seqlens is None:
         return splits
     for i, s in enumerate(splits):
-        if s.ndim >= 2 and s.shape[-1] > traj_seqlens[i]:
-            splits[i] = s[..., : traj_seqlens[i]]
+        if s.ndim >= 2 and s.shape[seq_dim] > traj_seqlens[i]:
+            splits[i] = s.narrow(seq_dim, 0, traj_seqlens[i])
     return splits
+
+
+# Payloads laid out as [tokens, k]: the sequence dimension is dim 1, so padding
+# must be trimmed there instead of on the (narrow) head axis.
+_TOKEN_PAYLOAD_KEYS = (
+    "routed_experts",
+    "sampler_head_ids",
+    "sampler_head_logprobs",
+)
 
 
 def split_and_unpad_tensor(
@@ -404,9 +422,14 @@ def split_and_unpad_tensor(
         split_result = [{} for _ in range(n_trajs)]
         for key, value in result.items():
             if isinstance(value, torch.Tensor) and value.shape[0] == total:
-                splits = _unpad_splits(
-                    list(value.split(traj_group_sizes, dim=0)), traj_seqlens
-                )
+                splits = list(value.split(traj_group_sizes, dim=0))
+                if key in _TOKEN_PAYLOAD_KEYS:
+                    # Only trim when there is a real token axis to trim; a 2D
+                    # [tokens, k] payload must keep its head width intact.
+                    if value.ndim >= 3:
+                        splits = _unpad_splits(splits, traj_seqlens, seq_dim=1)
+                else:
+                    splits = _unpad_splits(splits, traj_seqlens)
                 for i, s in enumerate(splits):
                     split_result[i][key] = s
             else:
@@ -856,8 +879,17 @@ def split_padded_tensor_dict_into_mb_list(
     for key, value in data.items():
         if key in multimodal_keys:
             continue
-        if key == "position_ids" or (
-            torch.is_tensor(value) and value.numel() == bs * max_seqlen
+        if (
+            key == "position_ids"
+            or (torch.is_tensor(value) and value.numel() == bs * max_seqlen)
+            or (
+                # Also split 3D [bs, max_seqlen, k] sampler tensors so packing yields
+                # [total_tokens, k]; ndim >= 3 avoids matching 2D [bs, seq] tensors.
+                torch.is_tensor(value)
+                and value.ndim >= 3
+                and value.shape[0] == bs
+                and value.shape[1] == max_seqlen
+            )
         ):
             # NOTE: qwen2.5-vl position_ids.numel() == bs * max_seqlen * 3
             to_split[key] = value
@@ -979,6 +1011,16 @@ def pad_packed_tensor_dict(
                 sequence_padded_data["cu_seqlens"] = cu_seqlens_padded
             elif key == "max_seqlen":
                 sequence_padded_data["max_seqlen"] = max_seqlens_padded
+            elif key in ("sampler_head_ids", "sampler_head_logprobs"):
+                fill = float("-inf") if key == "sampler_head_logprobs" else 0
+                new_value = value.new_full((padded_shape[0], *value.shape[1:]), fill)
+                for i in range(batch_size):
+                    new_start = cu_seqlens_padded[i]
+                    old_start, old_end = cu_seqlens[i], cu_seqlens[i + 1]
+                    new_value[new_start : new_start + (old_end - old_start)] = value[
+                        old_start:old_end
+                    ]
+                sequence_padded_data[key] = new_value
             elif key == "position_ids":
                 if len(value.shape) == 2 and value.shape[1] == 3:
                     # [total_seq_len, channel] for qwen2.5 vl, channel==3 for t,h,w
@@ -1066,6 +1108,10 @@ def pad_packed_tensor_dict(
             padded_data[key] = new_cu_seqlens
         elif key == "max_seqlen":
             padded_data[key] = new_max_seqlen
+        elif key in ("sampler_head_ids", "sampler_head_logprobs"):
+            fill = float("-inf") if key == "sampler_head_logprobs" else 0
+            pad = value.new_full((pad_length, *value.shape[1:]), fill)
+            padded_data[key] = torch.cat([value, pad], dim=0)
         elif key == "position_ids":
             # [total_seqlen, channel] for qwen2.5 vl, channel==3 for t,h,w
             if len(value.shape) == 2 and value.shape[1] == 3:
