@@ -370,6 +370,8 @@ class GatewayTrainController:
                 sys.executable,
                 "-m",
                 "areal.v2.training_service.data_proxy",
+                "--request-timeout",
+                str(cfg.request_timeout),
                 "--worker-addrs",
                 ",".join(self._worker_addrs),
                 "--admin-api-key",
@@ -497,7 +499,9 @@ class GatewayTrainController:
             "kwargs": serialize_value(kwargs or {}),
         }
         client = await self._get_async_client()
-        resp = await client.post(f"{worker_addr}{path}", json=payload, timeout=timeout)
+        resp = await client.post(
+            f"{worker_addr}{path}", json=payload, timeout=timeout or None
+        )
         if resp.status_code >= 400:
             raise RuntimeError(
                 f"Worker endpoint call failed on {worker_addr}{path}: {resp.text}"
@@ -670,7 +674,9 @@ class GatewayTrainController:
             url,
             json=payload,
             headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=self.config.request_timeout if timeout is None else timeout,
+            # Zero disables the training RPC deadline across HTTP libraries.
+            timeout=(self.config.request_timeout if timeout is None else timeout)
+            or None,
         )
         if resp.status_code >= 400:
             raise RuntimeError(
@@ -687,7 +693,7 @@ class GatewayTrainController:
         resp = requests.get(
             url,
             headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=self.config.request_timeout,
+            timeout=self.config.request_timeout or None,
         )
         if resp.status_code >= 400:
             raise RuntimeError(
@@ -972,7 +978,9 @@ class GatewayTrainController:
         # Optional trace persistence must not block failed-generation cleanup
         # for the full training RPC timeout. A timeout does not cancel the RPC.
         self._gateway_post(
-            "/save_perf_tracer", payload, timeout=min(5.0, self.config.request_timeout)
+            "/save_perf_tracer",
+            payload,
+            timeout=min(5.0, self.config.request_timeout or 5.0),
         )
 
     def clear_batches(self, *targets: Any) -> None:

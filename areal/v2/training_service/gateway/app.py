@@ -87,7 +87,7 @@ async def _forward_get(request: Request, path: str, config: GatewayConfig) -> Re
         resp = await request.app.state.upstream_client.get(
             f"{model_addr}{path}",
             headers=streaming._forwarding_headers(dict(request.headers)),
-            timeout=config.forward_timeout,
+            timeout=config.forward_timeout or None,
         )
     except Exception as exc:
         logger.error("Forwarding GET failed for %s: %s", path, exc)
@@ -103,7 +103,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         router_client = httpx.AsyncClient(timeout=config.router_timeout)
-        upstream_client = httpx.AsyncClient(timeout=config.forward_timeout)
+        upstream_client = httpx.AsyncClient(timeout=config.forward_timeout or None)
         app.state.router_client = router_client
         app.state.upstream_client = upstream_client
         try:

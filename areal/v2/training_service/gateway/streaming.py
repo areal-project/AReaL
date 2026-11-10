@@ -76,6 +76,6 @@ async def forward_request(
         upstream_url,
         content=body,
         headers=fwd_headers,
-        timeout=timeout,
+        timeout=timeout or None,
     )
     return resp
