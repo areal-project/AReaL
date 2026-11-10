@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import threading
+import time
 import traceback
 from collections import defaultdict
 from collections.abc import Callable
@@ -48,6 +49,7 @@ from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
 from areal.utils.rollout_metrics import ConsumedMetrics
 from areal.utils.rollout_phase_context import track_step_phase
+from areal.utils.session_request_ids import SessionRequestIds
 
 from ..staleness_manager import StalenessManager
 from ..workflow_executor import (
@@ -1443,16 +1445,33 @@ class RolloutController:
         ModelResponse
             The generated response from the model
         """
+        request_ids = SessionRequestIds.current()
+        if request_ids is not None:
+            req = req.copy()
+            req.metadata["_areal_sglang_session_uuid"] = request_ids.session_uuid
+            req.metadata["_areal_sglang_call_index"] = request_ids.next_call_index()
+
         # Choose worker and delegate
         worker, rank = self._choose_worker()
 
         # Call agenerate on engine via scheduler
-        return await self.scheduler.async_call_engine(
+        response = await self.scheduler.async_call_engine(
             worker_id=worker.id,
             method="agenerate",
             engine_name=self._engine_name(rank),
             req=req,
         )
+        if request_ids is not None and response is not None:
+            worker_finished_at = getattr(response, "sglang_worker_finished_at", None)
+            if isinstance(worker_finished_at, (int, float)):
+                clock_offset = time.time() - worker_finished_at
+                for rid, duration, worker_received_at in getattr(
+                    response, "sglang_server_timings", ()
+                ):
+                    request_ids.record_server_timing(
+                        rid, duration, worker_received_at + clock_offset
+                    )
+        return response
 
     async def init_weights_update_group(self, meta: WeightUpdateMeta) -> None:
         tasks = [
@@ -1577,6 +1596,15 @@ class RolloutController:
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
         self._collective_rpc("save_perf_tracer", step=step, force=force)
+
+    def get_sglang_timing_sessions(
+        self, started_at: float, ended_at: float
+    ) -> list[dict[str, Any]]:
+        """Collect direct v1 session lifetimes and SGLang request intervals."""
+        results = self._collective_rpc(
+            "get_sglang_timing_sessions", started_at, ended_at
+        )
+        return [session for worker_sessions in results for session in worker_sessions]
 
     @property
     def staleness_manager(self):

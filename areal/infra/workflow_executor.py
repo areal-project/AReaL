@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, Protocol
 from collections.abc import Generator
 from collections import deque
+from contextlib import nullcontext
 import torch
 import requests
 import torch.distributed as dist
@@ -42,6 +43,7 @@ from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
 from areal.utils.data import RolloutGroup, cycle_dataloader
 from areal.utils.perf_tracer import trace_perf, trace_session_event
+from areal.utils.session_request_ids import SessionRequestIds
 from areal.utils.rollout_phase_context import track_step_phase
 from logging import Logger
 
@@ -1336,6 +1338,7 @@ class WorkflowExecutor:
 
             # Set task_id in ContextVar before entering arun_episode
             perf_tracer.set_task_id(task_id)
+            perf_tracer.set_session_id(None)
 
             # Set workflow execution context
             workflow_context.set(
@@ -1348,13 +1351,39 @@ class WorkflowExecutor:
             should_accept_fn = pending_task.should_accept_fn
             should_accept: bool | None = None
             reason: str | None = None
+            request_ids: SessionRequestIds | None = None
 
             try:
                 workflow_data = pending_task.data
                 if workflow_data is not None:
-                    traj = await pending_task.workflow.arun_episode(
-                        self.inference_engine, workflow_data
+                    request_ids = (
+                        SessionRequestIds()
+                        if self.config._version == "v1"
+                        and perf_tracer.get_session_tracer() is not None
+                        and not getattr(
+                            pending_task.workflow, "owns_sample_request_ids", False
+                        )
+                        else None
                     )
+                    if request_ids is not None:
+                        callback = getattr(
+                            self.inference_engine, "record_sglang_server_timing", None
+                        )
+                        if callable(callback):
+                            request_ids.set_server_timing_callback(callback)
+                        start_timing = getattr(
+                            self.inference_engine, "start_sglang_timing_session", None
+                        )
+                        if callable(start_timing):
+                            start_timing(request_ids.session_uuid, time.time())
+                    with (
+                        request_ids.activate()
+                        if request_ids is not None
+                        else nullcontext()
+                    ):
+                        traj = await pending_task.workflow.arun_episode(
+                            self.inference_engine, workflow_data
+                        )
 
                 # Trajectory format checking
                 if self.config.check_trajectory_format and traj is not None:
@@ -1508,6 +1537,13 @@ class WorkflowExecutor:
                     )
                 await self._clear_rejected_trajectory(traj)
                 return None
+            finally:
+                if request_ids is not None:
+                    end_timing = getattr(
+                        self.inference_engine, "end_sglang_timing_session", None
+                    )
+                    if callable(end_timing):
+                        end_timing(request_ids.session_uuid, time.time())
 
         async def _execute_with_metrics() -> WorkflowTaskResult:
             with capture_metrics() as metrics:
