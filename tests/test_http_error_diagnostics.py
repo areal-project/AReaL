@@ -155,6 +155,36 @@ async def test_http_retry_after_error_returns_successful_json() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_retry_uses_a_new_rid_for_each_physical_send() -> None:
+    """An HTTP retry must not reuse the previous SGLang request ID."""
+    received: list[str] = []
+    next_index = 0
+
+    async def handler(request: web.Request) -> web.Response:
+        received.append((await request.json())["rid"])
+        if len(received) == 1:
+            return web.json_response({"error": "retry"}, status=503)
+        return web.json_response({"meta_info": {"id": received[-1]}})
+
+    def payload_factory() -> dict[str, str]:
+        nonlocal next_index
+        next_index += 1
+        return {"rid": f"session:{next_index}"}
+
+    async with http_server(handler) as addr:
+        result = await http.arequest_with_retry(
+            addr,
+            "/generate",
+            max_retries=2,
+            retry_delay=0,
+            payload_factory=payload_factory,
+        )
+
+    assert received == ["session:1", "session:2"]
+    assert result == {"meta_info": {"id": "session:2"}}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("borrowed", [False, True])
 async def test_http_invalid_method_respects_session_ownership(
     borrowed: bool, monkeypatch: pytest.MonkeyPatch
