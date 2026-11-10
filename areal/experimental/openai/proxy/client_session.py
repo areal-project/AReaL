@@ -231,6 +231,7 @@ class OpenAIProxyClient:
             data = await resp.json()
 
         serialized_interactions = data["interactions"]
+        self.session_uuid = data.get("session_uuid") or self.session_uuid
         tensor_group_id = data.get("tensor_reference_group_id")
         if tensor_group_id is not None:
             if self._shared_tensor_resolver is None:

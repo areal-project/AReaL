@@ -25,6 +25,7 @@ from torch import profiler
 from areal.api.cli_args import PerfTracerConfig, SessionTracerConfig
 from areal.utils import logging
 from areal.utils.environ import rank_in_env_filter
+from areal.utils.session_request_ids import SessionRequestIds
 
 logger = logging.getLogger("PerfTracer")
 
@@ -482,6 +483,7 @@ class SessionRecord:
     rank: int
     role: str | None
     submit_ts: float
+    session_uuid: str | None = None
     status: str = "pending"
     reason: str | None = None
     finalized_ts: float | None = None
@@ -629,6 +631,7 @@ class SessionRecord:
             FieldSpec("status"),
             FieldSpec("reason", omit_if_none=True),
             FieldSpec("submit_ts"),
+            FieldSpec("session_uuid", omit_if_none=True),
             FieldSpec("finalized_ts", omit_if_none=True),
             FieldSpec(
                 compute=cls._compute_total_time,
@@ -990,7 +993,7 @@ class SessionTracer:
         with self._lock:
             self._task_to_sessions.setdefault(task_id, set())
 
-    def register_session(self, task_id: int) -> int:
+    def register_session(self, task_id: int, session_uuid: str | None = None) -> int:
         """Register a new session and optionally associate it with a task.
 
         Returns the newly-created session_id.
@@ -1005,9 +1008,17 @@ class SessionTracer:
                 rank=self._rank,
                 role=self._role,
                 submit_ts=now,
+                session_uuid=session_uuid,
             )
             self._task_to_sessions.setdefault(task_id, set()).add(session_id)
         return session_id
+
+    def set_session_uuid(self, session_id: int, session_uuid: str) -> None:
+        """Replace a local workflow UUID with the proxy's physical session UUID."""
+        with self._lock:
+            record = self._records.get(session_id)
+            if record is not None:
+                record.session_uuid = session_uuid
 
     def get_session_ids(self, task_id: int) -> list[int]:
         """Get all session IDs associated with the given task_id."""
@@ -2001,8 +2012,20 @@ def register_session(task_id: int) -> int | None:
     session_id = None
     tracer = get_session_tracer()
     if tracer is not None:
-        session_id = tracer.register_session(task_id)
+        request_ids = SessionRequestIds.current()
+        session_id = tracer.register_session(
+            task_id,
+            session_uuid=request_ids.session_uuid if request_ids is not None else None,
+        )
     return session_id
+
+
+def set_current_session_uuid(session_uuid: str | None) -> None:
+    """Associate the active trace record with the proxy session UUID."""
+    tracer = get_session_tracer()
+    session_id = get_session_id()
+    if tracer is not None and session_id is not None and session_uuid is not None:
+        tracer.set_session_uuid(session_id, session_uuid)
 
 
 def session_context():
@@ -2118,6 +2141,7 @@ __all__ = [
     "get_task_id",
     "register_task",
     "register_session",
+    "set_current_session_uuid",
     "GLOBAL_TRACER",
     "get_tracer",
     "get_session_tracer",

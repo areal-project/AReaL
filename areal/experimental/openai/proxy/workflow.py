@@ -17,7 +17,11 @@ import torch
 from areal.api import RolloutWorkflow
 from areal.infra import workflow_context
 from areal.utils import logging, stats_tracker
-from areal.utils.perf_tracer import session_context, trace_session
+from areal.utils.perf_tracer import (
+    session_context,
+    set_current_session_uuid,
+    trace_session,
+)
 from areal.utils.stats_tracker import DistributedStatsTracker, ReduceType
 
 from .client_session import OpenAIProxyClient, post_json
@@ -539,6 +543,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 drop_retry_orphans=self.drop_retry_orphans,
                 is_eval=workflow_context.get().is_eval,
             )
+            set_current_session_uuid(proxy_client.session_uuid)
             self._configure_r3_interactions(interactions)
 
             # Return None if no interactions (empty session — user never sent chat/completions)
@@ -575,6 +580,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         )
         agent_error: Exception | None = None
         async with proxy_client:
+            set_current_session_uuid(proxy_client.session_uuid)
             # Run the user code.
             try:
                 rewards = await self._run_agent(
