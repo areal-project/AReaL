@@ -923,20 +923,36 @@ class PPOTrainer:
             if config.rollout.agent is not None
             else None
         )
+        direct_sglang_timing = (
+            is_v1_rollout
+            and config.rollout.backend.startswith("sglang:")
+            and config.perf_tracer is not None
+            and config.perf_tracer.session_tracer is not None
+            and config.perf_tracer.session_tracer.enabled
+        )
         if (
             is_v1_rollout
-            and trace_config is not None
-            and trace_config.enabled
             and isinstance(self.rollout, RolloutController)
-            and self.rollout.proxy_addrs
+            and (
+                (
+                    self.rollout.proxy_addrs
+                    and trace_config is not None
+                    and trace_config.enabled
+                )
+                or (not self.rollout.proxy_addrs and direct_sglang_timing)
+            )
         ):
             self._rollout_trace_observer = RolloutTraceObserver(
                 self.rollout.proxy_addrs,
-                config.rollout.agent.admin_api_key,
+                config.rollout.agent.admin_api_key
+                if config.rollout.agent is not None
+                else "",
                 trace_config,
                 logger,
+                use_sglang_server_timing=config.rollout.backend.startswith("sglang:"),
             )
-            self._rollout_trace_observer.start()
+            if self.rollout.proxy_addrs:
+                self._rollout_trace_observer.start()
 
         if self.recover_info is None and self._evaluate_before_train(
             eval_workflow=eval_workflow,
@@ -1006,6 +1022,11 @@ class PPOTrainer:
                 with tracker.lock:
                     rollout_seconds = tracker.stats["timeperf/rollout"][-1]
                 try:
+                    if not trace_observer.proxy_addrs:
+                        sessions = self.rollout.get_sglang_timing_sessions(
+                            rollout_started_at, rollout_ended_at
+                        )
+                        trace_observer.load_direct_sglang_sessions(sessions)
                     if trace_observer.poll_once():
                         attributed = trace_observer.attribute_step(
                             rollout_started_at, rollout_ended_at, rollout_seconds
