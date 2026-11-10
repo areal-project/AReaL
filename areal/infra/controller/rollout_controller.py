@@ -44,12 +44,12 @@ from areal.infra.utils.concurrent import run_async_task
 from areal.infra.utils.exp_metadata import get_metadata_dir
 from areal.infra.utils.inference_targets import write_inference_targets
 from areal.utils import logging, perf_tracer
+from areal.utils.arena_stream_dataloader import ArenaStreamDataLoader
 from areal.utils.data import cycle_dataloader
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
 from areal.utils.rollout_metrics import ConsumedMetrics
-from areal.utils.stream_dataloader import StreamDataLoader
 
 from ..staleness_manager import StalenessManager
 from ..workflow_executor import (
@@ -163,7 +163,7 @@ class _RemoteRolloutTaskInput:
     reward_normalization: bool = False
     reward_normalization_use_std: bool = True
     drop_incomplete_group: bool = False
-    stream_dataloader: StreamDataLoader | None = None
+    arena_stream_dataloader: ArenaStreamDataLoader | None = None
 
 
 class RolloutController:
@@ -1297,10 +1297,10 @@ class RolloutController:
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
                 return None
 
-        if pending_task.stream_dataloader is None:
+        if pending_task.arena_stream_dataloader is None:
             return _submit_then_wait
 
-        async def _submit_with_stream_feedback() -> WorkflowTaskResult | None:
+        async def _submit_with_arena_stream_feedback() -> WorkflowTaskResult | None:
             accepted = None
             try:
                 result = await _submit_then_wait()
@@ -1315,11 +1315,11 @@ class RolloutController:
                 # Cancellation releases a reservation without declaring an
                 # unfinished base task rejected. Feedback precedes consumption
                 # so a partial batch can immediately replenish its source.
-                pending_task.stream_dataloader.complete_rollout(
+                pending_task.arena_stream_dataloader.complete_arena_rollout(
                     pending_task.task_id, accepted
                 )
 
-        return _submit_with_stream_feedback
+        return _submit_with_arena_stream_feedback
 
     def get_capacity(self):
         return self.staleness_manager.get_capacity()
@@ -1425,7 +1425,7 @@ class RolloutController:
     @trace_perf("rollout_controller.prepare_batch", category="scheduler")
     def prepare_batch(
         self,
-        dataloader: StatefulDataLoader | StreamDataLoader,
+        dataloader: StatefulDataLoader | ArenaStreamDataLoader,
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         should_accept_fn: str | None = None,
@@ -1449,8 +1449,8 @@ class RolloutController:
         if workflow_kwargs is None:
             workflow_kwargs = {}
 
-        stream_dataloader = (
-            dataloader if isinstance(dataloader, StreamDataLoader) else None
+        arena_stream_dataloader = (
+            dataloader if isinstance(dataloader, ArenaStreamDataLoader) else None
         )
 
         def task_input_generator():
@@ -1460,8 +1460,8 @@ class RolloutController:
             while True:
                 task_id = self._task_id_generator.next()
                 item = (
-                    stream_dataloader.next_rollout(task_id)
-                    if stream_dataloader is not None
+                    arena_stream_dataloader.next_arena_rollout(task_id)
+                    if arena_stream_dataloader is not None
                     else next(base_items)
                 )
                 try:
@@ -1480,11 +1480,11 @@ class RolloutController:
                         reward_normalization=reward_normalization,
                         reward_normalization_use_std=reward_normalization_use_std,
                         drop_incomplete_group=drop_incomplete_group,
-                        stream_dataloader=stream_dataloader,
+                        arena_stream_dataloader=arena_stream_dataloader,
                     )
                 except BaseException:
-                    if stream_dataloader is not None:
-                        stream_dataloader.complete_rollout(task_id, None)
+                    if arena_stream_dataloader is not None:
+                        arena_stream_dataloader.complete_arena_rollout(task_id, None)
                     raise
                 yield task
 

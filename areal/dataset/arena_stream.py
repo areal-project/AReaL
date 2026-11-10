@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Opt-in stream provenance for rejection-aware rollout sampling."""
+"""Opt-in Arena stream provenance for rejection-aware rollout sampling."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from collections import defaultdict
 from typing import Any
 
 
-class StreamDataset:
+class ArenaStreamDataset:
     """Preserve a dataset's mixture while allowing same-stream replacements.
 
     ``stream_key`` identifies the source of each prompt. The original row order
@@ -32,7 +32,7 @@ class StreamDataset:
             self.streams.append(stream)
             self.indices[stream].append(index)
         if not self.streams:
-            raise ValueError("StreamDataset must contain at least one row")
+            raise ValueError("ArenaStreamDataset must contain at least one row")
 
     def __len__(self) -> int:
         return len(self.dataset)

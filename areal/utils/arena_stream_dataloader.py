@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Dispatch-only replacement sampling; training results remain first-come-first-served."""
+"""Arena stream replacement sampling; training results remain first-come-first-served."""
 
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ from typing import Any
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from areal.dataset.stream import StreamDataset
+from areal.dataset.arena_stream import ArenaStreamDataset
 from areal.utils.data import cycle_dataloader
 
 
-class StreamDataLoader:
+class ArenaStreamDataLoader:
     """A checkpointable prompt source for ``RolloutController.prepare_batch``.
 
     The base loader yields stream names in the original dataset's sampling order.
@@ -32,14 +32,14 @@ class StreamDataLoader:
 
     def __init__(
         self,
-        dataset: StreamDataset,
+        dataset: ArenaStreamDataset,
         base_loader: StatefulDataLoader,
         *,
         shuffle: bool,
         seed: int = 0,
     ) -> None:
         if len(base_loader) == 0:
-            raise ValueError("StreamDataLoader requires at least one base batch")
+            raise ValueError("ArenaStreamDataLoader requires at least one base batch")
         self.dataset = dataset
         self.batch_size = base_loader.batch_size
         self.sampler = base_loader.sampler
@@ -62,11 +62,11 @@ class StreamDataLoader:
 
     def __iter__(self):
         raise RuntimeError(
-            "StreamDataLoader requires RolloutController.prepare_batch for "
+            "ArenaStreamDataLoader requires RolloutController.prepare_batch for "
             "rejection feedback; use the unwrapped dataset for other consumers"
         )
 
-    def _next_row(self, stream: str) -> dict[str, Any]:
+    def _next_arena_row(self, stream: str) -> dict[str, Any]:
         if self._positions[stream] == len(self.dataset.indices[stream]):
             self._epochs[stream] += 1
             self._positions[stream] = 0
@@ -83,7 +83,7 @@ class StreamDataLoader:
         self._positions[stream] += 1
         return row
 
-    def next_rollout(self, task_id: int) -> dict[str, Any]:
+    def next_arena_rollout(self, task_id: int) -> dict[str, Any]:
         """Select and reserve a source before the task is enqueued."""
         with self._lock:
             if task_id in self._tasks:
@@ -100,7 +100,7 @@ class StreamDataLoader:
                         self._base_iterator = cycle_dataloader(self._base_loader)
                     self._pending_streams.extend(next(self._base_iterator))
                 stream = self._pending_streams[0]
-            row = self._next_row(stream)
+            row = self._next_arena_row(stream)
             if replacement:
                 self._reserved[stream] += 1
                 self._replacement_streak += 1
@@ -110,7 +110,7 @@ class StreamDataLoader:
             self._tasks[task_id] = (stream, replacement)
             return row
 
-    def complete_rollout(self, task_id: int, accepted: bool | None) -> None:
+    def complete_arena_rollout(self, task_id: int, accepted: bool | None) -> None:
         """Account once for completion, or release a cancelled reservation.
 
         ``None`` denotes cancellation before a result was observed, not a
@@ -151,10 +151,12 @@ class StreamDataLoader:
     def load_state_dict(self, state: dict[str, Any]) -> None:
         with self._lock:
             if self._tasks:
-                raise RuntimeError("Cannot restore a stream loader with active tasks")
+                raise RuntimeError(
+                    "Cannot restore an Arena stream loader with active tasks"
+                )
             if "stream_key" not in state:
                 raise ValueError(
-                    "Cannot restore a flat dataloader checkpoint into StreamDataLoader: "
+                    "Cannot restore a flat dataloader checkpoint into ArenaStreamDataLoader: "
                     "per-stream cursors and replacement debt are missing. Start a new "
                     "run or resume using the original unwrapped dataset."
                 )
@@ -168,7 +170,7 @@ class StreamDataLoader:
                 or state.get("seed") != self._seed
             ):
                 raise ValueError(
-                    "Stream sampling checkpoint does not match the dataset"
+                    "Arena stream sampling checkpoint does not match the dataset"
                 )
             self._base_loader.load_state_dict(state["base"])
             self._pending_streams = deque(state["pending_streams"])

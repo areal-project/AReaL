@@ -9,7 +9,7 @@ from examples.swe import train_swe_rl
 from examples.swe.utils import ArenaStreamConfig, SWEEnvConfig
 
 import areal
-from areal.dataset.stream import StreamDataset
+from areal.dataset.arena_stream import ArenaStreamDataset
 
 
 @pytest.mark.parametrize(
@@ -52,7 +52,7 @@ def test_arena_entrypoint_enables_compensation_only_for_supported_training(
     train_swe_rl.main([])
 
     datasets = trainer.call_args.kwargs
-    assert isinstance(datasets["train_dataset"], StreamDataset) == enabled
+    assert isinstance(datasets["train_dataset"], ArenaStreamDataset) == enabled
     assert datasets["valid_dataset"] is rows
     if not enabled:
         assert datasets["train_dataset"] is rows

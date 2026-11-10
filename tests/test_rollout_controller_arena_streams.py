@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tests.test_stream_dataloader import make_loader
+from tests.test_arena_stream_dataloader import make_arena_stream_loader
 
 from areal.api.cli_args import InferenceEngineConfig
 from areal.infra.controller.rollout_controller import (
@@ -24,7 +24,9 @@ from areal.infra.workflow_executor import (
 )
 
 
-def make_controller(*, batch_size=2, max_concurrent_rollouts=4, max_staleness=1):
+def make_arena_stream_controller(
+    *, batch_size=2, max_concurrent_rollouts=4, max_staleness=1
+):
     controller = RolloutController(
         inf_engine=Mock,
         config=InferenceEngineConfig(
@@ -54,12 +56,12 @@ def make_controller(*, batch_size=2, max_concurrent_rollouts=4, max_staleness=1)
     "outcome",
     ["accepted", "rejected", "empty", "timeout", "error", "contract", "cancelled"],
 )
-async def test_completion_feedback_covers_terminal_paths(outcome):
-    controller = make_controller()
-    loader = make_loader()
-    loader.next_rollout(0)
-    loader.complete_rollout(0, accepted=False)
-    data = loader.next_rollout(1)
+async def test_arena_completion_feedback_covers_terminal_paths(outcome):
+    controller = make_arena_stream_controller()
+    loader = make_arena_stream_loader()
+    loader.next_arena_rollout(0)
+    loader.complete_arena_rollout(0, accepted=False)
+    data = loader.next_arena_rollout(1)
 
     async def call_engine(worker_id, method, **kwargs):
         if method == "submit":
@@ -85,7 +87,7 @@ async def test_completion_feedback_covers_terminal_paths(outcome):
             workflow=None,
             workflow_kwargs={},
             should_accept_fn=None,
-            stream_dataloader=loader,
+            arena_stream_dataloader=loader,
         )
     )
     controller.staleness_manager.on_rollout_enqueued()
@@ -97,13 +99,17 @@ async def test_completion_feedback_covers_terminal_paths(outcome):
         await callback()
 
     assert loader.state_dict()["debt"]["a"] == int(outcome != "accepted")
-    assert loader.next_rollout(2)["stream"] == ("b" if outcome == "accepted" else "a")
+    assert loader.next_arena_rollout(2)["stream"] == (
+        "b" if outcome == "accepted" else "a"
+    )
 
 
 @pytest.mark.parametrize("dynamic_bs", [False, True])
-def test_fast_stream_results_are_consumed_without_waiting_for_slow_stream(dynamic_bs):
-    controller = make_controller()
-    loader = make_loader(batch_size=2)
+def test_arena_fast_stream_results_are_consumed_without_waiting_for_slow_stream(
+    dynamic_bs,
+):
+    controller = make_arena_stream_controller()
+    loader = make_arena_stream_loader(batch_size=2)
     release_slow = threading.Event()
     stopped = threading.Event()
     inputs = {}
@@ -154,9 +160,9 @@ def test_fast_stream_results_are_consumed_without_waiting_for_slow_stream(dynami
         controller.dispatcher.destroy()
 
 
-def test_prepare_batch_replenishes_filtered_stream_and_preserves_rejection_metrics():
-    controller = make_controller(batch_size=4)
-    loader = make_loader(batch_size=4)
+def test_arena_prepare_batch_replenishes_filtered_stream_and_preserves_rejection_metrics():
+    controller = make_arena_stream_controller(batch_size=4)
+    loader = make_arena_stream_loader(batch_size=4)
     # Give the test enough room for replacements while the main thread waits.
     inputs = {}
     rejected = False
@@ -209,11 +215,11 @@ def test_prepare_batch_replenishes_filtered_stream_and_preserves_rejection_metri
         pool.shutdown(wait=True)
 
 
-def test_permanently_filtered_stream_does_not_starve_healthy_stream():
-    controller = make_controller(
+def test_arena_permanently_filtered_stream_does_not_starve_healthy_stream():
+    controller = make_arena_stream_controller(
         batch_size=1, max_concurrent_rollouts=1, max_staleness=0
     )
-    loader = make_loader(batch_size=1)
+    loader = make_arena_stream_loader(batch_size=1)
     inputs = {}
     stopped = threading.Event()
 
