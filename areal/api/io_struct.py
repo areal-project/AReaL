@@ -90,6 +90,11 @@ class ModelResponse:
     sampler_head_logprobs: list[list[float]] | None = None
     input_videos: list[str | dict[str, Any]] | None = None
 
+    # Populated by SGLang workers for v1 session tracing. Each tuple contains
+    # the physical request ID, server-reported latency, and worker receipt time.
+    sglang_server_timings: list[tuple[str, float, float]] = field(default_factory=list)
+    sglang_worker_finished_at: float | None = None
+
     @property
     def input_len(self) -> int:
         return len(self.input_tokens)
