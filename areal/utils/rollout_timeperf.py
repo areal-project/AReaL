@@ -118,8 +118,22 @@ class SessionTiming:
         )
         return "other", last_end
 
-    def cumulative(self, phase: str, now: float) -> float:
+    def cumulative(
+        self, phase: str, now: float, *, server_generate: bool = False
+    ) -> float:
         if phase == "generate":
+            if server_generate:
+                intervals = sorted(
+                    (start, end)
+                    for (name, _, _, start), end in self.phase_intervals.items()
+                    if name == "server_generate" and end is not None
+                )
+                total = 0.0
+                latest_end = 0.0
+                for start, end in intervals:
+                    total += max(0.0, end - max(start, latest_end))
+                    latest_end = max(latest_end, end)
+                return total
             total = sum(end - start for start, end in self.generate_intervals)
             if self.generate_started_at is not None:
                 total += max(0.0, now - self.generate_started_at)
@@ -130,26 +144,37 @@ class SessionTiming:
             if name == phase
         )
 
-    def boundaries(self) -> list[tuple[float, str, int]]:
+    def boundaries(
+        self, *, server_generate: bool = False
+    ) -> list[tuple[float, str, int]]:
         if self.started_at is None:
             return []
         boundaries = [(self.started_at, "session", 1)]
         if self.ended_at is not None:
             boundaries.append((self.ended_at, "session", -1))
-        for start, end in self.generate_intervals:
-            boundaries.extend(((start, "generate", 1), (end, "generate", -1)))
-        if self.generate_started_at is not None:
-            boundaries.append((self.generate_started_at, "generate", 1))
+        if not server_generate:
+            for start, end in self.generate_intervals:
+                boundaries.extend(((start, "generate", 1), (end, "generate", -1)))
+            if self.generate_started_at is not None:
+                boundaries.append((self.generate_started_at, "generate", 1))
         for (phase, _, _, start), end in self.phase_intervals.items():
+            if phase == "server_generate":
+                if not server_generate or end is None:
+                    continue
+                phase = "generate"
             boundaries.append((start, phase, 1))
             if end is not None:
                 boundaries.append((end, phase, -1))
         return boundaries
 
     @staticmethod
-    def category(values: dict[str, int]) -> str | None:
+    def category(
+        values: dict[str, int], *, prefer_server_generate: bool = False
+    ) -> str | None:
         if values.get("session", 0) <= 0:
             return None
+        if prefer_server_generate and values.get("generate", 0) > 0:
+            return "generate"
         for phase in (
             "pre_process",
             "post_process",
@@ -164,7 +189,13 @@ class SessionTiming:
                 return phase
         return "other"
 
-    def phase_durations(self, started_at: float, ended_at: float) -> dict[str, float]:
+    def phase_durations(
+        self,
+        started_at: float,
+        ended_at: float,
+        *,
+        server_generate: bool = False,
+    ) -> dict[str, float]:
         """Return exclusive session wall time clipped to a requested window."""
         totals = {
             name: 0.0
@@ -183,13 +214,17 @@ class SessionTiming:
         values: dict[str, int] = {}
         previous = started_at
         boundaries = sorted(
-            (item for item in self.boundaries() if item[0] <= ended_at),
+            (
+                item
+                for item in self.boundaries(server_generate=server_generate)
+                if item[0] <= ended_at
+            ),
             key=lambda item: item[0],
         )
         for at, phase, delta in boundaries + [(ended_at, "", 0)]:
             if at > started_at:
                 duration = max(0.0, min(at, ended_at) - previous)
-                current = self.category(values)
+                current = self.category(values, prefer_server_generate=server_generate)
                 if current is not None:
                     totals[current] += duration
                 previous = min(at, ended_at)
@@ -226,11 +261,13 @@ class RolloutTraceObserver:
         admin_api_key: str,
         config: Any,
         logger: Any,
+        use_sglang_server_timing: bool = False,
     ) -> None:
         self.proxy_addrs = list(proxy_addrs)
         self.admin_api_key = admin_api_key
         self.config = config
         self.logger = logger
+        self.use_sglang_server_timing = use_sglang_server_timing
         self._cursors = dict.fromkeys(self.proxy_addrs, 0)
         self._sessions: dict[tuple[str, str], SessionTiming] = {}
         self._controller_intervals: list[tuple[str, float, float]] = []
@@ -260,6 +297,36 @@ class RolloutTraceObserver:
             return
         with self._lock:
             self._controller_intervals.append((phase, started_at, ended_at))
+
+    def load_direct_sglang_sessions(self, sessions: list[dict[str, Any]]) -> None:
+        """Load worker session bounds and SGLang spans for one direct-workflow step."""
+        loaded: dict[tuple[str, str], SessionTiming] = {}
+        for item in sessions:
+            session_uuid = str(item["session_uuid"])
+            session = SessionTiming(session_id=session_uuid)
+            session.apply(
+                {
+                    "kind": "session_start",
+                    "at": float(item["started_at"]),
+                    "session_uuid": session_uuid,
+                }
+            )
+            for rid, start, end in item["intervals"]:
+                session.apply(
+                    {
+                        "kind": "phase_interval",
+                        "at": end,
+                        "phase": "server_generate",
+                        "started_at": start,
+                        "ended_at": end,
+                        "source_id": rid,
+                    }
+                )
+            if item["ended_at"] is not None:
+                session.apply({"kind": "session_end", "at": float(item["ended_at"])})
+            loaded[("direct", session_uuid)] = session
+        with self._lock:
+            self._sessions = loaded
 
     def start(self) -> None:
         if self._thread is not None:
@@ -373,7 +440,11 @@ class RolloutTraceObserver:
             for session in long_tails[: self.config.top_n]:
                 phase, phase_start = session.current_phase(now)
                 elapsed = now - session.started_at
-                durations = session.phase_durations(session.started_at, now)
+                durations = session.phase_durations(
+                    session.started_at,
+                    now,
+                    server_generate=self.use_sglang_server_timing,
+                )
                 generate = durations["generate"]
                 reward = durations["reward"]
                 pause = durations["pause_wait"]
@@ -401,7 +472,7 @@ class RolloutTraceObserver:
                     f"| reward={reward / 60:.1f}m "
                     f"| pause={pause / 60:.1f}m "
                     f"| toolcall={durations['toolcall'] / 60:.1f}m "
-                    f"| other={other / 60:.1f}m "
+                    f"| {'other_or_pending' if self.use_sglang_server_timing else 'other'}={other / 60:.1f}m "
                     f"| last_progress={recent} | requests={session.request_count} "
                     f"| arena_retries={retry_count}"
                 )
@@ -432,7 +503,9 @@ class RolloutTraceObserver:
             for session in selected:
                 assert session.started_at is not None
                 elapsed = max(0.0, now - session.started_at)
-                generate = session.cumulative("generate", now)
+                generate = session.cumulative(
+                    "generate", now, server_generate=self.use_sglang_server_timing
+                )
                 non_generate = max(0.0, elapsed - generate)
                 last_generate_end = max(
                     (end for _, end in session.generate_intervals), default=None
@@ -465,7 +538,7 @@ class RolloutTraceObserver:
                     f"| elapsed={elapsed / 60:.1f}m "
                     f"| phase={phase} ({max(0.0, now - phase_started_at) / 60:.1f}m) "
                     f"| generate={generate / 60:.1f}m "
-                    f"| non_generate={non_generate / 60:.1f}m "
+                    f"| {'non_generate_or_pending' if self.use_sglang_server_timing else 'non_generate'}={non_generate / 60:.1f}m "
                     f"| last_generate_end={recent} | requests={session.request_count}"
                 )
             finished = self._finished_count
@@ -492,7 +565,9 @@ class RolloutTraceObserver:
             boundaries = [
                 (at, key, phase, delta)
                 for key, session in self._sessions.items()
-                for at, phase, delta in session.boundaries()
+                for at, phase, delta in session.boundaries(
+                    server_generate=self.use_sglang_server_timing
+                )
                 if at <= ended_at
             ]
             for index, (phase, start, end) in enumerate(self._controller_intervals):
@@ -526,9 +601,13 @@ class RolloutTraceObserver:
             if not phase:
                 break
             values = state.setdefault(key, {})
-            before = SessionTiming.category(values)
+            before = SessionTiming.category(
+                values, prefer_server_generate=self.use_sglang_server_timing
+            )
             values[phase] = values.get(phase, 0) + delta
-            after = SessionTiming.category(values)
+            after = SessionTiming.category(
+                values, prefer_server_generate=self.use_sglang_server_timing
+            )
             if before is not None:
                 counts[before] -= 1
             if after is not None:

@@ -8,7 +8,10 @@ from unittest.mock import Mock
 import pytest
 
 from areal.experimental.openai.proxy.session_trace import ProxySessionTrace
-from areal.utils.rollout_timeperf import RolloutTraceObserver, SessionTiming
+from areal.utils.rollout_timeperf import (
+    RolloutTraceObserver,
+    SessionTiming,
+)
 
 
 def _observer() -> RolloutTraceObserver:
@@ -46,6 +49,97 @@ def test_attribute_step_concurrent_sessions_splits_wall_time_by_active_count():
     assert result["generate"] == pytest.approx(40.0)
     assert result["reward"] == pytest.approx(20.0)
     assert result["other"] == pytest.approx(0.0)
+    assert sum(result.values()) == pytest.approx(60.0)
+
+
+def test_attribute_step_sglang_mode_uses_only_server_generate_intervals():
+    """Client wait outside the SGLang reported span belongs to other."""
+    observer = _observer()
+    observer.use_sglang_server_timing = True
+    session = SessionTiming("a")
+    for event in (
+        {"kind": "session_start", "at": 0.0},
+        {"kind": "generate_start", "at": 0.0},
+        {"kind": "generate_end", "at": 50.0},
+        {
+            "kind": "phase_interval",
+            "at": 50.0,
+            "phase": "server_generate",
+            "started_at": 10.0,
+            "ended_at": 40.0,
+            "source_id": "session:1",
+        },
+        {"kind": "session_end", "at": 60.0},
+    ):
+        session.apply(event)
+    observer._sessions[("proxy", "a")] = session
+
+    result = observer.attribute_step(0.0, 60.0, 60.0)
+
+    assert result["generate"] == pytest.approx(30.0)
+    assert result["other"] == pytest.approx(30.0)
+    assert sum(result.values()) == pytest.approx(60.0)
+
+
+def test_attribute_step_sglang_report_wins_over_overlapping_client_phase():
+    """A delayed proxy phase event cannot hide a completed server interval."""
+    observer = _observer()
+    observer.use_sglang_server_timing = True
+    session = SessionTiming("a")
+    session.apply({"kind": "session_start", "at": 0.0})
+    session.apply(
+        {
+            "kind": "phase_interval",
+            "at": 60.0,
+            "phase": "pre_process",
+            "started_at": 0.0,
+            "ended_at": 60.0,
+        }
+    )
+    session.apply(
+        {
+            "kind": "phase_interval",
+            "at": 40.0,
+            "phase": "server_generate",
+            "started_at": 10.0,
+            "ended_at": 40.0,
+            "source_id": "a:1.1",
+        }
+    )
+    session.apply({"kind": "session_end", "at": 60.0})
+    observer._sessions[("proxy", "a")] = session
+
+    result = observer.attribute_step(0.0, 60.0, 60.0)
+
+    assert result["generate"] == pytest.approx(30.0)
+    assert result["pre_process"] == pytest.approx(30.0)
+
+
+def test_attribute_direct_sglang_step_shares_time_with_other_active_session():
+    """A concurrent environment-bound session receives its half of wall time."""
+    observer = _observer()
+    observer.use_sglang_server_timing = True
+    observer.load_direct_sglang_sessions(
+        [
+            {
+                "session_uuid": "a",
+                "started_at": 0.0,
+                "ended_at": 60.0,
+                "intervals": [("a:1", 0.0, 60.0)],
+            },
+            {
+                "session_uuid": "b",
+                "started_at": 0.0,
+                "ended_at": 60.0,
+                "intervals": [],
+            },
+        ]
+    )
+
+    result = observer.attribute_step(0.0, 60.0, 60.0)
+
+    assert result["generate"] == pytest.approx(30.0)
+    assert result["other"] == pytest.approx(30.0)
     assert sum(result.values()) == pytest.approx(60.0)
 
 
