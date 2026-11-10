@@ -104,6 +104,8 @@ def _resolve_colocated_base_gpu_id(
 class SGLangBackend:
     """SGLang-specific backend implementation for remote inference."""
 
+    request_id_field = "rid"
+
     def __init__(self) -> None:
         self._readiness_endpoint = "/health"
 
