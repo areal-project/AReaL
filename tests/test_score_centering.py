@@ -305,8 +305,9 @@ def test_default_openai_payload_remains_unchanged():
     assert (
         "score_centering_top_k" not in GenerationHyperparameters().to_openai_args_dict()
     )
-    with pytest.raises(ValueError, match="native SGLang"):
-        GenerationHyperparameters(score_centering_top_k=2).to_openai_args_dict()
+    assert GenerationHyperparameters(score_centering_top_k=2).to_openai_args_dict()[
+        "extra_body"
+    ] == {"score_centering_top_k": 2}
 
 
 def test_mismatched_sampled_and_head_probabilities_fail():

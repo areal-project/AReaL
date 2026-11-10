@@ -24,7 +24,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses import Response
-from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import BaseModel
 
 from areal.api.cli_args import NameResolveConfig
@@ -996,7 +995,37 @@ async def _call_client_create(
     explicit_fields = (
         request.model_fields_set if isinstance(request, BaseModel) else set(request)
     )
+    # OpenAI SDK extra_body fields are flattened onto the HTTP request. Keep
+    # the sampler-head option in the internal extension body before filtering.
+    if "score_centering_top_k" in explicit_fields:
+        extra = kwargs.get("extra_body") or {}
+        if not isinstance(extra, Mapping):
+            raise HTTPException(status_code=400, detail="extra_body must be an object")
+        width = kwargs.pop("score_centering_top_k")
+        if "score_centering_top_k" in extra and extra["score_centering_top_k"] != width:
+            raise HTTPException(
+                status_code=400, detail="Conflicting score_centering_top_k values"
+            )
+        kwargs["extra_body"] = {**extra, "score_centering_top_k": width}
     for key, value in session_data.generation_args.items():
+        if key == "extra_body" and isinstance(value, Mapping):
+            request_extra = kwargs.get(key) or {}
+            if not isinstance(request_extra, Mapping):
+                raise HTTPException(
+                    status_code=400, detail="extra_body must be an object"
+                )
+            expected_width = value.get("score_centering_top_k", 0)
+            if (
+                expected_width
+                and request_extra.get("score_centering_top_k", expected_width)
+                != expected_width
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Request cannot override the session's score_centering_top_k",
+                )
+            kwargs[key] = {**value, **request_extra}
+            continue
         if key in token_limits:
             if token_limits & explicit_fields:
                 continue
@@ -1066,6 +1095,24 @@ async def _call_client_create(
     if template_kwargs:
         extra_body["chat_template_kwargs"] = template_kwargs
         kwargs["extra_body"] = extra_body
+
+    if "score_centering_top_k" in extra_body:
+        from areal.experimental.openai.client import _score_centering_request
+
+        # Validate before filtering so unsupported distribution-changing fields
+        # cannot be silently dropped from a score-centering request.
+        try:
+            _score_centering_request(
+                extra_body,
+                kwargs,
+                has_images=False,
+                temperature=kwargs.get("temperature"),
+                top_p=kwargs.get("top_p"),
+                top_k=kwargs.get("top_k"),
+                frequency_penalty=kwargs.get("frequency_penalty"),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     dropped_args = []
     for k, v in kwargs.items():
@@ -1363,9 +1410,14 @@ async def _deferred_openai_sse_stream(
     dependencies=[Depends(validate_json_request)],
 )
 async def responses(
-    request: ResponseCreateParams, session_id: str = Depends(_require_session_key)
+    request: dict[str, Any], session_id: str = Depends(_require_session_key)
 ) -> Response:
-    """OpenAI-compatible responses endpoint."""
+    """OpenAI-compatible responses endpoint.
+
+    Preserve SDK extension fields for normalization and validation in the AReaL
+    client, matching the chat-completions route. SDK TypedDict validation would
+    silently discard flattened extra_body fields before that validation runs.
+    """
     if _openai_client is None:
         raise HTTPException(
             status_code=500,
