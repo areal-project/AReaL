@@ -103,15 +103,21 @@ not counted. `finished` means the proxy session ended, not that its trajectory w
 accepted for training. Each active session line shows its AReaL workflow group ID,
 finished/expected group members, elapsed time, current `generate` or `non_generate`
 phase and its age,
-completed plus ongoing generation time, remaining non-generation time, the last
+completed SGLang generation time, remaining non-generation or pending time, the last
 generation end, and request count. Each line also includes the trace-only
-`session_uuid` and, when linked, the Arena task and attempt IDs. The longest-running
+`session_uuid` and, when linked, the Arena task and attempt IDs. Each physical
+SGLang `/generate` request uses `rid=session_uuid:call_index.send_index`; retries
+increment the physical send index, while each new `engine.agenerate` call gets a
+new call index. The longest-running
 `top_n` sessions are shown
 by default; set `show_all_sessions: true` to print every running session. No minimum
 age applies in this mode. These fields come from AReaL proxy events alone; reward,
 tool calls, and session-level pause cannot currently be separated from
-`non_generate`. Here `generate` measures the proxy's `engine.agenerate()` wait,
-excluding local input preparation and output parsing. `collect_interval_seconds` bounds how far behind the
+`non_generate`. The live current phase still comes from the proxy's
+`engine.agenerate()` boundary, but completed `generate` duration comes from
+SGLang's `meta_info.e2e_latency`. A request still in progress has no completed
+server duration yet, so its time appears as pending until SGLang responds.
+`collect_interval_seconds` bounds how far behind the
 live display may be; intermediate phase changes are retained as timestamped events.
 The group ID is an AReaL task key, not an Arena task ID.
 
@@ -128,8 +134,11 @@ counts. The controller measures request submission and result selection/assembly
 as `schedule_requests` and `data_collect`. Input normalization, tokenization and
 payload preparation inside the proxy client are `pre_process`; detokenization,
 reasoning/tool-call parsing and response construction are `post_process`.
-`generate` covers the proxy's inference-engine call, including backend queue/RPC
-and response wait; it is not SGLang kernel time. Arena reward includes waiting for
+`generate` uses SGLang's reported end-to-end request latency, including its
+server queue, prefill, and decode. The server duration is placed on the AReaL
+timeline at client response receipt; transport and AReaL-side waiting remain in
+`other`. A timed-out request without a server response also remains in `other`.
+Arena reward includes waiting for
 the reward sandbox, creating it, and evaluating, using the Task event timestamps.
 Unobserved time, including tool execution, proxy request ingress/stream delivery,
 and pause without explicit timestamps, stays in `other`. The current Arena Task trace exposes no dedicated tool spans, so
@@ -139,11 +148,15 @@ does not include later lazy `RTensor.localize()` calls in training scopes.
 
 For a small local one-step proxy smoke run, use
 `bash examples/agent_workflow/verify_rollout_trace_minimal.sh` on a configured CUDA
-host. The expected result is a completed step with additive
-`timeperf/rollout/*` values and at least one `Rollout progress` line.
+host. It enables session JSONL and native SGLang request logs. The expected
+result is a completed step with additive `timeperf/rollout/*` values, at least
+one `Rollout progress` line, and a matching `session_uuid:call_index.send_index` in
+the SGLang log.
 For this Qwen/Arena chain, use
 `QWEN_EXPECT_PROGRESS_LOG=1 bash examples/swe/rl/qwen38_27b/verify_rollout_trace_e2e.sh`
-after preparing the opt-in YAML and site profile. The expected log contains AReaL
+after preparing the opt-in YAML and site profile. Enable
+`perf_tracer.session_tracer.enabled` and `sglang.log_requests` in that YAML.
+The expected log contains AReaL
 group and session progress. After a completed Arena reward trace, the step's
 `reward` time reflects its explicit reward interval. The end-to-end script submits
 the job and waits up to five hours for the first step's timing fields; the submitted

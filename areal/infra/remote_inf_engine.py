@@ -11,6 +11,7 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future
+from contextlib import nullcontext
 from datetime import datetime
 from logging import Logger
 from threading import Lock
@@ -46,7 +47,7 @@ from areal.infra.utils.concurrent import get_executor
 from areal.infra.utils.http import arequest_with_retry, get_default_connector
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
-from areal.utils import logging, name_resolve, names, stats_tracker
+from areal.utils import logging, name_resolve, names, perf_tracer, stats_tracker
 from areal.utils.data import RolloutGroup, concat_padded_tensors, get_batch_size
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import (
@@ -56,6 +57,7 @@ from areal.utils.network import (
     split_hostport,
 )
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.session_request_ids import SessionRequestIds
 from areal.v2.inference_service.router.client import (
     RouteClient,
     backend_session,
@@ -78,6 +80,8 @@ logger = logging.getLogger("RemoteInfEngine")
 
 
 class GroupedRolloutWorkflow(RolloutWorkflow):
+    owns_sample_request_ids = True
+
     def __init__(
         self,
         workflow: RolloutWorkflow,
@@ -139,8 +143,30 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                     processor_cache=shared_processor_cache,
                 )
             )
-            async with backend_session(engine):
-                result = await self.workflow.arun_episode(engine, data)
+            request_ids = (
+                SessionRequestIds()
+                if getattr(getattr(engine, "config", None), "_version", None) == "v1"
+                and perf_tracer.get_session_tracer() is not None
+                else None
+            )
+            if request_ids is not None:
+                callback = getattr(engine, "record_sglang_server_timing", None)
+                if callable(callback):
+                    request_ids.set_server_timing_callback(callback)
+                start_timing = getattr(engine, "start_sglang_timing_session", None)
+                if callable(start_timing):
+                    start_timing(request_ids.session_uuid, time.time())
+            try:
+                with (
+                    request_ids.activate() if request_ids is not None else nullcontext()
+                ):
+                    async with backend_session(engine):
+                        result = await self.workflow.arun_episode(engine, data)
+            finally:
+                if request_ids is not None:
+                    end_timing = getattr(engine, "end_sglang_timing_session", None)
+                    if callable(end_timing):
+                        end_timing(request_ids.session_uuid, time.time())
             completed_results[sample_idx] = result
             return sample_idx, result
 
@@ -599,6 +625,56 @@ class RemoteInfEngine(InferenceEngine):
         self._proxy_gateway_addr: str | None = None
         self.local_server_processes: list[LocalInfServerInfo] = []
         self.route_client: RouteClient | None = None
+        self._sglang_timing_sessions: dict[str, dict[str, Any]] = {}
+        self._sglang_timing_lock = Lock()
+
+    def start_sglang_timing_session(self, session_uuid: str, started_at: float) -> None:
+        """Track a direct workflow's lifetime for fair step attribution."""
+        with self._sglang_timing_lock:
+            self._sglang_timing_sessions[session_uuid] = {
+                "session_uuid": session_uuid,
+                "started_at": started_at,
+                "ended_at": None,
+                "intervals": [],
+            }
+
+    def end_sglang_timing_session(self, session_uuid: str, ended_at: float) -> None:
+        with self._sglang_timing_lock:
+            session = self._sglang_timing_sessions.get(session_uuid)
+            if session is not None:
+                session["ended_at"] = ended_at
+
+    def record_sglang_server_timing(
+        self, rid: str, duration_seconds: float, client_finished_at: float
+    ) -> None:
+        """Keep SGLang-reported request time for step-level collection."""
+        if not rid or duration_seconds < 0:
+            return
+        session_uuid = rid.rsplit(":", 1)[0]
+        with self._sglang_timing_lock:
+            session = self._sglang_timing_sessions.get(session_uuid)
+            if session is not None:
+                session["intervals"].append(
+                    (rid, client_finished_at - duration_seconds, client_finished_at)
+                )
+
+    def get_sglang_timing_sessions(
+        self, started_at: float, ended_at: float
+    ) -> list[dict[str, Any]]:
+        """Return direct sessions and their completed SGLang request intervals."""
+        with self._sglang_timing_lock:
+            for session_uuid, session in tuple(self._sglang_timing_sessions.items()):
+                if (
+                    session["ended_at"] is not None
+                    and session["ended_at"] <= started_at
+                ):
+                    del self._sglang_timing_sessions[session_uuid]
+            return [
+                {**session, "intervals": list(session["intervals"])}
+                for session in self._sglang_timing_sessions.values()
+                if session["started_at"] < ended_at
+                and (session["ended_at"] is None or session["ended_at"] > started_at)
+            ]
 
     def _wait_for_server(self, address: str, process: subprocess.Popen | None = None):
         """Wait for a server to become healthy."""
@@ -1175,6 +1251,57 @@ class RemoteInfEngine(InferenceEngine):
 
         # Get the shared session from workflow context
         session = await workflow_context.get_aiohttp_session()
+        request_ids = SessionRequestIds.current()
+        request_id_field = getattr(self.backend, "request_id_field", None)
+
+        call_index: int | None = None
+        if request_ids is not None:
+            call_index = request_ids.next_call_index()
+        else:
+            session_uuid = req.metadata.get("_areal_sglang_session_uuid")
+            supplied_call_index = req.metadata.get("_areal_sglang_call_index")
+            if (
+                isinstance(session_uuid, str)
+                and session_uuid
+                and type(supplied_call_index) is int
+                and supplied_call_index > 0
+            ):
+                request_ids = SessionRequestIds(session_uuid)
+                call_index = supplied_call_index
+        send_index = 0
+        server_timings: list[tuple[str, float, float]] = []
+
+        def with_request_id(payload: dict[str, Any]) -> dict[str, Any]:
+            nonlocal send_index
+            if request_ids is None or request_id_field is None or call_index is None:
+                return payload
+            send_index += 1
+            return {
+                **payload,
+                request_id_field: request_ids.request_rid(call_index, send_index),
+            }
+
+        def record_server_timing(result: dict[str, Any]) -> None:
+            if request_ids is None or request_id_field is None:
+                return
+            meta_info = result.get("meta_info")
+            if not isinstance(meta_info, dict):
+                return
+            response_rid = meta_info.get("id")
+            server_latency = meta_info.get("e2e_latency")
+            if (
+                isinstance(response_rid, str)
+                and response_rid.startswith(f"{request_ids.session_uuid}:{call_index}.")
+                and isinstance(server_latency, (int, float))
+                and 0 <= server_latency < float("inf")
+            ):
+                finished_at = time.time()
+                server_timings.append(
+                    (response_rid, float(server_latency), finished_at)
+                )
+                request_ids.record_server_timing(
+                    response_rid, float(server_latency), finished_at
+                )
 
         # Deal with rollout interruption
         stop_reason = None
@@ -1194,15 +1321,8 @@ class RemoteInfEngine(InferenceEngine):
             # version is current once the response arrives.
             request_version = self.get_version()
 
-            # Build request using backend
-            http_req = self.backend.build_generation_request(
-                req,
-                with_lora=self.config.use_lora,
-                version=request_version,
-            )
-
             # Loop until the generation is complete
-            if getattr(self, "route_client", None) is not None:
+            if self.route_client is not None:
 
                 async def generate(lease):
                     routed_request = self.backend.build_generation_request(
@@ -1216,13 +1336,18 @@ class RemoteInfEngine(InferenceEngine):
                     async with session.request(
                         routed_request.method,
                         f"{base}/{routed_request.endpoint.lstrip('/')}",
-                        json=routed_request.payload,
+                        json=with_request_id(routed_request.payload),
                         timeout=aiohttp.ClientTimeout(
                             total=self.config.request_timeout
                         ),
                     ) as response:
                         response.raise_for_status()
                         result = await response.json()
+                    if not isinstance(result, dict):
+                        raise ValueError(
+                            f"Expected JSON dict response, got {type(result).__name__}"
+                        )
+                    record_server_timing(result)
                     parsed = self.backend.parse_generation_response(result)
                     if parsed.stop_reason not in (
                         "stop",
@@ -1244,6 +1369,11 @@ class RemoteInfEngine(InferenceEngine):
                     generate,
                 )
             else:
+                http_req = self.backend.build_generation_request(
+                    req,
+                    with_lora=self.config.use_lora,
+                    version=request_version,
+                )
                 result = await arequest_with_retry(
                     session=session,
                     addr=server_addr,
@@ -1252,12 +1382,19 @@ class RemoteInfEngine(InferenceEngine):
                     method=http_req.method,
                     max_retries=self.config.request_retries,
                     timeout=self.config.request_timeout,
+                    payload_factory=(
+                        lambda: with_request_id(http_req.payload)
+                        if request_ids is not None and request_id_field is not None
+                        else None
+                    ),
                 )
                 if not isinstance(result, dict):
                     raise ValueError(
                         f"Expected JSON dict response, got {type(result).__name__}"
                     )
+                record_server_timing(result)
                 gen_result = self.backend.parse_generation_response(result)
+
             stop_reason = gen_result.stop_reason
 
             if (
@@ -1375,6 +1512,8 @@ class RemoteInfEngine(InferenceEngine):
             tokenizer=req.tokenizer,
             processor=req.processor,
             routed_experts=final_routed_experts,
+            sglang_server_timings=server_timings,
+            sglang_worker_finished_at=time.time() if server_timings else None,
         )
         return response
 

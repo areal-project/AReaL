@@ -15,6 +15,14 @@ This script will run the example agent in
 can also modify the `workflow` parameter in `trainer.train` to run other example agents
 defined in the same file.
 
+For a one-step SGLang session ID and timing check on a GPU host, run
+`bash examples/agent_workflow/verify_rollout_trace_minimal.sh`. With session
+tracing enabled, each physical SGLang request has
+`rid=session_uuid:call_index.send_index`, and the script checks that a completed
+session UUID appears in the native SGLang request log. The step's
+`timeperf/rollout/generate` uses SGLang's reported request latency; request
+time without a completed server report remains in `other`.
+
 ## Write Your Own Agent
 
 1. Write a Python **`async` function** that takes a dict as agent input. The function

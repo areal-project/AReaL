@@ -32,6 +32,13 @@ if not re.search(
     text,
 ):
     raise SystemExit("selected rollout config must enable rollout_trace")
+if not re.search(
+    r"(?m)^  session_tracer:\s*\n(?:^    .*\n)*?^    enabled: true\s*$",
+    text,
+):
+    raise SystemExit("selected perf_tracer config must enable session_tracer")
+if not re.search(r"(?m)^  log_requests: true\s*$", text):
+    raise SystemExit("selected sglang config must enable log_requests")
 PY
 then
   echo "The selected YAML must enable rollout.agent.rollout_trace on v1" >&2
@@ -66,6 +73,8 @@ while (( SECONDS < deadline )); do
     else
       echo "Check the last Rollout long tails entry for Arena task_id / attempt_id."
     fi
+    python3 "$recipe_dir/../../../agent_workflow/check_sglang_session_rids.py" \
+      "$(dirname -- "$log_file")"
     exit 0
   fi
   sleep 60
