@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import gc
+import inspect
 import math
 import os
 import re
@@ -225,6 +227,16 @@ def _prepare_multimodal_forward_inputs(
 
 
 class FSDPEngine(TrainEngine):
+    # Packed-sequence metadata for the *text* tokens, added in ``_prepare_mb_list``.
+    _TEXT_PACKING_KWARGS = (
+        "cu_seqlens",
+        "max_seqlen",
+        "cu_seq_lens_q",
+        "cu_seq_lens_k",
+        "max_length_q",
+        "max_length_k",
+    )
+
     def __init__(self, config: TrainEngineConfig):
         self.config = config
         self.optimizer_config = config.optimizer
@@ -1134,6 +1146,39 @@ class FSDPEngine(TrainEngine):
             )
         return model
 
+    @staticmethod
+    def _drop_text_packing_kwargs_hook(module, args, kwargs):
+        for key in FSDPEngine._TEXT_PACKING_KWARGS:
+            kwargs.pop(key, None)
+        return args, kwargs
+
+    @staticmethod
+    def _isolate_vision_tower_from_text_packing_kwargs(model: torch.nn.Module) -> None:
+        """Keep text packing kwargs out of the Qwen-VL vision tower.
+
+        Since transformers 5.9, Qwen-VL forwards ``**kwargs`` into the vision
+        tower, whose helpers treat ``cu_seqlens``/``max_seqlen`` as precomputed
+        vision values and whose attention passes ``max_length_q`` twice.
+        """
+        inner = getattr(model, "model", model)
+        visual = getattr(inner, "visual", None)
+        if visual is None:
+            return
+        visual.register_forward_pre_hook(
+            FSDPEngine._drop_text_packing_kwargs_hook, with_kwargs=True
+        )
+
+    @staticmethod
+    @functools.cache
+    def _mrope_takes_mm_token_type_ids(model_cls: type) -> bool:
+        """Whether Qwen-VL ``compute_3d_position_ids`` accepts ``mm_token_type_ids``.
+
+        transformers >= 5.3 locates vision tokens through ``mm_token_type_ids``;
+        earlier versions derive them from ``input_ids`` and reject the argument.
+        """
+        params = inspect.signature(model_cls.compute_3d_position_ids).parameters
+        return "mm_token_type_ids" in params
+
     def _create_device_model(self):
         current_platform.set_device(int(os.environ["LOCAL_RANK"]))
         current_platform.set_numa_affinity(int(os.environ["LOCAL_RANK"]))
@@ -1191,6 +1236,8 @@ class FSDPEngine(TrainEngine):
                 )
                 if self.config.disable_dropout:
                     disable_dropout_in_model(model)
+            if is_qwen_vl_model(self.model_config.model_type):
+                self._isolate_vision_tower_from_text_packing_kwargs(model)
         else:
             self.tokenizer = load_hf_tokenizer(self.config.path)
             self.processor = None
@@ -2057,14 +2104,20 @@ class FSDPEngine(TrainEngine):
                 if video_grid_thw_list:
                     video_grid_thw = torch.cat(video_grid_thw_list)
 
+            mrope_kwargs = {}
+            if self._mrope_takes_mm_token_type_ids(type(self.model.model)):
+                mrope_kwargs["mm_token_type_ids"] = input_["mm_token_type_ids"]
+            else:
+                # Unused by this transformers version; keep it out of forward().
+                input_.pop("mm_token_type_ids", None)
             position_ids = self.model.model.compute_3d_position_ids(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
                 attention_mask=attn_mask,
-                mm_token_type_ids=input_["mm_token_type_ids"],
                 inputs_embeds=None,
                 past_key_values=None,
+                **mrope_kwargs,
             )
             position_ids = torch.einsum("ijk->jki", position_ids)
             input_["position_ids"] = position_ids
