@@ -27,6 +27,8 @@ uv run python examples/agent_workflow/train.py \
   rollout.agent.rollout_trace.collect_interval_seconds=1 \
   rollout.agent.rollout_trace.log_interval_seconds=1 \
   rollout.agent.rollout_trace.log_mode=progress \
+  perf_tracer.session_tracer.enabled=true \
+  sglang.log_requests=true sglang.log_level=info sglang.log_level_http=info \
   'rollout.agent.admin_api_key=${oc.env:AREAL_TRACE_ADMIN_KEY}'
 
 log_file="$trace_root/logs/$(id -un)/gsm8k-grpo/$trial_name/main.log"
@@ -45,3 +47,5 @@ if ! grep -Fq 'uuid=' "$log_file"; then
   exit 1
 fi
 echo "One-step rollout timing and live progress verified in $log_file"
+python3 examples/agent_workflow/check_sglang_session_rids.py \
+  "$trace_root/logs/$(id -un)/gsm8k-grpo/$trial_name"
