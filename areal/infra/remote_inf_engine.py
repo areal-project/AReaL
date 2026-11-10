@@ -57,12 +57,12 @@ from areal.utils.network import (
     split_hostport,
 )
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.session_request_ids import SessionRequestIds
 from areal.v2.inference_service.router.client import (
     RouteClient,
     backend_session,
     current_backend_session,
 )
-from areal.utils.session_request_ids import SessionRequestIds
 
 from .workflow_executor import (
     WorkflowContractError,
@@ -1323,6 +1323,7 @@ class RemoteInfEngine(InferenceEngine):
 
             # Loop until the generation is complete
             if getattr(self, "route_client", None) is not None:
+
                 async def generate(lease):
                     routed_request = self.backend.build_generation_request(
                         req,
