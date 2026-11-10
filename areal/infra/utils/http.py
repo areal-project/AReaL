@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any
 
@@ -159,6 +160,7 @@ async def arequest_with_retry(
     timeout: float | None = None,
     retry_delay: float = 1.0,
     verbose=False,
+    payload_factory: Callable[[], dict[str, Any]] | None = None,
 ) -> dict | str | bytes:
     if timeout is None:
         timeout = DEFAULT_REQUEST_TIMEOUT
@@ -188,16 +190,19 @@ async def arequest_with_retry(
     try:
         for attempt in range(max_retries):
             try:
+                attempt_payload = (
+                    payload_factory() if payload_factory is not None else payload
+                )
                 if verbose:
                     logger.info("enter client session, start sending requests")
                 if method.upper() == "GET":
                     ctx = _session.get(url, timeout=timeo)
                 elif method.upper() == "POST":
-                    ctx = _session.post(url, json=payload, timeout=timeo)
+                    ctx = _session.post(url, json=attempt_payload, timeout=timeo)
                 elif method.upper() == "PUT":
-                    ctx = _session.put(url, json=payload, timeout=timeo)
+                    ctx = _session.put(url, json=attempt_payload, timeout=timeo)
                 elif method.upper() == "DELETE":
-                    ctx = _session.delete(url, json=payload, timeout=timeo)
+                    ctx = _session.delete(url, json=attempt_payload, timeout=timeo)
                 else:
                     raise ValueError(f"Unsupported HTTP method: {method}")
                 async with ctx as response:
