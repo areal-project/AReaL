@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,7 +13,8 @@ from areal.experimental.openai import InteractionWithTokenLogpReward
 from areal.infra import dist_rollout, workflow_context
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
-from areal.utils import stats_tracker
+from areal.utils import perf_tracer, stats_tracker
+from areal.utils.session_request_ids import SessionRequestIds
 
 
 class _ListWorkflow(RolloutWorkflow):
@@ -65,6 +67,43 @@ def _interaction(reward: float) -> InteractionWithTokenLogpReward:
             "rewards": torch.tensor([reward]),
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_grouped_rollout_assigns_distinct_request_namespace_per_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sibling samples share a group but never share an SGLang RID prefix."""
+    monkeypatch.setattr(perf_tracer, "get_session_tracer", lambda: object())
+
+    class Engine:
+        config = SimpleNamespace(_version="v1")
+
+        def __init__(self):
+            self.started: list[str] = []
+            self.ended: list[str] = []
+
+        def start_sglang_timing_session(self, session_uuid: str, started_at: float):
+            self.started.append(session_uuid)
+
+        def end_sglang_timing_session(self, session_uuid: str, ended_at: float):
+            self.ended.append(session_uuid)
+
+    class Workflow(RolloutWorkflow):
+        async def arun_episode(self, engine, data):
+            request_ids = SessionRequestIds.current()
+            rid = request_ids.request_rid(request_ids.next_call_index(), 1)
+            return {rid: _interaction(1.0)}
+
+    engine = Engine()
+    result = await GroupedRolloutWorkflow(
+        Workflow(), group_size=2, logger=_Logger()
+    ).arun_episode(engine, {})
+
+    prefixes = {rid.rsplit(":", 1)[0] for rid in result}
+    assert len(prefixes) == 2
+    assert set(engine.started) == prefixes
+    assert set(engine.ended) == prefixes
 
 
 @pytest.mark.asyncio
