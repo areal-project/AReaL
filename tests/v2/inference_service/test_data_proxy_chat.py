@@ -1773,6 +1773,10 @@ async def test_full_session_lifecycle(client, inline_export_tensors):
 
 @pytest.mark.asyncio
 async def test_export_trajectories_preserves_r3_routing_rtensors(client):
+    import torch
+
+    from areal.infra.rpc.rtensor import RTensor, fetch, remove
+
     app = client._transport.app
     app.state.config.return_routed_experts = True
     app.state.config.r3_num_moe_layers = 2
@@ -1826,6 +1830,37 @@ async def test_export_trajectories_preserves_r3_routing_rtensors(client):
 
     assert export_resp.status_code == 200
     traj = deserialize_value(export_resp.json()["traj"])
-    assert set(("routed_experts", "r3_routing_valid")).issubset(traj)
-    assert traj["routed_experts"].shape == (1, 4, 2, 2)
-    assert traj["r3_routing_valid"].shape == (1,)
+    shard_ids = [sid for ids in RTensor.collect_shards(traj).values() for sid in ids]
+    try:
+        for key in ("routed_experts", "r3_cu_seqlens", "r3_routing_valid"):
+            assert isinstance(traj[key], RTensor)
+            tensor = fetch(traj[key].shard.shard_id)
+            assert traj[key].shape == tensor.shape
+            assert traj[key].dtype == tensor.dtype
+            traj[key] = tensor
+        torch.testing.assert_close(
+            traj["routed_experts"],
+            torch.tensor(
+                [
+                    [[1, 2], [3, 4]],
+                    [[5, 6], [7, 8]],
+                    [[9, 10], [11, 12]],
+                    [[9, 10], [11, 12]],
+                ],
+                dtype=torch.int16,
+            ),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            traj["r3_cu_seqlens"],
+            torch.tensor([0, 4], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            traj["r3_routing_valid"], torch.tensor([True]), rtol=0, atol=0
+        )
+    finally:
+        for shard_id in shard_ids:
+            remove(shard_id)

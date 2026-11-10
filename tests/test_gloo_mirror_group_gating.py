@@ -40,12 +40,31 @@ def _gloo_group_calls(node: ast.AST) -> list[ast.Call]:
 class TestGlooMirrorGroupIsGated:
     def test_the_gloo_group_is_built_only_under_an_offload_guard(self):
         method = _init_group_method()
-        gloo_calls = _gloo_group_calls(method)
-
-        assert len(gloo_calls) == 1, (
-            f"expected exactly one gloo new_group call, found {len(gloo_calls)}"
+        mirror_variables = {
+            node.value.id
+            for node in ast.walk(method)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Name)
+            and any(
+                isinstance(target, ast.Attribute)
+                and target.attr == "_cpu_model_parallel_group"
+                for target in node.targets
+            )
+        }
+        mirror_calls = [
+            node.value
+            for node in ast.walk(method)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in mirror_variables
+                for target in node.targets
+            )
+            and any(node.value is call for call in _gloo_group_calls(node))
+        ]
+        assert len(mirror_calls) == 1, (
+            f"expected exactly one mirror group creation, found {len(mirror_calls)}"
         )
-        target = gloo_calls[0]
+        target = mirror_calls[0]
 
         guarded = False
         for node in ast.walk(method):
