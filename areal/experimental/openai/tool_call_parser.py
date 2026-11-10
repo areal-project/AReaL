@@ -58,6 +58,7 @@ class InvalidToolCallError(ValueError):
     """The model emitted tool-call protocol syntax that cannot be parsed."""
 
     code = "invalid_tool_json"
+    message = "invalid_tool_json: model emitted a malformed tool call"
 
 
 _QWEN3_CODER_TOOL_CALL_RE = re.compile(
@@ -255,9 +256,7 @@ def _build_tool_call(
     try:
         arguments.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise InvalidToolCallError(
-            "invalid_tool_json: model emitted a malformed tool call"
-        ) from exc
+        raise InvalidToolCallError(InvalidToolCallError.message) from exc
     if use_responses:
         return ResponseFunctionToolCall(
             type="function_call",
@@ -746,9 +745,7 @@ def process_tool_calls(
             )
             or finish_reason in {"tool_call", "tool_calls", "tool_use"}
         ):
-            raise InvalidToolCallError(
-                "invalid_tool_json: model emitted a malformed tool call"
-            )
+            raise InvalidToolCallError(InvalidToolCallError.message)
         return parsed
     if tool_call_parser == "qwen3_coder":
         tool_calls, output_text, finish_reason = _process_tool_calls_qwen3_coder_xml(

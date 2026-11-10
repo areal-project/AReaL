@@ -221,6 +221,10 @@ class PPOTrainer:
         train_dataset: Dataset | None = None,
         valid_dataset: Dataset | None = None,
     ):
+        if config.rollout.backend_routing.enabled and (
+            config.rollout._version != "v1" or not is_single_controller()
+        ):
+            raise ValueError("Backend routing requires v1 single-controller mode")
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             # Set up file logging for controller process
@@ -815,6 +819,9 @@ class PPOTrainer:
             if cleanup_error is None:
                 cleanup_error = exc
 
+        if cleanup_error is not None:
+            raise cleanup_error
+
         try:
             with (
                 stats_tracker.record_timing("rollout_resume"),
@@ -1152,7 +1159,12 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                self.actor.ppo_update(adv_batch)
+                update_kwargs = (
+                    {"max_head_offpolicyness": config.rollout.max_head_offpolicyness}
+                    if config.rollout.mask_stale_tokens
+                    else {}
+                )
+                self.actor.ppo_update(adv_batch, **update_kwargs)
                 self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("ppo update")
 
@@ -1736,6 +1748,8 @@ class PPOTrainer:
             assert len(self.rollout.server_infos) > 0
             init_kwargs["server_infos"] = self.rollout.server_infos
             init_kwargs["role"] = "eval-rollout"
+            if config._version == "v1" and config.backend_routing.enabled:
+                init_kwargs["backend_router_owner"] = self.rollout
         controller.initialize(**init_kwargs)
         return controller
 
@@ -1880,6 +1894,24 @@ class PPOTrainer:
         eval_workflow: WorkflowLike,
         eval_workflow_kwargs,
     ):
+        routed = self.config.rollout.backend_routing.enabled
+        if routed:
+            # Both controllers own the same physical pool. Evaluation is an
+            # exclusive sender phase even without memory offloading (including
+            # evaluate-before-train); restore only the eval member here.
+            self.eval_rollout.pause()
+            self.eval_rollout.resume()
+        try:
+            self._collect_eval_results(eval_workflow, eval_workflow_kwargs)
+        finally:
+            if routed:
+                self.eval_rollout.pause()
+
+    def _collect_eval_results(
+        self,
+        eval_workflow: WorkflowLike,
+        eval_workflow_kwargs,
+    ):
         if self.actor.is_data_parallel_head():
             cnt = 0
             for data in self.valid_dataloader:
@@ -1937,6 +1969,12 @@ class PPOTrainer:
                     self._offload_rollout(is_eval=True)
 
         evaluated = self.evaluator.evaluate_before_train(evaluate_fn)
+        if (
+            evaluated
+            and self.config.rollout.backend_routing.enabled
+            and not self._should_offload_rollout
+        ):
+            self.rollout.resume()
         if evaluated and not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()

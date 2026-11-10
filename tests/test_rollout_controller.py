@@ -1553,11 +1553,23 @@ class TestRolloutControllerExportStats:
             _RolloutResult(0, {}, {"rollout/reward": [1.0, 1.0]})
         )
         controller.consumed_metrics.consume(
-            _RolloutResult(1, None, {"rollout/reward": [0.0]})
+            _RolloutResult(
+                1,
+                None,
+                {
+                    "rollout/reward": [0.0],
+                    "rollout/task_attempt/success": [0.0, 0.0, 0.0],
+                    "rollout/harness_success": [0.0, 0.0],
+                    "rollout/harness_error": [1.0, 0.0],
+                },
+            )
         )
         stats = controller.export_stats()
         assert stats["rollout/reward"] == pytest.approx(2 / 3)
         assert stats["rollout/reward_sample_count"] == 3
+        assert stats["rollout/task_attempt_count"] == 3
+        assert stats["rollout/task_result_count"] == 2
+        assert stats["rollout/harness_error"] == 0.5
         assert controller.export_stats() == {}
 
 

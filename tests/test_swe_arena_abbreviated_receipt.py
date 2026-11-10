@@ -87,7 +87,12 @@ def test_abbreviated_model_failure_with_native_collection_keeps_zero(
         "multiple_turns",
         "multiple_errors",
         "provider_failure",
-        "argument_budget",
+        "budget_wrong_kind",
+        "budget_not_exceeded",
+        "budget_malformed",
+        "budget_zero_limit",
+        "runner_timeout",
+        "external_interruption",
         "public_input_changed",
         "deliverable_conflict",
         "no_interactions",
@@ -137,15 +142,25 @@ def test_abbreviated_failure_with_missing_or_conflicting_evidence_rejected(
         receipt["turn_statuses"] = ["failed", "failed"]
     elif mutation == "multiple_errors":
         receipt["error"].append({"message": "provider failed"})
+    elif mutation == "runner_timeout":
+        receipt["observed_runner_timeout"] = True
+    elif mutation == "external_interruption":
+        receipt["observed_external_interruption"] = True
     elif mutation in {
         "provider_failure",
-        "argument_budget",
+        "budget_wrong_kind",
+        "budget_not_exceeded",
+        "budget_malformed",
+        "budget_zero_limit",
         "public_input_changed",
         "deliverable_conflict",
     }:
         receipt["error"][0]["message"] = {
             "provider_failure": "model service unavailable",
-            "argument_budget": "tool_call_budget_exceeded: argument_bytes (limit 65536, observed 69773)",
+            "budget_wrong_kind": "tool_call_budget_exceeded: tokens (limit 10, observed 11)",
+            "budget_not_exceeded": "tool_call_budget_exceeded: argument_bytes (limit 10, observed 10)",
+            "budget_malformed": "tool_call_budget_exceeded: argument_bytes (limit x, observed 69773)",
+            "budget_zero_limit": "tool_call_budget_exceeded: argument_bytes (limit 0, observed 69773)",
             "public_input_changed": "Public inputs changed during agent execution",
             "deliverable_conflict": "Conflicting workspace/output deliverable: renders/view.png",
         }[mutation]
@@ -179,10 +194,93 @@ def test_abbreviated_failure_with_missing_or_conflicting_evidence_rejected(
 
 
 @pytest.mark.parametrize("adopted", [False, True])
+def test_abbreviated_tool_call_budget_failure_keeps_zero(adopted):
+    error = _error(
+        adopted=adopted,
+        message="tool_call_budget_exceeded: argument_bytes (limit 65536, observed 69773)",
+    )
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+
+
+@pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "runner_timeout",
+        "external_interruption",
+        "collection",
+        "receipt_failure",
+        "provider_failure",
+        "terminal_outcome",
+        "nested_outcome",
+        "top_level_outcome",
+        "native_family",
+    ],
+)
+def test_runner_budget_receipt_overrides_earlier_proxy_overflow(
+    context_overflow, fault
+):
+    """A full runner envelope cannot rescue a conflicting terminal receipt."""
+    error = _error(
+        message="tool_call_budget_exceeded: argument_bytes (limit 65536, observed 69773)"
+    )
+    error.result = replace(
+        error.result,
+        raw={"harness": {"phase": "agent", "result_status": "ERROR", "exit_code": 1}},
+    )
+    receipt = error.harness_result
+    if fault == "runner_timeout":
+        receipt["observed_runner_timeout"] = True
+    elif fault == "external_interruption":
+        receipt["observed_external_interruption"] = True
+    elif fault == "collection":
+        receipt["collection"]["status"] = "ERROR"
+    elif fault == "receipt_failure":
+        receipt["failure"] = {"code": "EXPORT_FAILED"}
+    elif fault == "provider_failure":
+        receipt["error"][0]["message"] = "HTTP 503 service unavailable"
+    elif fault in {"terminal_outcome", "nested_outcome", "top_level_outcome"}:
+        outcome = {
+            "code": "HARNESS_INTERNAL_ERROR",
+            "class": "infrastructure",
+            "source": "core",
+            "details": {"reason": "unclassified"},
+        }
+        if fault == "terminal_outcome":
+            receipt["error"][0]["outcome"] = outcome
+        elif fault == "nested_outcome":
+            receipt["raw"] = {"outcome": outcome}
+        else:
+            receipt["outcome"] = outcome
+    elif fault == "native_family":
+        receipt["nativeExportHealthy"] = False
+
+    assert ArenaStreamAgentWorkflow.classify_proxy_failure(
+        error, context_overflow=context_overflow, interaction_count=2
+    ) == ("model_failure_zero" if fault is None else "unknown_failure_reject")
+
+
+@pytest.mark.parametrize("adopted", [False, True])
 @pytest.mark.parametrize("fetch_fails", [False, True])
 def test_abbreviated_task_fetches_receipt_before_classification(
     monkeypatch, adopted, fetch_fails
 ):
+    for proxy_var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(proxy_var, raising=False)
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
     workflow = ArenaStreamAgentWorkflow(
