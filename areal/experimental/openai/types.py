@@ -14,6 +14,11 @@ from openai.types.responses.response_input_param import ResponseInputParam
 
 from areal.api import ModelResponse
 from areal.utils import logging
+from areal.utils.topk_padding import (
+    pad_topk_ids,
+    pad_topk_logps,
+    truncate_topk,
+)
 
 logger = logging.getLogger("TokenLogpReward")
 
@@ -68,6 +73,9 @@ class InteractionWithTokenLogpReward:
     chat_template_type: str = "hf"
     trajectory_metadata: dict[str, str] = field(default_factory=dict)
     _cache: dict[str, torch.Tensor] | None = None
+
+    # score_centering_top_k from the engine config; caps k_dim in to_tensor_dict().  0 = SC off.
+    score_centering_top_k: int = 0
 
     # Vision payload for VLM training. ``mm_token_type_ids`` covers the prompt
     # only (it is extended with zeros over the output at tensor-dict time);
@@ -261,6 +269,66 @@ class InteractionWithTokenLogpReward:
                 _align_mm_token_type_ids(self.mm_token_type_ids, resp, len(seq)),
                 dtype=torch.long,
             ).unsqueeze(0)
+        # SC: input positions get zero top-k, output positions get the sampler heads.
+        if resp.sampler_head_ids is not None and resp.sampler_head_logprobs is not None:
+            if self.chat_template_type == "concat" and self.parent is not None:
+                raise NotImplementedError(
+                    "Score Centering is not supported with chat_template_type="
+                    "'concat' multi-turn interactions: the parent's top-k sampler "
+                    "data is not propagated into the child trajectory. Use "
+                    "chat_template_type='hf' or disable Score Centering."
+                )
+            pad_k = (
+                max(len(k) for k in resp.sampler_head_ids)
+                if resp.sampler_head_ids
+                else 0
+            )
+            if pad_k > 0:
+                # Rows are [sampled token] + top-k (k or k + 1); truncate_topk cuts them to k.
+                score_centering_top_k = self.score_centering_top_k
+                k_dim = score_centering_top_k if score_centering_top_k > 0 else pad_k
+                if score_centering_top_k > 0 and pad_k < score_centering_top_k:
+                    raise RuntimeError(
+                        f"Score Centering requires score_centering_top_k={score_centering_top_k} "
+                        f"but the sampler returned only {pad_k} "
+                        "top-k entries. Increase vLLM max_logprobs or "
+                        "reduce score_centering_top_k."
+                    )
+                # Cap by logprob, not by arrival order: vLLM puts the sampled token
+                # first, so a [:k] slice would drop the true k-th alternative.
+                kept = [
+                    truncate_topk(ids, logps, k_dim)
+                    for ids, logps in zip(
+                        resp.sampler_head_ids, resp.sampler_head_logprobs
+                    )
+                ]
+                narrow = min(len(row) for row, _ in kept) if kept else k_dim
+                if narrow != k_dim:
+                    logger.warning(
+                        "Sampler top-k rows are narrower than k=%d (min width %d); "
+                        "padded slots bias the score-centering correction.",
+                        k_dim,
+                        narrow,
+                    )
+                # Input tokens have no sampler data. Pad ids with 0 and
+                # log-probs with -inf so they contribute zero mass.
+                input_topk_ids = [
+                    pad_topk_ids([], k_dim) for _ in range(resp.input_len)
+                ]
+                input_topk_logps = [
+                    pad_topk_logps([], k_dim) for _ in range(resp.input_len)
+                ]
+                # Output tokens: cap by logprob, then pad each row to k_dim.
+                sampler_head_ids = [pad_topk_ids(ids, k_dim) for ids, _ in kept]
+                sampler_head_logprobs = [
+                    pad_topk_logps(logps, k_dim) for _, logps in kept
+                ]
+                result["sampler_head_ids"] = torch.tensor(
+                    input_topk_ids + sampler_head_ids, dtype=torch.int32
+                ).unsqueeze(0)  # [1, seq_len, k]
+                result["sampler_head_logprobs"] = torch.tensor(
+                    input_topk_logps + sampler_head_logprobs, dtype=torch.float32
+                ).unsqueeze(0)  # [1, seq_len, k]
         self._cache = result
         return result
 
