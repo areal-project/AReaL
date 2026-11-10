@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -702,7 +703,7 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
             )
 
         _capacity -= 1
-        _session_cache[session_id] = SessionData(
+        session_data = SessionData(
             session_id=session_id,
             prefix_matcher=_prefix_matcher,
             sampling_seed_identity=task_id,
@@ -710,6 +711,7 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
             processor_cache_group_id=request.processor_cache_group_id,
             metadata=request.metadata,
         )
+        _session_cache[session_id] = session_data
         _session_invalid_tool_errors.pop(session_id, None)
         _api_key_to_session[session_api_key] = session_id
         _session_to_api_key[session_id] = session_api_key
@@ -719,6 +721,19 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
                 session_id,
                 task_id=request.task_id,
                 group_size=request.processor_cache_group_size,
+                session_uuid=session_data.sglang_request_ids.session_uuid,
+            )
+            session_data.sglang_request_ids.set_server_timing_callback(
+                lambda rid,
+                duration,
+                ended_at,
+                trace=_session_trace: trace.record_phase(
+                    session_id,
+                    "server_generate",
+                    ended_at - duration,
+                    ended_at,
+                    source_id=rid,
+                )
             )
 
     return StartSessionResponse(
@@ -1261,7 +1276,17 @@ async def _call_client_create(
         }
         if supports_processor_cache:
             client_kwargs["processor_cache"] = session_data.processor_cache
-        result = await create_fn(**client_kwargs)
+        request_ids = session_data.sglang_request_ids if trace is not None else None
+        with request_ids.activate() if request_ids is not None else nullcontext():
+            result = await create_fn(**client_kwargs)
+        if inspect.isasyncgen(result) and request_ids is not None:
+
+            async def traced_stream():
+                with request_ids.activate():
+                    async for item in result:
+                        yield item
+
+            return traced_stream()
         return result
     except InvalidToolCallError as exc:
         # A streaming response has already sent HTTP 200 by the time the model
@@ -1830,6 +1855,11 @@ async def export_trajectories(
     return ExportTrajectoriesResponse(
         interactions=serialized,
         tensor_reference_group_id=tensor_reference_group_id,
+        session_uuid=(
+            session_data.sglang_request_ids.session_uuid
+            if _session_trace is not None
+            else None
+        ),
     )
 
 

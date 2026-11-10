@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.finalization import finalize_interactions
+from areal.utils.session_request_ids import SessionRequestIds
 
 if TYPE_CHECKING:
     from areal.experimental.openai.types import InteractionWithTokenLogpReward
@@ -117,6 +118,7 @@ class ExportTrajectoriesResponse(BaseModel):
 
     interactions: dict[str, Any]
     tensor_reference_group_id: str | None = None
+    session_uuid: str | None = None
 
 
 # =============================================================================
@@ -137,6 +139,7 @@ class SessionData:
         metadata: dict[str, Any] | None = None,
     ):
         self.session_id = session_id
+        self.sglang_request_ids = SessionRequestIds()
         self.sampling_seed_identity = sampling_seed_identity or session_id
         self.processor_cache = processor_cache
         self.processor_cache_group_id = processor_cache_group_id
