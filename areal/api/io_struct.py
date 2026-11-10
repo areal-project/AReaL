@@ -42,6 +42,8 @@ class ModelRequest:
 
     # vlm+vllm:
     vision_msg_vllm: list | None = None
+    # Native video inputs for SGLang, optionally accompanied by image_data.
+    video_data: list[str | dict[str, Any]] | None = None
 
     def copy(self):
         return ModelRequest(
@@ -51,6 +53,7 @@ class ModelRequest:
             metadata=self.metadata.copy(),
             tokenizer=self.tokenizer,
             image_data=self.image_data.copy() if self.image_data is not None else None,
+            video_data=copy.deepcopy(self.video_data),
             processor=self.processor,
             vision_msg_vllm=(
                 self.vision_msg_vllm.copy()
@@ -85,6 +88,7 @@ class ModelResponse:
 
     sampler_head_ids: list[list[int]] | None = None
     sampler_head_logprobs: list[list[float]] | None = None
+    input_videos: list[str | dict[str, Any]] | None = None
 
     @property
     def input_len(self) -> int:
