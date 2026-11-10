@@ -1,0 +1,199 @@
+.github/workflows/tag-release-image.yml
+  s_adcbc22f44e746::t_f3d5ea8db541f8 9
+.pre-commit-config.yaml
+  s_adcbc22f44e746::t_011c987acddbdd 28-29
+areal/api/cli_args.py
+  s_adcbc22f44e746::t_78e000034176d7 1845,1856,1888-1890,1892,1897,2198,2241,2362-2366,2454,2458-2468,2481,2483-2485,2701-2708,2779-2796,2862-2868,3212-3253,3287-3294,3428-3429
+areal/engine/fsdp_engine.py
+  s_adcbc22f44e746::t_6cb070cde48d70 356-359,361,2307,2309,2311-2314,2318,2323-2334,2336-2337,2341-2356,2359,2361-2362
+areal/engine/megatron_engine.py
+  s_adcbc22f44e746::t_5660fe3023805d 2131-2143,2285-2295,3779-3784,3858-3870,4222-4276,4356-4413,4418,4428
+areal/engine/megatron_utils/packed_context_parallel.py
+  s_adcbc22f44e746::t_792fb09b46d94c 11,75-149,526-534,749-751,764-787,800-801
+areal/engine/sglang_model_patches.py
+  s_adcbc22f44e746::t_5ff71acc13a74e 5,9-10,12,17,28-190,240-242
+areal/engine/sglang_remote.py
+  s_adcbc22f44e746::t_c57bef8238d888 718-730
+areal/experimental/openai/finalization.py
+  s_adcbc22f44e746::t_f54fc4c50cd6ae 52-54,63-70,74,89-90,110-111,136-144
+areal/experimental/openai/proxy/proxy_rollout_server.py
+  s_adcbc22f44e746::t_b02dd901c23972 47-48,562,579,588,594-598,620,624,646-648,650,714,730-731,1135-1143
+areal/experimental/openai/proxy/server.py
+  s_adcbc22f44e746::t_4efdd0fc6d6fa6 10,140-142
+areal/experimental/openai/tool_call_parser.py
+  s_adcbc22f44e746::t_fac4cfff93072a 61,259,748
+areal/infra/backend_router.py
+  s_adcbc22f44e746::t_b277b814abb77c 1-272
+areal/infra/controller/rollout_controller.py
+  s_adcbc22f44e746::t_f7e3df994cf0aa 40,44,194-197,303,339-359,389-391,399-451,706-716,808-816,1126-1131,1594-1602,1610-1619,1633-1636,1643-1656,1659-1660,1664-1667,1700-1706
+areal/infra/remote_inf_engine.py
+  s_adcbc22f44e746::t_26e695545a1807 59-63,142-143,601,1076-1100,1102-1110,1163-1165,1205,1207-1239,1241-1260
+areal/infra/workflow_executor.py
+  s_adcbc22f44e746::t_1b99f138c9a259 36-37,363,375,663-664,681-683,726-727,739-741,1364-1367,1490
+areal/reward/geometry3k.py
+  s_adcbc22f44e746::t_76c55c4bc89791 4-6,10,14-111,114-118,133-160,162,164,166-170,175-194
+areal/trainer/ppo/actor.py
+  s_adcbc22f44e746::t_92f66687753483 69,177-179,436-441,443,446-450,550-552,592-619,960-961,972,1053,1056-1070,1074,1076,1780-1813,1868-1908
+areal/trainer/ppo/gae.py
+  s_adcbc22f44e746::t_44eb2ec82eddad 234-235,269-272
+areal/trainer/rl_trainer.py
+  s_adcbc22f44e746::t_33e9b9109854d3 224-227,822-824,1162-1167,1751-1752,1896-1913,1972-1977
+areal/utils/data.py
+  s_adcbc22f44e746::t_bcc1a285003519 1288-1295,1365-1368
+areal/utils/functional/functional.py
+  s_adcbc22f44e746::t_4391d0f1e73df6 453-459
+areal/utils/logging.py
+  s_adcbc22f44e746::t_9db31d6f9eef2c 60
+areal/utils/mtp_checkpoint.py
+  s_adcbc22f44e746::t_0f57d9daaf88a9 1-177
+areal/utils/recover.py
+  s_adcbc22f44e746::t_b1815c72c6f508 468,509-510,543,545,554
+areal/utils/rollout_metrics.py
+  s_adcbc22f44e746::t_7df405007d6bc0 73-74,79-86
+areal/utils/score_centering.py
+  s_adcbc22f44e746::t_d4aae48fc6bb24 5,12-13,147-227,234-241,246-254,260-270,272-308
+areal/v2/inference_service/__init__.py
+  s_adcbc22f44e746::t_af0f6a662b1759 4-14
+areal/v2/inference_service/router/__main__.py
+  s_adcbc22f44e746::t_81271088d0ad65 8,17,32-37,68
+areal/v2/inference_service/router/app.py
+  s_adcbc22f44e746::t_fbc7719f722f6c 19,24,27-36,88,93-95,204,224-249,258-261,270-272,284-318,382,386-403
+areal/v2/inference_service/router/backend.py
+  s_adcbc22f44e746::t_b22f82b301e722 1-363
+areal/v2/inference_service/router/client.py
+  s_adcbc22f44e746::t_ac18ab3786a169 1-304
+areal/v2/inference_service/router/config.py
+  s_adcbc22f44e746::t_4e73c8338f5458 23
+areal/v2/training_service/controller/controller.py
+  s_adcbc22f44e746::t_e2c2ce31721b3e 1162-1170
+docs/en/algorithms/async.md
+  s_adcbc22f44e746::t_0fe6ed87faaffb 38-51
+docs/en/reference/metrics_tracking.md
+  s_adcbc22f44e746::t_432ab9d6c6adf0 376-385
+docs/en/tutorial/installation.md
+  s_adcbc22f44e746::t_fac33562e28ddd 27,45,49,57
+docs/zh/algorithms/async.md
+  s_adcbc22f44e746::t_1bec613f9b0c2b 27-38
+docs/zh/reference/metrics_tracking.md
+  s_adcbc22f44e746::t_28a1c97af9164e 351-356
+docs/zh/tutorial/installation.md
+  s_adcbc22f44e746::t_c81cb954c65a75 27,40,44,51
+examples/countdown/README.md
+  s_adcbc22f44e746::t_9e0c1422332a04 81-85
+examples/countdown/reward_score.py
+  s_adcbc22f44e746::t_06bf768296b703 1-2,5-6,29-38,40-63,65-74,78-96,98-99
+examples/math/README.md
+  s_adcbc22f44e746::t_437979c3633b20 41-42,56-126
+examples/math/score_centering_megatron.md
+  s_adcbc22f44e746::t_7e7eca37cecf6d 1-121
+examples/skypilot/README.md
+  s_adcbc22f44e746::t_cd17fc4022d2a4 28,81
+examples/skypilot/ray_cluster.sky.yaml
+  s_adcbc22f44e746::t_a1be94a49fa874 4
+examples/skypilot/single_node.sky.yaml
+  s_adcbc22f44e746::t_e83f2509385d32 11
+examples/swe/README_arena.md
+  s_adcbc22f44e746::t_5297457f99befc 119-160
+examples/swe/arena_agent.py
+  s_adcbc22f44e746::t_967df09d556df6 6,39,90-93,863-1029,1034,1036-1038,1055-1062,1064-1069,1073-1075,1079,1089-1091,1260-1261,1267,1278-1280,1286,1454-1460,1462-1469,1553-1556,1602,1762-1815,2082-2085
+examples/swe/rl/qwen38_27b/train_fine_released64_bs16.yaml
+  s_adcbc22f44e746::t_66eeebbdf2588a 309-315
+pyproject.toml
+  s_adcbc22f44e746::t_78c9e6be5f5433 11
+pyproject.vllm.toml
+  s_adcbc22f44e746::t_5afb5708adda9f 27
+tests/experimental/openai/test_arena_episode_reward.py
+  s_adcbc22f44e746::t_9b8c433610c989 3,14,22,191-450
+tests/experimental/openai/test_context_overflow_recovery.py
+  s_adcbc22f44e746::t_c245a974e03827 13-17,80-96,129-177,430-436,438,455-467,469,502-503,518-521,682-734,978-980
+tests/test_advantage_algorithms.py
+  s_adcbc22f44e746::t_faf5b2076d0a6f 11,86-134
+tests/test_arena_attempt_metrics.py
+  s_adcbc22f44e746::t_ba3d199b301f6a 1-145
+tests/test_backend_routing_lifecycle.py
+  s_adcbc22f44e746::t_7c0b18d5004d4d 1-250
+tests/test_binary_kl_divergence.py
+  s_adcbc22f44e746::t_48fddcd3cf7737 1-93
+tests/test_countdown_reward.py
+  s_adcbc22f44e746::t_6cefb617ba768c 1-372
+tests/test_data_engineering_execution.py
+  s_adcbc22f44e746::t_11a9964cb65c4e 60-66,70,79-87,260
+tests/test_data_engineering_parallel_stages.py
+  s_adcbc22f44e746::t_07338b44219829 45-50
+tests/test_deterministic_sampling.py
+  s_adcbc22f44e746::t_6fa2595295e4e3 431,452
+tests/test_eval_rtensor_cleanup.py
+  s_adcbc22f44e746::t_47a71e05b99a77 14,137,155,176
+tests/test_geometry3k_reward.py
+  s_adcbc22f44e746::t_a25e18b30ba3cd 1-151
+tests/test_geometry3k_reward_extended.py
+  s_adcbc22f44e746::t_025d9d90858631 1-184
+tests/test_geometry3k_reward_units.py
+  s_adcbc22f44e746::t_f83b5571f59299 1-207
+tests/test_math_verify_reward.py
+  s_adcbc22f44e746::t_fd44acde27dbae 1-2,116,328
+tests/test_megatron_engine_vlm.py
+  s_adcbc22f44e746::t_c7e57096507c0e 95-174,1028-1173
+tests/test_mtp_checkpoint.py
+  s_adcbc22f44e746::t_0163f3dc2f6408 1-302
+tests/test_policy_version_mask.py
+  s_adcbc22f44e746::t_0dab5c1826701a 1-165
+tests/test_recover.py
+  s_adcbc22f44e746::t_c843a35d6102de 681,696,820
+tests/test_rollout_controller.py
+  s_adcbc22f44e746::t_034edafaa26870 1556-1565,1570-1572
+tests/test_score_centering.py
+  s_adcbc22f44e746::t_fae34063dce97c 8-13,31-38,59,72-77,387-389,400-402,443,456,459-463,465,477-481,496
+tests/test_score_centering_megatron.py
+  s_adcbc22f44e746::t_e826aaadfeec2e 1-520
+tests/test_score_centering_parallel.py
+  s_adcbc22f44e746::t_4e0079a8c3e0bb 1-179
+tests/test_score_centering_tis.py
+  s_adcbc22f44e746::t_4714ff06f46068 1-270
+tests/test_score_centering_vocab_parallel.py
+  s_adcbc22f44e746::t_933e0fd7bcb626 1-196
+tests/test_sglang_mm_limits_config.py
+  s_adcbc22f44e746::t_b6c77895db1d51 1-51
+tests/test_sglang_qwen38_mtp_patch.py
+  s_adcbc22f44e746::t_d10c459ba218c4 1-247
+tests/test_swe_arena_abbreviated_receipt.py
+  s_adcbc22f44e746::t_0145587f5cd042 90-95,145-148,151-154,160-163,196-269,275-283
+tests/test_swe_arena_multi_stream.py
+  s_adcbc22f44e746::t_04d847e3b4334a 5,8,1037-1137,1159-1585,1588-1595,1601-1609,1625-1632,1635-1636,1810-1840
+tests/test_teacher_rtensor_cleanup.py
+  s_adcbc22f44e746::t_16aa114e8b1b3a 115
+tests/test_trainer_eval_before_train.py
+  s_adcbc22f44e746::t_b6401ac1d4a8f0 264-281
+tests/test_training_diagnostics.py
+  s_adcbc22f44e746::t_9f099920e0d89c 9-13,49-86
+tests/test_training_diagnostics_distributed.py
+  s_adcbc22f44e746::t_cab1bfcb75a2b3 12-15,56-74
+tests/torchrun/run_fsdp_score_centering.py
+  s_adcbc22f44e746::t_367ce853f62775 1-129
+tests/torchrun/run_megatron_score_centering.py
+  s_adcbc22f44e746::t_dd2f89960ba2ae 1-269
+tests/v2/inference_service/test_backend_router.py
+  s_adcbc22f44e746::t_2453a655aafcf3 1-763
+tests/v2/training_service/test_controller_unit.py
+  s_adcbc22f44e746::t_7e14fb4175a4ee 347-388
+uv.lock
+  s_adcbc22f44e746::t_22241ca8671482 371
+uv.vllm.lock
+  s_adcbc22f44e746::t_9adfafed90e52b 395
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ead7c5ad1b49dd8482610aa22e7d87d5be55c7c0",
+  "prompts": {},
+  "sessions": {
+    "s_adcbc22f44e746": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a178a2-581a-7ab0-8eac-6f6cdae307e6",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
