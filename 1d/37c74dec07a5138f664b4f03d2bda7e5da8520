@@ -1,0 +1,24 @@
+tests/test_stream_train_controller.py
+  s_5ffc08691846bc::t_c4f6b55258f484 1-102
+areal/infra/controller/train_controller.py
+  s_5ffc08691846bc::t_6cbc173d6fbdaf 793-795,798-800,803-805,819-820,870-874,878-882
+  s_5ffc08691846bc::t_183dc77477006b 791-792,796-797,801-802,806-818,821-830,836-857,859-869,875-877,883-898
+  s_5ffc08691846bc::t_a601a12e00b148 831-835,858
+  s_5ffc08691846bc::t_3e6266ea2c7125 899-900
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1d37c74dec07a5138f664b4f03d2bda7e5da8520",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
