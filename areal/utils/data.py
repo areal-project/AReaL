@@ -1710,16 +1710,44 @@ class _TensorLeaf:
         return int(np.prod(self.shape))
 
 
-def _deconstruct_tensor_container(value, out_tensors: list[torch.Tensor]):
-    """Split a container into a picklable skeleton and its tensor leaves (DFS order)."""
+@dataclass(frozen=True)
+class _TupleSkeleton:
+    """Picklable stand-in for a tuple (or named tuple) inside a container skeleton."""
+
+    container_type: type | None
+    items: list
+
+
+def _deconstruct_tensor_container(
+    value, out_tensors: list[torch.Tensor], *, split_tuples: bool = False
+):
+    """Split a container into a picklable skeleton and its tensor leaves (DFS order).
+
+    Tuples are kept as opaque values unless ``split_tuples`` is set.
+    """
     if torch.is_tensor(value):
         out_tensors.append(value)
         return _TensorLeaf(tuple(value.shape), value.dtype, value.device.type)
     if isinstance(value, list):
-        return [_deconstruct_tensor_container(item, out_tensors) for item in value]
+        return [
+            _deconstruct_tensor_container(item, out_tensors, split_tuples=split_tuples)
+            for item in value
+        ]
+    if split_tuples and isinstance(value, tuple):
+        return _TupleSkeleton(
+            type(value) if hasattr(value, "_fields") else None,
+            [
+                _deconstruct_tensor_container(
+                    item, out_tensors, split_tuples=split_tuples
+                )
+                for item in value
+            ],
+        )
     if isinstance(value, dict):
         return {
-            key: _deconstruct_tensor_container(item, out_tensors)
+            key: _deconstruct_tensor_container(
+                item, out_tensors, split_tuples=split_tuples
+            )
             for key, item in value.items()
         }
     return value
@@ -1731,6 +1759,13 @@ def _reconstruct_tensor_container(skeleton, tensors: Iterator[torch.Tensor]):
         return next(tensors)
     if isinstance(skeleton, list):
         return [_reconstruct_tensor_container(item, tensors) for item in skeleton]
+    if isinstance(skeleton, _TupleSkeleton):
+        values = [
+            _reconstruct_tensor_container(item, tensors) for item in skeleton.items
+        ]
+        if skeleton.container_type is not None:
+            return skeleton.container_type(*values)
+        return tuple(values)
     if isinstance(skeleton, dict):
         return {
             key: _reconstruct_tensor_container(item, tensors)
@@ -1747,6 +1782,9 @@ def _skeleton_tensor_leaves(skeletons) -> list[_TensorLeaf]:
             leaves.append(value)
         elif isinstance(value, list):
             for item in value:
+                _walk(item)
+        elif isinstance(value, _TupleSkeleton):
+            for item in value.items:
                 _walk(item)
         elif isinstance(value, dict):
             for item in value.values():
@@ -1855,6 +1893,86 @@ def all_gather_ragged_tensor_container(items: list, group=None) -> list[list]:
     return results
 
 
+# Upper bound on the extra buffer that one packed broadcast allocates.
+_BROADCAST_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def _broadcast_chunks(leaves: list[_TensorLeaf]) -> list[list[int]]:
+    """Group leaf indices into same-dtype/device chunks of bounded size."""
+    buckets: dict[tuple[torch.dtype, str], list[int]] = {}
+    for index, leaf in enumerate(leaves):
+        buckets.setdefault((leaf.dtype, leaf.device_type), []).append(index)
+    chunks: list[list[int]] = []
+    for bucket in sorted(buckets, key=str):
+        chunk: list[int] = []
+        chunk_bytes = 0
+        for index in buckets[bucket]:
+            nbytes = leaves[index].numel * leaves[index].dtype.itemsize
+            if chunk and chunk_bytes + nbytes > _BROADCAST_CHUNK_BYTES:
+                chunks.append(chunk)
+                chunk, chunk_bytes = [], 0
+            chunk.append(index)
+            chunk_bytes += nbytes
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def _broadcast_chunk(
+    leaves: list[_TensorLeaf],
+    chunk: list[int],
+    tensors: list[torch.Tensor] | None,
+    received: list[torch.Tensor | None],
+    src_rank: int,
+    group,
+) -> None:
+    first = leaves[chunk[0]]
+    device = (
+        torch.device("cpu")
+        if first.device_type == "cpu"
+        else current_platform.current_device()
+    )
+    if len(chunk) == 1:
+        buffer = (
+            tensors[chunk[0]]
+            if tensors is not None
+            else torch.empty(first.shape, dtype=first.dtype, device=device)
+        )
+    elif tensors is not None:
+        buffer = torch.cat([tensors[index].reshape(-1) for index in chunk])
+    else:
+        numel = sum(leaves[index].numel for index in chunk)
+        buffer = torch.empty(numel, dtype=first.dtype, device=device)
+    if buffer.numel() > 0:
+        dist.broadcast(buffer, src=src_rank, group=group)
+    if tensors is not None:
+        return
+    if len(chunk) == 1:
+        received[chunk[0]] = buffer
+        return
+    parts = buffer.split([leaves[index].numel for index in chunk])
+    for index, part in zip(chunk, parts):
+        received[index] = part.view(leaves[index].shape).clone()
+
+
+def _broadcast_leaf_tensors(
+    leaves: list[_TensorLeaf],
+    tensors: list[torch.Tensor] | None,
+    src_rank: int,
+    group,
+) -> list[torch.Tensor]:
+    """Broadcast the tensor leaves of a skeleton with one collective per chunk.
+
+    The source passes its contiguous leaves; receivers pass None and get one
+    tensor per leaf, each with its own storage. Only one packed chunk buffer
+    is alive at a time.
+    """
+    received: list[torch.Tensor | None] = [None] * len(leaves)
+    for chunk in _broadcast_chunks(leaves):
+        _broadcast_chunk(leaves, chunk, tensors, received, src_rank, group)
+    return tensors if tensors is not None else received
+
+
 def broadcast_tensor_container(
     data, src_rank=0, group=None, *, preserve_tensor_aliases: bool = False
 ):
@@ -1862,7 +1980,9 @@ def broadcast_tensor_container(
 
     Only a source payload with nonempty multi_modal_input* tensors activates
     the opt-in. Receivers follow source metadata, even when their input is None.
-    Text-only calls retain the original wire format and per-reference buffers.
+    Other payloads travel as one pickled skeleton (containers, non-tensor values
+    and tensor metadata) plus one tensor broadcast per same-dtype chunk; every
+    tensor reference still gets its own receiver buffer.
     """
     if (
         preserve_tensor_aliases
@@ -1876,80 +1996,24 @@ def broadcast_tensor_container(
     if dist.get_rank() != src_rank:
         metadata = [None]
         dist.broadcast_object_list(metadata, src=src_rank, group=group)
-        data_type, info = metadata[0]
+        data_type, skeleton = metadata[0]
         if data_type == "tensor_aliases":
             return _broadcast_tensor_container_with_aliases(None, src_rank, group)
-        if data_type == "none":
-            return None
-        if data_type == "tensor":
-            return broadcast_tensor(data, src_rank=src_rank, group=group)
-        elif data_type == "list":
-            length = info
-            return [
-                broadcast_tensor_container(None, src_rank=src_rank, group=group)
-                for _ in range(length)
-            ]
-        elif data_type == "tuple":
-            length, container_type = info
-            values = [
-                broadcast_tensor_container(None, src_rank=src_rank, group=group)
-                for _ in range(length)
-            ]
-            if container_type is not None:
-                return container_type(*values)
-            return tuple(values)
-        elif data_type == "dict":
-            keys = info
-            return {
-                k: broadcast_tensor_container(None, src_rank=src_rank, group=group)
-                for k in keys
-            }
-        elif data_type == "object":
-            to_broadcast = [None]
-            dist.broadcast_object_list(to_broadcast, src=src_rank, group=group)
-            return to_broadcast[0]
-        else:
+        if data_type != "skeleton":
             raise ValueError(f"Unknown data type: {data_type}")
-    else:
-        if data is None:
-            metadata = [("none", None)]
-            dist.broadcast_object_list(metadata, src=src_rank, group=group)
-            return None
-        elif torch.is_tensor(data):
-            metadata = [("tensor", None)]
-            dist.broadcast_object_list(metadata, src=src_rank, group=group)
-            return broadcast_tensor(data, src_rank=src_rank, group=group)
-        elif isinstance(data, list):
-            metadata = [("list", len(data))]
-            dist.broadcast_object_list(metadata, src=src_rank, group=group)
-            return [
-                broadcast_tensor_container(d, src_rank=src_rank, group=group)
-                for d in data
-            ]
-        elif isinstance(data, tuple):
-            container_type = type(data) if hasattr(data, "_fields") else None
-            metadata = [("tuple", (len(data), container_type))]
-            dist.broadcast_object_list(metadata, src=src_rank, group=group)
-            values = [
-                broadcast_tensor_container(d, src_rank=src_rank, group=group)
-                for d in data
-            ]
-            if container_type is not None:
-                return container_type(*values)
-            return tuple(values)
-        elif isinstance(data, dict):
-            metadata = [("dict", list(data.keys()))]
-            dist.broadcast_object_list(metadata, src=src_rank, group=group)
-            return {
-                k: broadcast_tensor_container(v, src_rank=src_rank, group=group)
-                for k, v in data.items()
-            }
-        else:
-            metadata = [("object", None)]
-            dist.broadcast_object_list(metadata, src=src_rank, group=group)
-            to_broadcast = [data]
-            dist.broadcast_object_list(to_broadcast, src=src_rank, group=group)
-            return to_broadcast[0]
+        received = _broadcast_leaf_tensors(
+            _skeleton_tensor_leaves(skeleton), None, src_rank, group
+        )
+        return _reconstruct_tensor_container(skeleton, iter(received))
+    tensors: list[torch.Tensor] = []
+    skeleton = _deconstruct_tensor_container(data, tensors, split_tuples=True)
+    tensors = [tensor.contiguous() for tensor in tensors]
+    if dist.get_world_size(group) > 1:
+        dist.broadcast_object_list([("skeleton", skeleton)], src=src_rank, group=group)
+        _broadcast_leaf_tensors(
+            _skeleton_tensor_leaves(skeleton), tensors, src_rank, group
+        )
+    return _reconstruct_tensor_container(skeleton, iter(tensors))
 
 
 def _broadcast_tensor_container_with_aliases(data, src_rank=0, group=None):
