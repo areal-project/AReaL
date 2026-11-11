@@ -1,0 +1,23 @@
+examples/stream_trainer/check_timeline.py
+  s_5ffc08691846bc::t_e58f3dd38bfeb0 1-70
+examples/stream_trainer/run_e2e.sh
+  s_5ffc08691846bc::t_fb5de4d0f461a2 1-72
+examples/stream_trainer/train_e2e.py
+  s_5ffc08691846bc::t_f308d59abb9bd9 1-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4f760129b2e8e754c014fbcc6a9299c7b8fc4202",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
