@@ -11,6 +11,8 @@
 以下硬件配置已经过测试：
 
 - **GPU**：每节点 8 × AMD Instinct MI308X（gfx942），或每节点 8 × AMD Instinct MI355X（gfx950）
+- **CPU**：每节点 224 个逻辑核（MI308X 节点）或 256 个逻辑核（MI355X 节点）
+- **内存**：每节点约 880 GB（MI308X 节点）或约 3 TB（MI355X 节点）
 
 **注意**：MI300X 和 MI325X 使用 gfx942 架构，MI350X 和 MI355X 使用 gfx950 架构。
 

@@ -12,6 +12,9 @@ described below.
 The following hardware configurations have been tested:
 
 - **GPU**: 8x AMD Instinct MI308X (gfx942) or 8x AMD Instinct MI355X (gfx950) per node
+- **CPU**: 224 logical cores per node (MI308X node) or 256 logical cores per node
+  (MI355X node)
+- **Memory**: about 880 GB per node (MI308X node) or about 3 TB per node (MI355X node)
 
 **Note**: MI300X and MI325X use the gfx942 architecture, and MI350X and MI355X use the
 gfx950 architecture.
