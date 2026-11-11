@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import time
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 
 from areal.elastic.contracts import (
@@ -19,13 +20,18 @@ from areal.elastic.contracts import (
     positive_int,
 )
 from areal.elastic.reconfigurator.reference import trigger as trigger_rules
+from areal.elastic.reconfigurator.reference.candidates import (
+    grid_roles,
+    restrict_grid,
+    role_witnesses,
+)
 from areal.elastic.reconfigurator.reference.forecast import (
     HistoricalForecaster,
     HistoricalReplay,
 )
+from areal.elastic.reconfigurator.reference.heuristic import POLICY, HeuristicOptimizer
 from areal.elastic.reconfigurator.reference.identity import fingerprint
 from areal.elastic.reconfigurator.reference.optimizer import (
-    OnlineOptimizer,
     meets_target,
 )
 from areal.elastic.serving import ServingSLO, rolling_slo
@@ -54,6 +60,8 @@ class OnlineReconfiguratorConfig:
     post_switch_wait_seconds: float | None = None
     # Spend at most one search per detected workload regime, including rejected results.
     search_once_per_regime: bool = False
+    # Candidates evaluated serially within each process-pool task (v2 grid search).
+    candidate_chunk_size: int = 1
 
     def __post_init__(self):
         for name in ("check_interval_seconds", "slo_window_seconds"):
@@ -76,6 +84,7 @@ class OnlineReconfiguratorConfig:
             "slack_checks",
             "minimum_completed_requests",
             "max_evaluations",
+            "candidate_chunk_size",
         ):
             positive_int(name, getattr(self, name))
 
@@ -91,6 +100,8 @@ class _Search:
 
 
 class OnlineReconfigurator:
+    """Reference v2 over a factorized grid, or a bounded explicit candidate catalog."""
+
     implementation = "reference"
 
     def __init__(
@@ -99,6 +110,8 @@ class OnlineReconfigurator:
         forecaster: HistoricalForecaster | HistoricalReplay,
         config: OnlineReconfiguratorConfig,
         slo: ServingSLO,
+        *,
+        search_space: dict | None = None,
     ):
         if not candidates:
             raise ValueError("Explicit online candidates are required")
@@ -107,8 +120,14 @@ class OnlineReconfigurator:
         ):
             raise ValueError("One search per regime requires HistoricalReplay")
         self.candidates = tuple(dict.fromkeys(candidates))
-        self.optimizer = OnlineOptimizer(
-            max_queries=config.max_evaluations, max_seconds=config.max_search_seconds
+        self.search_space = deepcopy(search_space)
+        self._grid_roles = (
+            grid_roles(self.search_space)[:2] if self.search_space is not None else None
+        )
+        self.optimizer = HeuristicOptimizer(
+            max_queries=config.max_evaluations,
+            max_seconds=config.max_search_seconds,
+            chunk_size=config.candidate_chunk_size,
         )
         self.forecaster, self.config, self.slo = (forecaster, config, slo)
         self.decision_index = 0
@@ -117,6 +136,9 @@ class OnlineReconfigurator:
         self.last_search = -math.inf
         self._last_search_state = None
         self._searched_regimes: set[int] = set()
+        self._retry_evidence = None
+        self._retry_times = []
+        self.retry_reason = "first_search"
         self._winners = []
         self.environment = None
 
@@ -127,6 +149,8 @@ class OnlineReconfigurator:
         return trigger_rules.search_state(self, view, evaluator)
 
     def redundant_search(self, view, evaluator):
+        if self.search_space is not None:
+            return trigger_rules.evidence_redundant_search(self, view, evaluator)
         return trigger_rules.redundant_search(self, view, evaluator)
 
     def switched(self, when: float):
@@ -226,8 +250,12 @@ class OnlineReconfigurator:
             self.last_search = view.now
             self._last_search_state = self.search_state(view, evaluator)
         seeds = () if historical else tuple(f.seed for f in forecasts)
-        candidates = (view.layout,) + tuple(
-            c for c in self.candidates if c != view.layout
+        candidates = (
+            role_witnesses(
+                *self._grid_roles, view.layout, self.search_space["gpu_budget"]
+            )
+            if self._grid_roles is not None
+            else (view.layout,) + tuple(c for c in self.candidates if c != view.layout)
         )
         if roles is not None:
             candidates = tuple(
@@ -236,9 +264,15 @@ class OnlineReconfigurator:
                 if (roles["actor"] or c.actor_key == view.layout.actor_key)
                 and (roles["rollout"] or c.rollout_key == view.layout.rollout_key)
             )
-        layouts = candidates
-        if cfg.independent_role_history and len(layouts) == 1:
+        if cfg.independent_role_history and len(candidates) == 1:
             return keep("No alternative layout under role history constraints", trigger)
+        layouts = candidates
+        if self.search_space is not None:
+            layouts = (
+                self.search_space
+                if roles is None
+                else restrict_grid(self.search_space, view.layout, roles)
+            )
         preferred = ()
         if historical and self._winners and (self.forecaster.features is not None):
             preferred = (
@@ -247,7 +281,7 @@ class OnlineReconfigurator:
                     key=lambda row: row[0].distance(self.forecaster.features),
                 )[1],
             )
-        preferred = tuple(c for c in preferred if c in layouts)
+        preferred = tuple(c for c in preferred if c in candidates)
         if cfg.search_once_per_regime:
             # A search consumes this regime's opportunity even if application is rejected.
             self._searched_regimes.add(self.forecaster.regime_index)
@@ -264,6 +298,20 @@ class OnlineReconfigurator:
         best = self.optimizer.select(
             predictions, view.layout, slo.minimum_request_fraction, trigger=trigger
         )
+        if self.search_space is not None and predictions:
+            self._retry_evidence = dict(
+                **trigger_rules.observed_evidence(view, cfg.slo_window_seconds),
+                regime=getattr(self.forecaster, "regime_index", None),
+                trigger=trigger,
+                target_met=best is not None
+                and meets_target(best, slo.minimum_request_fraction),
+            )
+            self._retry_times = [
+                t
+                for t in self._retry_times
+                if t > view.now - POLICY["search_rate_window_seconds"]
+            ] + [view.now]
+            evaluator.execution_stats["retry_reason"] = self.retry_reason
         if best is None:
             return keep(
                 "No scored candidate; retain current deployment",
@@ -280,6 +328,8 @@ class OnlineReconfigurator:
             reason = "No SLO-target and sustainable-Actor alternative; retain current deployment"
         else:
             reason = "Best executable request fraction, then minimum Actor-supply deficit and GPU cost. SLO/capacity target remains unmet"
+        if getattr(self.optimizer, "selection_mode", None) == "queue_recovery":
+            reason = "No target-feasible candidate; within 2pp of best SLO, prefer updates and queue drain, then supply and cost"
         features = self.forecaster.features if historical else None
         if features is not None:
             self._winners = (self._winners + [(features, best.layout)])[-16:]

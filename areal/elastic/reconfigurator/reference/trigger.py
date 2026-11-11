@@ -8,6 +8,7 @@ import math
 
 from areal.elastic.contracts import RollingSLO
 from areal.elastic.reconfigurator.reference.forecast import HistoricalReplay
+from areal.elastic.reconfigurator.reference.heuristic import POLICY
 from areal.elastic.serving import rolling_slo
 
 
@@ -100,3 +101,66 @@ def trigger(owner, stats: RollingSLO) -> str:
     ):
         return "slack"
     return "none"
+
+
+def observed_evidence(view, window):
+    """Summarize observed completed turns and current admission backlog."""
+    completed = [e for e in view.episodes if e.completed_at is not None]
+    recent = [e for e in completed if e.completed_at >= view.now - window]
+    turns = [t for e in recent for t in e.completed_turns]
+    return dict(
+        completed=len(completed),
+        waiting=sum(not e.admitted for e in view.episodes),
+        shape=(
+            sum(t.output_tokens for t in turns) / max(1, len(turns)),
+            sum(t.tool_seconds or 0 for t in turns) / max(1, len(turns)),
+            sum(len(e.completed_turns) for e in recent) / max(1, len(recent)),
+        ),
+    )
+
+
+def evidence_redundant_search(owner, view, evaluator):
+    old = owner._retry_evidence
+    if old is None:
+        owner.retry_reason = "first_search"
+        return False
+    if view.now - owner.last_search < POLICY["minimum_search_spacing_seconds"]:
+        return True
+    if (
+        sum(
+            t > view.now - POLICY["search_rate_window_seconds"]
+            for t in owner._retry_times
+        )
+        >= POLICY["searches_per_rate_window"]
+    ):
+        return True
+    now = observed_evidence(view, owner.config.slo_window_seconds)
+    stats = rolling_slo(view, owner.slo, owner.config.slo_window_seconds)
+    shape_changed = any(
+        abs(a - b) / max(abs(a), abs(b), 1e-9) >= POLICY["shape_change_ratio"]
+        for a, b in zip(now["shape"], old["shape"], strict=True)
+    )
+    reasons = []
+    if owner.forecaster.regime_index != old["regime"]:
+        reasons.append("detected_regime")
+    if (
+        shape_changed
+        and now["completed"] - old["completed"]
+        >= POLICY["minimum_new_completed_episodes"]
+    ):
+        reasons.append("observed_shape_change")
+    if owner._trigger(stats) == "pressure" and old["trigger"] != "pressure":
+        reasons.append("new_slo_pressure")
+    if now["waiting"] - old["waiting"] >= max(
+        evaluator.config.batch_size, old["waiting"] * 0.25
+    ):
+        reasons.append("admission_queue_growth")
+    if (
+        not old["target_met"]
+        and view.now - owner.last_search >= POLICY["unresolved_retry_seconds"]
+        and now["completed"] - old["completed"]
+        >= POLICY["minimum_new_completed_episodes"]
+    ):
+        reasons.append("unresolved_with_new_completed_history")
+    owner.retry_reason = "+".join(reasons) if reasons else "unchanged_evidence"
+    return not reasons

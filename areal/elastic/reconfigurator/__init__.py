@@ -43,12 +43,15 @@ def build_reconfigurator(
     forecast: dict | None = None,
     slo=None,
     optimizer=None,
+    search_space: dict | None = None,
 ):
     """Choose a complete algorithm version, independently of its execution backend."""
     from ..contracts import ExecutionConfig
     from ..serving import ServingSLO
 
     module = component_module(name, "reconfigurator")
+    if search_space is not None and name != "reference":
+        raise ValueError("Factorized search_space requires Reference")
     candidates = tuple(candidates)
     if name == "basic" and any(isinstance(c, ExecutionConfig) for c in candidates):
         raise ValueError(
@@ -74,7 +77,7 @@ def build_reconfigurator(
         cooldown_seconds=0.0,
         decision_delay_seconds=0.0,
         minimum_completed_requests=8,
-        max_evaluations=len(candidates),
+        max_evaluations=64 if search_space is not None else len(candidates),
     )
     options.update(settings or {})
     if slo is None:
@@ -82,7 +85,11 @@ def build_reconfigurator(
     elif isinstance(slo, dict):
         slo = ServingSLO(**slo)
     result = module.OnlineReconfigurator(
-        candidates, forecaster, module.OnlineReconfiguratorConfig(**options), slo
+        candidates,
+        forecaster,
+        module.OnlineReconfiguratorConfig(**options),
+        slo,
+        **(dict(search_space=search_space) if name == "reference" else {}),
     )
     if optimizer is not None:
         result.optimizer = optimizer
