@@ -14,7 +14,10 @@ The following hardware configurations have been tested:
 - **GPU**: 8x AMD Instinct MI308X (gfx942) or 8x AMD Instinct MI355X (gfx950) per node
 - **CPU**: 224 logical cores per node (MI308X node) or 256 logical cores per node
   (MI355X node)
-- **Memory**: about 880 GB per node (MI308X node) or about 3 TB per node (MI355X node)
+- **Memory**: 1 TB per node (MI308X node) or 3 TB per node (MI355X node)
+- **Network**: within a node, the 8 GPUs are fully connected by AMD Infinity Fabric (64
+  GB/s per link on MI308X, 144 GB/s per link on MI355X); across nodes, 8 × 400 Gb/s
+  InfiniBand or RoCE adapters per node (3.2 Tbps) are recommended
 
 **Note**: MI300X and MI325X use the gfx942 architecture, and MI350X and MI355X use the
 gfx950 architecture.

@@ -12,7 +12,9 @@
 
 - **GPU**：每节点 8 × AMD Instinct MI308X（gfx942），或每节点 8 × AMD Instinct MI355X（gfx950）
 - **CPU**：每节点 224 个逻辑核（MI308X 节点）或 256 个逻辑核（MI355X 节点）
-- **内存**：每节点约 880 GB（MI308X 节点）或约 3 TB（MI355X 节点）
+- **内存**：每节点 1 TB（MI308X 节点）或 3 TB（MI355X 节点）
+- **网络**：节点内 8 张 GPU 通过 AMD Infinity Fabric 两两直连（MI308X 每条链路 64 GB/s，MI355X 每条链路 144
+  GB/s）；节点间建议每节点配置 8 × 400 Gb/s 的 InfiniBand 或 RoCE 网卡，共 3.2 Tbps
 
 **注意**：MI300X 和 MI325X 使用 gfx942 架构，MI350X 和 MI355X 使用 gfx950 架构。
 
