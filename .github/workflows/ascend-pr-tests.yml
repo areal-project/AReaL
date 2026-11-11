@@ -361,6 +361,10 @@ jobs:
           collect_base_tests megatron-vlm \
             --deselect tests/test_megatron_engine_vlm.py::TestVisionModelDetection \
             tests/test_megatron_engine_vlm.py
+          collect_base_tests mindspeed-gdn-native \
+            tests/test_mindspeed_gdn_native_npu.py
+          collect_base_tests mindspeed-gdn-native-cp \
+            tests/test_mindspeed_gdn_native_cp.py
           collect_base_tests model-packed-seq-cp \
             tests/test_model_packed_seq_cp.py
           collect_base_tests megatron-bridge-vision-cp \
@@ -477,6 +481,18 @@ jobs:
             tests/test_npu_weight_reload_native.py
           pytest -q -p scripts.ci_test_report \
             tests/test_vllm_mtp_weights.py
+
+      - name: Run AscendC GDN operator and context-parallel tests
+        timeout-minutes: 15
+        env:
+          AREAL_TEST_REPORT_DIR: /tmp/current-npu-test-reports
+          ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3"
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          pytest -q -p scripts.ci_test_report \
+            tests/test_mindspeed_gdn_native_npu.py \
+            tests/test_mindspeed_gdn_native_cp.py
 
       - name: Run chunked LM-head single-device tests
         env:
