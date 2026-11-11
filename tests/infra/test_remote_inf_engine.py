@@ -6,6 +6,7 @@ from unittest import mock
 import pytest
 
 from areal.api.cli_args import InferenceEngineConfig
+from areal.engine.sglang_remote import RemoteSGLangEngine
 from areal.infra.remote_inf_engine import RemoteInfEngine
 
 
@@ -24,6 +25,25 @@ def test_sglang_timing_sessions_keep_server_spans_under_own_session():
     assert by_uuid["sample-a"]["ended_at"] == 30.0
     assert by_uuid["sample-b"]["intervals"] == []
     assert by_uuid["sample-b"]["ended_at"] is None
+
+
+def test_sglang_wrapper_exposes_worker_timing_sessions():
+    """The RPC-visible wrapper must export its internal engine's timing data."""
+    engine = RemoteSGLangEngine(InferenceEngineConfig())
+    engine._engine.start_sglang_timing_session("sample-a", 1.0)
+    engine._engine.record_sglang_server_timing("sample-a:1.1", 2.0, 4.0)
+    engine._engine.end_sglang_timing_session("sample-a", 5.0)
+
+    sessions = engine.get_sglang_timing_sessions(0.0, 6.0)
+
+    assert sessions == [
+        {
+            "session_uuid": "sample-a",
+            "started_at": 1.0,
+            "ended_at": 5.0,
+            "intervals": [("sample-a:1.1", 2.0, 4.0)],
+        }
+    ]
 
 
 def test_wait_for_server_dead_process_raises_runtime_error_with_returncode():

@@ -764,6 +764,12 @@ class RemoteSGLangEngine(InferenceEngine):
         """Get the workflow executor of the inference engine."""
         return self._engine.workflow_executor
 
+    def get_sglang_timing_sessions(
+        self, started_at: float, ended_at: float
+    ) -> list[dict[str, Any]]:
+        """Export direct session timing from the worker's internal engine."""
+        return self._engine.get_sglang_timing_sessions(started_at, ended_at)
+
     def set_version(self, version: int):
         """Set the current weight version."""
         return self._engine.set_version(version)
