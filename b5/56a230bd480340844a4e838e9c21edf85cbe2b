@@ -1,0 +1,22 @@
+areal/engine/sglang_remote.py
+  s_5ffc08691846bc::t_9382960e92b52c 930-932
+areal/infra/remote_inf_engine.py
+  s_5ffc08691846bc::t_9382960e92b52c 1900-1942
+  s_5ffc08691846bc::t_08ebf60d4f5b61 1943-1945
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b556a230bd480340844a4e838e9c21edf85cbe2b",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
