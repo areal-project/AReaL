@@ -1,0 +1,25 @@
+areal/api/cli_args.py
+  s_5ffc08691846bc::t_9384bceba8bae6 4429-4448,4455-4461,4502-4507
+  s_5ffc08691846bc::t_76c9b69889d3d1 4449-4454,4623,4632-4635
+  s_5ffc08691846bc::t_a3ee6a2e08f662 4605-4622,4624-4628,4631,4636-4665
+  s_5ffc08691846bc::t_96d680e83ec9b3 4629-4630
+  s_5ffc08691846bc::t_1159f7a0051f6d 4511-4512,4666-4691
+tests/test_stream_trainer_config.py
+  s_5ffc08691846bc::t_7ebbf21ab6a260 1-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d0d7689f28d4bb440ce7179f4f2a229d75e04b09",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
