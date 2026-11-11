@@ -260,6 +260,7 @@ def main(profile, args):
                 workflow=workflow,
                 workflow_kwargs=kwargs,
                 dynamic_filter_fn=config.should_accept_fn,
+                dynamic_filter_kwargs=getattr(config, "should_accept_kwargs", {}),
                 eval_workflow=workflow if evaluation_only else None,
                 eval_workflow_kwargs=kwargs if evaluation_only else None,
             )
