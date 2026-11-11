@@ -148,7 +148,7 @@ def _stage(loop: RevisionLoop, budget: int) -> _Stage:
         if not complete and remaining:
             # Already hold the same lock used by RevisionLoop.run; avoid relocking
             # and keep the budget check atomic with any new proposals.
-            loop._run(remaining, True)
+            loop._run(remaining)
             active = loop.store.active()
         if not context_path.exists() or not (root / "baseline.json").exists():
             raise ValueError("Stage has no completed baseline evaluation")

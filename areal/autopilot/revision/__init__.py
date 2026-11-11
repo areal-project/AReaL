@@ -10,7 +10,9 @@ from areal.autopilot.revision.agent import (
 from areal.autopilot.revision.contracts import (
     Proposal,
     ProposalRequest,
+    ReflectionRequest,
     RevisionBenchmark,
+    RevisionInsight,
     RevisionReport,
 )
 from areal.autopilot.revision.execution import CandidateRunner
@@ -21,8 +23,10 @@ __all__ = [
     "RevisionAgent",
     "Proposal",
     "ProposalRequest",
+    "ReflectionRequest",
     "CandidateRunner",
     "RevisionBenchmark",
+    "RevisionInsight",
     "RevisionReport",
     "LLMRevisionAgent",
     "RevisionLoop",

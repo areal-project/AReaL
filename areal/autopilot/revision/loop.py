@@ -12,8 +12,11 @@ from pathlib import Path
 
 from areal.autopilot.revision.agent import RevisionAgent
 from areal.autopilot.revision.contracts import (
+    Proposal,
     ProposalRequest,
+    ReflectionRequest,
     RevisionBenchmark,
+    RevisionInsight,
     digest,
     source_digest,
 )
@@ -177,6 +180,7 @@ class RevisionLoop:
                     "reason",
                     "parent_sha256",
                     "candidate_sha256",
+                    "stop_reason",
                 )
                 if k in outcome
             },
@@ -194,22 +198,86 @@ class RevisionLoop:
         )
         request_path = directory / "proposal-request.json"
         request = json.loads(request_path.read_text()) if request_path.exists() else {}
+        context = request.get("context", {})
+        history_context = context.get("history_context")
+        if history_context is None:
+            history_context = {
+                k: v
+                for k, v in context.items()
+                if k not in {"reference_sources", "instructions"}
+            }
+        else:
+            history_context = dict(history_context)
+            if "revision_budget" in context:
+                history_context["revision_budget"] = context["revision_budget"]
+        insight_path = directory / "insight.json"
+        insight = (
+            json.loads(insight_path.read_text()) if insight_path.exists() else None
+        )
+        if insight is not None:
+            insight.pop("metadata", None)
+        artifacts = {
+            name: str((directory / filename).relative_to(self.store.history_root))
+            for name, filename in (
+                ("observation", "proposal-request.json"),
+                ("proposal", "proposal.json"),
+                ("candidate", "candidate.py"),
+                ("evaluation", "evaluation.json"),
+                ("outcome", "outcome.json"),
+                ("insight", "insight.json"),
+            )
+            if (directory / filename).exists()
+        }
         self.store.record_history(
             directory,
             {
                 "target": self.benchmark.target,
                 "benchmark_sha256": self.benchmark.benchmark_sha256,
                 "settings": request.get("settings", {}),
-                "context": {
-                    k: v
-                    for k, v in request.get("context", {}).items()
-                    if k not in {"reference_sources", "instructions"}
-                },
+                "context": history_context,
                 "rationale": proposal.get("rationale", ""),
                 "baseline": outcome.get("baseline"),
                 "outcome": self._public_feedback(outcome),
+                "insight": insight,
+                "insight_status": outcome.get("insight_status", "not_recorded"),
+                "artifacts": artifacts,
             },
         )
+
+    def _reflect(
+        self,
+        directory: Path,
+        request: ProposalRequest,
+        proposal: Proposal,
+        outcome: dict,
+        *,
+        remaining_rounds: int,
+    ) -> RevisionInsight | None:
+        """Summarize after evaluation; the program's acceptance decision is final."""
+        reflect = getattr(self.agent, "reflect", None)
+        if not callable(reflect):
+            # Existing command-independent proposers can still run without lessons.
+            outcome["insight_status"] = "not_supported"
+            return
+        reflection = ReflectionRequest(
+            request,
+            proposal,
+            deepcopy(outcome["baseline"]),
+            deepcopy(self._public_feedback(outcome)),
+            remaining_rounds=remaining_rounds,
+        )
+        atomic_json(directory / "reflection-request.json", reflection.to_dict())
+        try:
+            insight = reflect(reflection)
+            if not isinstance(insight, RevisionInsight):
+                raise TypeError("Agent.reflect must return RevisionInsight")
+        except Exception as error:
+            outcome["insight_status"] = "failed"
+            outcome["insight_error"] = f"{type(error).__name__}: {error}"[:2000]
+        else:
+            atomic_json(directory / "insight.json", asdict(insight))
+            outcome["insight_status"] = "recorded"
+            return insight
 
     def restore_history(self) -> list[tuple[Path, dict]]:
         """Index completed rounds, including outputs created before history support."""
@@ -222,12 +290,12 @@ class RevisionLoop:
                 completed.append((directory, outcome))
         return completed
 
-    def run(self, *, max_rounds: int = 3, stop_after_accept: bool = True) -> dict:
+    def run(self, *, max_rounds: int = 3) -> dict:
         if type(max_rounds) is not int or max_rounds < 1:
             raise ValueError("Revision rounds must be positive")
         with (self.store.root / "revision.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return self._run(max_rounds, stop_after_accept)
+            return self._run(max_rounds)
 
     @property
     def context(self) -> dict:
@@ -246,7 +314,7 @@ class RevisionLoop:
             )
         return context
 
-    def _run(self, max_rounds: int, stop_after_accept: bool) -> dict:
+    def _run(self, max_rounds: int) -> dict:
         root, context = self.store.root, self.context
         if (root / "context.json").exists():
             if json.loads((root / "context.json").read_text()) != context:
@@ -311,10 +379,16 @@ class RevisionLoop:
             *(self._public_feedback(o) for o in previous[-3:]),
         ]
         outcomes = []
-        for _ in range(max_rounds):
+        stop_reason = "round_budget"
+        for round_index in range(max_rounds):
             round_number = len(list(attempts.glob("round-*"))) + 1
             directory = attempts / f"round-{round_number:04d}-{uuid.uuid4().hex[:8]}"
             directory.mkdir()
+            proposal_context = deepcopy(self.proposal_context)
+            proposal_context["revision_budget"] = {
+                "max_rounds": max_rounds,
+                "remaining_rounds": max_rounds - round_index,
+            }
             request = ProposalRequest(
                 self.benchmark.target,
                 round_number,
@@ -324,7 +398,7 @@ class RevisionLoop:
                 json.loads(json.dumps(self.benchmark.settings)),
                 tuple(feedback[-4:]),
                 previous_source=previous_source if previous_source != source else None,
-                context=deepcopy(self.proposal_context),
+                context=proposal_context,
                 revision_history=self.store.history(self.benchmark.target),
             )
             atomic_json(directory / "proposal-request.json", request.to_dict())
@@ -334,6 +408,7 @@ class RevisionLoop:
                 "parent_sha256": source_digest(source),
                 "baseline": self._report_feedback(baseline),
             }
+            proposal = None
             try:
                 proposal = self.agent.propose(request)
             except Exception as error:
@@ -389,10 +464,24 @@ class RevisionLoop:
                 except Exception as error:
                     outcome.update(reason=f"{type(error).__name__}: {error}")
             atomic_json(directory / "outcome.json", outcome)
+            insight = None
+            if proposal is not None:
+                insight = self._reflect(
+                    directory,
+                    request,
+                    proposal,
+                    outcome,
+                    remaining_rounds=max_rounds - round_index - 1,
+                )
+            agent_finished = insight is not None and insight.next_action == "finish"
+            if agent_finished or round_index + 1 == max_rounds:
+                stop_reason = "agent_finished" if agent_finished else "round_budget"
+                outcome["stop_reason"] = stop_reason
+            atomic_json(directory / "outcome.json", outcome)
             self._record_history(directory, outcome)
             feedback.append(self._public_feedback(outcome))
             outcomes.append(outcome)
-            if outcome["status"] == "accepted" and stop_after_accept:
+            if agent_finished:
                 break
         active = self.store.active()
         result = {
@@ -405,6 +494,8 @@ class RevisionLoop:
             "rounds": outcomes,
             "final_score": baseline.score,
             "final_metrics": baseline.metrics,
+            "stop_reason": stop_reason,
+            "budget": {"max_rounds": max_rounds, "attempted_rounds": len(outcomes)},
         }
         atomic_json(root / "run.json", result)
         return result

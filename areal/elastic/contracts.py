@@ -350,20 +350,24 @@ class ExecutionConfig:
     sglang_max_running_requests: int | None = None
     # Prefill-token budget per internal SGLang DP scheduler; chunk size stays fixed.
     sglang_max_prefill_tokens: int = 32768
-    # GPU memory fraction for model weights and KV cache; 0.9 means 90%.
-    sglang_mem_fraction_static: float | None = 0.9
+    # GPU memory fraction for model weights and KV cache; 0.8 means 80%.
+    sglang_mem_fraction_static: float | None = 0.8
 
     # Example grid: 32 GPUs (4x8), Actor + Rollout <= 32.
     # Each cell: (parallel layouts only, all raw parameter combinations).
     # TP/ETP: 1/2/4/8; PP/CP/EP: 1/2/4/8/16; DP/replicas: positive integers.
+    # Layout counts include SGLang Attention DP, plus Rollout EP for MoE.
+    # Internal DP/EP sizes divide rollout TP; size 1 means disabled.
+    # Enable flags follow these sizes and are not counted separately.
     # Actor n_mbs/token_cap/pad: 4/4/2 choices; rollout concurrency: 4.
-    # SGLang running/prefill/memory: 4/3/3 choices.
+    # SGLang running/prefill: 4/3 choices; memory fraction is fixed at 0.8.
+    # Non-layout multiplier: 4 * 4 * 2 * 4 * 4 * 3 = 1536.
     # Model, batch, memory and physical-placement filters are not applied.
     # Rollout backend: SGLang.
     #
     # | Actor backend | Dense             | MoE                 |
     # | ------------- | ----------------- | ------------------- |
-    # | Megatron      | (13980, 64419840)  | (171136, 788594688)  |
+    # | Megatron      | (13980, 21473280)  | (171136, 262864896)  |
 
     @staticmethod
     def _dimensions(text, allowed):
