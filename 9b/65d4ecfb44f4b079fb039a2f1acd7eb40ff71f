@@ -1,0 +1,24 @@
+areal/engine/megatron_engine.py
+  s_5ffc08691846bc::t_76c9b69889d3d1 12,402,444-446,1305,1352,1503-1641,1649,2139-2145,2499-2517,2524,2592,2788-2790,2878,2926,4269,4781-4933
+  s_5ffc08691846bc::t_4fffaeec3baa71 4934
+areal/engine/megatron_utils/stream_update.py
+  s_5ffc08691846bc::t_71fc3bff80de30 1-47
+tests/test_megatron_stream_update.py
+  s_5ffc08691846bc::t_18fb36d622316f 1-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9b65d4ecfb44f4b079fb039a2f1acd7eb40ff71f",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
