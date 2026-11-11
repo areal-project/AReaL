@@ -321,6 +321,41 @@ def test_sglang_deterministic_inference_unsupported_backend_warns(monkeypatch):
     assert "torch_native" in mock_logger.warning.call_args.args
 
 
+@pytest.mark.parametrize(
+    ("hip_version", "deterministic", "configured", "expected"),
+    [
+        ("7.15.0", False, "fa3", "aiter"),
+        ("7.15.0", True, "fa3", "triton"),
+        ("7.15.0", False, "triton", "triton"),
+        ("7.15.0", False, None, None),
+        (None, False, "fa3", "fa3"),
+    ],
+)
+def test_sglang_fa3_falls_back_on_rocm(
+    monkeypatch, hip_version, deterministic, configured, expected
+):
+    monkeypatch.setattr(
+        "areal.api.cli_args.pkg_version.is_version_greater_or_equal",
+        lambda *_: True,
+    )
+    monkeypatch.setattr(torch.version, "hip", hip_version, raising=False)
+    mock_logger = Mock()
+    monkeypatch.setattr("areal.api.cli_args.logger", mock_logger)
+
+    args = SGLangConfig.build_args(
+        SGLangConfig(
+            model_path="test-model",
+            attention_backend=configured,
+            enable_deterministic_inference=deterministic,
+        ),
+        tp_size=1,
+        base_gpu_id=0,
+    )
+
+    assert args["attention_backend"] == expected
+    mock_logger.warning.assert_not_called()
+
+
 def _deterministic_ppo_config(
     *,
     gconfig: GenerationHyperparameters,
