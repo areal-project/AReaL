@@ -1,0 +1,21 @@
+tests/torchrun/run_megatron_stream_update.py
+  s_5ffc08691846bc::t_35266983831e21 1-233
+examples/stream_trainer/run_minimal_gpu.sh
+  s_5ffc08691846bc::t_dfba38d90e38cd 1-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "28f9493c24af2a375a0b777b58d4471f60ddd9fc",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
