@@ -15,15 +15,33 @@ from typing import Any, Protocol, TypeVar
 
 Metrics = dict[str, list[float]]
 _CAPTURE: ContextVar[Metrics | None] = ContextVar("rollout_metrics", default=None)
+_DENOMINATORS = {
+    "reward": "reward_sample_count",
+    "accepted": "group_attempt_count",
+    "task_attempt/success": "task_attempt_count",
+    "harness_success": "task_result_count",
+}
+_COUNTERS = {"accepted", "rejected", "filter_rejected"}
+
+
+def _is_quality_metric(key: str) -> bool:
+    return key.startswith(("rollout/", "debug/task/")) and not key.startswith(
+        ("rollout/arena/", "rollout/prm_", "rollout/spec_accept_")
+    )
+
+
+def get_arena_stream_name(data: dict[str, Any] | None) -> str | None:
+    """Return the configured Arena stream name, falling back to its stream ID."""
+    if not data:
+        return None
+    name = data.get("arena_stream_name") or data.get("stream_id")
+    return str(name) if name else None
 
 
 def capture_scalar(key: str, value: float) -> bool:
     metrics = _CAPTURE.get()
     # Operational and proxy PRM metrics retain their wall-clock export window.
-    quality = key.startswith(("rollout/", "debug/task/")) and not key.startswith(
-        ("rollout/arena/", "rollout/prm_", "rollout/spec_accept_")
-    )
-    if metrics is None or not quality:
+    if metrics is None or not _is_quality_metric(key):
         return False
     metrics.setdefault(key, []).append(float(value))
     return True
@@ -72,16 +90,16 @@ class ConsumedMetrics:
                 result[f"{key}__count"] = len(values)
         # StatsLogger hides internal __count companions. Publish denominators
         # explicitly so dashboards can distinguish episodes, groups and Arena calls.
-        if "rollout/reward" in metrics:
-            result["rollout/reward_sample_count"] = len(metrics["rollout/reward"])
-        if "rollout/accepted" in metrics:
-            result["rollout/group_attempt_count"] = len(metrics["rollout/accepted"])
-        if "rollout/task_attempt/success" in metrics:
-            result["rollout/task_attempt_count"] = len(
-                metrics["rollout/task_attempt/success"]
-            )
-        if "rollout/harness_success" in metrics:
-            result["rollout/task_result_count"] = len(
-                metrics["rollout/harness_success"]
-            )
+        for key, values in metrics.items():
+            for metric in _DENOMINATORS.keys() | _COUNTERS:
+                suffix = f"/{metric}"
+                if not key.endswith(suffix):
+                    continue
+                scope = key.removesuffix(suffix)
+                if scope != "rollout" and not scope.startswith("rollout/stream/"):
+                    continue
+                if metric in _DENOMINATORS:
+                    result[f"{scope}/{_DENOMINATORS[metric]}"] = len(values)
+                if metric in _COUNTERS:
+                    result[f"{scope}/{metric}_count"] = sum(values)
         return result

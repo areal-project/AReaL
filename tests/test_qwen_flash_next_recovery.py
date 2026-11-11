@@ -61,6 +61,7 @@ def test_recipe_required_recovery_checks_loaded_state_before_training(
             mb_spec=SimpleNamespace(n_mbs=1, n_mbs_divisor=1),
         ),
         should_accept_fn="filter",
+        should_accept_kwargs={"min_accuracy": 0.4, "max_accuracy": 0.8},
     )
 
     class Trainer:
@@ -77,6 +78,7 @@ def test_recipe_required_recovery_checks_loaded_state_before_training(
             return False
 
         def train(self, **kwargs):
+            assert kwargs["dynamic_filter_kwargs"] == config.should_accept_kwargs
             events.append("trained")
 
     class RemoteEngine:
@@ -90,7 +92,7 @@ def test_recipe_required_recovery_checks_loaded_state_before_training(
             "get_arena_mixture_dataset": lambda *args, **kwargs: (
                 [{"data_id": "env:task@v1"}],
                 ["stream"],
-            )
+            ),
         },
         "examples.swe.utils": {"SWEPPOConfig": object},
         "areal": {"PPOTrainer": Trainer},
