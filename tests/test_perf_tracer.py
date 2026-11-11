@@ -776,3 +776,59 @@ async def test_trace_session_phase_with_exception(tmp_path):
 
     finally:
         perf_tracer.reset()
+
+
+@pytest.mark.asyncio
+async def test_session_end_precedes_group_finalization_for_each_sample(
+    tmp_path, monkeypatch
+):
+    config = PerfTracerConfig(
+        experiment_name="test-session-end",
+        trial_name="trial",
+        fileroot=str(tmp_path),
+        enabled=True,
+        session_tracer=SessionTracerConfig(enabled=True, flush_threshold=1),
+    )
+    perf_tracer.configure(config, rank=0)
+    try:
+        tracer = perf_tracer.get_session_tracer()
+        assert tracer is not None
+        perf_tracer.set_task_id(123)
+
+        times = iter((100.0, 105.0, 110.0, 120.0, 130.0, 131.0))
+
+        class Clock:
+            def time(self):
+                return next(times)
+
+            def perf_counter_ns(self):
+                return time.perf_counter_ns()
+
+        monkeypatch.setattr(perf_tracer, "time", Clock())
+
+        @perf_tracer.session_context()
+        async def run_sample():
+            return True
+
+        assert await run_sample()
+        assert await run_sample()
+        session_ids = sorted(tracer.get_session_ids(123))
+        assert len(session_ids) == 2
+        assert tracer._records[session_ids[0]].finalized_ts == 105.0
+        assert tracer._records[session_ids[1]].finalized_ts == 120.0
+
+        perf_tracer.trace_session_event(
+            "mark_finalized", task_id=123, status="accepted"
+        )
+        path = _expected_session_trace_path(config, rank=0)
+        records = sorted(
+            (json.loads(line) for line in path.read_text().splitlines()),
+            key=lambda record: record["session_id"],
+        )
+        assert len(records) == 2
+        assert [record["finalized_ts"] for record in records] == [105.0, 120.0]
+        assert all(record["group_finalized_ts"] >= 130.0 for record in records)
+        assert [record["total_s"] for record in records] == [5.0, 10.0]
+        assert all(record["status"] == "accepted" for record in records)
+    finally:
+        perf_tracer.reset()

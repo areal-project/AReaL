@@ -262,8 +262,10 @@ class SessionTraceEvent(str, Enum):
 
     Attributes
     ----------
+    SESSION_END : str
+        The individual workflow session has returned or raised.
     FINALIZED : str
-        Session has been finalized.
+        The containing rollout group has been finalized.
     GENERATE_START : str
         Generation phase has started within the workflow.
     GENERATE_END : str
@@ -285,6 +287,7 @@ class SessionTraceEvent(str, Enum):
     """
 
     # Lifecycle markers
+    SESSION_END = "session_end"
     FINALIZED = "finalized"
 
     # Phase boundaries
@@ -436,7 +439,8 @@ class SessionRecord:
     for persisted session traces.
 
     The record tracks three main aspects:
-    1. Lifecycle timestamps: submission (submit_ts) and finalization (finalized_ts)
+    1. Lifecycle timestamps: submission (submit_ts), session completion
+       (finalized_ts), and group finalization (group_finalized_ts)
     2. Phase executions: generate and reward phases with start/end times, supporting
        multiple executions per phase
     3. Derived metrics: computed from timestamps (total_s, generate_s, reward_s)
@@ -469,7 +473,9 @@ class SessionRecord:
     reason : str | None, default=None
         Reason for rejection if status is "rejected" or "dropped".
     finalized_ts : float | None, default=None
-        Timestamp when the session result was finalized by the training loop.
+        Timestamp when this individual workflow session returned or raised.
+    group_finalized_ts : float | None, default=None
+        Timestamp when the containing rollout group was accepted or rejected.
 
     See Also
     --------
@@ -487,6 +493,7 @@ class SessionRecord:
     status: str = "pending"
     reason: str | None = None
     finalized_ts: float | None = None
+    group_finalized_ts: float | None = None
     phases: dict[str, list[PhaseSpan]] = field(init=False)
     counters: dict[str, int] = field(init=False)
     # NOTE: repr=False is valid for dataclasses.field() despite Pydantic warnings
@@ -527,7 +534,7 @@ class SessionRecord:
     def is_ready_to_flush(self) -> bool:
         if self.status in {"rejected", "failed", "dropped"}:
             return True
-        if self.status == "accepted" and self.finalized_ts is not None:
+        if self.status == "accepted" and self.group_finalized_ts is not None:
             return True
         return False
 
@@ -571,11 +578,13 @@ class SessionRecord:
     @classmethod
     def build_event_rules(cls) -> dict[SessionTraceEvent, EventBinding]:
         rules: dict[SessionTraceEvent, EventBinding] = {
-            # FINALIZED is the canonical terminal event for a session; it
-            # records the wait/return timestamp and invokes the unified
-            # termination handler to set final status.
-            SessionTraceEvent.FINALIZED: EventBinding(
+            SessionTraceEvent.SESSION_END: EventBinding(
                 timestamp_attr="finalized_ts",
+            ),
+            # Group finalization supplies the final acceptance status, but
+            # does not overwrite the earlier end of an individual session.
+            SessionTraceEvent.FINALIZED: EventBinding(
+                timestamp_attr="group_finalized_ts",
                 payload_handler=cls._on_finalized,
                 mark_ready=True,
             ),
@@ -633,6 +642,7 @@ class SessionRecord:
             FieldSpec("submit_ts"),
             FieldSpec("session_uuid", omit_if_none=True),
             FieldSpec("finalized_ts", omit_if_none=True),
+            FieldSpec("group_finalized_ts", omit_if_none=True),
             FieldSpec(
                 compute=cls._compute_total_time,
                 key="total_s",
@@ -678,6 +688,7 @@ SessionRecord.FIELD_SPECS = SessionRecord.default_field_specs()
 _SESSION_EVENT_RULES = SessionRecord.build_event_rules()
 
 _SESSION_TRACE_METHOD_TO_EVENT: dict[str, SessionTraceEvent] = {
+    "mark_session_end": SessionTraceEvent.SESSION_END,
     "mark_finalized": SessionTraceEvent.FINALIZED,
     "mark_generate_start": SessionTraceEvent.GENERATE_START,
     "mark_generate_end": SessionTraceEvent.GENERATE_END,
@@ -707,8 +718,9 @@ def trace_session_event(
     Parameters
     ----------
     method : str
-        Event method name. Standard methods: "mark_finalized", "mark_generate_start",
-        "mark_generate_end", "mark_reward_start", "mark_reward_end", "increment_counter".
+        Event method name. Standard methods: "mark_session_end", "mark_finalized",
+        "mark_generate_start", "mark_generate_end", "mark_reward_start",
+        "mark_reward_end", "increment_counter".
     session_id : int | None, Optional
         Optional session ID to record the event for.
     task_id : int | None, optional
@@ -1040,6 +1052,9 @@ class SessionTracer:
             if record is None:
                 return False
             timestamp = time.time()
+            if event == SessionTraceEvent.FINALIZED and record.finalized_ts is None:
+                # Workflows without @session_context still have a usable end.
+                record.finalized_ts = timestamp
             if rule.timestamp_attr is not None:
                 setattr(record, rule.timestamp_attr, timestamp)
             if rule.phase is not None and rule.role is not None:
@@ -2032,9 +2047,10 @@ def session_context():
     """Decorator factory that populates ``session_id`` from the active task.
 
     Each wrapped invocation registers a session when a ``task_id`` exists and
-    records it in the session context for downstream tracing. No cleanup or
-    restoration is performed after execution; if no task is active the session
-    context is set to ``None``.
+    records it in the session context for downstream tracing. Completion is
+    recorded when the wrapped function returns or raises. No context restoration
+    is performed after execution; if no task is active the session context is
+    set to ``None``.
 
     Returns
     -------
@@ -2043,25 +2059,34 @@ def session_context():
     """
 
     def decorator(func):
-        def _activate_session() -> None:
+        def _activate_session() -> int | None:
             task_id = get_task_id()
             session_id = register_session(task_id) if task_id is not None else None
             set_session_id(session_id)
+            return session_id
 
         if asyncio.iscoroutinefunction(func):
 
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
-                _activate_session()
-                return await func(*args, **kwargs)
+                session_id = _activate_session()
+                try:
+                    return await func(*args, **kwargs)
+                finally:
+                    if session_id is not None:
+                        trace_session_event("mark_session_end", session_id=session_id)
 
             return async_wrapper
         else:
 
             @functools.wraps(func)
             def sync_wrapper(*args, **kwargs):
-                _activate_session()
-                return func(*args, **kwargs)
+                session_id = _activate_session()
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    if session_id is not None:
+                        trace_session_event("mark_session_end", session_id=session_id)
 
             return sync_wrapper
 
