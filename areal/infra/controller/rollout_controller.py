@@ -1750,7 +1750,7 @@ class RolloutController:
     ) -> list[dict[str, Any]]:
         """Collect direct v1 session lifetimes and SGLang request intervals."""
         results = self._collective_rpc(
-            "get_sglang_timing_sessions", started_at, ended_at
+            "get_sglang_timing_sessions", started_at=started_at, ended_at=ended_at
         )
         return [session for worker_sessions in results for session in worker_sessions]
 
