@@ -87,7 +87,7 @@ def check_trajectory_format(
     Special handling is provided for:
 
     - **multi_modal_input**: Expected to be a non-empty list of dictionaries
-      containing ``pixel_values``
+      containing ``pixel_values`` or ``pixel_values_videos``
     - **Non-tensor data**: Logged for informational purposes
 
     Parameters
@@ -220,10 +220,12 @@ def check_trajectory_format(
                 raise ValueError(
                     "multi_modal_input should be a non-empty list of dicts"
                 )
-            if not all("pixel_values" in v for v in value):
+            if not all(
+                "pixel_values" in v or "pixel_values_videos" in v for v in value
+            ):
                 raise ValueError(
                     "multi_modal_input should at least contain the "
-                    "`pixel_values` field."
+                    "`pixel_values` or `pixel_values_videos` field."
                 )
         else:
             logger.info(f"Encounter non-tensor data with key `{key}`: {value}")
