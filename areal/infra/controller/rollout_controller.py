@@ -46,7 +46,7 @@ from areal.infra.utils.inference_targets import write_inference_targets
 from areal.utils import logging, perf_tracer
 from areal.utils.arena_stream_dataloader import ArenaStreamDataLoader
 from areal.utils.data import cycle_dataloader
-from areal.utils.dynamic_import import import_from_string
+from areal.utils.dynamic_import import bind_filter_kwargs, import_from_string
 from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
 from areal.utils.rollout_metrics import ConsumedMetrics
@@ -163,6 +163,7 @@ class _RemoteRolloutTaskInput:
     reward_normalization: bool = False
     reward_normalization_use_std: bool = True
     drop_incomplete_group: bool = False
+    should_accept_kwargs: dict[str, Any] | None = None
     arena_stream_dataloader: ArenaStreamDataLoader | None = None
 
 
@@ -1178,7 +1179,9 @@ class RolloutController:
             return f"{workflow.__module__}.{workflow.__class__.__name__}"
 
     def _resolve_should_accept_fn(
-        self, should_accept_fn: Callable[[dict[str, Any]], bool] | str | None
+        self,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ):
         if callable(should_accept_fn):
             raise RuntimeError(
@@ -1191,6 +1194,11 @@ class RolloutController:
                 raise RuntimeError(
                     f"Failed to import `should_accept_fn` from string path: {should_accept_fn}"
                 )
+        if should_accept_kwargs:
+            bind_filter_kwargs(
+                import_from_string(should_accept_fn) if should_accept_fn else None,
+                should_accept_kwargs,
+            )
         return should_accept_fn
 
     def _rollout_stats(self) -> str:
@@ -1231,6 +1239,7 @@ class RolloutController:
                     workflow=pending_task.workflow,
                     workflow_kwargs=pending_task.workflow_kwargs,
                     should_accept_fn=pending_task.should_accept_fn,
+                    should_accept_kwargs=pending_task.should_accept_kwargs,
                     http_timeout=self.config.request_timeout,
                     is_eval=pending_task.is_eval,
                     group_size=pending_task.group_size,
@@ -1338,6 +1347,7 @@ class RolloutController:
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> int:
         validate_rollout_group_sizes(group_size, min_usable_group_size)
 
@@ -1345,13 +1355,12 @@ class RolloutController:
             data, required=self._mopd_routing_enabled and not is_eval
         )
         workflow_str = self._resolve_workflow_str(workflow)
-        should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+        should_accept_fn = self._resolve_should_accept_fn(
+            should_accept_fn, should_accept_kwargs
+        )
         if workflow_kwargs is None:
             workflow_kwargs = {}
 
-        # NOTE: RolloutController does not support `should_accept_fn`
-        # If the workflow's result should be aborted,
-        # `arun_episode` should return None instead.
         if task_id is None:
             task_id = self._task_id_generator.next()
         task_input = _RemoteRolloutTaskInput(
@@ -1359,6 +1368,7 @@ class RolloutController:
             workflow=workflow_str,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             task_id=task_id,
             mopd_route=mopd_route,
             is_eval=is_eval,
@@ -1400,6 +1410,7 @@ class RolloutController:
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         perf_tracer.instant(
             "rollout_controller.rollout_batch",
@@ -1412,6 +1423,7 @@ class RolloutController:
                 workflow=workflow,
                 workflow_kwargs=workflow_kwargs,
                 should_accept_fn=should_accept_fn,
+                should_accept_kwargs=should_accept_kwargs,
                 group_size=group_size,
                 min_usable_group_size=min_usable_group_size,
                 reward_normalization=reward_normalization,
@@ -1435,6 +1447,7 @@ class RolloutController:
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare a batch with controlled staleness.
 
@@ -1449,6 +1462,9 @@ class RolloutController:
         if workflow_kwargs is None:
             workflow_kwargs = {}
 
+        should_accept_fn = self._resolve_should_accept_fn(
+            should_accept_fn, should_accept_kwargs
+        )
         arena_stream_dataloader = (
             dataloader if isinstance(dataloader, ArenaStreamDataLoader) else None
         )
@@ -1473,6 +1489,7 @@ class RolloutController:
                         workflow=workflow_str,
                         workflow_kwargs=workflow_kwargs,
                         should_accept_fn=should_accept_fn,
+                        should_accept_kwargs=should_accept_kwargs,
                         task_id=task_id,
                         mopd_route=mopd_route,
                         group_size=group_size,
@@ -1733,21 +1750,8 @@ class RolloutController:
             )
         consumed = self.consumed_metrics.export()
         merged = _merge_worker_stats([*all_raw_stats, consumed])
-        # Expose denominators for batch-aligned quality metrics.
-        merged.update(
-            {
-                k: v
-                for k, v in consumed.items()
-                if k.endswith("__count")
-                or k
-                in {
-                    "rollout/reward_sample_count",
-                    "rollout/group_attempt_count",
-                    "rollout/task_attempt_count",
-                    "rollout/task_result_count",
-                }
-            }
-        )
+        # Expose batch-aligned denominators and counters, including stream scopes.
+        merged.update({k: v for k, v in consumed.items() if k.endswith("_count")})
         return merged
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:

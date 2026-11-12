@@ -53,10 +53,11 @@ where the reward $R_{i,t} = \log \pi_T(o_{i,t}) - \log \pi_\theta(o_{i,t})$.
 This encourages the student to increase the probability of tokens the teacher prefers
 and suppress those it deems unlikely.
 
-- Implementation Detail: During pure KD, we need to set `rl_loss_weight` to 0, so the
-  implementation estimates the RKL gradient using importance sampling. The code
-  calculates the reward as teacher_logp - logprobs ($R_{i,t}$) and applies a negative
-  coefficient to the loss to perform minimization (check `areal/trainer/ppo/actor.py`).
+- Implementation Detail: During pure KD, we need to set `rl_loss_weight` to 0. The code
+  uses teacher_logp - logprobs ($R_{i,t}$) as the per-token advantage of the actor's
+  PPO loss, so the importance ratio is clipped by `eps_clip` and filtered by
+  `rejection_sampling` as in RL, and scales the loss by `distill_loss_weight` (check
+  `areal/trainer/ppo/actor.py`).
 
 ### Combination of GRPO and KD
 
@@ -74,10 +75,12 @@ $\nabla_\theta J_{GRPO}( \theta) + \beta \cdot \nabla_\theta
 J_{RKL}(\theta)$.
 
 - Implementation Detail: In the joint loss case (`rl_loss_weight` > 0), the RKL is
-  treated as a direct penalty. Minimizing the term `logprobs - teacher_logp` is
-  mathematically equivalent to minimizing the Reverse KL objective
-  $D_{KL}(\pi_\theta \parallel \pi_T)$ when sampling from the student distribution
-  $\pi_\theta$. In the code, this is implemented as:
+  treated as a direct penalty. Backpropagating `logprobs - teacher_logp` itself would
+  give the gradient $\nabla_\theta \log \pi_\theta$, which does not depend on the
+  teacher and averages to zero on student samples. The code therefore uses the k2
+  estimate $\frac{1}{2}(\log \pi_\theta - \log \pi_T)^2$, whose gradient
+  $(\log \pi_\theta - \log \pi_T) \nabla_\theta \log \pi_\theta$ is the RKL gradient
+  when sampling from $\pi_\theta$:
   `loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty`
 
 ## Running the example

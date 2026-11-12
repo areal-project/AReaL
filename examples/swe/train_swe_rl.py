@@ -420,6 +420,7 @@ def main(args):
             eval_workflow=None,
             eval_workflow_kwargs=eval_workflow_kwargs,
             dynamic_filter_fn=getattr(config, "should_accept_fn", None),
+            dynamic_filter_kwargs=getattr(config, "should_accept_kwargs", {}),
         )
 
 

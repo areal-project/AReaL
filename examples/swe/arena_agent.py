@@ -40,6 +40,7 @@ from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.infra import workflow_context
 from areal.utils import logging, stats_tracker
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.rollout_metrics import get_arena_stream_name
 
 logger = logging.getLogger("ArenaStreamAgent")
 
@@ -955,11 +956,87 @@ class ArenaStreamAgentWorkflow:
         return True
 
     @classmethod
+    def _core_tool_argument_budget_failure_message(cls, raw: Any) -> str | None:
+        """Identify a model tool call exceeding the native decoder's byte budget."""
+        if not isinstance(raw, dict):
+            return None
+        outcome = raw.get("outcome")
+        harness = raw.get("harness")
+        if not isinstance(outcome, dict) or not isinstance(harness, dict):
+            return None
+        details = outcome.get("details")
+        if (
+            outcome.get("code") != "LLM_RESPONSE_FAILED"
+            or outcome.get("class") != "agent"
+            or outcome.get("source") != "core_tool_decoder"
+            or cls._gameagent_outcome_code(raw) != "LLM_RESPONSE_FAILED"
+            or not isinstance(details, dict)
+            or set(details) != {"budget", "code", "limit", "observed"}
+            or details["budget"] != "argument_bytes"
+            or details["code"] != "tool_call_budget_exceeded"
+            or type(details["limit"]) is not int
+            or type(details["observed"]) is not int
+            or details["limit"] <= 0
+            or details["observed"] <= details["limit"]
+            or harness.get("phase") != "agent"
+            or harness.get("result_status") != "ERROR"
+            or type(harness.get("exit_code")) is not int
+            or harness["exit_code"] != 1
+            or harness.get("summary")
+            != "GAMEAGENT_OUTCOME_CODE=LLM_RESPONSE_FAILED GAMEAGENT_OUTCOME_CLASS=agent"
+            or raw.get("failure") is not None
+        ):
+            return None
+        return (
+            "tool_call_budget_exceeded: argument_bytes "
+            f"(limit {details['limit']}, observed {details['observed']})"
+        )
+
+    @staticmethod
+    def _has_harness_receipt_system_failure(receipt: dict[str, Any]) -> bool:
+        """Reject explicit runner, collection, or interruption failures."""
+        return (
+            receipt.get("failure") is not None
+            or any(
+                receipt.get(flag, False) is not False
+                for flag in (
+                    "observed_runner_timeout",
+                    "observed_external_interruption",
+                )
+            )
+            or (
+                "collection" in receipt
+                and (
+                    not isinstance(receipt["collection"], dict)
+                    or receipt["collection"].get("status") != "OK"
+                )
+            )
+        )
+
+    @staticmethod
+    def _is_tool_call_budget_exceeded_message(message: Any) -> bool:
+        """Recognize the runner's explicit tool-argument byte budget failure."""
+        if not isinstance(message, str):
+            return False
+        match = re.fullmatch(
+            r"tool_call_budget_exceeded: argument_bytes "
+            r"\(limit ([0-9]{1,20}), observed ([0-9]{1,20})\)",
+            message,
+        )
+        if match is None:
+            return False
+        limit, observed = map(int, match.groups())
+        return 0 < limit < observed
+
+    @classmethod
     def _is_core_agent_zero_failure(
         cls, raw: Any, receipt: Any, *, invalid_tool_json: bool = False
     ) -> bool:
         """Match the terminal model failure, including completed continuations."""
         message = cls._core_model_zero_failure_message(raw)
+        budget_message = cls._core_tool_argument_budget_failure_message(raw)
+        if message is None:
+            message = budget_message
         if message is None:
             message = cls._core_context_zero_failure_message(raw)
         context_failure = cls._is_structured_context_failure(raw)
@@ -974,6 +1051,10 @@ class ArenaStreamAgentWorkflow:
             or type(receipt.get("exit_code")) is not int
             or receipt["exit_code"] != 1
             or receipt.get("summary") != raw["harness"]["summary"]
+        ):
+            return False
+        if budget_message is not None and cls._has_harness_receipt_system_failure(
+            receipt
         ):
             return False
         terminal_error = cls._core_terminal_failure_error(receipt)
@@ -1168,9 +1249,7 @@ class ArenaStreamAgentWorkflow:
             if (
                 _HARNESS_SYSTEM_ERROR_PATTERN.search(detail)
                 or "delivery" not in receipt
-                or cls._harness_result_format(receipt) != "native-runner"
                 or receipt.get("failure") is not None
-                or receipt.get("raw") is not None
                 or not isinstance(collection, dict)
                 or collection.get("status") != "OK"
                 or type(collection.get("file_count")) is not int
@@ -1179,11 +1258,14 @@ class ArenaStreamAgentWorkflow:
                 return False
         if (
             receipt.get("implementation") != "rust-core-runtime"
+            or cls._harness_result_format(receipt) != "native-runner"
+            or receipt.get("raw") is not None
             or receipt.get("status") != "ERROR"
             or type(receipt.get("exit_code")) is not int
             or receipt["exit_code"] != 1
             or receipt.get("delivery") is not None
             or receipt.get("turn_statuses") != ["failed"]
+            or cls._has_harness_receipt_system_failure(receipt)
         ):
             return False
         errors = receipt.get("error")
@@ -1194,12 +1276,15 @@ class ArenaStreamAgentWorkflow:
             or not isinstance(errors[0].get("message"), str)
         ):
             return False
-        if abbreviated and "outcome" in errors[0]:
+        # Structured outcomes require Core admission and matching envelopes;
+        # a runner message alone cannot override their attribution or health.
+        if "outcome" in errors[0]:
             return False
         message = errors[0]["message"]
         return (
             message == "model stopped with reason: length"
             or message == "model stopped without visible output or tool calls"
+            or cls._is_tool_call_budget_exceeded_message(message)
             or re.fullmatch(
                 r"context window limit exceeded: compaction is disabled "
                 r"\([1-9][0-9]* bytes / [1-9][0-9]* estimated tokens\)",
@@ -1367,9 +1452,22 @@ class ArenaStreamAgentWorkflow:
         if result_format == "native-runner":
             if cls._is_abbreviated_runner_failure(raw) and result.score != 0.0:
                 return False
+            receipt = error.harness_result
+            if isinstance(receipt, dict) and cls._has_harness_receipt_system_failure(
+                receipt
+            ):
+                return False
+            # An earlier proxy overflow cannot override a conflicting terminal
+            # receipt. Without a receipt, retain the typed-overflow fallback.
             return (
-                context_overflow and cls._is_runner_context_failure(raw)
-            ) or cls._is_runner_model_failure(raw, error.harness_result)
+                context_overflow
+                and cls._is_runner_context_failure(raw)
+                and (
+                    receipt is None
+                    or isinstance(receipt, dict)
+                    and cls._is_runner_context_failure(receipt)
+                )
+            ) or cls._is_runner_model_failure(raw, receipt)
         if (
             result_format == "gameagent"
             and result is not None
@@ -1453,10 +1551,10 @@ class ArenaStreamAgentWorkflow:
             return disposition == "system_failure_reject"
         if not isinstance(error, ArenaTaskFailedError):
             return False
-        # Setup, collection, and grader failures leave this task unscored without
-        # invalidating healthy siblings. Proxy service errors are still
-        # propagated by OpenAIProxyWorkflow before applying this hook.
-        if error.status in {"SETUP_FAILED", "COLLECT_FAILED", "EVAL_FAILED"}:
+        # Keep terminal system failures consistent with classify_proxy_failure:
+        # the failed task stays unscored without invalidating healthy siblings.
+        # OpenAIProxyWorkflow still propagates proxy service errors first.
+        if error.status in self._SYSTEM_FAILURE_STATUSES:
             return disposition == "system_failure_reject"
         return (
             error.status in {"HARNESS_FAILED", "NO_OUTPUT", "TIMEOUT"}
@@ -1669,9 +1767,11 @@ class ArenaStreamAgentWorkflow:
             error = exc
             raise
         finally:
-            self._record_attempt_metrics(error)
+            self._record_attempt_metrics(data, error)
 
-    def _record_attempt_metrics(self, error: BaseException | None) -> None:
+    def _record_attempt_metrics(
+        self, data: dict[str, Any], error: BaseException | None
+    ) -> None:
         """Count calls and observed terminal results before trajectory filtering.
 
         Local cancellation/timeouts do not establish the remote task's outcome.
@@ -1708,6 +1808,11 @@ class ArenaStreamAgentWorkflow:
                 metrics[f"harness_error/{code}"] = float(outcome_code == code)
             metrics["harness_error/OTHER"] = float(
                 is_harness_error and outcome_code not in _GAMEAGENT_OUTCOME_METRIC_CODES
+            )
+        stream_name = get_arena_stream_name(data) or self.default_stream_name
+        if stream_name:
+            metrics.update(
+                {f"stream/{stream_name}/{key}": value for key, value in metrics.items()}
             )
         _record_arena_metrics(**metrics)
 
@@ -1981,6 +2086,10 @@ class ArenaStreamAgentWorkflow:
                         self._harness_result_format(exc.result.raw) == "native-runner"
                         or self._is_abbreviated_whitebox_failure(exc.result.raw)
                         or self._core_model_zero_failure_message(exc.result.raw)
+                        is not None
+                        or self._core_tool_argument_budget_failure_message(
+                            exc.result.raw
+                        )
                         is not None
                         or self._is_structured_context_failure(exc.result.raw)
                         or self._is_core_invalid_tool_json_failure(exc.result.raw)

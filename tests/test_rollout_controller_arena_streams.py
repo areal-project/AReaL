@@ -160,11 +160,21 @@ def test_arena_fast_stream_results_are_consumed_without_waiting_for_slow_stream(
         controller.dispatcher.destroy()
 
 
-def test_arena_prepare_batch_replenishes_filtered_stream_and_preserves_rejection_metrics():
+@pytest.mark.parametrize(
+    "should_accept_fn,should_accept_kwargs",
+    [
+        (None, None),
+        ("examples.swe.filter_function.filter_by_accuracy", {"min_accuracy": 0.25}),
+    ],
+)
+def test_arena_prepare_batch_replenishes_filtered_stream_and_preserves_rejection_metrics(
+    should_accept_fn, should_accept_kwargs
+):
     controller = make_arena_stream_controller(batch_size=4)
     loader = make_arena_stream_loader(batch_size=4)
     # Give the test enough room for replacements while the main thread waits.
     inputs = {}
+    submitted_filters = {}
     rejected = False
     stopped = threading.Event()
 
@@ -177,6 +187,10 @@ def test_arena_prepare_batch_replenishes_filtered_stream_and_preserves_rejection
         task_id = kwargs["task_id"]
         if method == "submit":
             inputs[task_id] = kwargs["data"]
+            submitted_filters[task_id] = (
+                kwargs["should_accept_fn"],
+                kwargs["should_accept_kwargs"],
+            )
             controller._pending_futures[task_id].set_result(None)
             return task_id
         while len(inputs) < 4:
@@ -204,9 +218,16 @@ def test_arena_prepare_batch_replenishes_filtered_stream_and_preserves_rejection
             controller.prepare_batch,
             loader,
             workflow="tests.utils.TestWorkflow",
+            should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
         ).result(timeout=10)
         assert len(result) == 4
         assert inputs[4]["stream"] == "a"
+        # The same filter options reach both base tasks and the replacement.
+        assert all(
+            submitted_filters[task_id] == (should_accept_fn, should_accept_kwargs)
+            for task_id in range(5)
+        )
         # Consuming rejection metrics must not be bypassed by stream feedback.
         assert controller.consumed_metrics.export()["rollout/group_attempt_count"] == 5
     finally:
