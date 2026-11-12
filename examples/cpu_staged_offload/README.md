@@ -60,6 +60,30 @@ release uses the managed CPU slabs for staged AdamW. Ordinary Megatron optimizer
 AWEX's original phase-boundary GPU-to-CPU migration and are copied back before training
 resumes. The optional HybridDeviceOptimizer compatibility path is not supported.
 
+## Prepare the dataset
+
+Use the prompt-deduplicated
+[YouJiacheng/DAPO-Math-17k-dedup](https://huggingface.co/datasets/YouJiacheng/DAPO-Math-17k-dedup)
+train set (17,398 rows). Download it once before starting the job, into a directory
+visible to every worker:
+
+```bash
+export DAPO_MATH_17K_PATH=/path/to/DAPO-Math-17k-dedup
+hf download YouJiacheng/DAPO-Math-17k-dedup \
+  distinct-prompts-with-rewards.parquet --repo-type dataset \
+  --revision 6e26a33abdabd3e6aaa1d742326b790758f7dbc5 \
+  --local-dir "$DAPO_MATH_17K_PATH/data"
+```
+
+The `data/` directory is required by the existing DAPO loader. Without an environment
+override, the recipe uses `./datasets/DAPO-Math-17k-dedup`. The original repeated export
+contains about 1.79 million rows; its per-row prompt-length filtering can exceed
+data-registration RPC timeouts. The deduplicated dataset keeps the existing
+prompt/reward schema, and the normal tokenizer length filter remains enabled. Do not
+point the recipe at the repeated export. Deduplication changes the number and sampling
+frequency of examples in an epoch; use the same prepared dataset for all comparison
+runs.
+
 Set `QWEN3_30B_A3B_BASE_MODEL_PATH` and `DAPO_MATH_17K_PATH` to your model and dataset
 locations. The agent proxy requires a unique admin key when binding to a non-loopback
 address. Run on a local eight-GPU node with:
@@ -152,3 +176,10 @@ gathering released BF16 expert storage.
 After combining both PRs, select `actor.optimizer.type=dist_muon`,
 `actor.megatron.use_precision_aware_optimizer=false`, and
 `actor.megatron.ddp.use_distributed_optimizer=false` in the WeftMoE recipe.
+
+For Ray deployments, follow the
+[worker file-descriptor limit guidance](../weftmoe/README.md#ray-worker-file-descriptor-limits)
+after combining the integration PRs. Check actual worker limits on every node; changing
+only the driver shell's `ulimit` does not update an already-running Ray service. The
+WeftMoE launcher also generates a proxy admin key automatically; when using the
+CPU-staged Python entry point directly, keep the explicit random-key export shown above.

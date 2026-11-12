@@ -143,7 +143,7 @@ train_dataset:
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: ${oc.env:DAPO_MATH_17K_PATH,/path/to/DAPO-Math-17k}
+  path: ${oc.env:DAPO_MATH_17K_PATH,./datasets/DAPO-Math-17k-dedup}
   type: rl
   max_length: 2048
 
