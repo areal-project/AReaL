@@ -15,6 +15,7 @@ from ._boxd_client import BoxdClientManager
 from ._boxd_client import _load_boxd_sdk as _load_boxd_client_sdk
 from ._boxd_session import (
     _EXEC_TIMEOUT_PREFIX,
+    DEFAULT_DELETE_AFTER,
     TIMEOUT_EXIT_CODE,
     BoxdSession,
     _load_boxd_errors,
@@ -45,9 +46,12 @@ class BoxdRunner:
     Each runner creates one machine on first use and keeps it warm across
     ``run()`` calls. Every ``run()`` starts a fresh Python process, so nothing
     carries over between calls. ``close()`` deletes the machine. Machines carry
-    the label ``areal-sandbox=true``; ``delete_after`` (seconds after creation,
-    even while in use) has boxd delete the machine even if ``close()`` never
-    runs. A non-positive ``timeout`` raises ``ValueError``.
+    the label ``areal-sandbox=true``. ``delete_after`` (seconds after creation,
+    six hours by default) has boxd delete the machine even if ``close()`` never
+    runs; a runner that outlives it creates a new machine on the next
+    ``run()``. ``delete_after=None`` turns the timer off. A machine that does
+    not become ready, or any other boxd error, comes back as a result with
+    ``error`` set. A non-positive ``timeout`` raises ``ValueError``.
     """
 
     def __init__(
@@ -62,7 +66,7 @@ class BoxdRunner:
         env_vars: Mapping[str, str] | None = None,
         labels: Mapping[str, str] | None = None,
         python_packages: Sequence[str] | None = None,
-        delete_after: int | None = None,
+        delete_after: int | None = DEFAULT_DELETE_AFTER,
         create_timeout: float = 120.0,
         default_timeout: int = 30,
     ):
@@ -183,8 +187,9 @@ class BoxdRunner:
             response = await self._session.arun_script(
                 await self._aget_client(), code, timeout=timeout
             )
-        except (self._errors["BoxdError"], RuntimeError) as exc:
-            error = str(exc)
+        except (self._errors["BoxdError"], RuntimeError, TimeoutError) as exc:
+            # TimeoutError: the machine did not become ready in create_timeout.
+            error = str(exc) or type(exc).__name__
             exit_code = (
                 TIMEOUT_EXIT_CODE if error.startswith(_EXEC_TIMEOUT_PREFIX) else 1
             )

@@ -105,6 +105,37 @@ def test_runner_maps_sdk_errors_to_result(fake_boxd):
     assert result.error == "exec timed out after 18s"
 
 
+def test_runner_sets_a_delete_after_timer_by_default(fake_boxd):
+    with BoxdRunner() as runner:
+        runner.run("print(1)")
+
+    assert fake_boxd[0].machines.created[0]["delete_after"] == 6 * 3600
+
+
+def test_runner_returns_an_error_when_the_machine_is_not_ready_in_time(fake_boxd):
+    seen: list[str] = []
+    runner = BoxdRunner()
+    try:
+        runner._run(runner._aget_client())
+        machines = fake_boxd[0].machines
+        machines.ready_errors.append(
+            TimeoutError("machine vm-1 did not reach 'running' within 120.0s")
+        )
+        machines.exec_handler = lambda command, kwargs: FakeExecResult(stdout="ok\n")
+
+        result = runner.run("print('ok')", on_stderr=seen.append)
+        after = runner.run("print('ok')")
+    finally:
+        runner.close()
+
+    assert result.exit_code == 1
+    assert result.error == "machine vm-1 did not reach 'running' within 120.0s"
+    assert seen == [result.error]
+    # The machine that never became ready is deleted, and the next run gets a new one.
+    assert after == BoxdRunResult(stdout="ok\n", stderr="", exit_code=0, error=None)
+    assert machines.deleted == ["vm-1", "vm-2"]
+
+
 def test_runner_close_without_start_creates_nothing(fake_boxd):
     runner = BoxdRunner()
     runner.close()

@@ -98,6 +98,37 @@ async def test_boxd_python_tool_rejects_empty_code():
     assert "No code" in output
 
 
+@pytest.mark.asyncio
+async def test_boxd_python_tool_returns_an_error_when_the_machine_is_not_ready(
+    monkeypatch,
+):
+    async def fake_get_client():
+        return object()
+
+    async def not_ready(self, client, code, *, timeout):
+        raise TimeoutError("machine vm-1 did not reach 'running' within 120.0s")
+
+    monkeypatch.setattr(BoxdClientManager, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        "areal.infra.sandbox._boxd_session.BoxdSession.arun_cell", not_ready
+    )
+    tool = BoxdPythonTool()
+
+    output, status = await tool.aexecute({"code": "print(1)"})
+
+    assert status == ToolCallStatus.ERROR
+    assert output == "machine vm-1 did not reach 'running' within 120.0s"
+
+
+def test_stock_boxd_python_tool_sets_a_delete_after_timer():
+    registry = ToolRegistry(enabled_tools="boxd_python")
+
+    tool = registry.get_tool(ToolType.BOXD_PYTHON)
+
+    assert tool._session.delete_after == 3600
+    assert tool._session._create_kwargs()["delete_after"] == 3600
+
+
 def test_tool_registry_enables_boxd_python():
     registry = ToolRegistry(enabled_tools="boxd_python", debug_mode=True)
 

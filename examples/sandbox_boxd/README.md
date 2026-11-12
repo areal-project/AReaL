@@ -33,7 +33,10 @@ uv run python examples/sandbox_boxd/reward_example.py
   it starts. For many sandboxes, prepare one machine, save it as a snapshot and pass
   `snapshot="name"` instead.
 - Machines carry the label `areal-sandbox=true`. `close()` deletes the machine, but a
-  killed process cannot clean up. `delete_after` (seconds) has boxd delete the machine
-  that long after it was created, even if it is still in use. Pick a value above your
-  longest job, for example `delete_after=6 * 3600`.
+  killed process cannot clean up. So every machine has a `delete_after` timer: boxd
+  deletes it six hours after it was created, even if it is still in use. A runner that
+  lives longer creates a new machine on the next `run()`. Pass `delete_after=seconds` to
+  change the time, or `delete_after=None` for no timer.
+- If the machine does not become ready or boxd returns an error, `run()` returns a
+  result with `error` set and a non-zero exit code.
 - Other options: `org`, `region`, `vcpu`, `memory`, `env_vars`, `labels`, `name_prefix`.

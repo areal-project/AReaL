@@ -250,15 +250,15 @@ Notes:
 
 - `boxd_python` creates one isolated [boxd](https://boxd.sh?ref=AReaL) machine per
   trajectory and keeps Python state across tool calls in it. The machine is deleted when
-  the trajectory's tools are cleaned up. Cleanup is best effort: pass `delete_after`
-  (seconds) in the factory so boxd deletes machines a killed run leaves behind. It
-  counts from creation, not from the last call, so pick a value above your longest
-  trajectory.
+  the trajectory's tools are cleaned up. A killed run cannot clean up, so every machine
+  also has a `delete_after` timer: boxd deletes it one hour after it was created. The
+  timer counts from creation, not from the last call. If a trajectory runs longer, the
+  next tool call gets a new machine and says that earlier variables are gone.
 - A cell that runs past the tool timeout returns a `TimeoutError`. If the interpreter
   has to be restarted, the tool output says that earlier variables are gone.
 - The stock `ToolRegistry` uses default machine settings and the system Python. To pin a
-  snapshot, region, `python_packages` or `delete_after`, update the `boxd_python`
-  factory in `examples/tir/tool_manager.py`.
+  snapshot, region or `python_packages`, or to change `delete_after` (seconds, `None`
+  for no timer), update the `boxd_python` factory in `examples/tir/tool_manager.py`.
 
 ## Data engineering recipe
 
