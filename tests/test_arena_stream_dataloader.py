@@ -215,3 +215,20 @@ def test_arena_restore_flat_checkpoint_explains_missing_stream_state():
     loader = make_arena_stream_loader()
     with pytest.raises(ValueError, match="per-stream cursors and replacement debt"):
         loader.load_state_dict(loader.state_dict()["base"])
+
+
+@pytest.mark.parametrize("schedule,batch_size", [("aaaabbbb", 4), ("abababab", 2)])
+def test_arena_restore_rejects_changed_schedule_or_batch_size(schedule, batch_size):
+    loader = make_arena_stream_loader()
+    loader.next_arena_rollout(0)
+    loader.complete_arena_rollout(0, True)
+    restored = make_arena_stream_loader(schedule=schedule, batch_size=batch_size)
+    with pytest.raises(ValueError, match="source schedule, or batch size"):
+        restored.load_state_dict(loader.state_dict())
+
+
+def test_arena_restore_rejects_checkpoint_without_schedule_identity():
+    state = make_arena_stream_loader().state_dict()
+    del state["schedule_fingerprint"]
+    with pytest.raises(ValueError, match="original sampling configuration"):
+        make_arena_stream_loader().load_state_dict(state)
