@@ -187,7 +187,12 @@ class _PendingWeightUpdateBucket:
     stream: torch.cuda.Stream | None = None
 
 
-_MULTIMODAL_FORWARD_KEYS = ("image_grid_thw", "pixel_values", "video_grid_thw")
+_MULTIMODAL_FORWARD_KEYS = (
+    "image_grid_thw",
+    "pixel_values",
+    "pixel_values_videos",
+    "video_grid_thw",
+)
 
 
 def _is_multimodal_payload_key(key: str) -> bool:
