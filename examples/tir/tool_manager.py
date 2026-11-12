@@ -29,6 +29,17 @@ def _build_daytona_python_tool(timeout: int, debug_mode: bool) -> BaseTool:
     return DaytonaPythonTool(timeout, debug_mode)
 
 
+def _build_boxd_python_tool(timeout: int, debug_mode: bool) -> BaseTool:
+    if importlib.util.find_spec("boxd") is None:
+        raise ImportError(
+            "boxd_python requires the optional 'boxd' dependency. Install it with `uv sync --extra sandbox`."
+        )
+
+    from tools.boxd_python_tool import BoxdPythonTool
+
+    return BoxdPythonTool(timeout, debug_mode)
+
+
 class ToolRegistry:
     """Tool registry that manages all available tools."""
 
@@ -36,6 +47,7 @@ class ToolRegistry:
         "python": ToolType.PYTHON,
         "calculator": ToolType.CALCULATOR,
         "daytona_python": ToolType.DAYTONA_PYTHON,
+        "boxd_python": ToolType.BOXD_PYTHON,
     }
     DEFAULT_TOOL_NAMES = ("python", "calculator")
 
@@ -51,6 +63,7 @@ class ToolRegistry:
             ToolType.DAYTONA_PYTHON: lambda: _build_daytona_python_tool(
                 timeout, debug_mode
             ),
+            ToolType.BOXD_PYTHON: lambda: _build_boxd_python_tool(timeout, debug_mode),
         }
 
         if enabled_tools is None:
@@ -65,12 +78,19 @@ class ToolRegistry:
             else:
                 logger.warning(f"Unknown tool type: {tool_name}, skipping")
 
-        if (
-            ToolType.PYTHON in self.enabled_tools
-            and ToolType.DAYTONA_PYTHON in self.enabled_tools
-        ):
+        python_backends = [
+            tool_type
+            for tool_type in (
+                ToolType.PYTHON,
+                ToolType.DAYTONA_PYTHON,
+                ToolType.BOXD_PYTHON,
+            )
+            if tool_type in self.enabled_tools
+        ]
+        if len(python_backends) > 1:
+            names = " and ".join(tool_type.value for tool_type in python_backends)
             raise ValueError(
-                "python and daytona_python use the same markers; enable only one Python backend"
+                f"{names} use the same markers; enable only one Python backend"
             )
 
         self.tools = {
