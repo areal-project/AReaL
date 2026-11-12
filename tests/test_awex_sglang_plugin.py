@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -354,6 +355,49 @@ def test_awex_weight_update_runs_without_grad_tracking():
     AwexSGLangAdapter.update_weights(instance, 1)
 
     assert grad_modes == [False]
+
+
+@pytest.mark.parametrize("has_post_load", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_awex_update_refreshes_gemma_buffer_in_place(monkeypatch, has_post_load, dtype):
+    """Raw receives must update fused norm values without replacing graph buffers."""
+    import areal.engine.awex.adapters.sglang_adapter as adapter
+
+    class GemmaRMSNorm(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(8, dtype=dtype))
+            self.register_buffer("gemma_weight", torch.ones(8, dtype=dtype))
+
+    layernorm = ModuleType("sglang.srt.layers.layernorm")
+    layernorm.GemmaRMSNorm = GemmaRMSNorm
+    monkeypatch.setitem(sys.modules, layernorm.__name__, layernorm)
+    monkeypatch.setattr(adapter, "_reapply_aiter_moe_layout", lambda model: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    model = torch.nn.Sequential(GemmaRMSNorm(), torch.nn.Linear(8, 8, dtype=dtype))
+    if has_post_load:
+        # Recompute after model hooks, even when a hook changes the source weight.
+        model.post_load_weights = lambda: model[0].weight.add_(0.125)
+    buffer = model[0].gemma_weight
+    address = buffer.data_ptr()
+    unrelated_weight = model[1].weight.detach().clone()
+    instance = object.__new__(adapter.AwexSGLangAdapter)
+    instance._initialized = True
+    instance._qwen4_frozen_contract = None
+    instance._get_model = lambda: model
+    instance._ensure_reader = lambda: SimpleNamespace(
+        update_weights=lambda step_id: model[0].weight.fill_(step_id / 4)
+    )
+
+    for version in (1, 2):
+        instance.update_weights(version)
+        expected = version / 4 + 1 + (0.125 if has_post_load else 0)
+        torch.testing.assert_close(
+            buffer, torch.full_like(buffer, expected), rtol=0, atol=0
+        )
+        assert model[0].gemma_weight is buffer
+        assert buffer.data_ptr() == address
+    torch.testing.assert_close(model[1].weight, unrelated_weight, rtol=0, atol=0)
 
 
 def test_transfer_rank_uses_global_rank_for_isolated_gpu(monkeypatch):
@@ -798,3 +842,55 @@ def test_qwen_frozen_verification_precedes_worker_start(monkeypatch, invalid):
     else:
         plugin.bind()
         assert calls == ["verify", "start", "loop"]
+
+
+@pytest.mark.parametrize("separate_updater", [False, True])
+@pytest.mark.parametrize("tags", [["weights"], None, []])
+def test_native_memory_dispatch_restores_frozen_draft(separate_updater, tags):
+    """Native dispatch restores private buffers without reverting shared updates."""
+    target = torch.nn.Linear(4, 4, bias=False)
+    draft = torch.nn.Linear(4, 4, bias=False)
+    draft.register_parameter("shared", target.weight)
+    draft.register_buffer("derived", torch.arange(4), persistent=False)
+    expected = draft.weight.detach().clone()
+    derived = draft.derived.clone()
+    pointers = draft.weight.data_ptr(), draft.derived.data_ptr()
+
+    class Request:
+        def __init__(self, tags):
+            self.tags = tags
+
+    class Owner:
+        def __init__(self):
+            self.offload_tags = set()
+
+        def release_memory_occupation(self, request):
+            self.offload_tags.update(request.tags or ["weights", "kv_cache"])
+            with torch.no_grad():
+                draft.weight.zero_()
+                draft.derived.zero_()
+
+        def resume_memory_occupation(self, request):
+            self.offload_tags.difference_update(request.tags or ["weights", "kv_cache"])
+            with torch.no_grad():
+                target.weight.add_(1)
+
+    owner = Owner()
+    scheduler = SimpleNamespace(weight_updater=owner) if separate_updater else owner
+    scheduler.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(model=target))
+    scheduler.draft_worker = SimpleNamespace(
+        _draft_worker=SimpleNamespace(draft_runner=SimpleNamespace(model=draft))
+    )
+    scheduler._request_dispatcher = SimpleNamespace(
+        _mapping={Request: owner.release_memory_occupation}
+    )
+    plugin = AwexSchedulerPlugin(scheduler)
+    plugin._patch_memory_transitions()
+    plugin._patch_memory_transitions()
+    for _ in range(3):
+        scheduler._request_dispatcher._mapping[Request](Request(tags))
+        scheduler.resume_memory_occupation(Request(tags))
+        torch.testing.assert_close(draft.weight, expected, rtol=0, atol=0)
+        torch.testing.assert_close(draft.derived, derived, rtol=0, atol=0)
+        torch.testing.assert_close(draft.shared, target.weight, rtol=0, atol=0)
+        assert pointers == (draft.weight.data_ptr(), draft.derived.data_ptr())
