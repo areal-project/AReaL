@@ -1627,7 +1627,7 @@ class ArenaStreamAgentWorkflow:
             reward_metrics = arena_reward_metrics(
                 sub_scores=result.sub_scores, raw=result.raw, score=result.score
             )
-            metrics.update(reward_metrics)
+            # Grader-defined components are only comparable within their stream.
             metrics.update(
                 {
                     f"stream/{stream_config.name}/{key}": value

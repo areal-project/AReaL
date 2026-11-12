@@ -259,11 +259,39 @@ globally and per stream.
 ### Reward components in W&B
 
 The client preserves the result envelope's `sub_scores`. Finite named entries are logged
-as `rollout/reward_sub_score/<name>` and
-`rollout/stream/<stream>/reward_sub_score/<name>`. These metrics describe the verifier
-score before any training reward transform. They do not change the reward used by GRPO.
-Sub-scores are also included in private result audit shards. Both `raw` and `sub_scores`
-are independently omitted from audit shards when their encoded size exceeds
+as `rollout/stream/<stream>/reward_sub_score/<name>`. If the verifier supplies
+`raw.reward_display.component_ids`, display labels (including Chinese labels) are
+resolved to those stable component IDs. Without that mapping, bounded printable Unicode
+names are preserved. Component IDs may contain `/` to describe nested metrics. Invalid
+or duplicate names and non-finite values are counted in
+`rollout/stream/<stream>/reward_sub_score/invalid_entries`.
+
+The adapter also reads the generic `raw.reward_observation` contract when
+`schema_version` is `1`. Component names are defined by the verifier; they are not
+restricted to a particular reward formula. Supplied finite numeric fields are logged as:
+
+| Source                           | W&B metric                                                                  |
+| -------------------------------- | --------------------------------------------------------------------------- |
+| `components.<name>.value`        | `rollout/stream/<stream>/reward_observation/components/<name>/value`        |
+| `components.<name>.weight`       | `rollout/stream/<stream>/reward_observation/components/<name>/weight`       |
+| `components.<name>.contribution` | `rollout/stream/<stream>/reward_observation/components/<name>/contribution` |
+| `components.<name>.share`        | `rollout/stream/<stream>/reward_observation/components/<name>/share`        |
+| `diagnostics.<name>`             | `rollout/stream/<stream>/reward_observation/diagnostics/<name>`             |
+
+Grader-specific sub-scores, observations, and breakdowns are recorded only under
+`rollout/stream/<stream>/` so unrelated reward formulas are not averaged together.
+Global `arena_score` and `training_score` metrics remain available. `null` or missing
+measurements are omitted, never replaced with zero or derived from other fields. For
+example, a nonlinear component may have a measured `value` but no defined `weight` or
+`contribution`. The `share` metric is the mean of the verifier's per-result shares, not
+a ratio of batch-mean contribution and batch-mean score. `reward_observation/present`,
+`valid`, and `invalid_entries` report observation coverage and malformed telemetry.
+Unsupported schemas or invalid entries cannot reject an otherwise valid rollout.
+
+These metrics describe the verifier score before any training reward transform. The
+top-level `score` remains the reward source; observations do not change the reward used
+by GRPO. Sub-scores are also included in private result audit shards. Both `raw` and
+`sub_scores` are independently omitted from audit shards when their encoded size exceeds
 `arena_result_dump_max_bytes`; presence, size, and truncation flags remain available for
 each field.
 
@@ -321,20 +349,19 @@ declared weights remain 0.9 and 0.1. VLM `value` is null and `excluded` is true.
 `RULE_UNSCORABLE` carries a terminal null. The training adapter's model-failure zero
 policy remains separate from these verifier outcomes.
 
-The existing stats/W&B pipeline records the tree under these paths, also with a
-`rollout/stream/<stream>/` prefix:
+The existing stats/W&B pipeline records the tree under these per-stream paths:
 
 ```text
-rollout/reward_breakdown/present
-rollout/reward_breakdown/valid
-rollout/reward_breakdown/mode/MIXED_90_10
-rollout/reward_breakdown/total/score
-rollout/reward_breakdown/total/rule/weight
-rollout/reward_breakdown/total/rule/contribution_to_parent
-rollout/reward_breakdown/total/vlm/share_of_parent_mean
-rollout/reward_breakdown/total/rule/quality/mean/<part>/surface/score
-rollout/reward_breakdown/total/rule/quality/mean/<part>/surface/weight
-rollout/reward_breakdown/total/rule/factor/score
+rollout/stream/<stream>/reward_breakdown/present
+rollout/stream/<stream>/reward_breakdown/valid
+rollout/stream/<stream>/reward_breakdown/mode/MIXED_90_10
+rollout/stream/<stream>/reward_breakdown/total/score
+rollout/stream/<stream>/reward_breakdown/total/rule/weight
+rollout/stream/<stream>/reward_breakdown/total/rule/contribution_to_parent
+rollout/stream/<stream>/reward_breakdown/total/vlm/share_of_parent_mean
+rollout/stream/<stream>/reward_breakdown/total/rule/quality/mean/<part>/surface/score
+rollout/stream/<stream>/reward_breakdown/total/rule/quality/mean/<part>/surface/weight
+rollout/stream/<stream>/reward_breakdown/total/rule/factor/score
 ```
 
 Weights and shares use fractions, not percentages. Scalars are averaged over observed
