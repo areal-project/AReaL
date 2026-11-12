@@ -1,0 +1,23 @@
+areal/utils/training_metrics.py
+  s_5ffc08691846bc::t_23f7a9ebcf61e3 149-151,155-163
+tests/test_training_metrics.py
+  s_5ffc08691846bc::t_23f7a9ebcf61e3 17,220-226,350-365
+areal/engine/megatron_engine.py
+  s_5ffc08691846bc::t_23f7a9ebcf61e3 2809-2811
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "151bb143898e4affd2fceb70b821fe36597b43a0",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
