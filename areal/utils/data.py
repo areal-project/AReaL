@@ -444,10 +444,13 @@ class RolloutGroup:
 
     Workflows own optional raw reward references. A reference is required when
     reward normalization consumes a rollout whose row rewards differ.
+    ``arena_stream_name`` identifies the source Arena dataset for training counts
+    without adding non-tensor fields to packed model inputs.
     """
 
     row_counts: tuple[int, ...]
     rewards: tuple[float | None, ...] = ()
+    arena_stream_name: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "row_counts", tuple(self.row_counts))
@@ -469,7 +472,7 @@ class RolloutGroup:
     def validate_rows(self, rows: int) -> "RolloutGroup":
         # RPC restores dataclass fields without running the constructor and
         # encodes tuples as lists. Revalidate at the consuming boundary.
-        group = RolloutGroup(self.row_counts, self.rewards)
+        group = RolloutGroup(self.row_counts, self.rewards, self.arena_stream_name)
         if sum(group.row_counts) != rows:
             raise ValueError(
                 f"rollout row_counts sum to {sum(group.row_counts)}, expected {rows}"
@@ -1285,6 +1288,14 @@ def pad_packed_tensor_dict(
                             new_end - new_start, dtype=value.dtype, device=value.device
                         )
                 sequence_padded_data[key] = new_value
+            elif key in ("sampler_head_ids", "sampler_head_logprobs"):
+                fill = float("-inf") if key == "sampler_head_logprobs" else 0
+                new_value = value.new_full((padded_shape[0], *value.shape[1:]), fill)
+                for i in range(batch_size):
+                    start, end = cu_seqlens[i], cu_seqlens[i + 1]
+                    new_start = cu_seqlens_padded[i]
+                    new_value[new_start : new_start + end - start] = value[start:end]
+                sequence_padded_data[key] = new_value
             elif torch.is_tensor(value) and value.numel() == total_length:
                 new_value = torch.full(
                     padded_shape,
@@ -1354,6 +1365,10 @@ def pad_packed_tensor_dict(
                 pad = torch.arange(pad_length, dtype=torch.long, device=value.device)
                 padded_tensor = torch.cat([value, pad])
             padded_data[key] = padded_tensor
+        elif key in ("sampler_head_ids", "sampler_head_logprobs"):
+            fill = float("-inf") if key == "sampler_head_logprobs" else 0
+            pad = value.new_full((pad_length, *value.shape[1:]), fill)
+            padded_data[key] = torch.cat([value, pad], dim=0)
         elif torch.is_tensor(value) and value.numel() == total_length:
             # Pad the tensor to the new total length
             padded_tensor = torch.nn.functional.pad(

@@ -83,10 +83,41 @@ Workers source the file again, so remove unrelated deployment settings from it.
 For one Stream, set `ARENA_STREAM_ID`. For multiple Streams, edit the literal
 `econfig.arena_streams` entries in `arena_multi_stream.yaml` and select that config. Pin
 each Stream's actual Harness and reward key/version. Every group of `n_samples` uses one
-Stream. The default epoch interleaves all source rows without replacement; a positive
+Stream. The base mixture interleaves all source rows; a positive
 `arena_mixture_epoch_size` selects a weighted subset, must not exceed the union, and
-must be divisible by the training batch size. Rejection can change the mixture that
-actually reaches training.
+must be divisible by the training batch size.
+
+Multi-Stream training with the v1 single-controller rollout path automatically
+compensates for rejected rollout groups at dispatch time. Each rejected group creates
+one replacement debt in its Stream. The controller prioritizes the largest unreserved
+debt, draws the next prompt from that Stream, and reserves the debt while the
+replacement is queued or running. Successful replacements settle debt; rejected
+replacements release the reservation for another attempt. Worker failures and timeouts
+use the same replacement policy. For example, three rejected groups from A and one from
+B trigger three A replacements and one B replacement, without advancing the base mixture
+schedule for those extra draws.
+
+After at most `train_dataset.batch_size` consecutive replacements, the controller admits
+one normal base draw. This keeps healthy Streams reachable when another Stream
+continually rejects. All unpaid debt is retained, and this dispatch counter persists
+across training batches and checkpoints; it does not constrain training batch contents.
+
+Base and replacement draws share an independent cursor per Stream. Exhausted Streams
+cycle and reshuffle if `train_dataset.shuffle` is enabled. With replacements, a nominal
+epoch may therefore revisit prompts; its configured training-step count and base Stream
+proportions remain unchanged. The policy compensates the existing mixture, including
+dataset sizes and `sampling_weight`; it does not redefine these weights as strict
+per-batch quotas. Accepted results still enter training in arrival order (or the
+configured deterministic order), so a fast Stream need not wait for a slow one and
+individual batches may have different proportions.
+
+Stream cursors, base schedule position, and unpaid debt are saved in the dataloader
+checkpoint. Reservations are released on recovery because queued/running tasks are not
+restored. As with existing asynchronous recovery, completed but unconsumed trajectories
+are not replayed. Checkpoints from the old flat dataloader are not compatible with the
+new Stream loader: start a new run or resume with the original unwrapped dataset. V2,
+SPMD, single-Stream training, and validation retain their ordinary dataloaders and do
+not enable this compensation.
 
 Before submission, extract the Stream list and validate it without launching tasks:
 
@@ -115,6 +146,115 @@ and optional `reward_transform_fn` hooks can transform it. Heterogeneous `raw` p
 are retained for audit, not parsed for training rewards. Model-attributed failures can
 retain interactions with zero reward; system and ambiguous failures are rejected. Result
 shards are written under `arena_result_dump_dir` when configured.
+
+### Multimodal request limits
+
+Configure SGLang's item-count limits through the training YAML:
+
+```yaml
+sglang:
+  limit_mm_data_per_request:
+    image: 64
+    video: 1
+    audio: 5
+```
+
+The values apply to each inference request, including images retained in conversation
+history. Omit the field (or set it to `null`) to use the installed SGLang defaults. An
+empty mapping `{}` disables item-count validation; a zero value disallows that modality.
+Only the specified modalities are limited. Larger limits allow larger multimodal inputs
+and can increase preprocessing memory use.
+
+### Task failure metrics in W&B
+
+Arena task outcomes are recorded once when each agent call finishes, before proxy
+export, zero-reward recovery, or group filtering. Rejected attempts are included when
+their rollout results are consumed to form a training batch; pending attempts belong to
+a later batch's metric window.
+
+- `rollout/task_attempt_count`: all finished agent calls, including local errors and
+  cancellation. `rollout/task_attempt/{success,error,cancelled}` are fractions of these
+  calls. Success here means the Arena call returned a reward, not that the trajectory
+  was accepted for training.
+- `rollout/task_result_count`: calls with an observed Arena terminal status.
+  `rollout/harness_success` counts `DONE`/`OK`; `rollout/harness_error` counts
+  `HARNESS_FAILED`. `rollout/task_error` includes all failed terminal statuses, such as
+  `EVAL_FAILED`, `COLLECT_FAILED`, and `SETUP_FAILED`. These fractions and
+  `rollout/task_status/<status>` share the terminal-result denominator.
+- `rollout/harness_error/<code>` also uses the terminal-result denominator, with `OTHER`
+  for unrecognized or missing Harness outcome codes. A model failure recovered as zero
+  reward still counts once as its original task failure.
+
+Local timeouts and cancellations without a remote terminal result contribute only to the
+call metrics. Reward metrics retain their valid-export denominator, exposed as
+`rollout/reward_sample_count`; they must not be used as the task-failure denominator.
+
+For single-controller Arena training, the same attempt and terminal-result metrics are
+available under `rollout/stream/<name>/`, including `harness_error`, `task_error`,
+outcome codes, `task_attempt_count`, and `task_result_count`. Each Arena stream uses its
+own denominator. `<name>` is the dataset's `arena_stream_name`, falling back to
+`stream_id` for rows without a configured name.
+
+Per-Arena-stream `accepted_count`, `rejected_count`, and `group_attempt_count` count
+prompt groups consumed while forming the current batch, including failed attempts.
+`filter_rejected_count` counts only groups for which `should_accept_fn` returned false;
+missing trajectories and workflow/predicate exceptions are rejected but are not filter
+rejections. The corresponding `accepted`, `rejected`, and `filter_rejected` metrics are
+fractions of all consumed group attempts. Prefetched results remain outside this window
+until consumed. These counts also have aggregate `rollout/` counterparts.
+
+After a successful actor update, `ppo_actor/stream/<name>/` reports the same input-count
+metrics as the global `ppo_actor/` scope:
+
+| Metric           | Definition                                                                                                             |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `n_groups`       | Input prompt groups, including fully masked groups.                                                                    |
+| `n_seqs`         | Tensor rows; a multi-turn logical rollout can contain several rows.                                                    |
+| `n_tokens`       | All padded tensor positions, including prompt/context and padding, matching the global denominator.                    |
+| `n_valid_tokens` | Nonzero preprocessed `loss_mask` positions, excluding prompt/context, padding, and positions masked before the update. |
+
+Use `n_valid_tokens` to compare training token volume across datasets. Zero-advantage
+tokens still count; this does not measure nonzero gradient contributions or additional
+filtering inside the loss function. When all inputs have stream provenance, per-stream
+sums match the corresponding global counts. Counts sum over DP ranks once per successful
+update, without multiplying by Megatron TP/PP/CP replicas or PPO minibatches. Rejected
+or pending rollouts do not contribute. These are counts in the current metrics export
+window, not lifetime totals. These names replace the earlier `groups/rollouts/tokens`;
+logical rollout counts are not interchangeable with `n_seqs`.
+
+### Filtering groups by accuracy
+
+To reject groups with accuracy at or below 20%, as well as all-correct groups, set:
+
+```yaml
+should_accept_fn: examples.swe.filter_function.filter_by_accuracy
+should_accept_kwargs:
+  min_accuracy: 0.2
+  max_accuracy: 1.0
+  correct_reward_threshold: 0.999
+```
+
+This keeps only `0.2 < accuracy < 1.0`: one correct rollout out of five is rejected; two
+out of five are kept. Each logical rollout contributes one vote, even when it exports
+several turns. Accuracy uses `original_rewards` when present, otherwise `rewards`; a
+reward at least `1 - 1e-3` is correct by default. This is a fraction of correct
+rollouts, not the mean of fractional rewards. Rows within one logical rollout must agree
+on correctness; ambiguous split rewards raise an error.
+
+Both SWE training entrypoints, including the Qwen Arena recipe, forward
+`should_accept_kwargs` to the rollout workers in controller and SPMD modes. Override
+these YAML values directly or via CLI, for example
+`should_accept_kwargs.min_accuracy=0.4 should_accept_kwargs.max_accuracy=0.8`. This
+keeps only `0.4 < accuracy < 0.8`; both endpoints are rejected. Invalid bounds fail
+during configuration loading. Omit `should_accept_kwargs` to retain the function's
+defaults. Options require a non-null `should_accept_fn`.
+
+Bounds are exclusive for acceptance; `min_accuracy=0, max_accuracy=1` keeps only groups
+containing both correct and incorrect rollouts. The existing `filter_function` retains
+its reward-variation behavior. Rejections from the new function contribute to the
+per-stream `filter_rejected_count` described above; `filter_accuracy`,
+`rejected_by_low_accuracy`, and `rejected_by_high_accuracy` expose its decisions
+globally and per stream.
 
 ### Reward components in W&B
 
@@ -244,10 +384,14 @@ published Env metadata (`source_reward_ref` or `reward_ref`, plus optional
 `harness_ref`). Conflicting sources fail before rollout. Each distinct reward and
 Harness version must be published, and references must include an exact version.
 
-When Harness bindings are present, they must cover every dataset row. Each task uses its
-pinned Harness in preference to the Stream-level `harness`; its LLM protocol is inferred
-from that Harness using the existing protocol inference rules. Snapshots without Harness
-bindings retain the Stream-level Harness and protocol behavior.
+When Harness bindings are present, they must cover every dataset row. An explicit
+`arena_streams[].harness` (or `harness` in a Stream file) takes priority over the task's
+pinned Harness. Without that override, the task's pinned Harness takes priority over the
+common `arena_harness` fallback. Tasks using their pinned Harness infer the LLM protocol
+from it; an explicit Stream Harness uses the Stream's `llm_protocol` when set, otherwise
+its protocol is inferred from that Harness. Snapshots without Harness bindings retain
+the Stream-level Harness and protocol behavior. Changing the explicit Stream Harness
+takes effect without rewriting the snapshot.
 
 Subsequent starts reuse the snapshot, check exact dataset coverage, verify the pinned
 versions remain published, and check declared Stream bindings for drift. An invalid or

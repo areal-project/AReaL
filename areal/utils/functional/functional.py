@@ -450,7 +450,13 @@ def compute_binary_kl_divergence(
     """
     p = torch.clamp(torch.exp(log_p), eps, 1.0 - eps)
     q = torch.clamp(torch.exp(log_q), eps, 1.0 - eps)
-    return p * torch.log(p / q) + (1 - p) * torch.log((1 - p) / (1 - q))
+    # The upper clamp can round to one; use the zero-mass convention 0*log(0)=0.
+    return (
+        torch.special.xlogy(p, p)
+        - torch.special.xlogy(p, q)
+        + torch.special.xlog1py(1 - p, -p)
+        - torch.special.xlog1py(1 - p, -q)
+    )
 
 
 def ppo_actor_loss_fn(

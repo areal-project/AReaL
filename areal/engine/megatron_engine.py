@@ -1279,6 +1279,7 @@ class MegatronEngine(TrainEngine):
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
@@ -1286,6 +1287,7 @@ class MegatronEngine(TrainEngine):
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             group_size=group_size,
             min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
@@ -2128,6 +2130,19 @@ class MegatronEngine(TrainEngine):
                         f"{input_ids.shape}."
                     )
                 mb_input.padded_mb["mtp_loss_mask"] = mtp_loss_mask
+                mtp_version_mask = mb_input.padded_mb.get("mtp_version_mask")
+                if (
+                    mtp_version_mask is not None
+                    and mtp_version_mask.shape != input_ids.shape
+                ):
+                    raise ValueError(
+                        "MTP version mask must match input_ids before layout "
+                        f"conversion, got {mtp_version_mask.shape} and {input_ids.shape}."
+                    )
+            else:
+                # The actor carries this mask with policy-version filtering,
+                # but it only applies to an active MTP training objective.
+                mb_input.padded_mb.pop("mtp_version_mask", None)
 
             output = packed_context_parallel_forward(
                 model,
@@ -2269,6 +2284,17 @@ class MegatronEngine(TrainEngine):
                     )
                     cp_inputs = dict(mb_input.orig_mb)
                     cp_inputs["_cp_local_labels"] = cp_labels
+                    if (
+                        getattr(self.config, "use_score_centering", False)
+                        and "sampler_head_ids" in mb_input.padded_mb
+                    ):
+                        # Plain forward_batch requests do not carry sampler heads.
+                        for key in ("sampler_head_ids", "sampler_head_logprobs"):
+                            cp_inputs[f"_cp_local_{key}"] = (
+                                split_packed_seqs_for_context_parallel(
+                                    mb_input.padded_mb[key], padded_cu_seqlens
+                                )
+                            )
                     cp_inputs["_cp_padded_cu_seqlens"] = padded_cu_seqlens
                     cp_inputs["_cp_padding_length"] = mb_input.padding_length
                     cp_inputs["_cp_old_cu_seqlens"] = mb_input.old_cu_seqlens
@@ -3757,6 +3783,12 @@ class MegatronEngine(TrainEngine):
                     base_model_name_or_path=base_model_path or self.config.path,
                 )
             else:
+                if self._mtp_head_dropped and os.path.realpath(
+                    path
+                ) == os.path.realpath(self.bridge.hf_pretrained.state.source.path):
+                    raise ValueError(
+                        "HF export must not overwrite the frozen MTP source directory"
+                    )
                 # When the MTP head was dropped (enable_mtp=False), the export
                 # yields no mtp.* tensors and strict=True would silently skip
                 # every source shard containing an MTP key -- discarding the
@@ -3830,9 +3862,19 @@ class MegatronEngine(TrainEngine):
                 tokenizer.save_pretrained(path)
             if processor is not None:
                 processor.save_pretrained(path)
-            if self._mtp_head_dropped:
-                self._scrub_mtp_from_saved_config(path)
-                self._rebuild_index_from_saved_shards(path)
+            if self._mtp_head_dropped and not self.config.use_lora:
+                from areal.utils.mtp_checkpoint import restore_frozen_mtp_weights
+
+                restored = False
+                if self.bridge_cls == "megatron-bridge":
+                    # The bridge resolves Hub IDs to the actual local weights.
+                    # base_model_path controls exported assets, not provenance.
+                    restored = restore_frozen_mtp_weights(
+                        str(self.bridge.hf_pretrained.state.source.path), path
+                    )
+                if not restored:
+                    self._scrub_mtp_from_saved_config(path)
+                    self._rebuild_index_from_saved_shards(path)
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
@@ -4184,7 +4226,61 @@ class MegatronEngine(TrainEngine):
                 "Tree training with critic model is not supported yet."
             )
         if not self.config.is_critic:
-            if self.enable_tree_training:
+            sc_kwargs = {}
+            cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
+            if getattr(self.config, "use_score_centering", False):
+                if self.enable_tree_training or isinstance(output, ChunkedLMHeadOutput):
+                    raise ValueError(
+                        "Score centering requires ordinary packed Megatron logits."
+                    )
+                from areal.utils.score_centering import (
+                    resolve_score_centering_tis_cap,
+                    score_centering_logprobs,
+                )
+
+                labels = inputs.get("_cp_local_labels")
+                if labels is None:
+                    labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
+                ids = inputs.get(
+                    "_cp_local_sampler_head_ids", inputs["sampler_head_ids"]
+                )
+                q = inputs.get(
+                    "_cp_local_sampler_head_logprobs", inputs["sampler_head_logprobs"]
+                )
+                if (
+                    ids.ndim != 2
+                    or ids.shape[0] != output.shape[0]
+                    or ids.shape != q.shape
+                ):
+                    raise ValueError(
+                        "Packed sampler heads must have shape [real_tokens, K]."
+                    )
+                logprobs, entropy, correction = score_centering_logprobs(
+                    output,
+                    labels,
+                    ids,
+                    q,
+                    chunk_size=self.config.logprobs_chunk_size,
+                    tis_cap=resolve_score_centering_tis_cap(
+                        getattr(self.config, "rejection_sampling", None)
+                    ),
+                    tp_group=mpu.get_tensor_model_parallel_group()
+                    if mpu.get_tensor_model_parallel_world_size() > 1
+                    else None,
+                    vocab_size=lang_config(self.hf_config).vocab_size,
+                )
+                sc_kwargs["sc_correction"] = correction
+                vocab_min_logits = output.detach().min(-1).values.float()
+                vocab_max_logits = output.detach().max(-1).values.float()
+                vocab_mean_logits = output.detach().mean(-1, dtype=torch.float32)
+                vocab_norm_logits = torch.linalg.vector_norm(
+                    output.detach(),
+                    dim=-1,
+                    dtype=torch.float64
+                    if output.dtype == torch.float64
+                    else torch.float32,
+                ).float()
+            elif self.enable_tree_training:
                 # Handle dummy trie (empty tree for DP synchronization)
                 # When trie has no sequences, return zero loss with grad connection
                 trie_node = inputs.get("trie_node")
@@ -4228,7 +4324,6 @@ class MegatronEngine(TrainEngine):
                     chunk_size=self.config.logprobs_chunk_size,
                 )
             else:
-                cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
                 if isinstance(output, ChunkedLMHeadOutput):
                     (
                         logprobs,
@@ -4265,66 +4360,69 @@ class MegatronEngine(TrainEngine):
                             self.mcore_config.entropy_requires_grad,
                         ),
                     )
-                if cp_padded_cu_seqlens is not None:
-                    logprobs = reassemble_cp_packed_logprobs(
-                        logprobs, cp_padded_cu_seqlens
-                    )
-                    entropy = reassemble_cp_packed_logprobs(
-                        entropy, cp_padded_cu_seqlens
-                    )
-                    vocab_min_logits = reassemble_cp_packed_logprobs(
-                        vocab_min_logits, cp_padded_cu_seqlens
-                    )
-                    vocab_max_logits = reassemble_cp_packed_logprobs(
-                        vocab_max_logits, cp_padded_cu_seqlens
-                    )
-                    vocab_mean_logits = reassemble_cp_packed_logprobs(
-                        vocab_mean_logits, cp_padded_cu_seqlens
-                    )
-                    vocab_norm_logits = reassemble_cp_packed_logprobs(
-                        vocab_norm_logits, cp_padded_cu_seqlens
-                    )
-                    cp_padding_length = inputs.get("_cp_padding_length", 0)
-                    cp_old_cu_seqlens = inputs.get("_cp_old_cu_seqlens")
-                    logprobs = unpad_logits(
-                        logprobs,
+            if cp_padded_cu_seqlens is not None:
+                logprobs = reassemble_cp_packed_logprobs(logprobs, cp_padded_cu_seqlens)
+                entropy = reassemble_cp_packed_logprobs(entropy, cp_padded_cu_seqlens)
+                vocab_min_logits = reassemble_cp_packed_logprobs(
+                    vocab_min_logits, cp_padded_cu_seqlens
+                )
+                vocab_max_logits = reassemble_cp_packed_logprobs(
+                    vocab_max_logits, cp_padded_cu_seqlens
+                )
+                vocab_mean_logits = reassemble_cp_packed_logprobs(
+                    vocab_mean_logits, cp_padded_cu_seqlens
+                )
+                vocab_norm_logits = reassemble_cp_packed_logprobs(
+                    vocab_norm_logits, cp_padded_cu_seqlens
+                )
+                cp_padding_length = inputs.get("_cp_padding_length", 0)
+                cp_old_cu_seqlens = inputs.get("_cp_old_cu_seqlens")
+                logprobs = unpad_logits(
+                    logprobs,
+                    cp_padding_length,
+                    cp_padded_cu_seqlens,
+                    cp_old_cu_seqlens,
+                )
+                entropy = unpad_logits(
+                    entropy,
+                    cp_padding_length,
+                    cp_padded_cu_seqlens,
+                    cp_old_cu_seqlens,
+                )
+                vocab_min_logits = unpad_logits(
+                    vocab_min_logits,
+                    cp_padding_length,
+                    cp_padded_cu_seqlens,
+                    cp_old_cu_seqlens,
+                )
+                vocab_max_logits = unpad_logits(
+                    vocab_max_logits,
+                    cp_padding_length,
+                    cp_padded_cu_seqlens,
+                    cp_old_cu_seqlens,
+                )
+                vocab_mean_logits = unpad_logits(
+                    vocab_mean_logits,
+                    cp_padding_length,
+                    cp_padded_cu_seqlens,
+                    cp_old_cu_seqlens,
+                )
+                vocab_norm_logits = unpad_logits(
+                    vocab_norm_logits,
+                    cp_padding_length,
+                    cp_padded_cu_seqlens,
+                    cp_old_cu_seqlens,
+                )
+                if "sc_correction" in sc_kwargs:
+                    sc_kwargs["sc_correction"] = unpad_logits(
+                        reassemble_cp_packed_logprobs(
+                            sc_kwargs["sc_correction"], cp_padded_cu_seqlens
+                        ),
                         cp_padding_length,
                         cp_padded_cu_seqlens,
                         cp_old_cu_seqlens,
                     )
-                    entropy = unpad_logits(
-                        entropy,
-                        cp_padding_length,
-                        cp_padded_cu_seqlens,
-                        cp_old_cu_seqlens,
-                    )
-                    vocab_min_logits = unpad_logits(
-                        vocab_min_logits,
-                        cp_padding_length,
-                        cp_padded_cu_seqlens,
-                        cp_old_cu_seqlens,
-                    )
-                    vocab_max_logits = unpad_logits(
-                        vocab_max_logits,
-                        cp_padding_length,
-                        cp_padded_cu_seqlens,
-                        cp_old_cu_seqlens,
-                    )
-                    vocab_mean_logits = unpad_logits(
-                        vocab_mean_logits,
-                        cp_padding_length,
-                        cp_padded_cu_seqlens,
-                        cp_old_cu_seqlens,
-                    )
-                    vocab_norm_logits = unpad_logits(
-                        vocab_norm_logits,
-                        cp_padding_length,
-                        cp_padded_cu_seqlens,
-                        cp_old_cu_seqlens,
-                    )
-                    inputs = {
-                        k: v for k, v in inputs.items() if not k.startswith("_cp_")
-                    }
+                inputs = {k: v for k, v in inputs.items() if not k.startswith("_cp_")}
 
             loss = loss_fn(
                 logprobs,
@@ -4334,6 +4432,7 @@ class MegatronEngine(TrainEngine):
                 vocab_max_logits=vocab_max_logits,
                 vocab_mean_logits=vocab_mean_logits,
                 vocab_norm_logits=vocab_norm_logits,
+                **sc_kwargs,
             )
         else:
             values = output.squeeze(-1)

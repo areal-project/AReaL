@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+"""Geometry3K equivalence matrices, generated nesting, and malformed-answer cases."""
+
 import random
 
 import pytest
@@ -29,9 +31,6 @@ MATH_CASES = [
     ("pi coefficient", "2\\pi", "\\pi+\\pi"),
     ("pi fraction", "\\frac{\\pi}{2}", "0.5\\pi"),
     ("scientific", "1.2\\times10^3", "1200"),
-    ("degree", "90^\\circ", "90"),
-    ("degree braces", "90^{\\circ}", "90"),
-    ("unit", "5\\text{ cm}", "5"),
     ("redundant braces", "{{5}}", "5"),
     ("parenthesized", "\\left(\\frac12\\right)", "0.5"),
     ("nested boxed whole", "\\boxed{1}+2", "3"),

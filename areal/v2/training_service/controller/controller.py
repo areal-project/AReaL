@@ -1159,7 +1159,15 @@ class GatewayTrainController:
             f"meta.version must be a positive integer, got {meta.version}"
         )
         result = self._weight_update_ctrl.update_weights(version=meta.version)
-        self.rollout.continue_generation()
+        # Publish the version before resuming generation. Requests unblocked by
+        # continue_generation() are served by the new weights, so they must be
+        # stamped with the new version; otherwise every segment resumed during
+        # the version broadcast is recorded as pre-update policy and downstream
+        # importance ratios pick the wrong behavior policy for it.
+        try:
+            self.rollout.set_version(meta.version)
+        finally:
+            self.rollout.continue_generation()
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",
             meta.version,
@@ -1178,6 +1186,7 @@ class GatewayTrainController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if self.rollout is None:
             raise RuntimeError("connect_engine() must be called before prepare_batch()")
@@ -1186,6 +1195,7 @@ class GatewayTrainController:
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             group_size=group_size,
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
@@ -1203,6 +1213,7 @@ class GatewayTrainController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if self.rollout is None:
             raise RuntimeError("connect_engine() must be called before rollout_batch()")
@@ -1211,6 +1222,7 @@ class GatewayTrainController:
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             group_size=group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,

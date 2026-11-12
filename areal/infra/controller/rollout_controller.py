@@ -37,13 +37,16 @@ from areal.api.cli_args import (
     SchedulingStrategyType,
 )
 from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY, DatasetRoute
+from areal.infra.backend_router import BackendRouterService
 from areal.infra.rpc.rtensor import flatten_shard_ids
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
+from areal.infra.utils.exp_metadata import get_metadata_dir
 from areal.infra.utils.inference_targets import write_inference_targets
 from areal.utils import logging, perf_tracer
+from areal.utils.arena_stream_dataloader import ArenaStreamDataLoader
 from areal.utils.data import cycle_dataloader
-from areal.utils.dynamic_import import import_from_string
+from areal.utils.dynamic_import import bind_filter_kwargs, import_from_string
 from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
 from areal.utils.rollout_metrics import ConsumedMetrics
@@ -160,6 +163,8 @@ class _RemoteRolloutTaskInput:
     reward_normalization: bool = False
     reward_normalization_use_std: bool = True
     drop_incomplete_group: bool = False
+    should_accept_kwargs: dict[str, Any] | None = None
+    arena_stream_dataloader: ArenaStreamDataLoader | None = None
 
 
 class RolloutController:
@@ -189,6 +194,10 @@ class RolloutController:
         # State
         self._version_lock = Lock()
         self._version = 0
+        self._backend_router: BackendRouterService | None = None
+        self._owns_backend_router = True
+        self._routing_members = [self]
+        self._routing_active = True
 
         self._task_id_generator = TaskIdGenerator()
         self._mopd_routing_enabled = False
@@ -294,6 +303,7 @@ class RolloutController:
         server_args: dict[str, Any] | None = None,
         server_infos: list[LocalInfServerInfo] | None = None,
         *args,
+        backend_router_owner: RolloutController | None = None,
         **kwargs,
     ):
         # Get scheduling config from kwargs or use defaults
@@ -329,6 +339,27 @@ class RolloutController:
         run_async_task(
             self._async_initialize, job, server_args, server_infos, *args, **kwargs
         )
+        if self.config.backend_routing.enabled:
+            if backend_router_owner is None:
+                self._initialize_backend_router(server_args or {})
+            else:
+                self._backend_router = backend_router_owner._backend_router
+                if self._backend_router is None:
+                    raise ValueError(
+                        "Shared backend routing requires an initialized owner"
+                    )
+                self._owns_backend_router = False
+                self._routing_members = backend_router_owner._routing_members
+                self._routing_members.append(self)
+                self._routing_active = self._backend_router.state == "READY"
+                self._collective_rpc(
+                    "configure_backend_routing", **self._backend_router.client_kwargs()
+                )
+                self._collective_rpc(
+                    "set_sender_state",
+                    paused=not self._routing_active,
+                    control_seq=self._backend_router.control_seq,
+                )
 
         # Initialize staleness manager for global capacity control
         max_concurrent_rollouts = (
@@ -358,12 +389,68 @@ class RolloutController:
             enable_tracing=self.config.enable_rollout_tracing,
             terminal_error_fn=get_workflow_result_error,
             deterministic_order=getattr(self.config, "deterministic_sampling", False),
+            health_check=self._backend_router.check_health
+            if self._backend_router
+            else None,
         )
         # Initialize the dispatcher's async task runner
         self._dispatcher.initialize(logger=logger)
 
         # Start callback server for weight sync coordination
         self._start_callback_server()
+
+    def _initialize_backend_router(self, server_args: dict) -> None:
+        from areal.engine.sglang_remote import RemoteSGLangEngine
+
+        if not issubclass(self.inf_engine, RemoteSGLangEngine):
+            raise ValueError("v1 backend routing currently requires RemoteSGLangEngine")
+        routing = self.config.backend_routing
+        capacity = routing.capacity or server_args.get("max_running_requests")
+        if not capacity or capacity <= 0:
+            raise ValueError(
+                "Backend routing requires a positive max_running_requests or capacity"
+            )
+        log_dir = get_metadata_dir(
+            self.config.fileroot,
+            self.config.experiment_name,
+            self.config.trial_name,
+        )
+        manager = BackendRouterService(routing, log_dir, self._worker_role)
+        self._backend_router = manager
+        try:
+            manager.start(
+                [
+                    {
+                        "backend_id": str(rank),
+                        "backend_addr": f"http://{format_hostport(info.host, info.port)}",
+                        "capacity": capacity,
+                    }
+                    for rank, info in enumerate(self.server_infos)
+                ]
+            )
+            self._collective_rpc("configure_backend_routing", **manager.client_kwargs())
+            self._set_routing_senders(False, manager.control_seq + 1)
+            manager.set_state("READY")
+        except BaseException:
+            manager.destroy()
+            raise
+
+    def _set_routing_senders(self, paused: bool, control_seq: int) -> None:
+        for member in self._routing_members:
+            member_paused = paused or not member._routing_active
+            member._collective_rpc(
+                "set_sender_state",
+                paused=member_paused,
+                control_seq=control_seq,
+                http_timeout=60.0,
+            )
+            if member._proxy_started:
+                member._proxy_collective_rpc(
+                    "set_sender_state",
+                    paused=member_paused,
+                    control_seq=control_seq,
+                    http_timeout=60.0,
+                )
 
     def _write_inference_targets(self, source: str) -> None:
         write_inference_targets(
@@ -619,6 +706,17 @@ class RolloutController:
 
         with self._futures_lock:
             self._pending_futures.clear()
+        if getattr(self, "_backend_router", None) is not None:
+            try:
+                if self._owns_backend_router:
+                    # Shared-service retirement needs an external, confirmed
+                    # process teardown. Scheduler cancellation alone can be
+                    # asynchronous; don't assert that old processes exited.
+                    self._backend_router.destroy()
+                else:
+                    self._routing_members.remove(self)
+            except Exception as exc:
+                errors.append(f"backend router destroy: {exc}")
         if errors:
             raise RuntimeError("RolloutController cleanup failed: " + "; ".join(errors))
 
@@ -710,6 +808,15 @@ class RolloutController:
         await self._proxy_collective_rpc_async(
             "set_version", version=self.get_version(), http_timeout=60.0
         )
+        if getattr(self, "_backend_router", None) is not None:
+            await self._proxy_collective_rpc_async(
+                "configure_backend_routing", **self._backend_router.client_kwargs()
+            )
+            await self._proxy_collective_rpc_async(
+                "set_sender_state",
+                paused=not self._routing_active,
+                control_seq=self._backend_router.control_seq,
+            )
 
         logger.info(f"Proxy servers initialized. Addresses: {self.proxy_addrs}")
 
@@ -1019,7 +1126,12 @@ class RolloutController:
             )
             for rank, worker in enumerate(workers)
         ]
-        return await asyncio.gather(*tasks)
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException as exc:
+            if getattr(self, "_backend_router", None) is not None:
+                await asyncio.to_thread(self._backend_router.fail, exc)
+            raise
 
     def _choose_worker(self) -> tuple[Worker, int]:
         """Choose a worker for the next request using round-robin scheduling.
@@ -1067,7 +1179,9 @@ class RolloutController:
             return f"{workflow.__module__}.{workflow.__class__.__name__}"
 
     def _resolve_should_accept_fn(
-        self, should_accept_fn: Callable[[dict[str, Any]], bool] | str | None
+        self,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ):
         if callable(should_accept_fn):
             raise RuntimeError(
@@ -1080,6 +1194,11 @@ class RolloutController:
                 raise RuntimeError(
                     f"Failed to import `should_accept_fn` from string path: {should_accept_fn}"
                 )
+        if should_accept_kwargs:
+            bind_filter_kwargs(
+                import_from_string(should_accept_fn) if should_accept_fn else None,
+                should_accept_kwargs,
+            )
         return should_accept_fn
 
     def _rollout_stats(self) -> str:
@@ -1093,10 +1212,6 @@ class RolloutController:
 
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
         async def _submit_then_wait() -> WorkflowTaskResult | None:
-            # Choose worker via round-robin
-            worker, rank = self._choose_worker()
-            engine_name = self._engine_name(rank)
-
             # NOTE: No need to call `on_rollout_submitted` here.
             # This function will be passed to `BatchTaskDispather` where
             # `on_rollout_submitted` will be called upon dispatching
@@ -1105,6 +1220,9 @@ class RolloutController:
             manager = self.staleness_manager
 
             try:
+                # Choose worker via round-robin.
+                worker, rank = self._choose_worker()
+                engine_name = self._engine_name(rank)
                 # Set future for this task
                 future = asyncio.get_event_loop().create_future()
                 with self._futures_lock:
@@ -1121,6 +1239,7 @@ class RolloutController:
                     workflow=pending_task.workflow,
                     workflow_kwargs=pending_task.workflow_kwargs,
                     should_accept_fn=pending_task.should_accept_fn,
+                    should_accept_kwargs=pending_task.should_accept_kwargs,
                     http_timeout=self.config.request_timeout,
                     is_eval=pending_task.is_eval,
                     group_size=pending_task.group_size,
@@ -1187,7 +1306,29 @@ class RolloutController:
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
                 return None
 
-        return _submit_then_wait
+        if pending_task.arena_stream_dataloader is None:
+            return _submit_then_wait
+
+        async def _submit_with_arena_stream_feedback() -> WorkflowTaskResult | None:
+            accepted = None
+            try:
+                result = await _submit_then_wait()
+                accepted = (
+                    isinstance(result, _RolloutResult) and result.trajectory is not None
+                )
+                return result
+            except Exception:
+                accepted = False
+                raise
+            finally:
+                # Cancellation releases a reservation without declaring an
+                # unfinished base task rejected. Feedback precedes consumption
+                # so a partial batch can immediately replenish its source.
+                pending_task.arena_stream_dataloader.complete_arena_rollout(
+                    pending_task.task_id, accepted
+                )
+
+        return _submit_with_arena_stream_feedback
 
     def get_capacity(self):
         return self.staleness_manager.get_capacity()
@@ -1206,6 +1347,7 @@ class RolloutController:
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> int:
         validate_rollout_group_sizes(group_size, min_usable_group_size)
 
@@ -1213,13 +1355,12 @@ class RolloutController:
             data, required=self._mopd_routing_enabled and not is_eval
         )
         workflow_str = self._resolve_workflow_str(workflow)
-        should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+        should_accept_fn = self._resolve_should_accept_fn(
+            should_accept_fn, should_accept_kwargs
+        )
         if workflow_kwargs is None:
             workflow_kwargs = {}
 
-        # NOTE: RolloutController does not support `should_accept_fn`
-        # If the workflow's result should be aborted,
-        # `arun_episode` should return None instead.
         if task_id is None:
             task_id = self._task_id_generator.next()
         task_input = _RemoteRolloutTaskInput(
@@ -1227,6 +1368,7 @@ class RolloutController:
             workflow=workflow_str,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             task_id=task_id,
             mopd_route=mopd_route,
             is_eval=is_eval,
@@ -1268,6 +1410,7 @@ class RolloutController:
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         perf_tracer.instant(
             "rollout_controller.rollout_batch",
@@ -1280,6 +1423,7 @@ class RolloutController:
                 workflow=workflow,
                 workflow_kwargs=workflow_kwargs,
                 should_accept_fn=should_accept_fn,
+                should_accept_kwargs=should_accept_kwargs,
                 group_size=group_size,
                 min_usable_group_size=min_usable_group_size,
                 reward_normalization=reward_normalization,
@@ -1293,7 +1437,7 @@ class RolloutController:
     @trace_perf("rollout_controller.prepare_batch", category="scheduler")
     def prepare_batch(
         self,
-        dataloader: StatefulDataLoader,
+        dataloader: StatefulDataLoader | ArenaStreamDataLoader,
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         should_accept_fn: str | None = None,
@@ -1303,6 +1447,7 @@ class RolloutController:
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare a batch with controlled staleness.
 
@@ -1317,25 +1462,48 @@ class RolloutController:
         if workflow_kwargs is None:
             workflow_kwargs = {}
 
+        should_accept_fn = self._resolve_should_accept_fn(
+            should_accept_fn, should_accept_kwargs
+        )
+        arena_stream_dataloader = (
+            dataloader if isinstance(dataloader, ArenaStreamDataLoader) else None
+        )
+
         def task_input_generator():
-            for data in cycle_dataloader(dataloader):
-                for item in data:
+            base_items = (
+                item for data in cycle_dataloader(dataloader) for item in data
+            )
+            while True:
+                task_id = self._task_id_generator.next()
+                item = (
+                    arena_stream_dataloader.next_arena_rollout(task_id)
+                    if arena_stream_dataloader is not None
+                    else next(base_items)
+                )
+                try:
                     workflow_data, mopd_route = self._extract_mopd_route(
                         item, required=self._mopd_routing_enabled
                     )
-                    yield _RemoteRolloutTaskInput(
+                    task = _RemoteRolloutTaskInput(
                         data=workflow_data,
                         workflow=workflow_str,
                         workflow_kwargs=workflow_kwargs,
                         should_accept_fn=should_accept_fn,
-                        task_id=self._task_id_generator.next(),
+                        should_accept_kwargs=should_accept_kwargs,
+                        task_id=task_id,
                         mopd_route=mopd_route,
                         group_size=group_size,
                         min_usable_group_size=min_usable_group_size,
                         reward_normalization=reward_normalization,
                         reward_normalization_use_std=reward_normalization_use_std,
                         drop_incomplete_group=drop_incomplete_group,
+                        arena_stream_dataloader=arena_stream_dataloader,
                     )
+                except BaseException:
+                    if arena_stream_dataloader is not None:
+                        arena_stream_dataloader.complete_arena_rollout(task_id, None)
+                    raise
+                yield task
 
         if not hasattr(self, "data_generator"):
             self.data_generator = task_input_generator()
@@ -1482,6 +1650,15 @@ class RolloutController:
         shutil.rmtree(meta.path, ignore_errors=True)
 
     async def pause_generation(self):
+        if (
+            getattr(self, "_backend_router", None) is not None
+            and self._backend_router.state == "READY"
+        ):
+            await asyncio.to_thread(self.pause)
+        if getattr(self, "_backend_router", None) is not None:
+            await asyncio.to_thread(
+                self._backend_router.drain, abort_inflight=self.abort_all_requests
+            )
         await self._collective_rpc_async("pause_generation")
 
     def pause_generation_sync(self):
@@ -1489,6 +1666,16 @@ class RolloutController:
         # the worker also waits for pause_grace_period before returning.
         # A short RPC timeout retries the same pause while the
         # first call is still running and queues work behind the stalled call.
+        if (
+            getattr(self, "_backend_router", None) is not None
+            and self._backend_router.state == "READY"
+        ):
+            self.pause()
+        if getattr(self, "_backend_router", None) is not None:
+            # A fenced sender may still have a request in transport. Keep native
+            # admission open until repeated abort-only calls release every lease;
+            # native pause would strand a late arrival behind its resume gate.
+            self._backend_router.drain(abort_inflight=self.abort_all_requests)
         self._collective_rpc("pause_generation", http_timeout=600.0, max_retries=1)
 
     async def continue_generation(self):
@@ -1502,21 +1689,41 @@ class RolloutController:
                 self._proxy_collective_rpc(
                     "set_version", version=version, http_timeout=60.0
                 )
+            if getattr(self, "_backend_router", None) is not None:
+                self._backend_router.set_state(
+                    self._backend_router.state, version=version
+                )
 
     def get_version(self) -> int:
         with self._version_lock:
             return self._version
 
     def pause(self):
-        self.dispatcher.pause()
-        if self._proxy_started:
-            self._proxy_collective_rpc("pause", http_timeout=60.0)
-        self._collective_rpc("pause", http_timeout=60.0)
+        if getattr(self, "_backend_router", None) is not None:
+            self._backend_router.set_state("PAUSED")
+            for member in self._routing_members:
+                member._routing_active = False
+                member.dispatcher.pause()
+            self._set_routing_senders(True, self._backend_router.control_seq)
+            members = self._routing_members
+        else:
+            self.dispatcher.pause()
+            members = [self]
+        for member in members:
+            if member._proxy_started:
+                member._proxy_collective_rpc("pause", http_timeout=60.0)
+            member._collective_rpc("pause", http_timeout=60.0)
 
     def resume(self):
+        if getattr(self, "_backend_router", None) is not None:
+            self._backend_router.check_health()
         self._collective_rpc("resume", http_timeout=60.0)
         if self._proxy_started:
             self._proxy_collective_rpc("resume", http_timeout=60.0)
+        if getattr(self, "_backend_router", None) is not None:
+            self._routing_active = True
+            self._set_routing_senders(False, self._backend_router.control_seq + 1)
+            self._backend_router.set_state("READY")
         self.dispatcher.resume()
 
     def offload(self, tags: list[str] | None = None):
@@ -1543,15 +1750,8 @@ class RolloutController:
             )
         consumed = self.consumed_metrics.export()
         merged = _merge_worker_stats([*all_raw_stats, consumed])
-        # Expose denominators for batch-aligned quality metrics.
-        merged.update(
-            {
-                k: v
-                for k, v in consumed.items()
-                if k.endswith("__count")
-                or k in {"rollout/reward_sample_count", "rollout/group_attempt_count"}
-            }
-        )
+        # Expose batch-aligned denominators and counters, including stream scopes.
+        merged.update({k: v for k, v in consumed.items() if k.endswith("_count")})
         return merged
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:

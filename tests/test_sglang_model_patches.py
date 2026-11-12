@@ -541,3 +541,24 @@ def test_effective_flashinfer_decode_keeps_dependency_guard(
         assert (root / gdn.TARGET_RELATIVE).read_bytes() == gdn.patched_source(
             sources[gdn]
         )
+
+
+def test_qwen38_runtime_patches_do_not_suppress_flashinfer_gdn(runtime, monkeypatch):
+    root, model, sources = runtime
+    (model / "config.json").write_text(
+        json.dumps(
+            {"model_type": "qwen3_5", "text_config": dict(startup._QWEN38_TEXT_SHAPE)}
+        )
+    )
+    runtime_calls = []
+    monkeypatch.setattr(startup, "_apply_qwen38_runtime_patches", runtime_calls.append)
+    monkeypatch.delenv("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", raising=False)
+
+    startup.apply_model_patches(
+        ["--model-path", str(model), "--linear-attn-decode-backend", "flashinfer"]
+    )
+
+    assert runtime_calls == [root]
+    assert (root / gdn.TARGET_RELATIVE).read_bytes() == gdn.patched_source(sources[gdn])
+    for patch in (executor, qsa, qwen):
+        assert (root / patch.TARGET_RELATIVE).read_bytes() == sources[patch]

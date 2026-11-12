@@ -344,3 +344,45 @@ class TestGatewayTrainControllerClearBatches:
             "cancel-node": {"s-cancel": 0},
         }
         mock_gateway_post.assert_not_called()
+
+
+class TestUpdateWeightsVersionOrdering:
+    """Resumed generation must already see the post-update version."""
+
+    @staticmethod
+    def _controller() -> GatewayTrainController:
+        controller = _make_controller()
+        controller._weight_update_ctrl = MagicMock()
+        controller._weight_update_ctrl.update_weights.return_value = MagicMock(
+            status="ok", duration_ms=1.0
+        )
+        controller.rollout = MagicMock()
+        return controller
+
+    def test_version_published_before_generation_resumes(self):
+        controller = self._controller()
+        recorder = MagicMock()
+        recorder.attach_mock(controller.rollout, "rollout")
+        recorder.attach_mock(controller._weight_update_ctrl, "weights")
+        meta = MagicMock(version=7)
+
+        controller.update_weights(meta)
+
+        assert [name for name, _, _ in recorder.mock_calls] == [
+            "rollout.pause_generation",
+            "weights.update_weights",
+            "rollout.set_version",
+            "rollout.continue_generation",
+        ]
+        controller.rollout.set_version.assert_called_once_with(7)
+
+    def test_generation_resumes_even_if_version_broadcast_fails(self):
+        controller = self._controller()
+        controller.rollout.set_version.side_effect = RuntimeError("broadcast failed")
+        meta = MagicMock(version=7)
+
+        with pytest.raises(RuntimeError, match="broadcast failed"):
+            controller.update_weights(meta)
+
+        # A failed version broadcast must not leave inference paused forever.
+        controller.rollout.continue_generation.assert_called_once_with()

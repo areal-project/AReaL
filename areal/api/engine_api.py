@@ -250,6 +250,7 @@ class TrainEngine(abc.ABC):
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare a batch of data for training from a dataloader.
 
@@ -263,6 +264,9 @@ class TrainEngine(abc.ABC):
             Keyword arguments to pass to the workflow constructor, by default None.
         should_accept_fn : Callable[[dict[str, Any]], bool] | str | None, optional
             A function to filter trajectories, by default None.
+        should_accept_kwargs : dict[str, Any] | None, optional
+            Keyword arguments bound to the filter on the rollout worker. Requires
+            should_accept_fn when nonempty; defaults to None.
         group_size : int, optional
             Number of times to run the workflow per input and concatenate results.
             Default is 1 (no grouping).
@@ -767,6 +771,7 @@ class InferenceEngine(abc.ABC):
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -791,6 +796,9 @@ class InferenceEngine(abc.ABC):
         should_accept_fn : Callable, optional
             A function used to decide whether to accept a specific trajectory, i.e., dynamic filtering.
             It takes a complete trajectory output by the workflow, and returns a bool, by default None.
+        should_accept_kwargs : dict[str, Any] | None, optional
+            Keyword arguments bound to the filter on the rollout worker. Requires
+            should_accept_fn when nonempty; defaults to None.
         group_size : int, optional
             Number of times to run the workflow per input and concatenate results.
             Default is 1 (no grouping).
@@ -929,6 +937,7 @@ class InferenceEngine(abc.ABC):
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready with controlled staleness.
 
@@ -966,6 +975,9 @@ class InferenceEngine(abc.ABC):
             By default None.
         should_accept_fn : Callable, optional
             A function to decide whether to accept a trajectory, by default None
+        should_accept_kwargs : dict[str, Any] | None, optional
+            Keyword arguments bound to the filter on the rollout worker. Requires
+            should_accept_fn when nonempty; defaults to None.
         group_size : int, optional
             Number of times to run the workflow per input and concatenate results.
             Default is 1 (no grouping).
