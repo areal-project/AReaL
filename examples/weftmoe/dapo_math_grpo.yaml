@@ -117,6 +117,7 @@ sglang:
   chunked_prefill_size: -1
 
 train_dataset:
+  path: ${oc.env:DAPO_MATH_17K_PATH,./datasets/DAPO-Math-17k-dedup}
   batch_size: 32
   max_length: 2048
   num_workers: 0
