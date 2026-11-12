@@ -111,6 +111,15 @@ per-batch quotas. Accepted results still enter training in arrival order (or the
 configured deterministic order), so a fast Stream need not wait for a slow one and
 individual batches may have different proportions.
 
+The Qwen Flash Next training entrypoint uses the same compensation wrapper. For this
+entrypoint, `QWEN_EQUAL_STREAM_SAMPLING=1` optionally assigns the same number of base
+draws to every Stream, rounding the largest Stream size up to a multiple of
+`train_dataset.batch_size`. This changes the nominal epoch length and cycles smaller
+Streams without deleting source rows. It overrides the base mixture proportions;
+replacement draws still follow each Stream's rejection debt, and accepted training
+batches are not forced to be equal. The option is disabled by default and requires
+multi-Stream v1 single-controller training; evaluation does not apply it.
+
 Stream cursors, base schedule position, and unpaid debt are saved in the dataloader
 checkpoint. Reservations are released on recovery because queued/running tasks are not
 restored. As with existing asynchronous recovery, completed but unconsumed trajectories
@@ -118,6 +127,12 @@ are not replayed. Checkpoints from the old flat dataloader are not compatible wi
 new Stream loader: start a new run or resume with the original unwrapped dataset. V2,
 SPMD, single-Stream training, and validation retain their ordinary dataloaders and do
 not enable this compensation.
+
+Recovery validates the exact Stream source schedule and dataloader batch size, in
+addition to Stream sizes, shuffle, and seed. Changing the mixture or enabling equal
+sampling requires a new run. Checkpoints created before source-schedule fingerprints
+were introduced are also rejected: resume them with their original implementation or
+start a new run.
 
 Before submission, extract the Stream list and validate it without launching tasks:
 
