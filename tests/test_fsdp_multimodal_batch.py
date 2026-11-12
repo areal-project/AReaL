@@ -33,6 +33,31 @@ def test_multimodal_forward_inputs_are_not_kept_in_loss_mb():
     assert torch.equal(padded_mb["image_grid_thw"], torch.cat(image_grid_thw, dim=0))
 
 
+def test_multimodal_forward_inputs_keep_video_pixel_values():
+    pixel_values = torch.randn(2, 4)
+    pixel_values_videos = torch.randn(6, 4)
+    video_grid_thw = torch.tensor([[2, 1, 3]])
+    mb = {
+        "input_ids": torch.ones(5, dtype=torch.long),
+        "multi_modal_input": [
+            {"pixel_values": pixel_values, "image_grid_thw": torch.tensor([[1, 1, 2]])},
+            {
+                "pixel_values_videos": pixel_values_videos,
+                "video_grid_thw": video_grid_thw,
+            },
+        ],
+    }
+    padded_mb = dict(mb)
+
+    _prepare_multimodal_forward_inputs(mb, padded_mb)
+
+    assert "pixel_values_videos" not in mb
+    assert "video_grid_thw" not in mb
+    assert torch.equal(padded_mb["pixel_values_videos"], pixel_values_videos)
+    assert torch.equal(padded_mb["video_grid_thw"], video_grid_thw)
+    assert torch.equal(padded_mb["pixel_values"], pixel_values)
+
+
 def test_multimodal_forward_inputs_fall_back_to_padded_mb():
     pixel_values = [torch.randn(2, 4)]
     mb = {"input_ids": torch.ones(2, dtype=torch.long)}

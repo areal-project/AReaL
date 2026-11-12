@@ -1,6 +1,7 @@
 """Utilities for SWE-bench agent training with AReaL."""
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from examples.swe.arena_types import ArenaRewardRefConfig as ArenaRewardRefConfig
 from examples.swe.arena_types import ArenaStreamConfig
@@ -292,3 +293,18 @@ class SWEPPOConfig(PPOConfig):
             "help": "Import path of the filter function for accepting rollout samples."
         },
     )
+    should_accept_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Keyword arguments for should_accept_fn, such as min_accuracy and max_accuracy."
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.should_accept_kwargs and self.should_accept_fn is None:
+            raise ValueError("should_accept_kwargs requires should_accept_fn")
+        if self.should_accept_fn == "examples.swe.filter_function.filter_by_accuracy":
+            from examples.swe.filter_function import validate_accuracy_filter
+
+            validate_accuracy_filter(**self.should_accept_kwargs)

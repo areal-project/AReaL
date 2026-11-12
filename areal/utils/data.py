@@ -451,10 +451,13 @@ class RolloutGroup:
 
     Workflows own optional raw reward references. A reference is required when
     reward normalization consumes a rollout whose row rewards differ.
+    ``arena_stream_name`` identifies the source Arena dataset for training counts
+    without adding non-tensor fields to packed model inputs.
     """
 
     row_counts: tuple[int, ...]
     rewards: tuple[float | None, ...] = ()
+    arena_stream_name: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "row_counts", tuple(self.row_counts))
@@ -476,7 +479,7 @@ class RolloutGroup:
     def validate_rows(self, rows: int) -> "RolloutGroup":
         # RPC restores dataclass fields without running the constructor and
         # encodes tuples as lists. Revalidate at the consuming boundary.
-        group = RolloutGroup(self.row_counts, self.rewards)
+        group = RolloutGroup(self.row_counts, self.rewards, self.arena_stream_name)
         if sum(group.row_counts) != rows:
             raise ValueError(
                 f"rollout row_counts sum to {sum(group.row_counts)}, expected {rows}"
@@ -667,8 +670,9 @@ def pack_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:
     max_seqlen = lens.max().item()
     cu_seqlens = torch.cumsum(lens, dim=0, dtype=torch.int32)
     cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+    # Read all lengths at once: on accelerators every .item() is a host sync.
+    lens_list = lens.tolist()
 
-    total_length = int(cu_seqlens[-1].item())
     # Pack tensors
     packed_data = {}
     for key, value in data.items():
@@ -683,15 +687,9 @@ def pack_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:
             and value.shape[0] == bs
             and value.shape[1] == seq_len
         ):
-            packed_tensor = torch.empty(
-                (total_length, *value.shape[2:]), dtype=value.dtype, device=value.device
+            packed_data[key] = torch.cat(
+                [row[:n] for row, n in zip(value.unbind(0), lens_list)]
             )
-            # Fill the packed tensor with values from the original tensor
-            for i in range(bs):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
-                packed_tensor[start:end] = value[i][: end - start]
-            packed_data[key] = packed_tensor
         else:
             packed_data[key] = value
 

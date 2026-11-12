@@ -362,7 +362,7 @@ def _validate_streams_with_client(
             harness_mapping = load_harness_mapping(
                 configured.reward_mapping_file, configured.stream_id
             )
-        if not harness_mapping:
+        if configured.harness_override or not harness_mapping:
             harness_key, separator, harness_version = harness.partition("@")
             if not separator or not harness_key or not harness_version:
                 raise ArenaAPIError(
@@ -407,7 +407,7 @@ def _validate_streams_with_client(
             harness=harness,
             reward_ref=actual_reward_ref,
             reward_mapping=reward_mapping,
-            harness_mapping=harness_mapping,
+            harness_mapping=None if configured.harness_override else harness_mapping,
         )
         failure_rate = failure_count / terminal_count if terminal_count else 0.0
         unhealthy = (
@@ -432,6 +432,7 @@ def _validate_streams_with_client(
             ),
         )
         summary = asdict(resolved)
+        summary.pop("_harness_is_fallback")
         # Task env values can contain operational secrets and are irrelevant to
         # the preflight report.
         summary["task_envs"] = sorted(resolved.task_envs)

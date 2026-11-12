@@ -576,7 +576,10 @@ def test_preflight_health_ignores_tasks_without_exact_provenance():
     assert (terminal, failures) == (1, 1)
 
 
-def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path):
+@pytest.mark.parametrize("with_observation", [False, True])
+def test_workflow_routes_harness_transform_and_raw_metrics(
+    monkeypatch, tmp_path, with_observation
+):
     """A row should select all rollout and reward settings from its Stream."""
     stats_tracker.export_all(reset=True)
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
@@ -611,6 +614,28 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
         }
     )
     launched = {}
+    display_name = "总项｜可见几何质量（占总分10%）"
+    sub_scores = {display_name if with_observation else "quality": 0.25}
+    raw = {"exit_code": 0, "reward_txt": "ok"}
+    if with_observation:
+        raw.update(
+            {
+                "reward_display": {"component_ids": {display_name: "quality"}},
+                "reward_observation": {
+                    "schema_version": 1,
+                    "verifier_version": "test-v1",
+                    "components": {
+                        "quality": {
+                            "value": 0.25,
+                            "weight": 0.8,
+                            "contribution": 0.2,
+                            "share": 0.4,
+                        }
+                    },
+                    "diagnostics": {"output_length": 1234},
+                },
+            }
+        )
 
     async def resolve_stream(stream_id, **_kwargs):
         return {
@@ -634,8 +659,8 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
             task_id="task-b",
             status="DONE",
             score=0.5,
-            sub_scores={"quality": 0.25},
-            raw={"exit_code": 0, "reward_txt": "ok"},
+            sub_scores=sub_scores,
+            raw=raw,
             trace_id="trace-b",
         )
 
@@ -677,13 +702,40 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
     assert stats["rollout/training_score"] == pytest.approx(0.75)
     assert stats["rollout/arena_raw_present"] == 1.0
     assert stats["rollout/stream/b/arena_score"] == pytest.approx(0.5)
-    assert stats["rollout/reward_sub_score/quality"] == pytest.approx(0.25)
-    assert stats["rollout/stream/b/reward_sub_score/quality"] == pytest.approx(0.25)
+    prefix = "rollout/stream/b"
+    assert stats[f"{prefix}/reward_sub_score/quality"] == pytest.approx(0.25)
+    assert stats[f"{prefix}/reward_sub_score/invalid_entries"] == 0.0
+    assert stats[f"{prefix}/reward_observation/present"] == float(with_observation)
+    assert stats[f"{prefix}/reward_breakdown/present"] == 0.0
+    assert stats[f"{prefix}/reward_breakdown/valid"] == 0.0
+    assert not any(
+        key.startswith(
+            (
+                "rollout/reward_sub_score/",
+                "rollout/reward_observation/",
+                "rollout/reward_breakdown/",
+                "rollout/stream/a/reward_",
+            )
+        )
+        for key in stats
+    )
+    if with_observation:
+        assert stats[f"{prefix}/reward_observation/valid"] == 1.0
+        for field, expected in (
+            ("value", 0.25),
+            ("weight", 0.8),
+            ("contribution", 0.2),
+            ("share", 0.4),
+        ):
+            assert stats[
+                f"{prefix}/reward_observation/components/quality/{field}"
+            ] == pytest.approx(expected)
+        assert stats[f"{prefix}/reward_observation/diagnostics/output_length"] == 1234.0
     dump_files = list((tmp_path / "arena-results").glob("arena_results_*.jsonl"))
     assert len(dump_files) == 1
     dump_record = json.loads(dump_files[0].read_text(encoding="utf-8"))
-    assert dump_record["raw"] == {"exit_code": 0, "reward_txt": "ok"}
-    assert dump_record["sub_scores"] == {"quality": 0.25}
+    assert dump_record["raw"] == raw
+    assert dump_record["sub_scores"] == sub_scores
     assert dump_record["expected_reward_ref"] == {
         "key": "reward-b",
         "version": "2",
@@ -2785,3 +2837,48 @@ def _whitebox_deadline_error():
         "native_receipt_synthesized": False,
     }
     return error
+
+
+@pytest.mark.parametrize("failure", ["tool_argument_budget", "empty_completion", None])
+def test_arena_failure_reason_rates_include_successes_in_denominator(
+    monkeypatch, failure
+):
+    """Dedicated cause rates count every terminal task, including successful ones."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    agent = ArenaStreamAgentWorkflow(
+        econfig={
+            "arena_base_url": "https://arena.example",
+            "arena_streams": [{"name": "test", "stream_id": "stream"}],
+        }
+    )
+    metrics = {}
+    monkeypatch.setattr(
+        "examples.swe.arena_agent._record_arena_metrics",
+        lambda **values: metrics.update(values),
+    )
+    if failure == "tool_argument_budget":
+        error = _core_tool_argument_budget_failure_error()
+    elif failure == "empty_completion":
+        error = _core_model_failure_error(
+            "LLM_RESPONSE_FAILED",
+            "empty_completion",
+            "model stopped without visible output or tool calls",
+        )
+    else:
+        error = None
+    result = (
+        error.result
+        if error
+        else ArenaTaskResult(task_id="success", status="OK", score=0.5)
+    )
+    agent._task_result.set(result)
+    agent._record_attempt_metrics({}, error)
+    for reason in ("tool_call_argument_bytes_exceeded", "empty_completion"):
+        expected = "tool_argument_budget" if reason.startswith("tool_call") else reason
+        assert metrics[f"harness_error/{reason}"] == float(failure == expected)
+    metadata = agent.get_episode_metadata()
+    assert metadata.get("harness_failure_reason") == (
+        "tool_call_argument_bytes_exceeded"
+        if failure == "tool_argument_budget"
+        else failure
+    )

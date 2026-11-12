@@ -187,7 +187,12 @@ class _PendingWeightUpdateBucket:
     stream: torch.cuda.Stream | None = None
 
 
-_MULTIMODAL_FORWARD_KEYS = ("image_grid_thw", "pixel_values", "video_grid_thw")
+_MULTIMODAL_FORWARD_KEYS = (
+    "image_grid_thw",
+    "pixel_values",
+    "pixel_values_videos",
+    "video_grid_thw",
+)
 
 
 def _is_multimodal_payload_key(key: str) -> bool:
@@ -655,6 +660,7 @@ class FSDPEngine(TrainEngine):
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
@@ -662,6 +668,7 @@ class FSDPEngine(TrainEngine):
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             group_size=group_size,
             min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
@@ -977,9 +984,13 @@ class FSDPEngine(TrainEngine):
                     f"inferred {inferred_seqlens} from attention_mask shapes."
                 )
             output_seqlens = inferred_seqlens
-        cu_seqlens = pack_tensor_dict(input_batched)["cu_seqlens"]
         if output_seqlens is None:
-            output_seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu().numpy().tolist()
+            output_seqlens = (
+                input_batched["attention_mask"]
+                .sum(dim=1, dtype=torch.int64)
+                .cpu()
+                .tolist()
+            )
         assert output_seqlens is not None
         batch_size = len(output_seqlens)
 

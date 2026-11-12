@@ -44,8 +44,9 @@ from areal.infra.utils.concurrent import run_async_task
 from areal.infra.utils.exp_metadata import get_metadata_dir
 from areal.infra.utils.inference_targets import write_inference_targets
 from areal.utils import logging, perf_tracer
+from areal.utils.arena_stream_dataloader import ArenaStreamDataLoader
 from areal.utils.data import cycle_dataloader
-from areal.utils.dynamic_import import import_from_string
+from areal.utils.dynamic_import import bind_filter_kwargs, import_from_string
 from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
 from areal.utils.rollout_metrics import ConsumedMetrics
@@ -162,6 +163,8 @@ class _RemoteRolloutTaskInput:
     reward_normalization: bool = False
     reward_normalization_use_std: bool = True
     drop_incomplete_group: bool = False
+    should_accept_kwargs: dict[str, Any] | None = None
+    arena_stream_dataloader: ArenaStreamDataLoader | None = None
 
 
 class RolloutController:
@@ -1176,7 +1179,9 @@ class RolloutController:
             return f"{workflow.__module__}.{workflow.__class__.__name__}"
 
     def _resolve_should_accept_fn(
-        self, should_accept_fn: Callable[[dict[str, Any]], bool] | str | None
+        self,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ):
         if callable(should_accept_fn):
             raise RuntimeError(
@@ -1189,6 +1194,11 @@ class RolloutController:
                 raise RuntimeError(
                     f"Failed to import `should_accept_fn` from string path: {should_accept_fn}"
                 )
+        if should_accept_kwargs:
+            bind_filter_kwargs(
+                import_from_string(should_accept_fn) if should_accept_fn else None,
+                should_accept_kwargs,
+            )
         return should_accept_fn
 
     def _rollout_stats(self) -> str:
@@ -1202,10 +1212,6 @@ class RolloutController:
 
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
         async def _submit_then_wait() -> WorkflowTaskResult | None:
-            # Choose worker via round-robin
-            worker, rank = self._choose_worker()
-            engine_name = self._engine_name(rank)
-
             # NOTE: No need to call `on_rollout_submitted` here.
             # This function will be passed to `BatchTaskDispather` where
             # `on_rollout_submitted` will be called upon dispatching
@@ -1214,6 +1220,9 @@ class RolloutController:
             manager = self.staleness_manager
 
             try:
+                # Choose worker via round-robin.
+                worker, rank = self._choose_worker()
+                engine_name = self._engine_name(rank)
                 # Set future for this task
                 future = asyncio.get_event_loop().create_future()
                 with self._futures_lock:
@@ -1230,6 +1239,7 @@ class RolloutController:
                     workflow=pending_task.workflow,
                     workflow_kwargs=pending_task.workflow_kwargs,
                     should_accept_fn=pending_task.should_accept_fn,
+                    should_accept_kwargs=pending_task.should_accept_kwargs,
                     http_timeout=self.config.request_timeout,
                     is_eval=pending_task.is_eval,
                     group_size=pending_task.group_size,
@@ -1296,7 +1306,29 @@ class RolloutController:
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
                 return None
 
-        return _submit_then_wait
+        if pending_task.arena_stream_dataloader is None:
+            return _submit_then_wait
+
+        async def _submit_with_arena_stream_feedback() -> WorkflowTaskResult | None:
+            accepted = None
+            try:
+                result = await _submit_then_wait()
+                accepted = (
+                    isinstance(result, _RolloutResult) and result.trajectory is not None
+                )
+                return result
+            except Exception:
+                accepted = False
+                raise
+            finally:
+                # Cancellation releases a reservation without declaring an
+                # unfinished base task rejected. Feedback precedes consumption
+                # so a partial batch can immediately replenish its source.
+                pending_task.arena_stream_dataloader.complete_arena_rollout(
+                    pending_task.task_id, accepted
+                )
+
+        return _submit_with_arena_stream_feedback
 
     def get_capacity(self):
         return self.staleness_manager.get_capacity()
@@ -1315,6 +1347,7 @@ class RolloutController:
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> int:
         validate_rollout_group_sizes(group_size, min_usable_group_size)
 
@@ -1322,13 +1355,12 @@ class RolloutController:
             data, required=self._mopd_routing_enabled and not is_eval
         )
         workflow_str = self._resolve_workflow_str(workflow)
-        should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+        should_accept_fn = self._resolve_should_accept_fn(
+            should_accept_fn, should_accept_kwargs
+        )
         if workflow_kwargs is None:
             workflow_kwargs = {}
 
-        # NOTE: RolloutController does not support `should_accept_fn`
-        # If the workflow's result should be aborted,
-        # `arun_episode` should return None instead.
         if task_id is None:
             task_id = self._task_id_generator.next()
         task_input = _RemoteRolloutTaskInput(
@@ -1336,6 +1368,7 @@ class RolloutController:
             workflow=workflow_str,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             task_id=task_id,
             mopd_route=mopd_route,
             is_eval=is_eval,
@@ -1377,6 +1410,7 @@ class RolloutController:
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         perf_tracer.instant(
             "rollout_controller.rollout_batch",
@@ -1389,6 +1423,7 @@ class RolloutController:
                 workflow=workflow,
                 workflow_kwargs=workflow_kwargs,
                 should_accept_fn=should_accept_fn,
+                should_accept_kwargs=should_accept_kwargs,
                 group_size=group_size,
                 min_usable_group_size=min_usable_group_size,
                 reward_normalization=reward_normalization,
@@ -1402,7 +1437,7 @@ class RolloutController:
     @trace_perf("rollout_controller.prepare_batch", category="scheduler")
     def prepare_batch(
         self,
-        dataloader: StatefulDataLoader,
+        dataloader: StatefulDataLoader | ArenaStreamDataLoader,
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         should_accept_fn: str | None = None,
@@ -1412,6 +1447,7 @@ class RolloutController:
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare a batch with controlled staleness.
 
@@ -1426,25 +1462,48 @@ class RolloutController:
         if workflow_kwargs is None:
             workflow_kwargs = {}
 
+        should_accept_fn = self._resolve_should_accept_fn(
+            should_accept_fn, should_accept_kwargs
+        )
+        arena_stream_dataloader = (
+            dataloader if isinstance(dataloader, ArenaStreamDataLoader) else None
+        )
+
         def task_input_generator():
-            for data in cycle_dataloader(dataloader):
-                for item in data:
+            base_items = (
+                item for data in cycle_dataloader(dataloader) for item in data
+            )
+            while True:
+                task_id = self._task_id_generator.next()
+                item = (
+                    arena_stream_dataloader.next_arena_rollout(task_id)
+                    if arena_stream_dataloader is not None
+                    else next(base_items)
+                )
+                try:
                     workflow_data, mopd_route = self._extract_mopd_route(
                         item, required=self._mopd_routing_enabled
                     )
-                    yield _RemoteRolloutTaskInput(
+                    task = _RemoteRolloutTaskInput(
                         data=workflow_data,
                         workflow=workflow_str,
                         workflow_kwargs=workflow_kwargs,
                         should_accept_fn=should_accept_fn,
-                        task_id=self._task_id_generator.next(),
+                        should_accept_kwargs=should_accept_kwargs,
+                        task_id=task_id,
                         mopd_route=mopd_route,
                         group_size=group_size,
                         min_usable_group_size=min_usable_group_size,
                         reward_normalization=reward_normalization,
                         reward_normalization_use_std=reward_normalization_use_std,
                         drop_incomplete_group=drop_incomplete_group,
+                        arena_stream_dataloader=arena_stream_dataloader,
                     )
+                except BaseException:
+                    if arena_stream_dataloader is not None:
+                        arena_stream_dataloader.complete_arena_rollout(task_id, None)
+                    raise
+                yield task
 
         if not hasattr(self, "data_generator"):
             self.data_generator = task_input_generator()
@@ -1691,21 +1750,8 @@ class RolloutController:
             )
         consumed = self.consumed_metrics.export()
         merged = _merge_worker_stats([*all_raw_stats, consumed])
-        # Expose denominators for batch-aligned quality metrics.
-        merged.update(
-            {
-                k: v
-                for k, v in consumed.items()
-                if k.endswith("__count")
-                or k
-                in {
-                    "rollout/reward_sample_count",
-                    "rollout/group_attempt_count",
-                    "rollout/task_attempt_count",
-                    "rollout/task_result_count",
-                }
-            }
-        )
+        # Expose batch-aligned denominators and counters, including stream scopes.
+        merged.update({k: v for k, v in consumed.items() if k.endswith("_count")})
         return merged
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:

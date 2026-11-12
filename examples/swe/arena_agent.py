@@ -40,6 +40,7 @@ from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.infra import workflow_context
 from areal.utils import logging, stats_tracker
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.rollout_metrics import get_arena_stream_name
 
 logger = logging.getLogger("ArenaStreamAgent")
 
@@ -581,6 +582,9 @@ class ArenaStreamAgentWorkflow:
         )
         self._task_result_dumped: ContextVar[bool] = ContextVar(
             "arena_task_result_dumped", default=False
+        )
+        self._task_failure_reason: ContextVar[str | None] = ContextVar(
+            "arena_task_failure_reason", default=None
         )
         self._proxy_session_id: ContextVar[str] = ContextVar(
             "arena_proxy_session_id", default=""
@@ -1292,6 +1296,50 @@ class ArenaStreamAgentWorkflow:
             is not None
         )
 
+    @classmethod
+    def _harness_failure_reason(cls, error: BaseException | None) -> str | None:
+        """Identify verified model failure causes before trajectory filtering.
+
+        The metric describes the Harness cause, not whether the proxy can export
+        usable interactions. Reuse admission checks to exclude unhealthy receipts.
+        """
+        if (
+            not isinstance(error, ArenaTaskFailedError)
+            or error.status != "HARNESS_FAILED"
+            or error.result is None
+            or not cls._is_model_attributed_harness_failure(error)
+        ):
+            return None
+        raw = error.result.raw
+        result_format = cls._harness_result_format(raw)
+        if result_format == "gameagent":
+            if cls._core_tool_argument_budget_failure_message(raw) is not None:
+                return "tool_call_argument_bytes_exceeded"
+            if (
+                cls._core_model_zero_failure_message(raw)
+                == (
+                    _CORE_MODEL_ZERO_FAILURE_MESSAGES[
+                        ("LLM_RESPONSE_FAILED", "empty_completion")
+                    ]
+                )
+            ):
+                return "empty_completion"
+        elif result_format == "native-runner" and cls._is_runner_model_failure(
+            raw, error.harness_result
+        ):
+            # Admission above validates a single terminal error in this receipt.
+            message = error.harness_result["error"][0]["message"]
+            if cls._is_tool_call_budget_exceeded_message(message):
+                return "tool_call_argument_bytes_exceeded"
+            if message == "model stopped without visible output or tool calls":
+                return "empty_completion"
+        return None
+
+    @classmethod
+    def _is_tool_call_budget_failure(cls, error: BaseException | None) -> bool:
+        """Retain the budget predicate for callers using the upstream helper."""
+        return cls._harness_failure_reason(error) == "tool_call_argument_bytes_exceeded"
+
     @staticmethod
     def _is_native_model_failure(raw: Any) -> bool:
         """Require a complete, healthy native receipt with only model failures."""
@@ -1626,7 +1674,7 @@ class ArenaStreamAgentWorkflow:
             reward_metrics = arena_reward_metrics(
                 sub_scores=result.sub_scores, raw=result.raw, score=result.score
             )
-            metrics.update(reward_metrics)
+            # Grader-defined components are only comparable within their stream.
             metrics.update(
                 {
                     f"stream/{stream_config.name}/{key}": value
@@ -1647,6 +1695,7 @@ class ArenaStreamAgentWorkflow:
         finally:
             self._task_result.set(None)
             self._task_result_dumped.set(False)
+            self._task_failure_reason.set(None)
 
     def get_episode_metadata(self) -> dict[str, str]:
         """Return bounded identifiers used to join rollout and Arena audits."""
@@ -1668,6 +1717,9 @@ class ArenaStreamAgentWorkflow:
             metadata["harness_outcome_code"] = self._gameagent_outcome_metric_code(
                 result.raw
             )
+            reason = self._task_failure_reason.get()
+            if reason is not None:
+                metadata["harness_failure_reason"] = reason
         return metadata
 
     async def persist_episode_result(
@@ -1758,6 +1810,7 @@ class ArenaStreamAgentWorkflow:
         """Launch the row's task with the current rollout proxy session."""
         self._task_result.set(None)
         self._task_result_dumped.set(False)
+        self._task_failure_reason.set(None)
         self._proxy_session_id.set("")
         error: BaseException | None = None
         try:
@@ -1766,15 +1819,19 @@ class ArenaStreamAgentWorkflow:
             error = exc
             raise
         finally:
-            self._record_attempt_metrics(error)
+            self._record_attempt_metrics(data, error)
 
-    def _record_attempt_metrics(self, error: BaseException | None) -> None:
+    def _record_attempt_metrics(
+        self, data: dict[str, Any], error: BaseException | None
+    ) -> None:
         """Count calls and observed terminal results before trajectory filtering.
 
         Local cancellation/timeouts do not establish the remote task's outcome.
         Keep them in the call denominator, outside the terminal-result denominator.
         """
         cancelled = isinstance(error, asyncio.CancelledError)
+        failure_reason = self._harness_failure_reason(error)
+        self._task_failure_reason.set(failure_reason)
         metrics = {
             "task_attempt/success": float(error is None),
             "task_attempt/error": float(error is not None and not cancelled),
@@ -1805,6 +1862,20 @@ class ArenaStreamAgentWorkflow:
                 metrics[f"harness_error/{code}"] = float(outcome_code == code)
             metrics["harness_error/OTHER"] = float(
                 is_harness_error and outcome_code not in _GAMEAGENT_OUTCOME_METRIC_CODES
+            )
+            metrics["harness_error/tool_call_budget_exceeded_rate"] = float(
+                failure_reason == "tool_call_argument_bytes_exceeded"
+            )
+            metrics["harness_error/tool_call_argument_bytes_exceeded"] = float(
+                failure_reason == "tool_call_argument_bytes_exceeded"
+            )
+            metrics["harness_error/empty_completion"] = float(
+                failure_reason == "empty_completion"
+            )
+        stream_name = get_arena_stream_name(data) or self.default_stream_name
+        if stream_name:
+            metrics.update(
+                {f"stream/{stream_name}/{key}": value for key, value in metrics.items()}
             )
         _record_arena_metrics(**metrics)
 
@@ -1861,7 +1932,11 @@ class ArenaStreamAgentWorkflow:
         self._validate_row_reward_ref(data, stream_config)
         harness = self._expected_harness(data, stream_config)
         if self.harness_mappings.get(stream_config.name):
-            expected_protocol = infer_llm_protocol_from_harness(harness)
+            expected_protocol = (
+                stream_config.llm_protocol
+                if stream_config.harness_override and stream_config.llm_protocol
+                else infer_llm_protocol_from_harness(harness)
+            )
             llm_protocol = data.get("llm_protocol", expected_protocol)
             if llm_protocol != expected_protocol:
                 raise ValueError("Arena row LLM protocol mismatch with task Harness")
@@ -2301,9 +2376,11 @@ class ArenaStreamAgentWorkflow:
         data_id = str(data.get("data_id") or "")
         if mapping and data_id not in mapping:
             raise ValueError(f"Arena Harness mapping has no data_id {data_id!r}")
-        expected = mapping[data_id] if mapping else stream_config.harness
+        expected = stream_config.harness_override or (
+            mapping[data_id] if mapping else stream_config.harness
+        )
         if data.get("harness") and data["harness"] != expected:
-            raise ValueError("Arena row Harness mismatch with frozen binding")
+            raise ValueError("Arena row Harness mismatch with effective binding")
         return expected
 
     def _expected_reward_ref(
