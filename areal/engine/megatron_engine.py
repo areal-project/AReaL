@@ -746,6 +746,15 @@ class MegatronEngine(TrainEngine):
                 ),
             )
             self._weftmoe_adapter.prepare()
+            self.logger.info(
+                "Prepared WeftMoE actor: layers=%d, fp8=%s, adapter=%s, "
+                "ep_world=%d, nodes=%d",
+                len(self._weftmoe_adapter.layers),
+                self._weftmoe_adapter.fp8,
+                type(self._weftmoe_adapter).__qualname__,
+                self._weftmoe_adapter.runtime.world,
+                self._weftmoe_adapter.runtime.nodes,
+            )
         _warn_if_areal_lm_head_entropy_is_nondifferentiable(
             self.logger,
             global_rank=self.rank,
