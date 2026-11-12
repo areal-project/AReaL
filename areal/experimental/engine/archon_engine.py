@@ -646,9 +646,13 @@ class ArchonEngine(TrainEngine):
                     f"inferred {inferred_seqlens} from attention_mask shapes."
                 )
             output_seqlens = inferred_seqlens
-        cu_seqlens = pack_tensor_dict(input_batched)["cu_seqlens"]
         if output_seqlens is None:
-            output_seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu().numpy().tolist()
+            output_seqlens = (
+                input_batched["attention_mask"]
+                .sum(dim=1, dtype=torch.int64)
+                .cpu()
+                .tolist()
+            )
         assert output_seqlens is not None
         batch_size = len(output_seqlens)
 

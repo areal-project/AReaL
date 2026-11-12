@@ -663,8 +663,9 @@ def pack_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:
     max_seqlen = lens.max().item()
     cu_seqlens = torch.cumsum(lens, dim=0, dtype=torch.int32)
     cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+    # Read all lengths at once: on accelerators every .item() is a host sync.
+    lens_list = lens.tolist()
 
-    total_length = int(cu_seqlens[-1].item())
     # Pack tensors
     packed_data = {}
     for key, value in data.items():
@@ -679,15 +680,9 @@ def pack_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:
             and value.shape[0] == bs
             and value.shape[1] == seq_len
         ):
-            packed_tensor = torch.empty(
-                (total_length, *value.shape[2:]), dtype=value.dtype, device=value.device
+            packed_data[key] = torch.cat(
+                [row[:n] for row, n in zip(value.unbind(0), lens_list)]
             )
-            # Fill the packed tensor with values from the original tensor
-            for i in range(bs):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
-                packed_tensor[start:end] = value[i][: end - start]
-            packed_data[key] = packed_tensor
         else:
             packed_data[key] = value
 
