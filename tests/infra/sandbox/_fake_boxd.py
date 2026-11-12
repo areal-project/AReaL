@@ -25,6 +25,7 @@ class FakeMachines:
     uploads: dict[str, str] = field(default_factory=dict)
     deleted: list[str] = field(default_factory=list)
     delete_errors: list[Exception] = field(default_factory=list)
+    ready_errors: list[Exception] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
     started: list[str] = field(default_factory=list)
     stopped: set[str] = field(default_factory=set)
@@ -42,9 +43,13 @@ class FakeMachines:
         return SimpleNamespace(id=machine_id, name=name)
 
     async def wait_until_ready(self, machine_id, **kwargs):
+        if self.ready_errors:
+            raise self.ready_errors.pop(0)
         return SimpleNamespace(id=machine_id, status="running")
 
     async def exec(self, machine_id, command, **kwargs):
+        if machine_id in self.gone:
+            raise NotFoundError("machine not found")
         self.execs.append({"id": machine_id, "command": command, **kwargs})
         if machine_id in self.stopped:
             raise ConflictError("machine is stopped")
@@ -71,6 +76,8 @@ class FakeMachines:
         self.gone.add(machine_id)
 
     async def _upload(self, machine_id, path, data, **kwargs):
+        if machine_id in self.gone:
+            raise NotFoundError("machine not found")
         self.uploads[path] = data
         return len(data)
 

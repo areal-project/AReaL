@@ -37,6 +37,10 @@ _MAX_COMMAND_BYTES = 96 * 1024
 _EXEC_GRACE_SECONDS = 15.0
 _EXEC_TIMEOUT_PREFIX = "exec timed out"
 DEFAULT_LABELS = {"areal-sandbox": "true"}
+# Seconds after creation at which boxd deletes the machine on its own, so a
+# killed process does not leave machines behind. ``delete_after=None`` turns
+# the timer off.
+DEFAULT_DELETE_AFTER = 6 * 3600
 _DELETE_ATTEMPTS = 3
 
 BoxdError = None
@@ -88,6 +92,10 @@ class BoxdSession:
     The machine is always created with ``isolated=True``: it joins no private
     network and holds no credentials, which suits model-generated code. The
     API key stays on the AReaL side and never enters the machine.
+
+    ``delete_after`` (seconds after creation) has boxd delete the machine even
+    if this process never gets to. If the machine is gone when the next piece
+    of code arrives, a new one is created.
     """
 
     def __init__(
@@ -102,9 +110,13 @@ class BoxdSession:
         env_vars: Mapping[str, str] | None = None,
         labels: Mapping[str, str] | None = None,
         python_packages: Sequence[str] | None = None,
-        delete_after: int | None = None,
+        delete_after: int | None = DEFAULT_DELETE_AFTER,
         create_timeout: float = 120.0,
     ):
+        if delete_after is not None and delete_after <= 0:
+            raise ValueError(
+                f"delete_after must be positive or None, got {delete_after}"
+            )
         self._errors = _load_boxd_errors()
         self.name_prefix = name_prefix
         self.org = org
@@ -217,9 +229,27 @@ class BoxdSession:
             )
 
     def _fits_inline(self, command: Sequence[str]) -> bool:
-        size = len(shlex.join(command))
-        size += sum(len(k) + len(shlex.quote(v)) + 2 for k, v in self.env_vars.items())
+        # The limit is in bytes, and non-ASCII code takes several per character.
+        size = _byte_len(shlex.join(command))
+        size += sum(
+            _byte_len(k) + _byte_len(shlex.quote(v)) + 2
+            for k, v in self.env_vars.items()
+        )
         return size <= _MAX_COMMAND_BYTES
+
+    async def _aforget_if_gone(self, client) -> bool:
+        """Drop the machine id if boxd no longer has the machine."""
+        try:
+            await client.machines.get(self.machine_id, region=self.region)
+        except self._errors["NotFoundError"]:
+            logger.warning(
+                "boxd machine %s no longer exists; creating a new one",
+                self.machine_id,
+            )
+            self.machine_id = None
+            self._repl_started = False
+            return True
+        return False
 
     async def _aupload(self, client, suffix: str, data: str) -> str:
         path = f"{SANDBOX_DIR}/code-{uuid.uuid4().hex}{suffix}"
@@ -231,9 +261,21 @@ class BoxdSession:
     async def arun_script(self, client, code: str, *, timeout: float):
         """Run ``code`` in a fresh Python process.
 
-        Exit code 124 means the code ran past ``timeout`` and was killed.
+        Exit code 124 means the code ran past ``timeout`` and was killed. If
+        the machine was deleted since the last call (its ``delete_after`` time
+        passed), the code runs in a new one.
         """
         _check_timeout(timeout)
+        if self.machine_id is None:
+            return await self._arun_script_once(client, code, timeout=timeout)
+        try:
+            return await self._arun_script_once(client, code, timeout=timeout)
+        except self._errors["NotFoundError"]:
+            if not await self._aforget_if_gone(client):
+                raise
+            return await self._arun_script_once(client, code, timeout=timeout)
+
+    async def _arun_script_once(self, client, code: str, *, timeout: float):
         await self.astart(client)
         prefix = ["timeout", "-k", "2", str(timeout), self.python]
         command = [*prefix, "-c", code]
@@ -283,9 +325,27 @@ class BoxdSession:
         Variables defined by earlier cells stay available. If the interpreter
         is gone (it crashed, the machine was stopped, or the cell hung past
         its timeout), it is restarted and the result says that the earlier
-        state was lost. A cell is never sent twice.
+        state was lost. The same happens in a new machine if this one was
+        deleted since the last call. A cell is never sent twice.
         """
         _check_timeout(timeout)
+        if self.machine_id is None:
+            return await self._arun_cell_once(client, code, timeout=timeout)
+        try:
+            return await self._arun_cell_once(client, code, timeout=timeout)
+        except self._errors["NotFoundError"]:
+            if not await self._aforget_if_gone(client):
+                raise
+            await self.astart(client)
+            await self._astart_repl(client)
+            return _restarted_result(
+                "RuntimeError",
+                "The sandbox machine no longer exists, so a new one was created",
+            )
+
+    async def _arun_cell_once(
+        self, client, code: str, *, timeout: float
+    ) -> BoxdCellResult:
         await self.astart(client)
         if not self._repl_started:
             await self._astart_repl(client)
@@ -351,6 +411,10 @@ class BoxdSession:
                     raise
                 await asyncio.sleep(1.0 + attempt)
         self.machine_id = None
+
+
+def _byte_len(text: str) -> int:
+    return len(text.encode("utf-8", "surrogatepass"))
 
 
 def _check_timeout(timeout: float) -> None:

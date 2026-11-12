@@ -17,10 +17,11 @@ import pytest
 
 pytest.importorskip("boxd")
 
-from boxd.errors import BoxdError, ConflictError  # noqa: E402
+from boxd.errors import BoxdError, ConflictError, NotFoundError  # noqa: E402
 
 from areal.infra.sandbox import _boxd_session as session_module  # noqa: E402
 from areal.infra.sandbox._boxd_session import (  # noqa: E402
+    DEFAULT_DELETE_AFTER,
     REPL_PATH,
     BoxdSession,
 )
@@ -79,6 +80,31 @@ async def test_astart_passes_env_and_delete_after_without_snapshot():
     assert created["env"] == {"A": "1"}
     assert created["delete_after"] == 3600
     assert created["labels"] == {"areal-sandbox": "true"}
+
+
+@pytest.mark.asyncio
+async def test_astart_sets_a_delete_after_timer_by_default():
+    client = FakeAsyncBoxd()
+
+    await BoxdSession().astart(client)
+
+    assert DEFAULT_DELETE_AFTER == 6 * 3600
+    assert client.machines.created[0]["delete_after"] == DEFAULT_DELETE_AFTER
+
+
+@pytest.mark.asyncio
+async def test_astart_sets_no_timer_when_delete_after_is_none():
+    client = FakeAsyncBoxd()
+
+    await BoxdSession(delete_after=None).astart(client)
+
+    assert "delete_after" not in client.machines.created[0]
+
+
+@pytest.mark.parametrize("delete_after", [0, -5])
+def test_non_positive_delete_after_is_rejected(delete_after):
+    with pytest.raises(ValueError, match="delete_after must be positive or None"):
+        BoxdSession(delete_after=delete_after)
 
 
 @pytest.mark.asyncio
@@ -184,6 +210,86 @@ async def test_arun_script_uploads_code_whose_quoting_is_too_long():
     assert command[-1].endswith(".py")
     assert client.machines.uploads[command[-1]] == code
     assert client.machines.removed == [command[-1]]
+
+
+@pytest.mark.asyncio
+async def test_arun_script_measures_the_command_in_bytes():
+    client = FakeAsyncBoxd()
+    session = BoxdSession()
+    code = "x = '" + "\u00e9" * 60_000 + "'"  # 60 K characters, 120 KB as UTF-8
+
+    await session.arun_script(client, code, timeout=5)
+
+    command = client.machines.execs[-1]["command"]
+    assert command[-1].endswith(".py")
+    assert client.machines.uploads[command[-1]] == code
+
+
+@pytest.mark.asyncio
+async def test_fits_inline_measures_env_vars_in_bytes():
+    session = BoxdSession(env_vars={"NOTE": "\u00e9" * 60_000})
+
+    assert not session._fits_inline(["true"])
+
+
+@pytest.mark.asyncio
+async def test_arun_script_uses_a_new_machine_when_the_old_one_is_gone():
+    client = FakeAsyncBoxd()
+    client.machines.exec_handler = lambda command, kwargs: FakeExecResult(stdout="1\n")
+    session = BoxdSession()
+    await session.arun_script(client, "print(1)", timeout=5)
+    client.machines.gone.add("vm-1")  # its delete_after time passed
+
+    result = await session.arun_script(client, "print(1)", timeout=5)
+
+    assert result.stdout == "1\n"
+    assert session.machine_id == "vm-2"
+    assert [call["id"] for call in client.machines.execs] == ["vm-1", "vm-2"]
+
+
+@pytest.mark.asyncio
+async def test_arun_script_keeps_the_machine_on_an_unrelated_not_found():
+    client = FakeAsyncBoxd()
+    session = BoxdSession()
+    await session.astart(client)
+
+    def raise_not_found(command, kwargs):
+        raise NotFoundError("no such file")
+
+    client.machines.exec_handler = raise_not_found
+
+    with pytest.raises(NotFoundError):
+        await session.arun_script(client, "print(1)", timeout=5)
+
+    assert session.machine_id == "vm-1"
+    assert len(client.machines.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_arun_cell_reports_lost_state_when_the_machine_is_gone():
+    client = FakeAsyncBoxd()
+    client.machines.exec_handler = lambda command, kwargs: (
+        _repl_reply() if command[1:3] == [REPL_PATH, "call"] else FakeExecResult()
+    )
+    session = BoxdSession()
+    await session.arun_cell(client, "x = 5", timeout=5)
+    client.machines.gone.add("vm-1")  # its delete_after time passed
+
+    result = await session.arun_cell(client, "print(x)", timeout=5)
+    after = await session.arun_cell(client, "y = 1", timeout=5)
+
+    assert result.error is not None
+    assert "new one was created" in result.error.value
+    assert "earlier variables are gone" in result.error.value
+    assert session.machine_id == "vm-2"
+    # The cell that found the machine gone is not replayed in the new one.
+    sent = [
+        base64.b64decode(call["command"][-1]).decode()
+        for call in client.machines.execs
+        if call["command"][1:3] == [REPL_PATH, "call"]
+    ]
+    assert sent == ["x = 5", "y = 1"]
+    assert after.error is None
 
 
 @pytest.mark.asyncio

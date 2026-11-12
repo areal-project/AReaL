@@ -15,12 +15,19 @@ from .python_tool import extract_python_code
 
 logger = logging.getLogger("BoxdPythonTool")
 
+# One machine serves one trajectory, so an hour is plenty. boxd deletes the
+# machine at that age even if the run was killed before cleanup.
+DEFAULT_DELETE_AFTER = 3600
+
 
 class BoxdPythonTool(BaseTool):
     """Run model-generated Python in an isolated boxd machine.
 
     One machine per tool instance (one per trajectory). A persistent interpreter
     runs inside the machine, so variables survive across tool calls.
+
+    ``delete_after`` (seconds after creation, one hour by default) has boxd
+    delete the machine even if cleanup never runs. ``None`` turns the timer off.
     """
 
     def __init__(
@@ -37,7 +44,7 @@ class BoxdPythonTool(BaseTool):
         env_vars: Mapping[str, str] | None = None,
         labels: Mapping[str, str] | None = None,
         python_packages: Sequence[str] | None = None,
-        delete_after: int | None = None,
+        delete_after: int | None = DEFAULT_DELETE_AFTER,
         create_timeout: float = 120.0,
     ):
         super().__init__(timeout, debug_mode)
@@ -103,8 +110,9 @@ class BoxdPythonTool(BaseTool):
                 result = await self._session.arun_cell(
                     client, code, timeout=self.timeout
                 )
-        except (self._errors["BoxdError"], RuntimeError) as exc:
-            return str(exc), ToolCallStatus.ERROR
+        except (self._errors["BoxdError"], RuntimeError, TimeoutError) as exc:
+            # TimeoutError: the machine did not become ready in create_timeout.
+            return str(exc) or type(exc).__name__, ToolCallStatus.ERROR
 
         if result.error is not None:
             error_lines = []
