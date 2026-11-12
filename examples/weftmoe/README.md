@@ -76,6 +76,13 @@ bash examples/weftmoe/run.sh bf16 \
   total_train_steps=null total_train_epochs=3
 ```
 
+The server context includes headroom for resuming generation: the SGLang version used
+here limits inputs to at most `context_length - 6`, while a resumed request includes the
+prompt and partial completion. Keep `gconfig.max_tokens` as the prompt-plus-completion
+budget; the extra server context does not increase that budget or the training
+microbatch limit. The 16-token headroom is conservative, not an MTP draft-token
+requirement.
+
 For Qwen3.5-122B-A10B, set `WEFTMOE_MODEL_PATH` to that model and use an extension built
 with WeftMoE's `qwen122b` profile. It is a different checkpoint from the 35B Base model.
 Do not reuse the 35B native binary for 122B.

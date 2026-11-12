@@ -105,6 +105,7 @@ actor:
         PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
 sglang:
+  # Allow near-limit continuations to be resubmitted as inputs.
   context_length: 16400
   mem_fraction_static: 0.7
   dp_size: 8
