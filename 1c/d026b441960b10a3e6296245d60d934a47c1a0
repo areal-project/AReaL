@@ -1,0 +1,42 @@
+areal/api/cli_args.py
+  s_5ffc08691846bc::t_af66e2d1e19713 965-982,1277-1278
+  s_5ffc08691846bc::t_190035cf110cfb 1279-1284
+areal/engine/megatron_utils/actor_warmup.py
+  s_5ffc08691846bc::t_3ba31f86d8e712 85,89-91,114
+  s_5ffc08691846bc::t_5feeff203a8a74 59,64-67,84,86-87,112-113,117-119,123-126,138-140,142-150,162-168,170-172,176-181,207-211,220-222,225-227,230-232,236-238,241-243,248-250,256-262,272-274,277-282,285-291
+  s_5ffc08691846bc::t_af66e2d1e19713 1-58,60-63,68-83,88,92-111,115-116,120-122,127-137,141,151-161,169,173-175,182-206,212-219,223-224,228-229,233-235,239-240,244-247,251-255,263-271,275-276,283-284,292-295
+  s_5ffc08691846bc::t_576a43a62b17d2 296-303
+areal/engine/megatron_engine.py
+  s_5ffc08691846bc::t_af66e2d1e19713 4762-4765
+tests/test_actor_warmup.py
+  s_5ffc08691846bc::t_5feeff203a8a74 1-54
+  s_5ffc08691846bc::t_b963065cf85a2e 55-65
+docs/en/cli_reference.md
+  s_d2cc4f3536bafd::t_5f3f8237207206 1342-1344
+docs/zh/cli_reference.md
+  s_d2cc4f3536bafd::t_a05e0a47c1dc17 1340-1342
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1cd026b441960b10a3e6296245d60d934a47c1a0",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    },
+    "s_d2cc4f3536bafd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1335a-3e29-77d3-9130-2955bc5b7e89",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
