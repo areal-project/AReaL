@@ -788,6 +788,136 @@ class TrainController:
         """Onload model parameters to GPU across all train workers."""
         self._collective_lifecycle_call("onload")
 
+    def stream_topology(self) -> list[dict[str, Any]]:
+        """Query every actor rank without invoking tensor broadcast or onload."""
+        results = self._stream_worker_call(
+            "stream_topology", list(range(len(self.workers)))
+        )
+        records = {}
+        for rank, result in enumerate(results):
+            if not self.workers_is_dp_head[rank]:
+                continue
+            if not isinstance(result, list):
+                raise RuntimeError(
+                    f"Invalid streamed actor topology from worker {rank}"
+                )
+            for identity in result:
+                member = identity.get("rank") if isinstance(identity, dict) else None
+                if (
+                    not isinstance(member, int)
+                    or member < 0
+                    or member >= len(self.workers)
+                    or member in records
+                    or rank not in identity.get("replica_ranks", ())
+                ):
+                    raise RuntimeError(
+                        f"Invalid streamed actor topology from worker {rank}"
+                    )
+                records[member] = identity
+        if set(records) != set(range(len(self.workers))):
+            raise RuntimeError("Streamed actor topology does not cover every worker")
+        results = [records[rank] for rank in range(len(self.workers))]
+        for rank, result in enumerate(results):
+            # Use the scheduler's address on both sides of physical-GPU matching.
+            result["host"] = self.workers[rank].ip
+        self._stream_replica_groups = {
+            frozenset(result["replica_ranks"]) for result in results
+        }
+        return results
+
+    def stream_accumulate(
+        self,
+        update_id: str,
+        chunk_id: int,
+        data: list[dict[str, Any]],
+        *,
+        worker_ranks: list[int],
+    ) -> dict[str, Any]:
+        """Accumulate one group on an entire, explicitly selected TP replica."""
+        if not worker_ranks or len(set(worker_ranks)) != len(worker_ranks):
+            raise ValueError("stream_accumulate requires distinct worker ranks")
+        if frozenset(worker_ranks) not in getattr(self, "_stream_replica_groups", ()):
+            raise ValueError(
+                "stream_accumulate requires a discovered complete actor replica"
+            )
+        heads = [rank for rank in worker_ranks if self.workers_is_dp_head[rank]]
+        if len(heads) != 1:
+            raise ValueError("stream_accumulate requires exactly one DP head")
+        results = self._stream_worker_call(
+            "stream_accumulate",
+            worker_ranks,
+            update_id,
+            chunk_id,
+            data,
+            broadcast=True,
+            max_head_offpolicyness=(
+                self.rollout.config.max_head_offpolicyness
+                if self.rollout.config.mask_stale_tokens
+                else None
+            ),
+        )
+        return results[worker_ranks.index(heads[0])]
+
+    def finish_stream_update(self, update_id: str) -> dict[str, float]:
+        """Commit one streamed update collectively across the original actor world."""
+        results = self._stream_worker_call(
+            "finish_stream_update", list(range(len(self.workers))), update_id
+        )
+        return results[0]
+
+    def abort_stream_update(self, update_id: str) -> None:
+        """Discard local pending gradients without onloading inactive replicas."""
+        self._stream_worker_call(
+            "abort_stream_update", list(range(len(self.workers))), update_id
+        )
+
+    def _stream_worker_call(
+        self,
+        method: str,
+        worker_ranks: list[int],
+        *args: Any,
+        broadcast: bool = False,
+        **kwargs: Any,
+    ) -> list[Any]:
+        if any(rank < 0 or rank >= len(self.workers) for rank in worker_ranks):
+            raise ValueError("Stream worker rank outside the actor world")
+
+        async def call() -> list[Any]:
+            return await asyncio.gather(
+                *[
+                    self.scheduler.async_call_engine(
+                        self.workers[rank].id,
+                        method,
+                        self._engine_name(rank),
+                        *(
+                            args
+                            if not broadcast or self.workers_is_dp_head[rank]
+                            else ()
+                        ),
+                        rpc_meta={"broadcast": broadcast},
+                        max_retries=1,
+                        http_timeout=self.config.request_timeout,
+                        **(
+                            kwargs
+                            if not broadcast or self.workers_is_dp_head[rank]
+                            else {}
+                        ),
+                    )
+                    for rank in worker_ranks
+                ],
+                return_exceptions=True,
+            )
+
+        results = run_async_task(call)
+        failures = [
+            RuntimeError(f"{method} failed on actor rank {rank}: {result}")
+            for rank, result in zip(worker_ranks, results, strict=True)
+            if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise ExceptionGroup(f"Stream actor RPC {method} failed", failures)
+        return results
+
     def _collective_lifecycle_call(self, method: str) -> None:
         """Wait for every rank once; lifecycle collectives are not retry-safe."""
 

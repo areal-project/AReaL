@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 import subprocess
 import sys
+import tempfile
 import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -106,6 +109,44 @@ class SGLangBackend:
 
     def __init__(self) -> None:
         self._readiness_endpoint = "/health"
+        self._stream_topology_dir: tempfile.TemporaryDirectory | None = None
+        self._stream_topology_size = 0
+
+    def get_stream_topology(self) -> list[str]:
+        """Read identities published by this server's actual model processes."""
+        if self._stream_topology_dir is None:
+            raise RuntimeError("SGLang was not launched with stream topology enabled")
+        records = [
+            json.loads(path.read_text())
+            for path in Path(self._stream_topology_dir.name).glob("*.json")
+        ]
+        size = self._stream_topology_size
+        if (
+            len(records) != size
+            or {record["tp_rank"] for record in records} != set(range(size))
+            or any(record["tp_size"] != size for record in records)
+        ):
+            raise RuntimeError(f"Incomplete SGLang model topology: {records!r}")
+        for record in records:
+            # A stale identity must never authorize releasing another GPU.
+            pid = record["pid"]
+            if not isinstance(pid, int) or pid <= 0:
+                raise RuntimeError(f"Invalid SGLang model PID: {record!r}")
+            os.kill(pid, 0)
+            start_time = (
+                (Path("/proc") / str(pid) / "stat")
+                .read_text()
+                .rsplit(")", 1)[1]
+                .split()[19]
+            )
+            if start_time != record["process_start_time"]:
+                raise RuntimeError(
+                    "SGLang model PID was reused after topology publication"
+                )
+        uuids = [record["gpu_uuid"] for record in records]
+        if any(not value for value in uuids) or len(set(uuids)) != size:
+            raise RuntimeError(f"Invalid SGLang model GPU identities: {records!r}")
+        return sorted(uuids)
 
     @staticmethod
     def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
@@ -536,6 +577,11 @@ class SGLangBackend:
             "awex_meta_server_addr", None
         ) or os.environ.get("AWEX_META_SERVER_ADDR")
         awex_colocate = server_args.pop("awex_colocate_mode", False)
+        stream_topology = server_args.pop("_areal_stream_topology", False)
+        if stream_topology and (
+            not awex_colocate or server_args.get("pp_size", 1) != 1
+        ):
+            raise ValueError("Stream topology requires local AWEX colocation and PP=1")
         theta_native = os.environ.get(
             "AREAL_SGLANG_FORK", ""
         ).strip().lower() == "theta" and not (awex_colocate or awex_meta_addr)
@@ -595,6 +641,15 @@ class SGLangBackend:
             )
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
+        # Private to this server tree, including when workers share a host.
+        # Only the opt-in stream path writes these small startup records.
+        _env.pop("AREAL_SGLANG_STREAM_TOPOLOGY_DIR", None)
+        if stream_topology:
+            self._stream_topology_dir = tempfile.TemporaryDirectory(
+                prefix="areal-sglang-topology-"
+            )
+            self._stream_topology_size = int(server_args.get("tp_size", 1))
+            _env["AREAL_SGLANG_STREAM_TOPOLOGY_DIR"] = self._stream_topology_dir.name
         _env.setdefault("PYTHONFAULTHANDLER", "1")
         if awex_transfer_rank_base is not None:
             _env["AWEX_TRANSFER_RANK_BASE"] = str(awex_transfer_rank_base)
@@ -926,6 +981,9 @@ class RemoteSGLangEngine(InferenceEngine):
 
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
         return self._engine.launch_server(server_args)
+
+    def get_stream_topology(self) -> dict[str, Any]:
+        return self._engine.get_stream_topology()
 
     def teardown_server(self):
         return self._engine.teardown_server()

@@ -779,6 +779,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         input_generator: Generator[TInput, None, None],
         batch_size: int,
         dynamic_bs: bool = False,
+        stream_results: bool = False,
     ) -> list[TResult]:
         """Continuously submit tasks and wait until a full batch of results is ready.
 
@@ -797,6 +798,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             If True, enables dynamic batch sizing. The method will stop collecting
             when (accepted + rejected) >= batch_size, returning only accepted results.
             This results in variable-sized batches of valid data. Default is False.
+        stream_results : bool, optional
+            Consume each completed group immediately for streaming observers.
+            The accepted target and rejection replacement rules are unchanged.
 
         Returns
         -------
@@ -843,7 +847,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                             "Use cycle_dataloader() or provide an infinite generator."
                         ) from None
             try:
-                arrived = self.wait_results(count=batch_size - accepted_cnt, timeout=1)
+                arrived = self.wait_results(
+                    count=1 if stream_results else batch_size - accepted_cnt, timeout=1
+                )
             except TimeoutError:
                 arrived = []
 

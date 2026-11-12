@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import socket
 import struct
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
@@ -398,6 +399,7 @@ class MegatronEngine(TrainEngine):
             "forward",
             "forward_batch",
             "ppo_update",
+            "stream_accumulate",
             "train_batch",
             "train_dpo",
             "train_lm",
@@ -439,6 +441,9 @@ class MegatronEngine(TrainEngine):
         self.is_offload: bool = False
         self._offload_depth: int = 0
         self._weight_residency: MegatronWeightResidency | None = None
+        self._stream_update = None
+        self._stream_replica_active = False
+        self._stream_terminal: dict[str, tuple[str, dict[str, Any]]] = {}
         self._awex_adapter: AwexMegatronAdapter | None = None
         self._dte_runtime_config = DTERuntimeConfig.from_env()
         self._warned_unbounded_microbatch = False
@@ -1297,6 +1302,7 @@ class MegatronEngine(TrainEngine):
         )
 
     def update_weights(self, meta: WeightUpdateMeta):
+        self._assert_no_stream_update()
         self._check_rollout_engine_connected()
         if meta.type == "awex":
             # Colocate mode flow (mirrors the AWEX reference integration):
@@ -1343,6 +1349,7 @@ class MegatronEngine(TrainEngine):
         return self._version
 
     def save(self, meta: SaveLoadMeta):
+        self._assert_no_stream_update()
         if self._weight_residency is not None:
             # Post-ppo_update the fp32 grad buffers (~2x param bytes) are
             # dead weight until the next train_batch (which rebuilds them via
@@ -1493,6 +1500,145 @@ class MegatronEngine(TrainEngine):
             if self._offload_depth == 0:
                 self.offload()
 
+    def _assert_no_stream_update(self) -> None:
+        if getattr(self, "_stream_update", None) is not None:
+            raise RuntimeError(
+                "A Stream Trainer update is pending; commit or abort it first"
+            )
+
+    def _remember_stream_terminal(
+        self, update_id: str, status: str, result: dict[str, Any]
+    ) -> None:
+        # Bound retry metadata in long-running jobs. RPC retries are supported
+        # for the latest 16 terminated updates; checkpoint recovery starts fresh.
+        self._stream_terminal[update_id] = (status, dict(result))
+        while len(self._stream_terminal) > 16:
+            self._stream_terminal.pop(next(iter(self._stream_terminal)))
+
+    def _validate_stream_runtime(self) -> None:
+        strategy = self.parallel_strategy
+        if self.enable_fp8 or getattr(get_model_config(self.model[0]), "fp8", None):
+            raise ValueError("Stream Trainer requires BF16 compute without FP8")
+        if (
+            strategy.pipeline_parallel_size != 1
+            or strategy.context_parallel_size != 1
+            or strategy.expert_parallel_size != 1
+            or len(self.model) != 1
+            or self.tf_config.num_moe_experts
+            or self.mcore_config.enable_mtp_training
+            or self._r3_enabled
+            or self.enable_tree_training
+            or self._dte_runtime_config.enabled
+        ):
+            raise ValueError(
+                "Stream Trainer requires dense PP=CP=EP=1 without MTP/R3/tree/DTE"
+            )
+        if (
+            self.mcore_config.ddp.overlap_grad_reduce
+            or self.mcore_config.ddp.overlap_param_gather
+        ):
+            raise ValueError("Stream Trainer requires non-overlapped DP collectives")
+        if self._weight_residency is None or self._awex_adapter is None:
+            raise ValueError(
+                "Stream Trainer requires initialized AWEX flat-buffer residency"
+            )
+        if not all(isinstance(chunk, DDP) for chunk in self.model):
+            raise ValueError(
+                "Stream Trainer requires Megatron DDP flat gradient buffers"
+            )
+        if self.dtype != torch.bfloat16:
+            raise ValueError("Stream Trainer currently requires bfloat16 actor weights")
+        if (
+            not self.config.disable_dropout
+            or self.config.loss_aggregation != "token_mean"
+        ):
+            raise ValueError("Stream Trainer requires disabled dropout and token_mean")
+        if self.config.ppo_n_minibatches != 1 or self.config.kl_ctl != 0:
+            raise ValueError("Stream Trainer requires one PPO minibatch and kl_ctl=0")
+        if self.actor._mopd_loss_config is not None:
+            raise ValueError(
+                "Stream Trainer does not support teacher/distillation losses"
+            )
+        for normalization in (self.config.adv_norm, self.config.reward_norm):
+            if normalization is not None and "batch" in (
+                normalization.mean_level,
+                normalization.std_level,
+            ):
+                raise ValueError(
+                    "Stream Trainer cannot normalize across an unfinished batch"
+                )
+
+    def _stream_local_onload(self) -> None:
+        # Never call ordinary onload: it restores optimizer state and enters a
+        # global barrier while another replica may still be generating.
+        self._weight_residency.resume_memory(tags=["weights"])
+        self._weight_residency.ensure_grad_buffers()
+        self.is_offload = False
+
+    @contextmanager
+    def _stream_replica_context(self):
+        """Retain TP communication while suppressing every DP schedule hook."""
+        config = get_model_config(self.model[0])
+        fields = (
+            "no_sync_func",
+            "grad_sync_func",
+            "param_sync_func",
+            "finalize_model_grads_func",
+        )
+        saved = {field: getattr(config, field, None) for field in fields}
+        self._stream_replica_active = True
+        try:
+            config.no_sync_func = nullcontext
+            config.grad_sync_func = None
+            config.param_sync_func = None
+            config.finalize_model_grads_func = None
+            # The outer no_sync covers the last microbatch too. Do not expose
+            # DDP.no_sync to the schedule: its nested exit would re-enable sync.
+            with self.model[0].no_sync():
+                yield
+        finally:
+            for field, value in saved.items():
+                setattr(config, field, value)
+            self._stream_replica_active = False
+
+    def stream_backward_batch(
+        self,
+        input_: dict[str, Any],
+        loss_fn: LossFunction,
+        loss_weight_fn: LossNormalizer,
+    ) -> dict[str, float]:
+        """Accumulate unnormalized token numerators without an optimizer step."""
+        if not self._stream_replica_active or self._stream_update is None:
+            raise RuntimeError(
+                "stream_backward_batch requires an active streamed chunk"
+            )
+        if is_named_loss_normalizer(loss_weight_fn):
+            raise ValueError("Stream Trainer supports a single token-mean objective")
+        mb_list = self._prepare_mb_list(
+            tensor_container_to(input_, "cpu"), allow_transport_padding=True
+        )
+        per_token = bool(get_model_config(self.model[0]).calculate_per_token_loss)
+
+        def process_output(output, inputs):
+            # Setting denominator=1 preserves sum(loss_i * original_token_mass).
+            # Legacy schedule divides by Nmb; native per-token schedule does not.
+            return self._compute_logprobs_and_loss(
+                output,
+                inputs,
+                loss_fn,
+                loss_weight_fn,
+                torch.ones((), device=self.device),
+                loss_multiplier=1.0 if per_token else float(len(mb_list)),
+                per_token_loss=per_token,
+            )
+
+        with record_training_batch(self, input_, self.hf_config):
+            with self._activation_storage_context() as tracker:
+                self.forward_backward_batch(mb_list, process_output, forward_only=False)
+            if tracker is not None:
+                tracker.release()
+        return {"stream_num_micro_batches": float(len(mb_list))}
+
     def optimizer_zero_grad(self):
         assert self.optimizer is not None, "Optimizer is not initialized."
         self.optimizer.zero_grad()
@@ -1500,6 +1646,7 @@ class MegatronEngine(TrainEngine):
             model.zero_grad_buffer()
 
     def optimizer_step(self):
+        self._assert_no_stream_update()
         if self._dte_runtime_config.enabled:
             # The LR scheduler advances before the subsequent weight update.
             # Preserve the LR consumed by this optimizer step for AdamW
@@ -1989,12 +2136,13 @@ class MegatronEngine(TrainEngine):
         gather_cp_output: bool = False,
     ) -> None:
         self._ensure_ready()
-        validate_transport_padding(
-            mb_list,
-            has_internal_objectives=bool(self.tf_config.num_moe_experts)
-            or self.mcore_config.enable_mtp_training,
-            cpu_group=self.cpu_group,
-        )
+        if not self._stream_replica_active:
+            validate_transport_padding(
+                mb_list,
+                has_internal_objectives=bool(self.tf_config.num_moe_experts)
+                or self.mcore_config.enable_mtp_training,
+                cpu_group=self.cpu_group,
+            )
 
         r3_context: dict[str, Any] | None = None
         r3_mb_counters: dict[int, int] = {}
@@ -2348,12 +2496,32 @@ class MegatronEngine(TrainEngine):
                 ] / max(active_mbs, 1)
                 stats_tracker.scalar(**r3_scalar_stats)
 
+    def _activation_storage_context(self):
+        activation_context = nullcontext()
+        if self._weight_residency is not None:
+            install_activation_storage_tracking()
+            model_chunks = (
+                self.model if isinstance(self.model, (list, tuple)) else [self.model]
+            )
+            protected_tensors = [
+                tensor
+                for model_chunk in model_chunks
+                # Megatron DDP shadows nn.Module.buffers with its grad buffers.
+                for tensor in (
+                    *model_chunk.parameters(),
+                    *torch.nn.Module.buffers(model_chunk),
+                )
+            ]
+            activation_context = track_activation_storage(protected_tensors)
+        return activation_context
+
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: LossFunction,
         loss_weight_fn: LossNormalizer,
     ) -> dict[str, float]:
+        self._assert_no_stream_update()
         self._ensure_ready()
         if self._weight_residency is not None:
             self._weight_residency.ensure_grad_buffers()
@@ -2421,24 +2589,7 @@ class MegatronEngine(TrainEngine):
                     total_token_count=total_token_count,
                 )
 
-            activation_context = nullcontext()
-            if self._weight_residency is not None:
-                install_activation_storage_tracking()
-                model_chunks = (
-                    self.model
-                    if isinstance(self.model, (list, tuple))
-                    else [self.model]
-                )
-                protected_tensors = [
-                    tensor
-                    for model_chunk in model_chunks
-                    # Megatron DDP shadows nn.Module.buffers with its grad buffers.
-                    for tensor in (
-                        *model_chunk.parameters(),
-                        *torch.nn.Module.buffers(model_chunk),
-                    )
-                ]
-                activation_context = track_activation_storage(protected_tensors)
+            activation_context = self._activation_storage_context()
             with activation_context as activation_tracker:
                 self.forward_backward_batch(
                     mb_list,
@@ -2634,7 +2785,9 @@ class MegatronEngine(TrainEngine):
         return split_batch(res, meta)
 
     def export_stats(self) -> dict[str, float]:
-        key_sync_group = None
+        # Every rank records the terminal marker at commit. An empty replica
+        # can have no loss-side keys, so synchronize metric metadata explicitly.
+        key_sync_group = self.data_parallel_group if self._stream_terminal else None
         if self.parallel_strategy.context_parallel_size > 1:
             key_sync_group = mpu.get_data_parallel_group(with_context_parallel=True)
         with self._offload_aware_context():
@@ -2653,7 +2806,9 @@ class MegatronEngine(TrainEngine):
                     else mpu.get_tensor_model_parallel_world_size(),
                 )
             )
-            data.update(export_training_metrics(self))
+            data.update(
+                export_training_metrics(self, include_empty=bool(self._stream_terminal))
+            )
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             # Some log info only exist in last pipeline rank
             data_list = [data]
@@ -2722,6 +2877,7 @@ class MegatronEngine(TrainEngine):
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/actor.py
         """
+        self._assert_no_stream_update()
         if self._weight_residency is not None:
             self._log_weight_residency_stats("before_offload")
             self.get_device_stats().log("before offload model")
@@ -2769,6 +2925,7 @@ class MegatronEngine(TrainEngine):
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/actor.py
         """
+        self._assert_no_stream_update()
         if self._weight_residency is not None:
             self._weight_residency.resume_memory(tags=["optimizer", "weights"])
             current_platform.clear_memory()
@@ -4111,6 +4268,7 @@ class MegatronEngine(TrainEngine):
             input_,
             mb_spec,
             group=mpu.get_data_parallel_group(),
+            sync_mbs=not self._stream_replica_active,
             seq_align_to=align_to_multiple_of,
             padded=self.sequence_packing_mode == SequencePackingMode.PADDED,
             allow_transport_padding=allow_transport_padding,
@@ -4621,6 +4779,168 @@ class MegatronPPOActor(MegatronEngine):
 
     def ppo_update(self, *args, **kwargs) -> None:
         self.actor.ppo_update(*args, **kwargs)
+
+    def stream_topology(self) -> list[dict[str, Any]]:
+        """Gather actual TP identities for the RPC guard's DP-head-only return."""
+        self._validate_stream_runtime()
+        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+        gpu_uuid = getattr(properties, "uuid", None)
+        if gpu_uuid is None:
+            raise RuntimeError(
+                "CUDA device UUID is unavailable; refusing guessed GPU mapping"
+            )
+        identity = dict(
+            rank=dist.get_rank(self.cpu_group),
+            dp_rank=self.data_parallel_rank,
+            replica_ranks=dist.get_process_group_ranks(
+                self.context_and_model_parallel_group
+            ),
+            host=socket.gethostname(),
+            gpu_uuid=str(gpu_uuid),
+        )
+        # Initialized training RPCs discard non-DP-head responses. Gather
+        # metadata on the existing CPU mirror, without onloading any GPU state.
+        group = self.cpu_model_parallel_group
+        identities = [None] * dist.get_world_size(group)
+        dist.all_gather_object(identities, identity, group=group)
+        return identities
+
+    def stream_accumulate(
+        self,
+        update_id: str,
+        chunk_id: int,
+        data: list[dict[str, Any]] | None = None,
+        *,
+        max_head_offpolicyness: int | None = None,
+    ) -> dict[str, Any]:
+        """Prepare a complete GRPO group and accumulate its local gradient.
+
+        The RPC guard broadcasts the head's CPU-staged payload within this TP
+        replica. Call all ranks in the replica, and no ranks in other replicas.
+        """
+        from areal.engine.megatron_utils.stream_update import StreamUpdateState
+
+        self._validate_stream_runtime()
+        if not update_id:
+            raise ValueError("update_id must be nonempty")
+        if update_id in self._stream_terminal:
+            raise RuntimeError("Cannot add a chunk to a committed or aborted update")
+        if (
+            self._stream_update is not None
+            and self._stream_update.update_id != update_id
+        ):
+            raise RuntimeError("A different Stream Trainer update is already pending")
+        if self._stream_update is None:
+            self._stream_local_onload()
+            self.optimizer_zero_grad()
+            self._stream_update = StreamUpdateState(update_id)
+        state = self._stream_update
+        cached = state.check_chunk(chunk_id)
+        if cached is not None:
+            return dict(cached)
+        if not data:
+            raise ValueError(
+                "stream_accumulate requires a complete nonempty group on every TP rank"
+            )
+        try:
+            with self._stream_replica_context():
+                if self.config.should_compute_prox_logp():
+                    logps = self.actor.compute_logp(data)
+                    if logps is None:
+                        raise RuntimeError(
+                            "PP=1 streamed actor did not return proximal logprobs"
+                        )
+                    for trajectory, logp in zip(data, logps, strict=True):
+                        # Advantages consume CPU-staged rollout tensors, just
+                        # as they do after ordinary controller logprob RPCs.
+                        trajectory["prox_logp"] = logp.detach().cpu()
+                prepared = self.actor.compute_advantages(data)
+                batched, meta = concat_batch(prepared)
+                mass = int(batched["loss_mask"].count_nonzero().item())
+                self.actor._ppo_update(
+                    batched,
+                    meta,
+                    max_head_offpolicyness=max_head_offpolicyness,
+                    stream_accumulate=True,
+                )
+            return state.complete_chunk(chunk_id, mass)
+        except Exception:
+            # A failed backward may have partially changed main_grad. Never
+            # replay it into that buffer or commit an incomplete update.
+            state.failed = True
+            raise
+
+    def finish_stream_update(self, update_id: str) -> dict[str, float]:
+        """Commit exactly one optimizer step after every rollout has finished."""
+        from areal.engine.megatron_utils.stream_update import (
+            StreamUpdateState,
+            stream_gradient_scale,
+        )
+
+        self._validate_stream_runtime()
+        terminal = self._stream_terminal.get(update_id)
+        if terminal is not None:
+            status, result = terminal
+            if status != "committed":
+                raise RuntimeError("Cannot commit an aborted Stream Trainer update")
+            return dict(result)
+        state = self._stream_update
+        if state is not None and (state.update_id != update_id or state.failed):
+            raise RuntimeError("Stream update identity mismatch or failed local chunk")
+        if state is None:
+            self._stream_local_onload()
+            self.optimizer_zero_grad()
+            state = self._stream_update = StreamUpdateState(update_id)
+        # At this point *all* actors participate. Empty replicas contribute
+        # zero numerator gradients and zero mass, not synthetic sample weight.
+        mass = torch.tensor(state.local_mass, dtype=torch.int64, device=self.device)
+        dist.all_reduce(mass, group=self.data_parallel_group)
+        global_mass = int(mass.item())
+        scale = stream_gradient_scale(
+            global_mass,
+            self.data_parallel_world_size,
+            per_token_loss=bool(
+                get_model_config(self.model[0]).calculate_per_token_loss
+            ),
+        )
+        self._weight_residency.resume_memory(tags=["optimizer"])
+        for chunk in self.model:
+            chunk.scale_gradients(scale)
+        # Denominator has already been applied. Passing num_tokens here would
+        # normalize a second time in native per-token mode.
+        self._finalize_model_grads(self.model, num_tokens=None)
+        self._stream_update = None
+        try:
+            result = self.optimizer_step()
+        except Exception:
+            state.failed = True
+            self._stream_update = state
+            raise
+        result.update(stream_token_mass=float(global_mass))
+        self._remember_stream_terminal(update_id, "committed", result)
+        stats_tracker.scalar(**result)
+        return result
+
+    def abort_stream_update(self, update_id: str) -> dict[str, Any]:
+        """Discard local gradients, without onloading or touching other replicas."""
+        terminal = self._stream_terminal.get(update_id)
+        if terminal is not None:
+            if terminal[0] == "committed":
+                raise RuntimeError(
+                    "Cannot abort an already committed Stream Trainer update"
+                )
+            return dict(terminal[1])
+        state = self._stream_update
+        if state is not None:
+            if state.update_id != update_id:
+                raise RuntimeError(
+                    "Cannot abort a different pending Stream Trainer update"
+                )
+            self.optimizer_zero_grad()
+            self._stream_update = None
+        result = dict(update_id=update_id, aborted=True)
+        self._remember_stream_terminal(update_id, "aborted", result)
+        return dict(result)
 
     @classmethod
     def as_controller(cls, config: PPOActorConfig, scheduler: Scheduler):

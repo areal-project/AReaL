@@ -1896,6 +1896,20 @@ class RemoteInfEngine(InferenceEngine):
             self._shutdown_one_server(server_info)
             raise
 
+    def get_stream_topology(self) -> dict[str, Any]:
+        """Read GPU identities from the live local server's model processes."""
+        if len(self.local_server_processes) != 1:
+            raise ValueError(
+                "Stream colocation requires exactly one locally launched server"
+            )
+        info = self.local_server_processes[0]
+        if info.process is None or info.process.poll() is not None:
+            raise RuntimeError("Stream inference server is not running")
+        reader = getattr(self.backend, "get_stream_topology", None)
+        if not callable(reader):
+            raise ValueError("Inference backend cannot report model GPU identities")
+        return {"host": info.host, "gpu_uuids": reader()}
+
     def _shutdown_one_server(self, server_info: LocalInfServerInfo):
         addr = format_hostport(server_info.host, server_info.port)
         if addr in self.addresses:

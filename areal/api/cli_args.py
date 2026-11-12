@@ -4427,6 +4427,39 @@ class MOPDConfig:
 
 
 @dataclass
+class StreamTrainerConfig:
+    """Opt-in, fixed-batch gradient streaming on AWEX colocated GPUs.
+
+    Completed rollout groups may accumulate gradients on drained replicas.
+    Parameters and optimizer state change only after the entire batch completes.
+    """
+
+    enabled: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable experimental colocated, same-batch gradient streaming."
+        },
+    )
+    poll_interval: float = field(
+        default=0.1,
+        metadata={
+            "help": "Positive interval in seconds for polling completed rollout groups."
+        },
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("stream_trainer.enabled must be a boolean")
+        if (
+            not isinstance(self.poll_interval, (int, float))
+            or isinstance(self.poll_interval, bool)
+            or not math.isfinite(self.poll_interval)
+            or self.poll_interval <= 0
+        ):
+            raise ValueError("stream_trainer.poll_interval must be finite and positive")
+
+
+@dataclass
 class PPOConfig(BaseExperimentConfig):
     """Configuration for Proximal Policy Optimization (PPO) reinforcement learning experiments."""
 
@@ -4466,9 +4499,17 @@ class PPOConfig(BaseExperimentConfig):
             "This results in variable-sized batches of valid data."
         },
     )
+    stream_trainer: StreamTrainerConfig = field(
+        default_factory=StreamTrainerConfig,
+        metadata={
+            "help": "Experimental fixed-batch gradient streaming; disabled by default."
+        },
+    )
 
     def __post_init__(self):
         """Validate the eval generation config."""
+        if self.stream_trainer.enabled:
+            self._validate_stream_trainer()
         if self.teacher is not None and self.mopd is not None:
             raise ValueError("teacher and mopd cannot be configured at the same time")
         if self.mopd is not None:
@@ -4560,6 +4601,97 @@ class PPOConfig(BaseExperimentConfig):
                     "rollout.agent.prm currently requires chat_template_type='concat'"
                 )
         super().__post_init__()
+
+    def _validate_stream_trainer(self) -> None:
+        from areal.api.alloc_mode import ModelAllocation
+
+        actor = self.actor
+        training = ModelAllocation.from_str(actor.backend).parallel
+        inference = ModelAllocation.from_str(self.rollout.backend).parallel
+        requirements = {
+            "actor.backend must use Megatron": actor.backend.startswith("megatron:"),
+            "rollout.backend must use SGLang": self.rollout.backend.startswith(
+                "sglang:"
+            ),
+            "v1 controllers are required": actor._version
+            == self.rollout._version
+            == "v1",
+            "actor.weight_update_mode must be awex": actor.weight_update_mode == "awex",
+            "training DP must be greater than one": training.dp_size > 1,
+            "training PP, CP and EP must equal one": (
+                training.pp_size == training.cp_size == training.ep_size == 1
+            ),
+            "rollout PP and CP must equal one": inference.pp_size
+            == inference.cp_size
+            == 1,
+            "actor and rollout must use the same total GPU count": (
+                training.world_size == inference.world_size
+            ),
+            "actor TP must be a multiple of rollout TP": (
+                training.tp_size % inference.tp_size == 0
+            ),
+            "ppo_n_minibatches must equal one": actor.ppo_n_minibatches == 1,
+            "loss_aggregation must be token_mean": actor.loss_aggregation
+            == "token_mean",
+            "actor must use BF16 and disable dropout": actor.dtype == "bfloat16"
+            and actor.disable_dropout,
+            "FP8 training is unsupported": actor.megatron.fp8_config is None,
+            "critic, ref, teacher and MOPD are unsupported": (
+                self.critic is None
+                and self.ref is None
+                and self.teacher is None
+                and self.mopd is None
+            ),
+            "KL rewards require an unsupported reference model": actor.kl_ctl == 0,
+            "dynamic_bs must be false": not self.dynamic_bs,
+            "deterministic_sampling is unsupported": not self.rollout.deterministic_sampling,
+            "PRM advantage shaping is unsupported": not (
+                self.rollout.agent.prm.enabled and self.rollout.agent.prm.scorers
+            ),
+            "max_head_offpolicyness must equal zero": self.rollout.max_head_offpolicyness
+            == 0,
+            "consumer_batch_size must match train_dataset.batch_size": (
+                self.rollout.consumer_batch_size == self.train_dataset.batch_size
+            ),
+            "train_dataset.batch_size must be at least actor DP": self.train_dataset.batch_size
+            >= training.dp_size,
+            "DP communication overlap must be disabled": (
+                not actor.megatron.ddp.overlap_grad_reduce
+                and not actor.megatron.ddp.overlap_param_gather
+            ),
+            "MTP training, R3, tree training and LoRA are unsupported": (
+                not actor.megatron.enable_mtp_training
+                and not self.rollout.return_routed_experts
+                and not actor.enable_tree_training
+                and not actor.use_lora
+            ),
+            "backend routing is unsupported": not self.rollout.backend_routing.enabled,
+            "memory profiler is unsupported": self.memory_profiler is None,
+        }
+        for name in ("reward_norm", "adv_norm"):
+            norm = getattr(actor, name)
+            requirements[f"actor.{name} cannot use batch statistics"] = (
+                norm is None
+                or (norm.mean_level != "batch" and norm.std_level != "batch")
+            )
+        advantage = actor.advantage
+        requirements["custom advantage stages are unsupported"] = (
+            advantage.compute.implementation == "default"
+            and not advantage.compute.kwargs
+            and all(
+                getattr(advantage, name) is None
+                for name in (
+                    "outcome_reward_shaping",
+                    "estimator",
+                    "process_adv_shaping",
+                )
+            )
+        )
+        failures = [
+            message for message, satisfied in requirements.items() if not satisfied
+        ]
+        if failures:
+            raise ValueError("stream_trainer: " + "; ".join(failures))
 
     def _validate_mopd_config(self):
         """Validate MOPD engine topology before any workers are created."""

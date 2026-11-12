@@ -99,6 +99,7 @@ For detailed examples, see the experiment configurations in the `examples/` dire
 - [Scheduling Specification](section-scheduling)
 - [SchedulingStrategy](section-scheduling-strategy)
 - [SessionTracer Configuration](section-session-tracer)
+- [StreamTrainer Configuration](section-stream-trainer)
 - [Teacher Configuration](section-teacher)
 
 ______________________________________________________________________
@@ -173,6 +174,7 @@ A dummy place holder of GRPO config for backward compatibility.
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`                      | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
 | `mopd`               | [`MOPDConfig`](section-mopd) \| None                                      | `None`                      | Optional multi-teacher on-policy distillation config.                                                                                                                                                                                                               |
 | `dynamic_bs`         | boolean                                                                   | `False`                     | Enable dynamic batch sizing in prepare_batch. When True, batch collection stops when (accepted + rejected) >= batch_size, returning only accepted results. This results in variable-sized batches of valid data.                                                    |
+| `stream_trainer`     | [`StreamTrainerConfig`](section-stream-trainer)                           | *StreamTrainerConfig*       | Experimental fixed-batch gradient streaming; disabled by default.                                                                                                                                                                                                   |
 
 (section-ppo)=
 
@@ -213,6 +215,7 @@ Configuration for Proximal Policy Optimization (PPO) reinforcement learning expe
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`                      | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
 | `mopd`               | [`MOPDConfig`](section-mopd) \| None                                      | `None`                      | Optional multi-teacher on-policy distillation config.                                                                                                                                                                                                               |
 | `dynamic_bs`         | boolean                                                                   | `False`                     | Enable dynamic batch sizing in prepare_batch. When True, batch collection stops when (accepted + rejected) >= batch_size, returning only accepted results. This results in variable-sized batches of valid data.                                                    |
+| `stream_trainer`     | [`StreamTrainerConfig`](section-stream-trainer)                           | *StreamTrainerConfig*       | Experimental fixed-batch gradient streaming; disabled by default.                                                                                                                                                                                                   |
 
 (section-rw)=
 
@@ -1558,6 +1561,20 @@ Configuration for per-session lifecycle tracing.
 | ----------------- | ------- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `enabled`         | boolean | `False` | Enable per-session lifecycle tracing alongside perf events. When true, session metadata is captured to sessions.jsonl. |
 | `flush_threshold` | integer | `256`   | Flush session trace records once this many entries are ready. Values \<= 0 fall back to 1.                             |
+
+(section-stream-trainer)=
+
+## StreamTrainer Configuration
+
+Opt-in, fixed-batch gradient streaming on AWEX colocated GPUs.
+
+Completed rollout groups may accumulate gradients on drained replicas. Parameters and
+optimizer state change only after the entire batch completes.
+
+| Parameter       | Type    | Default | Description                                                        |
+| --------------- | ------- | ------- | ------------------------------------------------------------------ |
+| `enabled`       | boolean | `False` | Enable experimental colocated, same-batch gradient streaming.      |
+| `poll_interval` | float   | `0.1`   | Positive interval in seconds for polling completed rollout groups. |
 
 (section-teacher)=
 
