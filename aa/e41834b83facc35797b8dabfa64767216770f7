@@ -1,0 +1,21 @@
+areal/infra/controller/rollout_controller.py
+  s_5ffc08691846bc::t_eb0247f57351c3 1232-1238,1243-1245,1250-1253,1255,1257,1259,1261,1263,1265,1267,1290-1292,1294,1300,1315-1317
+tests/test_stream_rollout_controller.py
+  s_5ffc08691846bc::t_d27247e49c8d3f 81-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "aae41834b83facc35797b8dabfa64767216770f7",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
