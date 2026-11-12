@@ -20,7 +20,10 @@ from areal.v2.inference_service.router.backend import (
     RoutingError,
     SetPoolState,
 )
-from areal.v2.inference_service.router.client import RouteClient
+from areal.v2.inference_service.router.client import (
+    GenerationRejectedError,
+    RouteClient,
+)
 from areal.v2.inference_service.router.config import RouterConfig
 
 IDENTITY = {"pool_id": "pool", "run_id": "run"}
@@ -458,6 +461,61 @@ async def test_lost_metadata_replies_never_duplicate_generation(live_client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("release_committed", [False, True])
+async def test_release_recovers_with_independent_session(
+    live_client, release_committed
+):
+    state, route, session, controls = live_client
+    route.metadata_timeout = 0.2
+    sent = []
+
+    async def generate(lease):
+        sent.append(lease)
+        if release_committed:
+            # The registry committed the release, but the caller lost its reply.
+            await release(state, lease)
+        await session.close()
+        return "result", "completed"
+
+    assert await route.execute(session, "s", generate) == ("result", 0)
+    assert len(sent) == len(controls["requests"]) == 1
+    snapshot = await state.snapshot(**IDENTITY)
+    assert snapshot["state"] == "READY"
+    assert snapshot["outstanding"] == 0
+
+
+@pytest.mark.asyncio
+async def test_release_transport_failure_still_fails_pool(live_client, monkeypatch):
+    state, route, session, controls = live_client
+    original_post = route._post
+    release_sessions = []
+    sent = []
+
+    async def unavailable(client_session, path, body):
+        if path == "/routing/release":
+            release_sessions.append(client_session)
+            raise RoutingError("METADATA_UNCERTAIN")
+        return await original_post(client_session, path, body)
+
+    monkeypatch.setattr(route, "_post", unavailable)
+
+    async def generate(lease):
+        sent.append(lease)
+        return "result", "completed"
+
+    with pytest.raises(RoutingError, match="EXECUTION_UNCERTAIN"):
+        await route.execute(session, "s", generate)
+    assert len(sent) == len(controls["requests"]) == 1
+    assert len(release_sessions) == 2
+    assert release_sessions[0] is session
+    assert release_sessions[1] is not session
+    assert release_sessions[1].closed
+    snapshot = await state.snapshot(**IDENTITY)
+    assert snapshot["state"] == "FAILED"
+    assert snapshot["outstanding"] == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["close", "pause_and_resume", "cancel"])
 async def test_late_acquire_cannot_send_after_close_pause_or_cancel(
     live_client, action
@@ -640,6 +698,142 @@ async def test_engine_direct_http_abort_continuation_uses_lease_versions(
     assert engine.addresses == ["original-management-address"]
     snapshot = await state.snapshot("gen", "run")
     assert snapshot["outstanding"] == snapshot["sessions"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,body,rejected",
+    [
+        (
+            400,
+            {
+                "error": {
+                    "message": "Requested token count exceeds the model's maximum context length of 262144 tokens."
+                }
+            },
+            True,
+        ),
+        (
+            400,
+            {
+                "error": {
+                    "message": "The input (262148 tokens) is longer than the model's context length (262144 tokens)."
+                }
+            },
+            True,
+        ),
+        (400, {"error": {"message": "Unknown scheduler error"}}, False),
+        (400, {"error": {"code": "context_length_exceeded"}}, False),
+        (400, "invalid JSON", False),
+        (
+            500,
+            {
+                "error": {
+                    "message": "Requested token count exceeds the model's maximum context length"
+                }
+            },
+            False,
+        ),
+    ],
+)
+async def test_engine_rejection_releases_only_confirmed_unscheduled_requests(
+    live_client, monkeypatch, status, body, rejected
+):
+    from areal.api.cli_args import GenerationHyperparameters, InferenceEngineConfig
+    from areal.api.io_struct import ModelRequest
+    from areal.engine.sglang_remote import SGLangBackend
+    from areal.experimental.openai.proxy.proxy_rollout_server import (
+        _backend_context_length_message,
+    )
+    from areal.infra import workflow_context
+    from areal.infra.remote_inf_engine import RemoteInfEngine
+
+    state, _, http, controls = live_client
+    await state.register(
+        RegisterBackends(
+            pool_id="reject",
+            run_id="run",
+            weight_version=0,
+            backends=[
+                BackendSpec(
+                    backend_id="b", backend_addr=controls["address"], capacity=2
+                )
+            ],
+        )
+    )
+    await state.set_state(
+        "reject",
+        SetPoolState(run_id="run", control_seq=0, state="READY", weight_version=0),
+    )
+    route = RouteClient(
+        controls["address"], "reject", "run", "test", metadata_timeout=2
+    )
+    route.set_sender_state(False, 0)
+    engine = RemoteInfEngine(
+        InferenceEngineConfig(backend="sglang:d1"), SGLangBackend()
+    )
+    engine.route_client = route
+    engine._workflow_executor = SimpleNamespace(is_paused=lambda: False)
+    calls = []
+
+    async def generate(request):
+        calls.append(await request.json())
+        if len(calls) == 1:
+            if isinstance(body, str):
+                return web.Response(status=status, text=body)
+            return web.json_response(body, status=status)
+        return web.json_response(
+            {
+                "meta_info": {
+                    "finish_reason": {"type": "stop"},
+                    "output_token_logprobs": [[-0.1, 4]],
+                }
+            }
+        )
+
+    async def get_http():
+        return http
+
+    controls["generate"] = generate
+    monkeypatch.setattr(workflow_context, "get_aiohttp_session", get_http)
+    request = ModelRequest(
+        input_ids=[1, 2, 3],
+        gconfig=GenerationHyperparameters(n_samples=1, max_new_tokens=5, max_tokens=16),
+    )
+    error_type = GenerationRejectedError if rejected else RoutingError
+    with pytest.raises(error_type) as error:
+        await engine.agenerate(request)
+    assert len(calls) == 1  # Rejection never transparently retries generation.
+    snapshot = await state.snapshot("reject", "run")
+    assert snapshot["state"] == ("READY" if rejected else "FAILED")
+    assert snapshot["outstanding"] == (0 if rejected else 1)
+    if rejected:
+        # Preserve the bounded HTTP cause for the proxy's existing overflow
+        # disposition, instead of reporting a router/system failure.
+        assert _backend_context_length_message(error.value) == body["error"]["message"]
+        response = await engine.agenerate(request)
+        assert response.output_tokens == [4]
+        assert (await state.snapshot("reject", "run"))["outstanding"] == 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_generation_release_failure_still_fails_pool(
+    live_client, monkeypatch
+):
+    state, route, session, _ = live_client
+
+    async def generate(lease):
+        raise GenerationRejectedError("confirmed rejection")
+
+    async def release(*args):
+        raise TimeoutError("release acknowledgement lost")
+
+    monkeypatch.setattr(route, "release", release)
+    with pytest.raises(RoutingError, match="EXECUTION_UNCERTAIN"):
+        await route.execute(session, "s", generate)
+    snapshot = await state.snapshot(**IDENTITY)
+    assert snapshot["state"] == "FAILED"
+    assert snapshot["outstanding"] == 1
 
 
 @pytest.mark.asyncio

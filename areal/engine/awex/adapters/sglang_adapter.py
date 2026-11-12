@@ -179,6 +179,27 @@ def _reapply_aiter_moe_layout(model: torch.nn.Module) -> int:
     return count
 
 
+@torch.no_grad()
+def _refresh_gemma_norm_weights(model: torch.nn.Module) -> int:
+    """Refresh fused RMSNorm buffers after AWEX bypasses SGLang weight loaders."""
+    try:
+        from sglang.srt.layers.layernorm import GemmaRMSNorm
+    except ImportError:
+        return 0
+
+    count = 0
+    for module in model.modules():
+        if not isinstance(module, GemmaRMSNorm):
+            continue
+        gemma_weight = getattr(module, "gemma_weight", None)
+        if gemma_weight is None:
+            continue
+        # Match GemmaRMSNorm._weight_loader, retaining captured graph addresses.
+        torch.add(module.weight, 1.0, out=gemma_weight)
+        count += 1
+    return count
+
+
 def _to_awex_attr_dict(value: Any) -> Any:
     """Restore recursive attribute access missing from AWEX 0.8.1 configs."""
     if isinstance(value, dict):
@@ -1186,11 +1207,14 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 "Re-applied aiter MoE weight shuffle to %d FusedMoE layers", reshuffled
             )
         post_load_weights = getattr(model, "post_load_weights", None)
-        if post_load_weights is None:
-            return
-        post_load_weights()
-        torch.cuda.synchronize()
-        logger.info("post_load_weights() re-derived SGLang weights")
+        if post_load_weights is not None:
+            post_load_weights()
+            logger.info("post_load_weights() re-derived SGLang weights")
+        refreshed = _refresh_gemma_norm_weights(model)
+        if refreshed:
+            logger.info("Refreshed %d Gemma RMSNorm derived weight buffers", refreshed)
+        if post_load_weights is not None or refreshed:
+            torch.cuda.synchronize()
 
     def wait_for_training_offloaded(self, version: int) -> None:
         del version
