@@ -1,0 +1,25 @@
+examples/stream_trainer/README.md
+  s_5ffc08691846bc::t_d1639b802921fd 18-21,248-249,259-282
+  s_5ffc08691846bc::t_81fac06410c3a4 250-258
+  s_5ffc08691846bc::t_6f042269861ec2 283
+examples/stream_trainer/run_e2e.sh
+  s_5ffc08691846bc::t_d1639b802921fd 61
+examples/stream_trainer/run_paired_e2e.sh
+  s_5ffc08691846bc::t_d1639b802921fd 1-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "063dfddadda18eac35fc2d531e44fd4dd4fbe2b4",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
