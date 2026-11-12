@@ -199,6 +199,7 @@ examples/tir/
 │   ├── base.py                 # Tool base class
 │   ├── python_tool.py          # Python executor
 │   ├── daytona_python_tool.py  # Daytona cloud sandbox executor
+│   ├── boxd_python_tool.py     # boxd cloud sandbox executor
 │   └── calculator_tool.py      # Calculator
 ├── data/                       # Data files
 │   └── sample_math.jsonl       # Sample data
@@ -228,6 +229,36 @@ Notes:
 - The stock `ToolRegistry` uses Daytona's default sandbox settings. If you want to pin a
   snapshot or custom image, update the `daytona_python` factory in
   `examples/tir/tool_manager.py`.
+
+## Cloud sandbox backend (boxd)
+
+Install the optional boxd backend and export your API key:
+
+```bash
+uv sync --extra sandbox
+export BOXD_API_KEY=...
+```
+
+Then switch the TIR config to the boxd-backed tool:
+
+```yaml
+tir:
+  enable_tools: "boxd_python"
+```
+
+Notes:
+
+- `boxd_python` creates one isolated [boxd](https://boxd.sh?ref=AReaL) machine per
+  trajectory and keeps Python state across tool calls in it. The machine is deleted when
+  the trajectory's tools are cleaned up. Cleanup is best effort: pass `delete_after`
+  (seconds) in the factory so boxd deletes machines a killed run leaves behind. It
+  counts from creation, not from the last call, so pick a value above your longest
+  trajectory.
+- A cell that runs past the tool timeout returns a `TimeoutError`. If the interpreter
+  has to be restarted, the tool output says that earlier variables are gone.
+- The stock `ToolRegistry` uses default machine settings and the system Python. To pin a
+  snapshot, region, `python_packages` or `delete_after`, update the `boxd_python`
+  factory in `examples/tir/tool_manager.py`.
 
 ## Data engineering recipe
 

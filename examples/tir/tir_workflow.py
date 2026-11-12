@@ -107,7 +107,7 @@ class TIRWorkflow(RolloutWorkflow):
         :return: The output tensor dict.
         """
         tool_manager = self._build_tool_manager()
-        # Daytona-backed tools can allocate remote sandboxes per episode, so
+        # Cloud sandbox tools (Daytona, boxd) can allocate remote sandboxes per episode, so
         # cleanup must run even when generation or reward computation fails.
         try:
             # Initialize conversation history
