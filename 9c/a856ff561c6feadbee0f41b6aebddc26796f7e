@@ -1,0 +1,20 @@
+examples/stream_trainer/README.md
+  s_5ffc08691846bc::t_187c46632571e9 38-79
+  s_5ffc08691846bc::t_b42a4e3b7dedb4 80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9ca856ff561c6feadbee0f41b6aebddc26796f7e",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
