@@ -118,6 +118,24 @@ These short runs validate execution and memory use, not convergence or multi-nod
 behavior. Optimizer staging also requires substantial pinned host memory; the validation
 node had 1.5 TiB of RAM.
 
+## Qwen3.5-122B-A10B with Muon
+
+`dapo-math_grpo_qwen3_5_122b_muon.yaml` provides a three-step, eight-GPU smoke recipe
+with CPU-staged Muon, attention TP2/DP4, expert EP8, and rollout TP8. Set
+`QWEN3_5_122B_A10B_MODEL_PATH`, `DAPO_MATH_17K_PATH`, and `AREAL_EXPERIMENT_ROOT`, then
+use the same entry point with this configuration. This uses Qwen3.5-122B-A10B, not a
+Base checkpoint. It uses eight prompts with four samples each and an 8191-token
+prompt-plus-completion budget.
+
+The examples reserve server context headroom independently of the generation budget:
+2064 for a 2047-token budget, 8208 for 8191, and 32784 for 32767. The SGLang version
+used in these experiments limits request inputs to at most `context_length - 6` (and
+potentially less if the token pool is smaller). A resumed rollout sends its prompt and
+partial completion as a new input, so setting context to only one token above the
+generation budget can reject an otherwise valid continuation. The extra context does not
+increase the generation budget or the training microbatch limit; 16 tokens is
+conservative headroom, not an MTP draft-token requirement.
+
 ## WeftMoE compatibility
 
 The WeftMoE engine/AWEX/SGLang integration is maintained in a separate PR targeting

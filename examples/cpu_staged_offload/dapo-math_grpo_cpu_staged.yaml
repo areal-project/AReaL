@@ -47,7 +47,7 @@ rollout:
 gconfig:
   n_samples: 16
   min_new_tokens: 0
-  # SGLang 0.5.10 requires request total tokens to be below context_length.
+  # Prompt + completion budget; server context includes separate input headroom.
   max_tokens: 32767
   max_new_tokens: 20480
   greedy: false
@@ -134,7 +134,8 @@ sglang:
   skip_tokenizer_init: true
   dtype: ${actor.dtype}
   max_running_requests: null
-  context_length: 32768
+  # Allow near-limit continuations to be resubmitted as inputs.
+  context_length: 32784
   mem_fraction_static: 0.7
 
 train_dataset:
