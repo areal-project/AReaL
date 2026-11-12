@@ -1,0 +1,21 @@
+areal/trainer/stream_trainer.py
+  s_5ffc08691846bc::t_ef6a5b89f7d7bd 67
+tests/test_stream_trainer.py
+  s_5ffc08691846bc::t_98dce859ead634 229-257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7da323b287a4c6a71b536f332fd781edb22c96bc",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
