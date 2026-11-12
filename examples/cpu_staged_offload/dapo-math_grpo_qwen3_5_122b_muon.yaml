@@ -1,0 +1,104 @@
+# Short real-data RL validation; not a convergence or throughput benchmark.
+defaults:
+  - dapo-math_grpo_qwen3_5_cpu_staged
+  - _self_
+
+experiment_name: qwen3-5-122b-a10b-muon-dapo-8k
+trial_name: staged-tp2-ep8-rollout-tp8
+total_train_steps: 3
+allocation_mode: "megatron[actor]:(attn:d4p1t2c1|ffn:d1e8)|sglang[rollout]:d1t8p1"
+
+cluster:
+  fileroot: ${oc.env:AREAL_EXPERIMENT_ROOT}
+  name_resolve:
+    nfs_record_root: ${cluster.fileroot}/name_resolve/${experiment_name}/${trial_name}
+
+rollout:
+  backend: "sglang:d1t8p1"
+  setup_timeout: 1800.0
+  max_concurrent_rollouts: 8
+  queue_size: 32
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 8
+      cpu: 16
+      mem: 128
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        NCCL_NVLS_ENABLE: "0"
+        # SGLang's memory saver cannot use expandable segments.
+        PYTORCH_CUDA_ALLOC_CONF: ""
+        PYTORCH_ALLOC_CONF: ""
+        SGLANG_MEMORY_SAVER_CUDA_GRAPH: "1"
+
+gconfig:
+  n_samples: 4
+  max_new_tokens: 8192
+  # Bound the full prompt + completion, not just the completion, to 8K.
+  max_tokens: 8191
+
+actor:
+  path: ${oc.env:QWEN3_5_122B_A10B_MODEL_PATH}
+  mb_spec:
+    n_mbs: 1
+    max_tokens_per_mb: 8192
+    n_mbs_divisor: 1
+  optimizer:
+    type: dist_muon
+    warmup_steps: 0
+    muon:
+      momentum: 0.95
+      num_ns_steps: 5
+      tp_mode: duplicated
+  megatron:
+    use_precision_aware_optimizer: false
+    cpu_staged_offload:
+      enabled: true
+      buffer_count: 1
+      bucket_size_mb: 128
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: false
+    disable_grad_buffers_cpu_backup: true
+    async_save: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    recompute_modules: null
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 128
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        NCCL_NVLS_ENABLE: "0"
+        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+sglang:
+  # Keep the 8191-token generation budget; reserve room for resumed inputs.
+  context_length: 8208
+  mem_fraction_static: 0.4
+  dp_size: 1
+  ep_size: 8
+  enable_dp_attention: false
+  max_running_requests: 32
+  cuda_graph_max_bs: 32
+  log_level: info
+  decode_log_interval: 100
+
+train_dataset:
+  batch_size: 8
+  max_length: 2048
+  num_workers: 0
+
+stats_logger:
+  wandb:
+    mode: online
+
+memory_profiler:
+  profile_steps: []

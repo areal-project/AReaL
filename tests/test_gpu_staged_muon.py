@@ -65,6 +65,19 @@ def test_muon_owned_matrices_are_indivisible_pinned_slab_units() -> None:
         for value in optimizer.state[param].values():
             assert value.device.type == "cpu"
             assert value.dtype is torch.float32
+    optimizer.drain()
+    for param in params:
+        assert (
+            optimizer.get_full_parameter_master(param)
+            is optimizer.state[param]["master_param"]
+        )
+    unowned = torch.nn.Parameter(torch.ones(2, 2))
+    assert optimizer.get_full_parameter_master(unowned) is None
+    assert unowned not in optimizer.state
+    saved = optimizer.state[params[0]]["master_param"]
+    optimizer.state[params[0]]["master_param"] = saved.flatten()[:1]
+    assert optimizer.get_full_parameter_master(params[0]) is None
+    optimizer.state[params[0]]["master_param"] = saved
     first_state = optimizer.state[params[0]]["master_param"]
     assert (
         first_state.untyped_storage().data_ptr()
@@ -157,10 +170,12 @@ def test_muon_gpu_residency_is_bounded_by_max_unit_not_total_state() -> None:
 
 @pytest.mark.parametrize("use_nesterov", [False, True])
 @pytest.mark.parametrize("schedule_hyperparameters", [False, True])
+@pytest.mark.parametrize("master_writer", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_muon_steps_match_official_tensor_parallel_muon(
     use_nesterov: bool,
     schedule_hyperparameters: bool,
+    master_writer: bool,
 ) -> None:
     """Staged updates match native Muon with fixed or scheduled settings."""
     torch.manual_seed(20260829)
@@ -198,6 +213,15 @@ def test_muon_steps_match_official_tensor_parallel_muon(
         native_optimizer=baseline,
     )
     staged.bind_owned_params(staged.param_groups)
+    written = {}
+    if master_writer:
+
+        def write(parameter, master):
+            written[id(parameter)] = master.clone()
+
+        for param in staged_params:
+            param._weftmoe_fp8_writer = write
+            param.untyped_storage().resize_(0)
 
     for step in range(5):
         if schedule_hyperparameters:
@@ -235,12 +259,22 @@ def test_muon_steps_match_official_tensor_parallel_muon(
                 rtol=3e-6,
                 atol=3e-6,
             )
-            torch.testing.assert_close(
-                staged_param,
-                baseline_param.detach().bfloat16(),
-                rtol=0.0,
-                atol=0.0,
-            )
+            if master_writer:
+                assert staged_param.untyped_storage().nbytes() == 0
+                assert written[id(staged_param)].dtype == torch.float32
+                torch.testing.assert_close(
+                    written[id(staged_param)],
+                    baseline_param.detach(),
+                    rtol=3e-6,
+                    atol=3e-6,
+                )
+            else:
+                torch.testing.assert_close(
+                    staged_param,
+                    baseline_param.detach().bfloat16(),
+                    rtol=0.0,
+                    atol=0.0,
+                )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
