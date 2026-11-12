@@ -158,6 +158,15 @@ Local timeouts and cancellations without a remote terminal result contribute onl
 call metrics. Reward metrics retain their valid-export denominator, exposed as
 `rollout/reward_sample_count`; they must not be used as the task-failure denominator.
 
+Verified model-attributed Harness failures additionally record
+`rollout/harness_error/tool_call_argument_bytes_exceeded` and
+`rollout/harness_error/empty_completion`. The compatibility metric
+`rollout/harness_error/tool_call_budget_exceeded_rate` reports the same argument-budget
+cause. Their denominator includes all terminal task results, including successful ones;
+failures count even if no trainable trajectory can be exported. Unhealthy receipts and
+system failures are excluded from these model-cause numerators. Episode metadata carries
+`harness_failure_reason` when one of these causes is identified.
+
 For single-controller Arena training, the same attempt and terminal-result metrics are
 available under `rollout/stream/<name>/`, including `harness_error`, `task_error`,
 outcome codes, `task_attempt_count`, and `task_result_count`. Each Arena stream uses its

@@ -2785,3 +2785,48 @@ def _whitebox_deadline_error():
         "native_receipt_synthesized": False,
     }
     return error
+
+
+@pytest.mark.parametrize("failure", ["tool_argument_budget", "empty_completion", None])
+def test_arena_failure_reason_rates_include_successes_in_denominator(
+    monkeypatch, failure
+):
+    """Dedicated cause rates count every terminal task, including successful ones."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    agent = ArenaStreamAgentWorkflow(
+        econfig={
+            "arena_base_url": "https://arena.example",
+            "arena_streams": [{"name": "test", "stream_id": "stream"}],
+        }
+    )
+    metrics = {}
+    monkeypatch.setattr(
+        "examples.swe.arena_agent._record_arena_metrics",
+        lambda **values: metrics.update(values),
+    )
+    if failure == "tool_argument_budget":
+        error = _core_tool_argument_budget_failure_error()
+    elif failure == "empty_completion":
+        error = _core_model_failure_error(
+            "LLM_RESPONSE_FAILED",
+            "empty_completion",
+            "model stopped without visible output or tool calls",
+        )
+    else:
+        error = None
+    result = (
+        error.result
+        if error
+        else ArenaTaskResult(task_id="success", status="OK", score=0.5)
+    )
+    agent._task_result.set(result)
+    agent._record_attempt_metrics({}, error)
+    for reason in ("tool_call_argument_bytes_exceeded", "empty_completion"):
+        expected = "tool_argument_budget" if reason.startswith("tool_call") else reason
+        assert metrics[f"harness_error/{reason}"] == float(failure == expected)
+    metadata = agent.get_episode_metadata()
+    assert metadata.get("harness_failure_reason") == (
+        "tool_call_argument_bytes_exceeded"
+        if failure == "tool_argument_budget"
+        else failure
+    )
