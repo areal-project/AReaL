@@ -1,0 +1,34 @@
+areal/infra/controller/rollout_controller.py
+  s_5ffc08691846bc::t_490a878a1765af 1333-1335
+areal/trainer/rl_trainer.py
+  s_5ffc08691846bc::t_15247235145001 1720-1722
+areal/engine/awex/plugins/sglang_plugin.py
+  s_5ffc08691846bc::t_15247235145001 28,37,310,341-358,364-368
+  s_5ffc08691846bc::t_ff43640924c0be 359-363
+  s_5ffc08691846bc::t_669ce7c8877050 369-372
+tests/test_stream_rollout_controller.py
+  s_5ffc08691846bc::t_ff43640924c0be 211-212,215,217-219,225-279
+  s_5ffc08691846bc::t_917957a593042f 280-301
+areal/engine/sglang_remote.py
+  s_5ffc08691846bc::t_15247235145001 3,7,11,112-131,141-149,580-584,644-647
+  s_5ffc08691846bc::t_ff43640924c0be 132-140
+  s_5ffc08691846bc::t_9b6e05e0a5db0c 648-652
+areal/infra/remote_inf_engine.py
+  s_5ffc08691846bc::t_6c317e985c17da 1900,1906,1908-1911
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "41d3aafba2eab720e0649098af23f98f00261621",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
