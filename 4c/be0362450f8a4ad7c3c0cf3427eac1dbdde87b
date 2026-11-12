@@ -1,0 +1,24 @@
+tests/test_stream_train_controller.py
+  s_5ffc08691846bc::t_485816e42ebe05 89-99,106
+areal/infra/controller/train_controller.py
+  s_5ffc08691846bc::t_485816e42ebe05 796,798-800,804-817
+  s_5ffc08691846bc::t_ca351bdab85945 818-820
+areal/engine/megatron_engine.py
+  s_5ffc08691846bc::t_485816e42ebe05 4781-4782,4790,4799-4804
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4cbe0362450f8a4ad7c3c0cf3427eac1dbdde87b",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
