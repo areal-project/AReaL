@@ -1,0 +1,21 @@
+examples/stream_trainer/README.md
+  s_5ffc08691846bc::t_c5254668e00630 74-78,92-132
+tests/torchrun/run_megatron_stream_update.py
+  s_5ffc08691846bc::t_9dea635d869aef 12,36-179,312-314,319-320,340-344,350-353,391-400,402,404,433,435,438,442-473,475-498,503-506,512-517,519,522-526
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b9494e9531e181b74eefc37196448d3b2b0288e5",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
