@@ -1,0 +1,22 @@
+examples/stream_trainer/run_warmup_gpu.sh
+  s_5ffc08691846bc::t_187c46632571e9 1-9
+tests/torchrun/run_megatron_stream_update.py
+  s_5ffc08691846bc::t_5feeff203a8a74 712-714,726-728,760-761,775-778
+  s_5ffc08691846bc::t_86ce1f5efc1b43 779-780
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7c0f06a148f6f932e5d3f39aa9790f562e3b5a20",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
