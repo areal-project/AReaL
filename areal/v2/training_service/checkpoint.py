@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Full, fixed-layout checkpoint sidecars for unmodified native train engines."""
+"""Full checkpoint sidecars, with explicit fixed-TP Megatron DP migration."""
 
 from __future__ import annotations
 
@@ -17,6 +17,62 @@ from .runtime_state import (
 )
 
 Backend = Literal["megatron"]
+
+
+def _load_runtime(
+    engine: Any, root: Path, source_world_size: int | None
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Map DP coordinates while preserving TP; never copy optimizer shards here."""
+    if source_world_size is None or source_world_size == engine.world_size:
+        return json.loads((root / f"runtime-{engine.rank}.json").read_text()), None
+    from areal.api.alloc_mode import ModelAllocation
+
+    layout = json.loads((root / "actor-layout.json").read_text())
+    allocation = ModelAllocation.from_str(layout["backend"])
+    source = allocation.parallel
+    target = engine.parallel_strategy
+    if (
+        allocation.backend != "megatron"
+        or type(source_world_size) is not int
+        or source_world_size < 1
+        or layout["world_size"] != source_world_size
+        or source.world_size != source_world_size
+        or target.world_size != engine.world_size
+        or source.tp_size != target.tp_size
+        or any(
+            getattr(parallel, dimension) != 1
+            for parallel in (source, target)
+            for dimension in ("pp_size", "cp_size", "ep_size", "etp_size")
+        )
+    ):
+        raise ValueError("Checkpoint migration supports only DP changes with fixed TP")
+    source_rank = engine.rank % source_world_size
+    state = json.loads((root / f"runtime-{source_rank}.json").read_text())
+    if (state["rank"], state["world_size"]) != (source_rank, source_world_size):
+        raise ValueError("Source runtime does not match the saved DP layout")
+    # Every source rank must agree on the global scheduler/version contract,
+    # including ranks that disappear on shrink. Rank-local RNG is mapped below.
+    common = (
+        "format_version",
+        "policy_version",
+        "backend",
+        "identity_sha256",
+        "lr_scheduler",
+        "optimizer_group_lrs",
+    )
+    for rank in range(source_world_size):
+        peer = json.loads((root / f"runtime-{rank}.json").read_text())
+        if (peer["rank"], peer["world_size"]) != (rank, source_world_size) or any(
+            peer.get(key) != state.get(key) for key in common
+        ):
+            raise ValueError("Source ranks disagree on the checkpoint training state")
+    migration = {
+        "source_rank": source_rank,
+        "source_world_size": source_world_size,
+        "source_state_sha256": recovery_digest(state),
+        "rng_policy": "dp-coordinate-modulo-v1",
+    }
+    return {**state, "rank": engine.rank, "world_size": engine.world_size}, migration
 
 
 def _tracker() -> Any:
@@ -95,6 +151,7 @@ def inspect_full_checkpoint(
     identity_sha256: str,
     version: int,
     loading: bool = False,
+    source_world_size: int | None = None,
 ) -> dict[str, Any]:
     """Collective-free preflight; every rank must pass before any rank loads."""
     if backend != "megatron" or type(version) is not int or version < 1:
@@ -119,7 +176,7 @@ def inspect_full_checkpoint(
                 "Megatron requires full distributed optimizer/scheduler checkpoint support"
             )
     if loading:
-        state = json.loads((root / f"runtime-{engine.rank}.json").read_text())
+        state, migration = _load_runtime(engine, root, source_world_size)
         if (
             state.get("format_version"),
             state.get("rank"),
@@ -151,7 +208,10 @@ def inspect_full_checkpoint(
         if engine.get_version() != version:
             raise ValueError("Worker version does not match the checkpoint update")
         state = _capture(engine, backend, identity_sha256)
-    return _report(state)
+    report = _report(state)
+    if loading and migration is not None:
+        report["migration"] = migration
+    return report
 
 
 def save_full_checkpoint(
@@ -192,6 +252,7 @@ def load_full_checkpoint(
     backend: Backend,
     identity_sha256: str,
     version: int,
+    source_world_size: int | None = None,
 ) -> dict[str, Any]:
     from areal.api.io_struct import SaveLoadMeta
 
@@ -202,8 +263,9 @@ def load_full_checkpoint(
         identity_sha256=identity_sha256,
         version=version,
         loading=True,
+        source_world_size=source_world_size,
     )
-    state = json.loads((Path(path) / f"runtime-{engine.rank}.json").read_text())
+    state, migration = _load_runtime(engine, Path(path), source_world_size)
     engine.load(
         SaveLoadMeta(path=str(Path(path) / "dcp"), weight_format="dcp", with_optim=True)
     )
@@ -230,4 +292,7 @@ def load_full_checkpoint(
             "Full checkpoint runtime state was not restored exactly: "
             + ", ".join(different_fields)
         )
-    return _report(actual)
+    report = _report(actual)
+    if migration is not None:
+        report["migration"] = migration
+    return report

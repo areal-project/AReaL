@@ -605,7 +605,8 @@ class TrainerReconfiguration:
 
     @property
     def actor_backend(self):
-        return self.actor.config.backend
+        # Remains valid between releasing and restoring Actor during a switch.
+        return str(replace(self.allocation, name=None))
 
     @property
     def weight_meta(self):
@@ -645,8 +646,11 @@ class TrainerReconfiguration:
 
     @property
     def supports_resource_reconfiguration(self):
-        # Full Megatron layout changes need a separate checkpoint/engine mapping.
-        return False
+        parallel = self.allocation.parallel
+        return self.managed_rollout and all(
+            getattr(parallel, dimension) == 1
+            for dimension in ("pp_size", "cp_size", "ep_size", "etp_size")
+        )
 
     def control_snapshot(self):
         failed = self.trainer._training_failed
@@ -669,14 +673,25 @@ class TrainerReconfiguration:
             return
         if not self.supports_resource_reconfiguration:
             raise ValueError(
-                "Native Megatron layout changes are not implemented; use CPU Simulation"
+                "Native layout changes require managed TP1 Rollout and fixed Actor TP/PP1/CP1/EP1"
             )
         if not set(target.actor_devices + target.rollout_devices) <= set(
             self.resource_reservation
         ):
             raise ValueError("Target exceeds the original GPU reservation")
-        if self.config.train_dataset.batch_size % target.world_size:
+        tp = self.allocation.parallel.tp_size
+        if target.world_size != len(target.actor_devices) or target.world_size % tp:
+            raise ValueError("Actor GPU pool must exactly fit the fixed TP layout")
+        if self.config.train_dataset.batch_size % (target.world_size // tp):
             raise ValueError("Actor DP must divide the logical training batch")
+        megatron = self.config.actor.megatron
+        if target.world_size != self.actor_world_size and (
+            not megatron.ddp.use_distributed_optimizer
+            or not megatron.use_checkpoint_opt_param_scheduler
+        ):
+            raise ValueError(
+                "DP changes require distributed optimizer and scheduler checkpoints"
+            )
         if (
             target.actor_devices != self.actor_devices
             or target.rollout_devices != self.rollout_devices
@@ -700,10 +715,31 @@ class TrainerReconfiguration:
 
     def _set_execution_layout(self, target):
         self.validate_execution_layout(target)
+        from areal.api.alloc_mode import ModelAllocation
+
+        parallel = replace(
+            self.allocation.parallel,
+            data_parallel_size=target.world_size // self.allocation.parallel.tp_size,
+        )
+        if target.actor_devices != self.actor_devices:
+            if self.actor is not None:
+                raise RuntimeError("Release Actor before changing its GPU pool")
+            self.trainer.scheduler.set_gpu_pool(list(target.actor_devices))
+        self.trainer.actor_alloc = replace(self.allocation, parallel=parallel)
+        # Preserve the original config as the run's checkpoint compatibility
+        # contract; live allocations describe the current physical layout.
+        rollout = ModelAllocation.from_str(self.config.rollout.backend, name="rollout")
+        rollout.parallel = replace(
+            rollout.parallel, data_parallel_size=len(target.rollout_devices)
+        )
+        self.trainer.rollout_alloc = rollout
+        if self.rollout is not None:
+            self.rollout.rollout_alloc = rollout
         self.actor_devices, self.rollout_devices = (
             target.actor_devices,
             target.rollout_devices,
         )
+        self.gpu_uuids = tuple(resolve_gpu_uuids(list(self.actor_devices)))
 
     def save_checkpoint(self, *, reason):
         version = self.applied_version
@@ -751,9 +787,9 @@ class TrainerReconfiguration:
         if self.actor is not None:
             return self.actor
         config = deepcopy(self.config.actor)
-        if self.latest_manifest["world_size"] != self.actor_world_size:
-            raise ValueError("Megatron restore requires the saved execution layout")
-        config.backend = self.config.actor.backend
+        source_world_size = self.latest_manifest["world_size"]
+        allocation = replace(self.allocation, name=None)
+        config.backend = str(allocation)
         self.trainer._initialize_reconfigured_actor(config, self.ft_spec)
         self.last_restore_reports = self.actor.full_checkpoint(
             "load",
@@ -761,6 +797,7 @@ class TrainerReconfiguration:
             backend=self.allocation.backend,
             identity_sha256=self.identity,
             version=self.checkpoint_version,
+            source_world_size=source_world_size,
         )
         self.generation += 1
         if connect_weights:

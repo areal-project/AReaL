@@ -844,6 +844,7 @@ class GatewayTrainController:
         backend: str,
         identity_sha256: str,
         version: int,
+        source_world_size: int | None = None,
     ) -> list[dict[str, Any]]:
         """Save/load full Megatron state; inspect all ranks before collectives."""
         self._ensure_initialized()
@@ -855,6 +856,10 @@ class GatewayTrainController:
             "identity_sha256": identity_sha256,
             "version": version,
         }
+        if source_world_size is not None:
+            if operation != "load":
+                raise ValueError("Source world size is only valid when loading")
+            kwargs["source_world_size"] = source_world_size
 
         async def all_ranks(
             endpoint: str, parameters: dict[str, Any]
