@@ -1,0 +1,21 @@
+areal/engine/megatron_utils/actor_warmup.py
+  s_5ffc08691846bc::t_1dcde526f24034 130-132
+tests/torchrun/run_megatron_stream_update.py
+  s_5ffc08691846bc::t_1dcde526f24034 729-730,758-760
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e343e9cd1a6285f58cdc45bc1b15b6bddecf124d",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
