@@ -1561,6 +1561,11 @@ class TestRolloutControllerExportStats:
                     "rollout/task_attempt/success": [0.0, 0.0, 0.0],
                     "rollout/harness_success": [0.0, 0.0],
                     "rollout/harness_error": [1.0, 0.0],
+                    "rollout/stream/a/harness_success": [0.0, 1.0],
+                    "rollout/stream/a/task_error": [1.0, 0.0],
+                    "rollout/stream/a/accepted": [0.0, 1.0],
+                    "rollout/stream/a/rejected": [1.0, 0.0],
+                    "rollout/stream/a/filter_rejected": [1.0, 0.0],
                 },
             )
         )
@@ -1570,6 +1575,12 @@ class TestRolloutControllerExportStats:
         assert stats["rollout/task_attempt_count"] == 3
         assert stats["rollout/task_result_count"] == 2
         assert stats["rollout/harness_error"] == 0.5
+        assert stats["rollout/stream/a/task_result_count"] == 2
+        assert stats["rollout/stream/a/task_error"] == 0.5
+        assert stats["rollout/stream/a/group_attempt_count"] == 2
+        assert stats["rollout/stream/a/accepted_count"] == 1
+        assert stats["rollout/stream/a/rejected_count"] == 1
+        assert stats["rollout/stream/a/filter_rejected_count"] == 1
         assert controller.export_stats() == {}
 
 

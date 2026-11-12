@@ -40,6 +40,7 @@ from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.infra import workflow_context
 from areal.utils import logging, stats_tracker
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.rollout_metrics import get_arena_stream_name
 
 logger = logging.getLogger("ArenaStreamAgent")
 
@@ -1766,9 +1767,11 @@ class ArenaStreamAgentWorkflow:
             error = exc
             raise
         finally:
-            self._record_attempt_metrics(error)
+            self._record_attempt_metrics(data, error)
 
-    def _record_attempt_metrics(self, error: BaseException | None) -> None:
+    def _record_attempt_metrics(
+        self, data: dict[str, Any], error: BaseException | None
+    ) -> None:
         """Count calls and observed terminal results before trajectory filtering.
 
         Local cancellation/timeouts do not establish the remote task's outcome.
@@ -1805,6 +1808,11 @@ class ArenaStreamAgentWorkflow:
                 metrics[f"harness_error/{code}"] = float(outcome_code == code)
             metrics["harness_error/OTHER"] = float(
                 is_harness_error and outcome_code not in _GAMEAGENT_OUTCOME_METRIC_CODES
+            )
+        stream_name = get_arena_stream_name(data) or self.default_stream_name
+        if stream_name:
+            metrics.update(
+                {f"stream/{stream_name}/{key}": value for key, value in metrics.items()}
             )
         _record_arena_metrics(**metrics)
 

@@ -12,6 +12,7 @@ from areal.api.cli_args import TrainEngineConfig
 from areal.engine import FSDPEngine
 from areal.infra.platforms import current_platform
 from areal.utils.data import concat_padded_tensors, tensor_container_to
+from areal.utils.functional import gather_logprobs
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.network import find_free_ports
 from areal.utils.seeding import set_random_seed
@@ -175,16 +176,18 @@ def mock_padded_vlm_data(model_path):
             else processed_input["input_ids"]
         )
 
-        prompt_len = int(prompt_len) + int(image_input_id.shape[0])
+        text_prompt_len = int(prompt_len)
+        prompt_len = text_prompt_len + int(image_input_id.shape[0])
         ans_len = int(ans_len)
         total_len = prompt_len + ans_len
 
+        # Realistic layout: [text prompt][image tokens][text answer], loss on the
+        # answer only.
         input_ids = torch.cat(
             [
-                torch.randint(
-                    0, VOCAB_SIZE, size=(prompt_len + ans_len - len(image_input_id),)
-                ),
+                torch.randint(0, VOCAB_SIZE, size=(text_prompt_len,)),
                 image_input_id,
+                torch.randint(0, VOCAB_SIZE, size=(ans_len,)),
             ]
         )
 
@@ -198,6 +201,18 @@ def mock_padded_vlm_data(model_path):
                 }
             ],
         )
+
+        # Qwen-VL M-RoPE needs per-token modality types; text tokens are 0.
+        if "mm_token_type_ids" in processed_input:
+            image_token_types = processed_input["mm_token_type_ids"].reshape(-1)
+            dtype = image_token_types.dtype
+            seq["mm_token_type_ids"] = torch.cat(
+                [
+                    torch.zeros(text_prompt_len, dtype=dtype),
+                    image_token_types,
+                    torch.zeros(ans_len, dtype=dtype),
+                ]
+            ).unsqueeze(0)
 
         if "image_grid_thw" in processed_input:
             seq["multi_modal_input"][0]["image_grid_thw"] = processed_input[
@@ -242,6 +257,7 @@ def test_vlm_consistency(model_path):
         backend="fsdp:d1",
         path=model_path,
         dtype="bfloat16",
+        optimizer_dtype="bfloat16",
         attn_impl="flash_attention_2",
         gradient_checkpointing=False,
         disable_dropout=True,
@@ -295,7 +311,33 @@ def test_vlm_consistency(model_path):
             x2 = engine.model(**mb).logits.squeeze(0)[:-pad_len]
 
             assert x1.shape == x2.shape, f"Shape mismatch: {x1.shape} vs {x2.shape}"
-            assert_close(x1, x2, atol=2e-1, rtol=2e-1)
+
+            # Compare what training consumes: the log-prob of each answer token
+            # (loss_mask=1), scored from the previous position. An element-wise
+            # check on raw logits is too strict for VLMs: bf16 rounding from the
+            # different batch shapes moves a few of the ~150k logits per token
+            # past atol=0.2, even between two unpacked layouts. Measured on XPU
+            # (Qwen2.5-VL-3B, Qwen3-VL-2B): correct packing stays within 0.30 max
+            # / 0.062 mean |dlogp|; removing a sequence boundary or using 1-D
+            # positions for images raises the mean to >= 0.15.
+            input_ids = torch.cat(
+                [padded_input["input_ids"][i, :s] for i, s in enumerate(seqlens)]
+            )
+            loss_mask = torch.cat(
+                [padded_input["loss_mask"][i, :s] for i, s in enumerate(seqlens)]
+            ).bool()
+            ends = torch.cumsum(seqlens, 0).tolist()
+            pred_pos = torch.cat(
+                [torch.arange(e - s, e - 1) for s, e in zip(seqlens.tolist(), ends)]
+            ).to(input_ids.device)
+            pred_pos = pred_pos[loss_mask[pred_pos + 1]]
+            labels = input_ids[pred_pos + 1]
+
+            logp_padded = gather_logprobs(x1[pred_pos].float(), labels)
+            logp_packed = gather_logprobs(x2[pred_pos].float(), labels)
+            assert_close(logp_packed, logp_padded, atol=5e-1, rtol=0)
+            mean_diff = (logp_packed - logp_padded).abs().mean().item()
+            assert mean_diff <= 1e-1, f"mean |dlogp| {mean_diff:.4f} > 0.1"
     finally:
         engine.destroy()
         assert not dist.is_initialized()
