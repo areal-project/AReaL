@@ -1,0 +1,67 @@
+areal/dataset/arena_stream.py
+  s_5ffc08691846bc::t_454136a3e35067 1-41
+areal/engine/fsdp_engine.py
+  s_5ffc08691846bc::t_bd2337892e67ac 190-195
+areal/infra/controller/rollout_controller.py
+  s_adcbc22f44e746::t_69054088aac329 48,168,1431,1435-1440,1525-1559,1561,1670,1698-1700,1703-1713,1717,1723,1730,1732-1736
+areal/infra/workflow_executor.py
+  s_5ffc08691846bc::t_25d12e55afb731 90,223-225,228
+areal/utils/arena_stream_dataloader.py
+  s_5ffc08691846bc::t_58dba3e01fcb91 1-183
+areal/utils/dataloader.py
+  s_5ffc08691846bc::t_17edbeb682d2d8 11,13,22,43-58,69,83-87
+areal/utils/stats_tracker.py
+  s_5ffc08691846bc::t_ad234b310e3b1e 98-101
+examples/swe/README_arena.md
+  s_5ffc08691846bc::t_e8f5829f8cb3de 86,88-120,387-394
+examples/swe/arena_agent.py
+  s_5ffc08691846bc::t_ff319f5c0018ee 1872-1876,2316-2318,2320
+examples/swe/arena_config.py
+  s_5ffc08691846bc::t_c5f1b5b9f06c16 139,236-237
+examples/swe/arena_preflight.py
+  s_5ffc08691846bc::t_122487dcda8935 365,410,435
+examples/swe/arena_types.py
+  s_5ffc08691846bc::t_c590b92f2bb73e 32,40-46
+examples/swe/rl/qwen38_27b/train.sbatch
+  s_5ffc08691846bc::t_27ced97c3dbf05 86-87,91,101-103,127-128
+examples/swe/train_swe_rl.py
+  s_5ffc08691846bc::t_04355298e82d1c 31,33,191-196,347-359
+tests/test_arena_harness_priority.py
+  s_5ffc08691846bc::t_675bf35c572df1 1-257
+tests/test_arena_stream_dataloader.py
+  s_5ffc08691846bc::t_4d8ab788009583 1-217
+tests/test_check_trajectory_format.py
+  s_5ffc08691846bc::t_4b51a0ea42557e 1-38
+tests/test_fsdp_multimodal_batch.py
+  s_5ffc08691846bc::t_eed6f00ccacd8a 36-60
+tests/test_qwen27_arena_cleanup.py
+  s_5ffc08691846bc::t_0f1b741cf1580c 1-106
+tests/test_stats_tracker.py
+  s_5ffc08691846bc::t_ba2089003b9770 15-57
+tests/test_swe_arena_stream_dispatch.py
+  s_5ffc08691846bc::t_112047f7210176 1-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6729f1da8cd463dca190b3d39896463ed4b6e3a1",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    },
+    "s_adcbc22f44e746": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a178a2-581a-7ab0-8eac-6f6cdae307e6",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
