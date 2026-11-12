@@ -1,0 +1,21 @@
+tests/torchrun/run_megatron_stream_update.py
+  s_5ffc08691846bc::t_1200ba2f8beda1 150
+areal/engine/megatron_engine.py
+  s_5ffc08691846bc::t_1200ba2f8beda1 4846-4848
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a157580b37fdbf3985ab05bf383941cff9e75b1e",
+  "prompts": {},
+  "sessions": {
+    "s_5ffc08691846bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c897-5ff9-76e1-ae54-88480022ab2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
