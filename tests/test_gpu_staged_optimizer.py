@@ -862,3 +862,59 @@ def test_builder_preserves_all_stub_pipeline_optimizer(monkeypatch, stub_flags):
     else:
         with pytest.raises(RuntimeError, match="managed distributed optimizer"):
             build()
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
+def test_master_writer_preserves_complete_matrix_and_skips_bf16_writeback() -> None:
+    """A matrix crossing the old bucket boundary is updated and consumed once."""
+    torch.manual_seed(21)
+    params = [
+        torch.nn.Parameter(torch.randn(n, device="cuda", dtype=torch.bfloat16))
+        for n in (5, 7, 9)
+    ]
+    references = [torch.nn.Parameter(p.detach().float()) for p in params]
+    kwargs = dict(lr=0.003, betas=(0.9, 0.98), eps=1e-8, weight_decay=0.1)
+    staged = GPUStagedAdamW(
+        params, staged_config=_tiny_config(bucket_numel=8), **kwargs
+    )
+    staged.bind_owned_params(staged.param_groups)
+    baseline = torch.optim.AdamW(references, **kwargs)
+    written = []
+    staged.set_master_writers(
+        {params[1]: lambda master: written.append(master.clone())}
+    )
+    # The selected BF16 storage is absent during the step, as in the FP8 adapter.
+    storage = params[1].untyped_storage()
+    size = storage.nbytes()
+    storage.resize_(0)
+    for step in range(3):
+        for param, reference in zip(params, references, strict=True):
+            grad = torch.randn(param.shape, device="cuda")
+            param.decoupled_grad = grad
+            reference.grad = grad
+        staged.step()
+        baseline.step()
+        staged.drain()
+        assert len(written) == step + 1
+        assert storage.nbytes() == 0
+        torch.testing.assert_close(written[-1], references[1], rtol=2e-6, atol=2e-6)
+        for index in (0, 2):
+            torch.testing.assert_close(
+                params[index], references[index].bfloat16(), rtol=0, atol=0
+            )
+        for param, reference in zip(params, references, strict=True):
+            torch.testing.assert_close(
+                staged.state[param]["master_param"],
+                reference.detach().cpu(),
+                rtol=2e-6,
+                atol=2e-6,
+            )
+    storage.resize_(size)
+    staged.set_master_writers({})
+    staged.step()
+    baseline.step()
+    staged.drain()
+    assert len(written) == 3
+    torch.testing.assert_close(params[1], references[1].bfloat16(), rtol=0, atol=0)
+    with pytest.raises(ValueError, match="fitting one staging slot"):
+        staged.set_master_writers({params[2]: lambda master: None})
