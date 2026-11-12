@@ -1,0 +1,14 @@
+tests/torchrun/run_megatron_stream_update.py
+  h_0f206e897c097a 2-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "886e023c28803f6571e2de53b207065ff2229b2d",
+  "prompts": {},
+  "humans": {
+    "h_0f206e897c097a": {
+      "author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
