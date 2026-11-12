@@ -1,8 +1,8 @@
 ## SAO recipe
 
-`gsm8k_sao.yaml` is the stock-AReaL SAO math recipe (G=1 + critic +
-`rejection_sampling` mask `[0.3, 5]`), based on the PPO example path. It does
-**not** add paper K=2 critic passes or skip-observation GAE. See
+`gsm8k_sao.yaml` is the stock-AReaL SAO math recipe (G=1 + critic + `rejection_sampling`
+mask `[0.3, 5]`), based on the PPO example path. It does **not** add paper K=2 critic
+passes or skip-observation GAE. See
 [docs/en/algorithms/sao.md](../../docs/en/algorithms/sao.md) /
 [docs/zh/algorithms/sao.md](../../docs/zh/algorithms/sao.md).
 
