@@ -94,47 +94,88 @@ parsing and tool replies, native retry turns, empty responses, repeated stop tok
 streamed presentation, retry cleanup, proxy serialization and sampling validation. A
 full-vocabulary oracle checks the SC/TIS gradient using exported historical heads.
 
-## Multi-turn validation experiment
+## Synthetic sampler-mismatch stress test
 
-The following experiment exercises the math example's retry workflow with Qwen3-0.6B on
-GSM8K. Each episode allows up to two attempts. The reported training accuracy is the
-final episode's binary correctness, including successful retries.
+These are **real training runs under a synthetic sampler-mismatch stress test**. The
+fixed noise is an artificial perturbation, not a measurement of a typical production
+sampler mismatch. The experiment tests behavior under that perturbation; it does not
+establish general superiority or a production default.
 
-Both arms use the same REINFORCE objective with token-level TIS capped at 2. The control
-sets only the SC correction to zero; it is not the default clipped PPO objective. Both
-collect the same head width, 128. Binary rewards are mapped to -1/+1 before
-within-prompt mean subtraction.
+Qwen3-0.6B is trained on GSM8K with a single-turn math agent or a multi-turn math agent
+allowing up to two attempts total, with incorrect-answer feedback before the second
+attempt. Training accuracy is binary episode success under the noisy sampler, including
+successful retries for multi-turn. Clean evaluation uses unperturbed current weights on
+64 held-out questions every 20 updates and after the final update. Compare methods
+within each workflow; the two workflows have different retry and token budgets.
+
+All six runs completed 300 updates with seed 0, 64 questions x 8 responses per update,
+at most 1024 new tokens per turn, thinking disabled, and Megatron TP=CP=PP=1 with
+SGLang. Adam uses learning rate `1.7e-5` and weight decay `0.017`. Binary correctness is
+mapped to -1/+1 before within-prompt mean subtraction. All arms use REINFORCE, without
+PPO clipping, normalized by the original generated-token count.
+
+- **SC + TIS:** token-level importance weights capped at 2, with the top-128 SC
+  correction.
+- **TIS only:** the same weighting and logprob computation path, with only the SC
+  correction zeroed.
+- **IcePop only:** retain the importance ratio inside `[0.5, 5]`, otherwise zero it; SC
+  is disabled. This uses the native logprob path. Sampler heads are still collected for
+  auditing.
+
+The TIS pair isolates the SC correction. IcePop is an additional weighting baseline, not
+an isolated SC ablation: both its weighting rule and logprob computation path differ.
+**These runs do not evaluate SC + IcePop, and this PR does not add that combination.**
 
 A fixed Gaussian perturbation is created once from the initial weights:
 `delta = 0.02 * initial_weights * Normal(0, 1)`. After each trainer update, the sampler
-loads the current weights plus that same perturbation. Noise is seeded per parameter,
-shared by tied embeddings/output weights and stored in BF16. The trainer and held-out
-evaluation use unperturbed current weights. The arms use the same seed and perturbation,
-but asynchronous sampling does not guarantee identical trajectories.
+loads current weights plus that same perturbation. Noise is seeded per parameter, shared
+by tied embeddings/output weights and stored in BF16. Trainer and evaluation weights
+remain unperturbed. Within each workflow, methods share the data schedule, model,
+optimizer, seed and perturbation construction; independently sampled trajectories
+diverge during training.
 
-The configuration uses seed 0, 64 questions x 8 responses per update, at most 1024 new
-tokens per turn, thinking disabled, and Megatron TP=CP=PP=1 with SGLang. Adam uses
-learning rate `1.7e-5` and weight decay `0.017`. Each run targets 300 updates; clean
-held-out evaluation uses 64 questions every 20 updates. These settings adapt the fixed
-sampler-mismatch stress test to the math example.
+![Single-turn GSM8K training and clean evaluation under synthetic sampler mismatch](score_centering_agentic_single_noise002.png)
 
-![Multi-turn GSM8K training accuracy under fixed sampler weight noise](score_centering_agentic_multiturn_noise002.png)
+![Multi-turn GSM8K training and clean evaluation under synthetic sampler mismatch](score_centering_agentic_multiturn_noise002.png)
 
-The orange curve uses SC and TIS; the green curve uses TIS without the SC correction
-(`uncentered` in the legend). SC completed 300 training updates. The control was still
-running when the accompanying data snapshot was collected, with 260 updates recorded.
-Its recorded training accuracy is zero from step 125 through step 259. Over the shared
-window of steps 240-259, mean training accuracy is **34.3% with SC and 0% for the
-control**.
+Faint training lines show every recorded update; bold lines show a trailing 10-update
+mean. Evaluation points are unsmoothed. All figures use the same 0–100% accuracy scale;
+no confidence intervals are implied.
 
-SC also degrades late in this run: its final 20 training updates average **19.1%**, and
-its final clean held-out accuracy is **21.9%**, below its initial **59.4%**. This
-single-seed experiment supports retaining training signal longer under this specific
-mismatch. It does not establish general superiority, prevent all degradation, or measure
-tool-task learning. Text-tool support has separate unit and live-generation checks. No
-throughput claim is made.
+| Workflow                        | Method                 | Mean training accuracy, steps 280–299 | Clean evaluation, step 300 |
+| ------------------------------- | ---------------------- | ------------------------------------: | -------------------------: |
+| Single-turn                     | SC + TIS (cap 2)       |                                  2.2% |                       3.1% |
+| Single-turn                     | TIS only (cap 2)       |                                 40.7% |                      40.6% |
+| Single-turn                     | IcePop only \[0.5, 5\] |                                 20.4% |                      18.8% |
+| Multi-turn (up to two attempts) | SC + TIS (cap 2)       |                                 19.1% |                      21.9% |
+| Multi-turn (up to two attempts) | TIS only (cap 2)       |                                  0.0% |                       0.0% |
+| Multi-turn (up to two attempts) | IcePop only \[0.5, 5\] |                                 44.6% |                      35.9% |
 
-The [sanitized metric snapshot](score_centering_agentic_multiturn_results.json) contains
-the setup and per-step values without account links or deployment paths. The learning
-runs used the implementation before rebasing onto current main; regression checks on the
-rebased PR are reported separately.
+**Results are mixed.** SC + TIS retains more reward than TIS-only in multi-turn, but
+falls to near-zero accuracy and finishes substantially worse in single-turn. IcePop-only
+finishes ahead of SC + TIS in both workflows, while TIS-only finishes ahead of IcePop in
+single-turn. Single-turn IcePop also passes through a near-zero interval before
+recovering, so endpoint rankings do not describe the entire trajectory. The table uses
+the same final 20 training updates for every run; its training means are distinct from
+the final clean-model evaluation.
+
+The reason for the different rankings is **not established by these runs**. Score
+centering targets expected-score drift under the sampling distribution; that property
+does not guarantee better task reward than every weighting rule. One seed, differing
+trajectories, and the change of weighting and logprob path in the IcePop baseline
+prevent attributing the gap to a single cause. The top-128 tail approximation is another
+limitation; these results do not establish it as the cause of the single-turn collapse.
+
+All six runs also show heavy late response truncation: over the final 20 updates, the
+fraction of episodes whose final model response ended at the length limit exceeds 99% in
+every arm. Retained verifier reward therefore must not be read as healthy generation or
+general training stability. These curves provide behavior evidence for the integration,
+alongside separate functional and gradient tests. They do not prove universal
+performance gains, measure text-tool task learning, or support a throughput claim.
+
+The sanitized [single-turn metrics](score_centering_agentic_single_results.json) and
+[multi-turn metrics](score_centering_agentic_multiturn_results.json) include the setup,
+raw per-step values and summary calculations, without account links or deployment paths.
+All 300 training-accuracy values in every run were checked against the experiment
+tracking history and matched exactly. Learning runs used the feature implementation
+before its upstream rebase/merge; PR-tree regression validation is separate.
