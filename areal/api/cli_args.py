@@ -1028,6 +1028,18 @@ class MegatronEngineConfig:
     )
     use_checkpoint_opt_param_scheduler: bool = True
 
+    # Keep a string annotation: OmegaConf structured configs do not support Literal.
+    attention_backend: str | None = field(
+        default=None,
+        metadata={
+            "help": "Megatron attention backend for both SFT and RL training: "
+            "'auto', 'flash', 'fused', or 'unfused'. None preserves the model "
+            "bridge and deterministic-mode defaults. 'flash' disables cuDNN "
+            "fused attention without enabling deterministic mode. This does "
+            "not configure rollout attention or pin a FlashAttention version.",
+        },
+    )
+
     # Deterministic Option
     # NOTE: This option forces torch to use deterministic algorithms,
     # which makes sure that two forward passes with the same input
@@ -1256,6 +1268,19 @@ class MegatronEngineConfig:
     )
 
     def __post_init__(self) -> None:
+        if self.attention_backend not in (None, "auto", "flash", "fused", "unfused"):
+            raise ValueError(
+                "megatron.attention_backend must be one of "
+                "None, 'auto', 'flash', 'fused', or 'unfused'"
+            )
+        if self.use_deterministic_algorithms and self.attention_backend not in (
+            None,
+            "flash",
+        ):
+            raise ValueError(
+                "megatron.use_deterministic_algorithms=True requires "
+                "attention_backend=None or 'flash'"
+            )
         if (
             self.freeze_vision_model is not None
             or self.freeze_vision_projection is not None

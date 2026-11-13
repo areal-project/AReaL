@@ -1522,7 +1522,9 @@ class PPOTrainer:
 
         # Disable some environ for NCCL weight update.
         for spec in self.config.actor.scheduling_spec:
-            spec.env_vars["NCCL_CUMEM_ENABLE"] = "0"
+            spec.env_vars["NCCL_CUMEM_ENABLE"] = (
+                "1" if spec.env_vars.get("AREAL_USE_WEFTMOE") == "1" else "0"
+            )
             spec.env_vars["NCCL_NVLS_ENABLE"] = "0"
 
     def _amend_deterministic_envvar(self):
