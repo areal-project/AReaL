@@ -16,6 +16,9 @@ from areal.engine._sglang_source_patch import (
     installed_sglang_root,
     patch_source,
 )
+from areal.utils import logging
+
+logger = logging.getLogger("SGLangWrapper")
 
 _BOOTSTRAP = "areal.engine.sglang_model_patches"
 _ENTRYPOINTS = (
@@ -23,6 +26,15 @@ _ENTRYPOINTS = (
     "areal.engine.awex.plugins.sglang_plugin",
     "sglang.launch_server",
 )
+_GDN_MODEL_TYPES = {
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "qwen3_next",
+    "qwen4_exp",
+    "qwen4_exp_text",
+}
 
 
 # Qwen3.8-27B runtime patches ported from e055262d6d/d782649682 on
@@ -203,12 +215,16 @@ def wrap_server_command(command: list[str]) -> list[str]:
 
 
 def apply_model_patches(server_args: Sequence[str]) -> None:
-    """Apply model-specific preprocessing fixes, independent of model path."""
+    """Prepare validated GDN, Flash Next and optional CPU processor patches."""
     if "--help" in server_args or "-h" in server_args:
         return
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--model-path", "--model")
     parser.add_argument("--revision")
+    # Match the pinned SGLang and supported SM90 runtimes: decode inherits
+    # the general backend, whose default is Triton. Unset is not FlashInfer.
+    parser.add_argument("--linear-attn-backend", default="triton")
+    parser.add_argument("--linear-attn-decode-backend")
     args, _ = parser.parse_known_args(server_args)
     if not args.model_path:
         return  # Allow the original entry point to handle --help/argument errors.
@@ -240,15 +256,39 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
     if _matches_qwen38_27b(config):
         _apply_qwen38_runtime_patches(installed_sglang_root())
 
-    if config.get("model_type") in sglang_qwen_vl_cpu.MODEL_TYPES:
-        # Let existing SGLang installations and third-party processors run
-        # unchanged. Users explicitly select this integration in the server
-        # environment; spawned tokenizer workers inherit that selection.
-        package = "areal.engine.sglang_processors"
-        if os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE") != package:
-            return
-        root = installed_sglang_root()
-        install_source_patches(
+    # The optional processor integration and default GDN protection are
+    # independent: opting out of one must not suppress the other.
+    cpu_processor_enabled = (
+        config.get("model_type") in sglang_qwen_vl_cpu.MODEL_TYPES
+        and os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE")
+        == "areal.engine.sglang_processors"
+    )
+    patches = []
+    if config.get("model_type") == "qwen4_exp":
+        from areal.engine import (
+            sglang_mm_executor,
+            sglang_qsa_compress_gather,
+            sglang_qwen4_vl,
+        )
+
+        patches.extend(
+            (sglang_mm_executor, sglang_qsa_compress_gather, sglang_qwen4_vl)
+        )
+    decode_backend = args.linear_attn_decode_backend or args.linear_attn_backend
+    if config.get("model_type") in _GDN_MODEL_TYPES and decode_backend == "flashinfer":
+        from areal.engine import sglang_gdn_decode_padding
+
+        sglang_gdn_decode_padding.validate_flashinfer_version()
+        patches.append(sglang_gdn_decode_padding)
+    if not patches and not cpu_processor_enabled:
+        return
+
+    root = installed_sglang_root()
+    source_patches = [
+        (root / patch.TARGET_RELATIVE, patch.patched_source) for patch in patches
+    ]
+    if cpu_processor_enabled:
+        source_patches.extend(
             [
                 (
                     root / sglang_qwen_vl_cpu.TARGET_RELATIVE,
@@ -258,25 +298,14 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
                     root / sglang_qwen_vl_cpu.BASE_RELATIVE,
                     sglang_qwen_vl_cpu.patched_base_source,
                 ),
-            ],
-            lock_path=root / ".areal-sglang-patches.lock",
+            ]
         )
-        return
-    if config.get("model_type") != "qwen4_exp":
-        return
-
-    from areal.engine import (
-        sglang_mm_executor,
-        sglang_qsa_compress_gather,
-        sglang_qwen4_vl,
-    )
-
-    root = installed_sglang_root()
-    patches = (sglang_mm_executor, sglang_qsa_compress_gather, sglang_qwen4_vl)
     install_source_patches(
-        [(root / patch.TARGET_RELATIVE, patch.patched_source) for patch in patches],
+        source_patches,
         lock_path=root / ".areal-sglang-patches.lock",
     )
+    for patch in patches:
+        logger.info("Verified SGLang source patch: %s", root / patch.TARGET_RELATIVE)
 
 
 def main() -> None:
