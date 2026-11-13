@@ -1275,6 +1275,11 @@ if __name__ == "__main__":
 
     _load_sglang_plugins_if_available()
     server_args = prepare_server_args(sys.argv[1:])
+    from areal.v2.inference_service.sglang.launch_server import (
+        normalize_rocm_attention_backend,
+    )
+
+    normalize_rocm_attention_backend(server_args)
     # In AWEX colocated mode the scheduler may not be able to serve requests
     # until the first weight sync (actor holds GPUs / writer version not yet
     # published). SGLang's warmup request would then hang for 600s

@@ -495,3 +495,57 @@ def test_legacy_launcher_rejects_workers_without_initializers(monkeypatch, unsup
     )
     with pytest.raises(ValueError, match="Legacy sampling mask launcher"):
         main()
+
+
+@pytest.mark.parametrize(
+    "entry", ["sglang.launch_server", "areal.engine.awex.plugins.sglang_plugin"]
+)
+@pytest.mark.parametrize("hip_version", [None, "7.15.0"])
+def test_legacy_launcher_starts_http_with_real_backend_normalizer(
+    monkeypatch, entry, hip_version
+):
+    """Exercise successful launch, including the AWEX helper dependency."""
+    from areal.engine.sglang_sampling_mask_launcher import main, run_scheduler_process
+
+    monkeypatch.setenv("AREAL_SAMPLING_MASK_ENTRYPOINT", entry)
+    monkeypatch.setattr(torch.version, "hip", hip_version)
+    events = []
+    monkeypatch.setattr(plugin, "register", lambda: events.append("register"))
+    install_module(
+        monkeypatch,
+        "areal.engine.awex.plugins.sglang_plugin",
+        _load_sglang_plugins_if_available=lambda: events.append("awex"),
+    )
+    args = SimpleNamespace(
+        grpc_mode=False,
+        encoder_only=False,
+        use_ray=False,
+        tokenizer_worker_num=1,
+        attention_backend="fa3",
+        enable_deterministic_inference=False,
+        skip_server_warmup=False,
+    )
+    launched = []
+    install_module(
+        monkeypatch,
+        "sglang.srt.entrypoints.http_server",
+        launch_server=lambda *a, **kw: launched.append((a, kw)),
+    )
+    install_module(
+        monkeypatch, "sglang.srt.server_args", prepare_server_args=lambda argv: args
+    )
+    install_module(
+        monkeypatch,
+        "sglang.srt.utils",
+        kill_process_tree=lambda *a, **kw: events.append("cleanup"),
+    )
+
+    main()
+
+    awex = entry == "areal.engine.awex.plugins.sglang_plugin"
+    assert events == (["awex"] if awex else []) + ["register", "cleanup"]
+    assert args.attention_backend == ("aiter" if awex and hip_version else "fa3")
+    assert args.skip_server_warmup is awex
+    assert launched == [
+        ((args,), {"run_scheduler_process_func": run_scheduler_process})
+    ]
