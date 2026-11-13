@@ -1,0 +1,49 @@
+areal/api/cli_args.py
+  s_125ac839b9f4bb::t_ae8add1db44371 927-950,2683-2688,2826-2830,2860-2861
+areal/engine/awex/adapters/megatron_adapter.py
+  s_125ac839b9f4bb::t_f5eca25b9dc24a 205-216,252-253
+areal/engine/awex/adapters/sglang_adapter.py
+  s_125ac839b9f4bb::t_5dbd3b875c88cd 336,583-589,600-610,627-647,748,750-751,754-788,800-802,809-811,878-879,897-903,1001-1002,1019,1249,1278-1279,1292,1296-1305,1489-1490,1511
+areal/engine/awex/qwen3_5_fp8.py
+  s_125ac839b9f4bb::t_b22d74c778e878 1-502
+areal/engine/megatron_engine.py
+  s_125ac839b9f4bb::t_51889b13f48608 2858,2867,2869-2889
+areal/engine/megatron_utils/qwen3_5_fp8.py
+  s_125ac839b9f4bb::t_b2f44ecd559265 1-47
+areal/models/mcore/registry.py
+  s_125ac839b9f4bb::t_fa76ca4f1bff30 467-476
+areal/tools/prepare_qwen35_fp8.py
+  s_125ac839b9f4bb::t_6a431864da21dd 1-108
+areal/utils/logging.py
+  s_125ac839b9f4bb::t_bd232abed16083 147
+docs/en/cli_reference.md
+  s_125ac839b9f4bb::t_33b57d95b2b4b5 649
+docs/zh/cli_reference.md
+  s_125ac839b9f4bb::t_9aae81ae39bcbd 647
+tests/test_awex_separation_delta.py
+  s_125ac839b9f4bb::t_f90380470dfb93 342
+tests/test_awex_sglang_plugin.py
+  s_125ac839b9f4bb::t_192c3ad52416f6 352
+tests/test_megatron_bridge_deterministic.py
+  s_125ac839b9f4bb::t_e1f99c6e9d1dd9 10,18-20,85,95,214-258
+tests/test_qwen35_fp8.py
+  s_125ac839b9f4bb::t_7138928d924e42 1-323
+tests/test_qwen35_fp8_deepgemm.py
+  s_125ac839b9f4bb::t_2adde1c14b63e8 1-363
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ed42df5d4f15794b19d303b2405476a505401ea4",
+  "prompts": {},
+  "sessions": {
+    "s_125ac839b9f4bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1d316-3537-7ed2-bdc5-baa4e87b89ff",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
