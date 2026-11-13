@@ -7,12 +7,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib
 import json
 import math
+import multiprocessing
 import os
 import sys
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +27,7 @@ from examples.v2_online_workflows.types import (
     Benchmark,
     TaskExecutor,
     TaskResult,
+    TerminalExecutionError,
     get_benchmark,
 )
 
@@ -39,7 +43,7 @@ class ClientSettings:
     output: Path
     concurrency: int = 4
     request_timeout: float = 900.0
-    benchmark: str = "dapo_math"
+    benchmark: str = "dapo"
     arrival_offsets: tuple[float, ...] | None = None
     backend: str = "agent_service"
 
@@ -48,7 +52,7 @@ class ClientSettings:
             raise ValueError("Unsupported client mode")
         if min(self.concurrency, self.request_timeout) <= 0:
             raise ValueError("Concurrency and timeouts must be positive")
-        if self.backend not in ("agent_service", "arena"):
+        if self.backend not in ("agent_service", "arena", "external"):
             raise ValueError("Unsupported execution backend")
         if not self.inference_key or (
             self.backend == "agent_service" and not self.agent_key
@@ -61,6 +65,21 @@ class ClientSettings:
             raise ValueError("Arrival offsets must be finite, nonnegative and sorted")
 
 
+def _initialize_grader() -> None:
+    """Keep CPU grading isolated; do not leave workers after controller exit."""
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    if sys.platform.startswith("linux"):
+        import ctypes
+        import signal
+
+        parent = os.getppid()
+        if ctypes.CDLL(None).prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+            raise RuntimeError("Could not bind grader lifetime to controller")
+        if os.getppid() != parent:
+            raise SystemExit("Controller exited during grader initialization")
+
+
 class EpisodeClient:
     def __init__(
         self,
@@ -71,11 +90,29 @@ class EpisodeClient:
     ) -> None:
         self.settings, self.http = settings, http
         self.benchmark = benchmark or get_benchmark(settings.benchmark)
-        if (settings.backend == "arena") != (executor is not None):
-            raise ValueError("Arena settings require an explicit task executor")
+        if (settings.backend in ("arena", "external")) != (executor is not None):
+            raise ValueError("External settings require an explicit task executor")
         self.executor = executor
+        self._grade_pool = None
         self._write_lock = asyncio.Lock()
+        # Bound short control-plane handshakes, not active Agents or inference.
+        self._session_registration = asyncio.Semaphore(8)
         self.run_id = os.environ.get("AREAL_TRACE_RUN_ID", settings.output.name)
+
+    async def _grade(self, task, result, output):
+        if not getattr(self.benchmark, "grade_in_process", False):
+            return await asyncio.to_thread(self.benchmark.grade, task, result, output)
+        if self._grade_pool is None:
+            self._grade_pool = ProcessPoolExecutor(
+                max_workers=min(32, self.settings.concurrency),
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_grader,
+            )
+        # Python regex parsing can retain the GIL indefinitely. A thread cannot
+        # isolate it from HTTP/session/reward handling; a separate process can.
+        return await asyncio.get_running_loop().run_in_executor(
+            self._grade_pool, self.benchmark.grade, task, result, output
+        )
 
     async def _post(
         self,
@@ -138,12 +175,13 @@ class EpisodeClient:
                         )
                     if self.executor:
                         await self.executor.save(request_id, session_intent=True)
-                    response = await self._post(
-                        settings.inference_url,
-                        "/rl/start_session",
-                        settings.inference_key,
-                        {"task_id": request_id},
-                    )
+                    async with self._session_registration:
+                        response = await self._post(
+                            settings.inference_url,
+                            "/rl/start_session",
+                            settings.inference_key,
+                            {"task_id": request_id},
+                        )
                     if len(response["sessions"]) != 1:
                         raise RuntimeError(
                             "Independent task requests require one session"
@@ -188,57 +226,24 @@ class EpisodeClient:
             result["metadata"] = metadata
             result.update(answer=task_result.answer, answered=time.time())
             result.update(self.benchmark.result_metadata(task))
-            score = remote_score or await asyncio.to_thread(
-                self.benchmark.grade, task, task_result, settings.output / request_id
+            if self.executor:
+                await self.executor.save(request_id, grading_started=time.time())
+            score = remote_score or await self._grade(
+                task, task_result, settings.output / request_id
             )
             result["score"] = asdict(score)
             result["scored"] = time.time()
-            if credentials:
-                reward_body = {"reward": score.reward}
-                if credentials.get("areal_episode"):
-                    reward_body["areal_episode"] = credentials["areal_episode"]
-                if saved.get("reward_payload") not in (None, reward_body):
-                    raise RuntimeError("Reward differs from the saved submission")
-                receipt = saved.get("reward_receipt")
-                if receipt is None:
-                    if saved.get("reward_intent") and not credentials.get(
-                        "areal_episode"
-                    ):
-                        raise RuntimeError(
-                            "Reward outcome is unknown without episode identity"
-                        )
-                    if self.executor:
-                        await self.executor.save(
-                            request_id, reward_intent=True, reward_payload=reward_body
-                        )
-                    receipt = await self._post(
-                        settings.inference_url,
-                        "/rl/set_reward",
-                        credentials["session_api_key"],
-                        reward_body,
-                    )
-                    if self.executor:
-                        await self.executor.save(request_id, reward_receipt=receipt)
-                if receipt.get("trajectory_id") is None or not receipt.get(
-                    "trajectory_ready"
-                ):
-                    raise RuntimeError(
-                        "Reward did not seal the expected trajectory; use zero finish timeout"
-                    )
-                if (
-                    credentials.get("areal_episode")
-                    and receipt["trajectory_id"]
-                    != credentials["areal_episode"]["trajectory_id"]
-                ):
-                    raise RuntimeError("Reward receipt targets a different trajectory")
-                if receipt.get("session_id") not in (None, credentials["session_id"]):
-                    raise RuntimeError("Reward receipt targets a different session")
-                result["reward_receipt"] = receipt
+            if credentials and self.executor:
+                await self.executor.save(request_id, scored_result=result)
+            await self._submit_reward(result, credentials, saved, request_id)
             result["status"] = "completed"
             return result
         except Exception as exc:
             result.update(
-                status="infrastructure_error", error=f"{type(exc).__name__}: {exc}"
+                status="execution_failed"
+                if isinstance(exc, TerminalExecutionError)
+                else "infrastructure_error",
+                error=f"{type(exc).__name__}: {exc}",
             )
             return result
         finally:
@@ -279,6 +284,65 @@ class EpisodeClient:
                         else "last_result": result
                     },
                 )
+
+    async def _submit_reward(self, result, credentials, saved, request_id):
+        settings = self.settings
+        metadata = result.get("metadata", {})
+        if credentials:
+            reward_body = {"reward": result["score"]["reward"]}
+            if credentials.get("areal_episode"):
+                reward_body["areal_episode"] = credentials["areal_episode"]
+            saved_reward = saved.get("reward_payload")
+            if saved_reward is not None:
+                if any(saved_reward.get(k) != v for k, v in reward_body.items()):
+                    raise RuntimeError("Reward differs from the saved submission")
+                reward_body = saved_reward
+            else:
+                successful_calls = [
+                    call
+                    for call in metadata.get("inference_calls", [])
+                    if call.get("status") == "ok" and call.get("completion_id")
+                ]
+                if successful_calls:
+                    reward_body["interaction_id"] = successful_calls[-1][
+                        "completion_id"
+                    ]
+            if self.benchmark.name == "gsm8k":
+                calls = metadata.get("inference_calls", [])
+                final_id = (
+                    calls[-1].get("completion_id")
+                    if calls and calls[-1].get("status") == "ok"
+                    else None
+                )
+                if not final_id or reward_body.get("interaction_id") != final_id:
+                    raise RuntimeError(
+                        "GSM8K reward requires the final received completion ID"
+                    )
+            receipt = saved.get("reward_receipt")
+            if receipt is None:
+                if saved.get("reward_intent"):
+                    raise RuntimeError(
+                        "Reward outcome is unknown without episode identity"
+                    )
+                if self.executor:
+                    await self.executor.save(
+                        request_id, reward_intent=True, reward_payload=reward_body
+                    )
+                receipt = await self._post(
+                    settings.inference_url,
+                    "/rl/set_reward",
+                    credentials["session_api_key"],
+                    reward_body,
+                )
+                if self.executor:
+                    await self.executor.save(request_id, reward_receipt=receipt)
+            if receipt.get("message") != "success":
+                raise RuntimeError("Reward was not accepted; retain original intent")
+            if receipt.get("session_id") not in (None, credentials["session_id"]):
+                raise RuntimeError("Reward receipt targets a different session")
+            result["reward_receipt"] = receipt
+            result["reward_export_pending"] = not receipt.get("trajectory_ready", False)
+        return result
 
     async def _execute_agent(self, task_input, request_id, credentials):
         settings = self.settings
@@ -379,6 +443,163 @@ class EpisodeClient:
             else None,
         }
 
+    async def run_continuous(self, tasks: list[Any]) -> None:
+        """Rolling external requests. Native AReaL owns batching and versions.
+
+        Retain request identities before submission. Unknown outcomes are quarantined without retry; other requests
+        continue. No task/session/reward is blindly recreated on restart.
+        """
+        from examples.v2_online_workflows.artifacts import write_json
+
+        if not tasks or self.executor is None or self.settings.mode != "resident":
+            raise ValueError(
+                "Continuous training requires tasks and a durable executor"
+            )
+        root = self.settings.output
+        path = root / "producer-state.json"
+        heldout_path = root / "heldout-task-ids.json"
+        heldout = (
+            set(json.loads(heldout_path.read_text()))
+            if heldout_path.exists()
+            else set()
+        )
+        if heldout.issuperset(task.task_id for task in tasks):
+            raise ValueError("No training tasks remain outside the held-out set")
+        fingerprint = hashlib.sha256(
+            json.dumps([task.task_id for task in tasks], separators=(",", ":")).encode()
+        ).hexdigest()
+        state = (
+            json.loads(path.read_text())
+            if path.exists()
+            else {
+                "source_sha256": fingerprint,
+                "next_source_index": 0,
+                "completed": 0,
+                "correct": 0,
+                "entries": {},
+            }
+        )
+        if state["source_sha256"] != fingerprint:
+            raise ValueError("Continuous producer source changed")
+        running = {}
+        quarantined = state.setdefault("quarantined", {})
+        for rid, entry in list(state["entries"].items()):
+            if entry["phase"] == "unresolved":
+                saved = await self.executor.load(rid)
+                quarantined[rid] = {
+                    **entry,
+                    "phase": "quarantined",
+                    "quarantined_at": time.time(),
+                    "evidence": "episodes.jsonl",
+                    "capacity_reserved": bool(
+                        saved.get("local_intent") and not saved.get("local_receipt")
+                    ),
+                    "reward_status": "unknown"
+                    if saved.get("scored_result")
+                    else "not_submitted",
+                }
+                del state["entries"][rid]
+
+        def save():
+            write_json(path, state)
+            write_json(
+                root / "producer-progress.json",
+                {
+                    "time": time.time(),
+                    "concurrency": self.settings.concurrency,
+                    "next_source_index": state["next_source_index"],
+                    "source_total": len(tasks),
+                    "completed_passes": state["next_source_index"] // len(tasks),
+                    "completed": state["completed"],
+                    "correct": state["correct"],
+                    "execution_failed": state.get("execution_failed", 0),
+                    "running": len(running),
+                    "admission_stopped": (root / "stop-admission.json").exists(),
+                    "quarantined": len(quarantined),
+                    "quarantined_capacity_reserved": sum(
+                        bool(e.get("capacity_reserved")) for e in quarantined.values()
+                    ),
+                },
+            )
+
+        def dispatch(rid, entry):
+            entry["phase"] = "running"
+            save()
+            running[
+                asyncio.create_task(
+                    self.run_task(
+                        tasks[entry["source_index"] % len(tasks)], request_id=rid
+                    )
+                )
+            ] = rid
+
+        for rid, entry in list(state["entries"].items()):
+            if entry["phase"] != "unresolved":
+                dispatch(rid, entry)
+        try:
+            while True:
+                stopping = (root / "stop-admission.json").exists()
+                while (
+                    not stopping
+                    and len(running)
+                    + sum(
+                        bool(e.get("capacity_reserved")) for e in quarantined.values()
+                    )
+                    < self.settings.concurrency
+                ):
+                    index = state["next_source_index"]
+                    if tasks[index % len(tasks)].task_id in heldout:
+                        state["next_source_index"] += 1
+                        state["heldout_skipped"] = state.get("heldout_skipped", 0) + 1
+                        continue
+                    rid = self.benchmark.request_prefix + "-" + uuid.uuid4().hex
+                    entry = {
+                        "source_index": index,
+                        "task_id": tasks[index % len(tasks)].task_id,
+                        "phase": "pending",
+                    }
+                    state["entries"][rid] = entry
+                    state["next_source_index"] += 1
+                    dispatch(rid, entry)
+                save()
+                if not running:
+                    break
+                done, _ = await asyncio.wait(
+                    running, return_when=asyncio.FIRST_COMPLETED
+                )
+                for future in done:
+                    rid = running.pop(future)
+                    row = future.result()
+                    self._append_episode(row)
+                    if row["status"] == "completed":
+                        state["completed"] += 1
+                        state["correct"] += int(row["score"]["reward"] == 1)
+                        del state["entries"][rid]
+                    elif row["status"] == "execution_failed":
+                        state["execution_failed"] = state.get("execution_failed", 0) + 1
+                        del state["entries"][rid]
+                    else:
+                        quarantined[rid] = {
+                            **state["entries"].pop(rid),
+                            "phase": "quarantined",
+                            "quarantined_at": time.time(),
+                            "error": row.get("error"),
+                            "evidence": "episodes.jsonl",
+                            "capacity_reserved": bool(
+                                row.get("submitted") and not row.get("answered")
+                            ),
+                            "reward_status": "unknown"
+                            if row.get("scored")
+                            else "not_submitted",
+                        }
+                    save()
+        finally:
+            for future in running:
+                future.cancel()
+            if running:
+                await asyncio.gather(*running, return_exceptions=True)
+            save()
+
     def _append_episode(self, row: dict[str, Any]) -> None:
         with (self.settings.output / "episodes.jsonl").open(
             "a", encoding="utf-8"
@@ -386,9 +607,13 @@ class EpisodeClient:
             stream.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-async def _main(args: argparse.Namespace) -> int:
-    benchmark = get_benchmark(getattr(args, "benchmark", "dapo_math"))
+async def _main(args: argparse.Namespace, benchmark_loader=get_benchmark) -> int:
+    benchmark = benchmark_loader(getattr(args, "benchmark", "dapo"))
     tasks, manifest = await asyncio.to_thread(benchmark.load_tasks, args.tasks)
+    if args.mode != "eval" and not manifest.get("training_allowed", True):
+        raise ValueError(
+            "This frozen split is evaluation-only; no training sessions may be created"
+        )
     if args.limit is not None:
         if args.limit < 1 or args.limit > len(tasks):
             raise ValueError("Limit must fit the frozen task file")
@@ -409,7 +634,7 @@ async def _main(args: argparse.Namespace) -> int:
     settings = ClientSettings(
         agent_url=args.agent_url.rstrip("/"),
         inference_url=args.inference_url.rstrip("/"),
-        agent_key=os.environ["AREAL_AGENT_ADMIN_KEY"],
+        agent_key=os.environ.get("AREAL_AGENT_ADMIN_KEY", ""),
         inference_key=os.environ["AREAL_INFERENCE_ADMIN_KEY"],
         model=args.model,
         mode=args.mode,
@@ -418,8 +643,9 @@ async def _main(args: argparse.Namespace) -> int:
         request_timeout=args.request_timeout,
         benchmark=benchmark.name,
         arrival_offsets=offsets,
+        backend="external" if args.executor_factory else "agent_service",
     )
-    settings.output.mkdir(parents=True, exist_ok=False)
+    settings.output.mkdir(parents=True, exist_ok=args.continuous)
     (settings.output / "tasks-manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n"
     )
@@ -444,24 +670,54 @@ async def _main(args: argparse.Namespace) -> int:
         )
         + "\n"
     )
-    async with httpx.AsyncClient(timeout=settings.request_timeout) as http:
-        summary = await EpisodeClient(settings, http, benchmark).run(tasks)
+    async with httpx.AsyncClient(
+        timeout=None
+        if math.isinf(settings.request_timeout)
+        else settings.request_timeout,
+        trust_env=False,
+        limits=httpx.Limits(
+            max_connections=max(512, 2 * settings.concurrency),
+            max_keepalive_connections=0,
+        ),
+    ) as http:
+        executor = None
+        if args.executor_factory:
+            if args.executor_config is None:
+                raise ValueError("Executor factory requires configuration")
+            module, name = args.executor_factory.rsplit(".", 1)
+            factory = getattr(importlib.import_module(module), name)
+            executor = factory(
+                root=settings.output,
+                http=http,
+                **json.loads(args.executor_config.read_text()),
+            )
+        client = EpisodeClient(settings, http, benchmark, executor)
+        if args.continuous:
+            import fcntl
+
+            with (settings.output / "client.lock").open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                await client.run_continuous(tasks)
+            return 0
+        summary = await client.run(tasks)
     (settings.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     sys.stdout.write(json.dumps(summary, indent=2) + "\n")
     return int(bool(summary["infrastructure_errors"] or summary["not_submitted"]))
 
 
-def main() -> None:
+def main(
+    *, benchmark_loader=get_benchmark, benchmark_names=("dapo", "gsm8k", "dapo_math")
+) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--benchmark",
-        choices=("dapo_math", "swe_rebench", "swe_bench"),
-        default="dapo_math",
+        choices=benchmark_names,
+        default="dapo",
     )
     parser.add_argument("--tasks", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
-        "--agent-url", required=True, help="Agent gateway origin, without /v1"
+        "--agent-url", default="", help="Agent gateway origin, without /v1"
     )
     parser.add_argument(
         "--inference-url", required=True, help="Inference gateway origin, without /v1"
@@ -476,8 +732,11 @@ def main() -> None:
     )
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--request-timeout", type=float, default=900)
+    parser.add_argument("--continuous", action="store_true")
+    parser.add_argument("--executor-factory", help="Dotted TaskExecutor factory")
+    parser.add_argument("--executor-config", type=Path)
     args = parser.parse_args()
-    raise SystemExit(asyncio.run(_main(args)))
+    raise SystemExit(asyncio.run(_main(args, benchmark_loader)))
 
 
 if __name__ == "__main__":

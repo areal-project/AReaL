@@ -19,10 +19,11 @@ from examples.v2_online_workflows.types import EnvironmentSpec, TaskInput, TaskR
 
 DATASET = "open-r1/DAPO-Math-17k-Processed"
 INSTRUCTION = (
-    "Solve the following math problem. You may use math_python to compute, "
-    "enumerate or check intermediate results when helpful. Each Python call uses "
-    "a fresh interpreter; files persist within this task. Explain your solution "
-    "and put your final answer in \\boxed{...}.\n\n"
+    "Solve the following math problem. You may use the native terminal and file "
+    "tools to compute, enumerate or check intermediate results when helpful. "
+    "Run Python through terminal; each Python process has fresh interpreter "
+    "state and files persist within this task. Explain your solution and put "
+    "your final answer in \\boxed{...}.\n\n"
 )
 
 

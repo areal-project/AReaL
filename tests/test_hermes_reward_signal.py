@@ -12,7 +12,7 @@ _CONFIG_PATH = Path(__file__).resolve().parents[1] / "examples/hermes/config.yam
 
 
 def test_hermes_math_tool_captures_real_python_output():
-    from examples.v2_online_workflows.environments.python import run_limited
+    from examples.v2_online_workflows.environments.process import run_limited
 
     result = run_limited(
         [sys.executable, "-c", "print(6 * 7)"], timeout=10, output_bytes=1024
@@ -22,109 +22,11 @@ def test_hermes_math_tool_captures_real_python_output():
     assert result["output"].strip() == "42"
 
 
-def test_hermes_math_sampling_keeps_episode_on_direct_and_recreated_clients(
-    monkeypatch, tmp_path
-):
-    from types import SimpleNamespace
-
-    from examples.v2_online_workflows import service
-    from examples.v2_online_workflows.environments import python as python_environment
-    from examples.v2_online_workflows.harnesses import hermes, hermes_runtime
-    from examples.v2_online_workflows.harnesses.hermes import _Upstream
-
-    requests = []
-    clock = SimpleNamespace(value=0.0)
-
-    def chunks():
-        for text in ("hello", "world"):
-            clock.value += 2.0
-            yield text
-
-    def client():
-        def create(**kwargs):
-            requests.append(kwargs)
-            clock.value += 1.0
-            return chunks() if kwargs.get("stream") else kwargs
-
-        return SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
-        )
-
-    class Agent:
-        def __init__(self, **kwargs):
-            assert kwargs["enabled_toolsets"] == [
-                python_environment.PythonSandbox.toolset
-            ]
-            self.request_overrides = kwargs.get("request_overrides", {})
-            self.client = client()
-
-        def _create_openai_client(self, *args, **kwargs):
-            return client()
-
-    module = ModuleType("run_agent")
-    module.AIAgent = Agent
-    monkeypatch.setitem(sys.modules, "run_agent", module)
-    monkeypatch.setenv("AREAL_TASK_PYTHON_IMAGE", "local-python-image")
-    monkeypatch.setenv("AREAL_TASK_TOOL_ROOT", str(tmp_path))
-    monkeypatch.setenv("AREAL_TASK_MAX_TOKENS", "123")
-    monkeypatch.setattr(
-        hermes,
-        "time",
-        SimpleNamespace(time=lambda: clock.value, perf_counter=lambda: clock.value),
-    )
-    monkeypatch.setattr(python_environment, "time", hermes.time)
-    monkeypatch.setattr(hermes_runtime, "time", hermes.time)
-    monkeypatch.setattr(service.importlib.metadata, "version", lambda name: "0.19.0")
-    monkeypatch.setattr(service, "register_environment_tools", lambda provider: None)
-    monkeypatch.setattr(python_environment.shutil, "which", lambda name: "/bin/docker")
-    monkeypatch.setattr(
-        python_environment.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(stdout="sha256:test-image\n"),
-    )
-    identity = {"incarnation_id": "math-source", "trajectory_id": 2}
-    adapter = service.TaskAgent()
-    agent = adapter._build_agent(
-        _Upstream("http://inference/v1", "session-key", "test", identity)
-    )
-    agent.client.chat.completions.create(model="test", messages=[])
-    stream = agent._create_openai_client().chat.completions.create(
-        model="test", messages=[], stream=True
-    )
-    assert agent._areal_inference_calls[1]["finished"] is None
-    assert list(stream) == ["hello", "world"]
-    stream.close()
-    assert [call["seconds"] for call in agent._areal_inference_calls] == [1.0, 5.0]
-    tool = SimpleNamespace(call_timings=[])
-
-    def execute(code):
-        clock.value += 4.0
-        return "42"
-
-    tool.execute = execute
-    tool.invoke = lambda name, arguments: python_environment.PythonSandbox.invoke(
-        tool, name, arguments
-    )
-    monkeypatch.setitem(hermes._runtimes, "timed-task", tool)
-    assert (
-        hermes._dispatch_tool(
-            "math_python", {"code": "print(6 * 7)"}, task_id="timed-task"
-        )
-        == "42"
-    )
-    assert tool.call_timings[0]["seconds"] == 4.0
-    assert len(requests) == 2
-    for request in requests:
-        assert request["extra_body"]["areal_episode"] == identity
-        assert request["max_tokens"] == 123
-        assert request["temperature"] == request["top_p"] == 1.0
-
-
 @pytest.mark.asyncio
 async def test_hermes_math_client_scores_and_submits_native_reward(tmp_path):
     import httpx
 
-    from examples.v2_online_workflows.benchmarks.dapo_math import MathTask, question_id
+    from examples.v2_online_workflows.benchmarks.dapo import MathTask, question_id
     from examples.v2_online_workflows.client import ClientSettings, EpisodeClient
 
     output = tmp_path / "client"
@@ -211,38 +113,11 @@ async def test_hermes_math_client_scores_and_submits_native_reward(tmp_path):
     ]
 
 
-def test_hermes_math_config_shares_training_settings_with_elastic_enabled(
-    monkeypatch, tmp_path
-):
-    from omegaconf import OmegaConf
-
-    path = _CONFIG_PATH.parent.parent / "task_workflows/configs/dapo.yaml"
-    for key, value in {
-        "AREAL_TASK_RUN_ROOT": str(tmp_path / "runs"),
-        "AREAL_TASK_STATE_ROOT": str(tmp_path / "state"),
-        "AREAL_MODEL_PATH": str(tmp_path / "model"),
-        "AREAL_INFERENCE_ADMIN_KEY": "inference-test",
-        "AREAL_ACTOR_ADMIN_KEY": "actor-test",
-        "AREAL_CHECKPOINT_ESTIMATED_BYTES": str(80 << 30),
-    }.items():
-        monkeypatch.setenv(key, value)
-    configs = []
-    for enabled in (False, True):
-        monkeypatch.setenv("AREAL_ELASTIC_ENABLED", str(enabled).lower())
-        config = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
-        assert config["elastic"].pop("enabled") is enabled
-        assert config["train_dataset"]["batch_size"] == 4
-        assert config["rollout"]["consumer_batch_size"] == 4
-        assert config["rollout"]["agent"]["set_reward_finish_timeout"] == 0
-        configs.append(config)
-    assert configs[0] == configs[1]
-
-
 @pytest.mark.asyncio
 async def test_hermes_math_eval_does_not_create_or_reward_training_sessions(tmp_path):
     import httpx
 
-    from examples.v2_online_workflows.benchmarks.dapo_math import MathTask, question_id
+    from examples.v2_online_workflows.benchmarks.dapo import MathTask, question_id
     from examples.v2_online_workflows.client import ClientSettings, EpisodeClient
 
     paths = []

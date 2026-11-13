@@ -167,6 +167,24 @@ def observe_inference(
                 )
 
             try:
+                # Hermes expresses disabled read deadlines as infinity. httpx
+                # sockets require None instead; finite transport timeouts stay.
+                import math
+
+                import httpx
+
+                timeout = kwargs.get("timeout")
+                if isinstance(timeout, httpx.Timeout):
+                    kwargs["timeout"] = httpx.Timeout(
+                        **{
+                            key: None
+                            if isinstance(value, (int, float))
+                            and math.isinf(value)
+                            and value > 0
+                            else value
+                            for key, value in timeout.as_dict().items()
+                        }
+                    )
                 if request_snapshot is not None:
                     # Retain the complete conversation for every SDK request.
                     # Headers and extra_body contain credentials/session keys.

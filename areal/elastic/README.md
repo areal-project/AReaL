@@ -5,7 +5,7 @@
 ```bash
 CUDA_VISIBLE_DEVICES="" \
 python -m examples.v2_online_workflows.train \
-  --config examples/v2_online_workflows/configs/dapo.yaml \
+  --config examples/v2_online_workflows/configs/hermes_dapo_ppo.yaml \
   elastic.enabled=true
 ```
 

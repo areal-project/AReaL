@@ -12,6 +12,10 @@ from typing import Any, Protocol
 from examples.v2_online_workflows.outcome import require_successful_execution
 
 
+class TerminalExecutionError(RuntimeError):
+    """Executor returned a definitive failed outcome; no reward is submitted."""
+
+
 @dataclass(frozen=True)
 class EnvironmentSpec:
     kind: str
@@ -121,18 +125,12 @@ class Benchmark(Protocol):
 
 
 def get_benchmark(name: str) -> Benchmark:
-    if name == "swe_bench":
-        from examples.v2_online_workflows.benchmarks.swe_bench import SWEBenchBenchmark
+    if name == "gsm8k":
+        from examples.v2_online_workflows.benchmarks.gsm8k import GSM8KBenchmark
 
-        return SWEBenchBenchmark()
-    if name == "dapo_math":
-        from examples.v2_online_workflows.benchmarks.dapo_math import DapoBenchmark
+        return GSM8KBenchmark()
+    if name in ("dapo", "dapo_math"):
+        from examples.v2_online_workflows.benchmarks.dapo import DapoBenchmark
 
         return DapoBenchmark()
-    if name == "swe_rebench":
-        from examples.v2_online_workflows.benchmarks.swe_rebench import (
-            SWERebenchBenchmark,
-        )
-
-        return SWERebenchBenchmark()
     raise ValueError(f"Unknown benchmark: {name}")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
@@ -26,6 +27,8 @@ def run_training(
         control_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
     try:
         with trainer_factory(config, **kwargs) as trainer:
+            if hasattr(trainer, "_ensure_proxy_started"):
+                trainer._ensure_proxy_started()
             ready = {
                 "gateway_url": trainer.rollout.proxy_gateway_addr,
                 "model": config.rollout.model,
@@ -35,9 +38,79 @@ def run_training(
             if control_dir is not None:
                 write_json(control_dir / "ready.json", ready)
             print("TRAINER_READY " + json.dumps(ready), flush=True)
-            # The Trainer consumes native online trajectories. It never submits
-            # Arena tasks or drives an Agent; external applications own requests.
-            trainer.train()
+            if control_dir is not None:
+                write_json(
+                    control_dir / "trainer-process.json",
+                    {
+                        "pid": os.getpid(),
+                        "proc_start": Path("/proc/self/stat")
+                        .read_text()
+                        .rsplit(")", 1)[1]
+                        .split()[19],
+                    },
+                )
+            # External requests produce trajectories; the Trainer owns batching.
+            continuous = (
+                hasattr(config, "total_train_steps")
+                and config.total_train_steps is None
+            )
+            if continuous and control_dir is None:
+                raise ValueError(
+                    "Continuous training requires a durable control directory"
+                )
+
+            def checkpoint(version):
+                from areal.api.io_struct import SaveLoadMeta
+
+                destination = control_dir / "native-checkpoints" / f"v{version}"
+                destination.mkdir(parents=True, exist_ok=True)
+                trainer.actor.save(
+                    SaveLoadMeta(
+                        path=str(destination), weight_format="dcp", with_optim=True
+                    )
+                )
+                if not (destination / ".metadata").is_file():
+                    raise RuntimeError(
+                        "Native checkpoint has no completed DCP metadata"
+                    )
+                write_json(
+                    control_dir / "latest-native-checkpoint.json",
+                    {
+                        "updates": version,
+                        "path": str(destination),
+                        "optimizer_state_saved": True,
+                        "time": time.time(),
+                    },
+                )
+
+            def completed(version):
+                versions = trainer.rollout.serving_versions()
+                if any(value != version for value in versions):
+                    raise RuntimeError("Published rollout versions disagree")
+                write_json(
+                    control_dir / "progress.json",
+                    {
+                        "updates": version,
+                        "serving_versions": versions,
+                        "time": time.time(),
+                        "mode": "native_queue",
+                    },
+                )
+                if continuous:
+                    frequency = config.recover.freq_steps
+                    if frequency and version % frequency == 0:
+                        checkpoint(version)
+
+            train_options = {}
+            if control_dir is not None:
+                train_options["on_step"] = completed
+            if continuous:
+                train_options["should_stop"] = lambda: (
+                    control_dir / "stop-after-update.json"
+                ).exists()
+            version = trainer.train(**train_options)
+            if continuous:
+                checkpoint(version)
             finished = {
                 "status": "completed",
                 "serving_versions": trainer.rollout.serving_versions(),
