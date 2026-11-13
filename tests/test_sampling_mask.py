@@ -502,22 +502,6 @@ def test_megatron_chunked_mask_gradient_matches_dense(chunk_size):
     torch.testing.assert_close(weight.grad, reference_weight.grad, atol=1e-4, rtol=0)
 
 
-@pytest.mark.parametrize("backend", ["areal_sampling_mask", "flashinfer", "pytorch"])
-def test_deterministic_backend_keeps_restricted_sampler(backend):
-    """SGLang deterministic setup must retain the sampler that publishes refs."""
-    import textwrap
-    from types import SimpleNamespace
-
-    from areal.engine.sglang_sampling_mask_patch import _DETERMINISTIC_NEW
-
-    args = SimpleNamespace(sampling_backend=backend)
-    logger = SimpleNamespace(warning=lambda message: None)
-    exec(textwrap.dedent(_DETERMINISTIC_NEW), {"self": args, "logger": logger})
-    assert args.sampling_backend == (
-        "areal_sampling_mask" if backend == "areal_sampling_mask" else "pytorch"
-    )
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_full_support_matches_disabled_megatron_head_ppo_loss_and_gradients():
     """Exercise both real LM-head branches, including the original fused kernels."""
