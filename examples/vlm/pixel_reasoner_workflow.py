@@ -1,4 +1,4 @@
-"""Multi-turn Pixel visual-tool episodes for GRPO training."""
+"""Multi-turn Pixel visual-tool episodes for RL training."""
 
 import asyncio
 import itertools
@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 import unicodedata
+from copy import copy, deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from areal.api.reward_api import AsyncRewardWrapper
 from areal.api.workflow_api import RolloutWorkflow
 from areal.experimental.openai.client import _process_multimodal_prompt
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
+from areal.infra.processor_cache import ProcessorCallCache
 from areal.utils import stats_tracker
 from areal.utils.image import image2base64
 from areal.utils.qwen_vl_image import (
@@ -266,6 +268,34 @@ def pixel_reward_fn(completions: str, answer: list[str]) -> float:
     return float(verify(completions, answer)["status"] == "matched")
 
 
+class _CachedVideoProcessor:
+    """Reuse one immutable video's features while rendering fresh turn tokens."""
+
+    def __init__(self, processor, cache: ProcessorCallCache):
+        self.processor = processor
+        self.cache = cache
+
+    def __getattr__(self, name):
+        return getattr(self.processor, name)
+
+    def __call__(self, *args, **kwargs):
+        # This cache belongs to one prepared video, never to arbitrary inputs.
+        key = self.cache.make_key(id(self.processor), kwargs)
+
+        def process():
+            return {
+                name: value.detach().cpu() if torch.is_tensor(value) else value
+                for name, value in self.processor(*args, **kwargs).items()
+            }
+
+        result = self.cache.get_or_compute(key, process)
+        # HF pops video_metadata and may change its fps. Only tensors are shared.
+        return {
+            name: value if torch.is_tensor(value) else deepcopy(value)
+            for name, value in result.items()
+        }
+
+
 class PixelReasonerWorkflow(RolloutWorkflow):
     """One independent training row per turn, one logical rollout per episode.
 
@@ -303,6 +333,7 @@ class PixelReasonerWorkflow(RolloutWorkflow):
         self.crop_max_pixels = crop_max_pixels
         self.video_temp_root = video_temp_root
         self.reward_fn = AsyncRewardWrapper(pixel_reward_fn)
+        self._video_groups: dict[ProcessorCallCache, dict[tuple, asyncio.Task]] = {}
 
     def prepare(self, messages: list[dict], images: list[Image.Image], video=None):
         """Prepare exact actor tokens/features and separate native video wire IDs."""
@@ -324,6 +355,7 @@ class PixelReasonerWorkflow(RolloutWorkflow):
                 None,
                 template_kwargs,
                 align_sglang_images=True,
+                processor_cache=workflow_context.get().processor_cache,
             )
             return (
                 prepared.input_ids,
@@ -354,8 +386,21 @@ class PixelReasonerWorkflow(RolloutWorkflow):
                 raise ValueError(
                     "Literal visual special tokens in video text are unsupported"
                 )
-        aligned = prepare_sglang_qwen_images(self.processor, images)
-        processed = self.processor(
+        aligned = prepare_sglang_qwen_images(
+            self.processor,
+            images,
+            cache=workflow_context.get().processor_cache,
+            image_keys=image_data,
+        )
+        processor = self.processor
+        if getattr(processor, "video_processor", None) is not None:
+            # A per-call shallow copy leaves the shared processor unchanged.
+            processor = copy(processor)
+            processor.video_processor = _CachedVideoProcessor(
+                self.processor.video_processor,
+                video.setdefault("processor_cache", ProcessorCallCache()),
+            )
+        processed = processor(
             text=[prompt],
             images=(aligned[0] if aligned else images) or None,
             videos=[video["pixels"]],
@@ -385,7 +430,12 @@ class PixelReasonerWorkflow(RolloutWorkflow):
                 ]
             )
         payload = {
-            key: processed[key].detach().cpu()
+            key: (
+                processed[key]
+                if key in {"pixel_values_videos", "video_grid_thw"}
+                and processor is not self.processor
+                else processed[key].detach().cpu()
+            )
             for key in (
                 "pixel_values",
                 "image_grid_thw",
@@ -421,8 +471,25 @@ class PixelReasonerWorkflow(RolloutWorkflow):
     ) -> dict[str, InteractionWithTokenLogpReward] | None:
         if not data.get("is_video", False):
             return await self._run_episode(engine, data, None)
-        # Temporary native-video files live through all awaited requests, then
-        # disappear. Training trajectories/checkpoints are owned by PPOTrainer.
+        group_cache = workflow_context.get().processor_cache
+        if group_cache is None:
+            video = await self._prepare_video(data)
+            try:
+                return await self._run_episode(engine, data, video)
+            finally:
+                await self._release_video(video)
+
+        preparations = self._video_groups.setdefault(group_cache, {})
+        key = tuple(data.get("image", []))
+        if key not in preparations:
+            preparations[key] = asyncio.create_task(self._prepare_video(data))
+        # One cancelled candidate must not cancel its siblings' preparation.
+        video = await asyncio.shield(preparations[key])
+        return await self._run_episode(engine, data, video)
+
+    async def _prepare_video(self, data: dict[str, Any]) -> dict:
+        if not data.get("image"):
+            raise ValueError("Task has no visual inputs")
         if self.video_temp_root is not None:
             await asyncio.to_thread(
                 Path(self.video_temp_root).mkdir, parents=True, exist_ok=True
@@ -431,24 +498,44 @@ class PixelReasonerWorkflow(RolloutWorkflow):
             tempfile.TemporaryDirectory, dir=self.video_temp_root
         )
         try:
-            return await self._run_episode(engine, data, Path(directory.name))
-        finally:
+            frames = [await self.load_image(name) for name in data["image"]]
+            video = await prepare_video_data(frames, Path(directory.name) / "video.mkv")
+        except BaseException:
             await asyncio.to_thread(directory.cleanup)
+            raise
+        video.update(
+            frames=frames, directory=directory, processor_cache=ProcessorCallCache()
+        )
+        return video
 
-    async def _run_episode(self, engine, data: dict[str, Any], directory: Path | None):
+    async def _release_video(self, video: dict) -> None:
+        video["processor_cache"].close()
+        await asyncio.to_thread(video["directory"].cleanup)
+
+    async def _afinalize_processor_cache_group(self, context) -> None:
+        tasks = self._video_groups.pop(context.processor_cache, {})
+        try:
+            # Shielded preparation can outlive a cancelled sample. Drain it
+            # before removing files still needed by sibling model requests.
+            for result in await asyncio.gather(*tasks.values(), return_exceptions=True):
+                if not isinstance(result, BaseException):
+                    await self._release_video(result)
+        finally:
+            if context.processor_cache is not None:
+                context.processor_cache.close()
+
+    async def _run_episode(self, engine, data: dict[str, Any], video: dict | None):
         if not data.get("image"):
             raise ValueError("Task has no visual inputs")
-        originals = [await self.load_image(name) for name in data["image"]]
-        video_frames = originals if data.get("is_video", False) else []
-        video = None
+        originals = (
+            [] if video else [await self.load_image(name) for name in data["image"]]
+        )
+        video_frames = video["frames"] if video else []
         images = []
         content = [{"type": "text", "text": data["question"]}]
         if video_frames:
-            assert directory is not None
-            video = await prepare_video_data(video_frames, directory / "video.mkv")
-            originals = []
             content = [
-                {"type": "video", "video": str(directory / "video.mkv")},
+                {"type": "video", "video": video["path"]},
                 {
                     "type": "text",
                     "text": data["question"]

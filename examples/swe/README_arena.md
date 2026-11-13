@@ -83,10 +83,56 @@ Workers source the file again, so remove unrelated deployment settings from it.
 For one Stream, set `ARENA_STREAM_ID`. For multiple Streams, edit the literal
 `econfig.arena_streams` entries in `arena_multi_stream.yaml` and select that config. Pin
 each Stream's actual Harness and reward key/version. Every group of `n_samples` uses one
-Stream. The default epoch interleaves all source rows without replacement; a positive
+Stream. The base mixture interleaves all source rows; a positive
 `arena_mixture_epoch_size` selects a weighted subset, must not exceed the union, and
-must be divisible by the training batch size. Rejection can change the mixture that
-actually reaches training.
+must be divisible by the training batch size.
+
+Multi-Stream training with the v1 single-controller rollout path automatically
+compensates for rejected rollout groups at dispatch time. Each rejected group creates
+one replacement debt in its Stream. The controller prioritizes the largest unreserved
+debt, draws the next prompt from that Stream, and reserves the debt while the
+replacement is queued or running. Successful replacements settle debt; rejected
+replacements release the reservation for another attempt. Worker failures and timeouts
+use the same replacement policy. For example, three rejected groups from A and one from
+B trigger three A replacements and one B replacement, without advancing the base mixture
+schedule for those extra draws.
+
+After at most `train_dataset.batch_size` consecutive replacements, the controller admits
+one normal base draw. This keeps healthy Streams reachable when another Stream
+continually rejects. All unpaid debt is retained, and this dispatch counter persists
+across training batches and checkpoints; it does not constrain training batch contents.
+
+Base and replacement draws share an independent cursor per Stream. Exhausted Streams
+cycle and reshuffle if `train_dataset.shuffle` is enabled. With replacements, a nominal
+epoch may therefore revisit prompts; its configured training-step count and base Stream
+proportions remain unchanged. The policy compensates the existing mixture, including
+dataset sizes and `sampling_weight`; it does not redefine these weights as strict
+per-batch quotas. Accepted results still enter training in arrival order (or the
+configured deterministic order), so a fast Stream need not wait for a slow one and
+individual batches may have different proportions.
+
+The Qwen Flash Next training entrypoint uses the same compensation wrapper. For this
+entrypoint, `QWEN_EQUAL_STREAM_SAMPLING=1` optionally assigns the same number of base
+draws to every Stream, rounding the largest Stream size up to a multiple of
+`train_dataset.batch_size`. This changes the nominal epoch length and cycles smaller
+Streams without deleting source rows. It overrides the base mixture proportions;
+replacement draws still follow each Stream's rejection debt, and accepted training
+batches are not forced to be equal. The option is disabled by default and requires
+multi-Stream v1 single-controller training; evaluation does not apply it.
+
+Stream cursors, base schedule position, and unpaid debt are saved in the dataloader
+checkpoint. Reservations are released on recovery because queued/running tasks are not
+restored. As with existing asynchronous recovery, completed but unconsumed trajectories
+are not replayed. Checkpoints from the old flat dataloader are not compatible with the
+new Stream loader: start a new run or resume with the original unwrapped dataset. V2,
+SPMD, single-Stream training, and validation retain their ordinary dataloaders and do
+not enable this compensation.
+
+Recovery validates the exact Stream source schedule and dataloader batch size, in
+addition to Stream sizes, shuffle, and seed. Changing the mixture or enabling equal
+sampling requires a new run. Checkpoints created before source-schedule fingerprints
+were introduced are also rejected: resume them with their original implementation or
+start a new run.
 
 Before submission, extract the Stream list and validate it without launching tasks:
 
@@ -158,6 +204,15 @@ Local timeouts and cancellations without a remote terminal result contribute onl
 call metrics. Reward metrics retain their valid-export denominator, exposed as
 `rollout/reward_sample_count`; they must not be used as the task-failure denominator.
 
+Verified model-attributed Harness failures additionally record
+`rollout/harness_error/tool_call_argument_bytes_exceeded` and
+`rollout/harness_error/empty_completion`. The compatibility metric
+`rollout/harness_error/tool_call_budget_exceeded_rate` reports the same argument-budget
+cause. Their denominator includes all terminal task results, including successful ones;
+failures count even if no trainable trajectory can be exported. Unhealthy receipts and
+system failures are excluded from these model-cause numerators. Episode metadata carries
+`harness_failure_reason` when one of these causes is identified.
+
 For single-controller Arena training, the same attempt and terminal-result metrics are
 available under `rollout/stream/<name>/`, including `harness_error`, `task_error`,
 outcome codes, `task_attempt_count`, and `task_result_count`. Each Arena stream uses its
@@ -228,11 +283,39 @@ globally and per stream.
 ### Reward components in W&B
 
 The client preserves the result envelope's `sub_scores`. Finite named entries are logged
-as `rollout/reward_sub_score/<name>` and
-`rollout/stream/<stream>/reward_sub_score/<name>`. These metrics describe the verifier
-score before any training reward transform. They do not change the reward used by GRPO.
-Sub-scores are also included in private result audit shards. Both `raw` and `sub_scores`
-are independently omitted from audit shards when their encoded size exceeds
+as `rollout/stream/<stream>/reward_sub_score/<name>`. If the verifier supplies
+`raw.reward_display.component_ids`, display labels (including Chinese labels) are
+resolved to those stable component IDs. Without that mapping, bounded printable Unicode
+names are preserved. Component IDs may contain `/` to describe nested metrics. Invalid
+or duplicate names and non-finite values are counted in
+`rollout/stream/<stream>/reward_sub_score/invalid_entries`.
+
+The adapter also reads the generic `raw.reward_observation` contract when
+`schema_version` is `1`. Component names are defined by the verifier; they are not
+restricted to a particular reward formula. Supplied finite numeric fields are logged as:
+
+| Source                           | W&B metric                                                                  |
+| -------------------------------- | --------------------------------------------------------------------------- |
+| `components.<name>.value`        | `rollout/stream/<stream>/reward_observation/components/<name>/value`        |
+| `components.<name>.weight`       | `rollout/stream/<stream>/reward_observation/components/<name>/weight`       |
+| `components.<name>.contribution` | `rollout/stream/<stream>/reward_observation/components/<name>/contribution` |
+| `components.<name>.share`        | `rollout/stream/<stream>/reward_observation/components/<name>/share`        |
+| `diagnostics.<name>`             | `rollout/stream/<stream>/reward_observation/diagnostics/<name>`             |
+
+Grader-specific sub-scores, observations, and breakdowns are recorded only under
+`rollout/stream/<stream>/` so unrelated reward formulas are not averaged together.
+Global `arena_score` and `training_score` metrics remain available. `null` or missing
+measurements are omitted, never replaced with zero or derived from other fields. For
+example, a nonlinear component may have a measured `value` but no defined `weight` or
+`contribution`. The `share` metric is the mean of the verifier's per-result shares, not
+a ratio of batch-mean contribution and batch-mean score. `reward_observation/present`,
+`valid`, and `invalid_entries` report observation coverage and malformed telemetry.
+Unsupported schemas or invalid entries cannot reject an otherwise valid rollout.
+
+These metrics describe the verifier score before any training reward transform. The
+top-level `score` remains the reward source; observations do not change the reward used
+by GRPO. Sub-scores are also included in private result audit shards. Both `raw` and
+`sub_scores` are independently omitted from audit shards when their encoded size exceeds
 `arena_result_dump_max_bytes`; presence, size, and truncation flags remain available for
 each field.
 
@@ -290,20 +373,19 @@ declared weights remain 0.9 and 0.1. VLM `value` is null and `excluded` is true.
 `RULE_UNSCORABLE` carries a terminal null. The training adapter's model-failure zero
 policy remains separate from these verifier outcomes.
 
-The existing stats/W&B pipeline records the tree under these paths, also with a
-`rollout/stream/<stream>/` prefix:
+The existing stats/W&B pipeline records the tree under these per-stream paths:
 
 ```text
-rollout/reward_breakdown/present
-rollout/reward_breakdown/valid
-rollout/reward_breakdown/mode/MIXED_90_10
-rollout/reward_breakdown/total/score
-rollout/reward_breakdown/total/rule/weight
-rollout/reward_breakdown/total/rule/contribution_to_parent
-rollout/reward_breakdown/total/vlm/share_of_parent_mean
-rollout/reward_breakdown/total/rule/quality/mean/<part>/surface/score
-rollout/reward_breakdown/total/rule/quality/mean/<part>/surface/weight
-rollout/reward_breakdown/total/rule/factor/score
+rollout/stream/<stream>/reward_breakdown/present
+rollout/stream/<stream>/reward_breakdown/valid
+rollout/stream/<stream>/reward_breakdown/mode/MIXED_90_10
+rollout/stream/<stream>/reward_breakdown/total/score
+rollout/stream/<stream>/reward_breakdown/total/rule/weight
+rollout/stream/<stream>/reward_breakdown/total/rule/contribution_to_parent
+rollout/stream/<stream>/reward_breakdown/total/vlm/share_of_parent_mean
+rollout/stream/<stream>/reward_breakdown/total/rule/quality/mean/<part>/surface/score
+rollout/stream/<stream>/reward_breakdown/total/rule/quality/mean/<part>/surface/weight
+rollout/stream/<stream>/reward_breakdown/total/rule/factor/score
 ```
 
 Weights and shares use fractions, not percentages. Scalars are averaged over observed
@@ -353,10 +435,14 @@ published Env metadata (`source_reward_ref` or `reward_ref`, plus optional
 `harness_ref`). Conflicting sources fail before rollout. Each distinct reward and
 Harness version must be published, and references must include an exact version.
 
-When Harness bindings are present, they must cover every dataset row. Each task uses its
-pinned Harness in preference to the Stream-level `harness`; its LLM protocol is inferred
-from that Harness using the existing protocol inference rules. Snapshots without Harness
-bindings retain the Stream-level Harness and protocol behavior.
+When Harness bindings are present, they must cover every dataset row. An explicit
+`arena_streams[].harness` (or `harness` in a Stream file) takes priority over the task's
+pinned Harness. Without that override, the task's pinned Harness takes priority over the
+common `arena_harness` fallback. Tasks using their pinned Harness infer the LLM protocol
+from it; an explicit Stream Harness uses the Stream's `llm_protocol` when set, otherwise
+its protocol is inferred from that Harness. Snapshots without Harness bindings retain
+the Stream-level Harness and protocol behavior. Changing the explicit Stream Harness
+takes effect without rewriting the snapshot.
 
 Subsequent starts reuse the snapshot, check exact dataset coverage, verify the pinned
 versions remain published, and check declared Stream bindings for drift. An invalid or

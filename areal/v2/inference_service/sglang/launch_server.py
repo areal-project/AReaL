@@ -14,6 +14,35 @@ import os
 import sys
 
 
+# ---- BEGIN AREAL ----
+def normalize_rocm_attention_backend(server_args) -> bool:
+    """Replace fa3, which sgl_kernel does not ship on ROCm, with a ROCm backend."""
+    import torch
+
+    from areal.utils import logging
+
+    if (
+        torch.version.hip is None
+        or getattr(server_args, "attention_backend", None) != "fa3"
+    ):
+        return False
+    # aiter is SGLang's own ROCm default, but deterministic inference only
+    # accepts flashinfer, fa3 and triton.
+    backend = (
+        "triton"
+        if getattr(server_args, "enable_deterministic_inference", False)
+        else "aiter"
+    )
+    server_args.attention_backend = backend
+    logging.getLogger("SGLangLaunchServer").info(
+        "attention_backend='fa3' is unavailable on ROCm; using %r instead.", backend
+    )
+    return True
+
+
+# ---- END AREAL ----
+
+
 def areal_launch_server(server_args) -> None:
     # ---- BEGIN AREAL ----
     from areal.v2.inference_service.sglang.routed_experts_compat import (
@@ -23,6 +52,7 @@ def areal_launch_server(server_args) -> None:
 
     # ---- BEGIN AREAL ----
     normalize_routed_experts_server_args(server_args)
+    normalize_rocm_attention_backend(server_args)
     # ---- END AREAL ----
 
     from sglang.srt.entrypoints.engine import Engine, init_tokenizer_manager
