@@ -287,9 +287,14 @@ def main() -> None:
     server_args = args.server_args
     if server_args[:1] == ["--"]:
         server_args = server_args[1:]
+    entrypoint = args.entrypoint
+    if os.environ.get("AREAL_SAMPLING_MASK_TRANSFER") == "1":
+        from areal.engine.sglang_sampling_mask_plugin import prepare_launch
+
+        entrypoint = prepare_launch(entrypoint)
     apply_model_patches(server_args)
     # Exec preserves PID and the original __main__/multiprocessing spawn behavior.
-    os.execv(sys.executable, [sys.executable, "-m", args.entrypoint, *server_args])
+    os.execv(sys.executable, [sys.executable, "-m", entrypoint, *server_args])
 
 
 if __name__ == "__main__":
