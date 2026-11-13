@@ -105,6 +105,7 @@ actor:
         PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
 sglang:
+  # Allow near-limit continuations to be resubmitted as inputs.
   context_length: 16400
   mem_fraction_static: 0.7
   dp_size: 8
@@ -116,6 +117,7 @@ sglang:
   chunked_prefill_size: -1
 
 train_dataset:
+  path: ${oc.env:DAPO_MATH_17K_PATH,./datasets/DAPO-Math-17k-dedup}
   batch_size: 32
   max_length: 2048
   num_workers: 0

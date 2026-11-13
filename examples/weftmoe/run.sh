@@ -17,6 +17,14 @@ if [[ "$variant" != baseline ]]; then
   }
 fi
 
+# Do not expose the admin credential when invoked with bash -x.
+set +x
+if [[ -z "${AREAL_PROXY_ADMIN_API_KEY:-}" ||
+      "${AREAL_PROXY_ADMIN_API_KEY:-}" == areal-admin-key ]]; then
+  AREAL_PROXY_ADMIN_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+fi
+export AREAL_PROXY_ADMIN_API_KEY
+
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_dir"
 overrides=()

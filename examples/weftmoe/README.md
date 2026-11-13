@@ -20,16 +20,39 @@ blockwise FP8 routed-expert computation.
   0.5.10.post1, AWEX 0.9.0, and Megatron-Core 0.19.0. WeftMoE's FP8/TMS allocation
   compatibility requires PyTorch 2.9.x on this path.
 - A configured eight-GPU Ray node, a shared experiment directory, model weights, and a
-  local DAPO-Math-17k dataset. Set machine-specific network and library environment in
-  your worker configuration; no cluster addresses are embedded here.
+  local prompt-deduplicated DAPO-Math-17k dataset. Set machine-specific network and
+  library environment in your worker configuration; no cluster addresses are embedded
+  here.
 
 ## Run
 
 From the AReaL repository root, after preparing the environment:
 
+Use the prompt-deduplicated
+[YouJiacheng/DAPO-Math-17k-dedup](https://huggingface.co/datasets/YouJiacheng/DAPO-Math-17k-dedup)
+train set (17,398 rows). Download it once before starting the job, into a directory
+visible to every worker:
+
+```bash
+export DAPO_MATH_17K_PATH=/path/to/DAPO-Math-17k-dedup
+hf download YouJiacheng/DAPO-Math-17k-dedup \
+  distinct-prompts-with-rewards.parquet --repo-type dataset \
+  --revision 6e26a33abdabd3e6aaa1d742326b790758f7dbc5 \
+  --local-dir "$DAPO_MATH_17K_PATH/data"
+```
+
+The `data/` directory is required by the existing DAPO loader. Without an environment
+override, the recipe uses `./datasets/DAPO-Math-17k-dedup`. The original repeated export
+contains about 1.79 million rows; its per-row prompt-length filtering can exceed
+data-registration RPC timeouts. The deduplicated dataset keeps the existing
+prompt/reward schema, and the normal tokenizer length filter remains enabled. Do not
+point the recipe at the repeated export. Deduplication changes the number and sampling
+frequency of examples in an epoch; use the same prepared dataset for all comparison
+runs.
+
 ```bash
 export WEFTMOE_MODEL_PATH=/path/to/Qwen3.5-35B-A3B-Base
-export DAPO_MATH_17K_PATH=/path/to/DAPO-Math-17k
+export DAPO_MATH_17K_PATH=/path/to/DAPO-Math-17k-dedup
 export AREAL_FILEROOT=/path/to/experiments
 export WEFTMOE_TENSOR_EXTENSION=/path/to/model-matched/_runtime.so
 export RAY_ADDRESS=auto
@@ -44,6 +67,12 @@ WeftMoE in both engines and selects Megatron Flex/DeepEP. The YAML explicitly pr
 the WeftMoE flags and extension path to both sets of workers. Install WeftMoE and its
 shared libraries in the worker environment as well as the driver. W&B is disabled by
 default; configure it through the normal AReaL logger options.
+
+The launcher generates a random `AREAL_PROXY_ADMIN_API_KEY` when it is unset, empty, or
+still the public `areal-admin-key` default. An explicitly configured custom key is
+preserved. The resolved configuration supplies the same key to the remote proxy and its
+clients; do not pass credentials as command-line overrides. This avoids the proxy's
+rejection of a default admin key on a non-localhost bind address.
 
 The default recipe uses Qwen3.5-35B-A3B-Base, 32 prompts × 16 completions, 16K
 generation, a 16384-token training microbatch limit, and a 20-step cap. Training uses
@@ -76,9 +105,51 @@ bash examples/weftmoe/run.sh bf16 \
   total_train_steps=null total_train_epochs=3
 ```
 
+The server context includes headroom for resuming generation: the SGLang version used
+here limits inputs to at most `context_length - 6`, while a resumed request includes the
+prompt and partial completion. Keep `gconfig.max_tokens` as the prompt-plus-completion
+budget; the extra server context does not increase that budget or the training
+microbatch limit. The 16-token headroom is conservative, not an MTP draft-token
+requirement.
+
 For Qwen3.5-122B-A10B, set `WEFTMOE_MODEL_PATH` to that model and use an extension built
 with WeftMoE's `qwen122b` profile. It is a different checkpoint from the 35B Base model.
 Do not reuse the 35B native binary for 122B.
+
+## Ray worker file-descriptor limits
+
+The 32 × 16 rollout batch creates 512 completions and can exceed low process
+file-descriptor limits (`Too many open files`). Check the actual AReaL RPC,
+rollout/proxy, and relevant Ray worker processes on every node:
+
+```bash
+worker_pid=<actual-worker-pid>
+prlimit --pid "$worker_pid" --nofile
+cat "/proc/$worker_pid/limits"
+```
+
+Checking `ulimit -n` only in the submission shell is insufficient: an already-running
+Ray service and its children retain their own limits. Set adequate soft and hard limits
+in the service/container or shell that starts Ray on each node, and verify the new
+workers after a planned restart. Raising the hard limit may require administrator
+privileges. The tested workaround used 1048576 for both limits; this is not a measured
+minimum requirement.
+
+For the AReaL workers, the example can also be launched with an explicit limit:
+
+```bash
+bash examples/weftmoe/run.sh bf16 \
+  'actor.scheduling_spec.0.cmd="prlimit --nofile=1048576:1048576 -- python3 -m areal.infra.rpc.rpc_server"' \
+  'rollout.scheduling_spec.0.cmd="prlimit --nofile=1048576:1048576 -- python3 -m areal.infra.rpc.rpc_server"'
+```
+
+This requires `prlimit` and sufficient permissions on the worker hosts. The inner
+`python3` must resolve to the intended AReaL environment on each worker; replace it with
+that environment's absolute interpreter path if needed. Wrapping the command in
+`prlimit` bypasses the scheduler's usual leading-Python interpreter replacement. The
+limit applies to new RPC servers and their children, not existing Ray processes. Recheck
+the actual worker limits after startup; increasing only the driver limit does not fix an
+existing worker's limit.
 
 ## Integration boundaries
 
