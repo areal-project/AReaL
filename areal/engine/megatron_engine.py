@@ -3351,6 +3351,11 @@ class MegatronEngine(TrainEngine):
         )
 
         ensure_mindspeed_pipeline_layout_stage_count()
+        from areal.engine.megatron_utils.mindspeed_gdn_patch import (
+            ensure_mindspeed_gdn_native_kkt,
+        )
+
+        ensure_mindspeed_gdn_native_kkt()
         if self.bridge_cls == "megatron-bridge":
             from areal.engine.megatron_utils.mindspeed_gdn_patch import (
                 ensure_mindspeed_gdn_conv1d,
