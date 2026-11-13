@@ -33,3 +33,35 @@ def test_normalize_rocm_attention_backend(
 
     assert normalize_rocm_attention_backend(server_args) is changed
     assert server_args.attention_backend == expected
+
+
+def test_awex_entrypoint_replaces_fa3_on_rocm(monkeypatch):
+    import runpy
+    import sys
+
+    import sglang.srt.server_args as sglang_server_args
+    import sglang.srt.utils as sglang_utils
+
+    monkeypatch.setattr(torch.version, "hip", "7.15.0", raising=False)
+    server_args = SimpleNamespace(
+        attention_backend="fa3",
+        enable_deterministic_inference=False,
+        skip_server_warmup=True,
+    )
+    monkeypatch.setattr(
+        sglang_server_args, "prepare_server_args", lambda argv: server_args
+    )
+    launched = []
+    # The real http_server initializes the GPU on import.
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.entrypoints.http_server",
+        SimpleNamespace(launch_server=lambda args, **kwargs: launched.append(args)),
+    )
+    monkeypatch.setattr(sglang_utils, "kill_process_tree", lambda *a, **k: None)
+    monkeypatch.setattr("sys.argv", ["sglang_plugin"])
+
+    runpy.run_module("areal.engine.awex.plugins.sglang_plugin", run_name="__main__")
+
+    assert launched == [server_args]
+    assert server_args.attention_backend == "aiter"
