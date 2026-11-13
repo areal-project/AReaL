@@ -284,6 +284,8 @@ class GenerationHyperparameters:
             "help": "SGLang sampler head width for score centering; 0 disables collection. Requires temperature=1 and untruncated sampling."
         },
     )
+    _sampling_mask_transfer: bool = field(default=False, metadata={"cli_doc": False})
+
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
 
     def new(self, **kwargs):
@@ -340,6 +342,7 @@ class GenerationHyperparameters:
         "reward_normalization",
         "reward_normalization_use_std",
         "drop_incomplete_group",
+        "_sampling_mask_transfer",
     }
 
     def to_openai_args_dict(
@@ -2218,6 +2221,8 @@ class PPOActorConfig(TrainEngineConfig):
         },
     )
 
+    _sampling_mask_transfer: bool = field(default=False, metadata={"cli_doc": False})
+
     def _uses_group_statistics(self) -> bool:
         for normalization in (self.reward_norm, self.adv_norm):
             if normalization is None:
@@ -2677,6 +2682,11 @@ class SGLangConfig:
         },
     )
     sampling_backend: str | None = None
+    _sampling_mask_top_k: int | None = field(default=None, metadata={"cli_doc": False})
+    _sampling_mask_receivers: int = field(default=0, metadata={"cli_doc": False})
+    _sampling_mask_retained_versions: int = field(
+        default=2, metadata={"cli_doc": False}
+    )
     context_length: int | None = 32768
     mem_fraction_static: float | None = 0.9
     max_running_requests: int | None = None
@@ -2822,6 +2832,14 @@ class SGLangConfig:
             )
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
+        if args.get("_sampling_mask_top_k") is None:
+            for key in (
+                "_sampling_mask_top_k",
+                "_sampling_mask_receivers",
+                "_sampling_mask_retained_versions",
+            ):
+                args.pop(key, None)
+
         # build_args also accepts DictConfig, which bypasses __post_init__.
         limits = args.get("limit_mm_data_per_request")
         SGLangConfig._validate_mm_limits(limits)
@@ -3373,6 +3391,10 @@ class InferenceEngineConfig:
     )
 
     # v2 controller options
+    _sampling_mask_sampling: GenerationHyperparameters | None = field(
+        default=None, metadata={"cli_doc": False}
+    )
+
     _version: str = field(
         default="v1",
         metadata={
@@ -4430,6 +4452,12 @@ class MOPDConfig:
 class PPOConfig(BaseExperimentConfig):
     """Configuration for Proximal Policy Optimization (PPO) reinforcement learning experiments."""
 
+    sampling_mask_transfer: bool = field(
+        default=False,
+        metadata={
+            "help": "Reuse frozen SGLang sampling supports in restricted PPO; AReaL v1 + Megatron, NCCL GIN, uint24 IDs."
+        },
+    )
     gconfig: GenerationHyperparameters = field(
         default_factory=GenerationHyperparameters
     )
@@ -4475,6 +4503,10 @@ class PPOConfig(BaseExperimentConfig):
             self._validate_mopd_config()
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
+        if self.sampling_mask_transfer:
+            from areal.infra.sampling_mask.config import configure
+
+            configure(self)
         if self.rollout.deterministic_sampling:
             for config_name, generation_config in (
                 ("gconfig", self.gconfig),
