@@ -41,6 +41,7 @@ def test_auto_backend_balances_foreach_speed_and_fused_memory() -> None:
     assert _resolve_adamw_update_backend(config, 32) == "foreach"
 
 
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for pinned memory")
 def test_cpu_slabs_are_contiguous_pinned_and_zero_initialized() -> None:
     """Each state kind occupies one flat pinned allocation."""
     slabs = AdamWCPUSlabs.allocate(37)

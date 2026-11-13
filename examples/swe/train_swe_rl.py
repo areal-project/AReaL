@@ -28,7 +28,9 @@ from examples.swe.arena_reward_mapping import (
 from examples.swe.utils import ArenaRewardRefConfig, ArenaStreamConfig, SWEPPOConfig
 
 from areal.api.cli_args import load_expr_config
+from areal.dataset.arena_stream import ArenaStreamDataset
 from areal.utils import logging
+from areal.utils.environ import is_single_controller
 
 logger = logging.getLogger("SWETrain")
 
@@ -186,8 +188,12 @@ def _resolve_arena_stream(
     )
     for row in rows:
         if harnesses:
-            row["harness"] = harnesses[row["data_id"]]
-            row["llm_protocol"] = infer_llm_protocol_from_harness(row["harness"])
+            row["harness"] = configured.harness_override or harnesses[row["data_id"]]
+            row["llm_protocol"] = (
+                llm_protocol
+                if configured.harness_override
+                else infer_llm_protocol_from_harness(row["harness"])
+            )
         reward_ref = mapping[row["data_id"]] if mapping else actual_reward_ref
         row.update(
             {
@@ -338,6 +344,19 @@ def main(args):
             econfig, size_multiple=config.train_dataset.batch_size
         )
         valid_dataset = train_dataset
+        if (
+            len(resolved_streams) > 1
+            and config.rollout._version == "v1"
+            and is_single_controller()
+        ):
+            train_dataset = ArenaStreamDataset(
+                train_dataset, stream_key="arena_stream_name"
+            )
+        elif len(resolved_streams) > 1:
+            logger.warning(
+                "Per-stream rejection compensation requires the v1 single-controller "
+                "rollout path; using the ordinary mixture dataloader."
+            )
         econfig.arena_streams = resolved_streams
         econfig.arena_streams_yaml_b64 = ""
         econfig.arena_streams_file = ""
