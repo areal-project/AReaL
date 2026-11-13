@@ -42,7 +42,8 @@ actor:
       overlap_grad_reduce: false
 
 sglang:
-  context_length: 2048
+  # Allow near-limit continuations to be resubmitted as inputs.
+  context_length: 2064
   mem_fraction_static: 0.4
 
 train_dataset:

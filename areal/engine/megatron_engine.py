@@ -3239,6 +3239,8 @@ class MegatronEngine(TrainEngine):
                 mcore_opt_config, self.model, staged_muon_config, **optimizer_kwargs
             )
             self.optimizer.bind_managed_checkpoint_process_group(self.cpu_group)
+            if getattr(self, "_weftmoe_adapter", None) is not None:
+                self._weftmoe_adapter.bind_fp32_masters(self.optimizer)
         elif use_dist_muon:
             self.optimizer = get_megatron_optimizer_with_dist_muon(
                 mcore_opt_config, self.model, **optimizer_kwargs
