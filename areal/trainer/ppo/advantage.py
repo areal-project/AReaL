@@ -498,6 +498,7 @@ class AdvantagePipeline:
             kl_rewards=gae_kl_rewards,
             process_rewards=process_rewards,
             values=values,
+            zero_values="values" not in data,
             loss_mask=loss_mask,
             turn_ids=turn_ids,
             seq_no_eos_mask=seq_truncated_mask,

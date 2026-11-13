@@ -26,6 +26,8 @@ class TemporalInputs:
     order and prevents turn GAE from including KL in critic targets.
 
     Callable lambda functions receive lengths in the estimator's timestep unit.
+    ``zero_values`` marks inputs whose ``values`` and ``bootstrap_values`` are all
+    zero because no critic is trained; reset it when substituting values.
     """
 
     rewards: torch.Tensor
@@ -39,6 +41,7 @@ class TemporalInputs:
     turn_ids: torch.Tensor | None = None
     kl_rewards: torch.Tensor | None = None
     process_rewards: torch.Tensor | None = None
+    zero_values: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,7 @@ def token_gae(inputs: TemporalInputs) -> TemporalResult:
             timestep_unit="token",
             kwargs=inputs.gae_lambda_kwargs,
         ),
+        zero_values=inputs.zero_values,
     )
     return TemporalResult(advantages=advantages, returns=returns, total_rewards=rewards)
 
