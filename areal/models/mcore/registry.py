@@ -464,6 +464,16 @@ def make_mcore_model(
                         "use a compatible vision-language model provider"
                     )
                 setattr(provider, option, freeze)
+        if mcore_config.fp8_config is not None:
+            mcore_config.fp8_config.apply_to(provider)
+            if getattr(hf_config, "model_type", None) in ("qwen3_5", "qwen3_5_text"):
+                from areal.engine.megatron_utils.qwen3_5_fp8 import Qwen35FP8Training
+
+                provider.register_pre_wrap_hook(Qwen35FP8Training.prepare_model)
+                logger.info(
+                    "Qwen3.5 FP8 training keeps the fused GDN input projection "
+                    "in BF16 to preserve B/A precision."
+                )
         vpp_size = mcore_config.virtual_pipeline_parallel_size or 0
 
         provider.tensor_model_parallel_size = mpu.get_tensor_model_parallel_world_size()
