@@ -89,6 +89,7 @@ class ModelResponse:
     sampler_head_ids: list[list[int]] | None = None
     sampler_head_logprobs: list[list[float]] | None = None
     input_videos: list[str | dict[str, Any]] | None = None
+    sampling_mask_refs: list[list[int]] | None = None
 
     @property
     def input_len(self) -> int:
@@ -339,6 +340,7 @@ class HttpGenerationResult:
     spec_accept_length: float | None = None
     sampler_head_ids: list[list[int]] | None = None
     sampler_head_logprobs: list[list[float]] | None = None
+    sampling_mask_refs: list[list[int]] | None = None
 
     def __post_init__(self) -> None:
         if len(self.output_tokens) != len(self.output_logprobs):

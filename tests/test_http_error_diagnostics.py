@@ -28,6 +28,39 @@ async def http_server(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("encoding", ["plain", "chunked", "gzip"])
+async def test_response_observer_counts_decoded_utf8_body_once(encoding):
+    import gzip
+
+    body = '{"message":"候选集合","refs":[[1,2,3,1,0]]}'.encode()
+
+    async def handler(request):
+        headers = {"Content-Type": "application/json"}
+        if encoding == "gzip":
+            headers["Content-Encoding"] = "gzip"
+            return web.Response(body=gzip.compress(body), headers=headers)
+        if encoding == "chunked":
+            response = web.StreamResponse(headers=headers)
+            response.enable_chunked_encoding()
+            await response.prepare(request)
+            await response.write(body[:9])
+            await response.write(body[9:])
+            await response.write_eof()
+            return response
+        return web.Response(body=body, headers=headers)
+
+    observed = []
+    async with http_server(handler) as addr:
+        result = await http.arequest_with_retry(
+            addr,
+            "/generate",
+            response_size_observer=observed.append,
+        )
+    assert result["message"] == "候选集合"
+    assert observed == [len(body)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "body", [b"input length exceeds context limit", b"bad \xff body"]
 )

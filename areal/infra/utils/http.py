@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any
 
@@ -159,6 +160,7 @@ async def arequest_with_retry(
     timeout: float | None = None,
     retry_delay: float = 1.0,
     verbose=False,
+    response_size_observer: Callable[[int], None] | None = None,
 ) -> dict | str | bytes:
     if timeout is None:
         timeout = DEFAULT_REQUEST_TIMEOUT
@@ -217,6 +219,10 @@ async def arequest_with_retry(
                         res = await response.text()
                     else:
                         res = await response.read()
+                    if response_size_observer is not None:
+                        # aiohttp caches the decoded body already consumed above.
+                        # Count bytes, not JSON characters; excludes HTTP framing.
+                        response_size_observer(len(await response.read()))
                     if verbose:
                         logger.info("get http result")
                     return res
