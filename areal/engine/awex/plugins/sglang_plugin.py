@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import queue
 import threading
@@ -33,6 +34,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
@@ -305,6 +307,7 @@ class AwexSchedulerPlugin:
         )
 
     def bind(self) -> None:
+        self._publish_stream_topology()
         methods = [
             "awex_init_receiver",
             "awex_receive_weights",
@@ -334,6 +337,38 @@ class AwexSchedulerPlugin:
                 self._require_receiver().prepare_frozen_weights(meta_server_addr)
             self._start_background_worker(meta_server_addr)
             self._patch_event_loop()
+
+    def _publish_stream_topology(self) -> None:
+        directory = os.environ.get("AREAL_SGLANG_STREAM_TOPOLOGY_DIR")
+        if not directory:
+            return
+        import torch
+
+        model = self._scheduler.tp_worker.model_runner.model
+        device = next(model.parameters()).device
+        if device.type != "cuda" or device.index is None:
+            raise RuntimeError("Stream topology requires a CUDA model device")
+        gpu_uuid = getattr(torch.cuda.get_device_properties(device), "uuid", None)
+        if gpu_uuid is None:
+            raise RuntimeError("SGLang model CUDA device UUID is unavailable")
+        rank = self._int_attr(self._scheduler, "tp_rank", -1)
+        size = self._int_attr(self._scheduler, "tp_size", 1)
+        if not 0 <= rank < size:
+            raise RuntimeError("Cannot resolve SGLang model TP identity")
+        record = dict(
+            pid=os.getpid(),
+            process_start_time=Path("/proc/self/stat")
+            .read_text()
+            .rsplit(")", 1)[1]
+            .split()[19],
+            tp_rank=rank,
+            tp_size=size,
+            gpu_uuid=str(gpu_uuid),
+        )
+        path = Path(directory) / f"{os.getpid()}.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(record))
+        temporary.replace(path)
 
     def _require_receiver(self):
         if self._receiver is None:

@@ -82,6 +82,7 @@ LOGGER_COLORS_EXACT = {
     "ViRL39KDataset": "light_green",
     # Trainers - green
     "RLTrainer": "light_green",
+    "StreamTrainer": "light_green",
     "SFTTrainer": "light_green",
     # Algorithm-specific - cyan
     "PPOActor": "cyan",

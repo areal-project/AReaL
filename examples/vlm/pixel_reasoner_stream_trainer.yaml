@@ -1,0 +1,65 @@
+# Qwen3.5-4B on eight shared GPUs: actor DP2/TP4, rollout DP4/TP2.
+# Use pixel_reasoner.py with this config and the shared paths described in README.md.
+# Configure the worker image/mounts for your environment before launching.
+# For a synchronous comparison, set stream_trainer.enabled=false with all other
+# settings unchanged, including the disabled batch advantage normalization below.
+defaults:
+  - pixel_reasoner_config
+  - _self_
+
+experiment_name: pixel-reasoner-stream-trainer
+enable_offload: true
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+
+stream_trainer:
+  enabled: true
+
+rollout:
+  backend: "sglang:d4t2p1"
+  max_concurrent_rollouts: 8
+  max_head_offpolicyness: 0
+  scheduling_strategy:
+    type: colocation
+    target: actor
+    fork: true
+
+actor:
+  backend: "megatron:d2t4p1"
+  path: Qwen/Qwen3.5-4B
+  weight_update_mode: awex
+  ppo_n_minibatches: 1
+  loss_aggregation: token_mean
+  kl_ctl: 0.0
+  # Complete-group reward normalization is inherited. Batch statistics cannot
+  # be computed until all rollout groups finish, so do not normalize advantages.
+  adv_norm: null
+  mb_spec:
+    n_mbs: null
+    granularity: 1
+    # Each Pixel turn contains its full prompt/history and current response.
+    max_tokens_per_mb: ${gconfig.max_tokens}
+  megatron:
+    ddp:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+  scheduling_spec:
+    - gpu: 1
+      cpu: 8
+      mem: 32
+      port_count: 3
+      env_vars:
+        PYTORCH_ALLOC_CONF: "expandable_segments:True"
+        NCCL_CUMEM_ENABLE: "0"
+        NCCL_NVLS_ENABLE: "0"
+        TMS_INIT_ENABLE: "0"
+        TMS_INIT_ENABLE_CPU_BACKUP: "0"
+
+sglang:
+  enable_memory_saver: true
+
+# Eight complete prompt groups, four samples each (32 trajectories per step).
+train_dataset:
+  batch_size: 8

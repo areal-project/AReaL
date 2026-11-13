@@ -14,7 +14,7 @@ from torch.utils.checkpoint import checkpoint
 
 from areal.utils.flops import get_flops_estimator, register_flops_estimator
 from areal.utils.moe_metrics import MoEMetrics, normalize_expert_loads
-from areal.utils.training_metrics import TrainingMetrics
+from areal.utils.training_metrics import TrainingMetrics, export_training_metrics
 
 
 def _config(hybrid=False):
@@ -217,6 +217,13 @@ def test_training_metrics_unknown_model_omits_flops():
     assert all("flops" not in key for key in result)
 
 
+def test_training_metrics_untrained_engine_export_is_noop_by_default():
+    engine = SimpleNamespace()
+
+    assert export_training_metrics(engine) == {}
+    assert not hasattr(engine, "_training_metrics")
+
+
 @pytest.mark.parametrize(
     "counts,percent,ratio",
     [
@@ -340,6 +347,22 @@ def _distributed_worker(rank, rendezvous, backend="gloo"):
         assert result["train_perf/tokens"] == 10
         assert result["train_perf/tokens_per_second"] == 2.5
         assert result["train_perf/estimated_flops_per_second"] == 58 / 4
+        # A streamed replica with no backward has no lazily-created counters.
+        # It must still enter the real DP SUM and global timing MAX collectives.
+        engine = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="unknown"),
+            data_parallel_group=world,
+            cpu_group=timing,
+        )
+        if rank == 0:
+            engine._training_metrics = TrainingMetrics(None)
+            engine._training_metrics._pending = [
+                (torch.tensor([3], device=device), 2.0)
+            ]
+        result = export_training_metrics(engine, include_empty=True)
+        assert result["train_perf/tokens"] == 3
+        assert result["train_perf/tokens_per_second"] == 1.5
+        assert export_training_metrics(engine, include_empty=True) == {}
         # Two model-parallel replicas: each has the same logical input.
         metrics = TrainingMetrics(None)
         metrics._pending = [(torch.tensor([3], device=device), 2 + 2 * rank)]

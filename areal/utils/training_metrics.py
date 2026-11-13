@@ -146,11 +146,21 @@ def record_training_batch(
         yield
 
 
-def export_training_metrics(engine: Any) -> dict[str, float]:
+def export_training_metrics(
+    engine: Any, *, include_empty: bool = False
+) -> dict[str, float]:
     """Export outside the algorithm's scope to the dedicated train_perf scope."""
     metrics = getattr(engine, "_training_metrics", None)
     if metrics is None:
-        return {}
+        if not include_empty:
+            return {}
+        from areal.utils.flops import get_flops_estimator
+
+        # Streaming can leave a DP replica without any backward calls. It must
+        # still contribute zero work to the same reductions as active replicas.
+        metrics = engine._training_metrics = TrainingMetrics(
+            get_flops_estimator(engine.hf_config)
+        )
     return metrics.export(
         dp_group=engine.data_parallel_group, timing_group=engine.cpu_group
     )
