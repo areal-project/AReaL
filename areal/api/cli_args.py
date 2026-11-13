@@ -2512,7 +2512,9 @@ class vLLMConfig:
     # original
     max_num_seqs: int = 256
     # kv_cache_type: str = "auto"
-    block_size: int = 16
+    # None lets vLLM pick the attention backend's block size. XPU needs this:
+    # its prebuilt paged-decode kernels do not cover block size 16.
+    block_size: int | None = None
     cpu_offload_gb: float = 0
     disable_sliding_window: bool = True
     max_model_len: int | None = 32768
