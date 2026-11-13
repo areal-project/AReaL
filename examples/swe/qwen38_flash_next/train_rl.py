@@ -6,6 +6,14 @@ import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from datasets import Dataset
+
+    from examples.swe.utils import ArenaStreamConfig, SWEPPOConfig
+
+    from areal.dataset.arena_stream import ArenaStreamDataset
 
 
 def decorate_controller(controller):
@@ -175,6 +183,39 @@ def configure_evaluation_only(config, task_count):
     )
 
 
+def prepare_arena_training_dataset(
+    dataset: "Dataset", streams: list["ArenaStreamConfig"], config: "SWEPPOConfig"
+) -> "Dataset | ArenaStreamDataset":
+    """Use native stream feedback and optionally equalize base source draws.
+
+    Equal sampling changes the source schedule, not the source rows. Independent
+    cursors still visit every row, and accepted batches remain completion-ordered.
+    """
+    from examples.swe.train_swe_rl import logger, wrap_arena_training_dataset
+
+    from areal.dataset.arena_stream import ArenaStreamDataset
+
+    dataset = wrap_arena_training_dataset(dataset, streams, config)
+    if os.environ.get("QWEN_EQUAL_STREAM_SAMPLING") == "1":
+        if not isinstance(dataset, ArenaStreamDataset):
+            raise ValueError("Equal stream sampling requires multi-stream v1 training")
+        batch_size = config.train_dataset.batch_size
+        largest = max(len(indices) for indices in dataset.indices.values())
+        draws_per_stream = ((largest + batch_size - 1) // batch_size) * batch_size
+        dataset.streams = [
+            stream
+            for _ in range(draws_per_stream)
+            for stream in sorted(dataset.indices)
+        ]
+        logger.info(
+            "Equal Arena source dispatch: %d draws per stream, source rows=%s; "
+            "native replacement feedback, completion-ordered batches",
+            draws_per_stream,
+            {name: len(indices) for name, indices in dataset.indices.items()},
+        )
+    return dataset
+
+
 def main(profile, args):
     if profile not in ("swe", "swe-eval"):
         raise ValueError("Expected swe or swe-eval")
@@ -217,6 +258,8 @@ def main(profile, args):
     config.econfig.arena_streams_yaml_b64 = ""
     if evaluation_only:
         validate_evaluation_only(config, dataset)
+    if not evaluation_only:
+        dataset = prepare_arena_training_dataset(dataset, streams, config)
     generation = config.eval_gconfig if evaluation_only else config.gconfig
     workflow = "examples.swe.arena_agent.ArenaStreamAgentWorkflow"
     kwargs = dict(
