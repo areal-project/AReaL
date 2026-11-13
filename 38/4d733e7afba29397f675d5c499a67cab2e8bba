@@ -1,0 +1,45 @@
+areal/engine/awex/adapters/sglang_adapter.py
+  s_125ac839b9f4bb::t_c8fa97ada2b2e9 182-202,1210-1217
+areal/engine/awex/frozen_draft.py
+  s_125ac839b9f4bb::t_00c1a5eb4fea94 1-79
+areal/engine/awex/plugins/sglang_plugin.py
+  s_125ac839b9f4bb::t_b4e562c0ab32fe 38,356-360,386,395-405,416-420
+areal/engine/flashinfer_radix_patch.py
+  s_125ac839b9f4bb::t_c6e0ee7b050ed7 1-113
+areal/engine/flashinfer_radix_reset.json
+  s_125ac839b9f4bb::t_d47f71e619b06a 1-63
+areal/engine/sglang_remote.py
+  s_125ac839b9f4bb::t_cbcec8d242c0ac 3,111-135
+areal/infra/remote_inf_engine.py
+  s_125ac839b9f4bb::t_23f7d7ac59bdda 46-50,64,1235-1252
+areal/models/mcore/vocab_parallel_head.py
+  s_125ac839b9f4bb::t_799fce1245063a 124-140,218-221,320
+areal/v2/inference_service/router/client.py
+  s_125ac839b9f4bb::t_2d17d6c6547e2c 20,23-24,50-53,98,100,118,120-128,135-151,321-327,330-331
+tests/test_awex_frozen_draft.py
+  s_125ac839b9f4bb::t_62f73ccc170032 1-79
+tests/test_awex_sglang_plugin.py
+  s_125ac839b9f4bb::t_c79db00aa5c7b0 4,7,360-402,845-896
+tests/test_flashinfer_radix_patch.py
+  s_125ac839b9f4bb::t_99a3ca3d46ddb4 1-109
+tests/test_megatron_lm_head.py
+  s_125ac839b9f4bb::t_78ef079082ac0a 1044-1085
+tests/v2/inference_service/test_backend_router.py
+  s_125ac839b9f4bb::t_30ae0e20754fdc 23-26,463-517,703-838
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "384d733e7afba29397f675d5c499a67cab2e8bba",
+  "prompts": {},
+  "sessions": {
+    "s_125ac839b9f4bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1d316-3537-7ed2-bdc5-baa4e87b89ff",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
