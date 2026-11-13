@@ -100,14 +100,13 @@ def merge_sampling_batches(left, right, original_merge) -> None:
 
 
 def register_backend() -> None:
-    """Called in every spawned SGLang process through a validated import patch."""
+    """Register through SGLang's sampler factory API in each worker process."""
     from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
     from sglang.srt.layers.sampler import (
         Sampler,
         register_sampler_backend,
     )
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.server_args import get_global_server_args
 
     if getattr(SamplingBatchInfo, "_areal_mask_installed", False):
         return
@@ -185,18 +184,15 @@ def register_backend() -> None:
     class SamplingMaskSampler(Sampler):
         def __init__(self):
             super().__init__()
+            from areal.engine.sglang_sampling_mask_plugin import runtime_settings
             from areal.infra.sampling_mask.service import MaskProducer
 
-            args = get_global_server_args()
-            if args.sampling_backend != "areal_sampling_mask":
+            backend, pp_size, attn_cp_size, speculative_algorithm = runtime_settings()
+            if backend != "areal_sampling_mask":
                 raise ValueError(
                     "sampling_mask_transfer sampler backend was overridden"
                 )
-            if (
-                args.speculative_algorithm
-                or args.pp_size != 1
-                or getattr(args, "attn_cp_size", 1) != 1
-            ):
+            if speculative_algorithm or pp_size != 1 or attn_cp_size != 1:
                 raise ValueError(
                     "sampling_mask_transfer requires non-speculative SGLang PP=1"
                 )

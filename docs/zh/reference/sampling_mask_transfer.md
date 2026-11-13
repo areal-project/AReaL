@@ -82,8 +82,28 @@ token/top logprobs；这些路径报错，不静默采用另一种 概率定义�
 GIN peer 必须位于不同物理 GPU。同机同 GPU 的 rollout 与 actor 需要 actor TP 组内另一张 GPU 接收后广播；TP=1
 且双方只有同一张 GPU 时明确拒绝。
 
-SGLang 适配使用带指纹校验的安装补丁，目标版本为当前锁定的 0.5.10.post1； 不兼容版本会拒绝安装。NCCL 扩展针对运行环境的头文件和共享库编译，要求设备
-API 与 GDAKI 可用。
+SGLang sampler 通过 `register_sampler_backend()` 注册，sampling-mask 接入不再改写已安装的 SGLang
+源文件。未知版本会在启动前报错。
+
+| 接口                                 | 0.5.10.post1                                           | 0.5.19                                | 0.5.20                                |
+| ------------------------------------ | ------------------------------------------------------ | ------------------------------------- | ------------------------------------- |
+| sampler 注册与 `forward` 调用契约    | 相同                                                   | 相同                                  | 相同                                  |
+| 加载方式                             | AReaL HTTP launcher + 可序列化 scheduler spawn wrapper | 原生 `sglang.srt.plugins` entry point | 同 0.5.19                             |
+| 有效配置读取                         | `get_global_server_args()`                             | `runtime_context`                     | `runtime_context`；旧 accessor 会报错 |
+| deterministic 模式保留自定义 backend | 进程内包装旧方法                                       | 原生 `HookRegistry` around hook       | 原生 `register_resolution_hook`       |
+| 分块 metadata 累积                   | 进程内兼容包装                                         | SGLang 原生支持                       | SGLang 原生支持                       |
+
+新版插件入口名为 `areal_sampling_mask`，仅在 AReaL 的功能开关开启时注册。更新代码后须在 rollout 使用的 Python 环境重新安装
+AReaL，以更新 entry-point 元数据。若设置了 `SGLANG_PLUGINS` 白名单，需包含该入口；缺失安装元数据或白名单排除会直接报错，不静默回退。
+
+0.5.10 的兼容入口仅支持 HTTP、单 tokenizer worker，不支持 Ray、gRPC 和 encoder-only。旧环境若已经有上一版源码补丁，会识别原有
+metadata 累积，避免重复；本次不会自动撤销共享安装中的旧补丁。重新安装干净的 SGLang 后也可使用兼容入口。
+
+0.5.19/0.5.20 的适配验证覆盖 sampler 注册、插件加载、配置解析钩子与 metadata 接口，尚未完成这两个版本的 GPU 端到端训练验证。仓库仍锁定
+0.5.10.post1；现有 AWEX 版本白名单也尚不接受正式版 0.5.19/0.5.20。本次没有升级依赖或扩充 AWEX 白名单，sampler
+接口兼容不等于整个训练栈兼容。
+
+NCCL 扩展针对运行环境的头文件和共享库编译，要求设备 API 与 GDAKI 可用。
 
 当前基础 `uv.lock` 随 PyTorch 固定 NCCL 2.27.5；此次验证环境单独安装了 `nvidia-nccl-cu12==2.31.2`。新环境或重新执行
 `uv sync` 后，需要重新选择兼容的 NCCL 包，包含头文件和共享库，例如在已激活的验证环境运行：
@@ -204,3 +224,13 @@ pre-commit 标记为通过。
 41.847 秒，超过外层 30 秒清理超时。 launcher 被终止后，RPC 子进程成为孤儿并保留模型内存，使下一次模型加载触发 CPU 内存阈值。 该失败发生在
 rollout 和 mask 传输之前；失败日志保留。验证脚本增加了按本次实验目录精确匹配的 退出清理，确认内存回收后重试。本功能没有修改 Ray
 launcher/scheduler，环境中的僵尸进程问题 仍应单独处理，不能将其视为已由 sampling-mask 功能修复。
+
+## 原生插件接口验证
+
+`tests/test_sampling_mask_sglang_plugin.py` 包含禁用路径、版本拒绝、entry-point 元数据与白名单检查。可通过
+`AREAL_TEST_SGLANG_SOURCES` 指定上游源码快照，执行三版本注册与 factory、构造函数、插件加载器、deterministic
+hook、metadata 累积的 CPU 契约测试。快照目录为 `v<version>/srt/`；这些测试使用真实上游相关代码并隔离 GPU runtime，不代表完整
+SGLang GPU 测试。
+
+对于 0.5.19/0.5.20，官方 `return_sampling_mask` 也是可用的数据接口；本实现继续保留自定义 sampler，使采样、保存支持集和 old
+logprob 来自同一计算，并接入现有 uint24/NCCL GIN 通路。原生插件机制消除的是修改安装文件的接入方式，不是删除自定义采样逻辑。
