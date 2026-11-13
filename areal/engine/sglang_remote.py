@@ -196,7 +196,7 @@ class SGLangBackend:
         return HttpRequest(endpoint="/generate", payload=payload)
 
     def parse_generation_response(
-        self, response: dict[str, Any]
+        self, response: dict[str, Any], *, score_centering_top_k: int = 0
     ) -> HttpGenerationResult:
         """Parse SGLang generation response."""
         meta_info = response["meta_info"]

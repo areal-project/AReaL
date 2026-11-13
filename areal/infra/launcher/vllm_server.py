@@ -94,6 +94,7 @@ class vLLMServerWrapper:
         allocation_mode: _AllocationMode,
         n_gpus_per_node: int,
         cpu_per_gpu: int | None = None,
+        score_centering_top_k: int = 0,
     ):
         self.experiment_name = experiment_name
         self.trial_name = trial_name
@@ -102,6 +103,7 @@ class vLLMServerWrapper:
         self.server_processes = []
         self.n_gpus_per_node = n_gpus_per_node
         self.cpu_per_gpu = cpu_per_gpu
+        self.score_centering_top_k = score_centering_top_k
         self._shutdown_requested = False
         self._is_shutting_down = False
 
@@ -196,6 +198,7 @@ class vLLMServerWrapper:
                 host=host_ip,
                 port=server_port,
                 dist_init_addr=dist_init_addr,
+                score_centering_top_k=self.score_centering_top_k,
             )
             launch_server_args.append((cmd, host_ip, server_port, custom_env))
             server_addresses.append(f"http://{format_hostport(host_ip, server_port)}")
@@ -285,6 +288,10 @@ def launch_vllm_server(argv):
         allocation_mode,
         n_gpus_per_node=config.cluster.n_gpus_per_node,
         cpu_per_gpu=rollout_spec.cpu,
+        score_centering_top_k=max(
+            getattr(getattr(config, "gconfig", None), "score_centering_top_k", 0),
+            getattr(getattr(config, "eval_gconfig", None), "score_centering_top_k", 0),
+        ),
     )
     vllm_server.run()
 

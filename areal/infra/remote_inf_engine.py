@@ -375,7 +375,7 @@ class RemoteInfBackendProtocol(Protocol):
         ...
 
     def parse_generation_response(
-        self, response: dict[str, Any]
+        self, response: dict[str, Any], *, score_centering_top_k: int = 0
     ) -> HttpGenerationResult:
         """Parse generation response into standard format.
 
@@ -383,6 +383,8 @@ class RemoteInfBackendProtocol(Protocol):
         ----------
         response : Dict[str, Any]
             The raw JSON response from the server
+        score_centering_top_k : int
+            Requested sampler head width for this generation request.
 
         Returns
         -------
@@ -1229,7 +1231,12 @@ class RemoteInfEngine(InferenceEngine):
                     ) as response:
                         response.raise_for_status()
                         result = await response.json()
-                    parsed = self.backend.parse_generation_response(result)
+                    if gconfig.score_centering_top_k:
+                        parsed = self.backend.parse_generation_response(
+                            result, score_centering_top_k=gconfig.score_centering_top_k
+                        )
+                    else:
+                        parsed = self.backend.parse_generation_response(result)
                     if parsed.stop_reason not in (
                         "stop",
                         "tool_calls",
@@ -1263,7 +1270,12 @@ class RemoteInfEngine(InferenceEngine):
                     raise ValueError(
                         f"Expected JSON dict response, got {type(result).__name__}"
                     )
-                gen_result = self.backend.parse_generation_response(result)
+                if gconfig.score_centering_top_k:
+                    gen_result = self.backend.parse_generation_response(
+                        result, score_centering_top_k=gconfig.score_centering_top_k
+                    )
+                else:
+                    gen_result = self.backend.parse_generation_response(result)
             stop_reason = gen_result.stop_reason
 
             if (
