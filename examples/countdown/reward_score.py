@@ -7,7 +7,7 @@ from fractions import Fraction
 
 
 def extract_solution(solution_str):
-    """Extract the equation from the solution string."""
+    """Extract the equation from the last <answer>...</answer> block."""
     # Remove everything before the first "Assistant:"
     if "Assistant:" in solution_str:
         solution_str = solution_str.split("Assistant:", 1)[1]
@@ -15,7 +15,11 @@ def extract_solution(solution_str):
         solution_str = solution_str.split("<|im_start|>assistant", 1)[1]
     # else:
     #     return None
-    solution_str = solution_str.split("\n")[-1]
+    end = solution_str.rfind("</answer>")
+    if end == -1:
+        return None
+    # No match can end after the last closing tag; trimming keeps the scan linear.
+    solution_str = solution_str[: end + len("</answer>")]
 
     answer_pattern = r"<answer>(.*?)</answer>"
     matches = re.findall(answer_pattern, solution_str, re.DOTALL)
