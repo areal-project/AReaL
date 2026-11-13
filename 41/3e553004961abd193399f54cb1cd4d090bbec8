@@ -1,0 +1,77 @@
+.agents/skills/upgrade-deps/SKILL.md
+  s_125ac839b9f4bb::t_b79d67f63f36b0 32-34,36-38,74-75,318,320-324,523
+.agents/skills/upgrade-deps/checklists/sglang.md
+  s_125ac839b9f4bb::t_b66a517b557c22 12-13,15,17-18,20-25,37-50,64,82-84,225-226,233-235,240-242,511,519,521-524,535-538,540-543,554,556-558,562-565,588-674,682-685
+.agents/skills/upgrade-deps/checklists/torchao.md
+  s_125ac839b9f4bb::t_027b641be46263 25,47-50
+Dockerfile
+  s_125ac839b9f4bb::t_2c81d1ff5b54f8 1-2,7-8,13,190,243,289-501
+areal/engine/awex/adapters/sglang_adapter.py
+  s_125ac839b9f4bb::t_d84e0f0475d038 405-407,410-418,1547-1548,1559-1560
+areal/engine/awex/plugins/sglang_plugin.py
+  s_125ac839b9f4bb::t_44e50f4561aa3f 72,138-139,425-429,442-446,455-457
+areal/engine/sglang_mm_executor.py
+  s_125ac839b9f4bb::t_fa705bc5562ea0 9,16-21,38-47
+areal/engine/sglang_model_patches.py
+  s_125ac839b9f4bb::t_0cf2bdaf783960 251-263,265,279-286
+areal/engine/sglang_qsa_compress_gather.py
+  s_125ac839b9f4bb::t_d9cb604799fc21 2,4,11,23-25
+areal/engine/sglang_qwen4_vl.py
+  s_125ac839b9f4bb::t_480cceaf1582fb 2,4,14-19,50-61
+areal/engine/sglang_qwen_vl_cpu.py
+  s_125ac839b9f4bb::t_c187e9ba9fe65c 4,14-19,23,41-50,61-62
+areal/tools/check_pyproject_consistency.py
+  s_125ac839b9f4bb::t_71823d94b9f51a 50-52,201-202,204-206,209-211,270-272,287-298,304-305
+areal/tools/validate_docker_installation.py
+  s_125ac839b9f4bb::t_2dcd9cdda4ba1c 8-9,27-32,100-106,121,123-125
+areal/v2/inference_service/sglang/launch_server.py
+  s_125ac839b9f4bb::t_0b6ead599d3b16 34,48-54,65,76-77,79,81-84,96-98
+areal/v2/inference_service/sglang/mtp_weight_update_bridge.py
+  s_125ac839b9f4bb::t_dd8459b18c890e 5,21,41-42,45,70,105,117,204-208,213-217,238-240
+areal/v2/inference_service/sglang/pp_bridge.py
+  s_125ac839b9f4bb::t_e25607c91f8669 94-95,108,112,117,121,127-128,144-145,161-162,174-175,183-185,188,198-199,205,208,213,216,220-222,226,229,234
+areal/v2/inference_service/sglang/routed_experts_compat.py
+  s_125ac839b9f4bb::t_48bc1fe12335a5 61,65-68,85-91,150-197
+areal/v2/inference_service/sglang/rpc_proxy.py
+  s_125ac839b9f4bb::t_70f1fbe21ee35f 6,10-15,43-47
+areal/v2/inference_service/sglang/scheduler.py
+  s_125ac839b9f4bb::t_d584d4960cec6a 6,45-46,72-80,101-102,127,169-171,188,190,195-199,214-227,233-238,240,242,244,247,279-289
+docs/en/tutorial/installation.md
+  s_125ac839b9f4bb::t_591d350362edc4 41-43,129-130,136-140,169-171,236-237
+docs/zh/tutorial/installation.md
+  s_125ac839b9f4bb::t_64a8a765d1b9cf 37-38,111-112,118-120,146-147,203
+examples/swe/rl/qwen38_27b/configure_sglang_logging.py
+  s_125ac839b9f4bb::t_180ba4ef96f575 15,24
+pyproject.toml
+  s_125ac839b9f4bb::t_f7ca4abb6df30a 45,52,148,154,157,169,227-228,238-239,241,259-263,301-302,308-309,312-313,316-317
+tests/test_awex_sglang_plugin.py
+  s_125ac839b9f4bb::t_8308085e942e8c 14,29-44,134-173,220,224,227,244-245,271-275,288,290-292,295,317-321
+tests/test_pyproject_consistency.py
+  s_125ac839b9f4bb::t_88de3b1324c4f2 57-84
+tests/test_sglang_0520_bridge.py
+  s_125ac839b9f4bb::t_4721194f5897ae 1-189
+tests/test_sglang_logging_config.py
+  s_125ac839b9f4bb::t_a58fbe7c2c5676 1-42
+tests/test_sglang_model_patches.py
+  s_125ac839b9f4bb::t_51b1bdb2a59c36 26-28,98-185
+tests/test_sglang_mtp_weight_update_bridge.py
+  s_125ac839b9f4bb::t_84c4b6c6279177 19-23,50,57-59,66,75-79,89,102-106,113,124-126,134,176,194-196,242
+tests/v2/inference_service/test_sglang_routed_experts_compat.py
+  s_125ac839b9f4bb::t_10881487351b1b 5-6,11,55-107,110-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "413e553004961abd193399f54cb1cd4d090bbec8",
+  "prompts": {},
+  "sessions": {
+    "s_125ac839b9f4bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1d316-3537-7ed2-bdc5-baa4e87b89ff",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
