@@ -35,6 +35,7 @@ from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
 
+from areal.engine.awex.frozen_draft import FrozenDraftState, get_draft_model
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
 from areal.engine.awex.metadata import serialize_metadata_gc
 from areal.engine.awex.parallel import resolve_scheduler_parallel_attr
@@ -352,6 +353,11 @@ class AwexSchedulerPlugin:
         original_resume = getattr(owner, "resume_memory_occupation", None)
         if original_release is None or original_resume is None:
             return
+        frozen_draft = None
+
+        def _includes_weights(request: Any) -> bool:
+            tags = getattr(request, "tags", None)
+            return not tags or "weights" in tags
 
         def _filtered_request(request: Any, *, release: bool) -> Any | None:
             tags = getattr(request, "tags", None)
@@ -377,6 +383,7 @@ class AwexSchedulerPlugin:
             return filtered
 
         def _release(request: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal frozen_draft
             filtered = _filtered_request(request, release=True)
             if filtered is None:
                 from sglang.srt.managers.io_struct import (
@@ -385,6 +392,17 @@ class AwexSchedulerPlugin:
 
                 return ReleaseMemoryOccupationReqOutput()
             with _retract_memory_idle(scheduler, owner):
+                if _includes_weights(filtered) and frozen_draft is None:
+                    draft_model = get_draft_model(scheduler)
+                    if draft_model is not None:
+                        frozen_draft = FrozenDraftState(
+                            scheduler.tp_worker.model_runner.model, draft_model
+                        )
+                        logger.info(
+                            "[AWEX] preserved frozen draft: tensors=%d bytes=%d",
+                            frozen_draft.tensor_count,
+                            frozen_draft.nbytes,
+                        )
                 return original_release(filtered, *args, **kwargs)
 
         def _resume(request: Any, *args: Any, **kwargs: Any) -> Any:
@@ -395,7 +413,11 @@ class AwexSchedulerPlugin:
                 )
 
                 return ResumeMemoryOccupationReqOutput()
-            return original_resume(filtered, *args, **kwargs)
+            result = original_resume(filtered, *args, **kwargs)
+            if _includes_weights(filtered) and frozen_draft is not None:
+                frozen_draft.restore()
+                logger.info("[AWEX] restored frozen draft weights and buffers")
+            return result
 
         scheduler.release_memory_occupation = _release
         scheduler.resume_memory_occupation = _resume

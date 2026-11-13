@@ -121,6 +121,23 @@ def _lm_head_compute_weight(
     return weight.float(), bias.float() if bias is not None else None
 
 
+def _linear_backward(ctx, grad_output: torch.Tensor) -> tuple:
+    """Adapt Megatron's backward to AReaL's ten-input linear contract."""
+    gradients = mcore_layers.LinearWithGradAccumulationAndAsyncCommunication.backward(
+        ctx, grad_output
+    )
+    if len(gradients) == 9:
+        # Older Megatron versions do not take the non-tensor gtp_remat_size.
+        if ctx.gtp_remat_size != 1:
+            raise NotImplementedError("Legacy Megatron backward does not support GTP")
+        return (*gradients, None)
+    if len(gradients) != 10:
+        raise RuntimeError(
+            f"Unexpected Megatron linear backward arity: {len(gradients)}"
+        )
+    return gradients
+
+
 class _LinearWithNativeOutput(
     mcore_layers.LinearWithGradAccumulationAndAsyncCommunication
 ):
@@ -197,6 +214,10 @@ class _LinearWithNativeOutput(
         if bias is not None:
             output = output + bias
         return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        return _linear_backward(ctx, grad_output)
 
 
 class _LinearWithFrozenNativeOutput(mcore_layers.LinearWithFrozenWeight):
@@ -296,9 +317,7 @@ class _LinearWithFp32Output(
             ).view(ctx.output_shape)
         else:
             grad_output = grad_output.view(ctx.output_shape).to(dtype=weight.dtype)
-        return mcore_layers.LinearWithGradAccumulationAndAsyncCommunication.backward(
-            ctx, grad_output
-        )
+        return _linear_backward(ctx, grad_output)
 
 
 class _LinearWithFrozenFp32Output(mcore_layers.LinearWithFrozenWeight):
