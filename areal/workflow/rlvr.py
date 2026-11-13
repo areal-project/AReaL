@@ -185,6 +185,10 @@ class RLVRWorkflow(RolloutWorkflow):
                 resp.stop_reason == "length", dtype=torch.bool
             ),
         }
+        if self.gconfig._sampling_mask_transfer:
+            from areal.infra.sampling_mask.protocol import trajectory_references
+
+            res.update(trajectory_references(resp))
         if self.gconfig.score_centering_top_k:
             from areal.utils.score_centering import trajectory_heads
 

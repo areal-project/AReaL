@@ -287,6 +287,13 @@ def main() -> None:
     server_args = args.server_args
     if server_args[:1] == ["--"]:
         server_args = server_args[1:]
+    if os.environ.get("AREAL_SAMPLING_MASK_TRANSFER") == "1":
+        # SGLang otherwise disables cuMem before NCCL's first allocation.
+        # GIN symmetric windows require VMM-backed allocations from startup.
+        os.environ["NCCL_CUMEM_ENABLE"] = "1"
+        from areal.engine.sglang_sampling_mask_patch import install
+
+        install()
     apply_model_patches(server_args)
     # Exec preserves PID and the original __main__/multiprocessing spawn behavior.
     os.execv(sys.executable, [sys.executable, "-m", args.entrypoint, *server_args])

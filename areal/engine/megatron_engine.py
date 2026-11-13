@@ -1184,6 +1184,9 @@ class MegatronEngine(TrainEngine):
         return self._cpu_group
 
     def destroy(self):
+        if getattr(self, "_sampling_mask_consumer", None) is not None:
+            self._sampling_mask_consumer.close()
+            self._sampling_mask_consumer = None
         if getattr(self, "_weftmoe_adapter", None) is not None:
             self._weftmoe_adapter.close()
             self._weftmoe_adapter = None
@@ -2150,6 +2153,18 @@ class MegatronEngine(TrainEngine):
                     "also supports padded BSHD"
                 )
 
+            sampling_mask = None
+            if (
+                getattr(self.config, "_sampling_mask_transfer", False)
+                and is_pipeline_last_stage
+            ):
+                sampling_mask = self._load_sampling_mask_microbatch(
+                    source_mb,
+                    chunked=use_chunked_lm_head,
+                    cp_local=cp_local,
+                )
+                mb_input.orig_mb["_sampling_mask"] = sampling_mask
+
             # MTP training: pass the token loss mask through the model's actual
             # THD or BSHD layout. MCore 0.19 derives MTP labels directly from
             # input_ids when the main forward keeps labels=None, so AReaL only
@@ -2260,6 +2275,7 @@ class MegatronEngine(TrainEngine):
                     temperature=self.config.temperature,
                     chunk_size=self.mcore_config.lm_head_loss_chunk_size,
                     logit_scale=logit_scale,
+                    sampling_mask=sampling_mask,
                 )
 
                 if padded_lm_head:
@@ -2702,6 +2718,18 @@ class MegatronEngine(TrainEngine):
                 )
             )
             data.update(export_training_metrics(self))
+            if getattr(self.config, "_sampling_mask_transfer", False):
+                from areal.infra.sampling_mask.consumer import aggregate_metrics
+
+                data.update(
+                    aggregate_metrics(
+                        getattr(self, "_sampling_mask_consumer", None),
+                        vocab_size=lang_config(self.hf_config).vocab_size,
+                        logical_owner=mpu.is_pipeline_last_stage(ignore_virtual=True)
+                        and mpu.get_tensor_model_parallel_rank() == 0,
+                        cpu_group=self.cpu_group,
+                    )
+                )
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             # Some log info only exist in last pipeline rank
             data_list = [data]
@@ -4228,6 +4256,79 @@ class MegatronEngine(TrainEngine):
 
         return mb_list
 
+    def begin_sampling_mask_batch(self, data: dict) -> None:
+        from areal.infra.sampling_mask.protocol import batch_identity
+
+        identity = batch_identity(data)
+        if getattr(self, "_sampling_mask_batch_identity", None) != identity:
+            consumer = getattr(self, "_sampling_mask_consumer", None)
+            if consumer is not None:
+                consumer.release_batch()
+            self._sampling_mask_batch_identity = identity
+
+    def _load_sampling_mask_microbatch(
+        self, source_mb, *, chunked: bool, cp_local: bool
+    ):
+        from areal.infra.sampling_mask.consumer import SamplingMaskConsumer
+        from areal.infra.sampling_mask.protocol import REFERENCE_KEYS
+
+        if self.enable_tree_training:
+            raise ValueError("sampling_mask_transfer does not support tree training")
+        if not hasattr(self, "_sampling_mask_consumer"):
+            self._sampling_mask_consumer = SamplingMaskConsumer(
+                torch.device(self.device),
+                mpu.get_tensor_model_parallel_group()
+                if mpu.get_tensor_model_parallel_world_size() > 1
+                else None,
+                lang_config(self.hf_config).vocab_size,
+            )
+        use_padded = chunked or (cp_local and "cu_seqlens" in source_mb.padded_mb)
+        source = source_mb.padded_mb if use_padded else source_mb.orig_mb
+        if any(key not in source for key in REFERENCE_KEYS):
+            raise ValueError("sampling_mask_transfer requires saved rollout supports")
+        refs = {key: source[key] for key in REFERENCE_KEYS}
+        labels = torch.roll(source["input_ids"], shifts=-1, dims=-1)
+        versions = source.get("versions")
+        if versions is not None:
+            versions = torch.roll(versions, shifts=-1, dims=-1)
+        cu = source.get("cu_seqlens")
+        if chunked and self.use_padded_seq and cu is not None:
+            labels = _padded_lm_head_labels(
+                source["input_ids"], cu, source["max_seqlen"]
+            )
+            lengths = cu[1:] - cu[:-1]
+            valid = torch.arange(source["max_seqlen"])[None, :] < lengths[:, None]
+
+            def padded(value):
+                result = value.new_zeros((lengths.numel(), source["max_seqlen"]))
+                result[valid] = value
+                return result.transpose(0, 1).contiguous()
+
+            refs = {key: padded(value) for key, value in refs.items()}
+            versions = padded(versions) if versions is not None else None
+        elif (
+            use_padded and mpu.get_context_parallel_world_size() > 1 and cu is not None
+        ):
+            labels = split_packed_seqs_for_context_parallel(labels, cu)
+            refs = {
+                key: split_packed_seqs_for_context_parallel(value, cu)
+                for key, value in refs.items()
+            }
+            versions = (
+                split_packed_seqs_for_context_parallel(versions, cu)
+                if versions is not None
+                else None
+            )
+        elif chunked and labels.ndim == 2:
+            labels = labels.transpose(0, 1).contiguous()
+            refs = {
+                key: value.transpose(0, 1).contiguous() for key, value in refs.items()
+            }
+            versions = (
+                versions.transpose(0, 1).contiguous() if versions is not None else None
+            )
+        return self._sampling_mask_consumer.load(refs, labels, versions)
+
     def _compute_logprobs_and_loss(
         self,
         output: torch.Tensor | ChunkedLMHeadOutput,
@@ -4239,6 +4340,7 @@ class MegatronEngine(TrainEngine):
         per_token_loss: bool = False,
         total_token_count: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        sampling_support = inputs.pop("_sampling_mask", None)
         local_weight = compute_microbatch_loss_weight(inputs, loss_weight_fn)
         native_named = per_token_loss and isinstance(local_weight, dict)
         if native_named and total_token_count is None:
@@ -4283,7 +4385,38 @@ class MegatronEngine(TrainEngine):
         if not self.config.is_critic:
             sc_kwargs = {}
             cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
-            if getattr(self.config, "use_score_centering", False):
+            if getattr(
+                self.config, "_sampling_mask_transfer", False
+            ) and not isinstance(output, ChunkedLMHeadOutput):
+                from areal.utils.sampling_mask import restricted_logprobs
+
+                support = sampling_support
+                if support is None:
+                    raise ValueError(
+                        "Missing frozen sampling support in Megatron actor loss"
+                    )
+                labels = inputs.get("_cp_local_labels")
+                if labels is None:
+                    labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
+                ids, offsets = support.chunk(0, output.shape[0], output.device)
+                logprobs, entropy = restricted_logprobs(
+                    output,
+                    labels.reshape(-1),
+                    ids,
+                    offsets,
+                    temperature=self.config.temperature,
+                    vocab_size=support.vocab_size,
+                    tp_group=mpu.get_tensor_model_parallel_group()
+                    if mpu.get_tensor_model_parallel_world_size() > 1
+                    else None,
+                )
+                vocab_min_logits = output.detach().min(-1).values.float()
+                vocab_max_logits = output.detach().max(-1).values.float()
+                vocab_mean_logits = output.detach().mean(-1, dtype=torch.float32)
+                vocab_norm_logits = torch.linalg.vector_norm(
+                    output.detach(), dim=-1, dtype=torch.float32
+                )
+            elif getattr(self.config, "use_score_centering", False):
                 if self.enable_tree_training or isinstance(output, ChunkedLMHeadOutput):
                     raise ValueError(
                         "Score centering requires ordinary packed Megatron logits."
@@ -4539,6 +4672,7 @@ class MegatronEngine(TrainEngine):
         output: torch.Tensor | ChunkedLMHeadOutput,
         inputs: dict[str, Any],
     ) -> torch.Tensor | dict[int, torch.Tensor]:
+        sampling_support = inputs.pop("_sampling_mask", None)
         if self.config.is_critic and self.enable_tree_training:
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
@@ -4561,6 +4695,27 @@ class MegatronEngine(TrainEngine):
             labels = inputs.get("_cp_local_labels")
             if labels is None:
                 labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
+            if getattr(self.config, "_sampling_mask_transfer", False):
+                from areal.utils.sampling_mask import restricted_logprobs
+
+                support = sampling_support
+                if support is None:
+                    raise ValueError(
+                        "Missing frozen sampling support in Megatron forward"
+                    )
+                ids, offsets = support.chunk(0, output.shape[0], output.device)
+                logprobs, _ = restricted_logprobs(
+                    output,
+                    labels.reshape(-1),
+                    ids,
+                    offsets,
+                    temperature=self.config.temperature,
+                    vocab_size=support.vocab_size,
+                    tp_group=mpu.get_tensor_model_parallel_group()
+                    if mpu.get_tensor_model_parallel_world_size() > 1
+                    else None,
+                )
+                return self._reassemble_cp_forward_scalars(logprobs, inputs)
             logprobs = gather_logprobs(
                 output,
                 labels,

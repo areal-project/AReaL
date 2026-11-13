@@ -279,6 +279,23 @@ class InteractionWithTokenLogpReward:
             original_rewards=torch.tensor([float(original_reward)]),
             is_truncated=torch.tensor([resp.stop_reason == "length"], dtype=torch.bool),
         )
+        if resp.sampling_mask_refs is not None:
+            from areal.infra.sampling_mask.protocol import (
+                REFERENCE_KEYS,
+                trajectory_references,
+            )
+
+            references = trajectory_references(resp)
+            if self.chat_template_type == "concat" and self.parent is not None:
+                for key in REFERENCE_KEYS:
+                    if key not in parent_res:
+                        raise ValueError(
+                            "Concat parent is missing frozen sampling supports"
+                        )
+                    references[key][:parent_len] = parent_res[key].squeeze(0)
+            result.update(
+                {key: value.unsqueeze(0) for key, value in references.items()}
+            )
         if routed_experts is not None and r3_routing_valid is not None:
             result["routed_experts"] = routed_experts
             result["r3_routing_valid"] = r3_routing_valid
