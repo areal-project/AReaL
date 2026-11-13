@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import math
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +15,7 @@ from areal.api.cli_args import (
 )
 from areal.api.io_struct import ModelRequest, ModelResponse
 from areal.engine.sglang_remote import SGLangBackend
+from areal.utils import score_centering
 from areal.utils.data import (
     concat_batch,
     pack_tensor_dict,
@@ -243,6 +246,47 @@ def test_invalid_heads_are_rejected(ids, logps):
     """Malformed sampler evidence must never silently disable correction."""
     with pytest.raises(ValueError):
         validate_heads(ids, logps, 1, 2)
+
+
+def _random_heads(rng):
+    count, width = rng.randint(1, 5), rng.randint(1, 4)
+    ids = [rng.sample(range(50), width) for _ in range(count)]
+    logps = []
+    for _ in range(count):
+        raw = [rng.random() + 1e-9 for _ in range(width)]
+        mass = rng.uniform(0.5, 1 + 2e-5)
+        logps.append([math.log(x / sum(raw) * mass) for x in raw])
+    rows = rng.choice([ids, logps])
+    row = rng.randrange(count)
+    kind = rng.randrange(6)
+    if kind < 2:
+        bad = [True, -1, 2**70, 1.0, -0.0, 0, 1e-7, None]
+        bad += [float("nan"), float("inf"), -float("inf")]
+        rows[row][rng.randrange(width)] = rng.choice(bad)
+    elif kind == 2:
+        ids[row][-1] = ids[row][0]
+    elif kind == 3:
+        rows[row].append(-1.0)
+    elif kind == 4:
+        rows[row] = tuple(rows[row])
+    return ids, logps, count, width
+
+
+def test_bulk_head_checks_match_row_checks(monkeypatch):
+    """The whole-list fast path may only accept heads the row checks accept."""
+    cases = [_random_heads(random.Random(seed)) for seed in range(3000)]
+
+    def outcome(case):
+        try:
+            validate_heads(*case)
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    with_fast_path = [outcome(case) for case in cases]
+    assert sum(score_centering._rows_pass_checks(*c[:2], c[3]) for c in cases) > 500
+    monkeypatch.setattr(score_centering, "_rows_pass_checks", lambda *args: False)
+    assert [outcome(case) for case in cases] == with_fast_path
 
 
 @pytest.mark.parametrize("width", [1, 12])
