@@ -76,10 +76,82 @@ from areal.utils.qwen_vl_image import (
     sglang_image_alignment_enabled,
     sglang_qwen_image_kwargs,
 )
+from areal.utils.score_centering import validate_sampling
 
 if TYPE_CHECKING:
     from transformers.processing_utils import ProcessorMixin
     from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+
+
+def _score_centering_request(
+    extra_body: Mapping[str, Any],
+    kwargs: Mapping[str, Any],
+    *,
+    has_images: bool,
+    temperature: Any,
+    top_p: Any,
+    top_k: Any,
+    frequency_penalty: Any,
+) -> int:
+    """Validate the distribution before recording an agent interaction."""
+    width = extra_body.get("score_centering_top_k", 0)
+    if type(width) is int and width == 0:
+        return 0
+    validate_sampling(
+        GenerationHyperparameters(
+            score_centering_top_k=width,
+            temperature=1.0 if is_omitted(temperature) else temperature,
+            top_p=1.0 if is_omitted(top_p) else top_p,
+            top_k=int(1e8) if is_omitted(top_k) else top_k,
+            frequency_penalty=0.0
+            if is_omitted(frequency_penalty)
+            else frequency_penalty,
+        )
+    )
+    if has_images:
+        raise ValueError(
+            "Score centering in agent workflows currently supports text-only inputs."
+        )
+    # Tools are rendered in the prompt and parsed after sampling. Constrained
+    # decoding and other unrepresented distribution changes are not supported.
+    for source in (extra_body, kwargs):
+        for name, neutral in (
+            ("presence_penalty", 0),
+            ("repetition_penalty", 1),
+            ("min_p", 0),
+            ("logit_bias", {}),
+        ):
+            value = source.get(name)
+            if not is_omitted(value) and value != neutral:
+                raise ValueError(f"Score centering does not support {name}.")
+        for name in (
+            "response_format",
+            "json_schema",
+            "regex",
+            "ebnf",
+            "grammar",
+            "structural_tag",
+            "text",
+        ):
+            value = source.get(name)
+            if name == "text" and isinstance(value, Mapping):
+                value = value.get("format")
+            if not is_omitted(value) and value not in ({}, {"type": "text"}):
+                raise ValueError(
+                    f"Score centering does not support constrained decoding ({name})."
+                )
+    for name in (
+        "temperature",
+        "top_p",
+        "top_k",
+        "frequency_penalty",
+        "sampling_params",
+    ):
+        if name in extra_body:
+            raise ValueError(
+                f"Pass {name} as a generation argument, not inside extra_body."
+            )
+    return width
 
 
 class _AsyncGenerateEngine(Protocol):
@@ -1253,6 +1325,15 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             self.require_multimodal_processor,
         )
         has_images = len(image_data) > 0
+        sc_top_k = _score_centering_request(
+            extra_body,
+            kwargs,
+            has_images=has_images,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+        )
 
         # Convert response to OpenAI format
         current_time = int(datetime.datetime.now().timestamp())
@@ -1265,6 +1346,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             interaction = InteractionWithTokenLogpReward(
                 messages=deepcopy(messages_list),  # Store a copy of the input messages
                 chat_template_type=self.chat_template_type,
+                score_centering_top_k=sc_top_k,
             )
             cache[completion_id] = interaction
 
@@ -1399,6 +1481,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             top_k=top_k_val,
             stop=stop_tokens,
             greedy=temp == 0,
+            score_centering_top_k=sc_top_k,
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
             seed=None if is_omitted(seed) else seed,
@@ -1799,10 +1882,20 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             self.require_multimodal_processor,
         )
         has_images = len(image_data) > 0
+        sc_top_k = _score_centering_request(
+            extra_body,
+            kwargs,
+            has_images=has_images,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=kwargs.get("top_k", NOT_GIVEN),
+            frequency_penalty=frequency_penalty,
+        )
 
         interaction = InteractionWithTokenLogpReward(
             messages=deepcopy(messages_list),  # Store a copy of the input messages
             chat_template_type=self.chat_template_type,
+            score_centering_top_k=sc_top_k,
             input_data=(
                 deepcopy(input) if not is_omitted(input) else ""
             ),  # Store a copy of the input data
@@ -1895,6 +1988,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             top_p=top_p_val,
             stop=stop,
             greedy=temp == 0,
+            score_centering_top_k=sc_top_k,
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
             seed=None if is_omitted(seed) else seed,

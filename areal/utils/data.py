@@ -348,6 +348,13 @@ def concat_padded_tensors(
             continue
         values = [td[key] for td in tensor_dicts]
         if isinstance(values[0], torch.Tensor):
+            if key in ("sampler_head_ids", "sampler_head_logprobs") and any(
+                value.ndim != 3 or value.shape[2:] != values[0].shape[2:]
+                for value in values
+            ):
+                raise ValueError(
+                    "Sampler head tensors must share score_centering_top_k; only sequence padding is allowed."
+                )
             pv = 0.0 if key == "attention_mask" else pad_value
             if key == "sampler_head_logprobs":
                 pv = -float("inf")

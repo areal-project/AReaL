@@ -136,7 +136,9 @@ def main(args):
         max_turns=max_turns,
     )
     eval_workflow_kwargs = workflow_kwargs.copy()
-    eval_workflow_kwargs["gconfig"] = config.gconfig.new(temperature=0.6, n_samples=1)
+    eval_workflow_kwargs["gconfig"] = config.gconfig.new(
+        temperature=0.6, n_samples=1, score_centering_top_k=0
+    )
 
     with PPOTrainer(
         config,
