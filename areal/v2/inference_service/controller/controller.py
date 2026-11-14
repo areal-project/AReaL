@@ -114,6 +114,14 @@ class RolloutControllerV2:
         self.config = config
         self.scheduler = scheduler
 
+        if config.gpu_devices is not None:
+            from areal.infra.scheduler.local import LocalScheduler
+
+            if not isinstance(scheduler, LocalScheduler):
+                raise ValueError("gpu_devices requires LocalScheduler")
+            if config.api_url is not None:
+                raise ValueError("gpu_devices requires locally launched model servers")
+
         if config.api_url is not None:
             self.rollout_alloc = None
         else:
@@ -222,6 +230,10 @@ class RolloutControllerV2:
     ) -> concurrent.futures.Future | None:
         from areal.infra.utils.concurrent import get_executor
 
+        if self.config.gpu_devices is not None and server_infos is not None:
+            raise ValueError(
+                "gpu_devices cannot be used with pre-existing server_infos"
+            )
         if self._init_future is not None:
             raise RuntimeError(
                 "initialize() called while a previous initialization is in progress"
@@ -406,7 +418,10 @@ class RolloutControllerV2:
             role=inf_role,
         )
 
-        self.scheduler.create_workers(job=inf_job)
+        placement = {}
+        if cfg.gpu_devices is not None:
+            placement["gpu_devices"] = cfg.gpu_devices
+        self.scheduler.create_workers(job=inf_job, **placement)
         self._service_roles.append(inf_role)
         inf_workers = self.scheduler.get_workers(role=inf_role)
         if len(inf_workers) != total_workers:

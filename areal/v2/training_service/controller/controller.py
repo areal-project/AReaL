@@ -44,6 +44,11 @@ class GatewayTrainController:
         self.train_engine = train_engine
         self.scheduler = scheduler
         self.config = config
+        if config.gpu_devices is not None:
+            from areal.infra.scheduler.local import LocalScheduler
+
+            if not isinstance(scheduler, LocalScheduler):
+                raise ValueError("gpu_devices requires LocalScheduler")
         self.train_alloc = ModelAllocation.from_str(config.backend)
         self.api_key: str | None = None
         self._gateway_addr: str = ""
@@ -192,7 +197,12 @@ class GatewayTrainController:
                 scheduling_strategy=cfg.scheduling_strategy,
                 role=guard_role,
             )
-            await asyncio.to_thread(self.scheduler.create_workers, job=guard_job)
+            placement = {}
+            if cfg.gpu_devices is not None:
+                placement["gpu_devices"] = cfg.gpu_devices
+            await asyncio.to_thread(
+                self.scheduler.create_workers, job=guard_job, **placement
+            )
             self._service_roles.append(guard_role)
             guard_workers = await asyncio.to_thread(
                 self.scheduler.get_workers,

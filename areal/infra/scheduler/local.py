@@ -243,6 +243,33 @@ class LocalScheduler(Scheduler):
 
         return target_workers[worker_idx].gpu_devices
 
+    def _plan_gpu_devices(
+        self, devices: list[int], gpu_counts: list[int]
+    ) -> list[list[int]]:
+        """Partition an explicit device list in worker order before spawning workers."""
+        if any(type(device) is not int or device < 0 for device in devices):
+            raise GPUAllocationError(
+                "gpu_devices must contain non-negative integer IDs"
+            )
+        if len(set(devices)) != len(devices):
+            raise GPUAllocationError("gpu_devices must contain unique IDs")
+        if not set(devices).issubset(self.gpu_devices):
+            raise GPUAllocationError(
+                f"Requested GPUs {devices} must belong to scheduler pool {self.gpu_devices}"
+            )
+        if devices and not current_platform.device_control_env_var:
+            raise GPUAllocationError("The current platform cannot bind GPU devices")
+        if any(count < 0 for count in gpu_counts) or sum(gpu_counts) != len(devices):
+            raise GPUAllocationError(
+                f"gpu_devices has {len(devices)} IDs, but worker GPU counts are {gpu_counts}"
+            )
+        placements = []
+        offset = 0
+        for count in gpu_counts:
+            placements.append(list(devices[offset : offset + count]))
+            offset += count
+        return placements
+
     def _allocate_ports(self, count: int) -> list[int]:
         # Workers are on the same node, so we can directly allocate ports in the scheduler
         try:
@@ -677,7 +704,9 @@ class LocalScheduler(Scheduler):
                 del self._colocated_roles[role]
             raise
 
-    def create_workers(self, job: Job, *args, **kwargs) -> list[str]:
+    def create_workers(
+        self, job: Job, *args, gpu_devices: list[int] | None = None, **kwargs
+    ) -> list[str]:
         """Create worker subprocesses.
 
         Parameters
@@ -686,6 +715,10 @@ class LocalScheduler(Scheduler):
             Job configuration with role, replicas, tasks, and scheduling strategy
         *args
             Additional arguments passed to worker command
+        gpu_devices : list[int], optional
+            Ordered device IDs from this scheduler's pool, partitioned by worker
+            GPU count. Automatic placements use an independent round-robin cursor.
+            Specify every GPU role for a fully explicit layout.
         **kwargs
             Additional keyword arguments
 
@@ -722,6 +755,27 @@ class LocalScheduler(Scheduler):
         strategy = job.scheduling_strategy
         strategy_type = SchedulingStrategyType(strategy.type)
         colocate_role = strategy.target
+        placements = None
+        if gpu_devices is not None:
+            gpu_counts = [spec.gpu for spec in schedulings]
+            if strategy_type == SchedulingStrategyType.colocation:
+                gpu_counts = [
+                    len(self._get_colocated_gpus(colocate_role, idx))
+                    for idx in range(num_workers)
+                ]
+            placements = self._plan_gpu_devices(gpu_devices, gpu_counts)
+            for idx, (spec, devices) in enumerate(zip(schedulings, placements)):
+                device_env = current_platform.device_control_env_var
+                configured = spec.env_vars.get(device_env)
+                if configured is not None and configured != ",".join(map(str, devices)):
+                    raise GPUAllocationError(
+                        f"Worker {role}/{idx}: {device_env} conflicts with gpu_devices"
+                    )
+                if strategy_type == SchedulingStrategyType.colocation:
+                    if devices != self._get_colocated_gpus(colocate_role, idx):
+                        raise GPUAllocationError(
+                            f"Worker {role}/{idx} must inherit GPUs from {colocate_role}"
+                        )
         logger.info(
             f"Creating {num_workers} workers for role '{role}' "
             f"(strategy: {strategy_type}, colocate_with: {colocate_role})"
@@ -779,8 +833,12 @@ class LocalScheduler(Scheduler):
                 scheduling = schedulings[idx]
 
                 try:
-                    gpu_devices = self._allocate_gpus(scheduling.gpu)
-                    logger.debug(f"Worker {worker_id} allocated GPUs {gpu_devices}")
+                    devices = (
+                        self._allocate_gpus(scheduling.gpu)
+                        if placements is None
+                        else placements[idx]
+                    )
+                    logger.debug(f"Worker {worker_id} allocated GPUs {devices}")
                 except (
                     GPUAllocationError,
                     PortAllocationError,
@@ -795,7 +853,7 @@ class LocalScheduler(Scheduler):
                 env = get_env_vars(scheduling.env_vars)
                 if current_platform.device_control_env_var:
                     env[current_platform.device_control_env_var] = ",".join(
-                        map(str, gpu_devices)
+                        map(str, devices)
                     )
 
                 thread_env = get_thread_env_vars(
@@ -936,7 +994,7 @@ class LocalScheduler(Scheduler):
                     worker=worker,
                     process=process,
                     role=role,
-                    gpu_devices=gpu_devices,
+                    gpu_devices=devices,
                     created_at=time.time(),
                     log_file=str(log_file),
                     env_vars=env,
@@ -946,7 +1004,7 @@ class LocalScheduler(Scheduler):
                 worker_ids.append(worker_id)
                 logger.info(
                     f"Worker {worker_id} started (PID: {process.pid}, "
-                    f"GPUs: {gpu_devices}, ports: {ports})"
+                    f"GPUs: {devices}, ports: {ports})"
                 )
 
             self._workers[role] = workers

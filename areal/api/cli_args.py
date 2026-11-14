@@ -1613,6 +1613,14 @@ class TrainEngineConfig:
     )
 
     # Scheduling
+    gpu_devices: list[int] | None = field(
+        default=None,
+        metadata={
+            "help": "Ordered GPU IDs from the LocalScheduler device pool, partitioned "
+            "by worker rank. Supported by training controller v2. Set explicit lists on "
+            "all GPU roles for a fixed layout. None uses automatic allocation."
+        },
+    )
     scheduling_spec: tuple[SchedulingSpec, ...] = field(
         default_factory=lambda: (
             SchedulingSpec(cmd="python -m areal.infra.rpc.rpc_server"),
@@ -1676,6 +1684,8 @@ class TrainEngineConfig:
 
     def __post_init__(self):
         """Validate scheduling_spec length and config combinations."""
+        if self.gpu_devices is not None and self._version != "v2":
+            raise ValueError("gpu_devices requires training controller v2")
         if self.logprobs_chunk_size <= 0:
             raise ValueError(
                 f"logprobs_chunk_size must be positive, got {self.logprobs_chunk_size}"
@@ -3318,6 +3328,14 @@ class InferenceEngineConfig:
             "help": "The grace period after calling /pause_generation. Wait until all requests have been dropped."
         },
     )
+    gpu_devices: list[int] | None = field(
+        default=None,
+        metadata={
+            "help": "Ordered GPU IDs from the LocalScheduler device pool, partitioned "
+            "by inference replica and TP/PP rank. Supported by rollout controller v2 "
+            "for locally launched model servers. None uses automatic allocation."
+        },
+    )
     scheduling_spec: tuple[SchedulingSpec, ...] = field(
         default_factory=lambda: (
             SchedulingSpec(cmd="python -m areal.infra.rpc.rpc_server"),
@@ -3415,6 +3433,8 @@ class InferenceEngineConfig:
 
     def __post_init__(self):
         """Validate scheduling_spec length."""
+        if self.gpu_devices is not None and self._version != "v2":
+            raise ValueError("gpu_devices requires rollout controller v2")
         if len(self.scheduling_spec) not in (1, 2):
             raise ValueError(
                 f"scheduling_spec must contain 1 or 2 SchedulingSpec, "
