@@ -24,7 +24,7 @@ from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
 from areal.infra.rpc.rtensor import RTensor, RTensorDrainReceipt
 from areal.infra.utils.concurrent import run_async_task
-from areal.utils import logging, stats_tracker
+from areal.utils import logging, perf_tracer, stats_tracker
 from areal.utils.data import make_dummy_eval_item
 from areal.utils.network import find_free_ports
 from areal.utils.seqpack import balanced_greedy_partition
@@ -498,6 +498,7 @@ class TrainController:
         **kwargs,
     ):
         """Dispatch method call to workers via the appropriate path."""
+        rpc_meta = perf_tracer.rpc_trace_meta(rpc_meta)
         dp_args, dp_kwargs, group_indices = self._prepare_dispatch(*args, **kwargs)
         results = run_async_task(
             self._call_workers, method, dp_args, dp_kwargs, rpc_meta=rpc_meta
@@ -512,6 +513,7 @@ class TrainController:
         **kwargs,
     ) -> list[Any]:
         """Call every rank and retain one result for every DP head."""
+        rpc_meta = perf_tracer.rpc_trace_meta(rpc_meta)
         dp_args, dp_kwargs, group_indices = self._prepare_dispatch(*args, **kwargs)
         if group_indices is not None:
             raise ValueError("all-DP-head calls only support replicated inputs")
@@ -532,6 +534,7 @@ class TrainController:
         **kwargs,
     ):
         """Async version of _custom_function_call."""
+        rpc_meta = perf_tracer.rpc_trace_meta(rpc_meta)
         dp_args, dp_kwargs, group_indices = self._prepare_dispatch(*args, **kwargs)
         results = await self._call_workers(
             method, dp_args, dp_kwargs, rpc_meta=rpc_meta
@@ -827,6 +830,7 @@ class TrainController:
                 self.scheduler.async_call_engine(
                     worker_id=worker.id,
                     method="config_perf_tracer",
+                    rpc_meta={"broadcast": False},
                     engine_name=self._engine_name(rank),
                     rank=rank,
                     role=role,

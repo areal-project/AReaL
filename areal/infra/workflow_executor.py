@@ -8,6 +8,7 @@ import os
 import random
 import threading
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, Protocol
@@ -926,6 +927,7 @@ class WorkflowExecutor:
         ) = None
 
         self._task_id_generator = TaskIdGenerator()
+        self._identity_namespace = uuid.uuid4().hex
 
         # Lazy-loaded tokenizer for trajectory dumping
         self._tokenizer = None
@@ -1068,6 +1070,7 @@ class WorkflowExecutor:
             tokenizer = self._get_tokenizer()
             if tokenizer is None:
                 return False, "tokenizer not configured"
+            rollout_group = traj.get("rollout_group")
 
             # Dump only consumed fields, never vision payloads. localize mutates
             # RTensor.data, so copy the wrappers as well as the container: the
@@ -1129,6 +1132,16 @@ class WorkflowExecutor:
 
             # Handle batched trajectories
             batch_size = input_ids.shape[0]
+            sample_indices = None
+            if isinstance(rollout_group, RolloutGroup):
+                rollout_group = rollout_group.validate_rows(batch_size)
+                sample_indices = [
+                    index
+                    for index, rows in zip(
+                        rollout_group.sample_indices, rollout_group.row_counts
+                    )
+                    for _ in range(rows)
+                ]
             if sample_metadata is not None and len(sample_metadata) != batch_size:
                 return (
                     False,
@@ -1173,6 +1186,15 @@ class WorkflowExecutor:
                         "prompt": split["prompt_text"],
                         "completion": split["completion_text"],
                     }
+                    if (
+                        sample_indices is not None
+                        and rollout_group.query_id is not None
+                    ):
+                        record.update(
+                            query_id=rollout_group.query_id,
+                            occurrence_id=rollout_group.occurrence_id,
+                            sample_index=sample_indices[i],
+                        )
                     if split["segments"] is not None:
                         record["segments"] = split["segments"]
                     if sample_metadata is not None and sample_metadata[i]:
@@ -1482,6 +1504,11 @@ class WorkflowExecutor:
                         if not isinstance(group, RolloutGroup):
                             raise ValueError("rollout_group must be a RolloutGroup")
                         group = group.validate_rows(rows)
+                        if group.query_id is not None:
+                            group = replace(
+                                group,
+                                occurrence_id=f"{self._identity_namespace}:{task_id}",
+                            )
                         if arena_stream_name:
                             group = replace(group, arena_stream_name=arena_stream_name)
                         traj = {k: v for k, v in traj.items() if k != "rollout_reward"}

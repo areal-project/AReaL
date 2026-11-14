@@ -206,7 +206,7 @@ from areal.utils.lr_scheduler import get_num_warmup_steps
 from areal.utils.moe_metrics import MoEMetrics
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
-from areal.utils.perf_tracer import trace_perf, trace_scope
+from areal.utils.perf_tracer import instant, trace_perf, trace_scope
 from areal.utils.seeding import get_seed
 from areal.utils.training_metrics import export_training_metrics, record_training_batch
 
@@ -1326,6 +1326,9 @@ class MegatronEngine(TrainEngine):
             )
 
             dist.barrier(group=self.cpu_group)
+            instant(
+                "awex.weight_published", category="comm", args={"version": meta.version}
+            )
             return
         with self._offload_aware_context():
             if meta.type == "xccl":
@@ -1508,6 +1511,16 @@ class MegatronEngine(TrainEngine):
                 param_group["_areal_last_step_lr"] = float(param_group["lr"])
         with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
+            instant(
+                "megatron_engine.optimizer_result",
+                args={
+                    "update_successful": bool(update_successful),
+                    "skipped": not bool(update_successful),
+                    "reason": None
+                    if update_successful
+                    else "optimizer_reported_unsuccessful",
+                },
+            )
         # MTP-only pipeline stages without an MTP block have no parameter
         # groups. Their stub optimizer must still step for global grad stats.
         current_lr = (
@@ -2311,7 +2324,9 @@ class MegatronEngine(TrainEngine):
         forward_backward_func = get_forward_backward_func()
         try:
             r3_context = self._prepare_r3_forward_context(mb_list)
-            with trace_scope("megatron_engine.forward_backward"):
+            with trace_scope(
+                "megatron_engine.forward_backward", args={"forward_only": forward_only}
+            ):
                 if len(self.model) > 1:
                     data_iterator = [iter(mb_list) for _ in range(len(self.model))]
                 else:

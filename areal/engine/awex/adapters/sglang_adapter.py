@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import math
 import os
 import time
@@ -1176,6 +1177,19 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             reader.weight_converter.refresh_frozen_contract()
         reader.update_weights(step_id=version)
         self._rebuild_derived_weights()
+        logger.info(
+            "AWEX_EVENT %s",
+            json.dumps(
+                {
+                    "event": "awex.weight_received",
+                    "version": version,
+                    "rank": self._legacy_transfer_rank,
+                    "engine_rank": self._legacy_engine_rank,
+                    "status": "completed",
+                    "timestamp_ns": time.time_ns(),
+                }
+            ),
+        )
         logger.info("Legacy SGLang weight update completed: version=%d", version)
 
     def _rebuild_derived_weights(self) -> None:

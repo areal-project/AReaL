@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 import time
 from collections.abc import Callable
@@ -63,6 +64,7 @@ from areal.trainer.mopd.teacher_manager import (
 from areal.trainer.mopd.teacher_phase import MOPDTeacherPhase
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.cleanup import run_batch_cleanups
+from areal.utils.data import RolloutGroup
 from areal.utils.dataloader import create_dataloader
 from areal.utils.dte import apply_dte_config_envvars
 from areal.utils.environ import is_single_controller
@@ -1249,6 +1251,7 @@ class PPOTrainer:
                     else {}
                 )
                 self.actor.ppo_update(adv_batch, **update_kwargs)
+                self._record_consumed_rollouts(adv_batch, global_step)
                 self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("ppo update")
 
@@ -1470,6 +1473,44 @@ class PPOTrainer:
                 epoch=epoch,
                 epoch_step=epoch_step,
                 global_step=global_step,
+            )
+
+    def _record_consumed_rollouts(
+        self, batch: list[dict[str, Any]], global_step: int
+    ) -> None:
+        """Persist logical rollout identities once per successful PPO call."""
+        if not self.config.rollout.dump_to_file:
+            return
+        groups = []
+        for trajectory in batch:
+            group = trajectory.get("rollout_group")
+            if isinstance(group, RolloutGroup):
+                groups.append(
+                    {
+                        "query_id": group.query_id,
+                        "occurrence_id": group.occurrence_id,
+                        "sample_indices": list(group.sample_indices),
+                        "row_counts": list(group.row_counts),
+                    }
+                )
+            else:
+                groups.append(None)
+        if not any(group and group["query_id"] is not None for group in groups):
+            return
+        directory = StatsLogger.get_log_path(self.config.stats_logger)
+        record = {
+            "event": "train_consumed",
+            "global_step": global_step,
+            "timestamp": time.time(),
+            "groups": groups,
+        }
+        try:
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, "consumption.jsonl"), "a") as stream:
+                stream.write(json.dumps(record, allow_nan=False) + "\n")
+        except OSError:
+            logger.exception(
+                "Failed to record rollout consumption at step %s", global_step
             )
 
     def _is_final_train_step(self, *, global_step: int, max_steps: int) -> bool:

@@ -318,10 +318,16 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             return merged if merged else None
 
         # Otherwise, tensor dicts - concatenate
+        query_id = data.get("query_id")
+        query_id = str(query_id) if type(query_id) in (str, int) else None
         try:
             group = RolloutGroup(
                 tuple(get_batch_size(result) for result in valid_results),
                 tuple(result.get("rollout_reward") for result in valid_results),
+                query_id=query_id or None,
+                sample_indices=tuple(
+                    index for index, result in enumerate(results) if result is not None
+                ),
             )
         except (TypeError, ValueError) as exc:
             raise WorkflowContractError(str(exc)) from exc

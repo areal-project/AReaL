@@ -446,15 +446,25 @@ class RolloutGroup:
     reward normalization consumes a rollout whose row rewards differ.
     ``arena_stream_name`` identifies the source Arena dataset for training counts
     without adding non-tensor fields to packed model inputs.
+    ``query_id`` and ``occurrence_id`` identify the frozen task and its dispatch.
+    ``sample_indices`` retain the original sampling slots after filtering.
     """
 
     row_counts: tuple[int, ...]
     rewards: tuple[float | None, ...] = ()
     arena_stream_name: str | None = None
+    query_id: str | None = None
+    occurrence_id: str | None = None
+    sample_indices: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "row_counts", tuple(self.row_counts))
         object.__setattr__(self, "rewards", tuple(self.rewards))
+        object.__setattr__(
+            self,
+            "sample_indices",
+            tuple(self.sample_indices) or tuple(range(len(self.row_counts))),
+        )
         if not self.row_counts or any(
             type(count) is not int or count < 1 for count in self.row_counts
         ):
@@ -468,11 +478,27 @@ class RolloutGroup:
             for r in self.rewards
         ):
             raise ValueError("rollout_reward must be finite")
+        if len(self.sample_indices) != len(self.row_counts) or any(
+            type(index) is not int or index < 0 for index in self.sample_indices
+        ):
+            raise ValueError("sample_indices must match logical rollouts")
+        if len(set(self.sample_indices)) != len(self.sample_indices):
+            raise ValueError("sample_indices must be unique within a group")
+        for value in (self.query_id, self.occurrence_id):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError("rollout identity fields must be nonempty strings")
 
     def validate_rows(self, rows: int) -> "RolloutGroup":
         # RPC restores dataclass fields without running the constructor and
         # encodes tuples as lists. Revalidate at the consuming boundary.
-        group = RolloutGroup(self.row_counts, self.rewards, self.arena_stream_name)
+        group = RolloutGroup(
+            self.row_counts,
+            self.rewards,
+            self.arena_stream_name,
+            self.query_id,
+            self.occurrence_id,
+            self.sample_indices,
+        )
         if sum(group.row_counts) != rows:
             raise ValueError(
                 f"rollout row_counts sum to {sum(group.row_counts)}, expected {rows}"

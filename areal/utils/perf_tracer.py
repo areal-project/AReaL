@@ -1414,6 +1414,9 @@ class PerfTracer:
         if not self._enabled:
             return _NullContext()
         global_step = self._get_global_step(args)
+        args = dict(args or {})
+        if global_step is not None:
+            args["global_step"] = global_step
         profiler_active = _profiler_active.get(False)
         profiler_flag = not profiler_active and self._should_enable_profiler(
             enable_profiler, global_step
@@ -1439,6 +1442,9 @@ class PerfTracer:
         if not self._enabled:
             return _NullContext()
         global_step = self._get_global_step(args)
+        args = dict(args or {})
+        if global_step is not None:
+            args["global_step"] = global_step
         profiler_active = _profiler_active.get(False)
         profiler_flag = not profiler_active and self._should_enable_profiler(
             enable_profiler, global_step
@@ -1461,6 +1467,10 @@ class PerfTracer:
     ) -> None:
         if not self._enabled:
             return
+        args = dict(args or {})
+        global_step = self._get_global_step(args)
+        if global_step is not None:
+            args["global_step"] = global_step
         self._record_event(
             {
                 "name": name,
@@ -1876,6 +1886,16 @@ def is_configured() -> bool:
     global GLOBAL_TRACER
     with _GLOBAL_TRACER_LOCK:
         return GLOBAL_TRACER is not None
+
+
+def rpc_trace_meta(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Capture trace context before an RPC dispatch crosses an executor thread."""
+    step = _current_global_step.get()
+    if step is None:
+        return meta
+    result = dict(meta or {})
+    result.setdefault("global_step", step)
+    return result
 
 
 def reset() -> None:

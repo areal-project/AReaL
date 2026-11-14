@@ -485,6 +485,11 @@ def call_engine_method():
         raw_args = payload.args
         raw_kwargs = payload.kwargs
         rpc_meta = payload.rpc_meta
+        step = (rpc_meta or {}).get("global_step")
+        if step is not None and (type(step) is not int or step < -1):
+            return jsonify(
+                {"error": "rpc_meta.global_step must be an integer >= -1"}
+            ), 400
 
         if engine_name not in _engines:
             return (
@@ -588,10 +593,13 @@ def call_engine_method():
                     category = "compute"
 
                 # Wrap engine method call with perf_tracer
+                trace_args = {"method": method_name, "engine": engine_name}
+                if step is not None:
+                    trace_args["global_step"] = step
                 with perf_tracer.trace_scope(
                     f"rpc.{method_name}",
                     category=category,
-                    args={"method": method_name, "engine": engine_name},
+                    args=trace_args,
                 ):
                     method = getattr(engine, method_name)
                     result = method(*args_bcast, **kwargs_bcast)
