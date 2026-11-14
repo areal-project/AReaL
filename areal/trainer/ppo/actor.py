@@ -542,17 +542,22 @@ class PPOActor:
         )
         stats_tracker.stat(**seq_stats, denominator="n_seqs")
         if "versions" in data:
-            # Both regular advantage preprocessing and pure MOPD retain raw
-            # token-position versions. Align only the diagnostic copy here;
-            # changing proximal approximation requires separate validation.
-            metric_versions = torch.roll(data["versions"], shifts=-1, dims=-1)
-            metric_versions[..., -1] = -1
+            # PPO log-probs and the loss mask address next-token predictions.
+            # Shift before packing so versions cannot cross sequence boundaries.
+            prediction_versions = torch.roll(data["versions"], shifts=-1, dims=-1)
+            prediction_versions.masked_fill_(~loss_mask.bool(), -1)
+            prediction_versions[..., -1] = -1
+            if self.config.prox_logp_method in (
+                PROX_LOGP_METHOD_LOGLINEAR,
+                PROX_LOGP_METHOD_METRICS,
+            ):
+                data["prediction_versions"] = prediction_versions
             with stats_tracker.scope("update"):
                 _log_version_staleness_stats(
-                    metric_versions, self.engine.get_version(), loss_mask.bool()
+                    prediction_versions, self.engine.get_version(), loss_mask.bool()
                 )
                 _log_policy_version_age_distribution(
-                    metric_versions, self.engine.get_version(), loss_mask.bool()
+                    prediction_versions, self.engine.get_version(), loss_mask.bool()
                 )
         if group_metrics is not None:
             group_starts, usable_group_sizes, group_loss_weights = group_metrics
@@ -622,7 +627,6 @@ class PPOActor:
                     )
 
         # Pop keys that are no longer needed after advantage computation
-        # Note: "versions" is kept if needed for approximation/metrics in loss function
         for key in [
             "rewards",
             "tot_rewards",
@@ -963,6 +967,8 @@ def grpo_loss_fn(
     loss_mask = denominator_mask
     if "policy_version_mask" in input_data:
         loss_mask = loss_mask & input_data["policy_version_mask"].bool()
+    # Direct loss callers can supply already aligned versions.
+    versions = input_data.get("prediction_versions", input_data.get("versions"))
     if mopd_loss_config is not None and mopd_loss_config.rl_coefficient == 0:
         teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
         teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")
@@ -981,7 +987,7 @@ def grpo_loss_fn(
                 prox_logp_method=prox_logp_method,
                 old_logp=input_data["logprobs"],
                 logprobs=logprobs.detach(),
-                versions=input_data.get("versions"),
+                versions=versions,
                 current_version=current_version,
             )
             if m2_threshold is not None:
@@ -1043,7 +1049,7 @@ def grpo_loss_fn(
         prox_logp_method=prox_logp_method,
         old_logp=old_logp,
         logprobs=logprobs.detach(),
-        versions=input_data.get("versions"),
+        versions=versions,
         current_version=current_version,
     )
 
@@ -1312,7 +1318,7 @@ def grpo_loss_fn(
         prox_logp_gt=prox_logp_gt,
         old_logp=old_logp,
         logprobs=logprobs.detach(),
-        versions=input_data.get("versions"),
+        versions=versions,
         current_version=current_version,
         compute_logp_mask=compute_logp_mask,
     )
