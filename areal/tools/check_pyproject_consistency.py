@@ -47,6 +47,9 @@ ESCAPABLE_PACKAGES: frozenset[str] = frozenset(
         "fastapi-sso",
         "peft",
         "transformers",
+        "kernels",
+        "torch-memory-saver",
+        "flash-attn-4",
     }
 )
 
@@ -195,12 +198,17 @@ class _Checker:
                 )
                 continue
 
-            # Filter out backend-specific self-references before comparing.
+            # Filter backend self-references and packages whose versions are
+            # tied to the selected inference backend.
             filtered_a = sorted(
-                d for d in extras_a[extra] if not _is_backend_selfref(d)
+                d
+                for d in extras_a[extra]
+                if not _is_backend_selfref(d) and not _is_escapable(_parse_dep_name(d))
             )
             filtered_b = sorted(
-                d for d in extras_b[extra] if not _is_backend_selfref(d)
+                d
+                for d in extras_b[extra]
+                if not _is_backend_selfref(d) and not _is_escapable(_parse_dep_name(d))
             )
             if filtered_a != filtered_b:
                 self._err(
@@ -259,23 +267,13 @@ class _Checker:
         self, sources_a: dict[str, Any], sources_b: dict[str, Any]
     ) -> None:
         for pkg in sorted(set(sources_a) | set(sources_b)):
+            if _is_escapable(pkg):
+                # Backend-specific packages may have their own wheel index.
+                continue
             if pkg not in sources_a:
                 self._err(f"tool.uv.sources: {pkg!r} missing in {self.file_a}")
             elif pkg not in sources_b:
                 self._err(f"tool.uv.sources: {pkg!r} missing in {self.file_b}")
-            elif _is_escapable(pkg):
-                # Just verify index names match (extra names may differ).
-                idx_a = sorted(
-                    {e.get("index", "") for e in sources_a[pkg] if isinstance(e, dict)}
-                )
-                idx_b = sorted(
-                    {e.get("index", "") for e in sources_b[pkg] if isinstance(e, dict)}
-                )
-                if idx_a != idx_b:
-                    self._err(
-                        f"tool.uv.sources.{pkg}: index names differ — "
-                        f"{self.file_a}={idx_a}, {self.file_b}={idx_b}"
-                    )
             elif sources_a[pkg] != sources_b[pkg]:
                 self._err(
                     f"tool.uv.sources.{pkg}: differs (non-escapable)\n"
@@ -286,11 +284,25 @@ class _Checker:
     # ── [tool.uv] (top-level) ──────────────────────────────────────────
 
     def check_tool_uv(self, uv_a: dict, uv_b: dict) -> None:
+        shared_indexes_a = [
+            index
+            for index in uv_a.get("index", [])
+            if not index.get("name", "").startswith("pytorch-cu")
+        ]
+        shared_indexes_b = [
+            index
+            for index in uv_b.get("index", [])
+            if not index.get("name", "").startswith("pytorch-cu")
+        ]
+        self._cmp_values("tool.uv.index.shared", shared_indexes_a, shared_indexes_b)
+
         special_keys = {
             "override-dependencies",
             "sources",
             "conflicts",
             "dependency-metadata",
+            "index",  # Checked separately above, excluding backend CUDA wheels.
+            "prerelease",  # SGLang 0.5.20 requires a cuda-tile release candidate.
         }
 
         self.check_override_deps(

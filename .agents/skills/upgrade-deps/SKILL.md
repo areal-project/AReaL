@@ -29,12 +29,13 @@ mutually-incompatible `torch` / `torchao` versions:
 | `pyproject.toml`      | SGLang (default)  | `uv.lock`      |
 | `pyproject.vllm.toml` | vLLM              | `uv.vllm.lock` |
 
-Both share the same core dependencies, megatron extras, and dev group. They diverge only
-in inference backend extras and `torch`/`torchao` version constraints.
+Both share dependencies where their backend constraints allow it, along with the
+megatron extras and dev group. Backend-bound packages such as `torch`, `torchao`,
+`transformers`, `kernels`, and Torch Memory Saver can resolve to different versions.
 
-The `Dockerfile` builds both variants from a single file using `ARG VARIANT` (`sglang`
-or `vllm`). The base image, torch install, and flash-attn wheels are all
-variant-specific.
+The single `Dockerfile` builds both images. `ARG VARIANT=sglang` selects the SGLang
+0.5.20 / CUDA 13 stages by default, while `VARIANT=vllm` selects the existing vLLM /
+CUDA 12.9 stages. Review the selected stages for the backend being upgraded.
 
 ### Focused Packages
 
@@ -70,8 +71,8 @@ plus `torch` (tracked for Docker impact only, not API-audited) are listed.
 | `mbridge`         | shared           | `[optional-deps].megatron` (git pin)                           | `[optional-deps].megatron` (git pin)                           | No            |
 | `transformers`    | shared           | `[project].dependencies`                                       | `[project].dependencies`                                       | No            |
 | `peft`            | shared           | `[project].dependencies`                                       | `[project].dependencies`                                       | No            |
-| `torch`           | shared-divergent | `[project].dependencies` (≥2.9.1)                              | `[project].dependencies` (≥2.10.0)                             | Stage 1 torch |
-| `torchao`         | shared-divergent | `[tool.uv].override-dependencies` (==0.15.0)                   | `[project].dependencies` (==0.16.0)                            | No            |
+| `torch`           | shared-divergent | `[project].dependencies` (≥2.13.0)                             | `[project].dependencies` (≥2.10.0)                             | Stage 1 torch |
+| `torchao`         | shared-divergent | `[optional-dependencies].cuda-train` (==0.18.0)                | `[project].dependencies` (==0.16.0)                            | No            |
 
 **Scope rules:**
 
@@ -314,37 +315,13 @@ pyproject files — they are never installed together in the same environment.
 Review the Package Impact Matrix "Docker impact" column. Only proceed with Dockerfile
 changes if an upgraded package has Docker impact. The most common triggers are:
 
-**Base image change** (triggered by `sglang` upgrade):
+**Base image or Torch version change** (triggered by an inference backend upgrade):
 
-The Dockerfile base image is `lmsysorg/sglang:v{SGLANG_VERSION}-cu129-amd64-runtime`. If
-`sglang` was upgraded, update line 9 of the `Dockerfile`:
-
-```dockerfile
-FROM lmsysorg/sglang:v{NEW_SGLANG_VERSION}-cu129-amd64-runtime
-```
-
-Verify that the new base image tag exists on Docker Hub / GHCR before committing.
-
-**Torch version change** (triggered by `torch` upgrade):
-
-The Dockerfile Stage 1 installs torch with variant-specific versions. Update the version
-mapping in the `RUN uv venv` command:
-
-```dockerfile
-&& if [ "$VARIANT" = "vllm" ]; then TORCH_VER="{VLLM_TORCH}"; else TORCH_VER="{SGLANG_TORCH}"; fi \
-```
-
-Also check flash-attn wheel compatibility — **both** flash-attn-2 and flash-attn-3
-installs use a `TORCH_TAG` that must match the torch major.minor version. Update both
-occurrences in the Dockerfile:
-
-```dockerfile
-# flash-attn-2 (first flash-attn RUN block)
-&& if [ "$VARIANT" = "vllm" ]; then TORCH_TAG="torch{VLLM_TORCH_MAJOR_MINOR}"; else TORCH_TAG="torch{SGLANG_TORCH_MAJOR_MINOR}"; fi \
-
-# flash-attn-3 (second flash-attn RUN block — same TORCH_TAG pattern)
-&& if [ "$VARIANT" = "vllm" ]; then TORCH_TAG="torch{VLLM_TORCH_MAJOR_MINOR}"; else TORCH_TAG="torch{SGLANG_TORCH_MAJOR_MINOR}"; fi \
-```
+The Dockerfile selects backend-specific stages through `VARIANT`. Update the base image,
+CUDA toolkit, Torch lockfile sync, and compiled extensions in the affected stages. Keep
+the other variant's base image and extension versions unchanged. Verify the new base
+image tag exists before committing, and check that both `VARIANT=sglang` and
+`VARIANT=vllm` resolve to the intended final stage.
 
 **No Dockerfile changes needed** for: `megatron-core`, `megatron-bridge`,
 `transformers`, `peft`, `vllm`, `torchao`. These are installed via
@@ -543,7 +520,7 @@ ______________________________________________________________________
 | `megatron-bridge` | `checklists/megatron-bridge.md` | ✅ 9 API entries (AutoBridge, LoRA, save/load HF, Qwen3-VL patch target, AutoMapping, monkey-patch guard)                                                                           |
 | `mbridge`         | `checklists/mbridge.md`         | ✅ 14 API entries (AutoBridge, Bridge properties, weight mappings, LLMBridge subclassing, register_model, monkey-patch target)                                                      |
 | `vllm`            | `checklists/vllm.md`            | ✅ 14 API entries (entrypoints, LoRA manager, worker V0/V1, tool parsers, CLI)                                                                                                      |
-| `sglang`          | `checklists/sglang.md`          | ✅ 14 API entries (HTTP endpoints, tool/reasoning parsers, CLI flags, version guards)                                                                                               |
+| `sglang`          | `checklists/sglang.md`          | ✅ 24 API entries (HTTP endpoints, scheduler, AWEX, routed experts, multimodal processors, version guards)                                                                          |
 | `transformers`    | `checklists/transformers.md`    | ✅ 12 API entries (Auto\* classes, tokenizer, flash attention monkey-patches, Qwen VL internals, LR schedulers)                                                                     |
 | `peft`            | `checklists/peft.md`            | ✅ 4 API entries (LoraConfig, TaskType, get_peft_model, weight key format)                                                                                                          |
 | `torchao`         | `checklists/torchao.md`         | ✅ 5 API entries (fp8_blockwise_mm, enable_fp8_linear/experts, shard validation, Triton kernels)                                                                                    |

@@ -2,7 +2,7 @@
 
 """Route distributed MTP weight updates to SGLang's draft model.
 
-SGLang 0.5.10.post1 sends ``update_weights_from_distributed`` only to the
+SGLang 0.5.20 sends ``update_weights_from_distributed`` only to the
 regular TP worker, while NEXTN constructs a separate draft model that owns
 the MTP parameters. This bridge receives each distributed bucket once and
 applies its tensors to both model loaders, matching the update semantics of
@@ -18,7 +18,7 @@ from areal.utils import logging
 
 logger = logging.getLogger("SGLangMTPBridge")
 
-_SUPPORTED_SGLANG_VERSION = "0.5.10.post1"
+_SUPPORTED_SGLANG_VERSION = "0.5.20"
 _BOUND_MARKER = "_areal_mtp_distributed_update_bound"
 
 
@@ -38,10 +38,11 @@ def _receive_named_tensors(
     load_format: str | None,
 ) -> list[tuple[str, Any]]:
     """Receive one distributed bucket without applying it to a model."""
-    if group_name not in model_runner._model_update_group:
+    updater = model_runner.weight_updater
+    if group_name not in updater._model_update_group:
         raise AssertionError(
             f"Group {group_name} not in "
-            f"{list(model_runner._model_update_group.keys())}. "
+            f"{list(updater._model_update_group.keys())}. "
             "Please call init_weights_update_group first."
         )
     if load_format not in (None, "flattened_bucket"):
@@ -66,7 +67,7 @@ def _receive_named_tensors(
         )
         for name, dtype, shape in zip(names, dtypes, shapes)
     ]
-    process_group = model_runner._model_update_group[group_name]
+    process_group = updater._model_update_group[group_name]
 
     if load_format == "flattened_bucket":
         bucket = FlattenedTensorBucket(named_tensors=named_tensors)
@@ -101,7 +102,7 @@ def _get_draft_runner(scheduler: Any) -> Any | None:
         return runner
 
     # Spec v2 wraps EagleDraftWorker in EAGLEWorkerV2. The public property is
-    # named draft_worker in 0.5.10.post1; _draft_worker is retained as a
+    # named draft_worker in 0.5.20; _draft_worker is retained as a
     # defensive fallback for the same pinned implementation.
     draft_worker = getattr(speculative_worker, "draft_worker", None)
     if draft_worker is None:
@@ -113,7 +114,7 @@ class MTPDistributedWeightUpdateBridge:
     """Add built-in MTP routing to SGLang's distributed weight update path.
 
     This is intentionally a narrow compatibility patch for SGLang
-    0.5.10.post1. That version normalizes ``NEXTN`` to ``EAGLE`` before the
+    0.5.20. That version normalizes ``NEXTN`` to ``EAGLE`` before the
     scheduler is created, so a runtime ``EAGLE`` configuration without an
     external draft-model path also identifies the built-in MTP path. External
     EAGLE draft models and other speculative algorithms are left untouched.
@@ -200,16 +201,20 @@ class MTPDistributedWeightUpdateBridge:
                 # update_weights_from_tensor path. The tensors are already local,
                 # so the transport-specific flattened_bucket format has been
                 # consumed and both runners receive regular named tensors.
-                success, message = draft_runner.update_weights_from_tensor(
-                    named_tensors=named_tensors,
-                    load_format=None,
+                success, message = (
+                    draft_runner.weight_updater.update_weights_from_tensor(
+                        named_tensors=named_tensors,
+                        load_format=None,
+                    )
                 )
                 if not success:
                     return success, message
 
-                success, message = target_runner.update_weights_from_tensor(
-                    named_tensors=named_tensors,
-                    load_format=None,
+                success, message = (
+                    target_runner.weight_updater.update_weights_from_tensor(
+                        named_tensors=named_tensors,
+                        load_format=None,
+                    )
                 )
                 if not success:
                     return success, message
@@ -230,4 +235,6 @@ class MTPDistributedWeightUpdateBridge:
                 logger.error(message, exc_info=True)
                 return False, message
 
-        target_runner.update_weights_from_distributed = _update_weights_from_distributed
+        target_runner.weight_updater.update_weights_from_distributed = (
+            _update_weights_from_distributed
+        )

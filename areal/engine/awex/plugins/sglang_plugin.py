@@ -68,6 +68,7 @@ SUPPORTED_SGLANG_VERSIONS = (
     "0.5.10.post1",
     "0.5.18.dev10+g85b539146",
     "0.5.19.dev125+g119b5ffe4",
+    "0.5.20",
 )
 
 
@@ -133,10 +134,8 @@ def assert_supported_sglang_version() -> None:
 def _load_sglang_plugins_if_available() -> bool:
     """Load SGLang runtime plugins when supported by the installed version.
 
-    ``sglang.srt.plugins`` was added after the 0.5.10 runtime currently pinned
-    by AReaL.  AWEX does not depend on that registry because it injects its
-    scheduler entry point directly through ``launch_server``.  Treat the
-    registry as optional so the same entry module works with both APIs.
+    AWEX injects its scheduler entry point directly through ``launch_server``.
+    Treat the registry as optional so the same entry module works with both APIs.
     """
     try:
         plugins = importlib.import_module("sglang.srt.plugins")
@@ -401,6 +400,11 @@ class AwexSchedulerPlugin:
         scheduler.resume_memory_occupation = _resume
         original_flush = getattr(scheduler, "flush_cache", None)
         if callable(original_flush):
+            cache_module = (
+                "sglang.srt.managers.mm_schedule"
+                if pkg_version.get_version("sglang") == "0.5.20"
+                else "sglang.srt.managers.mm_utils"
+            )
 
             def _flush(*args, **kwargs):
                 with _retract_memory_idle(scheduler, owner):
@@ -413,11 +417,11 @@ class AwexSchedulerPlugin:
                         # Image hashes have no visual weight version. Establish
                         # the actor checkpoint once, then reuse features only
                         # when every visual parameter is known to be frozen.
-                        mm_utils = importlib.import_module(
-                            "sglang.srt.managers.mm_utils"
-                        )
-                        if mm_utils.embedding_cache is not None:
-                            mm_utils.embedding_cache.clear()
+                        embedding_cache = importlib.import_module(
+                            cache_module
+                        ).embedding_cache
+                        if embedding_cache is not None:
+                            embedding_cache.clear()
                         self._visual_embeddings_initialized = (
                             self._visual_embeddings_frozen
                         )
@@ -426,6 +430,9 @@ class AwexSchedulerPlugin:
             scheduler.flush_cache = _flush
             if owner is not scheduler and hasattr(owner, "flush_cache"):
                 owner.flush_cache = _flush
+            flush_wrapper = getattr(scheduler, "flush_wrapper", None)
+            if getattr(flush_wrapper, "_flush_cache", None) == original_flush:
+                flush_wrapper._flush_cache = _flush
         # Dispatchers cache bound methods before plugin binding.
         mapping = getattr(
             getattr(scheduler, "_request_dispatcher", None), "_mapping", {}
