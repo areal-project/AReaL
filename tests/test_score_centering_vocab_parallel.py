@@ -14,7 +14,7 @@ from areal.utils.score_centering import (
 )
 
 
-def _dense(logits, labels, ids, q, tis_cap=None):
+def _dense(logits, labels, ids, q, tis_cap=None, icepop_bounds=None):
     logp = logits.log_softmax(-1)
     heads = logp.gather(-1, ids)
     with torch.no_grad():
@@ -26,6 +26,15 @@ def _dense(logits, labels, ids, q, tis_cap=None):
                 torch.minimum(p, tis_cap * q.exp())
                 - (rho * tis_cap).clamp_max(1)[:, None] * p
             )
+        if icepop_bounds is not None:
+            lower, upper = icepop_bounds
+            sampler = q.exp()
+            rho = (1 - sampler.sum(-1)).clamp_min(0) / (1 - p.sum(-1)).clamp_min(1e-6)
+            ratio = p / sampler
+            keep = (ratio >= lower) & (ratio <= upper)
+            tail_ratio = 1 / rho
+            alpha = (tail_ratio >= lower) & (tail_ratio <= upper)
+            coefficients = p * (keep.to(p.dtype) - alpha[:, None].to(p.dtype))
     return logp.gather(-1, labels[:, None]).squeeze(-1), (heads * coefficients).sum(-1)
 
 

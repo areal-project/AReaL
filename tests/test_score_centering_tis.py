@@ -135,7 +135,7 @@ def test_tis_sc_rejects_invalid_upper(cap):
 @pytest.mark.parametrize(
     "options",
     [
-        dict(action="mask"),
+        dict(action="mask", level="sequence"),
         dict(action="clamp", level="sequence"),
         dict(action="clamp", lower=0.5),
         dict(action="mask", metric="kl_k2"),

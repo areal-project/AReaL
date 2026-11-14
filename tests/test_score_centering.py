@@ -56,7 +56,7 @@ def test_selected_backward_matches_dense_rounding_with_peaked_logits(device, dty
     torch.testing.assert_close(logits.grad, oracle.grad, rtol=0, atol=0)
 
 
-def reference(logits, labels, ids, q, tis_cap=None):
+def reference(logits, labels, ids, q, tis_cap=None, icepop_bounds=None):
     lp = logits.log_softmax(-1)
     phead = lp.gather(-1, ids)
     with torch.no_grad():
@@ -75,6 +75,15 @@ def reference(logits, labels, ids, q, tis_cap=None):
                 torch.minimum(p, tis_cap * sampler)
                 - (rho * tis_cap).clamp_max(1)[:, None] * p
             )
+        if icepop_bounds is not None:
+            lower, upper = icepop_bounds
+            sampler = q.exp()
+            rho = (1 - sampler.sum(-1)).clamp_min(0) / (1 - p.sum(-1)).clamp_min(1e-6)
+            ratio = p / sampler
+            keep = (ratio >= lower) & (ratio <= upper)
+            tail_ratio = 1 / rho
+            alpha = (tail_ratio >= lower) & (tail_ratio <= upper)
+            coefficient = p * (keep.to(p.dtype) - alpha[:, None].to(p.dtype))
     return lp.gather(-1, labels[:, None]).squeeze(-1), (phead * coefficient).sum(-1)
 
 
@@ -384,9 +393,13 @@ async def test_interrupted_generation_accumulates_heads_and_versions(monkeypatch
 
 
 @pytest.mark.parametrize("width", [1, 12])
-@pytest.mark.parametrize("tis_cap", [None, 2.0])
+@pytest.mark.parametrize(
+    "tis_cap,icepop_bounds", [(None, None), (2.0, None), (None, (0.5, 5.0))]
+)
 @pytest.mark.usefixtures("isolated_actor_stats_tracker")
-def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width, tis_cap):
+def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(
+    width, tis_cap, icepop_bounds
+):
     """Exercise real actor alignment and FSDP loss hooks without mocking DTensor."""
     from functools import partial
 
@@ -394,12 +407,19 @@ def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width, tis_cap):
     from areal.trainer.ppo.actor import PPOActor, grpo_loss_fn
     from areal.utils.data import pad_mb_list, unsqueeze_mb_list
 
+    rejection = (
+        RejectionSamplingConfig(
+            action="mask", lower=icepop_bounds[0], upper=icepop_bounds[1]
+        )
+        if icepop_bounds is not None
+        else RejectionSamplingConfig(action="clamp", upper=tis_cap)
+        if tis_cap is not None
+        else None
+    )
     config = PPOActorConfig(
         backend="fsdp:d1",
         use_score_centering=True,
-        rejection_sampling=RejectionSamplingConfig(action="clamp", upper=tis_cap)
-        if tis_cap is not None
-        else None,
+        rejection_sampling=rejection,
         recompute_logprob=False,
         kl_ctl=0,
         mb_spec=MicroBatchSpec(n_mbs=2),
@@ -454,6 +474,7 @@ def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width, tis_cap):
             ctx.mb_input["sampler_head_ids"],
             ctx.mb_input["sampler_head_logprobs"],
             tis_cap=tis_cap,
+            icepop_bounds=icepop_bounds,
         )
         mask = ctx.mb_input["loss_mask"].bool()
         weight = (
@@ -461,6 +482,11 @@ def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width, tis_cap):
             if tis_cap is None
             else (lp.detach() - ctx.mb_input["logprobs"]).exp().clamp_max(tis_cap)
         )
+        if icepop_bounds is not None:
+            ratio = (lp.detach() - ctx.mb_input["logprobs"]).exp()
+            weight = torch.where(
+                (ratio >= icepop_bounds[0]) & (ratio <= icepop_bounds[1]), ratio, 0.0
+            )
         expected = (
             torch.where(mask, ctx.mb_input["advantages"] * (c - weight * lp), 0).sum()
             / mask.sum()
@@ -474,11 +500,7 @@ def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width, tis_cap):
                 eps_clip_higher=None,
                 c_clip=None,
                 use_score_centering=True,
-                rejection_sampling=RejectionSamplingConfig(
-                    action="clamp", upper=tis_cap
-                )
-                if tis_cap is not None
-                else None,
+                rejection_sampling=rejection,
             ),
             lambda data: data["loss_mask"].count_nonzero(),
             mask.sum(),

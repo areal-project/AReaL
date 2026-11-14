@@ -69,7 +69,7 @@ from areal.utils.functional.loss_aggregation import (
     TokenMean,
 )
 from areal.utils.perf_tracer import trace_perf
-from areal.utils.score_centering import resolve_score_centering_tis_cap
+from areal.utils.score_centering import resolve_score_centering_rejection
 from areal.utils.stats_tracker import ReduceType
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -177,9 +177,15 @@ class PPOActor:
             logger.info(
                 "Mode: REINFORCE with score centering (sampler behavior probabilities)"
             )
-            tis_cap = resolve_score_centering_tis_cap(config.rejection_sampling)
-            if tis_cap is not None:
-                logger.info(f"  TIS weighted-score centering, cap={tis_cap}")
+            sc_options = resolve_score_centering_rejection(config.rejection_sampling)
+            if "icepop_bounds" in sc_options:
+                logger.info(
+                    f"  IcePop weighted-score centering, bounds={sc_options['icepop_bounds']}"
+                )
+            elif "tis_cap" in sc_options:
+                logger.info(
+                    f"  TIS weighted-score centering, cap={sc_options['tis_cap']}"
+                )
         elif not config.use_decoupled_loss:
             logger.info("Mode: Standard PPO (on-policy)")
             if config.recompute_logprob:
@@ -1072,8 +1078,19 @@ def grpo_loss_fn(
             raise ValueError("Score centering requires a score-centering logprob path.")
         if input_data.get("teacher_logp") is not None:
             raise ValueError("Score centering with distillation is not supported.")
-        tis_cap = resolve_score_centering_tis_cap(rejection_sampling)
-        if tis_cap is None:
+        sc_options = resolve_score_centering_rejection(rejection_sampling)
+        tis_cap = sc_options.get("tis_cap")
+        if "icepop_bounds" in sc_options:
+            from areal.utils.score_centering import score_centering_icepop_weights
+
+            behavior_logp = torch.where(loss_mask.bool(), old_logp, logprobs.detach())
+            sc_weight = score_centering_icepop_weights(
+                logprobs, behavior_logp, sc_options["icepop_bounds"]
+            )
+            sc_clipped = (sc_weight == 0) & loss_mask.bool()
+            # Do not filter loss_mask: a rejected sampled token still contributes
+            # the expected weighted-score correction at its context.
+        elif tis_cap is None:
             sc_weight = torch.ones_like(logprobs)
             sc_clipped = torch.zeros_like(loss_mask)
         else:

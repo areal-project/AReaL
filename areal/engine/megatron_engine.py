@@ -4234,7 +4234,7 @@ class MegatronEngine(TrainEngine):
                         "Score centering requires ordinary packed Megatron logits."
                     )
                 from areal.utils.score_centering import (
-                    resolve_score_centering_tis_cap,
+                    resolve_score_centering_rejection,
                     score_centering_logprobs,
                 )
 
@@ -4261,7 +4261,7 @@ class MegatronEngine(TrainEngine):
                     ids,
                     q,
                     chunk_size=self.config.logprobs_chunk_size,
-                    tis_cap=resolve_score_centering_tis_cap(
+                    **resolve_score_centering_rejection(
                         getattr(self.config, "rejection_sampling", None)
                     ),
                     tp_group=mpu.get_tensor_model_parallel_group()

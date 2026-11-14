@@ -1734,6 +1734,9 @@ class RejectionSamplingConfig:
     - 'mask': zero out loss_mask (rejection, exclude from gradient)
     - 'clamp': clamp importance weight to bounds (truncation, bounded gradient)
 
+    With score centering, token-ratio 'mask' instead zeros the sampled importance
+    weight while retaining the centering correction and original normalization.
+
     Supports direct ratio bounds and KL divergence estimators (K1/K2/K3),
     at both token-level and sequence-level granularity.
 
@@ -1770,7 +1773,8 @@ class RejectionSamplingConfig:
         metadata={
             "help": "Action to take when metric exceeds threshold. "
             "'mask': zero out loss_mask for filtered tokens/sequences (rejection, "
-            "completely excludes from gradient computation). "
+            "completely excludes from gradient computation). With score centering, only the "
+            "sampled importance weight is zeroed; the centering correction remains active. "
             "'clamp': clamp importance weight to [lower, upper] bounds (truncation, "
             "tokens still participate in gradient but with bounded weight).",
             "choices": ["mask", "clamp"],
@@ -2171,7 +2175,7 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={
             "help": "Rejection sampling configuration for filtering stale samples. "
             "None disables filtering (equivalent to old behave_imp_weight_mode='disabled'). "
-            "Effective with use_decoupled_loss=True, or with score centering for token-wise ratio clamping (no lower bound)."
+            "Effective with use_decoupled_loss=True, or with score centering for token-wise ratio TIS clamping (no lower bound) or IcePop masking. Score centering retains its correction and original normalization when a sampled token is rejected."
         },
     )
     importance_sampling_level: str = field(
@@ -2454,11 +2458,11 @@ class PPOActorConfig(TrainEngineConfig):
                 or self.importance_sampling_level != "token"
             ):
                 raise ValueError(
-                    "Score centering selects token-wise REINFORCE with optional TIS; other policy surrogates are unsupported."
+                    "Score centering selects token-wise REINFORCE with optional TIS or IcePop; other policy surrogates are unsupported."
                 )
-            from areal.utils.score_centering import resolve_score_centering_tis_cap
+            from areal.utils.score_centering import resolve_score_centering_rejection
 
-            resolve_score_centering_tis_cap(self.rejection_sampling)
+            resolve_score_centering_rejection(self.rejection_sampling)
 
 
 @dataclass
