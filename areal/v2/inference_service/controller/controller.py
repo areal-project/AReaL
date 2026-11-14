@@ -51,6 +51,13 @@ class _OnlineWaiter:
     future: asyncio.Future
 
 
+@dataclass
+class _OnlineAdmission:
+    worker_addr: str
+    session_id: str | None = None
+    finished: bool = False
+
+
 class _DummyDataLoader:
     """Minimal dataloader that yields a single batch of empty dicts.
 
@@ -164,9 +171,10 @@ class RolloutControllerV2:
         # Online callback server / waiter state
         self._online_waiters: deque[_OnlineWaiter] = deque()
         self._online_waiters_lock = Lock()
-        self._completed_online_results: deque[dict[str, Any]] = deque(
-            maxlen=_MAX_COMPLETED_ONLINE_RESULTS
-        )
+        self._completed_online_results: deque[dict[str, Any]] = deque()
+        self._online_admissions: dict[str, _OnlineAdmission] = {}
+        self._online_session_requests: dict[str, str] = {}
+        self._online_active_admissions = 0
         self._callback_app = None
         self._callback_server = None
         self._callback_server_thread: threading.Thread | None = None
@@ -989,6 +997,15 @@ class RolloutControllerV2:
 
         app = Flask("online_rollout_callback")
 
+        @app.route("/callback/online_admission", methods=["POST"])
+        def online_admission():
+            if request.headers.get("Authorization") != (
+                f"Bearer {self.config.admin_api_key}"
+            ):
+                return jsonify({"error": "Invalid admin API key"}), 403
+            result, status = self._handle_online_admission(request.get_json() or {})
+            return jsonify(result), status
+
         @app.route("/callback/online_ready", methods=["POST"])
         def online_ready():
             if request.headers.get("Authorization") != (
@@ -1063,13 +1080,37 @@ class RolloutControllerV2:
             raise RuntimeError("Callback server not started")
         return format_hostport(self._callback_host, self._callback_port)
 
-    def _pop_online_waiter(self) -> _OnlineWaiter | None:
+    def _handle_online_admission(
+        self, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], int]:
+        if self.config.agent is None or self.config.agent.mode != "online":
+            return {"enabled": False}, 200
+        request_id = payload.get("task_id")
+        worker_addr = payload.get("worker_addr")
+        session_id = payload.get("session_id")
+        if not request_id or not worker_addr or payload.get("group_size", 1) != 1:
+            return {"code": "invalid_online_admission"}, 422
         with self._online_waiters_lock:
-            while self._online_waiters:
-                waiter = self._online_waiters.popleft()
-                if not waiter.future.cancelled():
-                    return waiter
-        return None
+            admission = self._online_admissions.get(request_id)
+            if admission is None:
+                if session_id:
+                    return {"code": "missing_online_admission"}, 409
+                waiting = sum(not w.future.done() for w in self._online_waiters)
+                # Each waiting workflow already holds one native dispatcher slot.
+                # Reserving against those slots links session creation to its quota.
+                if waiting <= self._online_active_admissions:
+                    return {"code": "online_capacity_exhausted"}, 429
+                admission = _OnlineAdmission(worker_addr=worker_addr)
+                self._online_admissions[request_id] = admission
+                self._online_active_admissions += 1
+            if admission.worker_addr != worker_addr or admission.finished:
+                return {"code": "online_admission_conflict"}, 409
+            if session_id:
+                if admission.session_id not in (None, session_id):
+                    return {"code": "online_session_conflict"}, 409
+                admission.session_id = session_id
+                self._online_session_requests[session_id] = request_id
+            return {"enabled": True}, 200
 
     def _remove_online_waiter(self, future: asyncio.Future) -> None:
         with self._online_waiters_lock:
@@ -1097,29 +1138,60 @@ class RolloutControllerV2:
     ) -> dict[str, Any]:
         session_id = payload.get("session_id")
         trajectory_id = payload.get("trajectory_id")
-        if not session_id or trajectory_id is None:
+        execution_failed = payload.get("execution_failed") is True
+        if not execution_failed and (not session_id or trajectory_id is None):
             raise RuntimeError("Missing session_id or trajectory_id")
 
         export_request = {
             "session_id": session_id,
-            "trajectory_id": int(trajectory_id),
+            "trajectory_id": None if execution_failed else int(trajectory_id),
         }
+        if execution_failed:
+            export_request["execution_failed"] = True
 
-        waiter = self._pop_online_waiter()
-        if waiter is None:
-            with self._online_waiters_lock:
+        with self._online_waiters_lock:
+            request_id = self._online_session_requests.get(session_id)
+            if request_id is None and execution_failed:
+                request_id = payload.get("task_id")
+            admission = self._online_admissions.get(request_id)
+            if admission is not None and admission.finished:
+                return {"status": "ok"}
+            if (
+                admission is None
+                and self.config.agent is not None
+                and self.config.agent.mode == "online"
+                and session_id != "__hitl__"
+            ):
+                raise RuntimeError("Online result has no admitted session")
+            if len(self._completed_online_results) >= _MAX_COMPLETED_ONLINE_RESULTS:
+                raise RuntimeError("Online result queue is full; retry delivery")
+            waiter = None
+            while self._online_waiters:
+                candidate = self._online_waiters.popleft()
+                if not candidate.future.done():
+                    waiter = candidate
+                    break
+            if admission is not None:
+                admission.finished = True
+                self._online_active_admissions -= 1
+            if waiter is None:
                 self._completed_online_results.append(export_request)
-        elif waiter.future.cancelled() or waiter.future.done():
-            with self._online_waiters_lock:
-                self._completed_online_results.append(export_request)
-        else:
-            waiter.future.get_loop().call_soon_threadsafe(
-                waiter.future.set_result, export_request
-            )
+        if waiter is not None:
+
+            def deliver():
+                if waiter.future.done():
+                    # The callback has been acknowledged; preserve its result
+                    # if the native workflow was cancelled before delivery.
+                    with self._online_waiters_lock:
+                        self._completed_online_results.append(export_request)
+                else:
+                    waiter.future.set_result(export_request)
+
+            waiter.future.get_loop().call_soon_threadsafe(deliver)
         return {
             "status": "ok",
             "session_id": session_id,
-            "trajectory_id": int(trajectory_id),
+            "trajectory_id": export_request["trajectory_id"],
         }
 
     # -- Destroy -----------------------------------------------------------

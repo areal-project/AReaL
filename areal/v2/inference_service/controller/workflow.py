@@ -362,7 +362,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         export_request = await self.controller.wait_for_online_trajectory(
             timeout=self.timeout
         )
-        if not export_request:
+        if not export_request or export_request.get("execution_failed"):
             return None
 
         session_id = export_request["session_id"]

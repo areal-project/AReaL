@@ -377,6 +377,23 @@ async def _ready_trajectory_loop(app: FastAPI) -> None:
         await asyncio.sleep(0.1)
 
 
+async def _online_control(
+    app: FastAPI, endpoint: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    config: DataProxyConfig = app.state.config
+    if not config.callback_server_addr:
+        return {"enabled": False}
+    response = await app.state.http_client.post(
+        f"{config.callback_server_addr.rstrip('/')}/callback/{endpoint}",
+        json=payload,
+        headers={"Authorization": f"Bearer {config.admin_api_key}"},
+        timeout=config.request_timeout,
+    )
+    if response.is_error:
+        raise HTTPException(status_code=response.status_code, detail=response.json())
+    return response.json()
+
+
 def create_app(config: DataProxyConfig) -> FastAPI:
     """Factory that creates the FastAPI app with lifespan-managed resources."""
 
@@ -471,6 +488,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         body_json: dict[str, Any],
         session: SessionData | None,
     ) -> tuple[Any, bool]:
+        if session is not None and session.execution_failed:
+            raise HTTPException(status_code=409, detail="Session execution failed")
         areal_client: ArealOpenAI | None = app.state.areal_client
         if areal_client is None:
             raise HTTPException(status_code=503, detail="Inference backend unavailable")
@@ -616,7 +635,14 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
 
-        group_id = f"grp-{uuid.uuid4()}"
+        admission_payload = {
+            "task_id": body.task_id,
+            "worker_addr": config.serving_addr,
+            "group_size": body.group_size,
+        }
+        admission = await _online_control(app, "online_admission", admission_payload)
+        admitted = admission["enabled"]
+        group_id = f"grp-{body.task_id}" if admitted else f"grp-{uuid.uuid4()}"
         group_size = max(body.group_size, 1)
         credentials: list[SessionCredentials] = []
         for i in range(group_size):
@@ -629,13 +655,26 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     ),
                     processor_cache_group_id=group_id if group_size > 1 else None,
                     processor_cache_group_size=group_size,
+                    idempotent=admitted,
                 )
             except ValueError as e:
+                if admitted:
+                    await _online_control(
+                        app,
+                        "online_ready",
+                        {"task_id": body.task_id, "execution_failed": True},
+                    )
                 raise HTTPException(status_code=409, detail=str(e))
             credentials.append(
                 SessionCredentials(
                     session_id=session_id, session_api_key=session_api_key
                 )
+            )
+        if admitted:
+            await _online_control(
+                app,
+                "online_admission",
+                {**admission_payload, "session_id": credentials[0].session_id},
             )
         return StartSessionResponse(group_id=group_id, sessions=credentials)
 
@@ -649,6 +688,25 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 status_code=401, detail="Invalid or expired session API key."
             )
 
+        if body.execution_failed:
+            try:
+                session.mark_execution_failed()
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            await _online_control(
+                app,
+                "online_ready",
+                {"session_id": session.session_id, "execution_failed": True},
+            )
+            return SetRewardResponse(
+                message="execution_failed",
+                interaction_count=0,
+                session_id=session.session_id,
+                trajectory_id=None,
+                trajectory_ready=False,
+                ready_transition=False,
+            )
+
         try:
             if body.rewards is not None:
                 if not body.rewards:
@@ -657,6 +715,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     )
                 reward_result = session.set_rewards(body.rewards)
             else:
+                assert body.reward is not None
                 reward_result = session.set_reward(
                     interaction_id=body.interaction_id,
                     reward=body.reward,
