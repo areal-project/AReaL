@@ -97,10 +97,6 @@ RUN if [ "$VARIANT" = "vllm" ]; then \
 ENV LD_LIBRARY_PATH=${SITE_PACKAGES}/_rocm_sdk_core/lib:${SITE_PACKAGES}/_rocm_sdk_core/lib/llvm/lib:${SITE_PACKAGES}/_rocm_sdk_core/lib/host-math/lib:${SITE_PACKAGES}/_rocm_sdk_core/lib/rocm_sysdeps/lib:${SITE_PACKAGES}/_rocm_sdk_libraries/lib:/opt/openmpi/lib
 # The base sets NVTE_FLASH_ATTN=0; megatron-core's attention_backend=auto requires both on.
 ENV NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=1
-# vLLM 0.19.1 serves /sleep and /wake_up, which colocation calls, only in dev mode. Dev mode also
-# exposes unauthenticated debug endpoints, so do not publish the vLLM port to untrusted networks.
-# SGLang ignores this variable.
-ENV VLLM_SERVER_DEV_MODE=1
 
 ##############################################################
 # Install AReaL from local source (last for fast iteration)

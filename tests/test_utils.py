@@ -201,6 +201,70 @@ def test_micro_batch_split_accounts_for_sequence_alignment():
         assert actual_tokens <= mb_spec.max_tokens_per_mb
 
 
+def test_pack_tensor_dict_keeps_valid_prefix_of_each_row():
+    seq_len = 7
+    lens = torch.tensor([5, 0, 3, 7])
+    attention_mask = torch.arange(seq_len) < lens[:, None]
+    rewards = torch.randn(4)
+    data = {
+        "input_ids": torch.randint(0, VOCAB_SIZE, (4, seq_len), dtype=torch.int32),
+        "attention_mask": attention_mask,
+        "loss_mask": torch.rand(4, seq_len) > 0.5,
+        "logprobs": torch.randn(4, seq_len),
+        # Same stride-0 layout as amend_position_ids.
+        "position_ids": torch.arange(seq_len).expand(4, -1),
+        "sampler_head_logprobs": torch.randn(4, seq_len, 3),
+        "rewards": rewards,
+        "flag": True,
+    }
+
+    packed = pack_tensor_dict(data)
+
+    assert "attention_mask" not in packed
+    assert packed["cu_seqlens"].dtype == torch.int32
+    assert packed["cu_seqlens"].tolist() == [0, 5, 5, 8, 15]
+    assert packed["max_seqlen"] == 7
+    for key in (
+        "input_ids",
+        "loss_mask",
+        "logprobs",
+        "position_ids",
+        "sampler_head_logprobs",
+    ):
+        assert packed[key].is_contiguous()
+        torch.testing.assert_close(
+            packed[key], data[key][attention_mask], rtol=0.0, atol=0.0
+        )
+    assert packed["rewards"] is rewards
+    assert packed["flag"] is True
+
+
+def test_pack_tensor_dict_host_reads_do_not_scale_with_rows(monkeypatch):
+    batch_size, seq_len = 32, 16
+    lens = torch.randint(1, seq_len + 1, (batch_size,))
+    data = {
+        "input_ids": torch.randint(0, VOCAB_SIZE, (batch_size, seq_len)),
+        "attention_mask": torch.arange(seq_len) < lens[:, None],
+        "logprobs": torch.randn(batch_size, seq_len),
+        "loss_mask": torch.ones(batch_size, seq_len, dtype=torch.bool),
+    }
+    host_reads = []
+    item, tolist = torch.Tensor.item, torch.Tensor.tolist
+    monkeypatch.setattr(
+        torch.Tensor, "item", lambda t: host_reads.append("item") or item(t)
+    )
+    monkeypatch.setattr(
+        torch.Tensor, "tolist", lambda t: host_reads.append("tolist") or tolist(t)
+    )
+
+    packed = pack_tensor_dict(data)
+    monkeypatch.undo()
+
+    # Each host read synchronizes with the device when the batch is on an accelerator.
+    assert len(host_reads) <= 2
+    assert packed["cu_seqlens"][-1].item() == lens.sum().item()
+
+
 def _preference_batch() -> dict[str, torch.Tensor]:
     return {
         "input_ids": torch.arange(6).view(2, 3),

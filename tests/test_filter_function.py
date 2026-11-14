@@ -9,6 +9,8 @@ import torch
 
 import examples.swe.filter_function as filter_module
 
+from areal.utils.data import RolloutGroup
+
 
 class _RecordedStats:
     def __init__(self) -> None:
@@ -140,3 +142,74 @@ def test_mask_no_eos_filter_requires_attention_mask(recorded_stats):
 
     with pytest.raises(ValueError, match="requires attention_mask"):
         filter_module.filter_mixed_or_penalized_all_wrong_mask_no_eos(sample)
+
+
+@pytest.mark.parametrize(
+    ("rewards", "accepted"),
+    [
+        ([0, 0, 0, 0, 0], False),
+        ([1, 0, 0, 0, 0], False),  # Exactly 20% must be rejected.
+        ([1, 0, 0, 0], True),
+        ([1, 1, 1, 1, 0], True),
+        ([1, 1, 1, 1, 1], False),
+        ([0], False),
+        ([1], False),
+    ],
+)
+def test_accuracy_filter_default_boundaries(recorded_stats, rewards, accepted):
+    assert filter_module.filter_by_accuracy(_sample(rewards)) is accepted
+    assert recorded_stats.values["filter_accuracy"] == sum(rewards) / len(rewards)
+
+
+def test_accuracy_filter_uses_original_rewards_and_configured_bounds(recorded_stats):
+    sample = _sample([0, 1, 1, 0])
+    sample["rewards"] = torch.tensor([-1.0, -1.0, -1.0, -1.0])
+    assert filter_module.filter_by_accuracy(sample, min_accuracy=0, max_accuracy=1)
+    assert not filter_module.filter_by_accuracy(sample, min_accuracy=0.5)
+    assert not filter_module.filter_by_accuracy(
+        sample, min_accuracy=0, max_accuracy=0.5
+    )
+    assert filter_module.filter_by_accuracy(
+        {"rewards": torch.tensor([2.0, 0.0])}, correct_reward_threshold=2.0
+    )
+
+
+def test_accuracy_filter_counts_rollouts_without_turn_weighting(recorded_stats):
+    sample = _sample([1, 1, 1, 0, 0, 0, 0])
+    # Five logical rollouts: one successful 3-row rollout, four failures.
+    # References can already be normalized; use original row rewards instead.
+    sample["rollout_group"] = RolloutGroup(
+        (3, 1, 1, 1, 1), (2.0, -0.5, -0.5, -0.5, -0.5), arena_stream_name="swe"
+    )
+    assert not filter_module.filter_by_accuracy(sample)
+    assert recorded_stats.values["filter_accuracy"] == 0.2
+    assert recorded_stats.values["stream/swe/rejected_by_low_accuracy"] == 1
+    assert recorded_stats.values["stream/swe/rejected_by_high_accuracy"] == 0
+
+
+def test_accuracy_filter_rejects_ambiguous_rollout_correctness(recorded_stats):
+    sample = _sample([0, 1])
+    sample["rollout_group"] = RolloutGroup((2,))
+    with pytest.raises(ValueError, match="consistent original-reward correctness"):
+        filter_module.filter_by_accuracy(sample)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"min_accuracy": -0.1},
+        {"min_accuracy": 1.0},
+        {"min_accuracy": float("nan")},
+        {"max_accuracy": 1.1},
+        {"correct_reward_threshold": float("inf")},
+    ],
+)
+def test_accuracy_filter_rejects_invalid_configuration(recorded_stats, kwargs):
+    with pytest.raises(ValueError):
+        filter_module.filter_by_accuracy(_sample([0, 1]), **kwargs)
+
+
+@pytest.mark.parametrize("rewards", [[], [float("nan")], [float("inf")]])
+def test_accuracy_filter_rejects_invalid_rewards(recorded_stats, rewards):
+    with pytest.raises(ValueError):
+        filter_module.filter_by_accuracy(_sample(rewards))

@@ -265,6 +265,9 @@ def test_runner_budget_receipt_overrides_earlier_proxy_overflow(
     assert ArenaStreamAgentWorkflow.classify_proxy_failure(
         error, context_overflow=context_overflow, interaction_count=2
     ) == ("model_failure_zero" if fault is None else "unknown_failure_reject")
+    assert ArenaStreamAgentWorkflow._is_tool_call_budget_failure(error) is (
+        fault is None
+    )
 
 
 @pytest.mark.parametrize("adopted", [False, True])

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 from typing import Any
 
 import torch
 
 from areal.utils import stats_tracker
+from areal.utils.data import RolloutGroup
 
 
 def _get_rewards(sample: dict[str, Any]) -> torch.Tensor:
@@ -75,6 +77,74 @@ def filter_function(sample):
     )
 
     return accept
+
+
+def validate_accuracy_filter(
+    *,
+    min_accuracy: float = 0.2,
+    max_accuracy: float = 1.0,
+    correct_reward_threshold: float = 1.0 - 1e-3,
+) -> None:
+    """Validate accuracy-filter options before starting rollout workers."""
+    if not 0 <= min_accuracy < max_accuracy <= 1:
+        raise ValueError("accuracy bounds must satisfy 0 <= min < max <= 1")
+    if not math.isfinite(correct_reward_threshold):
+        raise ValueError("correct_reward_threshold must be finite")
+
+
+def filter_by_accuracy(
+    sample: dict[str, Any],
+    *,
+    min_accuracy: float = 0.2,
+    max_accuracy: float = 1.0,
+    correct_reward_threshold: float = 1.0 - 1e-3,
+) -> bool:
+    """Keep groups with ``min_accuracy < accuracy < max_accuracy``.
+
+    The importable default rejects groups with at most 20% correct rollouts and
+    all-correct groups. Correctness uses original rewards when available, with
+    one vote per logical rollout rather than per exported turn/sequence. A
+    SWEPPOConfig.should_accept_kwargs mapping can override these options.
+    When Arena stream provenance is present, record per-Arena-stream metrics too.
+    """
+    validate_accuracy_filter(
+        min_accuracy=min_accuracy,
+        max_accuracy=max_accuracy,
+        correct_reward_threshold=correct_reward_threshold,
+    )
+
+    correct = _get_rewards(sample) >= correct_reward_threshold
+    group = sample.get("rollout_group")
+    if group is not None:
+        if not isinstance(group, RolloutGroup):
+            raise ValueError("rollout_group must be a RolloutGroup")
+        group = group.validate_rows(correct.numel())
+        members = correct.split(group.row_counts)
+        if any(not bool((member == member[0]).all().item()) for member in members):
+            raise ValueError(
+                "accuracy filtering requires consistent original-reward correctness "
+                "within each logical rollout"
+            )
+        correct = torch.stack([member[0] for member in members])
+    # A float32 mean of 1/5 is slightly above 0.2, so divide integer counts
+    # in Python to preserve the inclusive lower rejection boundary.
+    accuracy = int(correct.sum().item()) / correct.numel()
+    too_low = accuracy <= min_accuracy
+    too_high = accuracy >= max_accuracy
+    metrics = {
+        "filter_accuracy": accuracy,
+        "rejected_by_low_accuracy": int(too_low),
+        "rejected_by_high_accuracy": int(too_high),
+    }
+    if group is not None and group.arena_stream_name:
+        metrics.update(
+            {
+                f"stream/{group.arena_stream_name}/{key}": value
+                for key, value in metrics.items()
+            }
+        )
+    stats_tracker.get("rollout").scalar(**metrics)
+    return not (too_low or too_high)
 
 
 def filter_mixed_or_penalized_all_wrong(sample: dict[str, Any]) -> bool:
