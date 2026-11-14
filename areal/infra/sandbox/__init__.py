@@ -2,12 +2,21 @@
 
 """Sandbox backends for code execution in rollouts and user scripts.
 
-Currently provides Daytona as a cloud sandbox. Install via::
+Provides Daytona and Runta as cloud sandboxes. Install via::
 
-    uv sync --extra sandbox
+    uv sync --extra sandbox                    # Daytona
+    uv pip install "runta-sdk>=0.2.6,<0.3"     # Runta
 """
 
 from ._client import DaytonaClientManager
 from .runner import DaytonaRunner, DaytonaRunResult
+from .runta import AsyncRuntaRunner, RuntaRunner, RuntaRunResult
 
-__all__ = ["DaytonaClientManager", "DaytonaRunResult", "DaytonaRunner"]
+__all__ = [
+    "AsyncRuntaRunner",
+    "DaytonaClientManager",
+    "DaytonaRunResult",
+    "DaytonaRunner",
+    "RuntaRunResult",
+    "RuntaRunner",
+]
