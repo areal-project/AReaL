@@ -17,8 +17,20 @@ def run_limited(
     process_group=False,
     env=None,
     separate_stderr=False,
+    preserve_tail=False,
+    keep_stdout_bytes=False,
 ):
-    """Bound total output and runtime; optionally keep stderr separate from stdout."""
+    """Bound output/time; optionally retain exact stdout bytes for artifact export."""
+    if preserve_tail and not truncate:
+        raise ValueError("Preserving the output tail requires truncate=True")
+
+    def head_tail(data, limit):
+        if len(data) <= limit:
+            return data
+        head = limit // 2
+        tail = limit - head
+        return data[:head] + (data[-tail:] if tail else data[:0])
+
     started = time.monotonic()
     process = subprocess.Popen(
         command,
@@ -31,6 +43,7 @@ def run_limited(
     errors = bytearray()
     status = "completed"
     truncated = False
+    bytes_seen = 0
     assert process.stdout is not None
     try:
         with selectors.DefaultSelector() as selector:
@@ -46,6 +59,12 @@ def run_limited(
                     chunk = os.read(key.fileobj.fileno(), 4096)
                     if not chunk:
                         selector.unregister(key.fileobj)
+                        continue
+                    if preserve_tail:
+                        bytes_seen += len(chunk)
+                        key.data.extend(chunk)
+                        key.data[:] = head_tail(key.data, output_bytes)
+                        truncated = bytes_seen > output_bytes
                         continue
                     available = output_bytes - len(output) - len(errors)
                     key.data.extend(chunk[:available])
@@ -73,6 +92,10 @@ def run_limited(
         process.stdout.close()
         if process.stderr is not None:
             process.stderr.close()
+    if preserve_tail:
+        # Reserve stderr first so noisy stdout cannot hide the final exception.
+        # Each stream's collector is bounded; the returned streams share one cap.
+        output = head_tail(output, output_bytes - len(errors))
     result = {
         "status": "output_limit" if truncated and status == "completed" else status,
         "exit_code": process.returncode,
@@ -81,4 +104,8 @@ def run_limited(
     }
     if separate_stderr:
         result.update(stdout=result["output"], stderr=errors.decode(errors="replace"))
+    if keep_stdout_bytes:
+        result["stdout_bytes"] = bytes(output)
+    if preserve_tail:
+        result["output_truncated"] = truncated
     return result

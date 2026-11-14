@@ -76,7 +76,8 @@ def _prepare_linear_forward(
     grad_output_buffer: list[torch.Tensor] | None,
     wgrad_deferral_limit: int | None,
     tp_group: torch.distributed.ProcessGroup | None,
-) -> torch.Tensor:
+    gtp_remat_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
         main_grad = weight.main_grad
     else:
@@ -91,9 +92,14 @@ def _prepare_linear_forward(
     ctx.wgrad_deferral_limit = wgrad_deferral_limit
     ctx.grad_output_buffer = grad_output_buffer
     ctx.tp_group = tp_group
+    ctx.gtp_remat_size = gtp_remat_size
+
+    compute_weight = (
+        weight.all_gather_and_prefetch(fwd=True) if gtp_remat_size > 1 else weight
+    )
 
     if not sequence_parallel:
-        return input_
+        return input_, compute_weight
 
     dim_size = list(input_.size())
     dim_size[0] *= tp_group.size()
@@ -101,7 +107,7 @@ def _prepare_linear_forward(
         dim_size, input_.dtype, "mpu"
     )
     mcore_layers.dist_all_gather_func(all_gather_buffer, input_, group=tp_group)
-    return all_gather_buffer
+    return all_gather_buffer, compute_weight
 
 
 def _lm_head_compute_weight(
@@ -129,8 +135,13 @@ class _LinearWithNativeOutput(
         allreduce_dgrad: bool,
         sequence_parallel: bool,
         tp_group: torch.distributed.ProcessGroup | None,
+        gtp_remat_size: int,
     ) -> torch.Tensor:
         """Project with FP32 operands while retaining PyTorch autograd semantics."""
+        if gtp_remat_size > 1:
+            raise NotImplementedError(
+                "FP32 lm_head operands do not support GTP weight rematerialization"
+            )
         if sequence_parallel:
             tp_group = mcore_layers.get_tensor_model_parallel_group_if_none(tp_group)
             total_input = tensor_parallel.gather_from_sequence_parallel_region(
@@ -167,8 +178,9 @@ class _LinearWithNativeOutput(
         grad_output_buffer: list[torch.Tensor] | None,
         wgrad_deferral_limit: int | None,
         tp_group: torch.distributed.ProcessGroup | None,
+        gtp_remat_size: int,
     ) -> torch.Tensor:
-        total_input = _prepare_linear_forward(
+        total_input, compute_weight = _prepare_linear_forward(
             ctx,
             input_,
             weight,
@@ -179,8 +191,9 @@ class _LinearWithNativeOutput(
             grad_output_buffer,
             wgrad_deferral_limit,
             tp_group,
+            gtp_remat_size,
         )
-        output = torch.matmul(total_input, weight.t())
+        output = torch.matmul(total_input, compute_weight.t())
         if bias is not None:
             output = output + bias
         return output
@@ -226,8 +239,9 @@ class _LinearWithFp32Output(
         grad_output_buffer: list[torch.Tensor] | None,
         wgrad_deferral_limit: int | None,
         tp_group: torch.distributed.ProcessGroup | None,
+        gtp_remat_size: int,
     ) -> torch.Tensor:
-        total_input = _prepare_linear_forward(
+        total_input, compute_weight = _prepare_linear_forward(
             ctx,
             input_,
             weight,
@@ -238,10 +252,11 @@ class _LinearWithFp32Output(
             grad_output_buffer,
             wgrad_deferral_limit,
             tp_group,
+            gtp_remat_size,
         )
 
         input_2d = total_input.reshape(-1, total_input.size(-1))
-        ctx.output_shape = (*total_input.shape[:-1], weight.size(0))
+        ctx.output_shape = (*total_input.shape[:-1], compute_weight.size(0))
         output = torch.empty(
             ctx.output_shape,
             dtype=torch.float32,
@@ -249,8 +264,8 @@ class _LinearWithFp32Output(
         )
         torch.mm(
             input_2d,
-            weight.t(),
-            out=output.view(-1, weight.size(0)),
+            compute_weight.t(),
+            out=output.view(-1, compute_weight.size(0)),
             out_dtype=torch.float32,
         )
         ctx.output_tensor_ref = weakref.ref(output)
@@ -357,6 +372,7 @@ def linear_with_fp32_output(
     grad_output_buffer: list[torch.Tensor] | None = None,
     wgrad_deferral_limit: int | None = 0,
     tp_group: torch.distributed.ProcessGroup | None = None,
+    gtp_remat_size: int = 1,
 ) -> torch.Tensor:
     """Run Megatron's TP linear with an FP32 output."""
     output = _LinearWithFp32Output.apply(
@@ -369,6 +385,7 @@ def linear_with_fp32_output(
         grad_output_buffer,
         wgrad_deferral_limit,
         tp_group,
+        gtp_remat_size,
     )
     return output
 
@@ -383,6 +400,7 @@ def _linear_with_frozen_areal_output(
     grad_output_buffer: list[torch.Tensor] | None,
     wgrad_deferral_limit: int | None,
     tp_group: torch.distributed.ProcessGroup | None,
+    gtp_remat_size: int,
     *,
     fp32_output: bool,
 ) -> torch.Tensor:
@@ -395,6 +413,9 @@ def _linear_with_frozen_areal_output(
         raise AssertionError(
             "wgrad_deferral_limit is only supported for trainable LM Head weights"
         )
+
+    if gtp_remat_size > 1:
+        weight = weight.all_gather_and_prefetch(fwd=True)
 
     tp_group = mcore_layers.get_tensor_model_parallel_group_if_none(tp_group)
     if sequence_parallel:
@@ -429,6 +450,7 @@ def linear_with_areal_output(
     grad_output_buffer: list[torch.Tensor] | None = None,
     wgrad_deferral_limit: int | None = 0,
     tp_group: torch.distributed.ProcessGroup | None = None,
+    gtp_remat_size: int = 1,
     *,
     fp32_output: bool,
     fp32_operands: bool = False,
@@ -446,6 +468,7 @@ def linear_with_areal_output(
             allreduce_dgrad=allreduce_dgrad,
             sequence_parallel=sequence_parallel,
             tp_group=tp_group,
+            gtp_remat_size=gtp_remat_size,
         )
     if not weight.requires_grad:
         return _linear_with_frozen_areal_output(
@@ -458,6 +481,7 @@ def linear_with_areal_output(
             grad_output_buffer,
             wgrad_deferral_limit,
             tp_group,
+            gtp_remat_size,
             fp32_output=fp32_output,
         )
 
@@ -478,6 +502,7 @@ def linear_with_areal_output(
             grad_output_buffer,
             wgrad_deferral_limit,
             tp_group,
+            gtp_remat_size,
         )
 
     output = _LinearWithNativeOutput.apply(
@@ -490,6 +515,7 @@ def linear_with_areal_output(
         grad_output_buffer,
         wgrad_deferral_limit,
         tp_group,
+        gtp_remat_size,
     )
     return output.float() if fp32_output else output
 

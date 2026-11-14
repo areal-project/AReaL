@@ -70,6 +70,7 @@ from areal.v2.inference_service.data_proxy.tokenizer_proxy import (
     TokenizerProxy,
 )
 from areal.v2.inference_service.inf_bridge import InfBridge
+from areal.v2.inference_service.session_auth import gateway_session_id
 from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
 
@@ -262,6 +263,21 @@ def _try_extract_bearer_token(request: Request) -> str | None:
     if x_api_key:
         return x_api_key
     return None
+
+
+def _resolve_generation_session(
+    request: Request, store: SessionStore
+) -> SessionData | None:
+    try:
+        session_id = gateway_session_id(request.headers, store.admin_api_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    if session_id is not None:
+        session = store.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired session.")
+        return session
+    return _resolve_session_from_token(_try_extract_bearer_token(request), store)
 
 
 def _create_inf_bridge(
@@ -841,8 +857,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         model_name = body_json.get("model")
         store: SessionStore = app.state.session_store
 
-        token = _try_extract_bearer_token(request)
-        session = _resolve_session_from_token(token, store)
+        session = _resolve_generation_session(request, store)
         if session is not None:
             session.update_last_access()
 
@@ -984,8 +999,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     async def anthropic_messages(request: Request) -> Message | StreamingResponse:
         """Serve Anthropic Messages API requests for session-backed agent rollouts."""
         store: SessionStore = app.state.session_store
-        token = _try_extract_bearer_token(request)
-        session = _resolve_session_from_token(token, store)
+        session = _resolve_generation_session(request, store)
         if session is None:
             raise HTTPException(status_code=401, detail="Invalid session key")
         session.update_last_access()

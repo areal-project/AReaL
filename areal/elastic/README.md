@@ -4,12 +4,13 @@
 
 ```bash
 CUDA_VISIBLE_DEVICES="" \
-python -m examples.task_workflows.train \
-  --config examples/task_workflows/configs/dapo.yaml \
+python -m examples.v2_online_workflows.train \
+  --config examples/v2_online_workflows/configs/hermes_dapo_ppo.yaml \
   elastic.enabled=true
 ```
 
-当前原生入口使用 Megatron＋SGLang 固定布局，保留完整 checkpoint 与观测；Megatron 动态布局切换待实现。
+当前原生入口支持固定 Actor TP 下调整 DP 和 GPU 分配，并调整托管 TP1 rollout 的副本数。 PP、CP、EP、ETP 须为 1；DP 变化要求分布式
+optimizer 和 scheduler checkpoint，目标 GPU 池须位于原始预留范围内。
 
 CPU 实验在工作区根目录运行：
 

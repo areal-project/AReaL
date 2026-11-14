@@ -57,6 +57,13 @@ from areal.v2.cli.watcher import ForegroundWatcher
     help="Seconds to wait for gateway /health.",
 )
 @click.option("-d", "--detach", is_flag=True, help="Fork the daemon and exit.")
+@click.option(
+    "--forward-timeout",
+    type=click.FloatRange(min=0, min_open=True),
+    default=120.0,
+    show_default=True,
+    help="Gateway upstream timeout in seconds, including waiting for generated tokens.",
+)
 @click.option("--model", default=None, help="Register this model at startup.")
 @click.option(
     "--backend",
@@ -124,6 +131,7 @@ def do_run(opts: dict) -> int:
         router_url=router_url,
         log_level=opts["log_level"],
         log_file=log_dir / "gateway.log",
+        forward_timeout=opts.get("forward_timeout", 120.0),
     )
     host_for_url = "127.0.0.1" if opts["host"] in ("0.0.0.0", "::") else opts["host"]
     gateway_url = f"http://{host_for_url}:{opts['port']}"

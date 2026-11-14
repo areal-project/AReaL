@@ -9,6 +9,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from examples.v2_online_workflows.outcome import require_successful_execution
+
+
+class TerminalExecutionError(RuntimeError):
+    """Executor returned a definitive failed outcome; no reward is submitted."""
+
 
 @dataclass(frozen=True)
 class EnvironmentSpec:
@@ -46,11 +52,9 @@ class TaskResult:
             metadata.get("completed"), bool
         ):
             raise RuntimeError("Expected task environment and completion metadata")
-        if environment.get("infrastructure_error") or any(
-            call.get("status") == "infrastructure_error"
-            for call in environment.get("calls", [])
-        ):
-            raise RuntimeError("Task environment infrastructure failure")
+        require_successful_execution(
+            metadata, environment, metadata.get("inference_calls")
+        )
         return cls(
             answer="".join(
                 block.get("text", "")
@@ -78,11 +82,40 @@ class GradeResult:
             raise ValueError("Benchmark reward must be finite")
 
 
+@dataclass(frozen=True)
+class TaskExecution:
+    result: TaskResult
+    metadata: dict[str, Any]
+    score: GradeResult | None = None
+
+
+class TaskExecutor(Protocol):
+    """Optional execution backend; the episode client owns the RL lifecycle."""
+
+    async def load(self, request_id: str) -> dict[str, Any]: ...
+
+    async def save(self, request_id: str, **values: Any) -> None: ...
+
+    async def execute(
+        self,
+        task: TaskInput,
+        *,
+        request_id: str,
+        base_url: str,
+        api_key: str,
+        model: str,
+        episode: dict[str, Any] | None,
+        session_id: str | None = None,
+    ) -> TaskExecution: ...
+
+
 class Benchmark(Protocol):
     name: str
     request_prefix: str
 
     def load_tasks(self, path: Path) -> tuple[list[Any], dict[str, Any]]: ...
+
+    def restore_task(self, value: dict[str, Any]) -> Any: ...
 
     def prepare(self, task: Any) -> TaskInput: ...
 
@@ -92,12 +125,12 @@ class Benchmark(Protocol):
 
 
 def get_benchmark(name: str) -> Benchmark:
-    if name == "dapo_math":
-        from examples.task_workflows.benchmarks.dapo_math import DapoBenchmark
+    if name == "gsm8k":
+        from examples.v2_online_workflows.benchmarks.gsm8k import GSM8KBenchmark
+
+        return GSM8KBenchmark()
+    if name in ("dapo", "dapo_math"):
+        from examples.v2_online_workflows.benchmarks.dapo import DapoBenchmark
 
         return DapoBenchmark()
-    if name == "swe_rebench":
-        from examples.task_workflows.benchmarks.swe_rebench import SWERebenchBenchmark
-
-        return SWERebenchBenchmark()
     raise ValueError(f"Unknown benchmark: {name}")

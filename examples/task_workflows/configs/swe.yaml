@@ -1,7 +1,0 @@
-# SPDX-License-Identifier: Apache-2.0
-# The same resident PPO recipe with a different externally submitted benchmark.
-defaults:
-  - dapo
-  - _self_
-
-trial_name: swe-smoke

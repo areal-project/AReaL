@@ -293,6 +293,7 @@ service = "default"
 gateway_host = "127.0.0.1"
 gateway_port = 8080
 routing_strategy = "round_robin"
+forward_timeout = 120.0
 
 [scheduler]
 type = "local"
@@ -303,6 +304,9 @@ model_health_timeout = 600
 engine_args = "--mem-fraction-static 0.8"
 proxy_args = "--request-timeout 120 --chat-template-type hf"
 ```
+
+长生成时，除 DataProxy 的 `--request-timeout` 外，还需设置 `areal inf run --forward-timeout 1800` 或
+`[launch].forward_timeout`。 Gateway 的独立超时默认是 120 秒；该参数控制上游 HTTP 等待，不负责断连后取消后台生成。
 
 ## Agent 服务 CLI（`areal agent`）
 

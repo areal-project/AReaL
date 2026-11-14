@@ -270,12 +270,29 @@ class PPOTrainer:
         self.train_dataloader: StatefulDataLoader | _EmptyDataLoader
         if self._online_mode:
             if config.total_train_steps is None:
-                raise ValueError(
-                    "total_train_steps must be set for online mode. "
-                    "Both total_train_epochs and total_train_steps are needed "
-                    "to compute steps_per_epoch."
-                )
-            steps_per_epoch = config.total_train_steps // config.total_train_epochs
+                # An explicit null step limit means continuous external training.
+                # One synthetic epoch is bookkeeping, never a source pass or cap.
+                for role in (config.actor, config.critic):
+                    if role is None or role.optimizer is None:
+                        continue
+                    opt = role.optimizer
+                    if (
+                        opt.lr_scheduler_type != "constant"
+                        or opt.warmup_steps != 0
+                        or opt.min_lr_ratio != 1.0
+                    ):
+                        raise ValueError(
+                            "Continuous online training requires constant LR, "
+                            "warmup_steps=0 and min_lr_ratio=1.0"
+                        )
+                for utility in (config.saver, config.recover, config.evaluator):
+                    if utility.freq_epochs is not None:
+                        raise ValueError(
+                            "Continuous online training requires null epoch frequencies"
+                        )
+                steps_per_epoch = 1
+            else:
+                steps_per_epoch = config.total_train_steps // config.total_train_epochs
             if steps_per_epoch < 1:
                 raise ValueError(
                     f"total_train_steps ({config.total_train_steps}) must be >= "
@@ -339,7 +356,9 @@ class PPOTrainer:
         if self._online_mode:
             assert steps_per_epoch is not None
             ft_spec = FinetuneSpec(
-                total_train_epochs=config.total_train_epochs,
+                total_train_epochs=(
+                    1 if config.total_train_steps is None else config.total_train_epochs
+                ),
                 dataset_size=steps_per_epoch * config.train_dataset.batch_size,
                 train_batch_size=config.train_dataset.batch_size,
             )
@@ -731,6 +750,8 @@ class PPOTrainer:
         eval_workflow_kwargs: dict[str, Any] | None = None,
         dynamic_filter_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         total_epochs: int | None = None,
+        on_step: Callable[[int], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ):
         config = self.config
         start_step = (
@@ -744,7 +765,8 @@ class PPOTrainer:
         if total_epochs <= 0:
             raise ValueError(f"Total epochs must be positive: {total_epochs}")
         steps_per_epoch = len(self.train_dataloader)
-        max_steps = total_epochs * steps_per_epoch
+        continuous = self._online_mode and config.total_train_steps is None
+        max_steps = None if continuous else total_epochs * steps_per_epoch
 
         # Initialize proxy workers if not using RolloutWorkflow
         if workflow is None:
@@ -761,7 +783,9 @@ class PPOTrainer:
             self._ensure_proxy_started()
 
         global_step = start_step
-        while global_step < max_steps:
+        while max_steps is None or global_step < max_steps:
+            if should_stop is not None and should_stop():
+                break
             if (
                 config.total_train_steps is not None
                 and global_step >= config.total_train_steps
@@ -777,6 +801,9 @@ class PPOTrainer:
                 eval_workflow_kwargs=eval_workflow_kwargs,
             )
             global_step += 1
+            if on_step is not None:
+                on_step(global_step)
+        return global_step
 
     def _train_step(self, **kwargs) -> None:
         # The lock also serializes explicit reconfiguration with batch reads,

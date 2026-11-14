@@ -2539,6 +2539,7 @@ class MegatronEngine(TrainEngine):
                     max_shard_size_byte=int(3e9),
                     max_workers=None,
                     fp8_direct_convert=self.fp8_direct_convert,
+                    is_critic=self.config.is_critic,
                 )
 
             if self.config.is_critic:

@@ -913,6 +913,14 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                     "completion_id": completion_id,
                     "request_id": model_request.rid,
                     "input_tokens": len(prompt_token_ids),
+                    **(
+                        {
+                            "input_token_ids": prompt_token_ids,
+                            "chat_template_type": self.chat_template_type,
+                        }
+                        if os.environ.get("AREAL_TRACE_MODEL_INPUTS") == "1"
+                        else {}
+                    ),
                 },
             )
         response = await self.engine.agenerate(model_request)

@@ -53,6 +53,7 @@ def spawn_gateway(
     router_url: str,
     log_level: str,
     log_file: Path,
+    forward_timeout: float = 120.0,
 ) -> int:
     cmd = [
         sys.executable,
@@ -66,6 +67,8 @@ def spawn_gateway(
         admin_api_key,
         "--router-addr",
         router_url,
+        "--forward-timeout",
+        str(forward_timeout),
         "--log-level",
         log_level,
     ]

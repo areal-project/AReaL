@@ -448,6 +448,7 @@ def save_weights_to_hf_with_mbridge_fast(
     max_shard_size_byte: int = int(3e9),
     max_workers: int | None = None,
     fp8_direct_convert: bool = False,
+    is_critic: bool = False,
 ):
     # 1. Prepare some global metadata required for saving the model.
     models = [unwrap_model(model) for model in models]
@@ -467,6 +468,10 @@ def save_weights_to_hf_with_mbridge_fast(
     for vpp_rank, model in enumerate(models):
         existing_keys = set()
         for name, param in model.named_parameters():
+            # Match the Critic HF loader: the independent ValueHead is saved
+            # separately by save_critic_value_head, not through the LM bridge.
+            if is_critic and "output_layer" in name:
+                continue
             device = param.device
             existing_keys.add(name)
             global_name = local_to_global_maps[vpp_rank][name]

@@ -1,14 +1,15 @@
-# SPDX-License-Identifier: Apache-2.0
-# Task workflows: Megatron TP4 + SGLang1 in an 8-GPU allocation.
-experiment_name: task-workflows
+# Hermes + DAPO v2 online PPO template with external task execution.
+# Uses the same training structure as hermes_gsm8k_ppo.yaml.
+# Explicit model, output/context lengths, epochs, steps and frozen tasks are required.
+# Configure external Hermes sampling consistently with gconfig.
+# individual exports per-call sequences; AReaL batches complete sessions.
+# This file configures the Trainer; the external Hermes executor runs separately.
+experiment_name: hermes-dapo-ppo
 trial_name: trial0
-
 seed: 1
 enable_offload: false
-total_train_epochs: 1
-total_train_steps: 4
+total_train_epochs: ${oc.env:AREAL_DAPO_EPOCHS}
 tokenizer_path: ${actor.path}
-
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
@@ -16,16 +17,13 @@ cluster:
   name_resolve:
     type: nfs
     nfs_record_root: ${cluster.fileroot}/names
-
 scheduler:
   type: local
-
 rollout:
-  backend: "sglang:d1"
-  _version: v2
+  backend: sglang:d4p1t1
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  max_concurrent_rollouts: 12
+  max_concurrent_rollouts: 256
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
   max_head_offpolicyness: 2
@@ -33,28 +31,27 @@ rollout:
   scheduling_spec: ${actor.scheduling_spec}
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
-  dump_to_file: false
+  dump_to_file: true
   agent:
     mode: online
+    reasoning_parser: ''
     tool_call_parser: qwen
-    reasoning_parser: qwen3
     export_style: individual
     turn_discount: 1.0
-    set_reward_finish_timeout: 0.0
+    drop_retry_orphans: true
+  _version: v2
   admin_api_key: ${oc.env:AREAL_INFERENCE_ADMIN_KEY}
-
+  model: ${oc.env:AREAL_MODEL_NAME}
+  request_timeout: .inf
 gconfig:
   n_samples: 1
   min_new_tokens: 0
-  max_new_tokens: 4096
+  max_new_tokens: ${oc.env:AREAL_DAPO_MAX_NEW_TOKENS}
+  max_tokens: ${sglang.context_length}
   greedy: false
   temperature: 1.0
-  top_p: 1.0
-
 actor:
-  backend: "megatron:d1t4"
-  _version: v2
-  admin_api_key: ${oc.env:AREAL_ACTOR_ADMIN_KEY}
+  backend: megatron:d4p1t1
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${oc.env:AREAL_MODEL_PATH}
@@ -63,11 +60,11 @@ actor:
   gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 65536
+    max_tokens_per_mb: 10240
   optimizer:
     type: adam
-    lr: 1.70e-5
-    weight_decay: 0.017
+    lr: 3e-6
+    weight_decay: 0.003
     beta1: 0.9
     beta2: 0.999
     eps: 1e-8
@@ -85,82 +82,92 @@ actor:
   rejection_sampling:
     metric: ratio
     upper: 5.0
-  # Online mode currently consumes one independently rewarded trajectory per
-  # group. Centering a singleton reward or flat singleton advantage would erase
-  # the task-conditioned learning signal.
-  reward_norm: null
-  adv_norm: null
-  weight_update_mode: awex
+  adv_norm:
+    mean_level: batch
+    std_level: batch
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
-    - task_type: worker
-      port_count: 2
-      gpu: 1
-      mem: 32
-      cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars:
-        AREAL_ROLLOUT_TRACE_DIR: ${oc.env:AREAL_ROLLOUT_TRACE_DIR,""}
-
-# Local CPU coordinator; elastic.enabled requires CUDA_VISIBLE_DEVICES="".
-# Configure physical device indices within the current job allocation.
-elastic:
-  enabled: ${oc.decode:${oc.env:AREAL_ELASTIC_ENABLED,false}}
-  reconfigurator: basic
-  state_root: ${oc.env:AREAL_TASK_STATE_ROOT}
-  actor_devices: [0, 1, 2, 3]
-  rollout_devices: [4]
-  checkpoint_estimated_bytes: ${oc.env:AREAL_CHECKPOINT_ESTIMATED_BYTES}
-  checkpoint_keep: 2
-
-# SGLang
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    mem: 32
+    cmd: python3 -m areal.infra.rpc.rpc_server
+    env_vars: {}
+  _version: v2
+  admin_api_key: ${oc.env:AREAL_ACTOR_ADMIN_KEY}
+  weight_update_mode: awex
+critic: null
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 10240
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor-guard
+    fork: true
+  scheduling_spec: ${actor.scheduling_spec}
+  _version: v2
+  admin_api_key: ${oc.env:AREAL_ACTOR_ADMIN_KEY}
 sglang:
   model_path: ${actor.path}
   random_seed: ${seed}
   skip_tokenizer_init: true
   dtype: ${actor.dtype}
   max_running_requests: null
-  context_length: 65536
+  context_length: ${oc.env:AREAL_DAPO_CONTEXT_LENGTH}
   mem_fraction_static: 0.8
-
-# datasets
+  enable_memory_saver: true
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_model_len: 32768
+  gpu_memory_utilization: 0.9
 train_dataset:
-  batch_size: 4
-  path: "null"
+  batch_size: 256
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: ${oc.env:AREAL_DAPO_TRAIN_TASKS}
   type: rl
-
-# Utilities
+  max_length: null
+valid_dataset: null
 saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: null
-  freq_steps: 10
+  freq_epochs: 1
+  freq_steps: null
   freq_secs: null
-
 recover:
   mode: disabled
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: null
-  freq_steps: 10
+  freq_epochs: 1
+  freq_steps: null
   freq_secs: null
-
 evaluator:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: null
-  freq_steps: 10
+  freq_steps: null
   freq_secs: null
-
 stats_logger:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   wandb:
     mode: disabled
-
 perf_tracer:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -168,3 +175,4 @@ perf_tracer:
   enabled: false
   session_tracer:
     enabled: false
+total_train_steps: ${oc.env:AREAL_DAPO_TOTAL_STEPS}

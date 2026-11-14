@@ -28,7 +28,7 @@ def create_app(config: TrainDataProxyConfig) -> FastAPI:
         )
         topology = await discover_topology(
             config.worker_addrs,
-            timeout=min(config.request_timeout, 30.0),
+            timeout=min(config.request_timeout or 30.0, 30.0),
         )
         dispatcher = Dispatcher(
             topology=topology, request_timeout=config.request_timeout

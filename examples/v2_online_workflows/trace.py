@@ -41,7 +41,7 @@ class CallTrace:
             self.tokenizer = _tokenizer(self.tokenizer_path)
         self.nodes: list[dict] = []
         self.requests: list[dict] = []
-        self.pools: dict[str, int] = {}
+        self.pools: dict[str, int | None] = {}
         self.last_request: dict | None = None
         self.tools: list[dict] = []
         self.dependencies_complete = True
@@ -83,46 +83,50 @@ class CallTrace:
 
         @wraps(invoke)
         def observed(name: str, arguments: dict) -> str:
-            with self.lock:
-                record = {
-                    "name": f"tool-{len(self.nodes) + 1}",
-                    "kind": "external",
-                    "tool": name,
-                    "pool": pool,
-                    "predecessors": [self.last_request["name"]]
-                    if self.last_request
-                    else [],
-                    "queued": time.time(),
-                    "started": None,
-                    "finished": None,
-                    "seconds": None,
-                    "output_tokens": None,
-                }
-                self.nodes.append(record)
-                self.tools.append(record)
-            token = _tool_record.set(record)
-            result = None
-            try:
-                result = invoke(name, arguments)
-                return result
-            finally:
-                record["finished"] = time.time()
-                clock = record.pop("_clock", None)
-                if clock is not None:
-                    record["seconds"] = record.pop(
-                        "_service_seconds", time.perf_counter() - clock
-                    )
-                _tool_record.reset(token)
-                if isinstance(result, str):
-                    content = result.encode("utf-8")
-                    record.update(
-                        returned_text=result,
-                        output_tokens=self._count_tokens(result),
-                        output_utf8_bytes=len(content),
-                        output_sha256=hashlib.sha256(content).hexdigest(),
-                    )
+            return self.observe_tool(name, pool, lambda: invoke(name, arguments))
 
         runtime.invoke = observed
+
+    def observe_tool(self, name: str, pool: str, execute: Any) -> Any:
+        """Observe a native execution callback without replacing its semantics."""
+        with self.lock:
+            record = {
+                "name": f"tool-{len(self.nodes) + 1}",
+                "kind": "external",
+                "tool": name,
+                "pool": pool,
+                "predecessors": [self.last_request["name"]]
+                if self.last_request
+                else [],
+                "queued": time.time(),
+                "started": None,
+                "finished": None,
+                "seconds": None,
+                "output_tokens": None,
+            }
+            self.nodes.append(record)
+            self.tools.append(record)
+        token = _tool_record.set(record)
+        result = None
+        try:
+            result = execute()
+            return result
+        finally:
+            record["finished"] = time.time()
+            clock = record.pop("_clock", None)
+            if clock is not None:
+                record["seconds"] = record.pop(
+                    "_service_seconds", time.perf_counter() - clock
+                )
+            _tool_record.reset(token)
+            if isinstance(result, str):
+                content = result.encode("utf-8")
+                record.update(
+                    returned_text=result,
+                    output_tokens=self._count_tokens(result),
+                    output_utf8_bytes=len(content),
+                    output_sha256=hashlib.sha256(content).hexdigest(),
+                )
 
     def _count_tokens(self, value: str) -> int | None:
         if self.tokenizer is None:
