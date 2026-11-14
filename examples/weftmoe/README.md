@@ -116,6 +116,40 @@ For Qwen3.5-122B-A10B, set `WEFTMOE_MODEL_PATH` to that model and use an extensi
 with WeftMoE's `qwen122b` profile. It is a different checkpoint from the 35B Base model.
 Do not reuse the 35B native binary for 122B.
 
+## Muon 8K sampling-mask comparison
+
+`dapo_math_grpo_muon_8k.yaml` uses BF16 WeftMoE, staged Muon, a 65536-token training
+microbatch limit, 32 prompts × 16 completions, and three epochs without a step cap.
+Recovery and periodic checkpoint writes are disabled. Set `DAPO_MATH_17K_PATH` to the
+exact baseline dataset; do not change its row multiplicity for an epoch comparison. Both
+arms use temperature 1, top-p 0.95, and top-k 30. This intentionally differs from the
+older untruncated sampler.
+
+After configuring the worker environment as above, run each arm on its own node:
+
+```bash
+python examples/weftmoe/dapo_math_sampling_mask.py \
+  --config examples/weftmoe/dapo_math_grpo_muon_8k.yaml \
+  trial_name=baseline sampling_mask_transfer=false
+python examples/weftmoe/dapo_math_sampling_mask.py \
+  --config examples/weftmoe/dapo_math_grpo_muon_8k.yaml \
+  trial_name=mask-on sampling_mask_transfer=true
+```
+
+Both arms use the OpenAI MathAgent workflow, with top-k explicitly forwarded in the HTTP
+request body and the historical gold-first `verify(gold, prediction)` reward convention.
+The proxy exports sampling-mask references when enabled. The recipe retains Flash
+attention and 16 tokens of server context headroom for the compatibility reasons
+described above; the generation budget remains 8191 tokens. Credentials, Ray addresses,
+native extension paths, and library paths belong in the deployment environment, not this
+recipe.
+
+`train_perf/estimated_tflops_per_second_per_gpu` reports effective training TFLOPs/s per
+GPU: the existing group FLOPs/s divided by the total number of training ranks and by
+1e12. The cumulative counterpart is a ratio of cumulative work and time, not an average
+of step rates. Neither metric measures hardware peak utilization or counts recomputation
+as useful work.
+
 ## Ray worker file-descriptor limits
 
 The 32 × 16 rollout batch creates 512 completions and can exceed low process

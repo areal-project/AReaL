@@ -425,16 +425,18 @@ timing. Rollout, reference/evaluation forwards, loading the next batch, checkpoi
 and statistics export are excluded. The denominator is the maximum accumulated training
 time across training ranks.
 
-| Metric                                                | Meaning                                                 |
-| ----------------------------------------------------- | ------------------------------------------------------- |
-| `train_perf/tokens`                                   | Global logical tokens processed in this export interval |
-| `train_perf/seconds`                                  | Training time for this interval                         |
-| `train_perf/tokens_per_second`                        | Interval tokens / interval seconds                      |
-| `train_perf/estimated_flops`                          | Sum of per-sequence forward + backward FLOPs            |
-| `train_perf/estimated_flops_per_second`               | Estimated interval FLOPs / interval seconds             |
-| `train_perf/total_tokens`, `train_perf/total_seconds` | Totals since engine initialization                      |
-| `train_perf/cumulative_tokens_per_second`             | Total tokens / total training time                      |
-| `train_perf/cumulative_estimated_flops_per_second`    | Total estimated FLOPs / total training time             |
+| Metric                                                      | Meaning                                                    |
+| ----------------------------------------------------------- | ---------------------------------------------------------- |
+| `train_perf/tokens`                                         | Global logical tokens processed in this export interval    |
+| `train_perf/seconds`                                        | Training time for this interval                            |
+| `train_perf/tokens_per_second`                              | Interval tokens / interval seconds                         |
+| `train_perf/estimated_flops`                                | Sum of per-sequence forward + backward FLOPs               |
+| `train_perf/estimated_flops_per_second`                     | Estimated interval FLOPs / interval seconds                |
+| `train_perf/total_tokens`, `train_perf/total_seconds`       | Totals since engine initialization                         |
+| `train_perf/cumulative_tokens_per_second`                   | Total tokens / total training time                         |
+| `train_perf/cumulative_estimated_flops_per_second`          | Total estimated FLOPs / total training time                |
+| `train_perf/estimated_tflops_per_second_per_gpu`            | Interval effective TFLOPs/s divided by all training GPUs   |
+| `train_perf/cumulative_estimated_tflops_per_second_per_gpu` | Cumulative effective TFLOPs/s divided by all training GPUs |
 
 These are aggregate training-cluster rates, not per-GPU rates. Cumulative counters
 restart when the engine is recreated, including checkpoint recovery. Unsupported model

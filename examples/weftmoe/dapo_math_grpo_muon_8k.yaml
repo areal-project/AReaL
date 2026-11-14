@@ -1,0 +1,46 @@
+# BF16 WeftMoE / Muon comparison; both arms use the same MathAgent workflow.
+defaults:
+  - dapo_math_grpo
+  - _self_
+
+experiment_name: weftmoe-35b-8k
+total_train_epochs: 3
+total_train_steps: null
+sampling_mask_transfer: false
+
+gconfig:
+  max_tokens: 8191
+  max_new_tokens: 8192
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 30
+
+actor:
+  mb_spec:
+    max_tokens_per_mb: 65536
+  optimizer:
+    type: dist_muon
+  megatron:
+    use_precision_aware_optimizer: false
+    ddp:
+      use_distributed_optimizer: false
+      check_for_nan_in_grad: false
+
+sglang:
+  context_length: 8208
+  decode_log_interval: 100
+
+train_dataset:
+  # Set the exact baseline dataset, preserving its row order and multiplicity.
+  path: ${oc.env:DAPO_MATH_17K_PATH}
+  max_length: 2048
+
+stats_logger:
+  wandb:
+    mode: online
+
+saver:
+  mode: auto
+  freq_steps: null
+  freq_epochs: null
+  freq_secs: null

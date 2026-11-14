@@ -381,16 +381,18 @@ padding；只沿 DP 维度求和，不重复乘以 TP、CP/SP、PP 或 EP。
 前未汇合的其他流异步工作， 因此不是设备全局同步后的 wall time。CPU/NPU 保留同步 wall time 计时。不包含
 rollout、参考模型/评估前向、读取下一批数据、存盘和统计导出。 分母取所有训练 rank 的累计训练耗时最大值。
 
-| 指标                                                  | 含义                                  |
-| ----------------------------------------------------- | ------------------------------------- |
-| `train_perf/tokens`                                   | 当前窗口训练侧总有效 tokens           |
-| `train_perf/seconds`                                  | 当前窗口训练耗时                      |
-| `train_perf/tokens_per_second`                        | 当前窗口 tokens / 耗时                |
-| `train_perf/estimated_flops`                          | 对各条序列的前向＋反向 FLOPs 估算求和 |
-| `train_perf/estimated_flops_per_second`               | 当前窗口预估 FLOPs / 耗时             |
-| `train_perf/total_tokens`、`train_perf/total_seconds` | engine 初始化以来的累计量             |
-| `train_perf/cumulative_tokens_per_second`             | 累计 tokens / 累计训练耗时            |
-| `train_perf/cumulative_estimated_flops_per_second`    | 累计预估 FLOPs / 累计训练耗时         |
+| 指标                                                        | 含义                                  |
+| ----------------------------------------------------------- | ------------------------------------- |
+| `train_perf/tokens`                                         | 当前窗口训练侧总有效 tokens           |
+| `train_perf/seconds`                                        | 当前窗口训练耗时                      |
+| `train_perf/tokens_per_second`                              | 当前窗口 tokens / 耗时                |
+| `train_perf/estimated_flops`                                | 对各条序列的前向＋反向 FLOPs 估算求和 |
+| `train_perf/estimated_flops_per_second`                     | 当前窗口预估 FLOPs / 耗时             |
+| `train_perf/total_tokens`、`train_perf/total_seconds`       | engine 初始化以来的累计量             |
+| `train_perf/cumulative_tokens_per_second`                   | 累计 tokens / 累计训练耗时            |
+| `train_perf/cumulative_estimated_flops_per_second`          | 累计预估 FLOPs / 累计训练耗时         |
+| `train_perf/estimated_tflops_per_second_per_gpu`            | 当前窗口有效 TFLOPs/s / 训练总卡数    |
+| `train_perf/cumulative_estimated_tflops_per_second_per_gpu` | 累计有效 TFLOPs/s / 训练总卡数        |
 
 这些指标表示整个训练集群的吞吐，不是单卡吞吐。重建 engine（包括恢复训练）会重新累计。 没有注册 FLOPs 函数的架构仍然上报 tokens 和耗时，省略 FLOPs
 指标。

@@ -113,11 +113,17 @@ def test_training_metrics_interval_and_cumulative_are_ratios_of_sums(monkeypatch
     assert result["train_perf/tokens"] == 10
     assert result["train_perf/tokens_per_second"] == pytest.approx(10 / 6)
     assert result["train_perf/estimated_flops_per_second"] == pytest.approx(26 / 6)
+    assert result["train_perf/estimated_tflops_per_second_per_gpu"] == pytest.approx(
+        26 / 6 / 1e12, rel=1e-12, abs=0
+    )
     assert metrics.export(dp_group=None, timing_group=None) == {}
     with metrics.measure(batch, lambda: None):
         pass
     result = metrics.export(dp_group=None, timing_group=None)
     assert result["train_perf/cumulative_tokens_per_second"] == 15 / 8
+    assert result[
+        "train_perf/cumulative_estimated_tflops_per_second_per_gpu"
+    ] == pytest.approx(39 / 8 / 1e12, rel=1e-12, abs=0)
 
 
 @pytest.mark.parametrize("fail", [False, True])
@@ -333,6 +339,7 @@ def _distributed_worker(rank, rendezvous, backend="gloo"):
     world = dist.new_group([0, 1], backend=backend)
     timing = dist.new_group([0, 1], backend="gloo")
     local_groups = [dist.new_group([i], backend=backend) for i in range(2)]
+    local_timing_groups = [dist.new_group([i], backend="gloo") for i in range(2)]
     try:
         metrics = TrainingMetrics(lambda n: n * n)
         metrics._pending = [(torch.tensor([3 + 4 * rank], device=device), 2 + 2 * rank)]
@@ -340,11 +347,26 @@ def _distributed_worker(rank, rendezvous, backend="gloo"):
         assert result["train_perf/tokens"] == 10
         assert result["train_perf/tokens_per_second"] == 2.5
         assert result["train_perf/estimated_flops_per_second"] == 58 / 4
+        assert result[
+            "train_perf/estimated_tflops_per_second_per_gpu"
+        ] == pytest.approx(58 / 4 / 2 / 1e12, rel=1e-12, abs=0)
         # Two model-parallel replicas: each has the same logical input.
-        metrics = TrainingMetrics(None)
+        metrics = TrainingMetrics(lambda n: n * n)
         metrics._pending = [(torch.tensor([3], device=device), 2 + 2 * rank)]
         result = metrics.export(dp_group=local_groups[rank], timing_group=timing)
         assert result["train_perf/tokens_per_second"] == 3 / 4
+        assert result[
+            "train_perf/estimated_tflops_per_second_per_gpu"
+        ] == pytest.approx(9 / 4 / 2 / 1e12, rel=1e-12, abs=0)
+        # A timing subgroup must not count unrelated global ranks as its GPUs.
+        metrics = TrainingMetrics(lambda n: n * n)
+        metrics._pending = [(torch.tensor([3], device=device), 2.0)]
+        result = metrics.export(
+            dp_group=local_groups[rank], timing_group=local_timing_groups[rank]
+        )
+        assert result[
+            "train_perf/estimated_tflops_per_second_per_gpu"
+        ] == pytest.approx(9 / 2 / 1e12, rel=1e-12, abs=0)
         # Unequal local loads must be summed BEFORE normalization.
         moe = MoEMetrics()
         moe.counts["0"] = (

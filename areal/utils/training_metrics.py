@@ -60,6 +60,9 @@ class TrainingMetrics:
         """Sum unique DP work; divide by MAX accumulated rank training time.
 
         timing_group is an explicit CPU group containing all training ranks.
+        Per-GPU TFLOPs/s divides by this group's size, including model-parallel
+        ranks, and converts FLOPs to teraFLOPs (1e12). It is estimated useful
+        training work, not a hardware counter or peak utilization measurement.
         Empty intervals (e.g. evaluation-only exports) produce no metrics.
         """
         # Wait once per device at export, covering events on all training streams.
@@ -112,12 +115,24 @@ class TrainingMetrics:
             / self._totals[2],
         }
         if self.estimator is not None:
+            training_world_size = (
+                dist.get_world_size(timing_group) if dist.is_initialized() else 1
+            )
+            per_gpu_tera_scale = training_world_size * 1e12
             result.update(
                 {
                     "train_perf/estimated_flops": flops,
                     "train_perf/estimated_flops_per_second": flops / elapsed,
                     "train_perf/cumulative_estimated_flops_per_second": self._totals[1]
                     / self._totals[2],
+                    "train_perf/estimated_tflops_per_second_per_gpu": flops
+                    / elapsed
+                    / per_gpu_tera_scale,
+                    "train_perf/cumulative_estimated_tflops_per_second_per_gpu": self._totals[
+                        1
+                    ]
+                    / self._totals[2]
+                    / per_gpu_tera_scale,
                 }
             )
         return result
