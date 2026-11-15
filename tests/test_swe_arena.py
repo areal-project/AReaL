@@ -1766,9 +1766,8 @@ def test_agent_records_global_and_domain_raw_reward_after_transform(monkeypatch)
         for key, value in stats.items()
         if "/selfcheck/" in key and not key.endswith("__count")
     }
-    assert selfcheck == pytest.approx(
-        {"calls": 4.0, "report_1/score": 0.0, "report_3/score": 0.6}
-    )
+    # Incomplete/failed check histories do not enter the filled-score cohort.
+    assert selfcheck == pytest.approx({"calls": 4.0})
 
 
 def test_agent_records_global_and_domain_pass_at_k(monkeypatch):

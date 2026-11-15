@@ -366,7 +366,7 @@ class ArenaOpenAPIClient:
     async def get_selfcheck_metrics(
         self, result: ArenaTaskResult, *, client: httpx.AsyncClient
     ) -> dict[str, float]:
-        """Read Checker telemetry from the Agent attempt that produced the result."""
+        """Read Checker scores, carrying early stops to the Harness check budget."""
         prefix, separator, suffix = (
             (result.artifacts_uri or "").rstrip("/").rpartition("/attempts/")
         )
@@ -414,24 +414,39 @@ class ArenaOpenAPIClient:
         )
         metrics: dict[str, float] = {}
         used_calls = budget.get("used_calls") if isinstance(budget, Mapping) else None
+        max_calls = budget.get("max_calls") if isinstance(budget, Mapping) else None
         if type(used_calls) is int and used_calls >= 0:
             metrics["calls"] = float(used_calls)
         elif audit == [] and "checker-budget.json" not in names:
             metrics["calls"] = 0.0
-        if isinstance(audit, list):
-            for index, row in enumerate(audit, start=1):
-                report = row.get("response") if isinstance(row, Mapping) else None
-                if not isinstance(report, Mapping) or report.get("status") != "OK":
-                    continue
-                score = report.get("score")
-                if type(score) not in (float, int):
-                    continue
-                try:
-                    score = float(score)
-                except OverflowError:
-                    continue
-                if math.isfinite(score):
-                    metrics[f"report_{index}/score"] = score
+        # A common cohort requires a complete, valid check history. Missing or
+        # failed checks are not an early stop and must not be forward-filled.
+        if (
+            type(used_calls) is not int
+            or used_calls <= 0
+            or type(max_calls) is not int
+            or max_calls < used_calls
+            or not isinstance(audit, list)
+            or len(audit) != used_calls
+        ):
+            return metrics
+        scores: list[float] = []
+        for row in audit:
+            report = row.get("response") if isinstance(row, Mapping) else None
+            if not isinstance(report, Mapping) or report.get("status") != "OK":
+                return metrics
+            score = report.get("score")
+            if type(score) not in (float, int):
+                return metrics
+            try:
+                score = float(score)
+            except OverflowError:
+                return metrics
+            if not math.isfinite(score):
+                return metrics
+            scores.append(score)
+        for index in range(1, max_calls + 1):
+            metrics[f"check_{index}/score"] = scores[min(index, used_calls) - 1]
         return metrics
 
     def __init__(
