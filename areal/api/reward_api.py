@@ -4,12 +4,13 @@ import asyncio
 import atexit
 import os
 import threading
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from functools import partial
 
-from areal.utils import logging
+from areal.utils import logging, perf_tracer
 
 logger = logging.getLogger("RewardAPI")
 
@@ -57,6 +58,12 @@ def reward_fn(
         Any other attributes in the dataset will be passed as keyword arguments to this function.
     :rtype: float
     """
+
+
+def _invoke_reward(fn, args, kwargs):
+    with perf_tracer.collect_dispositions() as diagnostics:
+        value = fn(*args, **kwargs)
+    return value, diagnostics
 
 
 class AsyncRewardWrapper:
@@ -139,19 +146,64 @@ class AsyncRewardWrapper:
             return new_executor
 
     async def __call__(self, *args, **kwargs) -> float:
+        operation_id = uuid.uuid4().hex
         for attempt in range(self.max_retries + 1):
             executor = self._executors.get(self._executor_key)
             if executor is None:
                 raise RuntimeError("ProcessPoolExecutor has been shut down")
 
             is_last = attempt == self.max_retries
+            if attempt:
+                perf_tracer.record_disposition(
+                    "retry",
+                    "reward",
+                    "reward_retry",
+                    operation_id=operation_id,
+                    attempt=attempt + 1,
+                    layer="reward_pool",
+                    unit="attempt",
+                )
             try:
                 future = asyncio.get_running_loop().run_in_executor(
                     executor,
-                    partial(self.reward_fn, *args, **kwargs),
+                    partial(_invoke_reward, self.reward_fn, args, kwargs),
                 )
-                return await asyncio.wait_for(future, timeout=self.timeout_seconds)
-            except TimeoutError:
+                value, diagnostics = await asyncio.wait_for(
+                    future, timeout=self.timeout_seconds
+                )
+                for diagnostic in diagnostics:
+                    perf_tracer.record_disposition(
+                        **{
+                            "operation_id": operation_id,
+                            "attempt": attempt + 1,
+                            **diagnostic,
+                            "reward_operation_id": operation_id,
+                            "reward_attempt": attempt + 1,
+                        },
+                    )
+                perf_tracer.record_disposition(
+                    "outcome",
+                    "reward",
+                    "completed",
+                    operation_id=operation_id,
+                    attempt=attempt + 1,
+                    layer="reward_pool",
+                    unit="operation",
+                    outcome="success",
+                )
+                return value
+            except TimeoutError as exc:
+                perf_tracer.record_disposition(
+                    "failure",
+                    "reward",
+                    "timeout",
+                    operation_id=operation_id,
+                    attempt=attempt + 1,
+                    layer="reward_pool",
+                    unit="attempt",
+                    exception=type(exc).__name__,
+                    outcome="zero_reward" if is_last else "retry",
+                )
                 logger.warning(
                     f"Computing reward timeout after {self.timeout_seconds}s "
                     f"(attempt {attempt + 1}/{self.max_retries + 1}). "
@@ -159,7 +211,18 @@ class AsyncRewardWrapper:
                 )
                 if is_last:
                     return 0.0
-            except BrokenProcessPool:
+            except BrokenProcessPool as exc:
+                perf_tracer.record_disposition(
+                    "failure",
+                    "reward",
+                    "broken_process_pool",
+                    operation_id=operation_id,
+                    attempt=attempt + 1,
+                    layer="reward_pool",
+                    unit="attempt",
+                    exception=type(exc).__name__,
+                    outcome="raised" if is_last else "recreate_pool",
+                )
                 logger.warning(
                     f"ProcessPoolExecutor broken (attempt {attempt + 1}/{self.max_retries + 1}). "
                     "Attempting to recreate..."
@@ -173,7 +236,18 @@ class AsyncRewardWrapper:
                     is None
                 ):
                     raise
-            except Exception:
+            except Exception as exc:
+                perf_tracer.record_disposition(
+                    "failure",
+                    "reward",
+                    "reward_exception",
+                    operation_id=operation_id,
+                    attempt=attempt + 1,
+                    layer="reward_pool",
+                    unit="attempt",
+                    exception=type(exc).__name__,
+                    outcome="raised" if is_last else "retry",
+                )
                 logger.exception(
                     f"Reward computation error (attempt {attempt + 1}/{self.max_retries + 1})"
                 )

@@ -10,6 +10,7 @@ from areal import PPOTrainer
 from areal.api.cli_args import GRPOConfig, load_expr_config
 from areal.reward import get_math_verify_worker
 from areal.utils.hf_utils import apply_chat_template, load_hf_tokenizer
+from areal.utils.perf_tracer import record_disposition
 from areal.utils.stats_logger import StatsLogger
 
 
@@ -57,10 +58,27 @@ def boba_reward_fn(
                 score = worker.verify(str(completions), str(sol))
                 if score == 1.0:
                     return 1.0
-            except Exception:
-                pass
+            except Exception as exc:
+                record_disposition(
+                    "failure",
+                    "verifier",
+                    "verify_exception",
+                    unit="verification",
+                    exception=type(exc).__name__,
+                    error=str(exc),
+                    outcome="try_next_solution",
+                )
         return 0.0
-    except Exception:
+    except Exception as exc:
+        record_disposition(
+            "failure",
+            "verifier",
+            "verifier_exception",
+            unit="verification",
+            exception=type(exc).__name__,
+            error=str(exc),
+            outcome="zero_reward",
+        )
         # Return 0 if completion parsing fails or any other error occurs
         return 0.0
 

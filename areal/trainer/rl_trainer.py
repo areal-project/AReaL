@@ -1030,6 +1030,7 @@ class PPOTrainer:
                     dynamic_bs=config.dynamic_bs,
                     min_batch_size=min_consumer_batch_size,
                 )
+            self._record_consumed_rollouts(rollout_batch, global_step, prepared=True)
             rollout_ended_at = time.time()
             if trace_observer is not None:
                 tracker = stats_tracker.get()
@@ -1476,9 +1477,9 @@ class PPOTrainer:
             )
 
     def _record_consumed_rollouts(
-        self, batch: list[dict[str, Any]], global_step: int
+        self, batch: list[dict[str, Any]], global_step: int, *, prepared: bool = False
     ) -> None:
-        """Persist logical rollout identities once per successful PPO call."""
+        """Record prepared batch identities and successful PPO consumption separately."""
         if not self.config.rollout.dump_to_file:
             return
         groups = []
@@ -1496,6 +1497,16 @@ class PPOTrainer:
             else:
                 groups.append(None)
         if not any(group and group["query_id"] is not None for group in groups):
+            return
+        if prepared:
+            perf_tracer.record_disposition(
+                "outcome",
+                "training_batch",
+                "prepared",
+                unit="batch",
+                global_step=global_step,
+                groups=groups,
+            )
             return
         directory = StatsLogger.get_log_path(self.config.stats_logger)
         record = {
@@ -2154,6 +2165,20 @@ class PPOTrainer:
     def _commit_stats(
         self, epoch: int, epoch_step: int, global_step: int, stats: dict[str, Any]
     ) -> None:
+        filter_counts = {
+            key.removeprefix("ppo_actor/update/disposition/"): value
+            for key, value in stats.items()
+            if key.startswith("ppo_actor/update/disposition/")
+        }
+        if filter_counts and (is_single_controller() or dist.get_rank() == 0):
+            perf_tracer.record_disposition(
+                "outcome",
+                "training_filters",
+                "counted",
+                unit="batch",
+                global_step=global_step,
+                counters=filter_counts,
+            )
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
         if not is_single_controller():

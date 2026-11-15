@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import uuid
 from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any
@@ -15,7 +16,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from areal.utils import logging
+from areal.utils import logging, perf_tracer
 from areal.utils.network import format_hostport, gethostip, split_hostport
 
 DEFAULT_RETRIES = 1
@@ -165,6 +166,7 @@ async def arequest_with_retry(
     if timeout is None:
         timeout = DEFAULT_REQUEST_TIMEOUT
     last_exception = None
+    operation_id = uuid.uuid4().hex
     max_retries = max_retries or DEFAULT_RETRIES
     try:
         host, port = split_hostport(addr)
@@ -187,14 +189,40 @@ async def arequest_with_retry(
     else:
         _session = session
 
+    send_attempt = 0
     try:
         for attempt in range(max_retries):
+            request_id = None
+            sending = False
             try:
                 attempt_payload = (
                     payload_factory() if payload_factory is not None else payload
                 )
                 if verbose:
                     logger.info("enter client session, start sending requests")
+                request_id = (
+                    (
+                        (attempt_payload or {}).get("rid")
+                        or (attempt_payload or {}).get("request_id")
+                    )
+                    if isinstance(attempt_payload, dict)
+                    else None
+                )
+                sending = True
+                send_attempt += 1
+                if send_attempt > 1:
+                    perf_tracer.record_disposition(
+                        "retry",
+                        "http",
+                        "request_retry",
+                        unit="attempt",
+                        layer="http",
+                        operation_id=operation_id,
+                        attempt=attempt + 1,
+                        send_attempt=send_attempt,
+                        endpoint=endpoint,
+                        request_id=request_id,
+                    )
                 if method.upper() == "GET":
                     ctx = _session.get(url, timeout=timeo)
                 elif method.upper() == "POST":
@@ -224,6 +252,19 @@ async def arequest_with_retry(
                         res = await response.read()
                     if verbose:
                         logger.info("get http result")
+                    perf_tracer.record_disposition(
+                        "outcome",
+                        "http",
+                        "completed",
+                        unit="attempt",
+                        layer="http",
+                        operation_id=operation_id,
+                        attempt=attempt + 1,
+                        send_attempt=send_attempt,
+                        endpoint=endpoint,
+                        request_id=request_id,
+                        outcome="success",
+                    )
                     return res
             except (
                 TimeoutError,
@@ -249,6 +290,20 @@ async def arequest_with_retry(
                         attempt + 1,
                         max_retries,
                     )
+                perf_tracer.record_disposition(
+                    "failure",
+                    "http",
+                    "request_exception" if sending else "payload_exception",
+                    unit="attempt",
+                    layer="http",
+                    operation_id=operation_id,
+                    attempt=attempt + 1,
+                    endpoint=endpoint,
+                    request_id=request_id,
+                    send_attempt=send_attempt if sending else None,
+                    exception=type(e).__name__,
+                    outcome="exhausted" if attempt == max_retries - 1 else "retry",
+                )
                 last_exception = e
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay)

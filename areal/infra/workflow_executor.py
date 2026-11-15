@@ -1406,6 +1406,14 @@ class WorkflowExecutor:
                 WorkflowContext(is_eval=pending_task.is_eval, task_id=task_id)
             )
 
+            identity = perf_tracer.disposition_context(
+                query_id=(pending_task.data or {}).get("query_id"),
+                occurrence_id=f"{self._identity_namespace}:{task_id}",
+            )
+            identity.__enter__()
+            perf_tracer.record_disposition(
+                "outcome", "workflow", "started", unit="group"
+            )
             manager = self.staleness_manager
             traj: dict[str, Any] | None = None
             trajectory_metadata: list[dict[str, Any]] | None = None
@@ -1542,6 +1550,13 @@ class WorkflowExecutor:
                         )
 
                 if should_accept_traj:
+                    perf_tracer.record_disposition(
+                        "outcome",
+                        "workflow",
+                        "accepted",
+                        unit="group",
+                        outcome="accepted",
+                    )
                     manager.on_rollout_accepted()
                     record_arena_stream_disposition(True)
                     trace_session_event(
@@ -1556,6 +1571,13 @@ class WorkflowExecutor:
                     assert traj is not None
                     return _RolloutResult(task_id=task_id, trajectory=traj)
 
+                perf_tracer.record_disposition(
+                    "filter" if reason == "rejected" else "drop",
+                    "workflow",
+                    reason,
+                    unit="group",
+                    outcome="rejected",
+                )
                 manager.on_rollout_rejected()
                 record_arena_stream_disposition(
                     False, filter_rejected=reason == "rejected"
@@ -1574,6 +1596,14 @@ class WorkflowExecutor:
                 return None
 
             except (WorkflowContractError, RoutingError) as exc:
+                perf_tracer.record_disposition(
+                    "failure",
+                    "workflow",
+                    "workflow_contract_error",
+                    unit="group",
+                    exception=type(exc).__name__,
+                    outcome="rejected",
+                )
                 manager.on_rollout_rejected()
                 record_arena_stream_disposition(False)
                 trace_session_event(
@@ -1588,6 +1618,14 @@ class WorkflowExecutor:
                     )
                 return WorkflowContractFailure(message=str(exc))
             except Exception as exc:  # pragma: no cover - workflow execution errors
+                perf_tracer.record_disposition(
+                    "failure",
+                    "workflow",
+                    "workflow_exception",
+                    unit="group",
+                    exception=type(exc).__name__,
+                    outcome="rejected",
+                )
                 manager.on_rollout_rejected()
                 record_arena_stream_disposition(False)
                 trace_session_event(
@@ -1602,7 +1640,23 @@ class WorkflowExecutor:
                     )
                 await self._clear_rejected_trajectory(traj)
                 return None
+            except asyncio.CancelledError:
+                perf_tracer.record_disposition(
+                    "drop",
+                    "workflow",
+                    "cancelled",
+                    unit="group",
+                    outcome="cancelled",
+                )
+                trace_session_event(
+                    "mark_finalized",
+                    task_id=task_id,
+                    status="dropped",
+                    reason="cancelled",
+                )
+                raise
             finally:
+                identity.__exit__(None, None, None)
                 if request_ids is not None:
                     end_timing = getattr(
                         self.inference_engine, "end_sglang_timing_session", None

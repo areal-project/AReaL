@@ -11,9 +11,14 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 import warnings
 from collections.abc import Callable
-from contextlib import AbstractAsyncContextManager, AbstractContextManager
+from contextlib import (
+    AbstractAsyncContextManager,
+    AbstractContextManager,
+    contextmanager,
+)
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import Enum
@@ -37,6 +42,66 @@ _current_session_id: ContextVar[int | None] = ContextVar("session_id", default=N
 
 # Context variable for propagating global_step into nested scopes
 _current_global_step: ContextVar[int | None] = ContextVar("global_step", default=None)
+
+# Logical identity is established before workflow execution, including failed samples.
+_disposition_identity: ContextVar[dict[str, Any]] = ContextVar(
+    "disposition_identity", default={}
+)
+_disposition_buffer: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "disposition_buffer", default=None
+)
+
+
+@contextmanager
+def disposition_context(**identity):
+    token = _disposition_identity.set({**_disposition_identity.get(), **identity})
+    try:
+        yield
+    finally:
+        _disposition_identity.reset(token)
+
+
+@contextmanager
+def collect_dispositions():
+    """Collect reward subprocess diagnostics for explicit return to its parent."""
+    records = []
+    token = _disposition_buffer.set(records)
+    try:
+        yield records
+    finally:
+        _disposition_buffer.reset(token)
+
+
+def record_disposition(kind: str, stage: str, reason: str, **fields) -> None:
+    """Record a disposition or successful operation result in the existing trace."""
+    record = {
+        "kind": kind,
+        "stage": stage,
+        "reason": reason,
+        "timestamp": time.time(),
+        **fields,
+    }
+    buffer = _disposition_buffer.get()
+    if buffer is not None:
+        buffer.append(record)
+        return
+    if GLOBAL_TRACER is None or not GLOBAL_TRACER.enabled:
+        return
+    instant(
+        "disposition",
+        category="instr",
+        args={
+            **_disposition_identity.get(),
+            "task_id": get_task_id(),
+            "session_id": get_session_id(),
+            "event_id": uuid.uuid4().hex,
+            "timestamp": time.time(),
+            "count": 1,
+            "unit": "sample",
+            **record,
+        },
+    )
+
 
 # Context variable tracking whether a profiler session is active
 _profiler_active: ContextVar[bool] = ContextVar("profiler_active", default=False)

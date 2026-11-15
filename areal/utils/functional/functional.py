@@ -602,6 +602,7 @@ def ppo_actor_loss_fn(
             behave_approx_kl=behave_approx_kl.detach(),
             behave_imp_weight=behave_imp_weight.detach(),
             behave_mask=behave_mask,
+            rejection_loss_mask=loss_mask.bool(),
             filtered_fraction=filtered_fraction,
         )
     return pg_loss, stat
@@ -805,6 +806,7 @@ def cispo_loss_fn(
             behave_approx_kl=behave_approx_kl.detach(),
             behave_imp_weight=behave_imp_weight.detach(),
             behave_mask=behave_mask,
+            rejection_loss_mask=loss_mask.bool(),
             filtered_fraction=filtered_fraction,
         )
     return pg_loss, stat

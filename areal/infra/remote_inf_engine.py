@@ -158,10 +158,40 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                     start_timing(request_ids.session_uuid, time.time())
             try:
                 with (
-                    request_ids.activate() if request_ids is not None else nullcontext()
+                    perf_tracer.disposition_context(sample_index=sample_idx),
+                    (
+                        request_ids.activate()
+                        if request_ids is not None
+                        else nullcontext()
+                    ),
                 ):
-                    async with backend_session(engine):
-                        result = await self.workflow.arun_episode(engine, data)
+                    perf_tracer.record_disposition("outcome", "sample", "started")
+                    try:
+                        async with backend_session(engine):
+                            result = await self.workflow.arun_episode(engine, data)
+                    except asyncio.CancelledError:
+                        perf_tracer.record_disposition(
+                            "drop",
+                            "sample",
+                            "cancelled",
+                            outcome="cancelled",
+                        )
+                        raise
+                    except Exception as exc:
+                        perf_tracer.record_disposition(
+                            "failure",
+                            "sample",
+                            "workflow_exception",
+                            exception=type(exc).__name__,
+                            outcome="raised",
+                        )
+                        raise
+                    perf_tracer.record_disposition(
+                        "outcome" if result else "drop",
+                        "sample",
+                        "completed" if result else "returned_none",
+                        outcome="completed" if result else "empty",
+                    )
             finally:
                 if request_ids is not None:
                     end_timing = getattr(engine, "end_sglang_timing_session", None)
@@ -256,11 +286,24 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                         f"sample_idx={sample_idx} with {unscored}/{len(result)} "
                         "unscored interactions"
                     )
+                    perf_tracer.record_disposition(
+                        "filter",
+                        "group",
+                        "unscored_interaction",
+                        sample_index=sample_idx,
+                    )
                     results[sample_idx] = None
             valid_results = [r for r in results if r is not None]
             usable_slot_count = len(valid_results)
 
         if not valid_results:
+            perf_tracer.record_disposition(
+                "drop",
+                "group",
+                "no_usable_samples",
+                unit="group",
+                sample_indices=[i for i, r in enumerate(results) if r],
+            )
             self._record_group_stats(usable_slot_count, trainable=False)
             return None
 
@@ -268,6 +311,13 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         if len(valid_results) < len(results):
             n_failed = len(results) - len(valid_results)
             if self.drop_incomplete_group:
+                perf_tracer.record_disposition(
+                    "drop",
+                    "group",
+                    "incomplete_group",
+                    unit="group",
+                    sample_indices=[i for i, r in enumerate(results) if r],
+                )
                 self.logger.warning(
                     f"GroupedRolloutWorkflow: {n_failed}/{len(results)} "
                     "trajectories returned None, dropping entire group "
@@ -288,6 +338,13 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                 )
 
         if usable_slot_count < self.min_usable_group_size:
+            perf_tracer.record_disposition(
+                "drop",
+                "group",
+                "below_min_usable_group_size",
+                unit="group",
+                sample_indices=[i for i, r in enumerate(results) if r],
+            )
             self._record_group_stats(usable_slot_count, trainable=False)
             return None
 
@@ -302,6 +359,13 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         ):
             if self.reward_normalization and self.group_size > 1:
                 if not self._normalize_group_rewards(valid_results):
+                    perf_tracer.record_disposition(
+                        "drop",
+                        "group",
+                        "reward_normalization_failed",
+                        unit="group",
+                        sample_indices=[i for i, r in enumerate(results) if r],
+                    )
                     self._record_group_stats(usable_slot_count, trainable=False)
                     return None
             # Merge dicts - each result is {completion_id: InteractionWithTokenLogpReward}
@@ -1239,6 +1303,7 @@ class RemoteInfEngine(InferenceEngine):
         req.gconfig.max_new_tokens = max_new_tokens
 
         # Make request
+        generation_id = uuid.uuid4().hex
         start_time = time.perf_counter()
         accumulated_output_tokens = []
         accumulated_output_logprobs = []
@@ -1288,6 +1353,16 @@ class RemoteInfEngine(InferenceEngine):
             if request_ids is None or request_id_field is None or call_index is None:
                 return payload
             send_index += 1
+            perf_tracer.record_disposition(
+                "outcome",
+                "generation_send",
+                "prepared",
+                unit="request",
+                operation_id=generation_id,
+                request_id=request_ids.request_rid(call_index, send_index),
+                call_index=call_index,
+                send_index=send_index,
+            )
             return {
                 **payload,
                 request_id_field: request_ids.request_rid(call_index, send_index),
@@ -1432,6 +1507,16 @@ class RemoteInfEngine(InferenceEngine):
                 accumulated_head_ids.extend(gen_result.sampler_head_ids)
                 accumulated_head_logprobs.extend(gen_result.sampler_head_logprobs)
 
+            if gen_result.stop_reason == "abort":
+                perf_tracer.record_disposition(
+                    "outcome",
+                    "generation_segment",
+                    "paused",
+                    unit="segment",
+                    operation_id=generation_id,
+                    request_version=request_version,
+                    output_tokens=len(gen_result.output_tokens),
+                )
             # Update accumulated outputs
             accumulated_output_tokens.extend(gen_result.output_tokens)
             accumulated_output_logprobs.extend(gen_result.output_logprobs)
@@ -1489,6 +1574,16 @@ class RemoteInfEngine(InferenceEngine):
             # so the actual reason is length
             stop_reason = "length"
 
+        perf_tracer.record_disposition(
+            "truncation" if stop_reason == "length" else "outcome",
+            "generation",
+            "length" if stop_reason == "length" else "completed",
+            operation_id=generation_id,
+            stop_reason=stop_reason,
+            output_tokens=len(accumulated_output_tokens),
+            output_limit=max_new_tokens,
+            total_limit=gconfig.max_tokens,
+        )
         latency = time.perf_counter() - start_time
 
         if (

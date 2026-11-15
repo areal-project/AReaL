@@ -923,6 +923,22 @@ class PPOActorControllerV2(GatewayTrainController):
         self._gateway_post("/ppo/actor/update", payload)
 
 
+def _record_loss_filter_counts(base, version, m2, rejection, effective):
+    """Count callback token processing through the existing DP-reduced stats."""
+    with stats_tracker.scope("disposition"):
+        stats_tracker.stat_compact(
+            base,
+            ReduceType.SUM,
+            input_tokens=torch.ones_like(base, dtype=torch.float64),
+            version_filtered_tokens=(base & ~version).double(),
+            m2_filtered_tokens=(version & ~m2).double(),
+            rejection_filtered_tokens=(m2 & ~rejection).double(),
+            final_tokens=rejection.double(),
+            zero_weight_tokens=(rejection & ~effective).double(),
+            effective_tokens=effective.double(),
+        )
+
+
 def grpo_loss_fn(
     logprobs: torch.Tensor,
     entropy: torch.Tensor,
@@ -963,6 +979,7 @@ def grpo_loss_fn(
     loss_mask = denominator_mask
     if "policy_version_mask" in input_data:
         loss_mask = loss_mask & input_data["policy_version_mask"].bool()
+    version_loss_mask = loss_mask
     if mopd_loss_config is not None and mopd_loss_config.rl_coefficient == 0:
         teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
         teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")
@@ -975,6 +992,7 @@ def grpo_loss_fn(
             )
         normalization_mask = denominator_mask
         prox_logp_gt = input_data.get("prox_logp")
+        m2_loss_mask = loss_mask
         if m2_threshold is not None or rejection_sampling is not None:
             prox_logp = _resolve_proximal_logp(
                 prox_logp_gt=prox_logp_gt,
@@ -988,6 +1006,7 @@ def grpo_loss_fn(
                 loss_mask = _apply_m2po_masking(
                     input_data["logprobs"], prox_logp, loss_mask, m2_threshold
                 )
+            m2_loss_mask = loss_mask
             if rejection_sampling is not None:
                 loss_mask = apply_rejection_sampling(
                     proximal_logprobs=prox_logp,
@@ -996,6 +1015,13 @@ def grpo_loss_fn(
                     cu_seqlens=input_data.get("cu_seqlens"),
                     config=rejection_sampling,
                 ).loss_mask
+        _record_loss_filter_counts(
+            denominator_mask,
+            version_loss_mask,
+            m2_loss_mask,
+            loss_mask.bool(),
+            loss_mask.bool(),
+        )
         loss, mopd_stats = compose_mopd_loss(
             logprobs.new_zeros(()),
             config=mopd_loss_config,
@@ -1155,6 +1181,13 @@ def grpo_loss_fn(
     # the original valid-token count. Keep both objectives on that denominator.
     mopd_normalization_mask = denominator_mask
     mopd_loss_mask = stat.get("behave_mask", loss_mask).bool()
+    _record_loss_filter_counts(
+        denominator_mask,
+        version_loss_mask,
+        loss_mask.bool(),
+        stat.get("rejection_loss_mask", loss_mask).bool(),
+        mopd_loss_mask,
+    )
 
     # Multi-teacher on-policy distillation. Legacy single-teacher numerators
     # retain their post-M2, pre-rejection mask; both use the original denominator.
