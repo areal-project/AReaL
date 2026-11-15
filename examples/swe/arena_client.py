@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Real
 from typing import Any, Literal
 from urllib.parse import parse_qs, quote, urlsplit
@@ -39,6 +39,7 @@ class ArenaTaskResult:
     computed_at: str | None = None
     # Optional telemetry is validated separately from the authoritative score.
     sub_scores: Any = None
+    selfcheck_metrics: dict[str, float] = field(default_factory=dict)
 
 
 def _arena_task_type_from_tags(tags: Any) -> str:
@@ -361,6 +362,77 @@ class ArenaOpenAPIClient:
         if not isinstance(result, dict):
             raise ArenaAPIError("Harness result artifact must be a JSON object")
         return result
+
+    async def get_selfcheck_metrics(
+        self, result: ArenaTaskResult, *, client: httpx.AsyncClient
+    ) -> dict[str, float]:
+        """Read Checker telemetry from the Agent attempt that produced the result."""
+        prefix, separator, suffix = (
+            (result.artifacts_uri or "").rstrip("/").rpartition("/attempts/")
+        )
+        if (
+            not separator
+            or not prefix
+            or not suffix.isascii()
+            or not suffix.isdecimal()
+        ):
+            return {}
+        result_attempt = int(suffix)
+        task_id = quote(result.task_id, safe="")
+        url = f"{self.base_url}/openapi/v1/tasks/{task_id}/artifacts"
+        response = await self._async_request(client, "GET", url, headers=self._headers)
+        items = _response_json(response)
+        if not isinstance(items, Mapping) or not isinstance(items.get("items"), list):
+            raise ArenaAPIError("Arena artifact listing is missing items")
+        agent_items = [
+            item
+            for item in items["items"]
+            if isinstance(item, Mapping)
+            and item.get("role") in ("agent", "harness")
+            and type(item.get("attempt")) is int
+            and 0 < item["attempt"] <= result_attempt
+        ]
+        attempt = max((item["attempt"] for item in agent_items), default=0)
+        names = {item.get("name") for item in agent_items if item["attempt"] == attempt}
+
+        async def read_artifact(name: str) -> Any:
+            if name not in names:
+                return None
+            response = await self._async_request(
+                client,
+                "GET",
+                f"{url}/{name}",
+                params={"attempt": attempt},
+                headers=self._headers,
+            )
+            return _response_json(response)
+
+        audit, budget = await asyncio.gather(
+            read_artifact("checker-audit.json"),
+            read_artifact("checker-budget.json"),
+            return_exceptions=True,
+        )
+        metrics: dict[str, float] = {}
+        used_calls = budget.get("used_calls") if isinstance(budget, Mapping) else None
+        if type(used_calls) is int and used_calls >= 0:
+            metrics["calls"] = float(used_calls)
+        elif audit == [] and "checker-budget.json" not in names:
+            metrics["calls"] = 0.0
+        if isinstance(audit, list):
+            for index, row in enumerate(audit, start=1):
+                report = row.get("response") if isinstance(row, Mapping) else None
+                if not isinstance(report, Mapping) or report.get("status") != "OK":
+                    continue
+                score = report.get("score")
+                if type(score) not in (float, int):
+                    continue
+                try:
+                    score = float(score)
+                except OverflowError:
+                    continue
+                if math.isfinite(score):
+                    metrics[f"report_{index}/score"] = score
+        return metrics
 
     def __init__(
         self,
