@@ -4839,3 +4839,7 @@ def save_config(cfg, log_dir):
             default_flow_style=False,
             sort_keys=False,
         )
+    config_json_path = Path(log_dir) / "config.json"
+    temporary = config_json_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(config_dict, indent=2, default=str) + "\n")
+    temporary.replace(config_json_path)

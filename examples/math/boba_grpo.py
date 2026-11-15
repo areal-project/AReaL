@@ -1,4 +1,8 @@
+import hashlib
+import json
+import os
 import sys
+from pathlib import Path
 
 from datasets import load_dataset
 
@@ -6,6 +10,7 @@ from areal import PPOTrainer
 from areal.api.cli_args import GRPOConfig, load_expr_config
 from areal.reward import get_math_verify_worker
 from areal.utils.hf_utils import apply_chat_template, load_hf_tokenizer
+from areal.utils.stats_logger import StatsLogger
 
 
 def get_input_ids_fn(data, tokenizer, enable_thinking):
@@ -60,11 +65,51 @@ def boba_reward_fn(
         return 0.0
 
 
-def main(args):
+def _load_inputs(args, *, record_dataset=False):
     config, _ = load_expr_config(args, GRPOConfig)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
-
+    source = Path(config.train_dataset.path)
+    record_dataset = record_dataset or (
+        config.rollout.dump_to_file and source.is_file()
+    )
+    source_hash = None
+    if record_dataset:
+        with source.open("rb") as stream:
+            source_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     train_dataset = get_boba_math_dataset(config.train_dataset.path, tokenizer)
+    if record_dataset and os.getenv("RANK", "0") == "0":
+        with source.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != source_hash:
+                raise ValueError("BOBA source changed while loading the dataset")
+        ids = [row.get("query_id") for row in train_dataset]
+        path = (
+            Path(StatsLogger.get_log_path(config.stats_logger)) / "loaded-dataset.json"
+        )
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "source_path": str(source.resolve()),
+                    "source_sha256": source_hash,
+                    "sample_count": len(train_dataset),
+                    "ordered_ids": ids,
+                    "filter": "len(tokenizer.encode(raw_prompt)) <= 1024",
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        temporary.replace(path)
+    return config, tokenizer, train_dataset
+
+
+def preflight(args):
+    """Resolve configuration and record loaded data before creating RL workers."""
+    _load_inputs(args, record_dataset=True)
+
+
+def main(args):
+    config, tokenizer, train_dataset = _load_inputs(args)
 
     workflow_kwargs = dict(
         reward_fn="examples.math.boba_grpo.boba_reward_fn",
