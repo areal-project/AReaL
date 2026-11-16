@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from areal.experimental.openai.cache import InteractionCache
-from areal.experimental.openai.finalization import finalize_interactions
+from areal.experimental.openai.finalization import (
+    ResponseValidationPolicy,
+    finalize_interactions,
+    response_validator_for_policy,
+)
 
 if TYPE_CHECKING:
     from areal.experimental.openai.types import InteractionWithTokenLogpReward
@@ -109,6 +113,7 @@ class ExportTrajectoriesRequest(BaseModel):
     is_eval: bool = False
     # Explicit agent opt-in; applied before serialization when PRM is disabled.
     episode_reward: float | None = Field(default=None, allow_inf_nan=False)
+    response_validation_policy: ResponseValidationPolicy = "final_response"
 
 
 class ExportTrajectoriesResponse(BaseModel):
@@ -236,7 +241,13 @@ class SessionData:
         drop_retry_orphans: bool = False,
         *,
         episode_reward: float | None = None,
+        response_validation_policy: ResponseValidationPolicy = "final_response",
     ) -> dict[str, InteractionWithTokenLogpReward]:
+        if response_validation_policy == "artifact_reward" and (
+            episode_reward is None or style != "concat"
+        ):
+            raise ValueError("Artifact reward policy requires a concat episode reward")
+        response_validator = response_validator_for_policy(response_validation_policy)
         if len(self.completions) == 0:
             return {}
         interactions = finalize_interactions(
@@ -244,6 +255,7 @@ class SessionData:
             style=style,
             reward_discount=discount,
             episode_reward=episode_reward,
+            response_validator=response_validator,
             drop_retry_orphans=drop_retry_orphans,
         )
         for interaction in interactions.values():

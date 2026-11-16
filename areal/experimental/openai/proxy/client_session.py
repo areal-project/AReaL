@@ -35,6 +35,7 @@ from .server import (
 from .tensor_reference import SharedTensorResolver
 
 if TYPE_CHECKING:
+    from ..finalization import ResponseValidationPolicy
     from ..types import InteractionWithTokenLogpReward
 
 logger = getLogger("OpenAIProxyClient")
@@ -167,6 +168,7 @@ class OpenAIProxyClient:
         drop_retry_orphans: bool = False,
         is_eval: bool = False,
         episode_reward: float | None = None,
+        response_validation_policy: ResponseValidationPolicy = "final_response",
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Export interactions for this session via HTTP.
 
@@ -197,6 +199,9 @@ class OpenAIProxyClient:
         episode_reward : float, optional
             Assign an episode return to disjoint concat segments before tensor
             serialization. Applied only when the proxy has no PRM runner.
+        response_validation_policy : {"final_response", "artifact_reward"}
+            Explicitly allow an empty final response for externally scored
+            artifacts. Requires a concat episode reward and no PRM runner.
 
         Returns
         -------
@@ -224,6 +229,8 @@ class OpenAIProxyClient:
         }
         if episode_reward is not None:
             payload["episode_reward"] = episode_reward
+        if response_validation_policy != "final_response":
+            payload["response_validation_policy"] = response_validation_policy
         headers = self._admin_auth_headers()
         async with self._session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()

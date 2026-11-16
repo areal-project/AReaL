@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 import torch
+from fastapi import HTTPException
+from pydantic import ValidationError
 
 from examples.swe.arena_agent import ArenaStreamAgentWorkflow
 from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
@@ -79,13 +81,15 @@ def arena_agent(monkeypatch):
 @pytest.mark.parametrize("reward", [0.0, 0.5275])
 @pytest.mark.parametrize("chain_lengths", [(71, 1, 15), (18, 1, 1, 76)])
 @pytest.mark.parametrize("context_overflow", [False, True])
+@pytest.mark.parametrize("response_policy", ["final_response", "artifact_reward"])
 async def test_arena_compacted_episode_scores_all_actions_once(
-    monkeypatch, arena_agent, reward, chain_lengths, context_overflow
+    monkeypatch, arena_agent, reward, chain_lengths, context_overflow, response_policy
 ):
     overflow = context_overflow
     if overflow:
         reward = 0.0
     cache = _compacted_session(chain_lengths)
+    arena_agent.response_validation_policy = response_policy
     leaves = cache.export_interactions(style="concat")
     expected_leaf_ids = [
         str(sum(chain_lengths[: index + 1])) for index in range(len(chain_lengths))
@@ -114,6 +118,11 @@ async def test_arena_compacted_episode_scores_all_actions_once(
         async def export_interactions(
             self, *, style, discount, drop_retry_orphans, **kwargs
         ):
+            expected_policy = response_policy if not overflow else "final_response"
+            assert (
+                kwargs.get("response_validation_policy", "final_response")
+                == expected_policy
+            )
             session = SessionData(session_id=self.session_id)
             session._completions = cache
             session.finish()
@@ -535,7 +544,10 @@ async def test_proxy_episode_return_requires_opt_in_and_preserves_prm(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("episode_reward", [None, 0.0, 0.5])
-async def test_proxy_client_sends_episode_reward_only_when_requested(episode_reward):
+@pytest.mark.parametrize("response_policy", ["final_response", "artifact_reward"])
+async def test_proxy_client_sends_episode_reward_only_when_requested(
+    episode_reward, response_policy
+):
     response = MagicMock()
     response.__aenter__ = AsyncMock(return_value=response)
     response.json = AsyncMock(return_value={"interactions": {}})
@@ -549,10 +561,151 @@ async def test_proxy_client_sends_episode_reward_only_when_requested(episode_rew
     )
     client.session_id = "episode"
 
-    await client.export_interactions(style="concat", episode_reward=episode_reward)
+    await client.export_interactions(
+        style="concat",
+        episode_reward=episode_reward,
+        response_validation_policy=response_policy,
+    )
 
     payload = session.post.call_args.kwargs["json"]
     if episode_reward is None:
         assert "episode_reward" not in payload
     else:
         assert payload["episode_reward"] == episode_reward
+    if response_policy == "final_response":
+        assert "response_validation_policy" not in payload
+    else:
+        assert payload["response_validation_policy"] == response_policy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_policy", ["final_response", "artifact_reward"])
+@pytest.mark.parametrize("invalid_tool_call", [False, True])
+@pytest.mark.parametrize("reward", [0.0, 0.8])
+@pytest.mark.parametrize("materialize_first", [False, True])
+async def test_artifact_episode_with_empty_title_preserves_external_score_only_when_opted_in(
+    monkeypatch, response_policy, invalid_tool_call, reward, materialize_first
+):
+    """A main task, compaction and empty auxiliary title share one artifact score."""
+    cache = _compacted_session((2, 1, 1))
+    title = cache["4"]
+    title.messages = [{"role": "user", "content": "Generate a short session title"}]
+    title.output_message_list = [{"role": "assistant", "content": None}]
+    title.metadata["response_parse"] = {
+        "has_content": False,
+        "has_tool_calls": False,
+        "tool_call_parse_failed": invalid_tool_call,
+    }
+    cache.set_last_reward(reward)
+    if materialize_first:
+        for leaf in cache.export_interactions(style="concat").values():
+            leaf.to_tensor_dict()
+    session = SessionData(session_id="artifact-episode")
+    session._completions = cache
+    session.finish()
+    monkeypatch.setattr(server_module, "_session_cache", {session.session_id: session})
+    monkeypatch.setattr(server_module, "_prm_runner", None)
+
+    response = await server_module.export_trajectories(
+        ExportTrajectoriesRequest(
+            session_id=session.session_id,
+            style="concat",
+            episode_reward=reward,
+            response_validation_policy=response_policy,
+        )
+    )
+    restored = deserialize_interactions(response.interactions)
+
+    accepted = response_policy == "artifact_reward" and not invalid_tool_call
+    expected = reward if accepted else 0.0
+    assert list(restored) == ["2", "3", "4"]
+    assert [leaf.reward for leaf in restored.values()] == [expected] * 3
+    assert [leaf.rollout_reward for leaf in restored.values()] == [expected] * 3
+    for leaf in restored.values():
+        if accepted:
+            assert "reward_validation_error" not in leaf.metadata
+        else:
+            error = (
+                "invalid_tool_call" if invalid_tool_call else "empty_assistant_response"
+            )
+            assert leaf.metadata["reward_validation_error"] == error
+    tensors = concat_tensor_interactions(restored)
+    assert tensors["loss_mask"].sum().item() == 4
+    torch.testing.assert_close(tensors["original_rewards"], torch.full((3,), expected))
+    peer = {"peer": InteractionWithTokenLogpReward(reward=0.4)}
+    assert normalize_logical_rollout_rewards([restored, peer], use_std=False)
+    normalized = (expected - 0.4) / 2
+    assert concat_tensor_interactions(restored)[
+        "rollout_group"
+    ].rewards == pytest.approx((normalized,))
+    stats_tracker.export_all(reset=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("episode_reward,prm_enabled", [(None, False), (0.8, True)])
+async def test_artifact_policy_rejects_missing_external_reward_or_prm(
+    monkeypatch, episode_reward, prm_enabled
+):
+    """Relaxed text validation cannot silently change process-reward semantics."""
+    session = SessionData(session_id="artifact-episode")
+    session.finish()
+    monkeypatch.setattr(server_module, "_session_cache", {session.session_id: session})
+    monkeypatch.setattr(server_module, "_prm_runner", Mock() if prm_enabled else None)
+    with pytest.raises(HTTPException) as error:
+        await server_module.export_trajectories(
+            ExportTrajectoriesRequest(
+                session_id=session.session_id,
+                style="concat",
+                episode_reward=episode_reward,
+                response_validation_policy="artifact_reward",
+            )
+        )
+    assert error.value.status_code == 400
+
+
+def test_response_policy_defaults_to_strict_and_rejects_unknown_values():
+    """An older caller or typo must never disable final-response validation."""
+    assert (
+        ExportTrajectoriesRequest(session_id="episode").response_validation_policy
+        == "final_response"
+    )
+    with pytest.raises(ValidationError):
+        ExportTrajectoriesRequest(
+            session_id="episode", response_validation_policy="off"
+        )
+
+
+@pytest.mark.parametrize(
+    "status,style", [("OK", "individual"), ("EVAL_FAILED", "concat")]
+)
+def test_artifact_policy_requires_successful_concat_arena_episode(
+    arena_agent, status, style
+):
+    """Only a successful external task opts into artifact-based validation."""
+    arena_agent.response_validation_policy = "artifact_reward"
+    arena_agent._task_result.set(
+        ArenaTaskResult(task_id="task", status=status, score=0.8)
+    )
+    assert (
+        arena_agent.get_response_validation_policy_for_export(
+            {}, 0.8, export_style=style
+        )
+        == "final_response"
+    )
+
+
+def test_arena_response_policy_is_explicit_and_validated(monkeypatch):
+    """The econfig opt-in is local to an Arena agent, with strict defaults."""
+    monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    econfig = {"arena_streams": [{"name": "test", "stream_id": "stream"}]}
+    for policy in [None, "artifact_reward", "unknown"]:
+        settings = dict(econfig)
+        if policy is not None:
+            settings["arena_response_validation_policy"] = policy
+        if policy == "unknown":
+            with pytest.raises(ValueError, match="Unknown response validation policy"):
+                ArenaStreamAgentWorkflow(econfig=settings)
+        else:
+            agent = ArenaStreamAgentWorkflow(econfig=settings)
+            assert agent.response_validation_policy == (policy or "final_response")
