@@ -126,7 +126,7 @@ BASELINE_SOURCE = {
 def build_cost_models(calibration_cases, settings):
     return calibrated_cost_models(settings)
 """,
-    "optimizer": """from areal.elastic.reconfigurator.reference.optimizer import OnlineOptimizer
+    "optimizer": """from areal.elastic.reconfigurator.optimizer import OnlineOptimizer
 
 def build_optimizer(settings):
     return OnlineOptimizer()

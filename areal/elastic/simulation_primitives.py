@@ -19,10 +19,10 @@ from areal.elastic.contracts import (
     ServiceView,
     nonnegative,
 )
-from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import (
+from areal.elastic.reconfigurator.evaluator.cost_model.contracts import (
     ServiceSlice,
 )
-from areal.elastic.reconfigurator.reference.evaluator.cost_model.rollout.scheduling import (
+from areal.elastic.reconfigurator.evaluator.cost_model.rollout.scheduling import (
     scheduler_for,
 )
 

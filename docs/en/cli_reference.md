@@ -77,7 +77,6 @@ For detailed examples, see the experiment configurations in the `examples/` dire
 - [DPO Configuration](section-dpo)
 - [DPOEngine Configuration](section-dpo-engine)
 - [DistributedDataParallel Configuration](section-distributed-data-parallel)
-- [Elastic Configuration](section-elastic)
 - [FP8Engine Configuration](section-fp8-engine)
 - [MegatronEngine Configuration](section-megatron-engine)
 - [MemoryProfiler Configuration](section-memory-profiler)
@@ -156,7 +155,6 @@ A dummy place holder of GRPO config for backward compatibility.
 | `eval_gconfig`       | [`GenerationHyperparameters`](section-generation-hyperparameters) \| None | `None`                      | Generation hyperparameters for evaluation. If None, use gconfig.                                                                                                                                                                                                    |
 | `rollout`            | [`InferenceEngineConfig`](section-inference-engine)                       | *InferenceEngineConfig*     | -                                                                                                                                                                                                                                                                   |
 | `actor`              | [`PPOActorConfig`](section-ppo-actor)                                     | *PPOActorConfig*            | -                                                                                                                                                                                                                                                                   |
-| `elastic`            | [`ElasticConfig`](section-elastic)                                        | *ElasticConfig*             | -                                                                                                                                                                                                                                                                   |
 | `ref`                | [`PPOActorConfig`](section-ppo-actor) \| None                             | `None`                      | -                                                                                                                                                                                                                                                                   |
 | `critic`             | [`PPOCriticConfig`](section-ppo-critic) \| None                           | `None`                      | -                                                                                                                                                                                                                                                                   |
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`                      | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
@@ -196,7 +194,6 @@ Configuration for Proximal Policy Optimization (PPO) reinforcement learning expe
 | `eval_gconfig`       | [`GenerationHyperparameters`](section-generation-hyperparameters) \| None | `None`                      | Generation hyperparameters for evaluation. If None, use gconfig.                                                                                                                                                                                                    |
 | `rollout`            | [`InferenceEngineConfig`](section-inference-engine)                       | *InferenceEngineConfig*     | -                                                                                                                                                                                                                                                                   |
 | `actor`              | [`PPOActorConfig`](section-ppo-actor)                                     | *PPOActorConfig*            | -                                                                                                                                                                                                                                                                   |
-| `elastic`            | [`ElasticConfig`](section-elastic)                                        | *ElasticConfig*             | -                                                                                                                                                                                                                                                                   |
 | `ref`                | [`PPOActorConfig`](section-ppo-actor) \| None                             | `None`                      | -                                                                                                                                                                                                                                                                   |
 | `critic`             | [`PPOCriticConfig`](section-ppo-critic) \| None                           | `None`                      | -                                                                                                                                                                                                                                                                   |
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`                      | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
@@ -1073,27 +1070,6 @@ Refer to Megatron-LM documentation for details.
 | `bucket_size`               | integer \| None | `None`  | -           |
 | `average_in_collective`     | boolean         | `False` | -           |
 | `fp8_param_gather`          | boolean         | `False` | -           |
-
-(section-elastic)=
-
-## Elastic Configuration
-
-Opt-in native reconfiguration on explicitly allocated local GPU pools.
-
-Actor and Rollout remain under Trainer ownership. The local state root stores switch
-checkpoints and application receipts; the checkpoint estimate must cover the complete
-model, optimizer and rank sidecars.
-
-| Parameter                     | Type           | Default       | Description                                                                                                             |
-| ----------------------------- | -------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `enabled`                     | boolean        | `False`       | -                                                                                                                       |
-| `reconfigurator`              | string         | `"reference"` | Complete Online reconfigurator: basic is v1; reference is the current implementation. **Choices:** `basic`, `reference` |
-| `state_root`                  | string \| None | `None`        | -                                                                                                                       |
-| `actor_devices`               | `tuple`        | `()`          | -                                                                                                                       |
-| `rollout_devices`             | `tuple`        | `()`          | -                                                                                                                       |
-| `checkpoint_keep`             | integer        | `2`           | -                                                                                                                       |
-| `checkpoint_estimated_bytes`  | integer        | `0`           | -                                                                                                                       |
-| `checkpoint_free_space_floor` | integer        | `1073741824`  | -                                                                                                                       |
 
 (section-fp8-engine)=
 

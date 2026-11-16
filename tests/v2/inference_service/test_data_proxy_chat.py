@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -527,10 +526,7 @@ async def test_start_session_wrong_admin_key(client):
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_with_session_key(
-    client, mock_areal_client, monkeypatch, tmp_path
-):
-    monkeypatch.setenv("AREAL_ROLLOUT_TRACE_DIR", str(tmp_path))
+async def test_chat_completions_with_session_key(client, mock_areal_client):
     # Start session first
     resp = await client.post(
         "/rl/start_session",
@@ -553,15 +549,6 @@ async def test_chat_completions_with_session_key(
     assert data["object"] == "chat.completion"
     assert data["choices"][0]["message"]["content"] == "Hello!"
     mock_areal_client.chat.completions.create.assert_called_once()
-    rows = [
-        json.loads(line)
-        for path in tmp_path.glob("model-calls-*.jsonl")
-        for line in path.read_text().splitlines()
-    ]
-    assert len(rows) == 1 and rows[0]["status"] == "completed"
-    assert rows[0]["session_id"] and rows[0]["incarnation_id"]
-    assert rows[0]["admission_wait_seconds"] >= 0
-    assert "armed_monotonic" not in rows[0]
 
 
 @pytest.mark.asyncio
@@ -1053,10 +1040,7 @@ async def test_batch_session_produces_single_trajectory(client):
 
 
 @pytest.mark.asyncio
-async def test_batch_online_set_reward_completes_that_session(
-    client, monkeypatch, tmp_path
-):
-    monkeypatch.setenv("AREAL_ROLLOUT_TRACE_DIR", str(tmp_path))
+async def test_batch_online_set_reward_completes_that_session(client):
     start = await client.post(
         "/rl/start_session",
         json={"task_id": "batch-complete"},
@@ -1088,23 +1072,6 @@ async def test_batch_online_set_reward_completes_that_session(
     )
     assert export_resp.status_code == 200
     assert "traj" in export_resp.json()
-    rows = [
-        json.loads(line)
-        for path in tmp_path.glob("exported-workloads-*.jsonl")
-        for line in path.read_text().splitlines()
-    ]
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["sources"][0]["session_id"] == session_id
-    assert row["sources"][0]["trajectory_id"] == 0
-    assert row["interaction_ids"] == ["chatcmpl-test0"]
-    assert row["workload"]["sequence_lengths"] == [6]
-    assert row["workload"]["sequence_tokens"] == 6
-    assert row["workload"]["loss_tokens"] == 3
-    from areal.elastic.contracts import WorkloadStats
-
-    assert WorkloadStats(**row["workload"]).n_seqs == 1
-    assert session_api_key not in json.dumps(row)
 
 
 @pytest.mark.asyncio
@@ -1664,232 +1631,3 @@ async def test_full_session_lifecycle(client, mock_areal_client):
     assert resp.status_code == 200
     data = resp.json()
     assert "interactions" in data
-
-
-class TestRetainedTrajectory:
-    @staticmethod
-    def ready_session():
-        from areal.v2.inference_service.data_proxy.session import ReadyTrajectory
-
-        session = SessionData("retained-session")
-        from areal.experimental.openai.types import InteractionWithTokenLogpReward
-
-        completions = MagicMock()
-        completions.snapshot.return_value = completions
-        completions.export_interactions.return_value = {
-            "interaction": InteractionWithTokenLogpReward(reward=1.0)
-        }
-        session._ready_trajectories[0] = ReadyTrajectory(
-            trajectory_id=0,
-            interaction_id="interaction",
-            completions=completions,
-            created_at=time.time(),
-        )
-        return session, completions
-
-    def test_repeated_peek_keeps_source_until_idempotent_ack(self):
-        session, cache = self.ready_session()
-        first = session.export_trajectory(
-            1.0, "individual", trajectory_id=0, consume=False
-        )
-        second = session.export_trajectory(
-            1.0, "individual", trajectory_id=0, consume=False
-        )
-
-        assert first == second
-        assert session.has_ready_trajectories
-        cache.export_interactions.assert_called_once()
-        session.acknowledge_trajectory(0)
-        session.acknowledge_trajectory(0)
-        assert not session.has_ready_trajectories
-
-    def test_failed_export_keeps_source_available_for_retry(self):
-        session, cache = self.ready_session()
-        cache.export_interactions.side_effect = RuntimeError("materialization failed")
-        with pytest.raises(RuntimeError, match="materialization failed"):
-            session.export_trajectory(1.0, "individual")
-        assert session.has_ready_trajectories
-
-        cache.export_interactions.side_effect = None
-        session.export_trajectory(1.0, "individual", consume=False)
-        session.acknowledge_trajectory(0)
-        assert not session.has_ready_trajectories
-
-    def test_ack_cannot_discard_unexported_or_unknown_trajectory(self):
-        session, _ = self.ready_session()
-        with pytest.raises(ValueError, match="before exporting"):
-            session.acknowledge_trajectory(0)
-        with pytest.raises(KeyError):
-            session.acknowledge_trajectory(1)
-        assert session.has_ready_trajectories
-
-    def test_peek_retry_cannot_change_reward_export_options(self):
-        session, cache = self.ready_session()
-        session.export_trajectory(1.0, "individual", consume=False)
-        with pytest.raises(ValueError, match="same export options"):
-            session.export_trajectory(0.5, "individual", consume=False)
-        cache.export_interactions.assert_called_once()
-
-    def test_failed_concat_export_does_not_mutate_source_discount(self):
-        import torch
-
-        from areal.experimental.openai.types import InteractionWithTokenLogpReward
-        from areal.v2.inference_service.data_proxy.session import ReadyTrajectory
-
-        session = SessionData("failed-export")
-        cache = session.active_completions
-        for key, reward in (("first", 0.0), ("last", 2.0)):
-            interaction = InteractionWithTokenLogpReward(
-                reward=reward,
-                output_message_list=[{"role": "assistant", "content": key}],
-            )
-            interaction.interaction_id = key
-            interaction._cache = {"rewards": torch.tensor([reward])}
-            cache[key] = interaction
-        session._ready_trajectories[0] = ReadyTrajectory(0, "last", cache, time.time())
-        with pytest.raises(ValueError, match="chat_template_type"):
-            session.export_trajectory(0.5, "concat", consume=False)
-        assert cache["first"].reward == 0.0
-        assert cache._apply_reward_discount_called is False
-
-        _, exported = session.export_trajectory(0.25, "individual", consume=False)
-        assert exported["first"].reward == 0.5
-        torch.testing.assert_close(
-            exported["first"]._cache["rewards"], torch.tensor([0.5]), rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            cache["first"]._cache["rewards"], torch.tensor([0.0]), rtol=0, atol=0
-        )
-        exported["first"].reward = 999
-        _, retry = session.export_trajectory(0.25, "individual", consume=False)
-        assert retry["first"].reward == 0.5
-
-
-@pytest.mark.asyncio
-async def test_resource_drain_rebind_preserves_session_and_sampling(
-    config, mock_tokenizer, mock_areal_client, monkeypatch
-):
-    import asyncio
-
-    from areal.v2.inference_service.data_proxy import app as proxy_app
-    from areal.v2.inference_service.data_proxy.pause import PauseState
-
-    config.deterministic_sampling = True
-    app = create_app(config)
-    store = SessionStore()
-    store.set_admin_key(config.admin_api_key)
-    session_id, key = store.start_session("retained")
-    session = store.get_session(session_id)
-    app.state.session_store, app.state.config = store, config
-    app.state.tokenizer, app.state.pause_state = mock_tokenizer, PauseState()
-    app.state.version = 7
-    old_bridge = MagicMock(aclose=AsyncMock())
-    app.state.inf_bridge = old_bridge
-    app.state.areal_client = mock_areal_client
-    entered, finish = asyncio.Event(), asyncio.Event()
-    old_create = mock_areal_client.chat.completions.create.side_effect
-
-    async def slow_create(**kwargs):
-        entered.set()
-        await finish.wait()
-        return await old_create(**kwargs)
-
-    mock_areal_client.chat.completions.create.side_effect = slow_create
-    new_client = MagicMock()
-    new_client.chat.completions.create = AsyncMock(side_effect=old_create)
-    new_bridge = MagicMock(aclose=AsyncMock())
-    monkeypatch.setattr(proxy_app, "_create_inf_bridge", lambda *args: new_bridge)
-    monkeypatch.setattr(proxy_app, "_create_areal_client", lambda *args: new_client)
-    body = {"model": "math", "messages": [{"role": "user", "content": "1+1?"}]}
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        first = asyncio.create_task(
-            client.post("/chat/completions", headers=session_headers(key), json=body)
-        )
-        await entered.wait()
-        drain = asyncio.create_task(
-            client.post(
-                "/reconfiguration/drain", headers=admin_headers(), json={"timeout": 5}
-            )
-        )
-        await asyncio.sleep(0)
-        assert app.state.generation_gate.closed and not drain.done()
-        second = asyncio.create_task(
-            client.post("/chat/completions", headers=session_headers(key), json=body)
-        )
-        await asyncio.sleep(0)
-        finish.set()
-        assert (await first).status_code == 200
-        assert (await drain).json() == {"status": "drained", "active": 0}
-        assert not second.done()
-        assert session._next_sampling_request_index == 1
-        response = await client.post(
-            "/configure_backend",
-            headers=admin_headers(),
-            json={"backend_addr": "http://new-backend"},
-        )
-        assert response.status_code == 200
-        new_bridge.set_version.assert_called_once_with(7)
-        old_bridge.aclose.assert_awaited_once()
-        armed = await client.post(
-            "/reconfiguration/observe",
-            headers=admin_headers(),
-            json={"transition_id": "resume-normal"},
-        )
-        assert armed.json()["status"] == "armed"
-        await client.post("/reconfiguration/open", headers=admin_headers())
-        assert (await second).status_code == 200
-        metrics = (
-            await client.get("/reconfiguration/metrics", headers=admin_headers())
-        ).json()
-        assert metrics["first_call"]["transition_id"] == "resume-normal"
-        assert metrics["first_call"]["status"] == "completed"
-        assert metrics["first_call"]["admitted_to_response_seconds"] >= 0
-        assert metrics["first_call"]["admission_wait_seconds"] >= 0
-    assert store.get_session_by_api_key(key) is session
-    assert session._next_sampling_request_index == 2
-    assert len(session.active_completions) == 2
-    assert mock_areal_client.chat.completions.create.await_count == 1
-    assert new_client.chat.completions.create.await_count == 1
-    assert app.state.generation_gate.active == 0
-
-
-@pytest.mark.asyncio
-async def test_resource_drain_waits_for_admin_stream_completion(config):
-    import asyncio
-
-    app = create_app(config)
-    store = SessionStore()
-    store.set_admin_key(config.admin_api_key)
-    app.state.session_store = store
-    entered, finish = asyncio.Event(), asyncio.Event()
-
-    async def chunks():
-        entered.set()
-        await finish.wait()
-        yield MagicMock(model_dump_json=lambda: '{"choices":[]}')
-
-    app.state.areal_client = MagicMock()
-    app.state.areal_client.chat.completions.create = AsyncMock(return_value=chunks())
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        stream = asyncio.create_task(
-            client.post(
-                "/chat/completions",
-                headers=admin_headers(),
-                json={"model": "math", "messages": [], "stream": True},
-            )
-        )
-        await entered.wait()
-        drain = asyncio.create_task(
-            client.post(
-                "/reconfiguration/drain", headers=admin_headers(), json={"timeout": 5}
-            )
-        )
-        await asyncio.sleep(0)
-        assert app.state.generation_gate.active == 1 and not drain.done()
-        finish.set()
-        assert (await stream).status_code == 200
-        assert (await drain).json() == {"status": "drained", "active": 0}

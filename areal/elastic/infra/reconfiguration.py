@@ -528,7 +528,7 @@ class ReconfigurationExecutor:
 class TrainerReconfiguration:
     """Execute layout changes against Trainer-owned engines and live data services.
 
-    This object owns the transition journal and full switch checkpoints only.
+    This object owns the transition journal, switch checkpoints and monitor bindings.
     It neither consumes batches nor advances training, publication or save schedules.
     CPU coordinator restart/replay is outside this execution contract.
     """
@@ -585,6 +585,17 @@ class TrainerReconfiguration:
         )
         self.reconfiguration_application = ConfigApplication(
             ReconfigurationExecutor(self), self.root / "resource-reconfiguration"
+        )
+
+    def bind_reconfigurator(self, adapter) -> None:
+        from .monitor.collector import TrainerMonitor
+
+        self.monitor = TrainerMonitor(self)
+        self.reconfigurator_adapter = adapter
+        adapter.bind(self)
+        self.rollout.configure_control_callbacks(
+            on_wait=self.trainer._poll_reconfigurator,
+            on_trajectory=self.monitor.record_trajectory,
         )
 
     @property

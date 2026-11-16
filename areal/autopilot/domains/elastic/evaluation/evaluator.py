@@ -21,10 +21,10 @@ from areal.autopilot.domains.elastic.versions import protected_files
 from areal.autopilot.revision.contracts import RevisionReport, digest, source_digest
 from areal.autopilot.revision.execution import load_source
 from areal.elastic.contracts import ExecutionConfig, OnlineLayout, Turn
-from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import (
+from areal.elastic.reconfigurator.evaluator.cost_model.contracts import (
     ServiceSlice,
 )
-from areal.elastic.reconfigurator.reference.evaluator.cost_model.loader import (
+from areal.elastic.reconfigurator.evaluator.cost_model.loader import (
     CalibratedCostModels,
 )
 from areal.utils.atomic import atomic_json

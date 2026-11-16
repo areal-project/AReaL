@@ -525,7 +525,6 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     async def _create_internal_chat_result_ungated(
         body_json: dict[str, Any],
         session: SessionData | None,
-        episode: Any = None,
     ) -> tuple[Any, bool]:
         areal_client: ArealOpenAI | None = app.state.areal_client
         if areal_client is None:
@@ -582,17 +581,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         gate = app.state.generation_gate
         received = time.monotonic()
         await gate.acquire()
-        observation = app.state.resume_observation.claim(received)
         collect = bool(os.environ.get("AREAL_ROLLOUT_TRACE_DIR"))
-        if collect and observation is None:
-            admitted = time.monotonic()
-            observation = {
-                "received_monotonic": received,
-                "admitted_monotonic": admitted,
-                "admission_wait_seconds": admitted - received,
-                "backend_attempts": [],
-                "status": "running",
-            }
+        observation = app.state.resume_observation.claim(received, collect=collect)
         if collect:
             observation.update(
                 session_id=None if session is None else session.session_id,
@@ -606,7 +596,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             # Resolve the bridge only after admission: queued calls must use the
             # replacement backend and retain their original session/cache.
             result, streaming = await _create_internal_chat_result_ungated(
-                body_json, session, episode
+                body_json, session
             )
             if observation is not None:
                 ready = time.monotonic()

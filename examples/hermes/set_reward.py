@@ -103,11 +103,7 @@ def main() -> None:
         default=None,
         help="Specific interaction ID (default: last interaction)",
     )
-    parser.add_argument("--incarnation-id", help="On-demand session incarnation")
-    parser.add_argument("--trajectory-id", type=int, help="On-demand episode number")
     args = parser.parse_args()
-    if (args.incarnation_id is None) != (args.trajectory_id is None):
-        parser.error("--incarnation-id and --trajectory-id must be supplied together")
 
     header("Set Reward")
     info(f"Assigning reward={args.reward} to the last interaction.")
@@ -116,11 +112,6 @@ def main() -> None:
     reward_body: dict = {"reward": args.reward}
     if args.interaction_id is not None:
         reward_body["interaction_id"] = args.interaction_id
-    if args.incarnation_id is not None:
-        reward_body["areal_episode"] = {
-            "incarnation_id": args.incarnation_id,
-            "trajectory_id": args.trajectory_id,
-        }
 
     dim(f"Request body: {json.dumps(reward_body)}")
 

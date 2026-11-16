@@ -164,13 +164,6 @@ def main() -> None:
     success("Session started!")
     arrow(f"Session ID : {BOLD}{session_id}{RESET}")
     arrow(f"API Key    : {BOLD}{session_api_key}{RESET}")
-    episode = session.get("areal_episode")
-    episode_args = (
-        f" --incarnation-id {episode['incarnation_id']}"
-        f" --trajectory-id {episode['trajectory_id']}"
-        if episode
-        else ""
-    )
     print()
     info("Forward this key to the Hermes Agent Service to capture the trajectory:")
     print()
@@ -179,7 +172,6 @@ def main() -> None:
         f" --admin-api-key <agent-admin-key>"
         f" --inf-base-url {args.gateway_url}"
         f" --session-api-key {session_api_key}"
-        f"{episode_args}"
     )
     print()
     info("Then score the episode with the same key:")
@@ -187,23 +179,14 @@ def main() -> None:
     print(
         f"  python set_reward.py {args.gateway_url}"
         f" --api-key {session_api_key} --reward 1.0"
-        f"{episode_args}"
     )
     print()
-    if episode:
-        info(
-            "After scoring or confirmed abort, read /rl/current_episode with the same session key."
-        )
-        info(
-            "Use its new trajectory_id for the next episode; keep every retry's original identity."
-        )
-    else:
-        info("To start the next episode reusing the same key:")
-        print()
-        print(
-            f"  python start_session.py {args.gateway_url}"
-            f" --admin-key {args.admin_key} --api-key {session_api_key}"
-        )
+    info("To start the next episode reusing the same key:")
+    print()
+    print(
+        f"  python start_session.py {args.gateway_url}"
+        f" --admin-key {args.admin_key} --api-key {session_api_key}"
+    )
     print()
 
     # Machine-readable output on stderr for scripting

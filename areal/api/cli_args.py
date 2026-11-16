@@ -3406,8 +3406,8 @@ class ElasticConfig:
     reconfigurator: str = field(
         default="reference",
         metadata={
-            "help": "Complete Online reconfigurator: basic is v1; reference is the current implementation.",
-            "choices": ["basic", "reference"],
+            "help": "Reference Online reconfigurator.",
+            "choices": ["reference"],
         },
     )
     state_root: str | None = None
@@ -3418,8 +3418,8 @@ class ElasticConfig:
     checkpoint_free_space_floor: int = 1 << 30
 
     def __post_init__(self) -> None:
-        if self.reconfigurator not in ("basic", "reference"):
-            raise ValueError("elastic.reconfigurator must be basic or reference")
+        if self.reconfigurator != "reference":
+            raise ValueError("elastic.reconfigurator must be reference")
         if self.checkpoint_keep < 1 or self.checkpoint_free_space_floor < 0:
             raise ValueError("Invalid checkpoint retention or space floor")
         if self.enabled:

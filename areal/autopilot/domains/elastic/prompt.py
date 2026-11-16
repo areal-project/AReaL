@@ -39,7 +39,7 @@ def proposal_context(target, *, workload_change=None, objective=None):
             "costs, query limits and acceptance; reduce cost and Evaluator queries at the fixed horizon."
         )
         reference_files += [
-            "elastic/reconfigurator/reference/optimizer.py",
+            "elastic/reconfigurator/optimizer.py",
             "autopilot/domains/elastic/evaluation/optimizer.py",
         ]
     else:

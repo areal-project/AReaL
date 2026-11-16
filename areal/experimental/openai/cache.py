@@ -538,10 +538,7 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
                 for id, interaction in complete_cache.items()
                 if id not in has_children
             }
-        elif style == "individual":
-            return dict(**complete_cache)
-        else:
-            raise ValueError(f"Invalid export interactions style {style}")
+        return dict(**complete_cache)
 
 
 def copy_interactions(

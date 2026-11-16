@@ -171,16 +171,6 @@ class NativeControlEnvironment:
                 controller.poll()
             elif kind == "search_complete":
                 controller.complete(data)
-            elif (
-                self.reconfigurator.implementation == "basic"
-                and kind == "verification_complete"
-            ):
-                controller.verified(data)
-            elif (
-                self.reconfigurator.implementation == "basic"
-                and kind == "decision_ready"
-            ):
-                controller.ready(data)
             else:
                 raise ValueError(f"Unknown native Online event: {kind}")
             clock = self.adapter.observations.now()

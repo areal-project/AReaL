@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Observe the first admitted model call after a reconfiguration marker."""
+"""Track request observations and the first call after reconfiguration."""
 
 import time
 from contextvars import ContextVar
@@ -23,19 +23,22 @@ class ResumeObservation:
         }
         self.first_call = None
 
-    def claim(self, received: float) -> dict | None:
-        if self.marker is None or self.first_call is not None:
+    def claim(self, received: float, *, collect: bool = False) -> dict | None:
+        first = self.marker is not None and self.first_call is None
+        if not first and not collect:
             return None
         admitted = time.monotonic()
-        self.first_call = {
-            **self.marker,
+        observation = {
             "received_monotonic": received,
             "admitted_monotonic": admitted,
             "admission_wait_seconds": admitted - received,
             "status": "running",
             "backend_attempts": [],
         }
-        return self.first_call
+        if first:
+            observation.update(self.marker)
+            self.first_call = observation
+        return observation
 
     def snapshot(self) -> dict:
         return {"marker": self.marker, "first_call": self.first_call}

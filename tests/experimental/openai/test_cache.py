@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-
-import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -8,6 +5,8 @@ import torch
 from openai.types.responses.response import Response
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_text import ResponseOutputText
+
+from tests.utils import get_model_path
 
 from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
@@ -17,10 +16,6 @@ from areal.utils.hf_utils import load_hf_tokenizer
 @pytest.fixture(scope="module")
 def tokenizer():
     """Load the tokenizer once for all tests in this module."""
-    if local_path := os.getenv("AREAL_TEST_TOKENIZER_PATH"):
-        return load_hf_tokenizer(local_path)
-    from tests.utils import get_model_path
-
     return load_hf_tokenizer(
         get_model_path("/storage/openpsi/models/Qwen__Qwen3-0.6B", "Qwen/Qwen3-0.6B")
     )

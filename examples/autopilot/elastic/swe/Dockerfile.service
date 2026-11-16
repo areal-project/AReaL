@@ -1,5 +1,0 @@
-ARG BASE_IMAGE=busybox:1.37.0
-FROM ${BASE_IMAGE}
-ARG COMPONENT
-COPY ${COMPONENT} /usr/bin/service
-ENTRYPOINT ["/usr/bin/service"]

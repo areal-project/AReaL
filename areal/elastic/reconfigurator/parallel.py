@@ -30,28 +30,20 @@ def evaluate_chunk(job):
     global _cost_models, _identity, _search
     payload, indexed = job
     implementation, payload = payload[0], payload[1:]
-    if implementation not in {"basic", "reference"}:
+    if implementation != "reference":
         raise ValueError("Unknown reconfigurator implementation")
     module = component_module(implementation, "evaluator")
-    Evaluator = (
-        module.Evaluator if implementation == "reference" else module.JointEvaluator
-    )
+    Evaluator = module.Evaluator
     CalibratedCostModels = component_module(
         implementation, "cost_models"
     ).CalibratedCostModels
     spec, expected, config, handoff, slo, delay, prune = payload[:7]
-    if implementation == "basic":
-        coalesce, view, forecasts = payload[7:10]
-        options = payload[10:]
-        legacy = (coalesce,)
-    else:
-        view, forecasts = payload[7:9]
-        options = payload[9:]
-        legacy = ()
+    view, forecasts = payload[7:9]
+    options = payload[9:]
     identity = implementation, spec, expected
     if identity != _identity:
         if spec[0] == "analytical":
-            from areal.elastic.reconfigurator.reference.evaluator.cost_model.loader import (
+            from areal.elastic.reconfigurator.evaluator.cost_model.loader import (
                 AnalyticalCostModels,
                 Catalog,
             )
@@ -90,7 +82,6 @@ def evaluate_chunk(job):
         slo,
         delay,
         prune,
-        legacy,
         context,
         reserve,
         scope,
@@ -103,11 +94,8 @@ def evaluate_chunk(job):
             slo,
             delay,
             prune_irreversible_slo=prune,
-            **(
-                dict(actor_memory_reserve_fraction=reserve, actor_memory_scope=scope)
-                if implementation == "reference"
-                else dict(coalesce_decode=coalesce)
-            ),
+            actor_memory_reserve_fraction=reserve,
+            actor_memory_scope=scope,
         )
         if context is not None:
             # Keep the first immutable DTOs for this content identity. Repeated

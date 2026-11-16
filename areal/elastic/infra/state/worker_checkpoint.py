@@ -1,0 +1,361 @@
+# SPDX-License-Identifier: Apache-2.0
+
+"""Full checkpoint sidecars, with explicit fixed-TP Megatron DP migration."""
+
+from __future__ import annotations
+
+import json
+import os
+import random
+import sys
+from pathlib import Path
+from typing import Any, Literal
+
+from areal.utils.atomic import atomic_json, recovery_digest
+
+Backend = Literal["megatron"]
+
+
+def capture_runtime_state(engine: Any) -> dict[str, Any]:
+    import numpy as np
+    import torch
+
+    np_state = np.random.get_state()
+    seeding = sys.modules.get("areal.utils.seeding")
+    return {
+        "format_version": 1,
+        "rank": engine.rank,
+        "world_size": engine.world_size,
+        "policy_version": engine.get_version(),
+        "lr_scheduler": engine.lr_scheduler.state_dict(),
+        "python_rng": random.getstate(),
+        "numpy_rng": [np_state[0], np_state[1].tolist(), *np_state[2:]],
+        "torch_rng": torch.get_rng_state().tolist(),
+        "cuda_rng": (
+            torch.cuda.get_rng_state(engine.device).cpu().tolist()
+            if engine.device.type == "cuda"
+            else None
+        ),
+        "seed_state": None
+        if seeding is None
+        else {
+            "seed": seeding._SEED,
+            "base_seed": seeding._BASE_SEED,
+            "shuffler": None
+            if seeding._SHUFFLER is None
+            else vars(seeding._SHUFFLER).copy(),
+        },
+        # Preserve the null field in existing Megatron sidecar digests.
+        "dtensor_rng": None,
+    }
+
+
+def restore_random_state(engine: Any, state: dict[str, Any]) -> None:
+    """Restore per-rank RNG without assuming a backend's scheduler interface."""
+    import numpy as np
+    import torch
+
+    if (state["rank"], state["world_size"]) != (engine.rank, engine.world_size):
+        raise ValueError("Runtime state rank/world size mismatch")
+    needs_cuda = engine.device.type == "cuda"
+    if needs_cuda != (state["cuda_rng"] is not None):
+        raise ValueError("Runtime state device type mismatch")
+    py_state = state["python_rng"]
+    random.setstate((py_state[0], tuple(py_state[1]), py_state[2]))
+    np_state = state["numpy_rng"]
+    np.random.set_state(
+        (np_state[0], np.asarray(np_state[1], dtype=np.uint32), *np_state[2:])
+    )
+    torch.set_rng_state(torch.tensor(state["torch_rng"], dtype=torch.uint8))
+    if needs_cuda:
+        torch.cuda.set_rng_state(
+            torch.tensor(state["cuda_rng"], dtype=torch.uint8), engine.device
+        )
+    if state.get("seed_state") is not None:
+        from areal.utils import seeding
+
+        metadata = state["seed_state"]
+        seeding._SEED, seeding._BASE_SEED = metadata["seed"], metadata["base_seed"]
+        seeding._SHUFFLER = None
+        if metadata["shuffler"] is not None:
+            seeding._SHUFFLER = seeding.Shuffler()
+            vars(seeding._SHUFFLER).update(metadata["shuffler"])
+
+
+def _load_runtime(
+    engine: Any, root: Path, source_world_size: int | None
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Map DP coordinates while preserving TP; never copy optimizer shards here."""
+    if source_world_size is None or source_world_size == engine.world_size:
+        return json.loads((root / f"runtime-{engine.rank}.json").read_text()), None
+    from areal.api.alloc_mode import ModelAllocation
+
+    layout = json.loads((root / "actor-layout.json").read_text())
+    allocation = ModelAllocation.from_str(layout["backend"])
+    source = allocation.parallel
+    target = engine.parallel_strategy
+    if (
+        allocation.backend != "megatron"
+        or type(source_world_size) is not int
+        or source_world_size < 1
+        or layout["world_size"] != source_world_size
+        or source.world_size != source_world_size
+        or target.world_size != engine.world_size
+        or source.tp_size != target.tp_size
+        or any(
+            getattr(parallel, dimension) != 1
+            for parallel in (source, target)
+            for dimension in ("pp_size", "cp_size", "ep_size", "etp_size")
+        )
+    ):
+        raise ValueError("Checkpoint migration supports only DP changes with fixed TP")
+    source_rank = engine.rank % source_world_size
+    state = json.loads((root / f"runtime-{source_rank}.json").read_text())
+    if (state["rank"], state["world_size"]) != (source_rank, source_world_size):
+        raise ValueError("Source runtime does not match the saved DP layout")
+    # Every source rank must agree on the global scheduler/version contract,
+    # including ranks that disappear on shrink. Rank-local RNG is mapped below.
+    common = (
+        "format_version",
+        "policy_version",
+        "backend",
+        "identity_sha256",
+        "lr_scheduler",
+        "optimizer_group_lrs",
+    )
+    for rank in range(source_world_size):
+        peer = json.loads((root / f"runtime-{rank}.json").read_text())
+        if (peer["rank"], peer["world_size"]) != (rank, source_world_size) or any(
+            peer.get(key) != state.get(key) for key in common
+        ):
+            raise ValueError("Source ranks disagree on the checkpoint training state")
+    migration = {
+        "source_rank": source_rank,
+        "source_world_size": source_world_size,
+        "source_state_sha256": recovery_digest(state),
+        "rng_policy": "dp-coordinate-modulo-v1",
+    }
+    return {**state, "rank": engine.rank, "world_size": engine.world_size}, migration
+
+
+def _tracker() -> Any:
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+
+    return get_cuda_rng_tracker()
+
+
+def _capture(engine: Any, backend: Backend, identity_sha256: str) -> dict[str, Any]:
+    state = capture_runtime_state(engine)
+    state.update(
+        backend=backend,
+        identity_sha256=identity_sha256,
+        optimizer_group_lrs=[group["lr"] for group in engine.optimizer.param_groups],
+    )
+    if backend == "megatron":
+        state["megatron_rng_tracker"] = {
+            name: value.cpu().tolist()
+            for name, value in _tracker().get_states().items()
+        }
+    return state
+
+
+def _restore_rng(engine: Any, state: dict[str, Any]) -> None:
+    restore_random_state(engine, state)
+    if state["backend"] == "megatron":
+        import torch
+
+        _tracker().set_states(
+            {
+                name: torch.tensor(value, dtype=torch.uint8)
+                for name, value in state["megatron_rng_tracker"].items()
+            }
+        )
+
+
+def _report(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **{
+            key: state[key]
+            for key in (
+                "rank",
+                "world_size",
+                "policy_version",
+                "backend",
+                "identity_sha256",
+            )
+        },
+        "state_sha256": recovery_digest(state),
+        "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+    }
+
+
+def _validate_payload(root: Path, backend: Backend) -> None:
+    if not (root / "dcp" / ".metadata").is_file():
+        raise ValueError("Checkpoint has no finalized DCP metadata")
+    if backend == "megatron":
+        marker = root / "dcp" / "metadata.json"
+        if not marker.is_file() or not (root / "dcp" / "common.pt").is_file():
+            raise ValueError("Megatron checkpoint has not finished finalization")
+        metadata = json.loads(marker.read_text())
+        if (
+            metadata.get("sharded_backend"),
+            metadata.get("sharded_backend_version"),
+            metadata.get("common_backend"),
+            metadata.get("common_backend_version"),
+        ) != ("torch_dist", 1, "torch", 1):
+            raise ValueError("Unsupported Megatron checkpoint serialization format")
+
+
+def inspect_full_checkpoint(
+    engine: Any,
+    *,
+    path: str,
+    backend: Backend,
+    identity_sha256: str,
+    version: int,
+    loading: bool = False,
+    source_world_size: int | None = None,
+) -> dict[str, Any]:
+    """Collective-free preflight; every rank must pass before any rank loads."""
+    if backend != "megatron" or type(version) is not int or version < 1:
+        raise ValueError(
+            "Full checkpoint requires a supported backend and positive version"
+        )
+    if len(identity_sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in identity_sha256
+    ):
+        raise ValueError("Checkpoint identity must be a SHA256 digest")
+    root = Path(path)
+    if not root.is_absolute() or not root.is_dir():
+        raise ValueError("Checkpoint root must be an existing absolute directory")
+    if engine.optimizer is None or engine.lr_scheduler is None:
+        raise ValueError("Full recovery requires optimizer and scheduler state")
+    if backend == "megatron":
+        if (
+            engine.checkpointer is None
+            or not engine.mcore_config.use_checkpoint_opt_param_scheduler
+        ):
+            raise ValueError(
+                "Megatron requires full distributed optimizer/scheduler checkpoint support"
+            )
+    if loading:
+        state, migration = _load_runtime(engine, root, source_world_size)
+        if (
+            state.get("format_version"),
+            state.get("rank"),
+            state.get("world_size"),
+            state.get("policy_version"),
+            state.get("backend"),
+            state.get("identity_sha256"),
+        ) != (1, engine.rank, engine.world_size, version, backend, identity_sha256):
+            raise ValueError("Checkpoint runtime identity does not match this worker")
+        _validate_payload(root, backend)
+        for key in (
+            "lr_scheduler",
+            "optimizer_group_lrs",
+            "python_rng",
+            "numpy_rng",
+            "torch_rng",
+            "cuda_rng",
+        ):
+            if key not in state:
+                raise ValueError(f"Checkpoint is missing {key}")
+        if backend == "megatron" and "megatron_rng_tracker" not in state:
+            raise ValueError("Checkpoint is missing Megatron RNG tracker state")
+        if (engine.device.type == "cuda") != (state["cuda_rng"] is not None):
+            raise ValueError("Checkpoint device type does not match this worker")
+    else:
+        # MCore expects the shared directory to exist before entering any
+        # save collectives. Every rank performs this collective-free preflight.
+        (root / "dcp").mkdir(exist_ok=True)
+        if engine.get_version() != version:
+            raise ValueError("Worker version does not match the checkpoint update")
+        state = _capture(engine, backend, identity_sha256)
+    report = _report(state)
+    if loading and migration is not None:
+        report["migration"] = migration
+    return report
+
+
+def save_full_checkpoint(
+    engine: Any,
+    *,
+    path: str,
+    backend: Backend,
+    identity_sha256: str,
+    version: int,
+) -> dict[str, Any]:
+    from areal.api.io_struct import SaveLoadMeta
+
+    inspect_full_checkpoint(
+        engine,
+        path=path,
+        backend=backend,
+        identity_sha256=identity_sha256,
+        version=version,
+    )
+    state = _capture(engine, backend, identity_sha256)
+    engine.save(
+        SaveLoadMeta(path=str(Path(path) / "dcp"), weight_format="dcp", with_optim=True)
+    )
+    if backend == "megatron":
+        # The finalize operation includes collectives, even on a rank with no
+        # locally pending writes. Never condition it on local queue depth.
+        engine.checkpointer.wait_async_saves()
+    _validate_payload(Path(path), backend)
+    _restore_rng(engine, state)
+    atomic_json(Path(path) / f"runtime-{engine.rank}.json", state)
+    return _report(state)
+
+
+def load_full_checkpoint(
+    engine: Any,
+    *,
+    path: str,
+    backend: Backend,
+    identity_sha256: str,
+    version: int,
+    source_world_size: int | None = None,
+) -> dict[str, Any]:
+    from areal.api.io_struct import SaveLoadMeta
+
+    inspect_full_checkpoint(
+        engine,
+        path=path,
+        backend=backend,
+        identity_sha256=identity_sha256,
+        version=version,
+        loading=True,
+        source_world_size=source_world_size,
+    )
+    state, migration = _load_runtime(engine, Path(path), source_world_size)
+    engine.load(
+        SaveLoadMeta(path=str(Path(path) / "dcp"), weight_format="dcp", with_optim=True)
+    )
+    # MCore DCP restores the scheduler; applying a sidecar scheduler twice
+    # would double its progress. The digest below verifies the loaded state.
+    engine.set_version(version)
+    if [group["lr"] for group in engine.optimizer.param_groups] != state[
+        "optimizer_group_lrs"
+    ]:
+        raise ValueError("Restored optimizer learning rates disagree with checkpoint")
+    _restore_rng(engine, state)
+    # Optional RNG metadata was added without invalidating legacy sidecars.
+    # Compare/report exactly the fields that were validated in the preflight.
+    captured = _capture(engine, backend, identity_sha256)
+    actual = {key: captured[key] for key in state}
+    if recovery_digest(actual) != recovery_digest(state):
+        different_fields = sorted(
+            key
+            for key in state.keys() | actual.keys()
+            if recovery_digest({key: state.get(key)})
+            != recovery_digest({key: actual.get(key)})
+        )
+        raise ValueError(
+            "Full checkpoint runtime state was not restored exactly: "
+            + ", ".join(different_fields)
+        )
+    report = _report(actual)
+    if migration is not None:
+        report["migration"] = migration
+    return report

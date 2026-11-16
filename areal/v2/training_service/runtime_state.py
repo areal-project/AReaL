@@ -1,73 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Per-rank scheduler, version and RNG state for native training checkpoints."""
+"""Compatibility imports for Elastic checkpoint runtime state."""
 
-import random
-import sys
-from typing import Any
-
-
-def capture_runtime_state(engine: Any) -> dict[str, Any]:
-    import numpy as np
-    import torch
-
-    np_state = np.random.get_state()
-    seeding = sys.modules.get("areal.utils.seeding")
-    return {
-        "format_version": 1,
-        "rank": engine.rank,
-        "world_size": engine.world_size,
-        "policy_version": engine.get_version(),
-        "lr_scheduler": engine.lr_scheduler.state_dict(),
-        "python_rng": random.getstate(),
-        "numpy_rng": [np_state[0], np_state[1].tolist(), *np_state[2:]],
-        "torch_rng": torch.get_rng_state().tolist(),
-        "cuda_rng": (
-            torch.cuda.get_rng_state(engine.device).cpu().tolist()
-            if engine.device.type == "cuda"
-            else None
-        ),
-        "seed_state": None
-        if seeding is None
-        else {
-            "seed": seeding._SEED,
-            "base_seed": seeding._BASE_SEED,
-            "shuffler": None
-            if seeding._SHUFFLER is None
-            else vars(seeding._SHUFFLER).copy(),
-        },
-        # Preserve the null field in existing Megatron sidecar digests.
-        "dtensor_rng": None,
-    }
-
-
-def restore_random_state(engine: Any, state: dict[str, Any]) -> None:
-    """Restore per-rank RNG without assuming a backend's scheduler interface."""
-    import numpy as np
-    import torch
-
-    if (state["rank"], state["world_size"]) != (engine.rank, engine.world_size):
-        raise ValueError("Runtime state rank/world size mismatch")
-    needs_cuda = engine.device.type == "cuda"
-    if needs_cuda != (state["cuda_rng"] is not None):
-        raise ValueError("Runtime state device type mismatch")
-    py_state = state["python_rng"]
-    random.setstate((py_state[0], tuple(py_state[1]), py_state[2]))
-    np_state = state["numpy_rng"]
-    np.random.set_state(
-        (np_state[0], np.asarray(np_state[1], dtype=np.uint32), *np_state[2:])
-    )
-    torch.set_rng_state(torch.tensor(state["torch_rng"], dtype=torch.uint8))
-    if needs_cuda:
-        torch.cuda.set_rng_state(
-            torch.tensor(state["cuda_rng"], dtype=torch.uint8), engine.device
-        )
-    if state.get("seed_state") is not None:
-        from areal.utils import seeding
-
-        metadata = state["seed_state"]
-        seeding._SEED, seeding._BASE_SEED = metadata["seed"], metadata["base_seed"]
-        seeding._SHUFFLER = None
-        if metadata["shuffler"] is not None:
-            seeding._SHUFFLER = seeding.Shuffler()
-            vars(seeding._SHUFFLER).update(metadata["shuffler"])
+from areal.elastic.infra.state.worker_checkpoint import (
+    capture_runtime_state as capture_runtime_state,
+)
+from areal.elastic.infra.state.worker_checkpoint import (
+    restore_random_state as restore_random_state,
+)

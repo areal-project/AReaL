@@ -36,7 +36,6 @@ from areal.api.cli_args import (
     ValidDatasetConfig,
     vLLMConfig,
 )
-from areal.elastic.infra.adapter import validate_unbound_adapter
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
 from areal.infra import (
     LocalScheduler,
@@ -115,7 +114,10 @@ class PPOTrainer:
         *,
         elastic_reconfigurator=None,
     ):
-        validate_unbound_adapter(elastic_reconfigurator)
+        if elastic_reconfigurator is not None:
+            from areal.elastic.infra.adapter import validate_unbound_adapter
+
+            validate_unbound_adapter(elastic_reconfigurator)
         self._elastic_reconfigurator = elastic_reconfigurator
         self._reconfiguration = None
         self._training_lock = threading.RLock()
@@ -555,21 +557,9 @@ class PPOTrainer:
 
         self._config_perf_tracer()
         self._apply_initial_offload_policy()
-        self._control_phase = "idle"
+        self._set_control_phase("idle")
         if self._elastic_reconfigurator is not None:
-            self._bind_reconfigurator()
-
-    def _bind_reconfigurator(self):
-        from areal.elastic.infra.monitor.collector import TrainerMonitor
-
-        execution = self._reconfiguration
-        execution.monitor = TrainerMonitor(execution)
-        execution.reconfigurator_adapter = self._elastic_reconfigurator
-        self._elastic_reconfigurator.bind(execution)
-        self.rollout.configure_control_callbacks(
-            on_wait=self._poll_reconfigurator,
-            on_trajectory=execution.monitor.record_trajectory,
-        )
+            self._reconfiguration.bind_reconfigurator(self._elastic_reconfigurator)
 
     def _poll_reconfigurator(self):
         adapter = getattr(self, "_elastic_reconfigurator", None)

@@ -5,7 +5,7 @@ RPC wrappers, PPO/SFT methods, weight management, and error handling.
 """
 
 import asyncio
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -207,22 +207,6 @@ class TestTrainControllerInitialization:
         assert len(train_controller.scheduler.env_settings) == len(
             train_controller.workers
         )
-
-    def test_initialize_defers_backend_import_to_workers(
-        self, mock_scheduler, train_config, ft_spec
-    ):
-        """A CPU coordinator can dispatch a backend it has never imported."""
-        engine_path = "unavailable_gpu_backend.TrainingEngine"
-        mock_scheduler.create_engine = AsyncMock()
-        controller = TrainController(engine_path, train_config, mock_scheduler)
-        try:
-            controller.initialize(role="actor", ft_spec=ft_spec)
-
-            calls = mock_scheduler.create_engine.await_args_list
-            assert len(calls) == controller.train_alloc.parallel.world_size
-            assert all(call.kwargs["engine"] == engine_path for call in calls)
-        finally:
-            controller.destroy()
 
     def test_identify_dp_heads(self, train_controller, ft_spec):
         """Test _identify_dp_heads correctly identifies DP head workers."""

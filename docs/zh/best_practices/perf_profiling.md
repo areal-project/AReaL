@@ -60,40 +60,6 @@ python examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml schedule
 python -m areal.tools.perf_trace_converter logs/**/perf_tracer/traces-*.jsonl merged.json
 ```
 
-## SGLang batch 请求数与 token 时序
-
-此采集独立于 `perf_tracer`，默认关闭。使用 AReaL 的 SGLang 启动入口，在现有 `rollout.scheduling_spec` 每项的
-`env_vars` 中增加输出目录，保留已有配置：
-
-```yaml
-env_vars:
-  AREAL_ROLLOUT_TRACE_DIR: /shared/your-new-run/rollout-batches
-```
-
-需要重启推理服务才生效。直接运行原版 `sglang.launch_server` 不会安装采集器；独立服务使用
-`python -m areal.v2.inference_service.sglang.launch_server`。当前按 SGLang 0.5.10.post1 普通
-TP／DP 路径实现，启用时会拒绝 DP Attention、推测解码和 PD-Multiplexing。
-
-每个 TP／CP leader、每个 PP stage 分别追加 `batches-<host>-<pid>.jsonl`。首行为 rank 元数据， 随后每个 batch
-一行；不保存 prompt 内容或鉴权密钥。记录包含服务预热请求，分析正式任务时按客户端起止时间截取。
-
-| 字段                                             | 含义                                                                                              |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| `prefill.requests`／`decode.requests`            | 当前 forward 中各阶段的请求数，不含排队请求                                                       |
-| `*.context_tokens`                               | 这些请求的完整 prompt＋已调度生成位置数；从 CPU 序列长度快照读取，避免 overlap 的输出列表滞后一拍 |
-| `*.input_tokens`                                 | 本次实际输入位置数：prefill 为当前 chunk 的 token 数，普通 decode 每请求为 1                      |
-| `gpu_start_ms`／`gpu_end_ms`                     | 相对本文件 GPU 基准事件的 forward 流区间；仅 end event 就绪后写入                                 |
-| `gpu_origin_wall_lower`／`gpu_origin_wall_upper` | 基准事件对应墙钟时间的主机观测估计范围；后续记录收紧上界，不包含设备时钟漂移误差                  |
-| `host_started`／`host_finished`                  | 主机 forward 调用起止，不作为 GPU 执行区间                                                        |
-
-mixed batch 的两类请求分别计数，共享该次 forward 区间，不能把两类时长再相加。完整上下文 token 总量不是 KV 占用量，也不是本次处理 token
-数。
-
-画时间线时，每个文件统一取 `origin=(lower+min(upper))/2`，再用 `origin+gpu_start_ms/1000` 和
-`origin+gpu_end_ms/1000` 对齐墙钟；保留估计范围，避免逐条改变时间原点。 PP>1 时选同一 PP stage 汇总各副本，避免重复计数；未完成的
-`incomplete_at_shutdown` 记录不能当作完整 GPU 区间。 事件区间可能包含流等待或启动间隙，不等于内核忙碌时间。采集不增加 GPU 同步，但每
-batch 的事件和写盘开销仍需实测。
-
 ## 分析模式和 API
 
 ### 模式 1：使用 `@trace_perf` 追踪整个函数

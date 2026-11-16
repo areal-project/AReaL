@@ -108,7 +108,7 @@ pip install -e .
 ```
 
 This installs the example-scoped dependencies declared in
-[`pyproject.toml`](pyproject.toml):
+[`pyproject.toml`](./pyproject.toml):
 
 - `ipython`
 - `ruamel.yaml`

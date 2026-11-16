@@ -29,7 +29,7 @@ def run_optimizer_search(source, ports, settings, runner, directory):
         ExecutionConfig,
         OnlineLayout,
     )
-    from areal.elastic.reconfigurator.reference.optimizer import SearchBound
+    from areal.elastic.reconfigurator.optimizer import SearchBound
 
     begun, finished = set(), {}
 

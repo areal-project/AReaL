@@ -4,20 +4,6 @@
 
 ## Quick reference
 
-For AutoPilot work, read the workspace [progress](../PROGRESS.md) and
-[plan](../docs/plan.md) first. Update the workspace `PROGRESS.md` after project
-advancement; distinguish verified results from planned work. Maintain project plans,
-implementation writeups, experiment reports and machine runbooks in the workspace
-`docs/` directory. Keep only concise usage READMEs beside examples. New project tests
-live in `../local/tests/`; Simulation run outputs live in
-`../local/simulation/outputs/`, and other experiment artifacts and validation logs live
-in `../local/artifacts/`. Keep upstream tests in `tests/`.
-
-For Reference work, read the [implementation](../docs/implementation/reference.md). Keep
-Reference independent of Basic; freeze source, calibration and NumPy identities for
-comparisons, preserve coefficients and coverage, and do not refit to hide migration
-differences. Record new conclusions with their version, evidence and assumptions.
-
 **Tech stack**: Python 3.12+ | PyTorch | FSDP2 / Megatron / Archon | SGLang / vLLM
 
 ```bash
@@ -50,23 +36,10 @@ uv run python docs/generate_cli_docs.py
 
 **Always do**:
 
-- Keep project documentation concise: retain necessary facts, limits and next steps;
-  link detailed evidence instead of repeating logs or history.
-- For implementation/execution-flow docs, lead with one concise paragraph of numbered
-  stages, then a `text` call tree with matching `# N. Stage` comments and actual
-  class/function/method names. Verify order and nesting against source, including
-  callback/RPC boundaries. Focus on the requested operation, use few tables and avoid
-  repetitive defensive language. Honor requests for just one part of this format.
 - Read relevant files before modifying code.
 - Run `pre-commit run --all-files` before committing.
 - Follow existing code patterns in the same module.
 - Add tests for new functionality.
-- Batch structure and naming changes, then run relevant tests once at the end. Use
-  static checks while iterating; rerun targeted tests only to diagnose concrete
-  failures.
-- For current elastic-training work, temporarily do not run corner-case or
-  fault-injection tests unless the user requests them. Limit validation to necessary
-  normal-path checks, batched after changes settle; retain existing tests and evidence.
 - Ask for decisions and clarifications with short, structured options instead of broad
   open-ended questions. Use the platform's native question/clarification tool if
   available.

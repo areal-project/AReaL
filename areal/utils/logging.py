@@ -62,8 +62,6 @@ LOGGER_COLORS_EXACT = {
     "PerfTracer": "light_green",
     "WorkloadTrace": "light_green",
     "SGLangBatchObserver": "light_green",
-    "ActorCalibration": "light_green",
-    "RolloutCalibration": "light_green",
     # RPC servers - white
     "SyncRPCServer": "white",
     "RPCSerialization": "white",

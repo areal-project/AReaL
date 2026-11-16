@@ -68,31 +68,6 @@ def anthropic_headers():
     }
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/rl/current_episode", "/rl/abort_episode"])
-async def test_episode_lifecycle_routes_to_own_session_without_revoking_key(
-    client, path
-):
-    with (
-        patch(
-            f"{MODULE}.query_router", new_callable=AsyncMock, return_value=WORKER_ADDR
-        ) as router,
-        patch(
-            f"{MODULE}.forward_request",
-            new_callable=AsyncMock,
-            return_value=httpx.Response(409, json={"detail": "conflict"}),
-        ) as forward,
-        patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock) as revoke,
-    ):
-        response = await client.post(
-            path, json={"trajectory_id": 0}, headers=session_headers()
-        )
-        assert response.status_code == 409
-        assert path in router.call_args.args
-        assert forward.call_args.args[0] == WORKER_ADDR + path
-        revoke.assert_not_awaited()
-
-
 # =============================================================================
 # Health endpoint
 # =============================================================================

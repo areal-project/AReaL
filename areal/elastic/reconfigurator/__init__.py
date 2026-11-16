@@ -1,17 +1,89 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Versioned complete reconfigurators for both native and simulated execution."""
+"""Reference reconfiguration for native and simulated execution."""
 
 from __future__ import annotations
 
 from importlib import import_module
 
-IMPLEMENTATIONS = ("basic", "reference")
+from areal.elastic.reconfigurator.evaluator.contracts import (
+    ExecutionConfig,
+    Request,
+)
+from areal.elastic.reconfigurator.evaluator.cost_model.actor.model import (
+    ActorEstimate,
+    AdvantageModel,
+    AdvantageObservation,
+    AdvantageRankWork,
+    AdvantageTerm,
+    AdvantageWorkload,
+    AggregateAdvantageModel,
+    ExpertActorModel,
+    ObservedPacking,
+)
+from areal.elastic.reconfigurator.evaluator.cost_model.actor.operators import (
+    Efficiency,
+)
+from areal.elastic.reconfigurator.evaluator.cost_model.actor.packing import (
+    DispatchConfig,
+    Microbatch,
+    ObservedPackingWork,
+    PackingComparison,
+    PackingError,
+    PackingMicrobatch,
+    PackingPlan,
+    PackingRecord,
+    PackingSummary,
+    RankPacking,
+)
+from areal.elastic.reconfigurator.evaluator.cost_model.contracts import (
+    ActorConfig,
+    AllocationChange,
+    CalibrationPoint,
+    Estimate,
+    Hardware,
+    InferenceRates,
+    ModelShape,
+    ParallelLayout,
+    PhaseCalibration,
+    RolloutConfig,
+    ServiceEstimate,
+    ServiceSlice,
+    ServiceState,
+    TransferTask,
+    TransitionProfile,
+)
+from areal.elastic.reconfigurator.evaluator.cost_model.loader import (
+    AssembledTrial,
+    Catalog,
+)
+from areal.elastic.reconfigurator.evaluator.cost_model.publication import (
+    ExpertPublicationModel,
+    ExpertTransitionModel,
+    PublicationEstimate,
+    PublicationFlow,
+    PublicationRank,
+    PublicationRates,
+    PublicationWork,
+    TransitionEstimate,
+    publication_binding,
+)
+from areal.elastic.reconfigurator.evaluator.cost_model.rollout.model import (
+    ExpertRolloutModel,
+)
+from areal.elastic.reconfigurator.reconfigurator import (
+    OnlineReconfigurator as OnlineReconfigurator,
+)
+from areal.elastic.reconfigurator.reconfigurator import (
+    OnlineReconfiguratorConfig as OnlineReconfiguratorConfig,
+)
+
+IMPLEMENTATIONS = ("reference",)
 
 
 def validate_reconfigurator(name: str) -> None:
     if name not in IMPLEMENTATIONS:
-        raise ValueError("reconfigurator must be basic or reference")
+        raise ValueError("reconfigurator must be reference")
 
 
 def component_module(name: str, component: str):
@@ -21,17 +93,15 @@ def component_module(name: str, component: str):
         "optimizer",
         "forecast",
         "history",
-        "simulator",
         "cost_models",
         "evaluator",
     }:
         raise ValueError("Unknown reconfigurator component")
     module = {
-        ("reference", "history"): "forecast",
-        ("reference", "cost_models"): "evaluator.cost_model.loader",
-        ("basic", "evaluator"): "prediction",
-    }.get((name, component), component)
-    return import_module(f"{__name__}.{name}.{module}")
+        "history": "forecast",
+        "cost_models": "evaluator.cost_model.loader",
+    }.get(component, component)
+    return import_module(f"{__name__}.{module}")
 
 
 def build_reconfigurator(
@@ -45,18 +115,11 @@ def build_reconfigurator(
     optimizer=None,
     search_space: dict | None = None,
 ):
-    """Choose a complete algorithm version, independently of its execution backend."""
-    from ..contracts import ExecutionConfig
+    """Build the Reference algorithm for native or simulated execution."""
     from ..serving import ServingSLO
 
     module = component_module(name, "reconfigurator")
-    if search_space is not None and name != "reference":
-        raise ValueError("Factorized search_space requires Reference")
     candidates = tuple(candidates)
-    if name == "basic" and any(isinstance(c, ExecutionConfig) for c in candidates):
-        raise ValueError(
-            "Basic v1 retains the original DP/TP interface; full ExecutionConfig requires Reference"
-        )
     if not candidates:
         raise ValueError("A reconfigurator requires explicit executable candidates")
     if replay is not None and forecast is not None:
@@ -89,8 +152,61 @@ def build_reconfigurator(
         forecaster,
         module.OnlineReconfiguratorConfig(**options),
         slo,
-        **(dict(search_space=search_space) if name == "reference" else {}),
+        search_space=search_space,
     )
     if optimizer is not None:
         result.optimizer = optimizer
     return result
+
+
+__all__ = [
+    "AdvantageObservation",
+    "AggregateAdvantageModel",
+    "AdvantageModel",
+    "AdvantageRankWork",
+    "AdvantageTerm",
+    "AdvantageWorkload",
+    "ActorConfig",
+    "AssembledTrial",
+    "ActorEstimate",
+    "AllocationChange",
+    "CalibrationPoint",
+    "Catalog",
+    "DispatchConfig",
+    "Efficiency",
+    "Estimate",
+    "ExecutionConfig",
+    "ExpertActorModel",
+    "ExpertPublicationModel",
+    "ExpertRolloutModel",
+    "ExpertTransitionModel",
+    "Hardware",
+    "InferenceRates",
+    "Microbatch",
+    "ModelShape",
+    "ObservedPacking",
+    "ObservedPackingWork",
+    "PackingComparison",
+    "PackingError",
+    "PackingSummary",
+    "PackingPlan",
+    "PackingMicrobatch",
+    "PackingRecord",
+    "ParallelLayout",
+    "PhaseCalibration",
+    "PublicationEstimate",
+    "PublicationFlow",
+    "PublicationRank",
+    "PublicationRates",
+    "PublicationWork",
+    "RankPacking",
+    "Request",
+    "RolloutConfig",
+    "ServiceEstimate",
+    "ServiceSlice",
+    "ServiceState",
+    "TransferTask",
+    "TransitionEstimate",
+    "TransitionProfile",
+    "publication_binding",
+]

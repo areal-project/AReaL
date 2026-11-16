@@ -131,12 +131,6 @@ Proxy gateway available at http://X.X.X.X:PORT
 > [allocation mode reference](../../docs/en/reference/alloc_mode.md) for fields and GPU
 > layout.
 
-For opt-in native reconfiguration, see the
-[native elastic training example](../autopilot/elastic/README.md#%E5%8E%9F%E7%94%9F%E8%AE%AD%E7%BB%83).
-This uses explicit local GPU pools and a state root, with the Actor kept resident.
-Automatic reconfiguration attaches through `ReconfiguratorAdapter`; Revision remains
-deferred. GPU reconfiguration acceptance is still pending.
-
 ### Step 2 — Start the Hermes Agent Service
 
 Same command as the quick start. The agent's env upstream is optional here — once
@@ -153,15 +147,6 @@ areal agent run \
 
 Note the printed `<agent-gateway>` address.
 
-For the first GSM8K stage, use `--agent examples.hermes.hermes.GSM8KAgent` instead. It
-needs no Hermes dependency. Send each prompt from `get_gsm8k_rl_dataset()` through
-`/v1/responses` with a fresh Agent Service session key, the inference routing fields
-below, and `metadata.generation` containing `max_tokens` and the training run's
-`temperature`, `top_p`, and optional `seed`. The agent returns the full answer and
-`metadata.completion_id`; score it externally with `gsm8k_reward_fn` and pass that ID to
-`/rl/set_reward`. Keep the gold answer out of the generation request. GSM8K only checks
-the single-turn path; Hermes remains a separate multi-turn/tool acceptance.
-
 ### Step 3 — Start a session on the inference gateway
 
 Copy the printed `sk-sess-*` key — forward it to the agent (Step 4) and score the
@@ -171,19 +156,6 @@ the previous one):
 ```bash
 python examples/hermes/start_session.py http://<inf-gateway> --admin-key sk-123456
 ```
-
-In on-demand mode, the response also contains `areal_episode` (session incarnation and
-trajectory number). Pass it on **every** Agent Service turn as `inf_episode`; direct
-inference requests use `extra_body={"areal_episode": identity}`, and rewards include
-`areal_episode` in their JSON body. The scripts print matching `--incarnation-id` /
-`--trajectory-id` arguments. Retain the original identity when retrying; stale requests
-return 409.
-
-After reward or confirmed abort, read `/rl/current_episode` with the session key to
-obtain the next identity; the inference session remains alive. To abandon an unrewarded
-episode, send its `incarnation_id`, `trajectory_id`, and `episode_id` to
-`/rl/abort_episode`. Credit is released only after durable confirmation and no in-flight
-or unknown generation. An unknown backend outcome remains quarantined.
 
 These are **your own upstream LLM credentials** (the agent's fallback chat backend),
 **not** the `sk-sess-*` key returned above — fill in your provider's values:

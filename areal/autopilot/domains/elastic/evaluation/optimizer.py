@@ -18,7 +18,7 @@ from areal.autopilot.domains.elastic.cycle import (
 from areal.autopilot.domains.elastic.versions import AREAL_ROOT, protected_files
 from areal.autopilot.revision.contracts import RevisionReport, digest, source_digest
 from areal.autopilot.revision.execution import load_source
-from areal.elastic.reconfigurator.reference.optimizer import (
+from areal.elastic.reconfigurator.optimizer import (
     OnlineOptimizer,
     SearchBound,
     credit_deficit,

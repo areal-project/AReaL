@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from areal.elastic.reconfigurator.reference.evaluator.cost_model.contracts import (
+    from areal.elastic.reconfigurator.evaluator.cost_model.contracts import (
         RolloutConfig,
         ServiceSlice,
     )

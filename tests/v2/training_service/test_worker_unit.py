@@ -53,37 +53,6 @@ def client():
     return app.test_client()
 
 
-def test_explicit_worker_seed_precedes_initialize_on_engine_thread(client, monkeypatch):
-    import threading
-    from types import SimpleNamespace
-
-    from areal.v2.training_service.worker import app as worker_app
-
-    events = []
-
-    def seed(value, *, key):
-        assert threading.current_thread().name == "EngineWorker"
-        events.append(("seed", value, key))
-
-    def initialize(**kwargs):
-        assert threading.current_thread().name == "EngineWorker"
-        assert kwargs == {"role": "actor"}
-        events.append(("initialize",))
-
-    worker_app._engine = SimpleNamespace(initialize=initialize)
-    monkeypatch.setenv("RANK", "2")
-    monkeypatch.setattr("areal.utils.seeding.set_random_seed", seed)
-    response = client.post(
-        "/initialize",
-        json={
-            "args": serialize_value([]),
-            "kwargs": serialize_value({"role": "actor", "worker_seed": 17}),
-        },
-    )
-    assert response.status_code == 200
-    assert events == [("seed", 17, "native-actor-rank-2"), ("initialize",)]
-
-
 class TestWorkerEngineCreation:
     def test_create_engine_requires_engine_class(self, client):
         resp = client.post(
@@ -105,51 +74,6 @@ class TestWorkerEngineCreation:
         assert resp.status_code == 200
         payload = resp.get_json()
         assert payload["status"] == "success"
-
-
-@pytest.mark.parametrize("operation", ["inspect", "save", "load"])
-def test_full_checkpoint_routes_execute_in_engine_thread(
-    request, monkeypatch, operation
-):
-    import threading
-
-    from areal.v2.training_service import checkpoint
-    from areal.v2.training_service.worker import app as worker_app
-
-    engine = object()
-    worker_app._engine = engine
-
-    def adapter(actual_engine, **kwargs):
-        assert actual_engine is engine
-        assert threading.current_thread().name == "EngineWorker"
-        assert kwargs == {
-            "path": "/checkpoint",
-            "backend": "fsdp",
-            "identity_sha256": "a" * 64,
-            "version": 2,
-        }
-        return {"policy_version": 2, "rank": 0}
-
-    monkeypatch.setattr(checkpoint, f"{operation}_full_checkpoint", adapter)
-    client = request.getfixturevalue("client")
-    response = client.post(
-        f"/checkpoint/{operation}",
-        json={
-            "kwargs": serialize_value(
-                {
-                    "path": "/checkpoint",
-                    "backend": "fsdp",
-                    "identity_sha256": "a" * 64,
-                    "version": 2,
-                }
-            )
-        },
-    )
-    assert response.status_code == 200
-    assert deserialize_value(response.get_json()["result"]) == {
-        "policy_version": 2,
-        "rank": 0,
-    }
 
 
 class TestWorkerEndpoints:

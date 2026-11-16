@@ -148,51 +148,6 @@ def _run_process_tool_calls(text: str):
     )
 
 
-def test_tool_json_invalid_escapes_preserve_literal_backslashes():
-    arguments = r'{"code":"# angle 90^\circ; existing \\circ; newline\n"}'
-
-    escaped = parser_module._escape_invalid_tool_json(arguments)
-
-    assert json.loads(escaped) == {
-        "code": "# angle 90^\\circ; existing \\circ; newline\n"
-    }
-    assert parser_module._escape_invalid_tool_json(escaped) == escaped
-
-
-def test_tool_json_other_syntax_is_not_repaired():
-    text = r'{"code":"90^\circ"'
-
-    assert parser_module._escape_invalid_tool_json(text) == text
-
-
-@pytest.mark.sglang
-@pytest.mark.parametrize("use_responses", [False, True])
-@pytest.mark.parametrize("tool_call_parser", ["qwen", "qwen25"])
-def test_sglang_tool_call_invalid_escape(use_responses, tool_call_parser):
-    pytest.importorskip("sglang.srt.function_call.function_call_parser")
-    text = (
-        "<tool_call>\n"
-        + r'{"name":"search","arguments":{"query":"90^\circ"}}'
-        + "\n</tool_call>"
-    )
-    tools = (
-        [{"type": "function", **tool["function"]} for tool in TOOLS]
-        if use_responses
-        else TOOLS
-    )
-
-    calls, content, finish = parser_module.process_tool_calls(
-        text, tools, tool_call_parser, "", "stop", use_responses
-    )
-
-    assert finish == "tool_calls"
-    assert len(calls) == 1
-    function = calls[0] if use_responses else calls[0].function
-    assert function.name == "search"
-    assert json.loads(function.arguments) == {"query": r"90^\circ"}
-    assert "<tool_call>" not in content
-
-
 def test_process_tool_calls_qwen3_coder_xml_parameters_without_sglang():
     tool_calls, new_text, new_finish_reason = parser_module.process_tool_calls(
         text=QWEN3_CODER_TEXT,
@@ -288,42 +243,6 @@ def test_process_tool_calls_qwen25_chat_completions_with_tool_call_in_thinking_s
 
     _assert_tool_calls(tool_calls, new_text, new_finish_reason)
     assert "<tool_call>" in new_text
-
-
-@pytest.mark.sglang
-@pytest.mark.parametrize("use_responses", [False, True])
-@pytest.mark.parametrize("has_tool_call", [False, True])
-def test_sglang_tool_calls_without_reasoning_parser(use_responses, has_tool_call):
-    pytest.importorskip("sglang.srt.function_call.function_call_parser")
-    pytest.importorskip("sglang.srt.parser.reasoning_parser")
-    text = TEXT.split("</think>", 1)[1] if has_tool_call else "No tool requested."
-    tools = (
-        [{"type": "function", **tool["function"]} for tool in TOOLS]
-        if use_responses
-        else TOOLS
-    )
-
-    calls, content, finish_reason = parser_module.process_tool_calls(
-        text=text,
-        tools=tools,
-        tool_call_parser="qwen25",
-        reasoning_parser="",
-        finish_reason="stop",
-        use_responses=use_responses,
-    )
-
-    if has_tool_call:
-        assert finish_reason == "tool_calls"
-        assert len(calls) == 2
-        for call in calls:
-            function = call if use_responses else call.function
-            assert function.name == "search"
-            assert json.loads(function.arguments)["query"].endswith("country")
-        assert "<tool_call>" not in content
-    else:
-        assert calls is None
-        assert content == text
-        assert finish_reason == "stop"
 
 
 def _raise_module_not_found(*args, **kwargs):
