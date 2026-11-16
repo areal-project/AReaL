@@ -185,7 +185,9 @@ class _ScoreResp:
         return _make_score_response(self._token_logps)
 
 
-def _run_compute_logp(input_ids, loss_mask, token_logps, monkeypatch):
+def _run_compute_logp(
+    input_ids, loss_mask, token_logps, monkeypatch, attention_mask=None
+):
     engine = RemoteInfEngine(
         InferenceEngineConfig(backend="sglang:d1"),
         _MockScoreBackend(token_logps),
@@ -196,7 +198,10 @@ def _run_compute_logp(input_ids, loss_mask, token_logps, monkeypatch):
         "request",
         lambda *a, **k: _ScoreResp(token_logps),
     )
-    return engine.compute_logp([{"input_ids": input_ids, "loss_mask": loss_mask}])[0]
+    traj = {"input_ids": input_ids, "loss_mask": loss_mask}
+    if attention_mask is not None:
+        traj["attention_mask"] = attention_mask
+    return engine.compute_logp([traj])[0]
 
 
 def test_compute_logp_writes_teacher_scores_at_prediction_positions(monkeypatch):
@@ -248,3 +253,35 @@ def test_compute_logp_rejects_gapped_loss_mask(monkeypatch):
 
     with pytest.raises(ValueError, match="contiguous response suffix"):
         _run_compute_logp(input_ids, loss_mask, token_logps, monkeypatch)
+
+
+def test_compute_logp_rejects_response_before_trailing_attended_context(monkeypatch):
+    """A contiguous mask can still stop before the last attended token.
+
+    ``[prompt, response, context, pad]`` with ``loss_mask=[0, 1, 0, 0]`` passes a
+    contiguity check, but the backend returns the context token's score, which
+    would be written into the slot that predicts ``response``.
+    """
+    input_ids = torch.tensor([[10, 11, 12, 20, 21, 30, 0]])
+    loss_mask = torch.tensor([[0, 0, 0, 1, 1, 0, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0]])
+
+    with pytest.raises(ValueError, match="final attended span"):
+        _run_compute_logp(
+            input_ids, loss_mask, [-0.1, -0.2], monkeypatch, attention_mask
+        )
+
+
+def test_compute_logp_accepts_right_padded_response_suffix(monkeypatch):
+    """A response followed only by padding is the final attended span."""
+    input_ids = torch.tensor([[10, 11, 12, 20, 21, 0, 0]])
+    loss_mask = torch.tensor([[0, 0, 0, 1, 1, 0, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 0, 0]])
+
+    out = _run_compute_logp(
+        input_ids, loss_mask, [-0.25, -0.5], monkeypatch, attention_mask
+    )
+
+    assert out[0, 2].item() == pytest.approx(-0.25)
+    assert out[0, 3].item() == pytest.approx(-0.5)
+    assert out[0, 4].item() == 0.0

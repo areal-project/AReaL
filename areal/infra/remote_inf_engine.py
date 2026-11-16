@@ -824,10 +824,19 @@ class RemoteInfEngine(InferenceEngine):
                 target_len = int(write_idx.numel())
                 if target_len <= 0:
                     continue
-                # Both backend parsers return the *last* ``target_len`` scores,
-                # which is only the response suffix when the mask is contiguous.
-                # A gapped mask (e.g. multi-turn ``[0, 1, 0, 1]``) would silently
-                # map the context score onto R1's slot, so reject it here.
+                if "attention_mask" in traj:
+                    attn_mask = traj["attention_mask"][i]
+                    active_idx = torch.nonzero(attn_mask, as_tuple=False).squeeze(-1)
+                    token_ids = input_ids[i, active_idx].tolist()
+                else:
+                    active_idx = torch.arange(
+                        input_ids.shape[1], device=input_ids.device
+                    )
+                    token_ids = input_ids[i].tolist()
+                # Both backend parsers return the *last* ``target_len`` scores.
+                # The mask must therefore be a contiguous response suffix (a
+                # gapped multi-turn ``[0, 1, 0, 1]`` would map the context score
+                # onto R1's slot) ...
                 expected_idx = torch.arange(
                     write_idx[0],
                     write_idx[0] + target_len,
@@ -839,20 +848,29 @@ class RemoteInfEngine(InferenceEngine):
                         "compute_logp supports a contiguous response suffix only; "
                         f"got a gapped loss mask at nonzeros {write_idx.tolist()}"
                     )
-                prediction_idx = write_idx - 1
-                if torch.any(prediction_idx < 0):
-                    # A response token at position 0 has no preceding prediction
-                    # slot; -1 would silently write its score at the end of the row.
+                # ... and the response must also be the final *attended* span.
+                # Trailing attended context (e.g. [prompt, R1, context, pad] with
+                # mask [0, 1, 0, 0]) otherwise receives the context's score.
+                if target_len > active_idx.numel() or not torch.equal(
+                    write_idx, active_idx[-target_len:]
+                ):
                     raise ValueError(
-                        "Invalid loss mask: response token has no preceding "
-                        f"prediction position: {write_idx.tolist()}"
+                        "compute_logp scores only the final attended span; the "
+                        "response tokens must be its suffix: "
+                        f"response={write_idx.tolist()}, "
+                        f"attended tail={active_idx[-target_len:].tolist()}"
                     )
-                if "attention_mask" in traj:
-                    attn_mask = traj["attention_mask"][i]
-                    active_idx = torch.nonzero(attn_mask, as_tuple=False).squeeze(-1)
-                    token_ids = input_ids[i, active_idx].tolist()
-                else:
-                    token_ids = input_ids[i].tolist()
+                prediction_idx = write_idx - 1
+                # The prediction slot must also be an attended position: a
+                # response token at position 0, or a mask whose predecessor is
+                # padding, has no model score to shift.
+                predecessor = write_idx[0] - 1
+                if predecessor < 0 or not torch.any(active_idx == predecessor):
+                    raise ValueError(
+                        "Invalid loss mask: the first response token has no "
+                        "attended preceding position: "
+                        f"{write_idx.tolist()}, attended={active_idx.tolist()}"
+                    )
                 server_addr = self.choose_server()
                 http_req = self.backend.build_score_request(
                     input_ids=token_ids,
