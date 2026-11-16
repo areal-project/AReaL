@@ -121,8 +121,12 @@ def test_diagnostics_off_does_not_require_the_field():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_diagnostics_finite_under_extreme_teacher_gap(dtype):
-    """A large positive x must not produce inf in the reported values."""
-    logprobs = torch.full((1, 3), -40.0, dtype=dtype, requires_grad=True)
+    """A gap of 99 must not produce inf in the reported values.
+
+    ``expm1(99)`` overflows fp32 (exp overflows around 88), so this case is the
+    one the earlier x=39 fixture missed.
+    """
+    logprobs = torch.full((1, 3), -100.0, dtype=dtype, requires_grad=True)
     data = {
         "logprobs": logprobs.detach().clone(),
         "prox_logp": logprobs.detach().clone(),
@@ -147,9 +151,9 @@ def test_diagnostics_finite_under_extreme_teacher_gap(dtype):
             eps_clip_higher=None,
             c_clip=None,
         )
-    # x = 39 -> expm1(39) is ~8.7e16, finite in fp32 but not representable in
-    # bf16's narrower mantissa; the diagnostic must still be finite there
-    # because it is promoted to fp32 before the exponential.
+    # x = 99 -> expm1(99) overflows fp32. The diagnostic saturates k3 at the
+    # documented cap instead of returning inf, and promotes bf16 inputs to fp32
+    # before the exponential.
     for key in ("distill_kl_k1", "distill_kl_k2", "distill_kl_k3"):
         assert torch.isfinite(captured[key]).all(), f"{key} not finite"
 

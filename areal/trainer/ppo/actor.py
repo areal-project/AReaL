@@ -923,6 +923,41 @@ class PPOActorControllerV2(GatewayTrainController):
         self._gateway_post("/ppo/actor/update", payload)
 
 
+# Saturation caps for the detached forward values. The selected scalar is a
+# straight-through carrier, so these caps change only the reported number and
+# never the gradient, which comes from the clipped policy loss.
+_K2_MAX_ABS_X = 1e19
+_K3_MAX_X = 60.0
+
+
+def _sampled_rkl_forward(
+    teacher_logp: torch.Tensor,
+    logprobs: torch.Tensor,
+    mask: torch.Tensor,
+    estimator: str,
+) -> torch.Tensor:
+    """Per-token sampled reverse-KL forward values on ``mask``.
+
+    Inputs are expected to be detached. Masked positions contribute exactly
+    zero (``torch.where``, not multiplication, so a sentinel ``-inf`` cannot
+    become ``NaN``). A non-finite gap on a valid token is dropped for the
+    reported value. k2 clamps ``|x|`` and k3 clamps ``x`` before
+    ``expm1``, so a finite input can never yield an infinite reported scalar;
+    this is a documented saturation, not a silent overflow.
+    """
+    mask = mask.bool()
+    x = torch.where(mask, teacher_logp - logprobs, torch.zeros_like(logprobs))
+    if x.dtype not in (torch.float32, torch.float64):
+        x = x.float()
+    x = torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+    if estimator == "k1":
+        return -x
+    if estimator == "k2":
+        return 0.5 * torch.clamp(x, -_K2_MAX_ABS_X, _K2_MAX_ABS_X).square()
+    x = torch.clamp(x, max=_K3_MAX_X)
+    return torch.expm1(x) - x
+
+
 def grpo_loss_fn(
     logprobs: torch.Tensor,
     entropy: torch.Tensor,
@@ -1212,17 +1247,19 @@ def grpo_loss_fn(
         # carrier swaps the forward value while keeping d(loss)/d(params) from
         # the clipped policy loss, so all three estimators remain
         # gradient-equivalent on matched finite inputs.
+        #
+        # The selected scalar describes the tokens the update actually uses: its
+        # numerator follows the post-rejection effective mask, while the
+        # denominator is the same pre-rejection valid-token count the policy
+        # loss uses. ``rkl_loss`` for k1 stays the legacy pre-rejection value.
         if kl_estimator != "k1":
-            x_sel = (teacher_logp - logprobs).detach() * loss_mask
-            x_sel32 = (
-                x_sel
-                if x_sel.dtype in (torch.float32, torch.float64)
-                else x_sel.float()
-            )
-            if kl_estimator == "k2":
-                selected_per_token = (0.5 * x_sel32**2).to(logprobs.dtype)
-            else:
-                selected_per_token = (torch.expm1(x_sel32) - x_sel32).to(logprobs.dtype)
+            effective_mask = stat.get("behave_mask", loss_mask).bool()
+            selected_per_token = _sampled_rkl_forward(
+                teacher_logp.detach(),
+                logprobs.detach(),
+                effective_mask,
+                kl_estimator,
+            ).to(logprobs.dtype)
             selected_value = (
                 distill_loss_weight
                 * selected_per_token.sum()
@@ -1243,22 +1280,20 @@ def grpo_loss_fn(
 
     # Optional same-token diagnostics for all three estimates. Detached and
     # unweighted: these describe the behavior-distribution draws, not an
-    # importance-weighted current-student KL. They are reported on the effective
-    # loss mask and do not affect the loss, its gradient, or ``rkl_loss``.
+    # importance-weighted current-student KL. They use the same post-rejection
+    # effective mask as the selected scalar (numerator), with the usual
+    # pre-rejection valid-token denominator, and do not affect the loss, its
+    # gradient, or ``rkl_loss``. The helper's caps keep the reported values
+    # finite on large but finite gaps.
     distill_diag = None
     if teacher_logp is not None and input_data.get("log_distill_diagnostics", False):
-        x_det = (teacher_logp - logprobs).detach()
-        # Mirror the loss path's precision guard: in bf16 a large positive x
-        # overflows expm1 to inf (would log inf) and a tiny x underflows
-        # 0.5*x^2 to 0. Higher-precision inputs are preserved.
-        x_det32 = (
-            x_det if x_det.dtype in (torch.float32, torch.float64) else x_det.float()
-        )
-        distill_diag = dict(
-            k1=-x_det,
-            k2=(0.5 * x_det32**2).to(logprobs.dtype),
-            k3=(torch.expm1(x_det32) - x_det32).to(logprobs.dtype),
-        )
+        effective_mask = stat.get("behave_mask", loss_mask).bool()
+        distill_diag = {
+            name: _sampled_rkl_forward(
+                teacher_logp.detach(), logprobs.detach(), effective_mask, name
+            ).to(logprobs.dtype)
+            for name in ("k1", "k2", "k3")
+        }
 
     # Match the engine's aggregation across microbatches and data-parallel ranks.
     stats_tracker.weighted_mean(
