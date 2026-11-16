@@ -105,7 +105,9 @@ def test_prepare_worker_specs_expands_single_spec(tmp_path):
 
     schedulings = scheduler._prepare_worker_specs("actor", 2, [spec])
 
-    assert schedulings == [spec, spec]
+    assert len(schedulings) == 2
+    assert all(s.gpu == spec.gpu for s in schedulings)
+    assert spec.env_vars == {}
 
 
 def test_empty_scheduling_spec_fails(tmp_path):
@@ -545,4 +547,199 @@ def test_colocation_target_not_found_raises_error(tmp_path):
     )
 
     with pytest.raises(WorkerNotFoundError):
+        scheduler.create_workers(job)
+
+
+def test_native_runtime_env_isolates_driver_paths_and_preserves_config(
+    tmp_path, monkeypatch
+):
+    import copy
+
+    scheduler = _scheduler(tmp_path)
+    monkeypatch.setattr(
+        ray_scheduler,
+        "get_env_vars",
+        lambda: {"PYTHONPATH": "/driver/site-packages", "SETTING": "driver"},
+    )
+    spec = SchedulingSpec(
+        cpu=1,
+        gpu=1,
+        env_vars={"SETTING": "role"},
+        ray_runtime_env={
+            "container": {"image": "train:test", "run_options": ["--ipc=host"]},
+            "env_vars": {"SETTING": "runtime", "IMAGE_ONLY": "yes"},
+        },
+    )
+    original = copy.deepcopy(spec)
+    prepared = scheduler._prepare_worker_specs("actor", 2, [spec])
+    assert spec == original
+    env = prepared[0].ray_runtime_env["env_vars"]
+    assert "PYTHONPATH" not in env
+    assert env["SETTING"] == "role"
+    assert env["IMAGE_ONLY"] == "yes"
+    assert prepared[0].env_vars == env
+    spec.env_vars["PYTHONPATH"] = "/mounted/source"
+    prepared = scheduler._prepare_worker_specs("actor", 1, [spec])
+    assert prepared[0].ray_runtime_env["env_vars"]["PYTHONPATH"] == "/mounted/source"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("ray_runtime_env", {"image_uri": "other:test"}),
+        ("gpu", 2),
+        ("cpu", 2),
+        ("env_vars", {"ROLE_ENV": "different"}),
+    ],
+)
+def test_native_runtime_env_rejects_heterogeneous_role(tmp_path, field, value):
+    import copy
+
+    spec = SchedulingSpec(cpu=1, gpu=1, ray_runtime_env={"image_uri": "train:test"})
+    other = copy.deepcopy(spec)
+    setattr(other, field, value)
+    with pytest.raises(ValueError, match="uniform"):
+        _scheduler(tmp_path)._prepare_worker_specs("actor", 2, [spec, other])
+
+
+@pytest.mark.parametrize("replicas,gpus", [(2, 4), (8, 1)])
+@pytest.mark.parametrize("fork", [False, True])
+def test_native_colocation_creates_image_launcher_without_more_gpus(
+    tmp_path, monkeypatch, replicas, gpus, fork
+):
+    from types import SimpleNamespace
+
+    scheduler = _scheduler(tmp_path)
+    scheduler._workers["actor"] = [_worker_info(f"actor/{i}") for i in range(8)]
+    node = dict(
+        host="node-a", node_id="a" * 56, visible_devices=[str(i) for i in range(8)]
+    )
+    scheduler._launchers["actor"] = [
+        SimpleNamespace(get_node_info=SimpleNamespace(remote=lambda: node))
+    ]
+    options_seen, batches = [], []
+
+    def options(**kwargs):
+        options_seen.append(kwargs)
+        return SimpleNamespace(
+            remote=lambda *args: SimpleNamespace(
+                start_workers=SimpleNamespace(
+                    remote=lambda batch: batches.append(batch)
+                )
+            )
+        )
+
+    monkeypatch.setattr(
+        ray_scheduler, "RayWorkerProcessLauncher", SimpleNamespace(options=options)
+    )
+    monkeypatch.setattr(ray_scheduler.ray, "get", lambda refs, **kwargs: refs)
+    job = Job(
+        role="rollout",
+        replicas=replicas,
+        tasks=[
+            SchedulingSpec(
+                cpu=1, gpu=gpus, ray_runtime_env={"image_uri": "rollout:test"}
+            )
+        ],
+        scheduling_strategy=SchedulingStrategy(
+            type="colocation", target="actor", fork=fork
+        ),
+    )
+    assert scheduler.create_workers(job) == [f"rollout/{i}" for i in range(replicas)]
+    assert len(options_seen) == 1
+    opts = options_seen[0]
+    assert opts["num_gpus"] == 0
+    assert opts["runtime_env"]["image_uri"] == "rollout:test"
+    assert opts["scheduling_strategy"].node_id == "a" * 56
+    assert opts["scheduling_strategy"].soft is False
+    assert [w["extra_env"]["SLURM_LOCALID"] for w in batches[0]] == list(
+        map(str, range(replicas))
+    )
+    assert [w["gpu_devices"] for w in batches[0]] == [
+        [str(j) for j in range(i * gpus, (i + 1) * gpus)] for i in range(replicas)
+    ]
+
+
+def test_native_separation_passes_runtime_env_before_launcher_import(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    scheduler = _scheduler(tmp_path)
+    options_seen = []
+    node = dict(host="node-a", node_id="a" * 56, visible_devices=["0", "1"])
+    launcher = SimpleNamespace(
+        get_node_info=SimpleNamespace(remote=lambda: node),
+        start_workers=SimpleNamespace(remote=lambda batch: None),
+    )
+
+    def options(**kwargs):
+        options_seen.append(kwargs)
+        return SimpleNamespace(remote=lambda *args: launcher)
+
+    monkeypatch.setattr(
+        ray_scheduler, "RayWorkerProcessLauncher", SimpleNamespace(options=options)
+    )
+    monkeypatch.setattr(ray_scheduler.ray, "get", lambda refs, **kwargs: refs)
+    monkeypatch.setattr(scheduler, "_create_placement_group", lambda *args: object())
+    monkeypatch.setattr(
+        ray_scheduler, "PlacementGroupSchedulingStrategy", lambda **kwargs: kwargs
+    )
+    job = Job(
+        role="actor",
+        replicas=2,
+        tasks=[
+            SchedulingSpec(
+                cpu=1,
+                gpu=1,
+                mem=1,
+                env_vars={"PYTHONPATH": "/source"},
+                ray_runtime_env={
+                    "container": {
+                        "image": "train:test",
+                        "run_options": ["--device=/dev/nvidia0"],
+                    }
+                },
+            )
+        ],
+    )
+    assert scheduler.create_workers(job) == ["actor/0", "actor/1"]
+    assert len(options_seen) == 1
+    env = options_seen[0]["runtime_env"]
+    assert env["container"] == job.tasks[0].ray_runtime_env["container"]
+    assert env["env_vars"]["PYTHONPATH"] == "/source"
+    assert "env_vars" not in job.tasks[0].ray_runtime_env
+
+
+def test_native_cpu_colocation_fails_before_launch(tmp_path):
+    scheduler = _scheduler(tmp_path)
+    scheduler._workers["actor"] = [_worker_info("actor/0")]
+    job = Job(
+        role="ref",
+        replicas=1,
+        tasks=[SchedulingSpec(gpu=0, ray_runtime_env={"image_uri": "ref:test"})],
+        scheduling_strategy=SchedulingStrategy(type="colocation", target="actor"),
+    )
+    with pytest.raises(WorkerCreationError, match="colocation requires GPUs"):
+        scheduler.create_workers(job)
+
+
+def test_grouped_colocation_rejects_duplicate_nodes_before_launch(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    scheduler = _scheduler(tmp_path)
+    node = dict(host="node-a", node_id="a" * 56, visible_devices=["0", "1"])
+    launcher = SimpleNamespace(get_node_info=SimpleNamespace(remote=lambda: node))
+    scheduler._workers["actor"] = [_worker_info(f"actor/{i}") for i in range(4)]
+    scheduler._launchers["actor"] = [launcher, launcher]
+    monkeypatch.setattr(ray_scheduler.ray, "get", lambda refs, **kwargs: refs)
+    job = Job(
+        role="rollout",
+        replicas=2,
+        tasks=[SchedulingSpec(gpu=2, ray_runtime_env={"image_uri": "rollout:test"})],
+        scheduling_strategy=SchedulingStrategy(type="colocation", target="actor"),
+    )
+    with pytest.raises(WorkerCreationError, match="one target launcher per node"):
         scheduler.create_workers(job)

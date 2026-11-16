@@ -1403,6 +1403,17 @@ class SchedulingSpec:
             "help": "Command to execute inside the container. Defaults to AReaL's RPC server."
         },
     )
+    ray_runtime_env: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Native Ray runtime environment for this role's launchers. "
+            "Use image_uri or container.image for OCI images; container.run_options "
+            "supplies Podman GPU and volume options. All specs in a role must "
+            "use the same runtime environment and resources. Explicit env_vars "
+            "override runtime_env.env_vars. Images must contain compatible Ray "
+            "and Python versions and make AReaL importable."
+        },
+    )
     # Slurm specific options
     srun_additional_args: str = field(
         default="--unbuffered --mpi=pmi2 -K --chdir $PWD",
