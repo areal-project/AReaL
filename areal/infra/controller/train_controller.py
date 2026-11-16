@@ -676,7 +676,9 @@ class TrainController:
         """
         # Statistics have been aggregated and synchronized across workers
         # All results should be identical, so return the first one
-        stats = stats_tracker.export_all()
+        stats = stats_tracker.export_all(
+            include_aggregation=perf_tracer.aggregation_enabled()
+        )
         stats.update(self._custom_function_call("export_stats"))
         return stats
 

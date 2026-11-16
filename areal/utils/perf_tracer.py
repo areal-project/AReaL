@@ -1419,6 +1419,7 @@ class PerfTracer:
         )
         self._save_interval = _normalize_save_interval(config)
         self._profile_steps = self._normalize_profile_steps(config.profile_steps)
+        self._numeric_writer = None
         self._session_tracer: SessionTracer | None = None
         self._configure_session_tracer(config, rank=rank, role=role)
 
@@ -1476,15 +1477,17 @@ class PerfTracer:
         profiler_args: dict[str, Any] | None = None,
         args: dict[str, Any] | None = None,
     ) -> AbstractContextManager[Any]:
-        if not self._enabled:
+        if not self._enabled and not (self._config.enabled and self._profile_steps):
             return _NullContext()
         global_step = self._get_global_step(args)
         args = dict(args or {})
         if global_step is not None:
             args["global_step"] = global_step
         profiler_active = _profiler_active.get(False)
-        profiler_flag = not profiler_active and self._should_enable_profiler(
-            enable_profiler, global_step
+        profiler_flag = (
+            self._enabled
+            and not profiler_active
+            and self._should_enable_profiler(enable_profiler, global_step)
         )
         return _Scope(
             self,
@@ -1504,15 +1507,17 @@ class PerfTracer:
         profiler_args: dict[str, Any] | None = None,
         args: dict[str, Any] | None = None,
     ) -> AbstractAsyncContextManager[Any]:
-        if not self._enabled:
+        if not self._enabled and not (self._config.enabled and self._profile_steps):
             return _NullContext()
         global_step = self._get_global_step(args)
         args = dict(args or {})
         if global_step is not None:
             args["global_step"] = global_step
         profiler_active = _profiler_active.get(False)
-        profiler_flag = not profiler_active and self._should_enable_profiler(
-            enable_profiler, global_step
+        profiler_flag = (
+            self._enabled
+            and not profiler_active
+            and self._should_enable_profiler(enable_profiler, global_step)
         )
         return _AsyncScope(
             self,
@@ -1710,6 +1715,8 @@ class PerfTracer:
     # Persistence helpers
     # ------------------------------------------------------------------
     def save(self, *, step: int | None = None, force: bool = False) -> None:
+        if self._numeric_writer is not None:
+            self._numeric_writer.flush()
         if self._session_tracer is not None and force:
             self._session_tracer.flush(force=True)
 
@@ -1753,6 +1760,9 @@ class PerfTracer:
                 self._events[0:0] = events_to_write
 
     def reset(self) -> None:
+        if self._numeric_writer is not None:
+            self._numeric_writer.close()
+            self._numeric_writer = None
         if self._session_tracer is not None:
             self._session_tracer.reset()
         with self._lock:
@@ -1914,6 +1924,45 @@ def _require_configured_tracer() -> PerfTracer:
 
 def get_tracer() -> PerfTracer:
     return _require_configured_tracer()
+
+
+def aggregation_enabled() -> bool:
+    """Use the shared configuration independently of performance-event rank filters."""
+    return bool(GLOBAL_TRACER is not None and GLOBAL_TRACER._config.enabled)
+
+
+def numeric_profile_context() -> dict[str, Any] | None:
+    tracer = GLOBAL_TRACER
+    step = _current_global_step.get()
+    if (
+        tracer is None
+        or not tracer._config.enabled
+        or step not in tracer._profile_steps
+    ):
+        return None
+    return {"global_step": step, "rank": tracer._rank, "role": tracer._role}
+
+
+def record_numeric(tensors: dict[str, Any], metadata: dict[str, Any]) -> None:
+    context = numeric_profile_context()
+    if context is None:
+        return
+    tracer = _require_configured_tracer()
+    with tracer._lock:
+        if tracer._numeric_writer is None:
+            from areal.utils.numeric_trace import NumericTraceWriter
+
+            tracer._numeric_writer = NumericTraceWriter(
+                _default_trace_path(
+                    tracer._config,
+                    rank=tracer._rank,
+                    role=tracer._role,
+                    filename="records.jsonl",
+                    subdir="numeric_tracer",
+                )
+            )
+        writer = tracer._numeric_writer
+    writer.submit(tensors, {**metadata, **context})
 
 
 def get_session_tracer() -> SessionTracer | None:

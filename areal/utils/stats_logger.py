@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import math
 import os
 import time
 from dataclasses import asdict
@@ -150,8 +152,33 @@ class StatsLogger:
             data = [data]
         log_step = max(global_step, self._last_commit_step + 1)
         for i, item in enumerate(data):
+            if getattr(getattr(self.exp_config, "perf_tracer", None), "enabled", False):
+                numeric = {
+                    key: value if math.isfinite(value) else str(value)
+                    for key, value in item.items()
+                    if key.startswith("ppo_actor/") and isinstance(value, (int, float))
+                }
+                logger.info(
+                    "Numeric statistics %s",
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "global_step": global_step,
+                            "epoch": epoch,
+                            "epoch_step": step,
+                            "item_index": i,
+                            "statistics": numeric,
+                        },
+                        allow_nan=False,
+                        sort_keys=True,
+                    ),
+                )
             # Filter out counter keys for scalar variables
-            item = {k: v for k, v in item.items() if not k.endswith("__count")}
+            item = {
+                k: v
+                for k, v in item.items()
+                if not k.endswith(("__count", "__sum", "__weight"))
+            }
 
             logger.info(f"Stats ({i + 1}/{len(data)}):")
             scalar_item, expert_rows = split_expert_load_metrics(item)

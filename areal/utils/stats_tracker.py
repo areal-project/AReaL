@@ -406,12 +406,15 @@ class DistributedStatsTracker:
         reduce_group=None,
         key_sync_group=None,
         reset=True,
+        include_aggregation=False,
     ) -> dict[str, float]:
         """Get aggregated statistics"""
         with self.lock:
             if key is not None:
                 full_key = self._get_full_key(key)
-                result = self._aggregate(full_key, reduce_group)
+                result = self._aggregate(
+                    full_key, reduce_group, include_aggregation=include_aggregation
+                )
                 if reset:
                     if full_key in self.denominators:
                         self.denominators.pop(full_key)
@@ -472,6 +475,7 @@ class DistributedStatsTracker:
                         reduce_group,
                         sync_metadata=sync_metadata,
                         key_sync_group=key_sync_group,
+                        include_aggregation=include_aggregation,
                     )
                 )
             if reset:
@@ -492,6 +496,7 @@ class DistributedStatsTracker:
         reduce_group,
         sync_metadata: dict[str, _StatMetadata] | None = None,
         key_sync_group=None,
+        include_aggregation=False,
     ):
         metadata = sync_metadata.get(key) if sync_metadata is not None else None
         reduce_type = self.reduce_types.get(
@@ -501,14 +506,23 @@ class DistributedStatsTracker:
 
         if key in self.compact_keys or (metadata is not None and metadata.compact):
             return self._aggregate_compact(
-                key, reduce_type, reduce_group, sync_metadata, key_sync_group
+                key,
+                reduce_type,
+                reduce_group,
+                sync_metadata,
+                key_sync_group,
+                include_aggregation=include_aggregation,
             )
 
         result = {}
         if reduce_type == ReduceType.AVG_MIN_MAX:
-            result["/".join([key, "avg"])] = self._avg_of(
-                key, reduce_group, sync_metadata, key_sync_group
+            mean, numerator, denominator = self._avg_of(
+                key, reduce_group, sync_metadata, key_sync_group, return_totals=True
             )
+            result[key + "/avg"] = mean
+            if include_aggregation:
+                result[key + "/avg__sum"] = numerator
+                result[key + "/avg__weight"] = denominator
             result["/".join([key, "min"])] = self._min_of(
                 key, reduce_group, sync_metadata, key_sync_group
             )
@@ -516,11 +530,21 @@ class DistributedStatsTracker:
                 key, reduce_group, sync_metadata, key_sync_group
             )
         elif reduce_type == ReduceType.AVG:
-            result[key] = self._avg_of(key, reduce_group, sync_metadata, key_sync_group)
-        elif reduce_type == ReduceType.WEIGHTED_AVG:
-            result[key] = self._weighted_avg_of(
-                key, reduce_group, sync_metadata, key_sync_group
+            mean, numerator, denominator = self._avg_of(
+                key, reduce_group, sync_metadata, key_sync_group, return_totals=True
             )
+            result[key] = mean
+            if include_aggregation:
+                result[key + "__sum"] = numerator
+                result[key + "__weight"] = denominator
+        elif reduce_type == ReduceType.WEIGHTED_AVG:
+            mean, numerator, denominator = self._weighted_avg_of(
+                key, reduce_group, sync_metadata, key_sync_group, return_totals=True
+            )
+            result[key] = mean
+            if include_aggregation:
+                result[key + "__sum"] = numerator
+                result[key + "__weight"] = denominator
         elif reduce_type == ReduceType.SUM:
             result[key] = self._sum_of(key, reduce_group, sync_metadata, key_sync_group)
         elif reduce_type == ReduceType.MIN:
@@ -545,6 +569,8 @@ class DistributedStatsTracker:
                 cnt = self._all_reduce(cnt, group=effective_group)
             result[key] = float(value / cnt) if float(cnt) > 0 else 0.0
             result[key + "__count"] = int(cnt)
+            if include_aggregation:
+                result[key + "__sum"] = float(value)
         else:
             raise ValueError(f"Unknown reduce type: {reduce_type}")
 
@@ -559,6 +585,8 @@ class DistributedStatsTracker:
         reduce_group,
         sync_metadata: dict[str, _StatMetadata] | None = None,
         key_sync_group=None,
+        *,
+        return_totals=False,
     ):
         effective_group = self._effective_reduce_group(
             key, reduce_group, sync_metadata, key_sync_group
@@ -572,12 +600,18 @@ class DistributedStatsTracker:
         if effective_group is not None:
             totals = self._all_reduce(totals, group=effective_group)
         numerator, weight = totals.unbind()
-        if weight == 0:
-            return None
-        return numerator / weight
+        mean = None if weight == 0 else numerator / weight
+        return (mean, numerator, weight) if return_totals else mean
 
     def _aggregate_compact(
-        self, key, reduce_type, reduce_group, sync_metadata, key_sync_group
+        self,
+        key,
+        reduce_type,
+        reduce_group,
+        sync_metadata,
+        key_sync_group,
+        *,
+        include_aggregation=False,
     ):
         values = self.stats.get(key, [])
         group = self._effective_reduce_group(
@@ -608,16 +642,27 @@ class DistributedStatsTracker:
                 maximum = self._all_reduce(maximum, group=group, op=dist.ReduceOp.MAX)
         if reduce_type == ReduceType.SUM:
             return {key: float(total)}
+        aggregation = {}
+        if include_aggregation and reduce_type in (
+            ReduceType.AVG_MIN_MAX,
+            ReduceType.AVG,
+        ):
+            mean_key = key + "/avg" if reduce_type == ReduceType.AVG_MIN_MAX else key
+            aggregation = {
+                mean_key + "__sum": float(total),
+                mean_key + "__weight": float(count),
+            }
         if count == 0:
-            return {}
+            return aggregation
         if reduce_type == ReduceType.AVG_MIN_MAX:
             return {
+                **aggregation,
                 f"{key}/avg": float(total / count),
                 f"{key}/min": float(minimum),
                 f"{key}/max": float(maximum),
             }
         if reduce_type == ReduceType.AVG:
-            return {key: float(total / count)}
+            return {**aggregation, key: float(total / count)}
         if reduce_type == ReduceType.MIN:
             return {key: float(minimum)}
         if reduce_type == ReduceType.MAX:
@@ -681,6 +726,8 @@ class DistributedStatsTracker:
         reduce_group,
         sync_metadata: dict[str, _StatMetadata] | None = None,
         key_sync_group=None,
+        *,
+        return_totals=False,
     ):
         values = self.stats.get(key, [])
         if not values:
@@ -692,9 +739,8 @@ class DistributedStatsTracker:
             if effective_group is not None:
                 x = self._all_reduce(x, group=effective_group)
                 d = self._all_reduce(d, group=effective_group)
-            if d == 0:
-                return None
-            return x / d
+            mean = None if d == 0 else x / d
+            return (mean, x, d) if return_totals else mean
 
         denominator = self._denominator_of(key, sync_metadata)
         if denominator not in self.stats:
@@ -712,9 +758,8 @@ class DistributedStatsTracker:
         if effective_group is not None:
             x = self._all_reduce(x, group=effective_group)
             d = self._all_reduce(d, group=effective_group)
-        if d == 0:
-            return None
-        return x / d
+        mean = None if d == 0 else x / d
+        return (mean, x, d) if return_totals else mean
 
     def _min_of(
         self,
@@ -810,7 +855,9 @@ def get(name: str = ""):
         return TRACKERS[name]
 
 
-def export_all(reduce_group=None, key_sync_group=None, reset=True) -> dict[str, float]:
+def export_all(
+    reduce_group=None, key_sync_group=None, reset=True, *, include_aggregation=False
+) -> dict[str, float]:
     stat = {}
     duplicate_keys = set()
     tracker_keys = list(TRACKERS.keys())
@@ -825,6 +872,7 @@ def export_all(reduce_group=None, key_sync_group=None, reset=True) -> dict[str, 
             reduce_group=reduce_group,
             key_sync_group=key_sync_group,
             reset=reset,
+            include_aggregation=include_aggregation,
         )
         for k in x.keys():
             if k in stat:
