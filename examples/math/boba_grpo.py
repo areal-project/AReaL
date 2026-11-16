@@ -52,14 +52,27 @@ def get_boba_math_dataset(path, tokenizer):
 def boba_reward_fn(
     prompts, completions, prompt_ids, completion_ids, solutions, **kwargs
 ) -> float:
+    verification_errors = 0
+    verified_solutions = 0
     try:
         worker = get_math_verify_worker()
         for sol in solutions:
             try:
                 score = worker.verify(str(completions), str(sol))
+                verified_solutions += 1
                 if score == 1.0:
+                    record_disposition(
+                        "outcome",
+                        "verifier",
+                        "verdict",
+                        unit="verification",
+                        verdict_status="scored",
+                        raw_reward=1.0,
+                        task_success=True,
+                    )
                     return 1.0
             except Exception as exc:
+                verification_errors += 1
                 record_disposition(
                     "failure",
                     "verifier",
@@ -69,6 +82,23 @@ def boba_reward_fn(
                     error=str(exc),
                     outcome="try_next_solution",
                 )
+        record_disposition(
+            "outcome",
+            "verifier",
+            "verdict",
+            unit="verification",
+            verdict_status="infrastructure_failure"
+            if verification_errors
+            else "scored"
+            if verified_solutions
+            else "unscored",
+            raw_reward=0.0,
+            task_success=False
+            if verified_solutions and not verification_errors
+            else None,
+            verified_solutions=verified_solutions,
+            verification_errors=verification_errors,
+        )
         return 0.0
     except Exception as exc:
         record_disposition(
@@ -79,6 +109,15 @@ def boba_reward_fn(
             exception=type(exc).__name__,
             error=str(exc),
             outcome="zero_reward",
+        )
+        record_disposition(
+            "outcome",
+            "verifier",
+            "verdict",
+            unit="verification",
+            verdict_status="infrastructure_failure",
+            raw_reward=0.0,
+            task_success=None,
         )
         # Return 0 if completion parsing fails or any other error occurs
         return 0.0

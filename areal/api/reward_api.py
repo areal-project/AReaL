@@ -2,6 +2,7 @@
 
 import asyncio
 import atexit
+import math
 import os
 import threading
 import uuid
@@ -9,6 +10,7 @@ from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from functools import partial
+from numbers import Real
 
 from areal.utils import logging, perf_tracer
 
@@ -181,6 +183,29 @@ class AsyncRewardWrapper:
                             "reward_attempt": attempt + 1,
                         },
                     )
+                verdict = next(
+                    (
+                        item
+                        for item in reversed(diagnostics)
+                        if item.get("stage") == "verifier"
+                        and item.get("reason") == "verdict"
+                    ),
+                    {},
+                )
+                raw_reward = float(value) if isinstance(value, Real) else None
+                if raw_reward is not None and not math.isfinite(raw_reward):
+                    raw_reward = None
+                fallback_status = (
+                    "infrastructure_failure"
+                    if any(
+                        item.get("kind") == "failure"
+                        and item.get("outcome") == "zero_reward"
+                        for item in diagnostics
+                    )
+                    else "scored"
+                    if raw_reward is not None
+                    else "invalid_reward"
+                )
                 perf_tracer.record_disposition(
                     "outcome",
                     "reward",
@@ -190,6 +215,13 @@ class AsyncRewardWrapper:
                     layer="reward_pool",
                     unit="operation",
                     outcome="success",
+                    raw_reward=raw_reward,
+                    verdict_status=verdict.get(
+                        "verdict_status",
+                        fallback_status,
+                    ),
+                    task_success=verdict.get("task_success"),
+                    verdict_completed_ts=verdict.get("timestamp"),
                 )
                 return value
             except TimeoutError as exc:
@@ -210,6 +242,19 @@ class AsyncRewardWrapper:
                     f"{'Returning 0.' if is_last else 'Retrying...'}"
                 )
                 if is_last:
+                    perf_tracer.record_disposition(
+                        "outcome",
+                        "reward",
+                        "completed",
+                        operation_id=operation_id,
+                        attempt=attempt + 1,
+                        layer="reward_pool",
+                        unit="operation",
+                        outcome="zero_reward",
+                        raw_reward=0.0,
+                        verdict_status="infrastructure_failure",
+                        task_success=None,
+                    )
                     return 0.0
             except BrokenProcessPool as exc:
                 perf_tracer.record_disposition(

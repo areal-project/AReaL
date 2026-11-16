@@ -13,6 +13,7 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from contextlib import nullcontext
 from datetime import datetime
+from functools import partial
 from logging import Logger
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Protocol
@@ -166,32 +167,8 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                     ),
                 ):
                     perf_tracer.record_disposition("outcome", "sample", "started")
-                    try:
-                        async with backend_session(engine):
-                            result = await self.workflow.arun_episode(engine, data)
-                    except asyncio.CancelledError:
-                        perf_tracer.record_disposition(
-                            "drop",
-                            "sample",
-                            "cancelled",
-                            outcome="cancelled",
-                        )
-                        raise
-                    except Exception as exc:
-                        perf_tracer.record_disposition(
-                            "failure",
-                            "sample",
-                            "workflow_exception",
-                            exception=type(exc).__name__,
-                            outcome="raised",
-                        )
-                        raise
-                    perf_tracer.record_disposition(
-                        "outcome" if result else "drop",
-                        "sample",
-                        "completed" if result else "returned_none",
-                        outcome="completed" if result else "empty",
-                    )
+                    async with backend_session(engine):
+                        result = await self.workflow.arun_episode(engine, data)
             finally:
                 if request_ids is not None:
                     end_timing = getattr(engine, "end_sglang_timing_session", None)
@@ -200,10 +177,46 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             completed_results[sample_idx] = result
             return sample_idx, result
 
-        group_tasks = [
-            asyncio.create_task(run_sample(sample_idx))
-            for sample_idx in range(self.group_size)
-        ]
+        def record_terminal(sample_idx: int, task: asyncio.Task) -> None:
+            if task.cancelled():
+                perf_tracer.record_disposition(
+                    "drop",
+                    "sample",
+                    "cancelled",
+                    sample_index=sample_idx,
+                    outcome="cancelled",
+                    cancellation_reason="sibling_failure"
+                    if group_error is not None
+                    else "external_or_shutdown",
+                )
+            elif (error := task.exception()) is not None:
+                perf_tracer.record_disposition(
+                    "failure",
+                    "sample",
+                    "workflow_exception",
+                    sample_index=sample_idx,
+                    exception=type(error).__name__,
+                    error=str(error),
+                    outcome="raised",
+                )
+            else:
+                _, result = task.result()
+                perf_tracer.record_disposition(
+                    "outcome" if result else "drop",
+                    "sample",
+                    "completed" if result else "returned_none",
+                    sample_index=sample_idx,
+                    outcome="completed" if result else "empty",
+                )
+
+        group_tasks = []
+        for sample_idx in range(self.group_size):
+            perf_tracer.record_disposition(
+                "outcome", "sample", "submitted", sample_index=sample_idx
+            )
+            task = asyncio.create_task(run_sample(sample_idx))
+            task.add_done_callback(partial(record_terminal, sample_idx))
+            group_tasks.append(task)
         try:
             indexed_results = await asyncio.gather(*group_tasks)
         except BaseException as exc:

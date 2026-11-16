@@ -8,6 +8,7 @@ import functools
 import getpass
 import json
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -79,6 +80,8 @@ def record_disposition(kind: str, stage: str, reason: str, **fields) -> None:
         "stage": stage,
         "reason": reason,
         "timestamp": time.time(),
+        "hostname": socket.gethostname(),
+        "clock_source": "unix_realtime",
         **fields,
     }
     buffer = _disposition_buffer.get()

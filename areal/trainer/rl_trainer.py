@@ -705,13 +705,19 @@ class PPOTrainer:
         if self.eval_rollout is not None:
             self.eval_rollout.set_version(new_version)
 
-        if not self._is_v1_awex_colocate(self.config):
-            return
-
         # The AWEX reader flushes all old cache entries while installing the
         # new weights. Discard paused requests before restoring the KV pool so
         # none can continue with a mixture of old request state and new weights.
-        self.rollout.abort_all_requests()
+        if self._is_v1_awex_colocate(self.config):
+            self.rollout.abort_all_requests()
+        perf_tracer.record_disposition(
+            "outcome",
+            "weight_publish",
+            "completed",
+            unit="update",
+            global_step=new_version - 1,
+            weight_version=new_version,
+        )
 
     def _restore_awex_rollout_after_stats(self) -> None:
         """Restore AWEX KV memory after GPU-backed training stats are exported."""
