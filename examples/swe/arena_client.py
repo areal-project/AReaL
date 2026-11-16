@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Real
 from typing import Any, Literal
 from urllib.parse import parse_qs, quote, urlsplit
@@ -16,6 +16,9 @@ from urllib.parse import parse_qs, quote, urlsplit
 import httpx
 
 LLMProtocol = Literal["anthropic", "responses", "chat_completions"]
+
+# Each slot becomes a metric key. Bound the fan-out from artifact data.
+_MAX_SELFCHECK_SCORE_SLOTS = 10
 
 
 class ArenaAPIError(RuntimeError):
@@ -39,6 +42,7 @@ class ArenaTaskResult:
     computed_at: str | None = None
     # Optional telemetry is validated separately from the authoritative score.
     sub_scores: Any = None
+    selfcheck_metrics: dict[str, float] = field(default_factory=dict)
 
 
 def _arena_task_type_from_tags(tags: Any) -> str:
@@ -361,6 +365,101 @@ class ArenaOpenAPIClient:
         if not isinstance(result, dict):
             raise ArenaAPIError("Harness result artifact must be a JSON object")
         return result
+
+    async def get_selfcheck_metrics(
+        self, result: ArenaTaskResult, *, client: httpx.AsyncClient
+    ) -> dict[str, float]:
+        """Read Checker scores, carrying early stops to the Harness check budget."""
+        prefix, separator, suffix = (
+            (result.artifacts_uri or "").rstrip("/").rpartition("/attempts/")
+        )
+        if (
+            not separator
+            or not prefix
+            or not suffix.isascii()
+            or not suffix.isdecimal()
+        ):
+            return {}
+        try:
+            result_attempt = int(suffix)
+        except ValueError:
+            return {}
+        if result_attempt <= 0:
+            return {}
+        task_id = quote(result.task_id, safe="")
+        url = f"{self.base_url}/openapi/v1/tasks/{task_id}/artifacts"
+        response = await self._async_request(client, "GET", url, headers=self._headers)
+        items = _response_json(response)
+        if not isinstance(items, Mapping) or not isinstance(items.get("items"), list):
+            raise ArenaAPIError("Arena artifact listing is missing items")
+        agent_items = [
+            item
+            for item in items["items"]
+            if isinstance(item, Mapping)
+            and isinstance(item.get("name"), str)
+            and item.get("role") in ("agent", "harness")
+            and type(item.get("attempt")) is int
+            and 0 < item["attempt"] <= result_attempt
+        ]
+        attempt = max((item["attempt"] for item in agent_items), default=0)
+        names = {item.get("name") for item in agent_items if item["attempt"] == attempt}
+
+        async def read_artifact(name: str) -> Any:
+            if name not in names:
+                return None
+            response = await self._async_request(
+                client,
+                "GET",
+                f"{url}/{name}",
+                params={"attempt": attempt},
+                headers=self._headers,
+            )
+            return _response_json(response)
+
+        audit, budget = await asyncio.gather(
+            read_artifact("checker-audit.json"),
+            read_artifact("checker-budget.json"),
+            return_exceptions=True,
+        )
+        metrics: dict[str, float] = {}
+        used_calls = budget.get("used_calls") if isinstance(budget, Mapping) else None
+        max_calls = budget.get("max_calls") if isinstance(budget, Mapping) else None
+        if type(used_calls) is int and used_calls >= 0:
+            try:
+                metrics["calls"] = float(used_calls)
+            except OverflowError:
+                return metrics
+        elif audit == [] and "checker-budget.json" not in names:
+            metrics["calls"] = 0.0
+        # A common cohort requires a complete, valid check history. Missing or
+        # failed checks are not an early stop and must not be forward-filled.
+        if (
+            type(used_calls) is not int
+            or used_calls <= 0
+            or type(max_calls) is not int
+            or not used_calls <= max_calls <= _MAX_SELFCHECK_SCORE_SLOTS
+            or not isinstance(audit, list)
+            or len(audit) != used_calls
+        ):
+            return metrics
+        scores: list[float] = []
+        for row in audit:
+            report = row.get("response") if isinstance(row, Mapping) else None
+            if not isinstance(report, Mapping) or report.get("status") != "OK":
+                return metrics
+            score = report.get("score")
+            if type(score) not in (float, int):
+                return metrics
+            try:
+                score = float(score)
+            except OverflowError:
+                return metrics
+            if not math.isfinite(score):
+                return metrics
+            scores.append(score)
+        for index in range(1, max_calls + 1):
+            metrics[f"check_{index}/score"] = scores[min(index, used_calls) - 1]
+        return metrics
 
     def __init__(
         self,

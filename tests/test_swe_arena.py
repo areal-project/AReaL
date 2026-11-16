@@ -13,6 +13,7 @@ from examples.swe.arena_client import (
     ArenaAPIError,
     ArenaOpenAPIClient,
     ArenaTaskFailedError,
+    ArenaTaskResult,
     infer_llm_protocol,
     resolve_llm_protocol,
 )
@@ -1662,8 +1663,11 @@ def test_agent_passes_configured_threshold_to_custom_reward_transform(monkeypatc
     assert asyncio.run(run_agent()) == 0.875
 
 
-def test_agent_records_global_and_domain_raw_reward_after_transform(monkeypatch):
-    """Reward metrics should expose values on both sides of the transform."""
+@pytest.mark.parametrize("broken_listing", [False, True])
+def test_agent_records_global_and_domain_raw_reward_after_transform(
+    monkeypatch, broken_listing
+):
+    """Raw and transformed rewards survive a malformed Checker artifact listing."""
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "test-llm-key")
     _reset_stats()
@@ -1685,7 +1689,48 @@ def test_agent_records_global_and_domain_raw_reward_after_transform(monkeypatch)
         return "http://arena.example/proxy", "model-1"
 
     async def fake_launch(**_kwargs):
-        return 0.75
+        return ArenaTaskResult(
+            task_id="job:env:0",
+            status="DONE",
+            score=0.75,
+            artifacts_uri="tasks/job:env:0/attempts/3/",
+        )
+
+    def artifact_handler(request):
+        artifact = request.url.path.rsplit("/", 1)[-1]
+        if artifact == "artifacts":
+            if broken_listing:
+                # JSON decoding raises RecursionError rather than ArenaAPIError.
+                return httpx.Response(200, content=b"[" * 10_000 + b"]" * 10_000)
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {"name": "checker-audit.json", "role": "harness", "attempt": 1},
+                        {"name": "checker-audit.json", "role": "harness", "attempt": 2},
+                        {
+                            "name": "checker-budget.json",
+                            "role": "harness",
+                            "attempt": 2,
+                        },
+                        {"name": "reward_result.json", "role": "reward", "attempt": 3},
+                        {"name": "checker-audit.json", "role": "harness", "attempt": 4},
+                    ]
+                },
+            )
+        assert request.url.params["attempt"] == "2"
+        assert request.headers["Authorization"] == "Bearer arena-token"
+        if artifact == "checker-budget.json":
+            return httpx.Response(200, json={"used_calls": 4})
+        assert artifact == "checker-audit.json"
+        return httpx.Response(
+            200,
+            json=[
+                {"response": {"status": "OK", "score": 0}},
+                {"response": {"status": "EVAL_FAILED", "score": None}},
+                {"response": {"status": "OK", "score": 0.6}},
+            ],
+        )
 
     async def fake_delete(*_args, **_kwargs):
         return None
@@ -1701,7 +1746,9 @@ def test_agent_records_global_and_domain_raw_reward_after_transform(monkeypatch)
     }
 
     async def run_and_record_metrics():
-        async with httpx.AsyncClient(trust_env=False) as http_client:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(artifact_handler)
+        ) as http_client:
             reward = await workflow.run(
                 data,
                 base_url="http://rollout-proxy",
@@ -1720,6 +1767,13 @@ def test_agent_records_global_and_domain_raw_reward_after_transform(monkeypatch)
     assert stats["rollout/swe/raw_reward"] == pytest.approx(0.75)
     assert stats["debug/task/data-1/raw_reward"] == pytest.approx(0.75)
     assert "rollout/task/data-1/raw_reward" not in stats
+    selfcheck = {
+        key.split("/selfcheck/")[1]: value
+        for key, value in stats.items()
+        if "/selfcheck/" in key and not key.endswith("__count")
+    }
+    # Incomplete/failed check histories do not enter the filled-score cohort.
+    assert selfcheck == pytest.approx({} if broken_listing else {"calls": 4.0})
 
 
 def test_agent_records_global_and_domain_pass_at_k(monkeypatch):

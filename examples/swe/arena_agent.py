@@ -14,7 +14,7 @@ import stat
 import uuid
 from contextlib import suppress
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Real
 from pathlib import Path
 from typing import Any, Literal
@@ -1671,6 +1671,12 @@ class ArenaStreamAgentWorkflow:
                 }
             )
         if result is not None:
+            metrics.update(
+                {
+                    f"stream/{stream_config.name}/selfcheck/{key}": value
+                    for key, value in result.selfcheck_metrics.items()
+                }
+            )
             reward_metrics = arena_reward_metrics(
                 sub_scores=result.sub_scores, raw=result.raw, score=result.score
             )
@@ -2270,6 +2276,22 @@ class ArenaStreamAgentWorkflow:
                 _record_arena_metrics(**{"arena/result_processing_success": 0.0})
                 _record_arena_metrics(**{"arena/call_success": 0.0})
                 raise
+            if task_result.artifacts_uri:
+                try:
+                    async with asyncio.timeout(min(self.request_timeout, 5.0)):
+                        checker_metrics = await self.client.get_selfcheck_metrics(
+                            task_result, client=client
+                        )
+                    task_result = replace(
+                        task_result, selfcheck_metrics=checker_metrics
+                    )
+                except Exception as exc:
+                    # Optional telemetry must not invalidate a successful rollout.
+                    logger.warning(
+                        "Could not read Checker metrics for Arena task %s (%s)",
+                        task_result.task_id,
+                        type(exc).__name__,
+                    )
             _record_arena_metrics(**{"arena/result_processing_success": 1.0})
             _record_arena_metrics(**{"arena/terminal_success": 1.0})
             _record_arena_metrics(**{"arena/call_success": 1.0})
