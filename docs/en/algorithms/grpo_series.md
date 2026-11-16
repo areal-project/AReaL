@@ -51,8 +51,7 @@ You can also switch algorithms by overriding configuration parameters:
 python3 examples/math/gsm8k_rl.py \
   --config examples/math/gsm8k_grpo.yaml \
   scheduler.type=local \
-  actor.adv_norm.mean_level=group \
-  actor.adv_norm.std_level=null
+  actor.reward_norm.std_level=null
 
 # GSPO from GRPO config
 python3 examples/math/gsm8k_rl.py \
@@ -141,13 +140,15 @@ actor:
     group_size: ${gconfig.n_samples}
 ```
 
-**AReaL Default Practice**: The default configuration uses `std_level: batch` for
-advantage normalization. This has been the AReaL team's standard practice across diverse
-RL applications, from game AI (StarCraft) to LLM training (RLHF, reasoning, agentic
-settings). While [Dr.GRPO](https://arxiv.org/abs/2503.20783) recommends
-`std_level: null` for potentially improved performance, we retain `std_level: batch` for
-backward compatibility. Users seeking Dr.GRPO-style behavior should set
-`actor.adv_norm.std_level=null`.
+**AReaL Default Practice**: Critic-based PPO uses batch-level advantage normalization
+(`actor.adv_norm` with `mean_level: batch` and `std_level: batch`,
+`actor.reward_norm: null`). Group-relative algorithms (GRPO, Dr.GRPO, LitePPO, RLOO,
+GSPO, DAPO, etc.) normalize outcome rewards per prompt group via `actor.reward_norm` and
+set `actor.adv_norm: null` so token-weighted batch normalization does not shift the
+group-centered baseline. While [Dr.GRPO](https://arxiv.org/abs/2503.20783) recommends
+`std_level: null` to avoid per-group standard deviation scaling, standard GRPO configs
+use `reward_norm.std_level: group`; users seeking Dr.GRPO-style behavior should set
+`actor.reward_norm.std_level=null`.
 
 ### Clipping Strategy (`actor.eps_clip*`)
 
@@ -176,18 +177,18 @@ $\text{clip}(r, 1-\epsilon_{\text{low}}, 1+\epsilon_{\text{high}})$.
 The following table shows how to configure each algorithm by setting the appropriate
 parameters:
 
-| Algorithm   | `adv_norm.mean_level` | `adv_norm.std_level` | `adv_norm.mean_leave1out` | `importance_sampling_level` | Special                           |
-| ----------- | --------------------- | -------------------- | ------------------------- | --------------------------- | --------------------------------- |
-| **PPO**     | `batch`               | `batch`              | `false`                   | `token`                     | critic model.                     |
-| **GRPO**    | `batch`               | `batch`              | `false`                   | `token`                     | -                                 |
-| **Dr.GRPO** | `group`               | `null`               | `false`                   | `token`                     | -                                 |
-| **LitePPO** | `group`               | `batch`              | `false`                   | `token`                     | -                                 |
-| **RLOO**    | `group`               | `null`               | `true`                    | `token`                     | -                                 |
-| **GSPO**    | `batch`               | `batch`              | `false`                   | `sequence`                  | -                                 |
-| **DAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | asymmetric clip, dynamic sampling      |
-| **SAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | `use_sapo_loss=true`                   |
-| **IcePop**  | `batch`               | `batch`              | `false`                   | `token`                     | `rejection_sampling.metric=ratio`      |
-| **KPop**    | `batch`               | `batch`              | `false`                   | `token`                     | `rejection_sampling.metric=binary_kl`  |
+| Algorithm   | `reward_norm.mean_level` | `reward_norm.std_level` | `reward_norm.mean_leave1out` | `adv_norm`       | `importance_sampling_level` | Special                               |
+| ----------- | ------------------------ | ----------------------- | ---------------------------- | ---------------- | --------------------------- | ------------------------------------- |
+| **PPO**     | `null`                   | `null`                  | -                            | `batch`, `batch` | `token`                     | critic model.                         |
+| **GRPO**    | `group`                  | `group`                 | `false`                      | `null`           | `token`                     | -                                     |
+| **Dr.GRPO** | `group`                  | `null`                  | `false`                      | `null`           | `token`                     | -                                     |
+| **LitePPO** | `group`                  | `batch`                 | `false`                      | `null`           | `token`                     | -                                     |
+| **RLOO**    | `group`                  | `null`                  | `true`                       | `null`           | `token`                     | -                                     |
+| **GSPO**    | `group`                  | `group`                 | `false`                      | `null`           | `sequence`                  | -                                     |
+| **DAPO**    | `group`                  | `group`                 | `false`                      | `null`           | `token`                     | asymmetric clip, dynamic sampling     |
+| **SAPO**    | `group`                  | `group`                 | `false`                      | `null`           | `token`                     | `use_sapo_loss=true`                  |
+| **IcePop**  | `group`                  | `group`                 | `false`                      | `null`           | `token`                     | `rejection_sampling.metric=ratio`     |
+| **KPop**    | `group`                  | `group`                 | `false`                      | `null`           | `token`                     | `rejection_sampling.metric=binary_kl` |
 
 **Note**: The "GRPO" row reflects the original DeepSeekMath formulation. AReaL's default
 GRPO config uses these settings but with length normalization already removed (see AReaL
@@ -222,7 +223,7 @@ $$
 
 RLOO estimates the baseline by averaging rewards of **other** sampled responses
 (excluding the current one). This is achieved by setting
-`actor.adv_norm.mean_leave1out=true`.
+`actor.reward_norm.mean_leave1out=true`.
 
 $$ J_{\text{RLOO}}(\theta) = \mathbb{E}_{\substack{q \sim P(Q), \\ {o_i}_{i=1}^G
 \sim \pi_{\theta_{\text{old}}}(O \mid q)}} \left[ \frac{1}{G} \sum_{i=1}^G

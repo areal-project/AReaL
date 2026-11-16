@@ -76,9 +76,7 @@ actor:
     mean_level: group
     std_level: group
     group_size: ${gconfig.n_samples}
-  adv_norm:
-    mean_level: batch
-    std_level: batch
+  adv_norm: null
   log_agent_stats: true
   log_agent_stats_keys:
     - num_input_tokens

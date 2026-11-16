@@ -84,9 +84,7 @@ actor:
     mean_level: group
     std_level: group
     group_size: ${gconfig.n_samples}
-  adv_norm:
-    mean_level: batch
-    std_level: batch
+  adv_norm: null
   max_new_tokens: ${gconfig.max_new_tokens}
   megatron:
     bridge_type: megatron-bridge
