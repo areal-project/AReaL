@@ -49,7 +49,7 @@ def test_supervised_command_quotes_arguments_without_importing_framework(tmp_pat
 
 
 def _target_command(shell_command: str) -> str:
-    return shell_command.split(" 2>&1", maxsplit=1)[0]
+    return shell_command.removeprefix("set -o pipefail; ").split(" 2>&1", maxsplit=1)[0]
 
 
 def test_build_streaming_log_cmd_regular_env_uses_target_stdbuf(monkeypatch):
@@ -227,3 +227,15 @@ def test_build_streaming_log_cmd_without_stdbuf_preserves_fallback(monkeypatch):
 
     assert _target_command(command) == "python worker.py"
     assert "stdbuf" not in command
+
+
+def test_streaming_logs_preserves_worker_failure_exit_code(tmp_path):
+    with (tmp_path / "stdout").open("w") as output:
+        process = run_with_streaming_logs(
+            [sys.executable, "-c", "raise SystemExit(7)"],
+            tmp_path / "worker.log",
+            tmp_path / "merged.log",
+            "rollout",
+            stdout=output,
+        )
+        assert process.wait(timeout=5) == 7
