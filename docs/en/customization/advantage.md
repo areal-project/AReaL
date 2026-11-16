@@ -83,10 +83,11 @@ should use framework metadata rather than constructing partial metadata themselv
 Temporal functions accept `TemporalInputs` from `areal.trainer.ppo.advantage_algorithms`
 and return `TemporalResult(advantages, returns, total_rewards)`. Inputs use next-token
 prediction alignment. Outcome, KL, and folded process rewards are separate channels. The
-explicit `bootstrap_values` come from each trajectory's actual final valid token.
-Callable lambda functions can be resolved with `compute_gae_lambda` in
-`areal.trainer.ppo.gae`, passing the estimator's timestep unit. `total_rewards` is the
-token-aligned monitoring channel.
+explicit `bootstrap_values` come from each trajectory's actual final valid token, and
+`seq_no_eos_mask` enables endpoint bootstrapping only for truncated trajectories whose
+terminal reward was masked by `mask_no_eos_with_zero=True`. Callable lambda functions
+can be resolved with `compute_gae_lambda` in `areal.trainer.ppo.gae`, passing the
+estimator's timestep unit. `total_rewards` is the token-aligned monitoring channel.
 
 Process functions accept `ProcessAdvantageInputs` and return a tensor of advantages.
 They receive normalized advantages, aligned direct token rewards (possibly `None`), and

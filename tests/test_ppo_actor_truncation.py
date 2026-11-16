@@ -23,13 +23,16 @@ def _make_trajectory(
     completion_len: int,
     reward: float,
     bootstrap_value: float,
-    is_truncated: bool,
+    is_truncated: bool | None = False,
+    action_value: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     seq_len = prompt_len + completion_len
     values = torch.zeros((1, seq_len), dtype=torch.float32)
+    if completion_len > 0:
+        values[0, prompt_len - 1 : seq_len - 1] = action_value
     values[0, -1] = bootstrap_value
 
-    return {
+    trajectory = {
         "input_ids": torch.arange(seq_len, dtype=torch.long).unsqueeze(0),
         "attention_mask": torch.ones((1, seq_len), dtype=torch.bool),
         "loss_mask": torch.tensor(
@@ -41,8 +44,10 @@ def _make_trajectory(
         ),
         "values": values,
         "rewards": torch.tensor([reward], dtype=torch.float32),
-        "is_truncated": torch.tensor([is_truncated], dtype=torch.bool),
     }
+    if is_truncated is not None:
+        trajectory["is_truncated"] = torch.tensor([is_truncated], dtype=torch.bool)
+    return trajectory
 
 
 def _assert_action_advantages(output: dict[str, torch.Tensor], expected: float) -> None:
@@ -50,6 +55,16 @@ def _assert_action_advantages(output: dict[str, torch.Tensor], expected: float) 
     torch.testing.assert_close(
         action_advantages,
         torch.full_like(action_advantages, expected),
+        rtol=0,
+        atol=0,
+    )
+
+
+def _assert_action_returns(output: dict[str, torch.Tensor], expected: float) -> None:
+    action_returns = output["returns"][output["loss_mask"].bool()]
+    torch.testing.assert_close(
+        action_returns,
+        torch.full_like(action_returns, expected),
         rtol=0,
         atol=0,
     )
@@ -299,3 +314,139 @@ def test_compute_advantages_uses_termination_reason_across_variable_padding(
         atol=0,
     )
     _assert_action_advantages(stopped, expected=3.0)
+
+
+@pytest.mark.parametrize("gae_timestep_unit", ["token", "turn"])
+def test_compute_advantages_kept_truncation_reward_does_not_bootstrap(
+    gae_timestep_unit: str,
+):
+    """Truncated trajectories with kept rewards are terminal and do not bootstrap."""
+    engine = MagicMock()
+    engine.train_batch.return_value = {}
+    actor = PPOActor(
+        PPOActorConfig(
+            backend="fsdp:d1",
+            ppo_n_minibatches=1,
+            max_new_tokens=3,
+            mask_no_eos_with_zero=False,
+            kl_ctl=0.0,
+            discount=1.0,
+            gae_lambda=1.0,
+            gae_timestep_unit=gae_timestep_unit,
+        ),
+        engine,
+    )
+
+    outputs = actor.compute_advantages(
+        [
+            _make_trajectory(
+                prompt_len=2,
+                completion_len=3,
+                reward=0.0,
+                action_value=0.8,
+                bootstrap_value=10.0,
+                is_truncated=True,
+            ),
+            _make_trajectory(
+                prompt_len=4,
+                completion_len=3,
+                reward=3.0,
+                action_value=0.8,
+                bootstrap_value=20.0,
+                is_truncated=False,
+            ),
+        ]
+    )
+
+    truncated, stopped = outputs
+
+    torch.testing.assert_close(
+        truncated["tot_rewards"],
+        torch.zeros_like(truncated["tot_rewards"]),
+        rtol=0,
+        atol=0,
+    )
+    _assert_action_returns(truncated, expected=0.0)
+    _assert_action_advantages(truncated, expected=-0.8)
+    torch.testing.assert_close(
+        truncated["is_truncated"],
+        torch.tensor([True], dtype=torch.bool),
+        rtol=0,
+        atol=0,
+    )
+
+    assert torch.count_nonzero(stopped["tot_rewards"]) == 1
+    torch.testing.assert_close(
+        stopped["tot_rewards"].sum(),
+        torch.tensor(3.0),
+        rtol=0,
+        atol=0,
+    )
+    _assert_action_returns(stopped, expected=3.0)
+    _assert_action_advantages(stopped, expected=2.2)
+    torch.testing.assert_close(
+        stopped["is_truncated"],
+        torch.tensor([False], dtype=torch.bool),
+        rtol=0,
+        atol=0,
+    )
+
+    batch = concat_padded_tensors(outputs)
+    with patch("areal.trainer.ppo.actor.stats_tracker") as tracker:
+        actor._ppo_update(batch)
+
+    truncation_call = next(
+        call for call in tracker.stat.call_args_list if "no_eos_ratios" in call.kwargs
+    )
+    torch.testing.assert_close(
+        truncation_call.kwargs["no_eos_ratios"],
+        torch.tensor([1.0, 0.0]),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("gae_timestep_unit", ["token", "turn"])
+@pytest.mark.parametrize("mask_no_eos_with_zero", [False, True])
+def test_compute_advantages_legacy_fallback_respects_mask_no_eos_flag(
+    gae_timestep_unit: str,
+    mask_no_eos_with_zero: bool,
+):
+    """Legacy width-based truncation still gates bootstrapping on mask_no_eos_with_zero."""
+    actor = PPOActor(
+        PPOActorConfig(
+            backend="fsdp:d1",
+            max_new_tokens=3,
+            mask_no_eos_with_zero=mask_no_eos_with_zero,
+            kl_ctl=0.0,
+            discount=1.0,
+            gae_lambda=1.0,
+            gae_timestep_unit=gae_timestep_unit,
+        ),
+        MagicMock(),
+    )
+
+    outputs = actor.compute_advantages(
+        [
+            _make_trajectory(
+                prompt_len=2,
+                completion_len=3,
+                reward=0.0,
+                action_value=0.8,
+                bootstrap_value=10.0,
+                is_truncated=None,
+            )
+        ]
+    )
+
+    output = outputs[0]
+    expected_return = 10.0 if mask_no_eos_with_zero else 0.0
+    expected_advantage = 9.2 if mask_no_eos_with_zero else -0.8
+    _assert_action_returns(output, expected=expected_return)
+    _assert_action_advantages(output, expected=expected_advantage)
+    torch.testing.assert_close(
+        output["is_truncated"],
+        torch.tensor([True], dtype=torch.bool),
+        rtol=0,
+        atol=0,
+    )
