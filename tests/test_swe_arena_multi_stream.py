@@ -227,17 +227,18 @@ def test_parse_arena_stream_config_rejects_metric_unsafe_name():
         parse_arena_stream_config({"name": "bad/name", "stream_id": "stream-a"})
 
 
-def test_load_arena_stream_configs_rejects_duplicate_stream_ids():
-    """A copied Stream id must not silently receive multiple mixture weights."""
-    with pytest.raises(ValueError, match="ids must be unique"):
-        load_arena_stream_configs(
-            {
-                "arena_streams": [
-                    {"name": "a", "stream_id": "stream-a"},
-                    {"name": "b", "stream_id": "stream-a"},
-                ]
-            }
-        )
+def test_load_arena_stream_configs_allows_duplicate_ids_for_logical_harnesses():
+    """One real Stream can have separate logical Harness metric namespaces."""
+    streams = load_arena_stream_configs(
+        {
+            "arena_streams": [
+                {"name": "a", "stream_id": "stream-a"},
+                {"name": "b", "stream_id": "stream-a"},
+            ]
+        }
+    )
+    assert [stream.name for stream in streams] == ["a", "b"]
+    assert [stream.stream_id for stream in streams] == ["stream-a", "stream-a"]
 
 
 def test_build_weighted_arena_rows_uses_attempted_group_weights():

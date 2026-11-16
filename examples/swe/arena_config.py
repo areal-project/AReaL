@@ -238,9 +238,10 @@ def load_arena_stream_configs(econfig: Any) -> list[ArenaStreamConfig]:
     names = [stream.name for stream in streams]
     if len(names) != len(set(names)):
         raise ValueError("Arena Stream names must be unique")
-    stream_ids = [stream.stream_id for stream in streams]
-    if len(stream_ids) != len(set(stream_ids)):
-        raise ValueError("Arena Stream ids must be unique")
+    # A logical mixture entry may intentionally point at the same Arena Stream
+    # more than once.  This is used when one dataset is evaluated through
+    # multiple Harnesses: ``name`` keeps the metric/reward-routing namespace
+    # separate while ``stream_id`` remains the original platform Stream id.
     return streams
 
 
