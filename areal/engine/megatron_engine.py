@@ -145,6 +145,7 @@ from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform, is_npu_available
 from areal.models.mcore.bailing_v3_bridge import BailingV3Bridge
 from areal.models.mcore.hf_load import (
+    dequant_fp8_safetensor_io,
     load_critic_value_head,
     load_weights_from_hf_with_mbridge_fast,
 )
@@ -3999,15 +4000,29 @@ class MegatronEngine(TrainEngine):
             with torch.device("cpu"):
                 self.bridge.load_weights(self.model, path)
         else:
-            if (
-                is_qwen3_5_model(getattr(self.hf_config, "model_type", ""))
-                and not self.fp8_direct_convert
-            ):
+            if is_qwen3_5_model(getattr(self.hf_config, "model_type", "")):
+                if self.fp8_direct_convert:
+                    raise NotImplementedError(
+                        "fp8_direct_convert=True is not supported for Qwen3.5 with "
+                        "bridge_type='mbridge'; set "
+                        "megatron.fp8_config.direct_convert=False."
+                    )
                 # AReaL's fast loader does not handle Qwen3.5's gated QKV,
                 # zero-centered out_norm, or GDN linear-attention layouts.
-                # Delegate to mbridge's native loader, which skips lm_head for
-                # one-row critic value heads.
-                with torch.device("cpu"):
+                # Delegate to mbridge's native loader with FP8 dequantization,
+                # which skips lm_head for one-row critic value heads.
+                with (
+                    torch.device("cpu"),
+                    dequant_fp8_safetensor_io(
+                        self.bridge,
+                        quantization_config=getattr(self, "quantization_config", None),
+                        dst_dtype=(
+                            getattr(self.bridge, "dtype", None)
+                            or getattr(self, "dtype", None)
+                            or torch.bfloat16
+                        ),
+                    ),
+                ):
                     self.bridge.load_weights(self.model, path)
                 if self.config.is_critic:
                     load_critic_value_head(self.model, path, bridge=self.bridge)
