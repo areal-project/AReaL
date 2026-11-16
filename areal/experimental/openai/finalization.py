@@ -3,6 +3,7 @@
 """Rollout response policy, applied after selection and before reward propagation."""
 
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 
@@ -10,6 +11,7 @@ from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 
 ResponseValidator = Callable[[InteractionWithTokenLogpReward], str | None]
+ResponseValidationPolicy = Literal["final_response", "artifact_reward"]
 
 
 def final_response_error(interaction: InteractionWithTokenLogpReward) -> str | None:
@@ -28,6 +30,28 @@ def final_response_error(interaction: InteractionWithTokenLogpReward) -> str | N
     if not facts["has_content"] and not facts["has_tool_calls"]:
         return "empty_assistant_response"
     return None
+
+
+def artifact_response_error(interaction: InteractionWithTokenLogpReward) -> str | None:
+    """Trust an external artifact score without requiring a final text answer.
+
+    Some artifact Harnesses finish with an auxiliary request, such as a title.
+    Its lack of visible text does not invalidate the evaluated artifact.
+    Malformed tool calls retain the strict policy's model-failure semantics.
+    """
+    error = final_response_error(interaction)
+    return None if error == "empty_assistant_response" else error
+
+
+def response_validator_for_policy(
+    policy: ResponseValidationPolicy,
+) -> ResponseValidator:
+    """Resolve an explicit export policy; unknown values must not relax validation."""
+    if policy == "final_response":
+        return final_response_error
+    if policy == "artifact_reward":
+        return artifact_response_error
+    raise ValueError(f"Unknown response validation policy: {policy!r}")
 
 
 def finalize_interactions(

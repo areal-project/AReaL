@@ -1599,6 +1599,13 @@ async def export_trajectories(
 
     # Apply the task return before final-response validation.
     export_kwargs = {}
+    if request.response_validation_policy != "final_response":
+        if request.episode_reward is None or _prm_runner is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Artifact reward policy requires an episode reward and no PRM",
+            )
+        export_kwargs["response_validation_policy"] = request.response_validation_policy
     if request.episode_reward is not None and _prm_runner is None:
         export_kwargs["episode_reward"] = request.episode_reward
     elif request.episode_reward is not None:
