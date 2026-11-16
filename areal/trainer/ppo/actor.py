@@ -1055,7 +1055,19 @@ def grpo_loss_fn(
     teacher_logp = input_data.get("teacher_logp")
     rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
     distill_loss_weight = input_data.get("distill_loss_weight", 0.005)
+    kl_estimator = input_data.get("kl_estimator", "k1")
+    if kl_estimator not in ("k1", "k2", "k3"):
+        raise ValueError(
+            f"kl_estimator must be 'k1', 'k2', or 'k3', got {kl_estimator!r}."
+        )
     pure_distill = teacher_logp is not None and rl_loss_weight == 0
+    if kl_estimator != "k1" and not pure_distill:
+        # Reject rather than silently falling back to k1. The selected value is
+        # only defined for the pure-KD path; joint KD+RL keeps its own term.
+        raise ValueError(
+            f"kl_estimator={kl_estimator!r} is only supported for sampled "
+            "pure-KD distillation (rl_loss_weight=0)."
+        )
     if pure_distill:
         # Pure KD: the per-token reverse-KL reward log pi_T - log pi_theta replaces
         # the task advantage, so the policy loss below clips its importance ratio
@@ -1194,6 +1206,30 @@ def grpo_loss_fn(
     elif pure_distill:
         loss = distill_loss_weight * loss
         rkl_stat = -advantages
+        # Optional forward-value selection. The policy loss above owns clipping,
+        # rejection and the backward pass; selecting a different estimator
+        # changes only the reported scalar, not the update. A straight-through
+        # carrier swaps the forward value while keeping d(loss)/d(params) from
+        # the clipped policy loss, so all three estimators remain
+        # gradient-equivalent on matched finite inputs.
+        if kl_estimator != "k1":
+            x_sel = (teacher_logp - logprobs).detach() * loss_mask
+            x_sel32 = (
+                x_sel
+                if x_sel.dtype in (torch.float32, torch.float64)
+                else x_sel.float()
+            )
+            if kl_estimator == "k2":
+                selected_per_token = (0.5 * x_sel32**2).to(logprobs.dtype)
+            else:
+                selected_per_token = (torch.expm1(x_sel32) - x_sel32).to(logprobs.dtype)
+            selected_value = (
+                distill_loss_weight
+                * selected_per_token.sum()
+                / denominator_mask.sum().clamp(min=1)
+            )
+            loss = selected_value + (loss - loss.detach())
+            rkl_stat = selected_per_token
     elif teacher_logp is not None:
         # KDRL joint loss. The teacher term of log pi_theta - log pi_T is constant,
         # so backpropagating it drops the teacher. The k2 estimate
@@ -1204,6 +1240,25 @@ def grpo_loss_fn(
         rkl_penalty = rkl_penalty / denominator_mask.sum().clamp(min=1)
         loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
         rkl_stat = log_ratio.detach() * loss_mask
+
+    # Optional same-token diagnostics for all three estimates. Detached and
+    # unweighted: these describe the behavior-distribution draws, not an
+    # importance-weighted current-student KL. They are reported on the effective
+    # loss mask and do not affect the loss, its gradient, or ``rkl_loss``.
+    distill_diag = None
+    if teacher_logp is not None and input_data.get("log_distill_diagnostics", False):
+        x_det = (teacher_logp - logprobs).detach()
+        # Mirror the loss path's precision guard: in bf16 a large positive x
+        # overflows expm1 to inf (would log inf) and a tiny x underflows
+        # 0.5*x^2 to 0. Higher-precision inputs are preserved.
+        x_det32 = (
+            x_det if x_det.dtype in (torch.float32, torch.float64) else x_det.float()
+        )
+        distill_diag = dict(
+            k1=-x_det,
+            k2=(0.5 * x_det32**2).to(logprobs.dtype),
+            k3=(torch.expm1(x_det32) - x_det32).to(logprobs.dtype),
+        )
 
     # Match the engine's aggregation across microbatches and data-parallel ranks.
     stats_tracker.weighted_mean(
@@ -1235,6 +1290,15 @@ def grpo_loss_fn(
                 rkl_loss=rkl_stat,
                 denominator="n_valid_tokens",
             )
+
+    if distill_diag is not None:
+        # Same-token, unweighted diagnostics, averaged over valid tokens.
+        stats_tracker.stat(
+            distill_kl_k1=distill_diag["k1"],
+            distill_kl_k2=distill_diag["k2"],
+            distill_kl_k3=distill_diag["k3"],
+            denominator="n_valid_tokens",
+        )
 
     if use_score_centering:
         stats_tracker.stat(
