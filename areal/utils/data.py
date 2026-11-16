@@ -1157,6 +1157,8 @@ def split_training_batch_into_microbatches(
     data: dict[str, Any],
     n_mbs: int,
     group: dist.ProcessGroup | None = None,
+    *,
+    return_source_indices: bool = False,
 ) -> list[dict[str, Any]]:
     """Build a synchronized PPO schedule without all-dummy global steps."""
     if n_mbs < 1:
@@ -1166,11 +1168,22 @@ def split_training_batch_into_microbatches(
         raise ValueError("Cannot split an empty training batch")
 
     local_n_mbs = min(batch_size, n_mbs)
-    local_mbs = split_padded_tensor_dict_into_mb_list(
+    split = split_padded_tensor_dict_into_mb_list(
         data,
         MicroBatchSpec(n_mbs=local_n_mbs),
         sync_mbs=False,
-    ).mbs
+    )
+    local_mbs = split.mbs
+    if return_source_indices:
+        offset = 0
+        for microbatch in local_mbs:
+            rows = get_batch_size(microbatch)
+            microbatch["_source_row_indices"] = (
+                []
+                if data.get(TRANSPORT_DUMMY_KEY, False)
+                else split.forward_indices[offset : offset + rows]
+            )
+            offset += rows
     if not dist.is_initialized():
         if local_n_mbs < n_mbs:
             logger.warning(
@@ -1217,6 +1230,8 @@ def split_training_batch_into_microbatches(
         scheduled[slot] = microbatch
 
     dummy = make_transport_microbatch(data)
+    if return_source_indices:
+        dummy["_source_row_indices"] = []
     return [
         microbatch if microbatch is not None else copy.deepcopy(dummy)
         for microbatch in scheduled

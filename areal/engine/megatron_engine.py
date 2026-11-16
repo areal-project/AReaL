@@ -2363,6 +2363,39 @@ class MegatronEngine(TrainEngine):
                 ] / max(active_mbs, 1)
                 stats_tracker.scalar(**r3_scalar_stats)
 
+    def _training_workload(self, mb_list: MicroBatchList) -> dict[str, int]:
+        """Count CPU-prepared slots before CP partitioning, once per DP replica."""
+        if self.enable_tree_training:
+            return {}
+        real_tokens = slots = transport_tokens = transport_slots = 0
+        for original, padded, length in zip(
+            mb_list.mbs, mb_list.padded_mbs, mb_list.group_lens
+        ):
+            count = padded["input_ids"].numel()
+            if self.sequence_packing_mode == SequencePackingMode.PADDED:
+                cu = padded.get("cu_seqlens")
+                if cu is not None:
+                    count = (len(cu) - 1) * int(padded["max_seqlen"])
+            slots += count
+            if original.get(TRANSPORT_DUMMY_KEY, False):
+                transport_tokens += length
+                transport_slots += count
+            else:
+                real_tokens += length
+        return {
+            "training_work_real_tokens": int(real_tokens),
+            "training_work_token_slots": int(slots),
+            "training_work_padding_tokens": int(slots - transport_slots - real_tokens),
+            "training_work_transport_tokens": int(transport_tokens),
+            "training_work_transport_slots": int(transport_slots),
+            "training_work_dp_rank": mpu.get_data_parallel_rank(),
+            "training_work_representative": int(
+                mpu.get_tensor_model_parallel_rank() == 0
+                and mpu.get_pipeline_model_parallel_rank() == 0
+                and mpu.get_context_parallel_rank() == 0
+            ),
+        }
+
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
@@ -2379,6 +2412,11 @@ class MegatronEngine(TrainEngine):
             # Step 1: Prepare micro-batches
             mb_list = self._prepare_mb_list(
                 tensor_container_to(input_batched, "cpu"), allow_transport_padding=True
+            )
+            work = (
+                self._training_workload(mb_list)
+                if perf_tracer.aggregation_enabled()
+                else {}
             )
 
             # Step 2: Select the normalization path from the model's effective config.
@@ -2473,6 +2511,7 @@ class MegatronEngine(TrainEngine):
             # Step 4: Optimizer step
             stats = self.optimizer_step()
             stats["num_micro_batches"] = len(mb_list.mbs)
+            stats.update(work)
 
             # Step 5: Surface the auxiliary MTP loss for logging (if enabled).
             mtp_loss = self._collect_mtp_loss(len(mb_list.mbs))

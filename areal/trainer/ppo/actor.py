@@ -688,11 +688,34 @@ class PPOActor:
                 .unsqueeze(1)
                 .expand(-1, seq_len)
             )
+        trace_work = perf_tracer.aggregation_enabled()
+        row_identities = []
+        if trace_work and meta is not None:
+            for group, rows in zip(
+                meta.rollout_groups or [None] * meta.n_trajs, meta.traj_group_sizes
+            ):
+                if group is None:
+                    row_identities.extend([None] * rows)
+                    continue
+                for sample_index, row_count in zip(
+                    group.sample_indices, group.row_counts
+                ):
+                    row_identities.extend(
+                        dict(
+                            query_id=group.query_id,
+                            occurrence_id=group.occurrence_id,
+                            sample_index=sample_index,
+                            row_within_sample=row,
+                        )
+                        for row in range(row_count)
+                    )
         mb_inputs = split_training_batch_into_microbatches(
             data,
             n_mbs=self.config.ppo_n_minibatches,
             group=self.engine.data_parallel_group,
+            return_source_indices=trace_work,
         )
+        work_indices = [mb.pop("_source_row_indices", []) for mb in mb_inputs]
         data.pop("_r3_row_indices", None)
         data.pop("_numeric_row_indices", None)
         data.pop("_numeric_token_positions", None)
@@ -742,6 +765,27 @@ class PPOActor:
                         mb,
                         loss_fn=loss_fn,
                         loss_weight_fn=loss_step.loss_weight,
+                    )
+                work = {
+                    key.removeprefix("training_work_"): train_stat.pop(key)
+                    for key in list(train_stat)
+                    if key.startswith("training_work_")
+                }
+                if trace_work and work.get("representative") == 1:
+                    perf_tracer.record_disposition(
+                        "outcome",
+                        "training_iteration",
+                        "completed",
+                        unit="batch",
+                        optimizer_minibatch=minibatch_index,
+                        workload=work,
+                        source_row_indices=work_indices[minibatch_index],
+                        rows=[
+                            row_identities[index]
+                            if index < len(row_identities)
+                            else None
+                            for index in work_indices[minibatch_index]
+                        ],
                     )
                 stats_tracker.scalar(**train_stat)
 

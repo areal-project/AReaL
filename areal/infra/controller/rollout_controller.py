@@ -1234,6 +1234,12 @@ class RolloutController:
                 proxy_addr = pending_task.proxy_addr
                 if self._proxy_started and proxy_addr is None:
                     proxy_addr = self.get_proxy_addr(rank)
+                self.dispatcher._record_task_event(
+                    "remote_dispatch",
+                    task_id,
+                    worker_id=worker.id,
+                    engine_name=engine_name,
+                )
                 engine_task_id = await self.scheduler.async_call_engine(
                     worker.id,
                     "submit",
@@ -1256,6 +1262,12 @@ class RolloutController:
                 )
 
                 assert task_id == engine_task_id, (task_id, engine_task_id)
+                self.dispatcher._record_task_event(
+                    "remote_submitted",
+                    task_id,
+                    worker_id=worker.id,
+                    engine_name=engine_name,
+                )
 
                 # Wait for callback to resolve the future
                 await asyncio.wait_for(future, timeout=self.config.request_timeout)
@@ -1269,6 +1281,12 @@ class RolloutController:
                     timeout=0.1,  # A short time to prevent blocking other requests
                     raise_timeout=False,
                     http_timeout=self.config.request_timeout,
+                )
+                self.dispatcher._record_task_event(
+                    "remote_result",
+                    task_id,
+                    worker_id=worker.id,
+                    engine_name=engine_name,
                 )
 
                 if isinstance(result, WorkflowContractFailure):

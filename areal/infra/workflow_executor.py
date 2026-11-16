@@ -390,6 +390,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self._pending_inputs: deque[TInput] = deque()
         self._pending_results: dict[int, TimedResult[TResult]] = {}
         self._active_task_ids: set[int] = set()
+        self._dispatcher_id = uuid.uuid4().hex
+        self._task_trace_identity: dict[int, dict[str, Any]] = {}
 
         # Condition variables for coordination
         self._input_lock = threading.Lock()
@@ -408,6 +410,17 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
         # Callback support: task_id -> callback_addr
         self._task_callbacks: dict[int, str] = {}
+
+    def _record_task_event(self, reason: str, task_id: int, **fields) -> None:
+        perf_tracer.record_disposition(
+            "outcome",
+            "dispatcher",
+            reason,
+            unit="group",
+            dispatcher_id=self._dispatcher_id,
+            task_id=task_id,
+            **{**self._task_trace_identity.get(task_id, {}), **fields},
+        )
 
     def _set_thread_exception(self, exc: Exception):
         """Store exception from background thread for fail-fast behavior."""
@@ -466,14 +479,22 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     continue
 
                 task_fn = self.task_factory(task_input)
+                trace_identity = self._task_trace_identity.get(task_input.task_id, {})
                 try:
                     self.runner.submit(task_fn, task_id=task_input.task_id)
+                    self._record_task_event(
+                        "dispatch_acknowledged",
+                        task_input.task_id,
+                        state_transition=False,
+                        **trace_identity,
+                    )
                     self.staleness_manager.on_rollout_submitted()
                     if self.enable_tracing:
                         self.logger.info(f"Submit rollout. {self._rollout_stats()}")
                 except TaskQueueFullError:
                     with self._input_cv:
                         self._pending_inputs.appendleft(task_input)
+                        self._record_task_event("requeued", task_input.task_id)
                         self._input_cv.wait_for(
                             lambda: (
                                 self._shutdown_event.is_set()
@@ -512,6 +533,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 with self._result_cv:
                     for result in results:
                         self._pending_results[result.task_id] = result
+                        self._record_task_event("result_available", result.task_id)
                         # Trigger callback if registered
                         cb_addr = self._task_callbacks.pop(result.task_id, None)
                         if cb_addr:
@@ -541,7 +563,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     and self.staleness_manager.get_capacity() > 0
                     and self._pending_inputs
                 ):
-                    return self._pending_inputs.popleft()
+                    task_input = self._pending_inputs.popleft()
+                    self._record_task_event("dispatching", task_input.task_id)
+                    return task_input
                 self._input_cv.wait()
 
         return None
@@ -634,6 +658,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self._check_thread_exception()
         with self._input_cv:
             self._pending_inputs.append(task_input)
+            data = getattr(task_input, "data", None)
+            self._task_trace_identity[task_input.task_id] = {
+                "query_id": data.get("query_id") if isinstance(data, dict) else None,
+                "group_size": getattr(task_input, "group_size", None),
+                "is_eval": getattr(task_input, "is_eval", False),
+            }
+            self._record_task_event("enqueued", task_input.task_id)
             self.staleness_manager.on_rollout_enqueued()
             if self.enable_tracing:
                 self.logger.info(f"Enqueue rollout. {self._rollout_stats()}")
@@ -642,7 +673,10 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             self._active_task_ids.add(task_input.task_id)
 
     def wait_results(
-        self, count: int, timeout: float | None = None, raise_timeout: bool = True
+        self,
+        count: int,
+        timeout: float | None = None,
+        raise_timeout: bool = True,
     ) -> list[TResult | None]:
         """Wait for the completion of `count` tasks.
 
@@ -709,8 +743,23 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     self._result_cv.notify_all()
                 for r in selected:
                     self._active_task_ids.discard(r.task_id)
+                    self._record_task_event("result_taken", r.task_id)
+                    self._task_trace_identity.pop(r.task_id, None)
 
-            return [self.consume_result(r.data) for r in selected]
+            results = []
+            for r in selected:
+                result = self.consume_result(r.data)
+                perf_tracer.record_disposition(
+                    "outcome",
+                    "collection",
+                    "result",
+                    unit="group",
+                    dispatcher_id=self._dispatcher_id,
+                    task_id=r.task_id,
+                    accepted=result is not None,
+                )
+                results.append(result)
+            return results
 
     def wait_for_task(
         self,
@@ -753,6 +802,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 )
 
             found_result = self._pending_results.pop(task_id)
+            self._record_task_event("result_taken", task_id)
+            self._task_trace_identity.pop(task_id, None)
             self._active_task_ids.remove(task_id)
             self._result_cv.notify_all()
             result = found_result.data
@@ -774,6 +825,10 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             if error is None:
                 continue
             self._pending_results.pop(pending_task_id)
+            self._record_task_event(
+                "terminal_removed", pending_task_id, exception=type(error).__name__
+            )
+            self._task_trace_identity.pop(pending_task_id, None)
             self._active_task_ids.discard(pending_task_id)
             self._result_cv.notify_all()
             return error
@@ -817,6 +872,19 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         """
         accepted_cnt = 0
         total_attempts = 0
+        rejected_cnt = 0
+        supplemental_accepted = 0
+        collection_id = uuid.uuid4().hex
+        perf_tracer.record_disposition(
+            "outcome",
+            "collection",
+            "started",
+            unit="batch",
+            dispatcher_id=self._dispatcher_id,
+            collection_id=collection_id,
+            requested_groups=batch_size,
+            dynamic_bs=dynamic_bs,
+        )
         results = []
 
         while True:
@@ -849,14 +917,34 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                                 "Use cycle_dataloader() or provide an infinite generator."
                             ) from None
             try:
-                arrived = self.wait_results(count=batch_size - accepted_cnt, timeout=1)
+                with perf_tracer.disposition_context(collection_id=collection_id):
+                    arrived = self.wait_results(
+                        count=batch_size - accepted_cnt, timeout=1
+                    )
             except TimeoutError:
                 arrived = []
+            except Exception as error:
+                perf_tracer.record_disposition(
+                    "failure",
+                    "collection",
+                    "aborted",
+                    unit="batch",
+                    dispatcher_id=self._dispatcher_id,
+                    collection_id=collection_id,
+                    requested_groups=batch_size,
+                    dynamic_bs=dynamic_bs,
+                    accepted_groups=accepted_cnt,
+                    rejected_groups=rejected_cnt,
+                    exception=type(error).__name__,
+                    outcome="raised",
+                )
+                raise
 
             for res in arrived:
                 is_accepted = res is not None
 
                 if not is_accepted:
+                    rejected_cnt += 1
                     if dynamic_bs:
                         total_attempts += 1
                         if total_attempts >= batch_size:
@@ -864,6 +952,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     continue
 
                 # Accepted sample
+                if accepted_cnt + rejected_cnt >= batch_size:
+                    supplemental_accepted += 1
                 accepted_cnt += 1
                 total_attempts += 1
                 results.append(res)
@@ -877,6 +967,20 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 continue
             break
 
+        perf_tracer.record_disposition(
+            "outcome",
+            "collection",
+            "completed",
+            unit="batch",
+            dispatcher_id=self._dispatcher_id,
+            collection_id=collection_id,
+            requested_groups=batch_size,
+            dynamic_bs=dynamic_bs,
+            accepted_groups=accepted_cnt,
+            rejected_groups=rejected_cnt,
+            supplemental_accepted_groups=supplemental_accepted,
+            extra_attempts=max(0, accepted_cnt + rejected_cnt - batch_size),
+        )
         return results
 
 

@@ -1359,27 +1359,49 @@ class RemoteInfEngine(InferenceEngine):
                 request_ids = SessionRequestIds(session_uuid)
                 call_index = supplied_call_index
         send_index = 0
+        segment_index = 0
+        last_send: dict[str, Any] = {}
         server_timings: list[tuple[str, float, float]] = []
 
-        def with_request_id(payload: dict[str, Any]) -> dict[str, Any]:
+        def with_request_id(
+            payload: dict[str, Any], version: int, *, lease=None
+        ) -> dict[str, Any]:
             nonlocal send_index
-            if request_ids is None or request_id_field is None or call_index is None:
-                return payload
             send_index += 1
+            physical_id = (
+                request_ids.request_rid(call_index, send_index)
+                if request_ids is not None
+                and call_index is not None
+                and request_id_field is not None
+                else None
+            )
+            last_send.clear()
+            last_send.update(
+                request_id=physical_id,
+                call_index=call_index,
+                send_index=send_index,
+                request_version=version,
+                version_source="router_lease"
+                if lease is not None
+                else "sender_snapshot",
+                lease_id=getattr(lease, "lease_id", None),
+                backend_id=getattr(lease, "backend_id", None),
+            )
             perf_tracer.record_disposition(
                 "outcome",
                 "generation_send",
                 "prepared",
                 unit="request",
                 operation_id=generation_id,
-                request_id=request_ids.request_rid(call_index, send_index),
-                call_index=call_index,
-                send_index=send_index,
+                segment_index=segment_index,
+                output_start=len(accumulated_output_tokens),
+                **last_send,
             )
-            return {
-                **payload,
-                request_id_field: request_ids.request_rid(call_index, send_index),
-            }
+            return (
+                {**payload, request_id_field: physical_id}
+                if physical_id is not None
+                else payload
+            )
 
         def record_server_timing(result: dict[str, Any]) -> None:
             if request_ids is None or request_id_field is None:
@@ -1412,8 +1434,30 @@ class RemoteInfEngine(InferenceEngine):
         ):
             # Request is interrupted, wait for some time to avoid interfering
             # with update weights requests
+            waiting = False
             while self.workflow_executor.is_paused():
+                if not waiting:
+                    perf_tracer.record_disposition(
+                        "outcome",
+                        "generation_wait",
+                        "paused",
+                        unit="operation",
+                        operation_id=generation_id,
+                        segment_index=segment_index,
+                        output_start=len(accumulated_output_tokens),
+                    )
+                    waiting = True
                 await asyncio.sleep(0.5)
+            if waiting:
+                perf_tracer.record_disposition(
+                    "outcome",
+                    "generation_wait",
+                    "resumed",
+                    unit="operation",
+                    operation_id=generation_id,
+                    segment_index=segment_index,
+                    output_start=len(accumulated_output_tokens),
+                )
 
             # Pin the version that serves this request. A trajectory may span
             # several weight versions, so each segment must be attributed to the
@@ -1436,7 +1480,9 @@ class RemoteInfEngine(InferenceEngine):
                     async with session.request(
                         routed_request.method,
                         f"{base}/{routed_request.endpoint.lstrip('/')}",
-                        json=with_request_id(routed_request.payload),
+                        json=with_request_id(
+                            routed_request.payload, lease.weight_version, lease=lease
+                        ),
                         timeout=aiohttp.ClientTimeout(
                             total=self.config.request_timeout
                         ),
@@ -1474,20 +1520,21 @@ class RemoteInfEngine(InferenceEngine):
                     with_lora=self.config.use_lora,
                     version=request_version,
                 )
-                result = await arequest_with_retry(
-                    session=session,
-                    addr=server_addr,
-                    endpoint=http_req.endpoint,
-                    payload=http_req.payload,
-                    method=http_req.method,
-                    max_retries=self.config.request_retries,
-                    timeout=self.config.request_timeout,
-                    payload_factory=(
-                        lambda: with_request_id(http_req.payload)
-                        if request_ids is not None and request_id_field is not None
-                        else None
-                    ),
-                )
+                with perf_tracer.disposition_context(
+                    generation_operation_id=generation_id, segment_index=segment_index
+                ):
+                    result = await arequest_with_retry(
+                        session=session,
+                        addr=server_addr,
+                        endpoint=http_req.endpoint,
+                        payload=http_req.payload,
+                        method=http_req.method,
+                        max_retries=self.config.request_retries,
+                        timeout=self.config.request_timeout,
+                        payload_factory=lambda: with_request_id(
+                            http_req.payload, request_version
+                        ),
+                    )
                 if not isinstance(result, dict):
                     raise ValueError(
                         f"Expected JSON dict response, got {type(result).__name__}"
@@ -1520,16 +1567,21 @@ class RemoteInfEngine(InferenceEngine):
                 accumulated_head_ids.extend(gen_result.sampler_head_ids)
                 accumulated_head_logprobs.extend(gen_result.sampler_head_logprobs)
 
-            if gen_result.stop_reason == "abort":
-                perf_tracer.record_disposition(
-                    "outcome",
-                    "generation_segment",
-                    "paused",
-                    unit="segment",
-                    operation_id=generation_id,
-                    request_version=request_version,
-                    output_tokens=len(gen_result.output_tokens),
-                )
+            perf_tracer.record_disposition(
+                "outcome",
+                "generation_segment",
+                "paused" if gen_result.stop_reason == "abort" else "completed",
+                unit="segment",
+                operation_id=generation_id,
+                segment_index=segment_index,
+                output_start=len(accumulated_output_tokens),
+                output_end=len(accumulated_output_tokens)
+                + len(gen_result.output_tokens),
+                output_tokens=len(gen_result.output_tokens),
+                stop_reason=gen_result.stop_reason,
+                **last_send,
+            )
+            segment_index += 1
             # Update accumulated outputs
             accumulated_output_tokens.extend(gen_result.output_tokens)
             accumulated_output_logprobs.extend(gen_result.output_logprobs)
