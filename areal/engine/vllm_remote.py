@@ -101,6 +101,11 @@ def _token_to_id(token: object) -> int | None:
     return int(s)
 
 
+def _score_centering_width(gconfig) -> int:
+    """Head width when score centering asks for a head, else 0."""
+    return max(0, int(getattr(gconfig, "score_centering_top_k", 0) or 0))
+
+
 def _parse_top_logprobs(top: object) -> tuple[list[int], list[float]]:
     """Parse one position's top-k logprobs into (token_ids, logprobs).
 
@@ -192,6 +197,20 @@ class VLLMBackend:
             # per position; 0 requests only the sampled token logprob.
             "logprobs": getattr(gconfig, "score_centering_top_k", 0),
         }
+        # Score centering consumes the sampler top-k head. Two engine options cut
+        # the cost of producing it without changing the distribution:
+        #   * `flat_logprobs` keeps the head as parallel primitive lists inside the
+        #     engine instead of a dict per position;
+        #   * `detokenize=False` skips decoding candidates that are only needed as
+        #     token ids. Stop strings require detokenization, so the flag is never
+        #     sent together with them.
+        # Both are opt-in; with neither env var set the request is unchanged.
+        if _score_centering_width(gconfig):
+            if os.environ.get("AREAL_SC_FLAT_HEADS", "0") == "1":
+                sampling_params["flat_logprobs"] = True
+            if os.environ.get("AREAL_SC_NODETOK", "0") == "1" and not gconfig.stop:
+                sampling_params["detokenize"] = False
+
         if gconfig.stop:
             # Stop strings require server-side detokenization, so `detokenize`
             # must stay enabled whenever they are present.
