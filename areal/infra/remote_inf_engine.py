@@ -1136,6 +1136,19 @@ class RemoteInfEngine(InferenceEngine):
 
         # Validate n_samples
         gconfig = req.gconfig
+        mask_sampling = self.config._sampling_mask_sampling
+        if mask_sampling is not None:
+            if (
+                gconfig.temperature != mask_sampling.temperature
+                or gconfig.top_p != mask_sampling.top_p
+            ):
+                raise ValueError(
+                    "sampling_mask_transfer request temperature/top_p differs from the training sampling configuration"
+                )
+            gconfig = req.gconfig = gconfig.new(
+                _sampling_mask_transfer=True,
+                top_k=mask_sampling.top_k,
+            )
         if gconfig.n_samples != 1:
             raise ValueError(
                 "Inference engines do not support n_samples > 1. "
@@ -1160,6 +1173,7 @@ class RemoteInfEngine(InferenceEngine):
         start_time = time.perf_counter()
         accumulated_output_tokens = []
         accumulated_output_logprobs = []
+        accumulated_mask_refs = []
         accumulated_head_ids = []
         accumulated_head_logprobs = []
         accumulated_versions = []
@@ -1229,6 +1243,12 @@ class RemoteInfEngine(InferenceEngine):
                     ) as response:
                         response.raise_for_status()
                         result = await response.json()
+                        if gconfig._sampling_mask_transfer:
+                            from areal.infra.sampling_mask.metrics import (
+                                record_response_body,
+                            )
+
+                            record_response_body(len(await response.read()))
                     parsed = self.backend.parse_generation_response(result)
                     if parsed.stop_reason not in (
                         "stop",
@@ -1250,6 +1270,13 @@ class RemoteInfEngine(InferenceEngine):
                     generate,
                 )
             else:
+                response_observer_kwargs = {}
+                if gconfig._sampling_mask_transfer:
+                    from areal.infra.sampling_mask.metrics import record_response_body
+
+                    response_observer_kwargs["response_size_observer"] = (
+                        record_response_body
+                    )
                 result = await arequest_with_retry(
                     session=session,
                     addr=server_addr,
@@ -1258,6 +1285,7 @@ class RemoteInfEngine(InferenceEngine):
                     method=http_req.method,
                     max_retries=self.config.request_retries,
                     timeout=self.config.request_timeout,
+                    **response_observer_kwargs,
                 )
                 if not isinstance(result, dict):
                     raise ValueError(
@@ -1288,6 +1316,19 @@ class RemoteInfEngine(InferenceEngine):
                 )
                 accumulated_head_ids.extend(gen_result.sampler_head_ids)
                 accumulated_head_logprobs.extend(gen_result.sampler_head_logprobs)
+
+            if gconfig._sampling_mask_transfer:
+                from areal.infra.sampling_mask.metrics import record_reference_json
+                from areal.infra.sampling_mask.protocol import validate_references
+
+                validate_references(
+                    gen_result.sampling_mask_refs,
+                    gen_result.output_tokens,
+                    [request_version] * len(gen_result.output_tokens),
+                )
+                accumulated_mask_refs.extend(gen_result.sampling_mask_refs or [])
+                if gen_result.sampling_mask_refs is not None:
+                    record_reference_json(gen_result.sampling_mask_refs)
 
             # Update accumulated outputs
             accumulated_output_tokens.extend(gen_result.output_tokens)
@@ -1366,6 +1407,9 @@ class RemoteInfEngine(InferenceEngine):
             ],
             input_images=req.image_data,
             input_videos=req.video_data,
+            sampling_mask_refs=accumulated_mask_refs
+            if gconfig._sampling_mask_transfer
+            else None,
             sampler_head_ids=accumulated_head_ids
             if gconfig.score_centering_top_k
             else None,

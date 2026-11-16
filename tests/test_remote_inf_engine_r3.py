@@ -63,6 +63,53 @@ def _make_request() -> ModelRequest:
 
 
 @pytest.mark.asyncio
+async def test_sampling_mask_resubmit_keeps_reference_alignment_and_http_totals(
+    monkeypatch,
+):
+    import orjson
+
+    from areal.infra.sampling_mask import metrics
+    from areal.infra.sampling_mask.protocol import encode_endpoint
+    from areal.utils.stats_tracker import DistributedStatsTracker
+
+    tracker = DistributedStatsTracker("sampling_mask/http")
+    monkeypatch.setattr(metrics.stats_tracker, "get", lambda name: tracker)
+    refs = [[encode_endpoint("127.0.0.1", 1234), 7, row, 1, 0] for row in [1, 2, 3]]
+    calls = []
+
+    async def session():
+        return object()
+
+    async def request(**kwargs):
+        index = len(calls)
+        calls.append(kwargs["payload"])
+        kwargs["response_size_observer"]([123, 456][index])
+        result = _make_sglang_response(
+            [(-0.5, 100), (-0.3, 101)] if index == 0 else [(-0.2, 200)],
+            "abort" if index == 0 else "stop",
+        )
+        result["meta_info"]["sampling_mask_refs"] = refs[:2] if index == 0 else refs[2:]
+        return result
+
+    monkeypatch.setattr(
+        remote_inf_engine.workflow_context, "get_aiohttp_session", session
+    )
+    monkeypatch.setattr(remote_inf_engine, "arequest_with_retry", request)
+    engine = _make_engine(return_routed_experts=False)
+    engine.config._sampling_mask_sampling = GenerationHyperparameters(top_k=8)
+    response = await engine.agenerate(_make_request())
+    assert response.output_tokens == [100, 101, 200]
+    assert response.sampling_mask_refs == refs
+    assert calls[1]["input_ids"] == [1, 2, 3, 100, 101]
+    exported = tracker.export()
+    assert exported["sampling_mask/http/generate_response_body_bytes"] == 579
+    assert exported["sampling_mask/http/generate_responses"] == 2
+    assert exported["sampling_mask/http/reference_json_value_bytes"] == len(
+        orjson.dumps(refs[:2])
+    ) + len(orjson.dumps(refs[2:]))
+
+
+@pytest.mark.asyncio
 async def test_agenerate_r3_resubmit_drops_duplicate_prefix(monkeypatch):
     """Abort/resubmit keeps one routing row sequence instead of duplicating prefix."""
     calls: list[dict[str, Any]] = []

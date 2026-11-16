@@ -263,7 +263,17 @@ class PPOActor:
                 clear_engine_r3_side_channel(self.engine)
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
+        if self.config._sampling_mask_transfer:
+            from areal.infra.sampling_mask.protocol import REFERENCE_KEYS
+
+            data = dict(data)
+            for key in REFERENCE_KEYS:
+                if key not in data:
+                    raise ValueError("compute_logp requires frozen sampling supports")
+                data[key] = torch.roll(data[key], shifts=-1, dims=-1)
         stage_batch_for_engine(data, self.engine)
+        if self.config._sampling_mask_transfer:
+            self.engine.begin_sampling_mask_batch(data)
         routed_experts, routing_valid = pop_r3_tensors(data)
         r3_enabled = routed_experts is not None and routing_valid is not None
         self.engine.eval()
@@ -418,6 +428,19 @@ class PPOActor:
             )
         )
         data.update(validate_advantage_result(result, data))
+        if self.config._sampling_mask_transfer:
+            from areal.infra.sampling_mask.protocol import REFERENCE_KEYS
+
+            for key in REFERENCE_KEYS:
+                if key not in data or data[key].shape != data["input_ids"].shape:
+                    raise ValueError(
+                        "Missing or misaligned sampling mask in actor batch"
+                    )
+                data[key] = torch.roll(data[key], shifts=-1, dims=-1)
+            if ((data["sampling_mask_source"] == 0) & data["loss_mask"].bool()).any():
+                raise ValueError(
+                    "Effective actor token is missing its sampling support"
+                )
         if self.config.use_score_centering:
             for key in ("sampler_head_ids", "sampler_head_logprobs"):
                 if key not in data:
@@ -641,6 +664,8 @@ class PPOActor:
             group_sizes=meta.traj_group_sizes if meta is not None else None,
         )
         stage_batch_for_engine(data, self.engine)
+        if self.config._sampling_mask_transfer:
+            self.engine.begin_sampling_mask_batch(data)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
         routed_experts, routing_valid = pop_r3_tensors(data)
@@ -1255,6 +1280,19 @@ def grpo_loss_fn(
         logp_abs_diff=logp_diff.abs(),
         denominator="n_valid_tokens",
     )
+    if "sampling_mask_source" in input_data:
+        # At the first update these expose inference/training backend drift;
+        # later updates also include the intended policy change. Keep threshold
+        # counts on device and aggregate with the existing valid-token mask.
+        difference = logp_diff.abs()
+        stats_tracker.stat_compact(
+            loss_mask,
+            ReduceType.AVG_MIN_MAX,
+            sampling_mask_logp_abs_gt_1e_3=(difference > 1e-3).float(),
+            sampling_mask_logp_abs_gt_1e_2=(difference > 1e-2).float(),
+            sampling_mask_logp_abs_gt_1e_1=(difference > 1e-1).float(),
+            sampling_mask_ratio_abs_error=torch.expm1(-logp_diff).abs(),
+        )
 
     if "behave_imp_weight" in stat:
         stats_tracker.denominator(unclipped_behave_tokens=stat["behave_mask"])

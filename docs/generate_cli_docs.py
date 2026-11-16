@@ -263,6 +263,8 @@ def generate_config_section(
     doc += "|-----------|------|---------|-------------|\n"
 
     for field in fields(config_class):
+        if not field.metadata.get("cli_doc", True):
+            continue
         field_name = field.name
         field_type = get_type_description(field.type, all_dataclasses)
         default_value = format_default_value(field)

@@ -79,6 +79,7 @@ def _run_until_provider_finalize(
     freeze_vision_model: bool | None = None,
     freeze_vision_projection: bool | None = None,
     model_type: str | None = None,
+    attention_backend: str | None = None,
 ) -> None:
     pytest.importorskip("mbridge")
     pytest.importorskip("megatron.core")
@@ -86,6 +87,7 @@ def _run_until_provider_finalize(
 
     tf_config = SimpleNamespace(params_dtype=None)
     mcore_config = _make_mcore_config(deterministic=deterministic)
+    mcore_config.attention_backend = attention_backend
     mcore_config.freeze_vision_model = freeze_vision_model
     mcore_config.freeze_vision_projection = freeze_vision_projection
 
@@ -188,6 +190,21 @@ def test_megatron_bridge_provider_applies_determinism_before_finalize():
         enums.AttnBackend.flash,
         False,
         False,
+    )
+
+
+@pytest.mark.parametrize("backend", ["auto", "flash", "fused", "unfused"])
+def test_explicit_attention_backend_reaches_provider_before_finalize(backend):
+    enums = pytest.importorskip("megatron.core.transformer.enums")
+    provider = _make_provider(enums.AttnBackend.auto)
+    _run_until_provider_finalize(
+        provider, deterministic=False, attention_backend=backend
+    )
+    assert provider.config_at_finalize == (
+        False,
+        enums.AttnBackend[backend],
+        True,
+        True,
     )
 
 

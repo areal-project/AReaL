@@ -602,6 +602,7 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
         tp_group: dist.ProcessGroup | None,
         logit_scale: float,
         fp32_operands: bool,
+        sampling_mask=None,
     ) -> tuple[torch.Tensor, ...]:
         from areal.utils.functional.vocab_parallel_kernels import (
             fused_exp_sum_inplace,
@@ -683,6 +684,25 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
             vocab_mean[start:end] = logits.mean(dim=-1)
             vocab_norm[start:end] = torch.linalg.vector_norm(logits, dim=-1)
 
+            if sampling_mask is not None:
+                from areal.utils.sampling_mask import restricted_policy_terms
+
+                mask_ids, mask_offsets = sampling_mask.chunk(start, end, logits.device)
+                logp, ent, maximum, denominator = restricted_policy_terms(
+                    logits,
+                    labels_1d[start:end],
+                    mask_ids,
+                    mask_offsets,
+                    temperature=temperature,
+                    vocab_size=sampling_mask.vocab_size,
+                    tp_group=tp_group,
+                )
+                logprobs[start:end] = logp
+                entropy[start:end] = ent
+                row_maxes[start:end] = maximum
+                sum_exps[start:end] = denominator
+                continue
+
             logits_max = logits.max(dim=-1).values
             _all_reduce_if_needed(logits_max, dist.ReduceOp.MAX, tp_group)
             row_maxes[start:end] = logits_max
@@ -737,6 +757,8 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
             row_maxes,
             sum_exps,
         )
+        ctx.sampling_mask = sampling_mask
+        ctx.labels = labels_1d
         ctx.has_bias = bias is not None
         ctx.temperature = temperature
         ctx.chunk_size = chunk_size
@@ -840,15 +862,42 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
                 compute_bias,
                 ctx.logit_scale,
             )
-            fused_logits_backward_inplace(
-                logits,
-                row_maxes[start:end],
-                sum_exps[start:end],
-                local_targets[start:end],
-                (grad_logprobs_1d[start:end] if grad_logprobs_1d is not None else None),
-                1.0 / ctx.temperature,
-                ctx.logit_scale,
-            )
+            if ctx.sampling_mask is not None:
+                from areal.utils.sampling_mask import restricted_logits_backward_
+
+                mask_ids, mask_offsets = ctx.sampling_mask.chunk(
+                    start, end, logits.device
+                )
+                restricted_logits_backward_(
+                    logits,
+                    ctx.labels[start:end],
+                    mask_ids,
+                    mask_offsets,
+                    row_maxes[start:end],
+                    sum_exps[start:end],
+                    grad_logprobs_1d[start:end]
+                    if grad_logprobs_1d is not None
+                    else None,
+                    temperature=ctx.temperature,
+                    tp_rank=dist.get_rank(ctx.tp_group)
+                    if _tp_world_size(ctx.tp_group) > 1
+                    else 0,
+                    logit_scale=ctx.logit_scale,
+                )
+            else:
+                fused_logits_backward_inplace(
+                    logits,
+                    row_maxes[start:end],
+                    sum_exps[start:end],
+                    local_targets[start:end],
+                    (
+                        grad_logprobs_1d[start:end]
+                        if grad_logprobs_1d is not None
+                        else None
+                    ),
+                    1.0 / ctx.temperature,
+                    ctx.logit_scale,
+                )
             if ctx.fp32_operands:
                 grad_input_2d[start:end].copy_(torch.mm(logits, compute_weight))
                 dlogits = logits
@@ -961,7 +1010,8 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
             None,
             None,
             None,
-        )
+            None,
+        )[: len(ctx.needs_input_grad)]
 
 
 def chunked_lm_head_logprobs_entropy(
@@ -973,6 +1023,7 @@ def chunked_lm_head_logprobs_entropy(
     temperature: float,
     chunk_size: int,
     logit_scale: float = 1.0,
+    sampling_mask=None,
 ) -> ChunkedLMHeadOutput:
     """Run a Megatron-compatible LM Head and logprob backward by sequence chunk."""
     if not isinstance(output_layer, _AReaLVocabParallelLMHeadMixin):
@@ -1004,6 +1055,7 @@ def chunked_lm_head_logprobs_entropy(
         output_layer.tp_group,
         logit_scale,
         output_layer.fp32_operands,
+        sampling_mask,
     )
     return ChunkedLMHeadOutput(*values)
 

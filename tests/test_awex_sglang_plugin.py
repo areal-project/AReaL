@@ -113,6 +113,61 @@ def test_awex_config_preserves_nested_router_and_vision_metadata(monkeypatch):
     assert config.architectures == ["SimpleNamespace"]
 
 
+@pytest.mark.parametrize("attn_tp_size", [1, 2, 8])
+def test_legacy_awex_publishes_attention_tp_with_dp_attention(
+    monkeypatch, attn_tp_size
+):
+    import awex.meta.meta_server as meta_server
+
+    import areal.engine.awex.adapters.sglang_adapter as reader
+
+    published = {}
+    monkeypatch.setattr(
+        meta_server,
+        "MetaServerClient",
+        lambda *args: SimpleNamespace(put_object=published.__setitem__),
+    )
+    monkeypatch.setattr(
+        reader,
+        "_get_legacy_awex_hf_config",
+        lambda *args: SimpleNamespace(router_dtype="fp32"),
+    )
+    runner = SimpleNamespace(model=SimpleNamespace())
+    scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(
+            tp_size=8,
+            pp_size=1,
+            dp_size=8 // attn_tp_size,
+            enable_dp_attention=attn_tp_size < 8,
+        ),
+        tp_worker=SimpleNamespace(
+            model_runner=runner,
+            ps=SimpleNamespace(
+                tp_rank=0,
+                attn_tp_rank=0,
+                attn_tp_size=attn_tp_size,
+                attn_dp_rank=0,
+            ),
+        ),
+    )
+    instance = object.__new__(reader.AwexSGLangAdapter)
+    instance._scheduler = scheduler
+    instance._qwen4_frozen_contract = None
+    instance._get_legacy_weight_metadata = lambda: None
+
+    instance.initialize(
+        meta_server_addr="localhost:12345",
+        transfer_rank=0,
+        infer_world_size=8,
+        train_world_size=8,
+        local_gpu_id=0,
+    )
+
+    assert published["infer_conf"]["infer_atten_tp_size"] == attn_tp_size
+    assert published["infer_conf"]["infer_world_size"] == 8
+    assert published["num_infer_engines"] == 1
+
+
 def test_memory_transitions_are_idempotent(monkeypatch):
     import sys
 
