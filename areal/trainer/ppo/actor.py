@@ -926,7 +926,7 @@ class PPOActorControllerV2(GatewayTrainController):
 # Saturation caps for the detached forward values. The selected scalar is a
 # straight-through carrier, so these caps change only the reported number and
 # never the gradient, which comes from the clipped policy loss.
-_K2_MAX_ABS_X = 1e19
+_K2_MAX_ABS_X = 1e9
 _K3_MAX_X = 60.0
 
 
@@ -956,6 +956,26 @@ def _sampled_rkl_forward(
         return 0.5 * torch.clamp(x, -_K2_MAX_ABS_X, _K2_MAX_ABS_X).square()
     x = torch.clamp(x, max=_K3_MAX_X)
     return torch.expm1(x) - x
+
+
+def _selected_rkl_scalar(
+    per_token: torch.Tensor,
+    weight: float,
+    denominator: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reduce selected per-token values without overflowing the loss dtype.
+
+    Every per-token value is finite, but their sum need not be: eight values of
+    5e17 already exceed fp32's maximum. Accumulate in float64, then saturate the
+    final scalar at the loss dtype's maximum before the straight-through
+    carrier. The saturation affects only the reported number, never the
+    gradient.
+    """
+    total = per_token.sum(dtype=torch.float64)
+    count = denominator.sum().clamp(min=1).to(torch.float64)
+    value = weight * total / count
+    return torch.clamp(value, max=torch.finfo(dtype).max).to(dtype)
 
 
 def grpo_loss_fn(
@@ -1260,10 +1280,11 @@ def grpo_loss_fn(
                 effective_mask,
                 kl_estimator,
             ).to(logprobs.dtype)
-            selected_value = (
-                distill_loss_weight
-                * selected_per_token.sum()
-                / denominator_mask.sum().clamp(min=1)
+            selected_value = _selected_rkl_scalar(
+                selected_per_token,
+                distill_loss_weight,
+                denominator_mask,
+                logprobs.dtype,
             )
             loss = selected_value + (loss - loss.detach())
             rkl_stat = selected_per_token

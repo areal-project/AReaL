@@ -15,6 +15,7 @@ clipping and rejection independently rather than assuming ratio = 1.
 
 from __future__ import annotations
 
+import math
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -22,6 +23,7 @@ import torch
 
 from areal.api.cli_args import RejectionSamplingConfig
 from areal.trainer.ppo.actor import _sampled_rkl_forward, grpo_loss_fn
+from areal.utils.stats_tracker import DistributedStatsTracker
 
 BETA = 1.0
 
@@ -156,6 +158,43 @@ def test_k1_reports_the_legacy_pre_rejection_signed_value():
     _, _, captured = _run("k1")
     x = _t(TEACHER) - _t(CURRENT)
     torch.testing.assert_close(captured["rkl_loss"], -x, rtol=0, atol=1e-6)
+
+
+def test_k2_reduction_stays_finite_in_loss_and_exported_metric():
+    """Finite per-token values can still overflow their sum.
+
+    Eight tokens at the ``|x|`` cap produce 5e17 each; accumulating 5e37-sized
+    values in fp32 would already exceed the dtype maximum. The reduction
+    accumulates in float64, and the real stats tracker must export a finite
+    average.
+    """
+    n = 8
+    current = torch.full((1, n), -1e9, dtype=torch.float32, requires_grad=True)
+    data = {
+        "logprobs": torch.full((1, n), -1e9),
+        "prox_logp": torch.full((1, n), -1e9),
+        "advantages": torch.zeros_like(current),
+        "loss_mask": torch.ones_like(current, dtype=torch.bool),
+        "teacher_logp": torch.zeros_like(current),
+        "rl_loss_weight": 0.0,
+        "distill_loss_weight": 1.0,
+        "kl_estimator": "k2",
+    }
+    tracker = DistributedStatsTracker()
+    with patch("areal.trainer.ppo.actor.stats_tracker", tracker):
+        loss = grpo_loss_fn(
+            logprobs=current,
+            entropy=torch.zeros_like(current),
+            input_data=data,
+            eps_clip=0.2,
+            eps_clip_higher=None,
+            c_clip=None,
+        )
+    assert torch.isfinite(loss)
+    assert float(loss.detach()) == pytest.approx(5e17, rel=1e-6)
+    exported = tracker.export()
+    assert math.isfinite(exported["rkl_loss/avg"])
+    assert exported["rkl_loss/avg"] == pytest.approx(5e17, rel=1e-6)
 
 
 def test_forward_value_saturates_instead_of_overflowing():
