@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+import torch
 
 from areal.api.cli_args import GenerationHyperparameters, InferenceEngineConfig
 from areal.api.io_struct import ModelRequest
@@ -152,3 +153,83 @@ async def test_agenerate_r3_resubmit_shorter_routing_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="shorter than the previously accumulated"):
         await _make_engine().agenerate(_make_request())
+
+
+def _make_score_response(token_logps: list[float]) -> dict[str, Any]:
+    """SGLang score response carrying one log-prob per response token."""
+    return {"meta_info": {"input_token_logprobs": [[lp, 0] for lp in token_logps]}}
+
+
+class _MockScoreBackend(SGLangBackend):
+    """Backend whose score parse returns exactly the values it was given."""
+
+    def __init__(self, token_logps: list[float]) -> None:
+        super().__init__()
+        self._token_logps = token_logps
+
+    def parse_score_response(
+        self, response: dict[str, Any], target_len: int
+    ) -> list[float]:
+        assert len(self._token_logps) == target_len
+        return list(self._token_logps)
+
+
+class _ScoreResp:
+    def __init__(self, token_logps: list[float]) -> None:
+        self._token_logps = token_logps
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return _make_score_response(self._token_logps)
+
+
+def _run_compute_logp(input_ids, loss_mask, token_logps, monkeypatch):
+    engine = RemoteInfEngine(
+        InferenceEngineConfig(backend="sglang:d1"),
+        _MockScoreBackend(token_logps),
+    )
+    engine.addresses = ["mock-server"]
+    monkeypatch.setattr(
+        remote_inf_engine.requests,
+        "request",
+        lambda *a, **k: _ScoreResp(token_logps),
+    )
+    return engine.compute_logp([{"input_ids": input_ids, "loss_mask": loss_mask}])[0]
+
+
+def test_compute_logp_writes_teacher_scores_at_prediction_positions(monkeypatch):
+    """Teacher scores land one slot left of the response token.
+
+    ``loss_mask`` marks response tokens, but the actor predicts token t at
+    position t - 1 and downstream code rolls the mask and student log-probs left
+    by one while passing ``teacher_logp`` unchanged. Writing at the response
+    index would offset every teacher score by one position.
+    """
+    input_ids = torch.tensor([[10, 11, 12, 20, 21, 22]])
+    loss_mask = torch.tensor([[0, 0, 0, 1, 1, 1]])
+    token_logps = [-0.25, -0.5, -0.75]
+
+    out = _run_compute_logp(input_ids, loss_mask, token_logps, monkeypatch)
+
+    assert out[0, 2].item() == pytest.approx(-0.25)
+    assert out[0, 3].item() == pytest.approx(-0.5)
+    assert out[0, 4].item() == pytest.approx(-0.75)
+    # Response-token positions stay zero-filled.
+    assert out[0, 5].item() == 0.0
+    # No teacher score may leak into the prompt region.
+    assert out[0, 0].item() == 0.0
+    assert out[0, 1].item() == 0.0
+
+
+def test_compute_logp_single_token_response_keeps_teacher_signal(monkeypatch):
+    """A one-token response previously lost its only teacher score."""
+    input_ids = torch.tensor([[10, 11, 12, 20]])
+    loss_mask = torch.tensor([[0, 0, 0, 1]])
+    token_logps = [-0.4]
+
+    out = _run_compute_logp(input_ids, loss_mask, token_logps, monkeypatch)
+
+    assert out[0, 2].item() == pytest.approx(-0.4)
+    assert out[0, 3].item() == 0.0

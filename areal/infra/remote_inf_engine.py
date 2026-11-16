@@ -789,6 +789,17 @@ class RemoteInfEngine(InferenceEngine):
             return self._version
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        """Score teacher log-probs at prediction positions.
+
+        Scope: this assumes a contiguous response span, as in single-turn
+        rollout. Both backend parsers return the *last* ``target_len`` scores,
+        so for a multi-turn trajectory with gaps in ``loss_mask`` — e.g.
+        ``[prompt, R1, user_context, R2]`` masked ``[0, 1, 0, 1]`` — the
+        returned scores cover ``[user_context, R2]`` and shifting their write
+        positions still maps the context score onto R1's slot. Supporting that
+        case requires selecting scores by token index in the backend response,
+        not by count.
+        """
         results: list[torch.Tensor] = []
         timeout = self.config.request_timeout
         version = self.get_version()
@@ -801,9 +812,26 @@ class RemoteInfEngine(InferenceEngine):
             out = torch.zeros_like(loss_mask, dtype=torch.float32)
             for i in range(bs):
                 token_ids = input_ids[i].tolist()
-                target_len = int(loss_mask[i].sum().item())
+                # ``loss_mask`` marks the response tokens themselves, but the
+                # actor predicts token t at position t - 1. Downstream, PPO rolls
+                # ``loss_mask`` and the student log-probs left by one to that
+                # prediction convention while passing ``teacher_logp`` through
+                # unchanged. Writing at ``write_idx`` would therefore put each
+                # teacher score one position late: the first prediction would
+                # read the zero fill and every later one would read the previous
+                # token's score, dropping the final token's.
+                write_idx = torch.nonzero(loss_mask[i], as_tuple=False).squeeze(-1)
+                target_len = int(write_idx.numel())
                 if target_len <= 0:
                     continue
+                prediction_idx = write_idx - 1
+                if torch.any(prediction_idx < 0):
+                    # A response token at position 0 has no preceding prediction
+                    # slot; -1 would silently write its score at the end of the row.
+                    raise ValueError(
+                        "Invalid loss mask: response token has no preceding "
+                        f"prediction position: {write_idx.tolist()}"
+                    )
                 if "attention_mask" in traj:
                     attn_mask = traj["attention_mask"][i]
                     active_idx = torch.nonzero(attn_mask, as_tuple=False).squeeze(-1)
@@ -830,8 +858,7 @@ class RemoteInfEngine(InferenceEngine):
                     raise ValueError(
                         f"Expected {target_len} token logprobs, got {len(token_logps)}"
                     )
-                write_idx = torch.nonzero(loss_mask[i], as_tuple=False).squeeze(-1)
-                out[i, write_idx] = torch.tensor(
+                out[i, prediction_idx] = torch.tensor(
                     token_logps, device=out.device, dtype=out.dtype
                 )
             results.append(out)
