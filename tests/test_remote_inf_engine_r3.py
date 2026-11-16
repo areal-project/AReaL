@@ -233,3 +233,18 @@ def test_compute_logp_single_token_response_keeps_teacher_signal(monkeypatch):
 
     assert out[0, 2].item() == pytest.approx(-0.4)
     assert out[0, 3].item() == 0.0
+
+
+def test_compute_logp_rejects_gapped_loss_mask(monkeypatch):
+    """A non-suffix mask cannot be aligned from the backend's last-N scores.
+
+    With ``[prompt, R1, context, R2]`` masked ``[0, 1, 0, 1]`` the backend
+    returns scores for ``[context, R2]``; shifting their write positions would
+    map the context score onto R1's slot. Reject rather than silently misalign.
+    """
+    input_ids = torch.tensor([[10, 11, 12, 20, 21, 30, 31]])
+    loss_mask = torch.tensor([[0, 0, 0, 1, 1, 0, 1]])
+    token_logps = [-0.1, -0.2, -0.3]
+
+    with pytest.raises(ValueError, match="contiguous response suffix"):
+        _run_compute_logp(input_ids, loss_mask, token_logps, monkeypatch)

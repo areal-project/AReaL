@@ -824,6 +824,21 @@ class RemoteInfEngine(InferenceEngine):
                 target_len = int(write_idx.numel())
                 if target_len <= 0:
                     continue
+                # Both backend parsers return the *last* ``target_len`` scores,
+                # which is only the response suffix when the mask is contiguous.
+                # A gapped mask (e.g. multi-turn ``[0, 1, 0, 1]``) would silently
+                # map the context score onto R1's slot, so reject it here.
+                expected_idx = torch.arange(
+                    write_idx[0],
+                    write_idx[0] + target_len,
+                    dtype=write_idx.dtype,
+                    device=write_idx.device,
+                )
+                if not torch.equal(write_idx, expected_idx):
+                    raise ValueError(
+                        "compute_logp supports a contiguous response suffix only; "
+                        f"got a gapped loss mask at nonzeros {write_idx.tolist()}"
+                    )
                 prediction_idx = write_idx - 1
                 if torch.any(prediction_idx < 0):
                     # A response token at position 0 has no preceding prediction
