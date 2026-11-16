@@ -39,6 +39,11 @@ class MegatronWeightResidency:
         self._ordinary_optimizer_restores: dict[
             int, list[tuple[torch.Tensor, torch.device]]
         ] = {}
+        # Some optimizers use DDP gradient buffers without param_data. Keep
+        # storage identity intact: optimizer owner schemas and tied views refer
+        # to the original storage, even while its allocation is absent.
+        self._unbuffered_weights: dict[int, tuple] = {}
+        self._master_backed_weights: dict[int, tuple] = {}
 
     @property
     def released_tags(self) -> frozenset[str]:
@@ -63,6 +68,13 @@ class MegatronWeightResidency:
         tags_to_release = [t for t in tags if t not in self._released_tags]
         if not tags_to_release:
             return
+
+        adapter = getattr(self._engine, "_weftmoe_adapter", None)
+        if adapter is not None and (
+            "weights" in tags_to_release
+            or getattr(adapter, "master_weights", None) is None
+        ):
+            adapter.suspend()
 
         if "optimizer" in tags_to_release:
             self._offload_optimizer_states()
@@ -146,16 +158,35 @@ class MegatronWeightResidency:
             return
         if not isinstance(model, (list, tuple)):
             model = [model]
+        flat_storages = {
+            buf.param_data.untyped_storage()._cdata
+            for chunk in model
+            for buf in (*chunk.buffers, *chunk.expert_parallel_buffers)
+            if buf.param_data is not None
+        }
+        self._offload_unbuffered_weights(model, flat_storages)
         count = 0
+        nbytes = 0
         for chunk in model:
             if isinstance(chunk, DDP):
                 for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
                     for buf in buffers:
+                        if buf.param_data is not None:
+                            size = buf.param_data.untyped_storage().nbytes()
+                            nbytes += size
+                            count += int(size > 0)
                         if hasattr(buf, "offload_to_cpu"):
-                            buf.offload_to_cpu()
-                            count += 1
+                            buf.offload_to_cpu(
+                                move_params=not getattr(
+                                    buf, "_weftmoe_fp8_master_managed", False
+                                )
+                            )
                             continue
-                        if buf.param_data.storage().size() > 0:
+                        if (
+                            buf.param_data is not None
+                            and not getattr(buf, "_weftmoe_fp8_master_managed", False)
+                            and buf.param_data.storage().size() > 0
+                        ):
                             if not hasattr(buf, "cpu_param_data"):
                                 buf.cpu_param_data = torch.zeros(
                                     buf.param_data.data.shape,
@@ -166,7 +197,6 @@ class MegatronWeightResidency:
                             buf.cpu_param_data.copy_(buf.param_data.data)
                             buf.param_data_size = buf.param_data.storage().size()
                             buf.param_data.storage().resize_(0)
-                            count += 1
                         if buf.grad_data.storage().size() > 0:
                             buf.grad_data_size = buf.grad_data.storage().size()
                             buf.grad_data.storage().resize_(0)
@@ -176,7 +206,159 @@ class MegatronWeightResidency:
                     "per-parameter weight offload is forbidden"
                 )
         current_platform.synchronize()
-        logger.info("Offloaded %d weight buffers to CPU", count)
+        nbytes += sum(host.numel() for _, host, _ in self._unbuffered_weights.values())
+        logger.info(
+            "Offloaded %d flat weight buffers and %d unbuffered storages (%d bytes) to CPU; %d expert storages restored from existing FP32 masters",
+            count,
+            len(self._unbuffered_weights),
+            nbytes,
+            len(self._master_backed_weights),
+        )
+
+    @staticmethod
+    def _storage_bytes(storage, size, device):
+        return torch.empty(0, dtype=torch.uint8, device=device).set_(
+            storage, 0, (size,), (1,)
+        )
+
+    @torch.no_grad()
+    def _offload_unbuffered_weights(self, model, flat_storages) -> None:
+        if self._unbuffered_weights or self._master_backed_weights:
+            raise RuntimeError("Unbuffered weights are already offloaded")
+        storages = {}
+        grad_storages = {
+            grad.untyped_storage()._cdata
+            for chunk in model
+            for param in chunk.parameters()
+            for grad in (getattr(param, "main_grad", None), param.grad)
+            if grad is not None
+        }
+        for chunk in model:
+            for param in chunk.parameters():
+                storage = param.untyped_storage()
+                if storage._cdata in flat_storages or storage.nbytes() == 0:
+                    continue
+                if not storage.resizable():
+                    raise RuntimeError("Cannot offload non-resizable parameter storage")
+                if storage._cdata in grad_storages:
+                    raise RuntimeError("Parameter storage aliases a gradient buffer")
+                storages[storage._cdata] = (storage, param.device)
+        # Complete consumers before releasing any allocation. Copy entire
+        # storages once, including shared views with nonzero offsets.
+        for device in {device for _, device in storages.values()}:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+        masters = self._expert_restore_sources(model, storages)
+        for key, (storage, device) in storages.items():
+            size = storage.nbytes()
+            if key in masters:
+                param, owner, master = masters[key]
+                self._master_backed_weights[key] = (
+                    storage,
+                    size,
+                    param,
+                    owner,
+                    master,
+                    master._version,
+                )
+                continue
+            host = torch.empty(
+                size, dtype=torch.uint8, device="cpu", pin_memory=device.type == "cuda"
+            )
+            host.copy_(self._storage_bytes(storage, size, device), non_blocking=True)
+            self._unbuffered_weights[key] = (storage, host, device)
+        for device in {device for _, device in storages.values()}:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+        for storage, _ in storages.values():
+            storage.resize_(0)
+
+    @torch.no_grad()
+    def _expert_restore_sources(self, model, storages):
+        """Release BF16 expert copies using their authoritative FP32 masters.
+
+        Drain pending optimizer writes before recording restore sources. Do not
+        copy or compare master values during offload. An optimizer may expose complete CPU master
+        tensors through get_full_parameter_master(param). Tied/partially owned matrices retain byte
+        snapshots; checkpoint leases restore weights before changing masters.
+        """
+        optimizer = getattr(self._engine, "optimizer", None)
+        providers = [
+            leaf.optimizer
+            for leaf in getattr(optimizer, "chained_optimizers", (optimizer,))
+            if callable(
+                getattr(
+                    getattr(leaf, "optimizer", None), "get_full_parameter_master", None
+                )
+            )
+        ]
+        if not providers:
+            return {}
+        for owner in providers:
+            owner.drain()
+        aliases = {}
+        for chunk in model:
+            for _, tensor in list(
+                chunk.named_parameters(remove_duplicate=False)
+            ) + list(chunk.named_buffers(remove_duplicate=False)):
+                key = tensor.untyped_storage()._cdata
+                aliases[key] = aliases.get(key, 0) + 1
+        sources = {}
+        for chunk in model:
+            for param in chunk.parameters():
+                key = param.untyped_storage()._cdata
+                if (
+                    key not in storages
+                    or aliases.get(key) != 1
+                    or getattr(param, "allreduce", True)
+                    or param.dtype != torch.bfloat16
+                    or not param.is_contiguous()
+                    or param.storage_offset()
+                    or param.numel() * param.element_size() != storages[key][0].nbytes()
+                ):
+                    continue
+                for owner in providers:
+                    master = owner.get_full_parameter_master(param)
+                    if (
+                        master is not None
+                        and master.device.type == "cpu"
+                        and master.dtype == torch.float32
+                        and master.numel() == param.numel()
+                    ):
+                        sources[key] = (param, owner, master)
+                        break
+        return sources
+
+    @torch.no_grad()
+    def _reload_unbuffered_weights(self) -> None:
+        # Validate every source before restoring any storage. A changed master
+        # while weights are released violates the residency lease ordering.
+        for _, _, param, owner, master, version in self._master_backed_weights.values():
+            if (
+                owner.get_full_parameter_master(param) is not master
+                or master._version != version
+            ):
+                raise RuntimeError(
+                    "Optimizer master changed while model weights were offloaded"
+                )
+        for storage, size, param, _, master, _ in self._master_backed_weights.values():
+            storage.resize_(size)
+            param.data.copy_(master.to(device=param.device).view(param.shape))
+        for storage, host, device in self._unbuffered_weights.values():
+            storage.resize_(host.numel())
+            self._storage_bytes(storage, host.numel(), device).copy_(
+                host, non_blocking=True
+            )
+        for device in {device for _, _, device in self._unbuffered_weights.values()}:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+        for device in {
+            p.device for _, _, p, _, _, _ in self._master_backed_weights.values()
+        }:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+        self._unbuffered_weights.clear()
+        self._master_backed_weights.clear()
 
     def _reload_model_weights(self, load_grad: bool = False) -> None:
         from megatron.core.distributed import DistributedDataParallel as DDP
@@ -191,11 +373,19 @@ class MegatronWeightResidency:
                 for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
                     for buf in buffers:
                         if hasattr(buf, "reload_from_cpu"):
-                            buf.reload_from_cpu(move_grads=load_grad)
+                            buf.reload_from_cpu(
+                                move_params=not getattr(
+                                    buf, "_weftmoe_fp8_master_managed", False
+                                ),
+                                move_grads=load_grad,
+                            )
                             continue
-                        if buf.param_data.storage().size() == 0:
-                            buf.param_data.storage().resize_(buf.param_data_size)
-                        buf.param_data.copy_(buf.cpu_param_data, non_blocking=True)
+                        if buf.param_data is not None and not getattr(
+                            buf, "_weftmoe_fp8_master_managed", False
+                        ):
+                            if buf.param_data.storage().size() == 0:
+                                buf.param_data.storage().resize_(buf.param_data_size)
+                            buf.param_data.copy_(buf.cpu_param_data, non_blocking=True)
                         if (
                             load_grad
                             and hasattr(buf, "grad_data_size")
@@ -207,6 +397,7 @@ class MegatronWeightResidency:
                 raise RuntimeError(
                     "Cannot reload Megatron weights without MCore DDP flat buffers"
                 )
+        self._reload_unbuffered_weights()
         current_platform.synchronize()
         logger.info("Reloaded model weights to GPU (load_grad=%s)", load_grad)
 

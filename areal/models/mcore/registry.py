@@ -14,6 +14,7 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig as MCoreDDPConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 from transformers import AutoConfig, PretrainedConfig
 
@@ -404,6 +405,25 @@ def make_mcore_layer_specs(hf_config: PretrainedConfig, tf_config: TransformerCo
         )
 
 
+def _configure_attention_backend(
+    model_config: TransformerConfig, engine_config: MegatronEngineConfig
+) -> None:
+    if engine_config.attention_backend is None:
+        return
+    model_config.attention_backend = AttnBackend[engine_config.attention_backend]
+    logger.info(
+        "Training attention_backend set to %s.", engine_config.attention_backend
+    )
+    if (
+        model_config.attention_backend == AttnBackend.flash
+        and getattr(model_config, "context_parallel_size", 1) > 1
+    ):
+        from areal.models.mcore.flash_attention_compat import patch_te_flash_attention_3
+
+        if patch_te_flash_attention_3():
+            logger.info("Adapted TE CP calls to the FA3 tuple-window interface.")
+
+
 def make_mcore_model(
     hf_config: PretrainedConfig,
     tf_config: TransformerConfig,
@@ -413,6 +433,10 @@ def make_mcore_model(
     is_critic: bool = False,
     use_lora: bool = False,
 ) -> list[GPTModel | DDP]:
+    if mcore_config is not None:
+        # mbridge and mcore-bridge return their own config as tf_config.
+        # Apply before get_model(), including the direct GPTModel path.
+        _configure_attention_backend(tf_config, mcore_config)
     if mcore_config is not None and mcore_config.mtp_only:
         if bridge_type != "megatron-bridge" or bridge is None:
             raise ValueError("mtp_only requires a megatron-bridge model")
@@ -539,14 +563,10 @@ def make_mcore_model(
                     "head requires fused_weight_gradient_mlp_cuda."
                 )
 
-        # Keep these four flags aligned with mbridge base defaults.
+        # Honor dispatcher selection just as the mbridge path does.
         provider.variable_seq_lengths = True
-        logger.warning(
-            "Ignoring mcore_config.moe_token_dispatcher_type=%s for bridge_type='megatron-bridge'; "
-            "using 'alltoall' and variable_seq_lengths=True.",
-            mcore_config.moe_token_dispatcher_type,
-        )
-        provider.moe_token_dispatcher_type = "alltoall"
+        provider.moe_token_dispatcher_type = mcore_config.moe_token_dispatcher_type
+        provider.moe_enable_deepep = mcore_config.moe_enable_deepep
         provider.batch_p2p_comm = False
         provider.overlap_p2p_comm = (
             vpp_size > 1 and provider.pipeline_model_parallel_size > 1
@@ -563,6 +583,7 @@ def make_mcore_model(
         # Aligning tf config settings with provider for consistency.
         tf_config.variable_seq_lengths = provider.variable_seq_lengths
         tf_config.moe_token_dispatcher_type = provider.moe_token_dispatcher_type
+        tf_config.moe_enable_deepep = provider.moe_enable_deepep
         tf_config.batch_p2p_comm = provider.batch_p2p_comm
         tf_config.overlap_p2p_comm = provider.overlap_p2p_comm
         if mcore_config.enable_router_replay:
@@ -575,6 +596,7 @@ def make_mcore_model(
         if mcore_config.use_deterministic_algorithms:
             set_deterministic_algorithms(provider, prebuild=True)
 
+        _configure_attention_backend(provider, mcore_config)
         provider.finalize()
 
         if getattr(hf_config, "model_type", None) in (

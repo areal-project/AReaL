@@ -233,8 +233,24 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             def resume_memory_occupation(self, tags=None):
                 del tags
 
-        resolver = McoreParamMetaResolver(
-            _EngineShim(self._engine), self._engine.hf_config, infer_conf
+        from areal.engine.awex.adapters.weftmoe_fp8 import (
+            train_meta_resolver,
+            train_primary,
+        )
+
+        if bool(infer_conf.get("weftmoe_fp8_primary", False)) != (
+            train_primary(self._engine) is not None
+        ):
+            raise ValueError(
+                "Training and inference must agree on WeftMoE FP8 primary weights"
+            )
+
+        resolver = (
+            train_meta_resolver(self._engine, _EngineShim(self._engine), infer_conf)
+            if train_primary(self._engine) is not None
+            else McoreParamMetaResolver(
+                _EngineShim(self._engine), self._engine.hf_config, infer_conf
+            )
         )
         self._parameters_meta = resolver.get_parameters_meta()
         self._rank_info = get_rank_info_extractor("mcore")()
@@ -713,6 +729,12 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         """Yield canonical parameters through AWEX's model registry."""
         from awex.converter.mcore_converter import get_mcore_model_parameters
 
+        from areal.engine.awex.adapters.weftmoe_fp8 import (
+            convert_fp8,
+            train_parameter,
+            train_primary,
+        )
+
         if self._weight_converter is None or self._rank_info is None:
             raise RuntimeError("AWEX Megatron converter is not configured")
         if self._engine.hf_config.architectures == ["Qwen4ExpForConditionalGeneration"]:
@@ -723,6 +745,13 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             self._weight_converter.refresh_frozen_contract()
 
         overrides = theta_by_id if theta_by_id is not None else {}
+        primary = train_primary(self._engine)
+        if primary is not None:
+            if overrides:
+                raise ValueError(
+                    "FP8 primary weights do not support DTE tensor overrides"
+                )
+            primary.resume()
         converted_names: set[str] = set()
         embed_tensor: torch.Tensor | None = None
         models = self._engine.model
@@ -731,6 +760,12 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
         for vp_stage, model in enumerate(models):
             for mcore_name, param in get_mcore_model_parameters(model).items():
+                fp8 = train_parameter(primary, param)
+                if fp8 is not None:
+                    yield from convert_fp8(
+                        self._weight_converter, mcore_name, *fp8, vp_stage=vp_stage
+                    )
+                    continue
                 source = overrides.get(id(param), param)
                 for hf_name, tensor in self._weight_converter.convert_param(
                     mcore_name, source.detach(), vp_stage=vp_stage
@@ -822,6 +857,18 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         torch.cuda.synchronize()
 
         live_storages = set()
+        from areal.engine.awex.adapters.weftmoe_fp8 import train_primary
+
+        primary = train_primary(self._engine)
+        if primary is not None:
+            for weights in primary.weights.values():
+                for weight in weights:
+                    live_storages.update(
+                        (
+                            weight.data.untyped_storage().data_ptr(),
+                            weight.scales.untyped_storage().data_ptr(),
+                        )
+                    )
         model = self._engine.model
         for chunk in model if isinstance(model, (list, tuple)) else [model]:
             for _, param in chunk.named_parameters():

@@ -798,3 +798,34 @@ def test_qwen_frozen_verification_precedes_worker_start(monkeypatch, invalid):
     else:
         plugin.bind()
         assert calls == ["verify", "start", "loop"]
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("tags", [["weights"], ["kv_cache"], None])
+def test_weftmoe_release_discards_only_fp8_receive_buffers(monkeypatch, fp8, tags):
+    import sys
+
+    calls = []
+    runner = object()
+    monkeypatch.setenv("AREAL_USE_WEFTMOE", "1")
+    monkeypatch.setenv("WEFTMOE_FP8", "1" if fp8 else "0")
+    monkeypatch.setitem(
+        sys.modules,
+        "weftmoe.sglang",
+        SimpleNamespace(
+            suspend=lambda model, **kwargs: calls.append((model, kwargs)),
+        ),
+    )
+    scheduler = SimpleNamespace(
+        tp_worker=SimpleNamespace(model_runner=runner),
+        release_memory_occupation=lambda request: calls.append("release"),
+        resume_memory_occupation=lambda request: None,
+    )
+    plugin = AwexSchedulerPlugin(scheduler)
+    plugin._receiver = SimpleNamespace(
+        release_fp8_bindings=lambda: calls.append("unbind"),
+    )
+    plugin._patch_memory_transitions()
+    scheduler.release_memory_occupation(SimpleNamespace(tags=tags))
+    discard = fp8 and (tags is None or "weights" in tags)
+    assert calls == ["unbind", (runner, {"discard_fp8": discard}), "release"]
