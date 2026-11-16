@@ -403,6 +403,8 @@ class ArenaOpenAPIClient:
         ]
         attempt = max((item["attempt"] for item in agent_items), default=0)
         names = {item.get("name") for item in agent_items if item["attempt"] == attempt}
+        if "checker-budget.json" not in names:
+            return {}
 
         async def read_artifact(name: str) -> Any:
             if name not in names:
@@ -429,8 +431,6 @@ class ArenaOpenAPIClient:
                 metrics["calls"] = float(used_calls)
             except OverflowError:
                 return metrics
-        elif audit == [] and "checker-budget.json" not in names:
-            metrics["calls"] = 0.0
         # A common cohort requires a complete, valid check history. Missing or
         # failed checks are not an early stop and must not be forward-filled.
         if (

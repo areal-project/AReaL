@@ -118,8 +118,8 @@ async def test_selfcheck_uses_harness_budget_even_when_no_episode_reaches_it():
 @pytest.mark.parametrize(
     "audit,budget,expected",
     [
-        ([], {"used_calls": 0}, {"calls": 0.0}),
-        ([], None, {"calls": 0.0}),
+        ([], {"used_calls": 0, "max_calls": 3}, {"calls": 0.0}),
+        ([], None, {}),
         ([{"response": {"status": "OK", "score": 1}}], None, {}),
         (
             [{"response": {"status": "OK", "score": 1}}],
