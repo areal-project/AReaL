@@ -11,6 +11,7 @@ from areal.api.cli_args import GRPOConfig, load_expr_config
 from areal.reward import get_math_verify_worker
 from areal.utils.hf_utils import apply_chat_template, load_hf_tokenizer
 from areal.utils.perf_tracer import record_disposition
+from areal.utils.runtime_versions import tokenizer_identity
 from areal.utils.stats_logger import StatsLogger
 
 
@@ -112,6 +113,7 @@ def _load_inputs(args, *, record_dataset=False):
                     "sample_count": len(train_dataset),
                     "ordered_ids": ids,
                     "filter": "len(tokenizer.encode(raw_prompt)) <= 1024",
+                    "tokenizer": tokenizer_identity(tokenizer),
                 },
                 indent=2,
             )

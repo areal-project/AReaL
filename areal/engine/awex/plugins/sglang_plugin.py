@@ -1149,6 +1149,14 @@ def register_awex_plugin() -> None:
             logger.exception("[AWEX] Scheduler.__init__ AWEX bind failed")
             raise
         logger.info("[AWEX] Scheduler.__init__ AWEX bind complete")
+        from areal.utils.runtime_versions import record_runtime_versions
+
+        record_runtime_versions(
+            "sglang",
+            gpu_id=getattr(self, "gpu_id", None),
+            tp_rank=resolve_scheduler_parallel_attr(self, "tp_rank"),
+            port=getattr(getattr(self, "server_args", None), "port", None),
+        )
 
     Scheduler.__init__ = _patched_init
     logger.info("[AWEX] Patched Scheduler.__init__ with awex plugin")

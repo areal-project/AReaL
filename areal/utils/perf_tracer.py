@@ -1937,6 +1937,10 @@ def configure(
                 "before configuring again."
             )
         GLOBAL_TRACER = PerfTracer(config, rank=rank, role=role)
+        if role == "actor":
+            from areal.utils.runtime_versions import record_runtime_versions
+
+            record_runtime_versions(role, rank=rank)
         logger.info(
             "Configured global PerfTracer: enabled=%s, session_tracing=%s, rank=%s, role=%s",
             GLOBAL_TRACER.enabled,

@@ -25,6 +25,7 @@ from areal.utils.perf_tracer import (
     session_context,
     trace_session,
 )
+from areal.utils.runtime_versions import record_tokenizer
 
 logger = logging.getLogger("RLVRWorkflow")
 
@@ -70,6 +71,7 @@ class RLVRWorkflow(RolloutWorkflow):
 
             tokenizer = load_hf_tokenizer(self.tokenizer)
             self.tokenizer = tokenizer
+        record_tokenizer(self.tokenizer)
         self.gconfig = gconfig.new_with_stop_and_pad_token_ids(self.tokenizer)
         self.enable_thinking = enable_thinking
         if not isinstance(reward_fn, str):
