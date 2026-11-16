@@ -144,7 +144,10 @@ from areal.engine.r3.transport import localize_r3_tensor
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform, is_npu_available
 from areal.models.mcore.bailing_v3_bridge import BailingV3Bridge
-from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
+from areal.models.mcore.hf_load import (
+    load_critic_value_head,
+    load_weights_from_hf_with_mbridge_fast,
+)
 from areal.models.mcore.hf_save import (
     save_critic_value_head,
     save_weights_to_hf_with_mbridge_fast,
@@ -3996,14 +3999,27 @@ class MegatronEngine(TrainEngine):
             with torch.device("cpu"):
                 self.bridge.load_weights(self.model, path)
         else:
-            load_weights_from_hf_with_mbridge_fast(
-                bridge=self.bridge,
-                models=self.model,
-                weights_path=path,
-                max_workers=None,
-                is_critic=self.config.is_critic,
-                fp8_direct_convert=self.fp8_direct_convert,
-            )
+            if (
+                is_qwen3_5_model(getattr(self.hf_config, "model_type", ""))
+                and not self.fp8_direct_convert
+            ):
+                # AReaL's fast loader does not handle Qwen3.5's gated QKV,
+                # zero-centered out_norm, or GDN linear-attention layouts.
+                # Delegate to mbridge's native loader, which skips lm_head for
+                # one-row critic value heads.
+                with torch.device("cpu"):
+                    self.bridge.load_weights(self.model, path)
+                if self.config.is_critic:
+                    load_critic_value_head(self.model, path, bridge=self.bridge)
+            else:
+                load_weights_from_hf_with_mbridge_fast(
+                    bridge=self.bridge,
+                    models=self.model,
+                    weights_path=path,
+                    max_workers=None,
+                    is_critic=self.config.is_critic,
+                    fp8_direct_convert=self.fp8_direct_convert,
+                )
 
     def _prepare_mb_list(
         self,

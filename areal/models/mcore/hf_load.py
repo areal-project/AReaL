@@ -679,6 +679,36 @@ def make_filename_bins(
     return grouped_local_names, grouped_filenames
 
 
+def load_critic_value_head(
+    models: list[torch.nn.Module],
+    weights_path: str,
+    *,
+    bridge: Bridge | None = None,
+) -> None:
+    """Load ``value_head.pt`` saved next to a critic HF checkpoint, if present.
+
+    Base-model HF checkpoints have no value head; the ValueHead then keeps its
+    zero initialization.
+    """
+    if not mpu.is_pipeline_last_stage():
+        return
+    if bridge is not None and hasattr(bridge, "_get_actual_hf_path"):
+        weights_path = bridge._get_actual_hf_path(weights_path)
+    value_head_path = os.path.join(weights_path, "value_head.pt")
+    if os.path.exists(value_head_path):
+        value_head_state = torch.load(value_head_path, weights_only=True)
+        for model in models:
+            _model = unwrap_to_gpt_model(model)
+            if hasattr(_model, "output_layer"):
+                _model.output_layer.load_state_dict(value_head_state)
+        logger.info(f"Loaded ValueHead weights from {value_head_path}")
+    else:
+        logger.info(
+            f"ValueHead checkpoint not found at {value_head_path}, "
+            "keeping zero-initialized ValueHead (normal for first training)."
+        )
+
+
 def load_weights_from_hf_with_mbridge_fast(
     bridge: Bridge,
     models: list[torch.nn.Module],
@@ -779,18 +809,5 @@ def load_weights_from_hf_with_mbridge_fast(
         for _ in results:
             pass
 
-    # Load value_head weights for critic models.
-    if is_critic and mpu.is_pipeline_last_stage():
-        value_head_path = os.path.join(weights_path, "value_head.pt")
-        if os.path.exists(value_head_path):
-            value_head_state = torch.load(value_head_path, weights_only=True)
-            for model in models:
-                _model = unwrap_to_gpt_model(model)
-                if hasattr(_model, "output_layer"):
-                    _model.output_layer.load_state_dict(value_head_state)
-            logger.info(f"Loaded ValueHead weights from {value_head_path}")
-        else:
-            logger.info(
-                f"ValueHead checkpoint not found at {value_head_path}, "
-                "using random initialization (normal for first training)."
-            )
+    if is_critic:
+        load_critic_value_head(models, weights_path)
