@@ -99,9 +99,8 @@ rollout:
     additional_bash_cmds:
     - set -euo pipefail
     - source "$QWEN_RUNTIME_SCRIPT"
-    # Apply after site.env so historical cache=0 profiles cannot override it.
-    - export SGLANG_VLM_CACHE_SIZE_MB=100
     - python3 "$QWEN_RECIPE_DIR/configure_sglang_logging.py"
+    - python3 -m areal.engine.sglang_mm_tensor_storage
     - test "$TMS_INIT_ENABLE" = 0
     - test "$TMS_INIT_ENABLE_CPU_BACKUP" = 0
     - cd ${oc.env:QWEN_REPO}
@@ -187,8 +186,6 @@ actor:
     recompute_num_layers: 1
     bridge_type: megatron-bridge
     language_model_only: false
-    freeze_vision_model: true
-    freeze_vision_projection: true
     use_bridge_for_update_weights: false
     enable_mtp: false
     use_precision_aware_optimizer: false
@@ -315,10 +312,6 @@ sglang:
   ep_size: 1
   log_level: info
   enable_multimodal: true
-  limit_mm_data_per_request:
-    image: 64
-    video: 1
-    audio: 5
 train_dataset:
   batch_size: 16
   shuffle: true
@@ -360,6 +353,7 @@ stats_logger:
   fileroot: ${cluster.fileroot}
   wandb:
     mode: online
+    entity: sct-test
     project: ${experiment_name}
     name: ${trial_name}
 perf_tracer:
