@@ -252,6 +252,7 @@ class InteractionWithTokenLogpReward:
             attention_mask=torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             # reward
             rewards=torch.tensor([float(reward)]),
+            is_truncated=torch.tensor([resp.stop_reason == "length"], dtype=torch.bool),
         )
         if self.multi_modal_input is not None:
             result["multi_modal_input"] = self.multi_modal_input

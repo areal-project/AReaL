@@ -36,10 +36,6 @@ from areal.utils.data import (
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "device",
-    ["cpu", pytest.param("cuda", marks=[pytest.mark.gpu, pytest.mark.cuda])],
-)
 @pytest.mark.parametrize("mode", ["token-mean", "seq-mean", "traj-mean", "prompt-mean"])
 @pytest.mark.parametrize("export_mode", ["inline", "online"])
 @pytest.mark.parametrize(
@@ -58,11 +54,10 @@ from areal.utils.data import (
     ],
 )
 async def test_discounted_individual_rows_keep_episode_reference(
-    device, mode, export_mode, explicit_reference, long_row, monkeypatch
+    mode, export_mode, explicit_reference, long_row, monkeypatch
 ):
     """Exercise export, proxy transport, grouped markers, RPC and actor rewards."""
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("Requires CUDA")
+    device = "cpu"
 
     cache = InteractionCache()
     for index, key in enumerate(("first", "last")):

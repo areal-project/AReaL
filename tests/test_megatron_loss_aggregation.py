@@ -164,6 +164,7 @@ def run_callback_contract(mode, cp_size, dp_size, split, per_token, scenario):
             }
             train, compute, build = load_engine_callbacks(namespace)
             engine = SimpleNamespace(
+                mcore_config=SimpleNamespace(enable_mtp_training=False),
                 _ensure_ready=lambda: None,
                 optimizer_zero_grad=lambda: None,
                 optimizer_step=lambda: {},

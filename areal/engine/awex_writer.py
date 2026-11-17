@@ -58,10 +58,6 @@ class AwexMegatronWriterAdapter:
         if self.weights_exchange_writer is not None:
             return
         self.weights_exchange_writer = self._get_writer(self)
-        from areal.engine.patch_awex import patch_awex
-
-        patch_awex()
-        logger.info("patching awex success for megatron process.")
         self.weights_exchange_writer.initialize()
 
     def set_global_step(self, global_step: int) -> None:

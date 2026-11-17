@@ -28,6 +28,7 @@ from areal.api.cli_args import (
     TrainEngineConfig,
 )
 from areal.engine import FSDPEngine, MegatronEngine
+from areal.engine.megatron_utils.frozen_mtp import read_mtp_tensors
 from areal.infra.platforms import current_platform
 from areal.utils import seeding
 from areal.utils.data import broadcast_tensor_container
@@ -659,8 +660,8 @@ def test_train_hf_save_load(
         and model_type == "qwen3_5_moe"
         and getattr(engine.hf_config, "areal_test_fixture", False)
     ):
-        source_mtp = engine._read_source_mtp_by_shard(_get_model_path(model_type))
-        saved_mtp = engine._read_source_mtp_by_shard(save_dir)
+        source_mtp = read_mtp_tensors(_get_model_path(model_type))
+        saved_mtp = read_mtp_tensors(save_dir)
         assert source_mtp, "The fixture must exercise frozen MTP passthrough"
         assert source_mtp.keys() == saved_mtp.keys()
         for shard, tensors in source_mtp.items():

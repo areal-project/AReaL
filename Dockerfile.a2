@@ -15,29 +15,36 @@
 # This file is a part of the AReaL project.
 #
 
-FROM quay.io/ascend/cann:9.1.0-910b-ubuntu22.04-py3.12
+FROM quay.io/ascend/cann:9.2.1-910b-ubuntu22.04-py3.12
 
-ARG CANN_VERSION=9.1.0
+ARG CANN_VERSION=9.2.1
 ARG MEGATRON_BRANCH=core_r0.18.0
 ARG MEGATRON_COMMIT=dc0ee41ada177d4c74ba46bb501bba5967264815
-ARG MINDSPEED_BRANCH=core_r0.18.0
-ARG MINDSPEED_COMMIT=24565708bc9809d80f53e43621115122e93abeea
-ARG MEGATRON_ADAPTOR_BRANCH=core_r0.18.0
-ARG MEGATRON_ADAPTOR_COMMIT=45efe78fed838bc9d11347c82155710a365d8eec
-ARG TRANSFORMER_ENGINE_NPU_BRANCH=main
-ARG TRANSFORMER_ENGINE_NPU_COMMIT=fd09a928c1e2c74fa13f08dd96a9d7c68cabb48f
+ARG MINDSPEED_BRANCH=26.2.0_core_r0.18.0
+ARG MINDSPEED_COMMIT=bc6a7d793c1a920ff82d5867b3ac32cb6cd5493b
+ARG MEGATRON_ADAPTOR_BRANCH=26.2.0_core_r0.18.0
+ARG MEGATRON_ADAPTOR_COMMIT=9a2dbe20d92b14dde5522abd98b5b555b78b10a2
+ARG TRANSFORMER_ENGINE_NPU_BRANCH=26.2.0_release_v2.17
+ARG TRANSFORMER_ENGINE_NPU_COMMIT=7a5e08351d7c0c7bc00a3d4f2c0c6dec4c8999e6
 ARG MEGATRON_BRIDGE_TAG=v0.5.1
 ARG MEGATRON_BRIDGE_COMMIT=5cb3444c43f7499cf3872b2d46870cf8bc2e00ce
-ARG VLLM_TAG=v0.26.0
-ARG VLLM_ASCEND_BRANCH=releases/v0.26.0rc
-ARG VLLM_ASCEND_COMMIT=fb2820b9b6598f888d7dc56260c03d3352cc08e9
+ARG VLLM_TAG=v0.30.0
+ARG VLLM_ASCEND_BRANCH=releases/v0.30.0
+ARG VLLM_ASCEND_COMMIT=32c31d8ad4d7a41c226f3bcb56314088f5367140
+# Upstream v0.3.14.rc1 artifacts report package version 0.3.13.
+ARG MOONCAKE_VERSION=0.3.13
+ARG MOONCAKE_OBS_PREFIX=https://mindie.obs.cn-north-4.myhuaweicloud.com/buildtools/docker_images_tools/Mooncake/v0.3.14.rc1
+ARG TRITON_ASCEND_PACKAGE_VERSION=3.6.0.post2
+ARG FLA_VERSION=26.9.1
+ARG FLA_RELEASE_TAG=v26.9.1-release
 ARG ASCEND_INSTALL_PATH=/usr/local/Ascend
 ARG SOC_VERSION=ascend910b1
 
 # System build deps (the clean CANN base ships none) + pip/uv bootstrap.
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
-        gcc g++ cmake libnuma-dev wget git curl jq vim tmux build-essential gawk clang-15 && \
+        gcc g++ cmake libnuma-dev wget git curl jq vim tmux build-essential gawk clang-15 \
+        protobuf-compiler libprotobuf-dev numactl libibverbs-dev libjemalloc2 libhiredis-dev && \
     update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 && \
     update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
@@ -46,11 +53,10 @@ RUN apt-get update -y && \
 
 # Exact-token generation transport for the pinned vLLM release; see
 # patches/README.md for provenance and deletion conditions.
-COPY patches/vllm-content-parts.patch \
-     patches/vllm-exact-token-validation.patch /areal-workspace/patches/
+COPY patches/vllm-exact-token-validation.patch /areal-workspace/patches/
 
-# Install vLLM + vllm-ascend. The latter pins torch 2.10.0,
-# torch-npu 2.10.0.post4, and triton-ascend 3.2.2.
+# Install vLLM + vllm-ascend with the CANN 9.2 / MindSpeed 26.2 runtime.
+# Keep torch-npu and triton-ascend pinned to the shared runtime versions.
 # Patches are applied after the editable install, never before: a dirty tree changes
 # setuptools-scm's recorded version and can select incompatible vllm-ascend paths.
 # The recorded version is asserted so any regression fails during the build.
@@ -65,14 +71,46 @@ RUN export PIP_EXTRA_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pyp
     git -C /areal-workspace/vllm-ascend checkout ${VLLM_ASCEND_COMMIT} && \
     cd /areal-workspace/vllm && \
     VLLM_TARGET_DEVICE=empty pip install -v -e . && \
-    git apply -v /areal-workspace/patches/vllm-content-parts.patch && \
     git apply -v /areal-workspace/patches/vllm-exact-token-validation.patch && \
     python3 -c "import sys, os; sys.path.insert(0, 'vllm'); import _version; want = os.environ['VLLM_TAG'].removeprefix('v'); assert _version.__version__ == want, f'vllm reports {_version.__version__}, expected {want}'" && \
     pip uninstall -y triton && \
     cd /areal-workspace/vllm-ascend && \
     pip install -r requirements.txt && \
-    COMPILE_CUSTOM_KERNELS=1 pip install --no-build-isolation --no-deps -v -e . && \
-    python3 -c "from importlib.metadata import version; from packaging.version import Version; expected = {'torch': '2.10.0', 'torch-npu': '2.10.0.post4', 'triton-ascend': '3.2.2'}; actual = {name: Version(version(name)).public for name in expected}; assert actual == expected, (actual, expected)" && \
+    VLLM_BATCH_INVARIANT=1 COMPILE_CUSTOM_KERNELS=1 pip install --no-build-isolation --no-deps -v -e . && \
+    python3 -c "import os; from importlib.metadata import version; from packaging.version import Version; expected = {'torch': '2.10.0', 'torch-npu': '2.10.0.post7', 'triton': '3.6.0', 'triton-ascend': os.environ['TRITON_ASCEND_PACKAGE_VERSION']}; actual = {name: Version(version(name)).public for name in expected}; assert actual == expected, (actual, expected)" && \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 mfcli kernel install --soc-version A2 && \
+    python3 -m pip cache purge
+
+# Install the optional AWEX source override.
+# Set AWEX_COMMIT="" to use the pyproject.npu.toml package instead.
+ARG AWEX_REPO=https://github.com/HwVanICI/asystem-awex.git
+ARG AWEX_COMMIT=2bff8835beb287ca853a52d463b697a0e3da3e81
+RUN touch /areal-workspace/awex-manifest.sed && \
+    if [ -n "${AWEX_COMMIT}" ]; then \
+        git clone "${AWEX_REPO}" /areal-workspace/awex && \
+        git -C /areal-workspace/awex checkout "${AWEX_COMMIT}" && \
+        python3 -m pip uninstall -y awex-ascend && \
+        python3 -m pip install --no-deps --no-build-isolation /areal-workspace/awex && \
+        echo '/"awex-ascend==/d' > /areal-workspace/awex-manifest.sed && \
+        python3 -m pip cache purge; \
+    fi
+
+# ARM64 wheels from the pinned Mooncake and FLA releases.
+RUN MOONCAKE_WHL="mooncake_transfer_engine-${MOONCAKE_VERSION}-cp312-cp312-manylinux_2_35_aarch64.whl" && \
+    wget --no-check-certificate --no-verbose "${MOONCAKE_OBS_PREFIX}/${MOONCAKE_WHL}" -O "/tmp/${MOONCAKE_WHL}" && \
+    echo "1347085176ea15abeaaba02466f22c670f9ce39fd3108b7bee9d3769c0f069bf  /tmp/${MOONCAKE_WHL}" | sha256sum --check && \
+    . ${ASCEND_INSTALL_PATH}/ascend-toolkit/set_env.sh && \
+    python3 -m pip install aiohttp requests msgpack concurrent-log-handler && \
+    python3 -m pip uninstall -y mooncake-transfer-engine-npu && \
+    python3 -m pip install --force-reinstall --no-deps "/tmp/${MOONCAKE_WHL}" && \
+    rm -f "/tmp/${MOONCAKE_WHL}" && \
+    python3 -m pip cache purge
+
+RUN FLA_WHL="flash_linear_attention_npu_a2-${FLA_VERSION}-py3-none-manylinux_2_34_aarch64.whl" && \
+    wget --no-check-certificate --no-verbose "https://github.com/flashserve/flash-linear-attention-npu/releases/download/${FLA_RELEASE_TAG}/${FLA_WHL}" -O "/tmp/${FLA_WHL}" && \
+    echo "aefe29fe3f021db45276b289b1f9882f85a34ce1f9900ba94251bda490af4b6e  /tmp/${FLA_WHL}" | sha256sum --check && \
+    python3 -m pip install --force-reinstall --no-deps "/tmp/${FLA_WHL}" && \
+    rm -f "/tmp/${FLA_WHL}" && \
     python3 -m pip cache purge
 
 # Install the MCore 0.18 NPU stack in its required MA -> TENPU -> MindSpeed order.
@@ -94,7 +132,7 @@ RUN git clone --branch ${MEGATRON_BRANCH} https://github.com/NVIDIA/Megatron-LM.
 
 # Supply dependencies skipped by source-only/--no-deps training installs:
 # qwen-vl-utils/modelopt for Bridge, nvdlfw-inspect for TENPU, tzdata for MindSpeed.
-# Restore vLLM 0.26's FastAPI/Starlette requirements after vllm-ascend downgrades them;
+# Restore vLLM 0.30's FastAPI/Starlette requirements after vllm-ascend downgrades them;
 # OpenAI >=2.44 is the validated SDK baseline for its Responses API imports.
 # Keep this separate so dependency adjustments reuse the backend build layers.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -102,10 +140,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         qwen-vl-utils nvidia-modelopt nvdlfw-inspect tzdata \
         'fastapi>=0.133.0,<0.137' 'starlette>=1.0.1' 'openai>=2.44.0'
 
-# Install only AReaL application dependencies from the manifest.
+# Install AReaL application dependencies, preserving the AWEX source override.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.npu.toml,target=pyproject.toml \
-    UV_HTTP_TIMEOUT=300 uv pip install -r pyproject.toml --system --group dev
+    sed -f /areal-workspace/awex-manifest.sed pyproject.toml > /tmp/pyproject.toml && \
+    UV_HTTP_TIMEOUT=300 uv pip install -r /tmp/pyproject.toml --system --group dev && \
+    rm /tmp/pyproject.toml
 
 # Install Megatron-Bridge
 COPY patches/megatron-bridge.v0.5.1-vision-dp-cp.patch /areal-workspace/patches/
@@ -123,8 +163,10 @@ RUN cp /AReaL/pyproject.npu.toml /AReaL/pyproject.toml && \
 ENV PYTHONPATH=/areal-workspace/MegatronAdaptor:/areal-workspace/TransformerEngineNPU:/areal-workspace/MindSpeed:/areal-workspace/megatron-python:/areal-workspace/Megatron-Bridge/src:$PYTHONPATH
 
 # Validate dependency metadata and module paths without importing NPU backends.
-RUN python3 -c "from importlib.metadata import version; from packaging.version import Version; expected = {'torch': '2.10.0', 'torch-npu': '2.10.0.post4', 'triton-ascend': '3.2.2', 'transformers': '5.14.1'}; actual = {name: Version(version(name)).public for name in expected}; assert actual == expected, (actual, expected)" && \
-    python3 -c "import tomllib; from importlib.metadata import version; from packaging.requirements import Requirement; deps = tomllib.load(open('/AReaL/pyproject.toml', 'rb'))['project']['dependencies']; requirements = [Requirement(dep) for dep in deps]; mismatches = [(r.name, version(r.name), str(r.specifier)) for r in requirements if (r.marker is None or r.marker.evaluate()) and r.specifier and not r.specifier.contains(version(r.name))]; assert not mismatches, mismatches" && \
+RUN python3 -c "import triton; import triton.language; assert callable(triton.jit); assert triton.language.dtype is not None"
+RUN python3 -c "import os; from importlib.metadata import version; from packaging.version import Version; expected = {'torch': '2.10.0', 'torch-npu': '2.10.0.post7', 'triton': '3.6.0', 'triton-ascend': os.environ['TRITON_ASCEND_PACKAGE_VERSION'], 'transformers': '5.14.1', 'memfabric-hybrid': '1.3.0', 'memcache-hybrid': '1.3.0'}; actual = {name: Version(version(name)).public for name in expected}; assert actual == expected, (actual, expected)" && \
+    python3 -c "import os; from importlib.metadata import version; from packaging.version import Version; expected = {'mooncake-transfer-engine': os.environ['MOONCAKE_VERSION'], 'flash-linear-attention-npu-a2': os.environ['FLA_VERSION']}; actual = {name: version(name) for name in expected}; assert all(Version(actual[name]) == Version(want) for name, want in expected.items()), (actual, expected)" && \
+    python3 -c "import os, tomllib; from importlib.metadata import version; from packaging.requirements import Requirement; deps = tomllib.load(open('/AReaL/pyproject.toml', 'rb'))['project']['dependencies']; requirements = [Requirement(dep) for dep in deps]; requirements = [r for r in requirements if not (r.name == 'awex-ascend' and os.environ.get('AWEX_COMMIT'))]; mismatches = [(r.name, version(r.name), str(r.specifier)) for r in requirements if (r.marker is None or r.marker.evaluate()) and r.specifier and not r.specifier.contains(version(r.name))]; assert not mismatches, mismatches" && \
     python3 -c "from importlib.metadata import version; from packaging.requirements import Requirement; requirements = [Requirement(dep) for dep in ('fastapi>=0.133.0,<0.137', 'starlette>=1.0.1', 'openai>=2.44.0')]; mismatches = [(r.name, version(r.name), str(r.specifier)) for r in requirements if not r.specifier.contains(version(r.name))]; assert not mismatches, mismatches" && \
     python3 -c "from importlib.util import find_spec; modules = ('megatron_adaptor', 'transformer_engine', 'mindspeed', 'mbridge', 'megatron.core', 'megatron.training', 'megatron.bridge'); missing = [name for name in modules if find_spec(name) is None]; assert not missing, missing" && \
     python3 -c "from importlib.util import find_spec; spec = find_spec('examples.vlm.geometry3k_grpo'); assert spec is not None and spec.origin == '/AReaL/examples/vlm/geometry3k_grpo.py', spec"

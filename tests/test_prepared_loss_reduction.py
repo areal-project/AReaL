@@ -266,6 +266,7 @@ def test_prepared_weights_are_loss_metadata_not_model_kwargs(backend):
         "input_ids": torch.ones(1, 4, dtype=torch.long),
         "loss_mask": torch.ones(1, 4, dtype=torch.bool),
         "unit_weights": torch.full((1, 4), 0.25),
+        "is_truncated": torch.tensor([True]),
     }
     item = SimpleNamespace(orig_mb=dict(data), padded_mb=dict(data), padding_length=0)
     namespace = {
@@ -285,6 +286,11 @@ def test_prepared_weights_are_loss_metadata_not_model_kwargs(backend):
         enable_tree_training=False,
     )
     inputs, context = prepare(engine, item)
+    assert "is_truncated" not in inputs
+    assert "is_truncated" in item.padded_mb
+    torch.testing.assert_close(
+        context.mb_input["is_truncated"], data["is_truncated"], rtol=0, atol=0
+    )
     assert "unit_weights" not in inputs
     assert "unit_weights" in item.padded_mb
     torch.testing.assert_close(

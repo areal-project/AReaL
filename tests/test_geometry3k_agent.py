@@ -49,6 +49,42 @@ def test_geometry3k_reward_combines_accuracy_and_format_scores(monkeypatch):
     assert reward == pytest.approx(0.55)
 
 
+@pytest.mark.parametrize("entrypoint", ["agent", "vlm"])
+@pytest.mark.parametrize("answer,accuracy", [("2", 1.0), ("3", 0.0)])
+@pytest.mark.parametrize(
+    "completion,think_prefilled,format_score",
+    [
+        (r"<think>Reasoning.</think>\boxed{2}", False, 1.0),
+        (r"Reasoning.</think>\boxed{2}", True, 1.0),
+        (r"Reasoning.</think>\boxed{2}", False, 0.0),
+        (r"<think>Reasoning.</think>\boxed{2}", True, 0.0),
+        (r"<think><think>Reasoning.</think>\boxed{2}", False, 0.0),
+        (r"<think>Reasoning.</think></think>\boxed{2}", False, 0.0),
+        (r"Reasoning.\boxed{2}", True, 0.0),
+    ],
+)
+def test_geometry3k_reward_prefill_and_tag_boundaries_match_expected(
+    entrypoint, answer, accuracy, completion, think_prefilled, format_score
+):
+    """Both entrypoints grade the full format without changing answer accuracy."""
+    reward_fn = geometry3k_agent.geometry3k_reward_fn
+    if entrypoint == "vlm":
+        from examples.vlm.geometry3k_grpo import geometry3k_reward_fn
+
+        reward_fn = geometry3k_reward_fn
+
+    reward = reward_fn(
+        prompt="",
+        completions=completion,
+        prompt_ids=[],
+        completion_ids=[],
+        answer=answer,
+        think_prefilled=think_prefilled,
+    )
+
+    assert reward == pytest.approx(0.9 * accuracy + 0.1 * format_score)
+
+
 def test_build_agent_input_preserves_text_and_embeds_image():
     """Geometry3K image placeholders should become Responses API image items."""
     data = {

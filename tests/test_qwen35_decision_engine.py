@@ -204,6 +204,8 @@ def test_load_hf_skips_output_layer_then_syncs_head():
         model=["chunk"],
         bridge_cls="megatron-bridge",
         config=SimpleNamespace(is_decision_model=True, is_critic=False),
+        mcore_config=SimpleNamespace(enable_mtp_training=False),
+        _mtp_head_dropped=False,
         bridge=Bridge(),
         _sync_decision_pointer_head=lambda path: calls.setdefault("sync", path),
     )
@@ -214,9 +216,10 @@ def test_load_hf_skips_output_layer_then_syncs_head():
         "lm_head.weight",
     ]
     assert calls["sync"] == "/ckpt"
+    assert engine._frozen_mtp_state is None
 
 
-def test_save_hf_writes_head_and_relaxes_lm_head_export():
+def test_save_hf_writes_head_and_relaxes_lm_head_export(tmp_path):
     calls = {}
 
     class Bridge:
@@ -244,6 +247,7 @@ def test_save_hf_writes_head_and_relaxes_lm_head_export():
             "current_platform": SimpleNamespace(synchronize=lambda: None),
         },
     )
+    ckpt_dir = str(tmp_path / "decision-ckpt")
     engine = SimpleNamespace(
         model=["chunk"],
         bridge_cls="megatron-bridge",
@@ -258,6 +262,7 @@ def test_save_hf_writes_head_and_relaxes_lm_head_export():
         ),
         bridge=Bridge(),
         _mtp_head_dropped=False,
+        _run_hf_rank_zero=lambda fn: fn(),
         _rebuild_index_from_saved_shards=lambda path: calls.setdefault("index", path),
         _decision_head_checkpoint_meta=_method(
             "_decision_head_checkpoint_meta"
@@ -267,9 +272,116 @@ def test_save_hf_writes_head_and_relaxes_lm_head_export():
     engine._decision_head_checkpoint_meta = lambda: _method(
         "_decision_head_checkpoint_meta"
     )(engine)
-    save(engine, "/tmp/decision-ckpt")
+    save(engine, ckpt_dir)
     assert calls["strict"] is False
-    assert calls["index"] == "/tmp/decision-ckpt"
-    assert calls["head"] == "/tmp/decision-ckpt"
+    assert calls["index"] == ckpt_dir
+    assert calls["head"] == ckpt_dir
     assert calls["meta"].weights == "full"
     assert calls["meta"].head_dim == 8
+
+
+def test_rebuild_index_prunes_ghost_lm_head_before_frozen_mtp_export(tmp_path):
+    import json
+    from pathlib import Path
+
+    from safetensors.torch import save_file
+
+    from areal.engine.megatron_utils.frozen_mtp import FrozenMTPState
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+
+    save_file(
+        {
+            "model.embed_tokens.weight": torch.ones(4, 4),
+            "lm_head.weight": torch.ones(4, 4),
+            "mtp.layers.0.weight": torch.full((2, 2), 3.0),
+        },
+        src / "model-00001-of-00001.safetensors",
+        metadata={"format": "pt"},
+    )
+    source_index = {
+        "metadata": {"total_size": 144},
+        "weight_map": {
+            "model.embed_tokens.weight": "model-00001-of-00001.safetensors",
+            "lm_head.weight": "model-00001-of-00001.safetensors",
+            "mtp.layers.0.weight": "model-00001-of-00001.safetensors",
+        },
+    }
+    (src / "model.safetensors.index.json").write_text(json.dumps(source_index))
+    (src / "config.json").write_text(
+        json.dumps({"text_config": {"mtp_num_hidden_layers": 1}})
+    )
+    frozen = FrozenMTPState.load(str(src))
+
+    # Bridge strict=False export omits both replaced lm_head.weight and dropped mtp.*,
+    # while still writing the source weight_map.
+    save_file(
+        {"model.embed_tokens.weight": torch.ones(4, 4)},
+        dst / "model-00001-of-00001.safetensors",
+        metadata={"format": "pt"},
+    )
+    (dst / "model.safetensors.index.json").write_text(json.dumps(source_index))
+    (dst / "config.json").write_text(
+        json.dumps({"text_config": {"mtp_num_hidden_layers": 0}})
+    )
+
+    rebuild = _method(
+        "_rebuild_index_from_saved_shards",
+        extra={"Path": Path, "json": json},
+    )
+    engine = SimpleNamespace(logger=SimpleNamespace(info=lambda *a, **k: None))
+    rebuild(engine, str(dst))
+    frozen.export(str(dst))
+
+    exported_index = json.loads((dst / "model.safetensors.index.json").read_text())
+    assert set(exported_index["weight_map"]) == {
+        "model.embed_tokens.weight",
+        "mtp.layers.0.weight",
+    }
+
+
+def test_pointer_head_skips_fp32_lm_head_patch_and_rejects_lm_head_flags():
+    from areal.api.cli_args import MegatronEngineConfig, TrainEngineConfig
+    from areal.models.mcore.qwen35_decision import PointerHead as RealPointerHead
+    from areal.models.mcore.registry import _enable_fp32_lm_head_forward
+
+    class FakeGPT(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.output_layer = RealPointerHead(8, dp=4)
+
+    gpt = FakeGPT()
+    assert _enable_fp32_lm_head_forward([gpt], enabled=True) == 0
+    assert not hasattr(gpt.output_layer, "_areal_fp32_lm_head_enabled")
+
+    from areal.engine.megatron_engine import MegatronEngine
+
+    with pytest.raises(ValueError, match="enable_chunked_logits=False"):
+        MegatronEngine(
+            TrainEngineConfig(
+                experiment_name="t",
+                trial_name="t",
+                path="Qwen/Qwen3.5-4B",
+                is_decision_model=True,
+                megatron=MegatronEngineConfig(
+                    bridge_type="megatron-bridge",
+                    enable_chunked_logits=True,
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="enable_mtp_training=True"):
+        MegatronEngine(
+            TrainEngineConfig(
+                experiment_name="t",
+                trial_name="t",
+                path="Qwen/Qwen3.5-4B",
+                is_decision_model=True,
+                megatron=MegatronEngineConfig(
+                    bridge_type="megatron-bridge",
+                    enable_mtp_training=True,
+                ),
+            )
+        )

@@ -5,7 +5,6 @@ from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
-from vllm.logger import init_logger
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
@@ -22,10 +21,17 @@ except ImportError:
 
 
 from areal.engine.core.distributed import init_custom_process_group
+from areal.engine.vllm_ext.npu_weight_reload import (
+    NpuReloadModel,
+    NpuWeightReload,
+    needs_native_moe_reload,
+    weight_update_models,
+)
 from areal.infra.platforms import current_platform
 from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
+from areal.utils.logging import getLogger
 
-logger = init_logger("vllm_worker_extension")
+logger = getLogger("VLLMWorkerExtension")
 
 
 def undo_moe_postprocess_for_reload(model):
@@ -40,42 +46,6 @@ def undo_moe_postprocess_for_reload(model):
             p.data = p.data.transpose(1, 2).contiguous()
 
 
-def _apply_ascend_patch_once():
-    try:
-        from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
-    except Exception:
-        return
-
-    if getattr(AscendUnquantizedFusedMoEMethod, "_areal_patched", False):
-        return
-
-    original = AscendUnquantizedFusedMoEMethod.process_weights_after_loading
-
-    def patched(self_method, layer):
-        original(self_method, layer)
-        layer.w13_weight.weight_loader = layer.weight_loader
-        layer.w2_weight.weight_loader = layer.weight_loader
-
-    AscendUnquantizedFusedMoEMethod.process_weights_after_loading = patched
-    AscendUnquantizedFusedMoEMethod._areal_patched = True
-
-
-_apply_ascend_patch_once()
-
-
-def _apply_ascend_patch_awex():
-    try:
-        from areal.engine.patch_awex import patch_awex
-
-        patch_awex()
-        print("patching awex success for vllm worker process.", flush=True)
-    except ImportError:
-        print("Failed to import awex, skip patching awex.", flush=True)
-
-
-_apply_ascend_patch_awex()
-
-
 class VLLMWorkerExtension:
     """
     Iherited from vllm codebase
@@ -85,8 +55,37 @@ class VLLMWorkerExtension:
         current_platform.synchronize()
         torch.distributed.barrier()
 
+    def _uses_native_moe_reload(self):
+        return current_platform.device_type == "npu" and needs_native_moe_reload(
+            self.model_runner.model
+        )
+
+    def _begin_native_moe_reload(self):
+        transaction = getattr(self, "_areal_weight_reload", None)
+        if transaction is None:
+            models = [model for model, _ in weight_update_models(self.model_runner)]
+            transaction = NpuWeightReload(
+                NpuReloadModel(*models), self.model_runner.model_config
+            )
+            transaction.start()
+            self._areal_weight_reload = transaction
+        return transaction
+
+    def areal_finish_weight_update(self):
+        transaction = getattr(self, "_areal_weight_reload", None)
+        if transaction is not None:
+            with (
+                set_current_vllm_config(self.model_runner.vllm_config),
+                torch.device(self.model_runner.device),
+            ):
+                transaction.finish()
+            current_platform.synchronize()
+            self._areal_weight_reload = None
+            logger.info("Finalized native MoE weight reload")
+        return True, "Success"
+
     def areal_update_weights(self, model_path):
-        logger.info(f"start update weights, {model_path}", flush=True)
+        logger.info("Start update weights, %s", model_path)
         try:
             # load weight
             undo_moe_postprocess_for_reload(self.model_runner.model)
@@ -121,7 +120,6 @@ class VLLMWorkerExtension:
     ):
         logger.info(
             f"start lora update weights, lora_model_path-{lora_model_path}, lora_name-{lora_name}, lora_int_id-{lora_int_id}, base_model_name-{base_model_name}",
-            flush=True,
         )
         try:
             # load lora weight
@@ -188,41 +186,49 @@ class VLLMWorkerExtension:
         return True, "Success"
 
     def areal_update_weight_xccl(self):
-        logger.info("start update weights by nccl or hccl", flush=True)
-        undo_moe_postprocess_for_reload(self.model_runner.model)
-        names = self.areal_weight_meta_names
-        dtypes = self.areal_weight_meta_dtypes
-        shapes = self.areal_weight_meta_shapes
+        logger.info("Start update weights by NCCL or HCCL")
         try:
+            native_reload = self._uses_native_moe_reload()
             group = self.weight_update_groups[self.areal_weight_meta_group_name]
-        except KeyError:
-            raise KeyError(
-                f"Weight update group named `{self.areal_weight_meta_group_name}` not found"
-            )
-        try:
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                tensor = torch.empty(
-                    shape, dtype=target_dtype, device=self.model_runner.device
-                )
-                torch.distributed.broadcast(
-                    tensor,
-                    src=0,
-                    group=group,
-                    async_op=False,
-                )
-                with set_current_vllm_config(self.model_runner.vllm_config):
-                    self.model_runner.model.load_weights(weights=[(name, tensor)])
-            if getattr(current_platform, "device_type", None) == "npu":
-                with set_current_vllm_config(self.model_runner.vllm_config):
-                    process_weights_after_loading(
-                        self.model_runner.model,
-                        self.model_runner.model_config,
-                        self.model_runner.device,
+            with (
+                set_current_vllm_config(self.model_runner.vllm_config),
+                torch.device(self.model_runner.device),
+            ):
+                if native_reload:
+                    loader = self._begin_native_moe_reload()
+                else:
+                    models = weight_update_models(self.model_runner)
+                for name, dtype, shape in zip(
+                    self.areal_weight_meta_names,
+                    self.areal_weight_meta_dtypes,
+                    self.areal_weight_meta_shapes,
+                    strict=True,
+                ):
+                    target_dtype = (
+                        dtype
+                        if isinstance(dtype, torch.dtype)
+                        else getattr(torch, dtype)
                     )
-            self.sync()
+                    tensor = torch.empty(
+                        shape, dtype=target_dtype, device=self.model_runner.device
+                    )
+                    torch.distributed.broadcast(
+                        tensor, src=0, group=group, async_op=False
+                    )
+                    if native_reload:
+                        loader.load([(name, tensor)])
+                    else:
+                        for model, _ in models:
+                            model.load_weights([(name, tensor)])
+                if not native_reload:
+                    for model, config in models:
+                        process_weights_after_loading(
+                            model, config, self.model_runner.device
+                        )
+            if native_reload:
+                current_platform.synchronize()
+            else:
+                self.sync()
             return True, "Success"
         except Exception as e:
             error_msg = f"Failed to update parameter! {e}."
@@ -235,7 +241,6 @@ class VLLMWorkerExtension:
 
         logger.info(
             f"start update lora weights by xccl, lora_name={self.areal_lora_name}, lora_int_id={self.areal_lora_int_id}",
-            flush=True,
         )
         names = self.areal_lora_weight_meta_names
         dtypes = self.areal_lora_weight_meta_dtypes

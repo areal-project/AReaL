@@ -43,9 +43,16 @@ def main(args: list[str]) -> None:
         enable_thinking=False,
     )
     eval_kwargs = {**workflow_kwargs, "gconfig": config.eval_gconfig}
-    with PPOTrainer(
-        config, train_dataset=train_dataset, valid_dataset=valid_dataset
-    ) as trainer:
+    # Hardware telemetry is outside this training E2E and may block in DCMI init.
+    with (
+        patch(
+            "areal.utils.stats_logger.install_dcmi_ascend_collector",
+            return_value="unavailable",
+        ),
+        PPOTrainer(
+            config, train_dataset=train_dataset, valid_dataset=valid_dataset
+        ) as trainer,
+    ):
         # These spies call through to the real implementations.
         with (
             patch.object(

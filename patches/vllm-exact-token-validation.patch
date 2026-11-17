@@ -1,17 +1,16 @@
-AReaL-local extension to /inference/v1/generate for the pinned vLLM v0.26.0 source.
+AReaL-local extension to /inference/v1/generate for the pinned vLLM v0.30.0 source.
 
 Adds `expected_token_ids` and refuses to generate unless the fully preprocessed
 engine prompt equals it. Targets `entrypoints/scale_out/token_in_token_out`
-in vLLM v0.26.0.
+in vLLM v0.30.0, which already includes content_parts support.
 
-Applies on top of vllm-content-parts.patch. Keep it until upstream
-exposes an equivalent prompt assertion.
+Keep it until upstream exposes an equivalent prompt assertion.
 
 diff --git a/vllm/entrypoints/scale_out/token_in_token_out/protocol.py b/vllm/entrypoints/scale_out/token_in_token_out/protocol.py
 --- a/vllm/entrypoints/scale_out/token_in_token_out/protocol.py
 +++ b/vllm/entrypoints/scale_out/token_in_token_out/protocol.py
-@@ -99,6 +99,19 @@ class GenerateRequest(BaseModel):
-             raise ValueError("content_parts and features are mutually exclusive")
+@@ -206,6 +206,19 @@
+                 )
          return self
  
 +    expected_token_ids: list[int] | None = None
@@ -33,9 +32,9 @@ diff --git a/vllm/entrypoints/scale_out/token_in_token_out/protocol.py b/vllm/en
 diff --git a/vllm/entrypoints/scale_out/token_in_token_out/serving.py b/vllm/entrypoints/scale_out/token_in_token_out/serving.py
 --- a/vllm/entrypoints/scale_out/token_in_token_out/serving.py
 +++ b/vllm/entrypoints/scale_out/token_in_token_out/serving.py
-@@ -54,6 +54,40 @@ from .protocol import (
- 
+@@ -59,6 +59,40 @@
  logger = init_logger(__name__)
+ 
  
 +# Tokens of context shown on either side of an exact-token mismatch. Enough to
 +# identify where the sequences part without echoing the prompt into logs.
@@ -71,10 +70,10 @@ diff --git a/vllm/entrypoints/scale_out/token_in_token_out/serving.py b/vllm/ent
 +        f"{ {modality: len(v) for modality, v in placeholders.items()} }"
 +    )
 +
- 
  class ServingTokens(GenerateBaseServing):
      """Provides Tokens IN <> Tokens OUT functionality to vLLM API."""
-@@ -199,6 +233,24 @@ class ServingTokens(GenerateBaseServing):
+ 
+@@ -251,6 +285,24 @@
              else await self._get_trace_headers(raw_request.headers)
          )
  
@@ -98,4 +97,4 @@ diff --git a/vllm/entrypoints/scale_out/token_in_token_out/serving.py b/vllm/ent
 +
          # Extract data_parallel_rank from header (router can inject it)
          data_parallel_rank = self._get_data_parallel_rank(raw_request)
- 
+         session_id = self._get_session_id_from_headers(raw_request)

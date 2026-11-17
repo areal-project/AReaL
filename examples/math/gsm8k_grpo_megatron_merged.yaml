@@ -91,7 +91,7 @@ actor:
   megatron:
     bridge_type: megatron-bridge
     use_bridge_for_update_weights: true
-    enable_mtp: false
+    enable_mtp_training: false
   scheduling_spec:
     - task_type: worker
       port_count: 2

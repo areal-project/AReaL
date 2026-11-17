@@ -115,7 +115,7 @@ actor:
   megatron:
     bridge_type: megatron-bridge
     use_bridge_for_update_weights: false
-    enable_mtp: false
+    enable_mtp_training: false
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker

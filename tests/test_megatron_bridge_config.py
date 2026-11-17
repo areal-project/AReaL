@@ -59,6 +59,17 @@ class _Config:
             raise ValueError("Pipeline layout has not been configured")
 
 
+@dataclasses.dataclass
+class _MBridgeConfig:
+    moe_token_dispatcher_type: str = "allgather"
+    moe_permute_fusion: bool = False
+    moe_router_fusion: bool = False
+    moe_shared_expert_overlap: bool = False
+    moe_router_bias_update_rate: float = 0.0
+    moe_router_dtype: str | None = None
+    moe_z_loss_coeff: float | None = None
+
+
 @pytest.mark.parametrize("ep,etp", [(4, 1), (4, 2), (1, 1)])
 def test_npu_bridge_config_validates_runtime_expert_dimensions(ep, etp):
     """Validate both configs with real EP while deferring uneven pipeline splits."""
@@ -282,6 +293,7 @@ def test_bridge_model_honors_mindspeed_aux_settings_before_finalize(
             ),
             "MCoreDDPConfig": SimpleNamespace,
             "MindSpeedEngineConfig": MindSpeedEngineConfig,
+            "_configure_actor_output_layers": lambda models, config: None,
             "logger": SimpleNamespace(warning=warning),
         },
     )
@@ -435,11 +447,18 @@ def test_mbridge_fusion_override_is_independent_of_checkpointing(
 ):
     """NPU mbridge receives the canonical flag before any config/model access."""
     extra = {}
-    bridge = SimpleNamespace(set_extra_args=lambda **kwargs: extra.update(kwargs))
+    bridge = SimpleNamespace(
+        set_extra_args=lambda **kwargs: extra.update(kwargs),
+        TransformerConfigClass=_MBridgeConfig,
+    )
     build = _load_function(
         "areal/engine/megatron_engine.py",
         "_build_hf_mcore_bridge",
         {
+            "dataclasses": dataclasses,
+            "_mbridge_precision_args": _load_function(
+                "areal/engine/megatron_engine.py", "_mbridge_precision_args", {}
+            ),
             "mbridge": SimpleNamespace(
                 AutoBridge=SimpleNamespace(from_pretrained=lambda *a, **kw: bridge)
             ),
@@ -473,7 +492,8 @@ def test_mbridge_fusion_override_is_independent_of_checkpointing(
         assert extra["moe_permute_fusion"] is enabled
         assert extra["use_fused_moe_token_permute_and_unpermute"] is enabled
     else:
-        assert "moe_permute_fusion" not in extra
+        assert extra["moe_permute_fusion"] is config.megatron.moe_permute_fusion
+        assert "use_fused_moe_token_permute_and_unpermute" not in extra
     assert ("recompute_granularity" in extra) is checkpointing
 
 
@@ -493,7 +513,15 @@ def test_npu_bridge_rejects_dispatcher_before_initialization(
     initialize = _load_function(
         "areal/engine/megatron_engine.py",
         "__init__",
-        {"torch": SimpleNamespace(bfloat16="bf16"), "is_npu_available": True},
+        {
+            "torch": SimpleNamespace(bfloat16="bf16"),
+            "is_npu_available": True,
+            "_validate_areal_lm_head_compatibility": _load_function(
+                "areal/engine/megatron_engine.py",
+                "_validate_areal_lm_head_compatibility",
+                {},
+            ),
+        },
     )
     with pytest.raises(ValueError, match="NPU requires.*alltoall"):
         initialize(SimpleNamespace(), config)
@@ -516,6 +544,11 @@ def test_engine_resolves_dispatcher_from_platform_config(bridge_type, is_npu):
         {
             "torch": SimpleNamespace(bfloat16="bf16"),
             "is_npu_available": is_npu,
+            "_validate_areal_lm_head_compatibility": _load_function(
+                "areal/engine/megatron_engine.py",
+                "_validate_areal_lm_head_compatibility",
+                {},
+            ),
             "logger": SimpleNamespace(warning=warning),
             "importlib": SimpleNamespace(
                 util=SimpleNamespace(find_spec=lambda name: True)
@@ -565,6 +598,11 @@ def test_npu_engine_warns_when_megatron_fusion_setting_is_ignored(bridge_type, f
         {
             "torch": SimpleNamespace(bfloat16="bf16"),
             "is_npu_available": True,
+            "_validate_areal_lm_head_compatibility": _load_function(
+                "areal/engine/megatron_engine.py",
+                "_validate_areal_lm_head_compatibility",
+                {},
+            ),
             "logger": SimpleNamespace(warning=warning),
             "importlib": SimpleNamespace(
                 util=SimpleNamespace(find_spec=lambda name: True)
@@ -700,11 +738,18 @@ def test_cuda_mbridge_passes_selected_dispatcher(dispatcher):
         mindspeed=MindSpeedEngineConfig(),
     )
     extra = {}
-    bridge = SimpleNamespace(set_extra_args=lambda **kwargs: extra.update(kwargs))
+    bridge = SimpleNamespace(
+        set_extra_args=lambda **kwargs: extra.update(kwargs),
+        TransformerConfigClass=_MBridgeConfig,
+    )
     build = _load_function(
         "areal/engine/megatron_engine.py",
         "_build_hf_mcore_bridge",
         {
+            "dataclasses": dataclasses,
+            "_mbridge_precision_args": _load_function(
+                "areal/engine/megatron_engine.py", "_mbridge_precision_args", {}
+            ),
             "is_npu_available": False,
             "mbridge": SimpleNamespace(
                 AutoBridge=SimpleNamespace(from_pretrained=lambda *a, **kw: bridge)
@@ -722,4 +767,4 @@ def test_cuda_mbridge_passes_selected_dispatcher(dispatcher):
     )
     build(engine)
     assert extra["moe_token_dispatcher_type"] == dispatcher
-    assert "moe_permute_fusion" not in extra
+    assert extra["moe_permute_fusion"] is config.megatron.moe_permute_fusion

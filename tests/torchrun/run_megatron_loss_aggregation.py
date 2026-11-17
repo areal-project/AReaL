@@ -54,6 +54,7 @@ from areal.engine.megatron_utils.packed_context_parallel import (
     split_packed_seqs_for_context_parallel,
 )
 from areal.infra.platforms import current_platform
+from areal.models.mcore.vocab_parallel_head import ChunkedLMHeadOutput
 from areal.trainer.ppo.loss_reduction import prepare_policy_gradient_batch
 from areal.utils.data import pack_tensor_dict, split_training_batch_into_microbatches
 from areal.utils.functional.loss_aggregation import PolicyGradientReduction
@@ -173,9 +174,11 @@ def run_case(mode, per_token, split, scenario, check, prepared=False, optimizer_
         "mpu": mpu,
         "get_model_config": get_model_config,
         "compute_total_loss_weight": compute_total_loss_weight,
+        "ChunkedLMHeadOutput": ChunkedLMHeadOutput,
     }
     train, compute, build = load_engine_callbacks(namespace)
     engine = SimpleNamespace(
+        mcore_config=SimpleNamespace(enable_mtp_training=False),
         _ensure_ready=lambda: None,
         optimizer_zero_grad=model.zero_grad_buffer,
         optimizer_step=lambda: {},

@@ -65,6 +65,7 @@ LOGGER_COLORS_EXACT = {
     # Inference wrappers - white
     "SGLangWrapper": "white",
     "VLLMWrapper": "white",
+    "VLLMWorkerExtension": "white",
     "RemoteInfEngine": "white",
     "vLLMEngine": "white",
     # Dataset - green

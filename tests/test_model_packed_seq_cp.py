@@ -254,7 +254,9 @@ def test_forward_result_reassembles_cp_local_logprobs():
         pytest.skip("MegatronEngine dependencies are unavailable")
 
     engine = object.__new__(megatron_engine_module.MegatronEngine)
-    engine.config = SimpleNamespace(is_critic=False, temperature=1.0)
+    engine.config = SimpleNamespace(
+        is_critic=False, temperature=1.0, logprobs_chunk_size=1024
+    )
     engine.enable_tree_training = False
 
     output = torch.randn(4, 8)
@@ -304,3 +306,51 @@ def test_forward_result_reassembles_cp_local_logprobs():
         inputs["_cp_old_cu_seqlens"],
     )
     torch.testing.assert_close(result, unpadded_logprobs, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "cp_rank,expected",
+    [(0, [0, 1, 6, 7, 8, 9, 14, 15]), (1, [2, 3, 4, 5, 10, 11, 12, 13])],
+)
+def test_mtp_model_owned_thd_uses_cp_local_labels(cp_rank, expected):
+    labels = torch.arange(16)
+    mask = labels.remainder(3).eq(0)
+    batch = {"scale": torch.tensor(0.1)}
+    with (
+        patch.object(packed_cp.mpu, "get_context_parallel_world_size", return_value=2),
+        patch.object(packed_cp.mpu, "get_context_parallel_rank", return_value=cp_rank),
+    ):
+        result = packed_cp._prepare_mtp_forward_kwargs(
+            {"mtp_labels": labels, "mtp_loss_mask": mask, "batch": batch},
+            labels.reshape(2, 8),
+            torch.ones(2, 8, dtype=torch.bool),
+            cu_seqlens=torch.tensor([0, 8, 16]),
+            packed_num_tokens=16,
+            uses_padded_form=True,
+            uses_model_packed_seq=True,
+        )
+    assert result["mtp_labels"].tolist() == [expected]
+    assert result["mtp_loss_mask"].tolist() == [mask[expected].tolist()]
+    assert result["batch"] is batch
+
+
+@pytest.mark.parametrize("mtp_layers", [None, 1])
+def test_automatic_pipeline_layout_places_active_mtp_before_loss(
+    monkeypatch, mtp_layers
+):
+    from areal.engine.megatron_utils import pipeline_parallel as pipeline
+
+    monkeypatch.setattr(
+        pipeline,
+        "estimate_stage_parameter_buckets",
+        lambda *args: ([1.0] * 4, 0.0, 0.0),
+    )
+    config = SimpleNamespace(num_layers=4, mtp_num_layers=mtp_layers)
+    pipeline.configure_pipeline_layer_splits(
+        SimpleNamespace(pipeline_parallel_size=2, virtual_pipeline_parallel_size=1),
+        SimpleNamespace(),
+        config,
+    )
+    layout = config.pipeline_model_parallel_layout
+    layout.validate_layer_layout(num_layers=4, mtp_num_layers=mtp_layers or 0)
+    assert layout.flatten_layout.count(pipeline.LayerType.mtp) == (mtp_layers or 0)

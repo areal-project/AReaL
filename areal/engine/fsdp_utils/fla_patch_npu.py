@@ -544,6 +544,11 @@ def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
         import areal.engine.megatron_utils.triton_l2norm_patch  # noqa: F401, I001
         from mindspeed.core.ssm.gdn_backend import load_gdn_operators
 
+        from areal.engine.megatron_utils.mindspeed_gdn_patch import (
+            ensure_mindspeed_gdn_native_kkt,
+        )
+
+        ensure_mindspeed_gdn_native_kkt()
         chunk_gated_delta_rule = load_gdn_operators().chunk_gated_delta_rule
     except ImportError as exc:
         # The backend selector already falls back to MindSpeed's own operators when

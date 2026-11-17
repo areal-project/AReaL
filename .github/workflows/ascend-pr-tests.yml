@@ -252,7 +252,7 @@ jobs:
     runs-on: linux-aarch64-a3-800i-8
     timeout-minutes: 135
     container:
-      image: ghcr.io/hwvanici/areal_npu:a3-nightly
+      image: swr.cn-north-12.myhuaweicloud.com/ascend/areal_npu:a3-nightly
 
     env:
       AREAL_IS_IN_CI: "1"
@@ -361,16 +361,34 @@ jobs:
           collect_base_tests megatron-vlm \
             --deselect tests/test_megatron_engine_vlm.py::TestVisionModelDetection \
             tests/test_megatron_engine_vlm.py
+          collect_base_tests mindspeed-gdn-native \
+            tests/test_mindspeed_gdn_native_npu.py
+          collect_base_tests mindspeed-gdn-native-cp \
+            tests/test_mindspeed_gdn_native_cp.py
           collect_base_tests model-packed-seq-cp \
             tests/test_model_packed_seq_cp.py
           collect_base_tests megatron-bridge-vision-cp \
             tests/test_megatron_bridge_vision_cp.py
           collect_base_tests reassemble-cp-logprobs \
             -m skipif tests/test_reassemble_cp_logprobs.py
+          collect_base_tests npu-weight-reload-native \
+            tests/test_npu_weight_reload_native.py
+          collect_base_tests vllm-mtp-weights \
+            tests/test_vllm_mtp_weights.py
+          collect_base_tests mtp-loss-distributed \
+            tests/test_mtp_loss_distributed.py
+          collect_base_tests npu-weight-reload-graph \
+            tests/test_npu_weight_reload_graph.py
           collect_base_tests megatron-distributed \
             tests/test_megatron_engine_distributed.py
           collect_base_tests megatron-loss-aggregation \
             tests/test_megatron_loss_aggregation.py
+          collect_base_tests megatron-lm-head tests/test_megatron_lm_head.py
+          collect_base_tests mcore-fp32-lm-head tests/test_mcore_fp32_lm_head.py
+          collect_base_tests megatron-optimizer-config tests/test_megatron_optimizer_config.py
+          collect_base_tests all-gather-param tests/test_all_gather_param.py
+          collect_base_tests grad-norm-tp tests/megatron/test_grad_norm_tp_invariance.py
+          collect_base_tests ppo-advantages tests/test_ppo_advantages.py
           collect_base_tests lock tests/test_lock.py
           collect_base_tests perf-tracer tests/test_perf_tracer.py
           collect_base_tests ulysses tests/test_ulysses.py
@@ -459,6 +477,46 @@ jobs:
             tests/test_model_packed_seq_cp.py
           pytest -q -p scripts.ci_test_report \
             -m skipif tests/test_reassemble_cp_logprobs.py
+          pytest -q -p scripts.ci_test_report \
+            tests/test_npu_weight_reload_native.py
+          pytest -q -p scripts.ci_test_report \
+            tests/test_vllm_mtp_weights.py
+
+      - name: Run AscendC GDN operator and context-parallel tests
+        timeout-minutes: 15
+        env:
+          AREAL_TEST_REPORT_DIR: /tmp/current-npu-test-reports
+          ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3"
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          pytest -q -p scripts.ci_test_report \
+            tests/test_mindspeed_gdn_native_npu.py \
+            tests/test_mindspeed_gdn_native_cp.py
+
+      - name: Run chunked LM-head single-device tests
+        env:
+          AREAL_TEST_REPORT_DIR: /tmp/current-npu-test-reports
+          ASCEND_RT_VISIBLE_DEVICES: "0"
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          pytest -q -p scripts.ci_test_report -m npu \
+            tests/test_megatron_lm_head.py \
+            tests/test_mcore_fp32_lm_head.py \
+            tests/test_megatron_optimizer_config.py \
+            tests/test_all_gather_param.py
+
+      - name: Run NPU weight-reload graph regression
+        timeout-minutes: 5
+        env:
+          AREAL_TEST_REPORT_DIR: /tmp/current-npu-test-reports
+          ASCEND_RT_VISIBLE_DEVICES: "0"
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          pytest -q -p scripts.ci_test_report \
+            tests/test_npu_weight_reload_graph.py
 
       - name: Run NPU test suites
         env:
@@ -565,14 +623,14 @@ jobs:
           start_normal_test() {
             local name="$1"
             local devices="$2"
-            local selector="$3"
+            shift 2
 
             echo "START: ${name} devices=${devices}"
             (
               export ASCEND_RT_VISIBLE_DEVICES="${devices}"
               export TMPDIR="${wave_tmpdir}"
               timeout --kill-after=60s 900s \
-                pytest -q -p scripts.ci_test_report "${selector}"
+                pytest -q -p scripts.ci_test_report "$@"
             ) >"npu-test-logs/${name}.log" 2>&1 &
             pids+=("$!")
             names+=("${name}")
@@ -753,7 +811,7 @@ jobs:
               wait_for_normal_wave
             done
 
-            # The remaining four single-device cases share the final wave.
+            # The remaining four single-device loss cases share one wave.
             start_normal_test \
               megatron-loss-aggregation-legacy-main-d1c1 \
               0 \
@@ -770,6 +828,26 @@ jobs:
               megatron-loss-aggregation-update-protocol-auxiliary-d1c1 \
               3 \
               "${loss_selector}[update-protocol-auxiliary-1-1]"
+            start_normal_test \
+              ppo-advantages \
+              4 \
+              'tests/test_ppo_advantages.py::test_terminal_reward_fastpath_respects_masks_and_truncation[accelerator-False]' \
+              'tests/test_ppo_advantages.py::test_terminal_reward_fastpath_respects_masks_and_truncation[accelerator-True]' \
+              'tests/test_ppo_advantages.py::test_dense_kl_fastpath_matches_original_gae[accelerator]' \
+              'tests/test_ppo_advantages.py::test_critic_or_discounted_gae_keeps_original_recurrence[accelerator-True-1.0-1.0]' \
+              'tests/test_ppo_advantages.py::test_critic_or_discounted_gae_keeps_original_recurrence[accelerator-False-0.9-1.0]' \
+              'tests/test_ppo_advantages.py::test_critic_or_discounted_gae_keeps_original_recurrence[accelerator-False-1.0-0.8]' \
+              'tests/test_ppo_advantages.py::test_fastpath_single_token_sequence_has_zero_advantage[accelerator]'
+            start_normal_test \
+              grad-norm-tp \
+              5,6 \
+              tests/megatron/test_grad_norm_tp_invariance.py::test_grad_norm_is_tp_invariant
+            wait_for_normal_wave
+
+            start_normal_test \
+              mtp-loss-distributed \
+              5,6 \
+              tests/test_mtp_loss_distributed.py
             wait_for_normal_wave
 
             return "${failed}"

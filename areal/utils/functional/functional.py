@@ -460,6 +460,7 @@ def ppo_actor_loss_fn(
     eps_clip_higher: float | None = None,
     c_clip: float | None = None,
     rejection_sampling: RejectionSamplingConfig | None = None,
+    importance_sampling: RejectionSamplingConfig | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
     pg_reduction: PolicyGradientReduction | None = None,
@@ -494,7 +495,13 @@ def ppo_actor_loss_fn(
         loss_mask: Mask for valid tokens (1 = valid).
         eps_clip_higher: Upper clipping factor (decoupled clipping). None = use eps_clip.
         c_clip: Dual clipping factor, must be > 1.0. None disables dual clipping.
-        rejection_sampling: Rejection sampling configuration. None disables filtering.
+        rejection_sampling: Configuration of the stage that masks tokens or
+            sequences. None disables it.
+        importance_sampling: Configuration of the stage that supplies the
+            pi_proximal/pi_behave correction weight. None makes
+            ``rejection_sampling`` supply the weight as well, which is the
+            single-stage behaviour. Setting both runs Geo-RS + Token-TIS style
+            two-stage correction.
         importance_sampling_level: Level at which to compute importance sampling ratios.
             - 'token': Per-token ratios (standard PPO)
             - 'sequence': Sequence-level geometric mean of per-token ratios (GSPO)
@@ -513,19 +520,52 @@ def ppo_actor_loss_fn(
     # denominator, so it stays consistent with loss_weight_fn in actor.py.
     orig_loss_mask = loss_mask if denominator_mask is None else denominator_mask
 
-    # === Apply rejection sampling (replaces old compute_behave_imp_weight) ===
-    if rejection_sampling is not None:
-        rs_result = apply_rejection_sampling(
-            proximal_logprobs=proximal_logprobs,
-            old_logprobs=old_logprobs,
-            loss_mask=loss_mask,
-            cu_seqlens=cu_seqlens,
-            config=rejection_sampling,
-        )
-        # mask mode updates loss_mask; clamp mode keeps it unchanged
-        loss_mask = rs_result.loss_mask
-        behave_imp_weight = rs_result.behave_imp_weight
-        filtered_fraction = rs_result.filtered_fraction
+    # === Apply rollout correction ===
+    # One or two stages, both judging pi_proximal/pi_behave on the incoming mask
+    # so their verdicts are independent of the order they run in:
+    #   - importance_sampling supplies the per-token correction weight;
+    #   - rejection_sampling supplies the mask.
+    # With only one of them configured that stage supplies both, which is the
+    # single-stage behaviour this code had before.
+    correction_configs = [
+        cfg for cfg in (importance_sampling, rejection_sampling) if cfg is not None
+    ]
+    is_filtered_fraction = 0.0
+    if correction_configs:
+        stage_mask = loss_mask
+        filtered_fraction = 0.0
+        if importance_sampling is not None:
+            is_result = apply_rejection_sampling(
+                proximal_logprobs=proximal_logprobs,
+                old_logprobs=old_logprobs,
+                loss_mask=loss_mask,
+                cu_seqlens=cu_seqlens,
+                config=importance_sampling,
+            )
+            # The weight always comes from this stage when it is configured.
+            behave_imp_weight = is_result.behave_imp_weight
+            stage_mask = is_result.loss_mask
+            # Fraction this stage clamped (or masked, if it was told to mask).
+            is_filtered_fraction = is_result.filtered_fraction
+            filtered_fraction = is_filtered_fraction
+        if rejection_sampling is not None:
+            rs_result = apply_rejection_sampling(
+                proximal_logprobs=proximal_logprobs,
+                old_logprobs=old_logprobs,
+                loss_mask=loss_mask,
+                cu_seqlens=cu_seqlens,
+                config=rejection_sampling,
+            )
+            if importance_sampling is None:
+                behave_imp_weight = rs_result.behave_imp_weight
+            stage_mask = stage_mask.bool() & rs_result.loss_mask.bool()
+            # Keep the existing meaning of this stat: what the mask stage drops.
+            filtered_fraction = rs_result.filtered_fraction
+        stage_mask = stage_mask.to(loss_mask.dtype)
+        # Each stage already zeroed its own weight where it masked; redo it
+        # against the combined mask so the weight matches what survives.
+        behave_imp_weight = torch.where(stage_mask.bool(), behave_imp_weight, 0.0)
+        loss_mask = stage_mask
     else:
         filtered_fraction = 0.0
 
@@ -562,8 +602,8 @@ def ppo_actor_loss_fn(
     else:
         dual_clip_mask = torch.zeros_like(clip_mask)
 
-    # Apply behavioural importance weight from rejection sampling
-    if rejection_sampling is not None:
+    # Apply behavioural importance weight from rollout correction
+    if correction_configs:
         behave_approx_kl = proximal_logprobs.detach() - old_logprobs.detach()
         behave_mask = (behave_imp_weight > 0).logical_and(loss_mask.bool())
         behave_approx_kl = torch.where(behave_mask, behave_approx_kl, 0.0)
@@ -588,12 +628,13 @@ def ppo_actor_loss_fn(
         dual_clip_mask=dual_clip_mask,
     )
 
-    if rejection_sampling is not None:
+    if correction_configs:
         stat.update(
             behave_approx_kl=behave_approx_kl.detach(),
             behave_imp_weight=behave_imp_weight.detach(),
             behave_mask=behave_mask,
             filtered_fraction=filtered_fraction,
+            is_filtered_fraction=is_filtered_fraction,
         )
     return pg_loss, stat
 
