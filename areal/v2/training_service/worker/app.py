@@ -15,7 +15,10 @@ from areal.infra.platforms import current_platform
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.utils import logging
 from areal.utils.data import broadcast_tensor_container, tensor_container_to
-from areal.v2.training_service.worker.awex import create_awex_blueprint
+from areal.v2.training_service.worker.awex import (
+    create_awex_blueprint,
+    teardown_training_adapter,
+)
 from areal.v2.training_service.worker.config import TrainWorkerConfig
 from areal.v2.training_service.worker.engine import create_engine_module
 
@@ -67,6 +70,8 @@ def _init_engine_thread() -> None:
                         )
                     finally:
                         work_queue.task_done()
+                        # Idle workers must release the previous task's closures/results.
+                        work_item = func = args = kwargs = future = result = None
                 except Exception as e:
                     logger.error(
                         f"Error in engine thread when "
@@ -107,13 +112,12 @@ def _execute_compute(
     *,
     require_broadcast: bool = False,
 ) -> Any:
-    engine = _require_engine()
-    method = getattr(engine, method_name, None)
-    if not callable(method):
-        raise RuntimeError(f"Engine does not implement method '{method_name}'")
-
     def execute():
         nonlocal args, kwargs
+        engine = _require_engine()
+        method = getattr(engine, method_name, None)
+        if not callable(method):
+            raise RuntimeError(f"Engine does not implement method '{method_name}'")
         if require_broadcast:
             cpu_staged_methods = getattr(engine, "cpu_staged_rpc_methods", ())
             if method_name in cpu_staged_methods:
@@ -197,13 +201,14 @@ def create_app(config: TrainWorkerConfig):
     def _get_engine() -> TrainEngine | None:
         return _engine
 
-    def _set_engine(engine: TrainEngine) -> None:
+    def _set_engine(engine: TrainEngine | None) -> None:
         global _engine
         _engine = engine
 
     def _get_node_addr() -> str:
         return _node_addr
 
+    adapter_state: dict[str, Any] = {"adapter": None}
     app.register_blueprint(
         create_engine_module(
             flask_module=flask,
@@ -216,6 +221,7 @@ def create_app(config: TrainWorkerConfig):
             run_endpoint=_run_endpoint,
             execute_compute=_execute_compute,
             get_node_addr=_get_node_addr,
+            before_destroy=lambda: teardown_training_adapter(adapter_state),
         )
     )
 
@@ -225,6 +231,7 @@ def create_app(config: TrainWorkerConfig):
             get_engine=_get_engine,
             submit_to_engine_thread=_submit_to_engine_thread,
             run_endpoint=_run_endpoint,
+            adapter_state=adapter_state,
         )
     )
 

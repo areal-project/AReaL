@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import traceback
+from copy import deepcopy
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -55,6 +56,12 @@ class GatewayTrainController:
         self._router_addr: str = ""
         self._model_addr: str = ""
         self._worker_addrs: list[str] = []
+        self._worker_pool_addrs: list[str] = []
+        self._worker_pool_devices: dict[int, str] = {}
+        self._engine_initialize_kwargs: dict[str, Any] = {}
+        self._engine_rendezvous_owner: tuple[str, str, int] | None = None
+        self._training_held = False
+        self._engine_rebuild_ready = True
         self._guard_addrs: list[str] = []
         self._forked_services: list[tuple[str, str, int]] = []
         self._service_roles: list[str] = []
@@ -66,6 +73,8 @@ class GatewayTrainController:
         self._weight_update_meta: WeightUpdateMeta | None = None
         self._weight_update_connected = False
         self._weight_update_port_owner: tuple[str, str, int] | None = None
+        self._reconfiguration_lock = Lock()
+        self._reconfiguration_phase = "idle"
 
         # Version management
         self._version_lock = Lock()
@@ -176,6 +185,41 @@ class GatewayTrainController:
         cfg = self.config
 
         world_size = self.train_alloc.parallel.world_size
+        pool_devices = kwargs.pop("worker_gpu_devices", None)
+        pool_size = world_size
+        if pool_devices is not None:
+            from areal.infra.scheduler.local import LocalScheduler
+
+            if not isinstance(self.scheduler, LocalScheduler):
+                raise ValueError("worker_gpu_devices requires LocalScheduler")
+            if not isinstance(pool_devices, list) or not pool_devices:
+                raise ValueError("worker_gpu_devices must be a non-empty GPU list")
+            active = (
+                cfg.gpu_devices
+                if cfg.gpu_devices is not None
+                else pool_devices[:world_size]
+            )
+            if (
+                len(pool_devices) < world_size
+                or any(type(device) is not int for device in pool_devices)
+                or len(set(pool_devices)) != len(pool_devices)
+                or not set(pool_devices).issubset(self.scheduler.gpu_devices)
+                or len(active) != world_size
+                or not set(active).issubset(pool_devices)
+                or any(type(device) is not int for device in active)
+                or len(set(active)) != world_size
+                or len(cfg.scheduling_spec) != 1
+                or cfg.scheduling_spec[0].gpu != 1
+            ):
+                raise ValueError(
+                    "Worker GPU pool must contain the active single-GPU slots"
+                )
+            pool_size = len(pool_devices)
+            cfg.gpu_devices = list(active)
+        self._engine_initialize_kwargs = {
+            "addr": kwargs.get("addr"),
+            "ft_spec": ft_spec,
+        }
 
         try:
             # ==============================================================
@@ -195,13 +239,15 @@ class GatewayTrainController:
 
             guard_role = f"{role}{self._GUARD_SUFFIX}"
             guard_job = Job(
-                replicas=world_size,
+                replicas=pool_size,
                 tasks=[guard_spec],
                 scheduling_strategy=cfg.scheduling_strategy,
                 role=guard_role,
             )
             placement = {}
-            if cfg.gpu_devices is not None:
+            if pool_devices is not None:
+                placement["gpu_devices"] = pool_devices
+            elif cfg.gpu_devices is not None:
                 placement["gpu_devices"] = cfg.gpu_devices
             await asyncio.to_thread(
                 self.scheduler.create_workers, job=guard_job, **placement
@@ -235,8 +281,11 @@ class GatewayTrainController:
             self._guard_addrs = [_guard_addr(w) for w in guard_workers]
 
             client = await self._get_async_client()
+            self._engine_rendezvous_owner = (guard_addr_0, f"{role}-engine", 0)
             resp = await client.post(
-                f"{guard_addr_0}/alloc_ports", json={"count": 1}, timeout=30.0
+                f"{guard_addr_0}/alloc_ports",
+                json={"count": 1, "role": f"{role}-engine", "worker_index": 0},
+                timeout=30.0,
             )
             resp.raise_for_status()
             master_port = resp.json()["ports"][0]
@@ -276,65 +325,31 @@ class GatewayTrainController:
                 )
                 return f"http://{format_hostport(host, port)}"
 
-            self._worker_addrs = list(
-                await asyncio.gather(
-                    *[_fork_worker(rank) for rank in range(world_size)]
-                )
+            self._worker_pool_addrs = list(
+                await asyncio.gather(*[_fork_worker(rank) for rank in range(pool_size)])
             )
+            self._worker_addrs = list(self._worker_pool_addrs)
+            from areal.infra.scheduler.local import LocalScheduler
+
+            if isinstance(self.scheduler, LocalScheduler) and guard_spec.gpu == 1:
+                self._worker_pool_devices = {
+                    device: self._worker_pool_addrs[index]
+                    for index in range(pool_size)
+                    for device in self.scheduler._get_colocated_gpus(guard_role, index)
+                }
+            if pool_devices is not None:
+                self._worker_addrs = [
+                    self._worker_pool_devices[device] for device in cfg.gpu_devices
+                ]
+                await self._async_configure_worker_ranks(
+                    self._worker_addrs, master_addr, master_port
+                )
             logger.info("Workers: %s", self._worker_addrs)
 
             # ==============================================================
             # Step 3: Create engines on all workers (coordinated NCCL init)
             # ==============================================================
-            if isinstance(self.train_engine, str):
-                engine_class = self.train_engine
-            else:
-                engine_class = (
-                    f"{self.train_engine.__module__}.{self.train_engine.__name__}"
-                )
-            await asyncio.gather(
-                *[
-                    self._create_engine_on_worker(
-                        worker_addr=addr,
-                        engine_class=engine_class,
-                        init_args=[],
-                        init_kwargs={"config": self.config},
-                    )
-                    for addr in self._worker_addrs
-                ]
-            )
-            logger.info("Engines created on all workers")
-
-            pg_kwargs = {"parallel_strategy": self._parallel_strategy}
-            await asyncio.gather(
-                *[
-                    self._call_worker_engine_endpoint(
-                        addr,
-                        "/create_process_group",
-                        args=[],
-                        kwargs=pg_kwargs,
-                        timeout=self.config.setup_timeout,
-                    )
-                    for addr in self._worker_addrs
-                ]
-            )
-
-            await asyncio.gather(
-                *[
-                    self._call_worker_engine_endpoint(
-                        addr,
-                        "/initialize",
-                        args=[],
-                        kwargs={
-                            "addr": kwargs.get("addr"),
-                            "ft_spec": ft_spec,
-                        },
-                        timeout=self.config.setup_timeout,
-                    )
-                    for addr in self._worker_addrs
-                ]
-            )
-            logger.info("Engines initialized on all workers")
+            await self._async_initialize_engines(self.train_alloc, self.config)
 
             if self._shutdown_requested.is_set():
                 return
@@ -433,6 +448,79 @@ class GatewayTrainController:
             raise
 
     # -- Engine creation ---------------------------------------------------
+
+    async def _async_configure_worker_ranks(
+        self, addresses: list[str], master_addr: str, master_port: int
+    ) -> None:
+        client = await self._get_async_client()
+
+        async def configure(rank: int, address: str) -> None:
+            response = await client.post(
+                f"{address}/configure_runtime",
+                json={
+                    "rank": rank,
+                    "world_size": len(addresses),
+                    "master_addr": master_addr,
+                    "master_port": master_port,
+                },
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
+            response.raise_for_status()
+
+        await asyncio.gather(
+            *(configure(rank, address) for rank, address in enumerate(addresses))
+        )
+
+    async def _async_initialize_engines(self, alloc: Any, config: Any) -> None:
+        if isinstance(self.train_engine, str):
+            engine_class = self.train_engine
+        else:
+            engine_class = (
+                f"{self.train_engine.__module__}.{self.train_engine.__name__}"
+            )
+        await asyncio.gather(
+            *[
+                self._create_engine_on_worker(
+                    worker_addr=addr,
+                    engine_class=engine_class,
+                    init_args=[],
+                    init_kwargs={"config": config},
+                )
+                for addr in self._worker_addrs
+            ]
+        )
+        logger.info("Engines created on all workers")
+
+        pg_kwargs = {"parallel_strategy": alloc.parallel}
+        await asyncio.gather(
+            *[
+                self._call_worker_engine_endpoint(
+                    addr,
+                    "/create_process_group",
+                    args=[],
+                    kwargs=pg_kwargs,
+                    timeout=self.config.setup_timeout,
+                )
+                for addr in self._worker_addrs
+            ]
+        )
+
+        await asyncio.gather(
+            *[
+                self._call_worker_engine_endpoint(
+                    addr,
+                    "/initialize",
+                    args=[],
+                    kwargs={
+                        "addr": self._engine_initialize_kwargs.get("addr"),
+                        "ft_spec": self._engine_initialize_kwargs["ft_spec"],
+                    },
+                    timeout=self.config.setup_timeout,
+                )
+                for addr in self._worker_addrs
+            ]
+        )
+        logger.info("Engines initialized on all workers")
 
     async def _async_set_guards_env(
         self,
@@ -688,10 +776,34 @@ class GatewayTrainController:
 
     # -- Gateway HTTP helpers (duck-type TrainController interface) ---------
 
+    async def _async_held_state_post(self, path: str, payload: Any) -> Any:
+        """Restore state through active worker endpoints while compute stays held."""
+        if not self._engine_rebuild_ready or not self._worker_addrs:
+            raise RuntimeError("Complete Engine initialization before accessing state")
+        client = await self._get_async_client()
+        responses = await asyncio.gather(
+            *(
+                client.post(
+                    f"{address}{path}",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+                )
+                for address in self._worker_addrs
+            ),
+            return_exceptions=True,
+        )
+        for response in responses:
+            if isinstance(response, BaseException):
+                raise response
+            response.raise_for_status()
+        return responses[0].json()
+
     def _gateway_post(self, path: str, payload: Any = None) -> Any:
         import requests
 
         self._ensure_initialized()
+        if self._training_held and path in {"/save", "/load", "/set_version"}:
+            return run_async_task(self._async_held_state_post, path, payload)
         url = f"{self._gateway_addr}{path}"
         resp = requests.post(
             url,
@@ -824,9 +936,6 @@ class GatewayTrainController:
     def set_version(self, version: int) -> None:
         from areal.infra.rpc.serialization import serialize_value
 
-        with self._version_lock:
-            self._version = version
-
         self._gateway_post(
             "/set_version",
             {
@@ -834,6 +943,8 @@ class GatewayTrainController:
                 "kwargs": serialize_value({}),
             },
         )
+        with self._version_lock:
+            self._version = version
 
     def get_version(self) -> int:
         with self._version_lock:
@@ -1075,6 +1186,155 @@ class GatewayTrainController:
         return list(self._worker_addrs)
 
     # -- RL parity methods (connect_engine / update_weights / batch) --------
+
+    async def _async_training_control(
+        self, endpoint: str, payload: dict[str, Any]
+    ) -> None:
+        client = await self._get_async_client()
+        response = await client.post(
+            f"{self._model_addr}{endpoint}",
+            json=payload,
+            headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+        )
+        response.raise_for_status()
+
+    def hold_training(self) -> None:
+        """Hold new frontend calls and wait for current worker RPCs to finish."""
+        self._ensure_initialized()
+        if not self._model_addr:
+            raise RuntimeError("Initialize the training frontend before holding it")
+        self._training_held = True
+        run_async_task(self._async_training_control, "/hold_training", {})
+
+    def release_training(self) -> None:
+        """Release calls after state restoration and any required AWEX publication."""
+        self._ensure_initialized()
+        if not self._engine_rebuild_ready:
+            raise RuntimeError(
+                "Complete Engine initialization and topology binding first"
+            )
+        if self.rollout is not None and (
+            not self._weight_update_connected
+            or self.rollout.get_version() != self.get_version()
+        ):
+            raise RuntimeError(
+                "Reconnect and publish the matching rollout version first"
+            )
+        run_async_task(self._async_training_control, "/release_training", {})
+        self._training_held = False
+
+    def rebuild_engines(self, backend: str, gpu_devices: list[int]) -> None:
+        """Replace Engines in the fixed worker pool, returning held with fresh state."""
+        with self._reconfiguration_lock, self._clear_batches_lock:
+            alloc = self._validate_engine_rebuild(backend, gpu_devices)
+            self._rebuild_engines_locked(alloc, gpu_devices)
+
+    def _validate_engine_rebuild(self, backend: str, gpu_devices: list[int]):
+        from areal.api.alloc_mode import ModelAllocation
+
+        self._ensure_initialized()
+        alloc = ModelAllocation.from_str(backend)
+        if (
+            not self._worker_pool_devices
+            or self.train_alloc.backend != "megatron"
+            or alloc.backend != "megatron"
+        ):
+            raise ValueError(
+                "Engine rebuilding requires a local single-GPU Megatron worker pool"
+            )
+        if (
+            not isinstance(gpu_devices, list)
+            or len(gpu_devices) != alloc.parallel.world_size
+            or any(type(device) is not int for device in gpu_devices)
+            or len(set(gpu_devices)) != len(gpu_devices)
+            or not set(gpu_devices).issubset(self._worker_pool_devices)
+        ):
+            raise ValueError(
+                "Target GPUs must match the layout and original worker pool"
+            )
+        if self._pending_clear_shards:
+            raise RuntimeError(
+                "Finish pending batch storage cleanup before rebuilding Engines"
+            )
+        return alloc
+
+    def _rebuild_engines_locked(self, alloc: Any, gpu_devices: list[int]) -> None:
+        self.hold_training()
+        self._engine_rebuild_ready = False
+        try:
+            self._reconfiguration_phase = "disconnecting-actor"
+            self.disconnect_engine()
+            self._reconfiguration_phase = "rebuilding-engines"
+            run_async_task(self._async_rebuild_engines, alloc, list(gpu_devices))
+            self._reconfiguration_phase = "actor-held"
+        except BaseException:
+            logger.exception(
+                "Actor Engine rebuild failed during %s", self._reconfiguration_phase
+            )
+            raise
+
+    async def _async_release_engine_rendezvous(self) -> None:
+        if self._engine_rendezvous_owner is not None:
+            guard, role, index = self._engine_rendezvous_owner
+            client = await self._get_async_client()
+            response = await client.post(
+                f"{guard}/release_ports", json={"role": role, "worker_index": index}
+            )
+            response.raise_for_status()
+            self._engine_rendezvous_owner = None
+
+    async def _async_rebuild_engines(self, alloc: Any, gpu_devices: list[int]) -> None:
+        await self._async_release_engines()
+        await self._async_create_engines(alloc, gpu_devices)
+
+    async def _async_release_engines(self) -> None:
+        self._engine_rebuild_ready = False
+        client = await self._get_async_client()
+
+        async def destroy(address: str) -> None:
+            response = await client.post(f"{address}/destroy_engine", json={})
+            response.raise_for_status()
+
+        results = await asyncio.gather(
+            *(destroy(address) for address in self._worker_addrs),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        await self._async_release_engine_rendezvous()
+
+    async def _async_create_engines(self, alloc: Any, gpu_devices: list[int]) -> None:
+        client = await self._get_async_client()
+        guard = self._guard_addrs[0]
+        owner = (guard, f"{self._role}-engine", 0)
+        self._engine_rendezvous_owner = owner
+        response = await client.post(
+            f"{guard}/alloc_ports",
+            json={"count": 1, "role": owner[1], "worker_index": owner[2]},
+        )
+        response.raise_for_status()
+        rendezvous = response.json()
+        self._worker_addrs = [
+            self._worker_pool_devices[device] for device in gpu_devices
+        ]
+        await self._async_configure_worker_ranks(
+            self._worker_addrs, rendezvous["host"], rendezvous["ports"][0]
+        )
+        config = deepcopy(self.config)
+        config.backend, config.gpu_devices = str(alloc), gpu_devices
+        await self._async_initialize_engines(alloc, config)
+        await self._async_training_control(
+            "/configure_workers", {"worker_addrs": self._worker_addrs}
+        )
+        self.train_alloc, self._parallel_strategy, self.config = (
+            alloc,
+            alloc.parallel,
+            config,
+        )
+        with self._version_lock:
+            self._version = 0
+        self._engine_rebuild_ready = True
 
     def connect_engine(self, rollout: Any, meta: Any) -> None:
         self._ensure_initialized()
@@ -1397,6 +1657,10 @@ class GatewayTrainController:
             self._weight_update_connected = False
         self._graceful_shutdown_workers()
         try:
+            run_async_task(self._async_release_engine_rendezvous)
+        except Exception:
+            logger.warning("Failed to release Engine rendezvous port", exc_info=True)
+        try:
             self._release_weight_update_port()
         except Exception:
             logger.warning(
@@ -1426,6 +1690,11 @@ class GatewayTrainController:
                 )
         self._service_roles.clear()
         self._worker_addrs.clear()
+        self._worker_pool_addrs.clear()
+        self._worker_pool_devices.clear()
+        self._engine_initialize_kwargs.clear()
+        self._training_held = False
+        self._engine_rebuild_ready = True
         self._router_addr = ""
         self._gateway_addr = ""
         self._model_addr = ""

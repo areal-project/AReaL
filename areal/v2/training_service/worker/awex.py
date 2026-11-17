@@ -12,12 +12,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger("AwexBlueprint")
 
 
+def teardown_training_adapter(state: dict[str, Any]) -> None:
+    """Release the cached adapter on the worker's Engine thread."""
+    adapter = state.get("adapter")
+    if adapter is not None:
+        adapter.teardown_weight_update_group()
+        state["adapter"] = None
+
+
 def create_awex_blueprint(
     *,
     flask_module: Any,
     get_engine: Any,
     submit_to_engine_thread: Any,
     run_endpoint: Any,
+    adapter_state: dict[str, Any] | None = None,
 ) -> Blueprint:
     """Create Flask blueprint for awex weight update endpoints.
 
@@ -28,7 +37,7 @@ def create_awex_blueprint(
     """
     bp = flask_module.Blueprint("awex", __name__, url_prefix="/awex")
 
-    _state: dict[str, Any] = {"adapter": None}
+    _state = adapter_state if adapter_state is not None else {"adapter": None}
 
     def _require_adapter():
         if _state["adapter"] is None:
@@ -41,8 +50,10 @@ def create_awex_blueprint(
     @bp.route("/report_parallelism", methods=["GET"])
     def report_parallelism():
         try:
-            adapter = _require_adapter()
-            return flask_module.jsonify(adapter.parallelism_strategy)
+            result = submit_to_engine_thread(
+                "report_parallelism", lambda: _require_adapter().parallelism_strategy
+            )
+            return flask_module.jsonify(result)
         except RuntimeError as e:
             return flask_module.jsonify({"error": str(e)}), 400
 
@@ -110,17 +121,11 @@ def create_awex_blueprint(
 
     @bp.route("/teardown", methods=["POST"])
     def teardown():
-        adapter = _state.get("adapter")
-        if adapter is None:
-            return flask_module.jsonify({"status": "success"})
-
-        def action():
-            adapter.teardown_weight_update_group()
-            _state["adapter"] = None
-
         return run_endpoint(
             "awex_teardown",
-            lambda: submit_to_engine_thread("awex_teardown", action),
+            lambda: submit_to_engine_thread(
+                "awex_teardown", lambda: teardown_training_adapter(_state)
+            ),
             return_result=False,
         )
 
