@@ -964,13 +964,28 @@ class GatewayTrainController:
     def load(self, meta: Any) -> None:
         from areal.infra.rpc.serialization import serialize_value
 
-        self._gateway_post(
-            "/load",
-            {
-                "args": serialize_value([meta]),
-                "kwargs": serialize_value({}),
-            },
-        )
+        payload = {
+            "args": serialize_value([meta]),
+            "kwargs": serialize_value({}),
+        }
+        if getattr(meta, "weight_format", None) == "raw":
+            self.hold_training()
+            try:
+                receipt = self._gateway_post_result("/load", payload)
+                if (
+                    not isinstance(receipt, dict)
+                    or type(receipt.get("version")) is not int
+                    or receipt["version"] < 0
+                ):
+                    raise RuntimeError("Raw state load returned no restored version")
+                with self._version_lock:
+                    self._version = receipt["version"]
+            except BaseException:
+                self._engine_rebuild_ready = False
+                raise
+            self._engine_rebuild_ready = True
+        else:
+            self._gateway_post("/load", payload)
 
     def offload(self) -> None:
         self._gateway_post("/offload")
