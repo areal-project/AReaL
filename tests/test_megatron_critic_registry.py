@@ -578,7 +578,8 @@ def test_qwen35_mbridge_load_dequantizes_fp8_weights_and_mixed_gdn_layers(
 
     engine._load_model_from_hf(str(tmp_path))
 
-    assert bridge._get_safetensor_io is orig_get_io
+    assert bridge._get_safetensor_io == orig_get_io
+    assert "_get_safetensor_io" not in bridge.__dict__
     expected_down = torch.tensor(
         [[0.04, 0.04, 2.0, 2.0], [0.04, 0.04, 2.0, 2.0]],
         dtype=torch.bfloat16,
@@ -648,10 +649,13 @@ def test_dequant_fp8_safetensor_io_3d_experts_one_weight_and_missing_scale(
         encoding="utf-8",
     )
 
+    def orig_get_io(path: str) -> SafeTensorIO:
+        return SafeTensorIO(path)
+
     bridge = SimpleNamespace(
         dtype=torch.bfloat16,
         hf_config=SimpleNamespace(quantization_config={"weight_block_size": [2, 2]}),
-        _get_safetensor_io=lambda path: SafeTensorIO(path),
+        _get_safetensor_io=orig_get_io,
     )
 
     with hf_load.dequant_fp8_safetensor_io(bridge):
@@ -660,6 +664,8 @@ def test_dequant_fp8_safetensor_io_3d_experts_one_weight_and_missing_scale(
         loaded_many = io.load_some_hf_weight(["model.layers.0.mlp.experts.down_proj"])
         with pytest.raises(RuntimeError, match="no matching scale tensor"):
             io.load_one_hf_weight("model.layers.0.mlp.gate_proj.weight")
+
+    assert bridge._get_safetensor_io is orig_get_io
 
     expected = torch.tensor(
         [

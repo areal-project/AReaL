@@ -860,6 +860,13 @@ def dequant_fp8_safetensor_io(
     if not callable(get_io):
         yield
         return
+    bridge_dict = getattr(bridge, "__dict__", None)
+    had_instance_attr = (
+        isinstance(bridge_dict, dict) and "_get_safetensor_io" in bridge_dict
+    )
+    orig_instance_attr = (
+        bridge_dict["_get_safetensor_io"] if had_instance_attr else None
+    )
     hf_cfg = getattr(bridge, "hf_config", None)
     resolved_qconfig = (
         quantization_config
@@ -888,7 +895,10 @@ def dequant_fp8_safetensor_io(
     try:
         yield
     finally:
-        bridge._get_safetensor_io = get_io
+        if had_instance_attr:
+            bridge._get_safetensor_io = orig_instance_attr
+        else:
+            delattr(bridge, "_get_safetensor_io")
 
 
 def load_critic_value_head(
