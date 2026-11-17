@@ -21,6 +21,7 @@ import traceback
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
@@ -154,6 +155,10 @@ class RolloutControllerV2:
 
         # Worker management
         self.workers: list[Worker] = []
+        self._inference_workers: list[Worker] = []
+        self._inference_gpu_devices: dict[str, list[int]] = {}
+        self._guard_gpu_devices: dict[str, list[int]] = {}
+        self._model_server_args: dict[str, Any] = {}
         self._server_infos: list[LocalInfServerInfo] = []
         self._worker_role: str = ""
 
@@ -161,6 +166,9 @@ class RolloutControllerV2:
         self._inf_addrs: list[str] = []
         self._router_addr: str = ""
         self._data_proxy_addrs: list[str] = []
+        self._data_proxy_backends: dict[str, str] = {}
+        self._reconfiguration_prepared = False
+        self._backend_bindings_ready = True
         self._gateway_addr: str = ""
 
         # Worker ID mapping (data proxy addr → router-assigned worker_id)
@@ -367,10 +375,32 @@ class RolloutControllerV2:
 
         from areal.api.cli_args import SchedulingSpec, SchedulingStrategy
         from areal.api.scheduler_api import Job
+        from areal.infra.scheduler.local import LocalScheduler
 
         cfg = self.config
         admin_api_key = self.config.admin_api_key
         agent_cfg = self._agent_config
+        fixed_guard_pool = False
+        guard_pool = kwargs.pop("guard_gpu_devices", None)
+        if guard_pool is not None and (
+            not isinstance(self.scheduler, LocalScheduler)
+            or self.external_mode
+            or server_infos is not None
+            or not isinstance(guard_pool, list)
+            or not guard_pool
+            or any(type(device) is not int for device in guard_pool)
+            or len(set(guard_pool)) != len(guard_pool)
+            or not set(guard_pool).issubset(self.scheduler.gpu_devices)
+            or cfg.gpu_devices is None
+            or len(cfg.gpu_devices) != self.rollout_alloc.parallel.world_size
+            or len(set(cfg.gpu_devices)) != len(cfg.gpu_devices)
+            or any(type(device) is not int for device in cfg.gpu_devices)
+            or not set(cfg.gpu_devices).issubset(guard_pool)
+            or cfg.scheduling_spec[0].gpu <= 0
+        ):
+            raise ValueError(
+                "guard_gpu_devices must contain the active local GPU slots"
+            )
 
         if self.external_mode:
             dp_size = 1
@@ -381,7 +411,7 @@ class RolloutControllerV2:
             inf_backend = alloc.backend
 
         # ==================================================================
-        # Step 0: Create RPCGuard workers (dp_size × nnodes_per_instance)
+        # Step 0: Keep a per-GPU Guard pool for locally allocated devices.
         # ==================================================================
         if self.external_mode:
             inf_spec = SchedulingSpec(
@@ -402,11 +432,22 @@ class RolloutControllerV2:
                 total_workers = dp_size
                 inf_spec.gpu = 0
             else:
-                total_workers = dp_size * nnodes_per_instance
-                inf_spec.cpu *= gpus_per_worker
-                inf_spec.mem *= gpus_per_worker
-                if inf_spec.gpu > 0:
-                    inf_spec.gpu = gpus_per_worker
+                fixed_guard_pool = (
+                    isinstance(self.scheduler, LocalScheduler) and inf_spec.gpu > 0
+                )
+                if fixed_guard_pool:
+                    total_workers = (
+                        len(guard_pool)
+                        if guard_pool is not None
+                        else dp_size * instance_size
+                    )
+                    inf_spec.gpu = 1
+                else:
+                    total_workers = dp_size * nnodes_per_instance
+                    inf_spec.cpu *= gpus_per_worker
+                    inf_spec.mem *= gpus_per_worker
+                    if inf_spec.gpu > 0:
+                        inf_spec.gpu = gpus_per_worker
 
             inf_spec.cmd = "python -m areal.v2.inference_service.guard"
 
@@ -419,7 +460,9 @@ class RolloutControllerV2:
         )
 
         placement = {}
-        if cfg.gpu_devices is not None:
+        if guard_pool is not None:
+            placement["gpu_devices"] = guard_pool
+        elif cfg.gpu_devices is not None:
             placement["gpu_devices"] = cfg.gpu_devices
         self.scheduler.create_workers(job=inf_job, **placement)
         self._service_roles.append(inf_role)
@@ -430,6 +473,37 @@ class RolloutControllerV2:
                 f"got {len(inf_workers)}"
             )
         self.workers = inf_workers
+        self._inference_workers = list(inf_workers)
+        if fixed_guard_pool:
+            self._guard_gpu_devices = {
+                worker.id: list(self.scheduler._get_colocated_gpus(inf_role, index))
+                for index, worker in enumerate(inf_workers)
+            }
+            self._model_server_args = deepcopy(server_args or {})
+            active = (
+                cfg.gpu_devices
+                if cfg.gpu_devices is not None
+                else [
+                    device
+                    for devices in self._guard_gpu_devices.values()
+                    for device in devices
+                ]
+            )
+            owners = {
+                device: worker
+                for worker in inf_workers
+                for device in self._guard_gpu_devices[worker.id]
+            }
+            self._inference_workers = [
+                owners[active[index]]
+                for index in range(0, len(active), gpus_per_worker)
+            ]
+            self._inference_gpu_devices = {
+                worker.id: active[
+                    index * gpus_per_worker : (index + 1) * gpus_per_worker
+                ]
+                for index, worker in enumerate(self._inference_workers)
+            }
         logger.info("RPCGuard workers ready: %s", [w.id for w in inf_workers])
 
         self._workers_ready.set()
@@ -483,7 +557,7 @@ class RolloutControllerV2:
                 cfg,
                 alloc,
                 inf_backend,
-                inf_workers,
+                self._inference_workers,
                 dp_size,
                 nnodes_per_instance,
                 dict(inf_spec.env_vars),
@@ -556,7 +630,7 @@ class RolloutControllerV2:
             data_proxy_base_cmd += ["--prm-config", json.dumps(asdict(agent_cfg.prm))]
 
         async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str]:
-            if self.external_mode:
+            if self.external_mode or fixed_guard_pool:
                 head_worker = inf_workers[group_idx]
             else:
                 head_worker = inf_workers[
@@ -570,7 +644,7 @@ class RolloutControllerV2:
             else:
                 dp_cmd = data_proxy_base_cmd + [
                     "--backend-addr",
-                    self._inf_addrs[group_idx],
+                    self._inf_addrs[group_idx % dp_size],
                     "--backend-type",
                     inf_backend or "sglang",
                 ]
@@ -605,12 +679,20 @@ class RolloutControllerV2:
             )
         )
         dp_results = await asyncio.gather(
-            *[_fork_data_proxy(i) for i in range(dp_size)]
+            *[
+                _fork_data_proxy(i)
+                for i in range(total_workers if fixed_guard_pool else dp_size)
+            ]
         )
 
         # Track data-proxies in group order, then gateway — deterministic cleanup.
         for group_idx, (dp_host, dp_port, dp_guard) in enumerate(dp_results):
-            self._data_proxy_addrs.append(f"http://{format_hostport(dp_host, dp_port)}")
+            proxy_addr = f"http://{format_hostport(dp_host, dp_port)}"
+            self._data_proxy_addrs.append(proxy_addr)
+            if not self.external_mode:
+                self._data_proxy_backends[proxy_addr] = self._inf_addrs[
+                    group_idx % dp_size
+                ]
             self._forked_services.append((dp_guard, "data-proxy", group_idx))
         logger.info("Data proxies: %s", self._data_proxy_addrs)
 
@@ -790,6 +872,14 @@ class RolloutControllerV2:
                         ),
                         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
                     }
+
+                devices = self._inference_gpu_devices.get(group_workers[node_rank].id)
+                if devices is not None:
+                    from areal.infra.platforms import current_platform
+
+                    fork_payload.setdefault("env", {})[
+                        current_platform.device_control_env_var
+                    ] = ",".join(str(device) for device in devices)
 
                 resp = await client.post(
                     f"{guard_addr}/fork",
@@ -1272,6 +1362,10 @@ class RolloutControllerV2:
 
         self._service_roles.clear()
         self.workers.clear()
+        self._inference_workers.clear()
+        self._inference_gpu_devices.clear()
+        self._guard_gpu_devices.clear()
+        self._model_server_args.clear()
         self._server_infos.clear()
         with self._online_waiters_lock:
             for waiter in self._online_waiters:
@@ -1281,6 +1375,9 @@ class RolloutControllerV2:
             self._completed_online_results.clear()
         self._inf_addrs.clear()
         self._data_proxy_addrs.clear()
+        self._data_proxy_backends.clear()
+        self._reconfiguration_prepared = False
+        self._backend_bindings_ready = True
         self._worker_ids.clear()
         self._router_addr = ""
         self._gateway_addr = ""
@@ -1294,30 +1391,15 @@ class RolloutControllerV2:
 
         self._ensure_initialized()
 
+        if self._gateway_addr:
+            run_async_task(self._async_set_version, version)
         with self._version_lock:
             self._version = version
 
-        if not self._gateway_addr:
-            return
-
-        run_async_task(self._async_set_version, version)
-
     async def _async_set_version(self, version: int) -> None:
-        payload = {"version": version}
-        results = await asyncio.gather(
-            *[
-                self._async_data_proxy_post(addr, "/set_version", payload)
-                for addr in self._data_proxy_addrs
-            ],
-            return_exceptions=True,
+        await self._post_to_proxies(
+            self._data_proxy_addrs, "/set_version", {"version": version}
         )
-        failed = [r for r in results if isinstance(r, Exception)]
-        for r in failed:
-            logger.error("Failed to set version on a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(
-                f"set_version({version}) failed on ALL {len(failed)} workers"
-            )
 
     def get_version(self) -> int:
         """Return the local version (compatible with VersionProvider protocol)."""
@@ -1674,93 +1756,123 @@ class RolloutControllerV2:
         self._ensure_initialized()
         run_async_task(self._async_offload)
 
-    async def _async_offload(self) -> None:
-        if not self._data_proxy_addrs:
-            return
+    def _backend_proxy_addrs(self) -> list[str]:
+        """Choose one proxy per backend for shared inference control requests."""
+        representatives: dict[str, str] = {}
+        for addr in self._data_proxy_addrs:
+            backend = self._data_proxy_backends.get(addr, addr)
+            representatives.setdefault(backend, addr)
+        return list(representatives.values())
+
+    async def _post_to_proxies(
+        self, addrs: list[str], endpoint: str, payload: dict[str, Any]
+    ) -> None:
         results = await asyncio.gather(
-            *(
-                self._async_data_proxy_post(addr, "/release_memory_occupation", {})
-                for addr in self._data_proxy_addrs
-            ),
+            *(self._async_data_proxy_post(addr, endpoint, payload) for addr in addrs),
             return_exceptions=True,
         )
-        failed = [r for r in results if isinstance(r, Exception)]
-        for r in failed:
-            logger.error("Failed to offload a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(f"offload failed on ALL {len(failed)} workers")
+        failed = [result for result in results if isinstance(result, BaseException)]
+        if failed:
+            raise RuntimeError(
+                f"{endpoint} failed on {len(failed)}/{len(addrs)} proxies"
+            ) from failed[0]
+
+    async def _async_offload(self) -> None:
+        await self._post_to_proxies(
+            self._backend_proxy_addrs(), "/release_memory_occupation", {}
+        )
 
     def onload(self, tags: list[str] | None = None) -> None:
-        """Reload model memory on all inference workers."""
+        """Reload model memory once per inference backend."""
         from areal.infra.utils.concurrent import run_async_task
 
         self._ensure_initialized()
         run_async_task(self._async_onload, tags)
 
     async def _async_onload(self, tags: list[str] | None = None) -> None:
-        if not self._data_proxy_addrs:
-            return
-        payload: dict = {"tags": tags} if tags is not None else {}
-        results = await asyncio.gather(
-            *(
-                self._async_data_proxy_post(addr, "/resume_memory_occupation", payload)
-                for addr in self._data_proxy_addrs
-            ),
-            return_exceptions=True,
+        payload = {"tags": tags} if tags is not None else {}
+        await self._post_to_proxies(
+            self._backend_proxy_addrs(), "/resume_memory_occupation", payload
         )
-        failed = [r for r in results if isinstance(r, Exception)]
-        for r in failed:
-            logger.error("Failed to onload a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(f"onload failed on ALL {len(failed)} workers")
 
     def pause_generation(self) -> None:
-        """Pause generation on all workers."""
+        """Hold all proxies, abort each backend and collect segment responses."""
         from areal.infra.utils.concurrent import run_async_task
 
         self._ensure_initialized()
         run_async_task(self._async_pause_generation)
 
     async def _async_pause_generation(self) -> None:
-        if not self._data_proxy_addrs:
-            return
+        self._reconfiguration_prepared = False
+        await self._post_to_proxies(self._data_proxy_addrs, "/hold_generation", {})
+        await self._post_to_proxies(
+            self._backend_proxy_addrs(), "/pause_generation", {}
+        )
+        await self._post_to_proxies(self._data_proxy_addrs, "/wait_generation_idle", {})
+        self._reconfiguration_prepared = True
+
+    def rebind_backends(self, proxy_backends: dict[str, str]) -> None:
+        """Rebind every held data proxy to its prepared inference backend."""
+        from areal.infra.utils.concurrent import run_async_task
+
+        self._ensure_initialized()
+        run_async_task(self._async_rebind_backends, proxy_backends)
+
+    async def _async_rebind_backends(self, proxy_backends: dict[str, str]) -> None:
+        if not self._reconfiguration_prepared:
+            raise RuntimeError("Pause and collect all segments before rebinding")
+        if set(proxy_backends) != set(self._data_proxy_addrs):
+            raise ValueError("Provide a backend for every existing data proxy")
+        if any(
+            not isinstance(addr, str) or not addr.startswith(("http://", "https://"))
+            for addr in proxy_backends.values()
+        ):
+            raise ValueError("Backend addresses must be HTTP(S) URLs")
+        self._backend_bindings_ready = False
+
+        async def rebind_one(proxy: str, backend: str) -> None:
+            await self._async_data_proxy_post(
+                proxy,
+                "/configure_backend",
+                {"backend_addr": backend, "preserve_requests": True},
+            )
+            self._data_proxy_backends[proxy] = backend.rstrip("/")
+
         results = await asyncio.gather(
-            *[
-                self._async_data_proxy_post(addr, "/pause_generation", {})
-                for addr in self._data_proxy_addrs
-            ],
+            *(rebind_one(proxy, backend) for proxy, backend in proxy_backends.items()),
             return_exceptions=True,
         )
-        failed = [r for r in results if isinstance(r, Exception)]
-        for r in failed:
-            logger.error("Failed to pause generation on a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(f"pause_generation failed on ALL {len(failed)} workers")
+        failed = [result for result in results if isinstance(result, BaseException)]
+        if failed:
+            raise RuntimeError(
+                "Backend rebinding incomplete; generation remains held"
+            ) from failed[0]
+        self._inf_addrs = list(dict.fromkeys(self._data_proxy_backends.values()))
+        self._server_infos = [
+            LocalInfServerInfo(
+                host=url.host,
+                port=url.port or (443 if url.scheme == "https" else 80),
+                process=None,
+            )
+            for url in (httpx.URL(addr) for addr in self._inf_addrs)
+        ]
+        self._backend_bindings_ready = True
 
     def continue_generation(self) -> None:
-        """Continue generation on all workers."""
+        """Resume each backend, then release all retained logical requests."""
         from areal.infra.utils.concurrent import run_async_task
 
         self._ensure_initialized()
         run_async_task(self._async_continue_generation)
 
     async def _async_continue_generation(self) -> None:
-        if not self._data_proxy_addrs:
-            return
-        results = await asyncio.gather(
-            *[
-                self._async_data_proxy_post(addr, "/continue_generation", {})
-                for addr in self._data_proxy_addrs
-            ],
-            return_exceptions=True,
+        if not self._backend_bindings_ready:
+            raise RuntimeError("Complete backend rebinding before resuming generation")
+        self._reconfiguration_prepared = False
+        await self._post_to_proxies(
+            self._backend_proxy_addrs(), "/continue_generation", {}
         )
-        failed = [r for r in results if isinstance(r, Exception)]
-        for r in failed:
-            logger.error("Failed to continue generation on a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(
-                f"continue_generation failed on ALL {len(failed)} workers"
-            )
+        await self._post_to_proxies(self._data_proxy_addrs, "/release_generation", {})
 
     # -- Stats -------------------------------------------------------------
 
@@ -1796,7 +1908,7 @@ class RolloutControllerV2:
         self._ensure_initialized()
         return [
             f"http://{format_hostport(w.ip, int(w.worker_ports[0]))}"
-            for w in self.workers
+            for w in self._inference_workers
         ]
 
     @property
@@ -2098,6 +2210,7 @@ class RolloutControllerV2:
             "role": role,
             "worker_index": worker_index,
             "raw_cmd": cmd,
+            "env": {"CUDA_VISIBLE_DEVICES": "", "ASCEND_RT_VISIBLE_DEVICES": ""},
         }
 
         try:
@@ -2175,7 +2288,11 @@ class RolloutControllerV2:
         url = f"{addr}{endpoint}"
         try:
             client = await self._get_async_client()
-            resp = await client.post(url, json=payload)
+            resp = await client.post(
+                url,
+                json=payload,
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
             if resp.status_code >= 400:
                 raise RuntimeError(
                     f"Data proxy {url} returned {resp.status_code}: {resp.text}"

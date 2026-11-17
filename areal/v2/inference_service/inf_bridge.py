@@ -78,10 +78,55 @@ class InfBridge:
         self._version = version
         self.return_routed_experts = return_routed_experts
         self._client = httpx.AsyncClient(timeout=request_timeout)
+        self._control_client = httpx.AsyncClient(timeout=request_timeout)
+        self._segments = asyncio.Condition()
+        self._generation_held = False
+        self._active_segments = 0
 
     async def aclose(self) -> None:
         """Close the underlying HTTP client."""
         await self._client.aclose()
+        await self._control_client.aclose()
+
+    async def hold_generation(self) -> None:
+        """Prevent new backend segments while retaining logical requests."""
+        async with self._segments:
+            self._generation_held = True
+            await self.pause_state.set_paused(True)
+
+    async def wait_generation_idle(self) -> None:
+        """Wait until in-flight segment responses have been accumulated."""
+        async with self._segments:
+            if not self._generation_held:
+                raise RuntimeError("Hold generation before waiting for segments")
+            await self._segments.wait_for(lambda: self._active_segments == 0)
+
+    async def rebind(self, backend_addr: str) -> None:
+        """Change the backend after held segments have finished unwinding."""
+        backend_addr = backend_addr.rstrip("/")
+        if not backend_addr.startswith(("http://", "https://")):
+            raise ValueError("backend_addr must be an HTTP(S) URL")
+        async with self._segments:
+            if not self._generation_held or self._active_segments:
+                raise RuntimeError("Backend rebinding requires held, idle generation")
+            self.backend_addr = backend_addr
+
+    async def release_generation(self) -> None:
+        """Release logical requests after the backend has been prepared."""
+        async with self._segments:
+            await self.pause_state.set_paused(False)
+            self._generation_held = False
+            self._segments.notify_all()
+
+    async def _begin_segment(self) -> None:
+        async with self._segments:
+            await self._segments.wait_for(lambda: not self._generation_held)
+            self._active_segments += 1
+
+    async def _end_segment(self) -> None:
+        async with self._segments:
+            self._active_segments -= 1
+            self._segments.notify_all()
 
     # -- version tracking ---------------------------------------------------
 
@@ -97,26 +142,26 @@ class InfBridge:
         """Pause generation by setting pause_state and calling the backend."""
         await self.pause_state.set_paused(True)
         http_req = self.backend.get_pause_request()
-        await self._send_request(http_req, timeout=10.0)
+        await self._send_request(http_req, timeout=10.0, control=True)
         logger.info("Pause request sent to %s", self.backend_addr)
 
     async def resume(self) -> None:
         """Resume generation by calling the backend and clearing pause_state."""
         http_req = self.backend.get_resume_request()
-        await self._send_request(http_req, timeout=10.0)
+        await self._send_request(http_req, timeout=10.0, control=True)
         await self.pause_state.set_paused(False)
         logger.info("Resume request sent to %s", self.backend_addr)
 
     async def offload(self) -> None:
         """Offload model memory on the backend inference server."""
         http_req = self.backend.get_offload_request()
-        await self._send_request(http_req, timeout=30.0)
+        await self._send_request(http_req, timeout=30.0, control=True)
         logger.info("Offload request sent to %s", self.backend_addr)
 
     async def onload(self, tags: list[str] | None = None) -> None:
         """Reload model memory on the backend inference server."""
         http_req = self.backend.get_onload_request(tags=tags)
-        await self._send_request(http_req, timeout=30.0)
+        await self._send_request(http_req, timeout=30.0, control=True)
         logger.info("Onload request sent to %s", self.backend_addr)
 
     # -- HTTP transport (shared across all backends) -------------------------
@@ -126,6 +171,7 @@ class InfBridge:
         http_req: HttpRequest,
         *,
         timeout: float | None = None,
+        control: bool = False,
     ) -> dict[str, Any]:
         """Send an :class:`HttpRequest` and return the parsed JSON body.
 
@@ -149,10 +195,11 @@ class InfBridge:
         """
         _timeout = timeout if timeout is not None else self.request_timeout
         url = f"{self.backend_addr}{http_req.endpoint}"
+        client = self._control_client if control else self._client
         if http_req.method == "GET":
-            resp = await self._client.get(url, timeout=_timeout)
+            resp = await client.get(url, timeout=_timeout)
         else:
-            resp = await self._client.post(url, json=http_req.payload, timeout=_timeout)
+            resp = await client.post(url, json=http_req.payload, timeout=_timeout)
         if resp.status_code >= 400:
             body = resp.text[:500]
             logger.error("Backend returned %d for %s: %s", resp.status_code, url, body)
@@ -209,85 +256,91 @@ class InfBridge:
             while await self.pause_state.is_paused():
                 await asyncio.sleep(self.resubmit_wait)
 
-            # Adjust max_new_tokens for already-generated tokens
-            remaining = ori_max_new_tokens - len(accumulated_tokens)
-            if remaining <= 0:
-                stop_reason = "length"
-                break
+            await self._begin_segment()
+            try:
+                # Adjust max_new_tokens for already-generated tokens
+                remaining = ori_max_new_tokens - len(accumulated_tokens)
+                if remaining <= 0:
+                    stop_reason = "length"
+                    break
 
-            # Patch the payload for this iteration (extend input, shrink budget)
-            self.backend.patch_generation_request(
-                http_req,
-                req,
-                accumulated_tokens,
-                remaining,
-            )
+                # Patch the payload for this iteration (extend input, shrink budget)
+                self.backend.patch_generation_request(
+                    http_req,
+                    req,
+                    accumulated_tokens,
+                    remaining,
+                )
 
-            # A weight update may complete before this segment's response arrives.
-            request_version = self._version
-            data = await self._send_request(http_req)
-            result = self.backend.parse_generation_response(data)
+                # A weight update may complete before this segment's response arrives.
+                request_version = self._version
+                data = await self._send_request(http_req)
+                result = self.backend.parse_generation_response(data)
 
-            if requested_routing and result.routed_experts is None:
-                if result.stop_reason != "abort":
-                    raise RuntimeError(
-                        "Requested return_routed_experts=True but the inference "
-                        "backend response did not include routed_experts. "
-                        "This usually means the SGLang server was not launched with "
-                        "enable_return_routed_experts=True or the model is not a MoE "
-                        "model."
-                    )
-
-            accumulated_tokens.extend(result.output_tokens)
-            accumulated_logprobs.extend(result.output_logprobs)
-            accumulated_versions.extend([request_version] * len(result.output_tokens))
-            stop_reason = cast(_StopReason, result.stop_reason)
-
-            if result.routed_experts is not None:
-                if final_routed_experts is None:
-                    final_routed_experts = result.routed_experts
-                else:
-                    consumed_rows = final_routed_experts.shape[0]
-                    if result.routed_experts.shape[0] < consumed_rows:
+                if requested_routing and result.routed_experts is None:
+                    if result.stop_reason != "abort":
                         raise RuntimeError(
-                            "SGLang routed_experts for a resubmitted request is "
-                            "shorter than the previously accumulated routing rows: "
-                            f"new_shape={result.routed_experts.shape}, "
-                            f"accumulated_shape={final_routed_experts.shape}."
+                            "Requested return_routed_experts=True but the inference "
+                            "backend response did not include routed_experts. "
+                            "This usually means the SGLang server was not launched with "
+                            "enable_return_routed_experts=True or the model is not a MoE "
+                            "model."
                         )
-                    final_routed_experts = np.concatenate(
-                        [
-                            final_routed_experts,
-                            result.routed_experts[consumed_rows:],
-                        ],
-                        axis=0,
+
+                accumulated_tokens.extend(result.output_tokens)
+                accumulated_logprobs.extend(result.output_logprobs)
+                accumulated_versions.extend(
+                    [request_version] * len(result.output_tokens)
+                )
+                stop_reason = cast(_StopReason, result.stop_reason)
+
+                if result.routed_experts is not None:
+                    if final_routed_experts is None:
+                        final_routed_experts = result.routed_experts
+                    else:
+                        consumed_rows = final_routed_experts.shape[0]
+                        if result.routed_experts.shape[0] < consumed_rows:
+                            raise RuntimeError(
+                                "SGLang routed_experts for a resubmitted request is "
+                                "shorter than the previously accumulated routing rows: "
+                                f"new_shape={result.routed_experts.shape}, "
+                                f"accumulated_shape={final_routed_experts.shape}."
+                            )
+                        final_routed_experts = np.concatenate(
+                            [
+                                final_routed_experts,
+                                result.routed_experts[consumed_rows:],
+                            ],
+                            axis=0,
+                        )
+
+                # Record speculative-decoding acceptance metrics from SGLang
+                # meta_info. Recorded per generation segment (partial rollout may
+                # issue multiple /generate calls); exported as a segment-level mean.
+                if result.spec_accept_rate is not None:
+                    stats_tracker.get("rollout").scalar(
+                        spec_accept_rate=result.spec_accept_rate
+                    )
+                if result.spec_accept_length is not None:
+                    stats_tracker.get("rollout").scalar(
+                        spec_accept_length=result.spec_accept_length
                     )
 
-            # Record speculative-decoding acceptance metrics from SGLang
-            # meta_info. Recorded per generation segment (partial rollout may
-            # issue multiple /generate calls); exported as a segment-level mean.
-            if result.spec_accept_rate is not None:
-                stats_tracker.get("rollout").scalar(
-                    spec_accept_rate=result.spec_accept_rate
+                if stop_reason in ("stop", "tool_calls", "length"):
+                    break
+
+                if len(accumulated_tokens) >= ori_max_new_tokens:
+                    stop_reason = "length"
+                    break
+
+                # stop_reason == "abort" → continue loop (resubmit)
+                logger.debug(
+                    "Abort detected, resubmit attempt %d, accumulated %d tokens",
+                    _attempt + 1,
+                    len(accumulated_tokens),
                 )
-            if result.spec_accept_length is not None:
-                stats_tracker.get("rollout").scalar(
-                    spec_accept_length=result.spec_accept_length
-                )
-
-            if stop_reason in ("stop", "tool_calls", "length"):
-                break
-
-            if len(accumulated_tokens) >= ori_max_new_tokens:
-                stop_reason = "length"
-                break
-
-            # stop_reason == "abort" → continue loop (resubmit)
-            logger.debug(
-                "Abort detected, resubmit attempt %d, accumulated %d tokens",
-                _attempt + 1,
-                len(accumulated_tokens),
-            )
+            finally:
+                await self._end_segment()
 
         # Final abort at max retries → treat as length
         if stop_reason == "abort" or stop_reason is None:

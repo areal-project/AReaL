@@ -542,7 +542,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         pause_state: PauseState = app.state.pause_state
         return DataProxyHealthResponse(
             status="ok",
-            backend=config.backend_addr,
+            backend=app.state.config.backend_addr,
             sessions=store.session_count,
             paused=await pause_state.is_paused(),
             version=app.state.version,
@@ -555,6 +555,29 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     # =========================================================================
     # Pause/Resume — internal control plane (no auth at data proxy level)
     # =========================================================================
+
+    def require_bridge(request: Request) -> InfBridge:
+        _require_admin_key(request, app.state.session_store)
+        if app.state.inf_bridge is None:
+            raise HTTPException(
+                status_code=503, detail="No inference backend configured"
+            )
+        return app.state.inf_bridge
+
+    @app.post("/hold_generation")
+    async def hold_generation(request: Request):
+        await require_bridge(request).hold_generation()
+        return {"status": "ok"}
+
+    @app.post("/wait_generation_idle")
+    async def wait_generation_idle(request: Request):
+        await require_bridge(request).wait_generation_idle()
+        return {"status": "ok"}
+
+    @app.post("/release_generation")
+    async def release_generation(request: Request):
+        await require_bridge(request).release_generation()
+        return {"status": "ok"}
 
     @app.post("/pause_generation", response_model=PauseGenerationResponse)
     async def pause_generation():
@@ -1172,17 +1195,26 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/configure_backend", response_model=ConfigureBackendResponse)
     async def configure_backend(request: Request):
-        """Reconfigure the inference backend address after process start."""
+        """Bind a backend, preserving an existing held InfBridge and its calls."""
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
         body = await request.json()
         new_addr = body.get("backend_addr")
-        if not new_addr:
+        if not isinstance(new_addr, str) or not new_addr:
             raise HTTPException(status_code=400, detail="backend_addr is required")
         pause_state: PauseState = app.state.pause_state
         tok: TokenizerProxy = app.state.tokenizer
 
         old_inf_bridge: InfBridge | None = app.state.inf_bridge
+        if old_inf_bridge is not None and body.get("preserve_requests", False):
+            try:
+                await old_inf_bridge.rebind(new_addr)
+            except (RuntimeError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            from dataclasses import replace as _dc_replace
+
+            app.state.config = _dc_replace(app.state.config, backend_addr=new_addr)
+            return ConfigureBackendResponse(status="ok", backend_addr=new_addr)
 
         # Recreate InfBridge + ArealOpenAI with new backend address
         new_inf_bridge = _create_inf_bridge(new_addr, pause_state, app.state.config)
@@ -1203,8 +1235,6 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         app.state.inf_bridge = new_inf_bridge
         app.state.areal_client = new_areal_client
 
-        # Close old InfBridge after the swap so in-flight requests that already
-        # hold a reference to the old bridge can still finish their HTTP calls.
         if old_inf_bridge is not None:
             await old_inf_bridge.aclose()
 
