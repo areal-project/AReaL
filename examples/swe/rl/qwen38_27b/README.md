@@ -96,3 +96,95 @@ checkpoint manifest. These checks do not replace actual distributed optimizer lo
 The independent experiment observer and logp/GDN diagnostic candidates are outside this
 recipe. FA3 adapters, forced stable top-k, cache isolation and tensor replay patches are
 not added by these files.
+
+## Ray
+
+Use `ray_worker.sh controller` inside the controller image on an **existing** Ray
+cluster. This entry reuses `train_fine_released64_bs16.yaml`, the dense Qwen controller
+decorator, and `qwen27_actor_worker` (including its CPU optimizer offload). It replaces
+only the Slurm launch settings and runtime paths. Training remains bs16/gs12, with actor
+DP1/PP4/TP4/CP4 and sixteen TP4 rollout replicas colocated on the same 64 GPUs. The
+adapter rejects other allocations: equal-replica forks and cross-node inference TP use
+different bootstrap paths and are not covered by this recipe.
+
+Prepare the controller and both role images with compatible Ray/Python versions and
+role-specific dependencies. Set `QWEN_RAY_ACTOR_IMAGE` and `QWEN_RAY_ROLLOUT_IMAGE` to
+OCI references in the profile. They become each role's `ray_runtime_env.image_uri`: Ray
+starts the containers through Podman on the raylet node. The wrapper executes inside
+that container; it does not launch Singularity or another raylet. See
+[Ray container deployment](../../../ray/README.md) for Podman, GPU access, shared mounts
+and Kubernetes prerequisites. This path does not require Slurm services.
+
+`QWEN_RAY_PYTHON` selects the controller interpreter. Independently set
+`QWEN_RAY_ACTOR_PYTHON` and `QWEN_RAY_ROLLOUT_PYTHON` to the native Python paths inside
+their images (default `python3`). Do not force the controller's interpreter or
+site-packages onto the worker images. For example, a training image using a virtualenv
+should select that virtualenv's Python to avoid mixing CUDA/cuDNN installations. Proxy
+forks use the rollout worker's interpreter.
+
+For explicit Podman mounts/devices, put `ray_runtime_env.container` with `image` and
+`run_options` in each role's `scheduling_spec` in a custom YAML and leave the profile's
+image fields empty. Do not combine a profile image with `container`. These deployment
+settings are preserved in the generated configuration. The images must contain an
+importable AReaL installation before Ray deserializes the launcher; the shell wrapper's
+later `PYTHONPATH` setup cannot provide that bootstrap requirement.
+
+Optional `QWEN_RAY_ACTOR_PYTHONPATH` and `QWEN_RAY_ROLLOUT_PYTHONPATH` select
+role-specific package directories before Python starts. Leave them empty when the image
+contains the dependencies. A profile can use `QWEN_RUNTIME_ROLE` (`controller`, `actor`,
+or `rollout`) to select native library paths. Do not change the scheduler-provided
+GPU/rank variables.
+
+1. Make the checkout, model, output storage and private profile readable at the same
+   absolute paths on every node. Use a fixed checkout for the run; this Ray entry does
+   not create the Slurm submission's source snapshot. Each of the eight nodes needs
+   eight GPUs and enough Ray CPU/memory resources for the actor requests (32 CPUs and
+   512 GiB per node in the preset). CPU optimizer and rollout processes also need
+   sufficient physical host memory.
+
+1. Copy `ray.env.example` to an external private profile. Source your existing
+   credentials there. Set the model/output paths, explicit experiment/trial identity,
+   shared run directory and `RAY_ADDRESS`. Pin the actual stream, harness and reward
+   key/version used by the experiment; an unspecified reward version is rejected. There
+   is no need to supply Slurm images, partitions, reservations or mounts.
+
+1. Prepare the configuration without starting Ray workers or training:
+
+   ```bash
+   export QWEN_ENV_FILE=/shared/private/qwen27-ray.env
+   bash examples/swe/rl/qwen38_27b/ray_worker.sh controller --prepare-only
+   ```
+
+   This writes `$QWEN_RUN_DIR/train-ray.yaml` with credential references, not expanded
+   credentials. Review it before running. To edit training settings, copy the bs16
+   preset and pass `--config /shared/path/custom.yaml`; this option also works with
+   `--prepare-only`. Changing an existing generated config requires a new run directory,
+   so a running trial's config cannot be overwritten accidentally.
+
+1. Verify controller/worker RPC and training communication, worker access to Arena
+   Online, and **Arena LLM gateway access back to each rollout proxy's advertised
+   address and port**. Successful model registration does not verify that callback. Then
+   start the driver in your Ray job platform:
+
+   ```bash
+   bash examples/swe/rl/qwen38_27b/ray_worker.sh controller
+   ```
+
+The driver connects to the selected cluster without falling back to local Ray and checks
+for eight live nodes with at least eight GPUs. `--prepare-only` does not check the
+target images, network or cluster. Validate real multimodal inference, rewards, CPU
+optimizer allocation, initial AWEX synchronization and the first optimizer update before
+treating a submitted job as healthy.
+
+The role wrapper ignores `SLURM_JOB_NAME`, preserves Ray's device/rank assignment, uses
+unique process cache/log paths, and explicitly enables the historical external
+multimodal processor. Visual embedding cache remains 100 MB. The profile's pixel limit
+and image alignment settings must match for proxy and SGLang.
+
+For a new experiment choose a fresh trial. If its log/checkpoint directory already
+exists, startup fails unless `--resume` is supplied. Resume requires an actual loaded
+checkpoint; it must not silently start at step zero. Stop the previous Ray job and its
+workers before resuming. The Ray entry does not execute the Slurm job-state preflight or
+install an `afterany` cleanup job. Configure your Ray job platform to terminate the
+driver/workers and arrange trial-scoped Arena task cleanup after a hard kill; do not run
+the Slurm cleanup script against Ray jobs.
