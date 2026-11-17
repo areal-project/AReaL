@@ -585,7 +585,7 @@ requires-dist = [
     { name = "colorlog", marker = "extra == 'cli'" },
     { name = "cookiecutter", specifier = ">2.1.1" },
     { name = "datasets", specifier = ">=3.0.0" },
-    { name = "daytona", marker = "extra == 'sandbox'", specifier = ">=0.167.0" },
+    { name = "daytona", marker = "extra == 'sandbox'", specifier = ">=0.167.0,<1" },
     { name = "distro-info", specifier = ">=1.0" },
     { name = "einops" },
     { name = "fastapi", specifier = ">=0.115.12" },
