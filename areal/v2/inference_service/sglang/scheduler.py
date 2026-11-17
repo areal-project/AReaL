@@ -59,6 +59,7 @@ class AwexSchedulerBridge:
             "awex_report_parallelism",
             "awex_init_weights_update_group",
             "awex_execute_weight_update",
+            "awex_teardown",
             "awex_batch_isend_irecv",
             "awex_get_parameters",
             "awex_randomize_parameters",
@@ -107,6 +108,11 @@ class AwexSchedulerBridge:
 
     def awex_execute_weight_update(self, version: int = 0) -> None:
         self._require_adapter().execute_weight_update(version)
+
+    def awex_teardown(self) -> None:
+        if self._adapter is not None:
+            self._adapter.teardown_weight_update_group()
+            self._adapter = None
 
     def awex_batch_isend_irecv(self, **kwargs: Any) -> None:
         self._require_adapter().batch_isend_irecv(**kwargs)

@@ -22,7 +22,7 @@ from areal.utils.network import format_hostport, gethostip
 if TYPE_CHECKING:
     from areal.api import ParallelStrategy, TrainEngine
     from areal.api.cli_args import TrainEngineConfig
-    from areal.api.io_struct import FinetuneSpec
+    from areal.api.io_struct import FinetuneSpec, WeightUpdateMeta
     from areal.api.scheduler_api import Scheduler, Worker
 
 logger = logging.getLogger("GatewayTrainController")
@@ -63,6 +63,9 @@ class GatewayTrainController:
         self._own_process_group = False
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
+        self._weight_update_meta: WeightUpdateMeta | None = None
+        self._weight_update_connected = False
+        self._weight_update_port_owner: tuple[str, str, int] | None = None
 
         # Version management
         self._version_lock = Lock()
@@ -1094,40 +1097,57 @@ class GatewayTrainController:
                 f"Ensure _version='v2' is set on InferenceEngineConfig."
             )
 
-        self.rollout = rollout
-
         if meta.type not in ("awex", "disk"):
             raise ValueError(
                 f"GatewayTrainController supports 'awex' or 'disk' weight "
                 f"updates, got '{meta.type}'"
             )
-
-        ctrl = WeightUpdateController(
-            WeightUpdateControllerConfig(
-                # Bind gateway to this node's outbound IP so cross-host
-                # train/inf workers can reach the kv_store_url the gateway
-                # publishes. Default "127.0.0.1" only works single-machine.
-                host=gethostip(),
-                admin_api_key=self.config.admin_api_key,
-                log_level=self.config.log_level,
-                request_timeout=self.config.request_timeout,
-                init_timeout_s=self.config.request_timeout,
-                update_timeout_s=self.config.request_timeout,
+        if self._weight_update_connected:
+            raise RuntimeError(
+                "Disconnect the current weight-transfer pair before reconnecting"
             )
-        )
-        ctrl.initialize()
+        self.rollout = rollout
+
+        ctrl = self._weight_update_ctrl
+        if ctrl is None:
+            ctrl = WeightUpdateController(
+                WeightUpdateControllerConfig(
+                    # Bind gateway to this node's outbound IP so cross-host
+                    # train/inf workers can reach the kv_store_url the gateway
+                    # publishes. Default "127.0.0.1" only works single-machine.
+                    host=gethostip(),
+                    admin_api_key=self.config.admin_api_key,
+                    log_level=self.config.log_level,
+                    request_timeout=self.config.request_timeout,
+                    init_timeout_s=self.config.request_timeout,
+                    update_timeout_s=self.config.request_timeout,
+                )
+            )
+            self._weight_update_ctrl = ctrl
+            try:
+                ctrl.initialize()
+            except BaseException:
+                ctrl.destroy()
+                self._weight_update_ctrl = None
+                raise
 
         inference_urls: list[str] = rollout.inference_worker_urls
+        if not inference_urls:
+            raise RuntimeError("No inference servers available for weight transfer")
         pair_name = f"{self._role}-rollout"
+        self._weight_update_meta = meta
+        self._weight_update_connected = True
 
         if meta.type == "awex":
             # NCCL rendezvous master must live on the rank-0 process's node.
             # awex assigns rank 0 to inference[0], so allocate on the inference
             # rank-0 guard rather than a train guard.
             inf_guard_addrs = rollout.inference_guard_addrs
+            owner_role = f"{pair_name}-awex"
+            self._weight_update_port_owner = (inf_guard_addrs[0], owner_role, 0)
             resp = requests.post(
                 f"{inf_guard_addrs[0]}/alloc_ports",
-                json={"count": 1},
+                json={"count": 1, "role": owner_role, "worker_index": 0},
                 timeout=30,
             )
             resp.raise_for_status()
@@ -1151,7 +1171,6 @@ class GatewayTrainController:
                 lora_name=meta.lora_name,
                 lora_keep_versions=meta.lora_keep_versions,
             )
-        self._weight_update_ctrl = ctrl
         logger.info(
             "WeightUpdateController connected (pair=%s, train=%d, inf=%d)",
             pair_name,
@@ -1159,15 +1178,58 @@ class GatewayTrainController:
             len(inference_urls),
         )
 
-    def update_weights(self, meta: Any) -> None:
+    def _release_weight_update_port(self) -> None:
+        import requests
+
+        if self._weight_update_port_owner is not None:
+            if self.rollout is not None and self.rollout._destroyed:
+                # The rollout Guard has already released all of its reservations.
+                self._weight_update_port_owner = None
+                return
+            guard, role, index = self._weight_update_port_owner
+            response = requests.post(
+                f"{guard}/release_ports",
+                json={"role": role, "worker_index": index},
+                timeout=30,
+            )
+            response.raise_for_status()
+            self._weight_update_port_owner = None
+
+    def disconnect_engine(self) -> None:
+        """Release weight-transfer groups while retaining the training engine."""
+        self._ensure_initialized()
+        if self._weight_update_connected:
+            if self._weight_update_meta.type == "awex":
+                urls = self._worker_addrs + self.rollout.inference_worker_urls
+
+                async def teardown() -> None:
+                    client = await self._get_async_client()
+                    responses = await asyncio.gather(
+                        *(client.post(f"{url}/awex/teardown", json={}) for url in urls),
+                        return_exceptions=True,
+                    )
+                    for response in responses:
+                        if isinstance(response, BaseException):
+                            raise response
+                        response.raise_for_status()
+
+                run_async_task(teardown)
+            self._weight_update_ctrl.disconnect()
+            self._weight_update_connected = False
+        self._release_weight_update_port()
+
+    def update_weights(self, meta: Any, *, resume_generation: bool = True) -> None:
         if self._weight_update_ctrl is None or self.rollout is None:
             raise RuntimeError(
                 "connect_engine() must be called before update_weights()"
             )
         self.rollout.pause_generation()
-        assert meta.version is not None and meta.version > 0, (
-            f"meta.version must be a positive integer, got {meta.version}"
-        )
+        if resume_generation:
+            assert meta.version is not None and meta.version > 0, (
+                f"meta.version must be a positive integer, got {meta.version}"
+            )
+        elif meta.version is None or meta.version < 0:
+            raise ValueError("meta.version must be a non-negative integer")
         result = self._weight_update_ctrl.update_weights(version=meta.version)
         # Publish the version before resuming generation. Requests unblocked by
         # continue_generation() are served by the new weights, so they must be
@@ -1175,9 +1237,18 @@ class GatewayTrainController:
         # the version broadcast is recorded as pre-update policy and downstream
         # importance ratios pick the wrong behavior policy for it.
         try:
+            if not resume_generation and (
+                result.status != "ok" or result.version != meta.version
+            ):
+                raise RuntimeError(
+                    f"Weight publication failed for version {meta.version}: {result.error}"
+                )
             self.rollout.set_version(meta.version)
+            if not resume_generation:
+                self.rollout.verify_proxy_versions(meta.version)
         finally:
-            self.rollout.continue_generation()
+            if resume_generation:
+                self.rollout.continue_generation()
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",
             meta.version,
@@ -1317,7 +1388,21 @@ class GatewayTrainController:
             except Exception:
                 logger.error("Failed to unregister model: %s", traceback.format_exc())
 
+        if self._weight_update_ctrl is not None:
+            try:
+                self._weight_update_ctrl.destroy()
+            except Exception:
+                logger.error("Failed to destroy weight-update gateway", exc_info=True)
+            self._weight_update_ctrl = None
+            self._weight_update_connected = False
         self._graceful_shutdown_workers()
+        try:
+            self._release_weight_update_port()
+        except Exception:
+            logger.warning(
+                "Failed to release weight-update rendezvous port", exc_info=True
+            )
+        self._weight_update_meta = None
 
         for guard_addr, role, worker_index in reversed(self._forked_services):
             try:

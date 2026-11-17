@@ -33,6 +33,7 @@ from areal.infra.utils.http import async_http_retry, create_httpx_client
 from areal.infra.workflow_executor import validate_rollout_group_sizes
 
 if TYPE_CHECKING:
+    from areal.api.alloc_mode import ModelAllocation
     from areal.api.scheduler_api import Scheduler, Worker
 
 from areal.api.cli_args import InferenceEngineConfig
@@ -1401,6 +1402,26 @@ class RolloutControllerV2:
             self._data_proxy_addrs, "/set_version", {"version": version}
         )
 
+    def verify_proxy_versions(self, version: int) -> None:
+        """Read every proxy's published version before releasing held requests."""
+        from areal.infra.utils.concurrent import run_async_task
+
+        self._ensure_initialized()
+
+        async def verify(addr: str) -> None:
+            client = await self._get_async_client()
+            response = await client.get(f"{addr}/health")
+            response.raise_for_status()
+            if response.json()["version"] != version:
+                raise RuntimeError(
+                    f"Data proxy {addr} has not published version {version}"
+                )
+
+        async def verify_all() -> None:
+            await asyncio.gather(*(verify(addr) for addr in self._data_proxy_addrs))
+
+        run_async_task(verify_all)
+
     def get_version(self) -> int:
         """Return the local version (compatible with VersionProvider protocol)."""
         with self._version_lock:
@@ -1736,6 +1757,131 @@ class RolloutControllerV2:
             await session.close()
 
     # -- Pause / Resume / Offload -------------------------------------------
+
+    def validate_reconfiguration(
+        self, backend: str, gpu_devices: list[int]
+    ) -> ModelAllocation:
+        """Resolve a target within the original locally allocated Guard pool."""
+        from areal.api.alloc_mode import ModelAllocation
+
+        self._ensure_initialized()
+        if not self._guard_gpu_devices or not self._model_server_args:
+            raise RuntimeError("Reconfiguration requires locally launched GPU servers")
+        alloc = ModelAllocation.from_str(backend)
+        if alloc.backend != "sglang" or self.rollout_alloc.backend != "sglang":
+            raise ValueError("Model server reconfiguration currently supports SGLang")
+        if any(
+            getattr(alloc.parallel, name) != getattr(self.rollout_alloc.parallel, name)
+            for name in ("cp_size", "ep_size", "etp_size")
+        ):
+            raise ValueError("Reconfiguration supports changing DP, TP and PP")
+        count = alloc.parallel.dp_size * alloc.parallel.tp_size * alloc.parallel.pp_size
+        pool = {
+            device for devices in self._guard_gpu_devices.values() for device in devices
+        }
+        if (
+            len(gpu_devices) != count
+            or any(type(device) is not int for device in gpu_devices)
+            or len(set(gpu_devices)) != count
+            or not set(gpu_devices).issubset(pool)
+        ):
+            raise ValueError(
+                "Target GPUs must match the layout and original Guard pool"
+            )
+        return alloc
+
+    def rebuild_model_servers(self, backend: str, gpu_devices: list[int]) -> None:
+        """Rebuild held model servers while preserving Guards, proxies and sessions.
+
+        The caller disconnects weight-transfer groups before this call and
+        publishes current Actor weights before continuing generation.
+        """
+        from areal.infra.utils.concurrent import run_async_task
+
+        alloc = self.validate_reconfiguration(backend, gpu_devices)
+        if not self._reconfiguration_prepared:
+            raise RuntimeError("Pause and collect generation before rebuilding servers")
+        run_async_task(self._async_rebuild_model_servers, alloc, list(gpu_devices))
+
+    async def _async_rebuild_model_servers(
+        self, alloc: ModelAllocation, gpu_devices: list[int]
+    ) -> None:
+        await self._async_release_model_servers()
+        await self._async_create_model_servers(alloc, gpu_devices)
+
+    async def _async_release_model_servers(self) -> None:
+        client = await self._get_async_client()
+        self._backend_bindings_ready = False
+        servers = [row for row in self._forked_services if row[1] == "inf-server"]
+        for guard, role, index in servers:
+            response = await client.post(
+                f"{guard}/kill_forked_worker",
+                json={"role": role, "worker_index": index},
+            )
+            if response.status_code != 404:
+                response.raise_for_status()
+            self._forked_services.remove((guard, role, index))
+
+    async def _async_create_model_servers(
+        self, alloc: ModelAllocation, gpu_devices: list[int]
+    ) -> None:
+        client = await self._get_async_client()
+        owners = {
+            device: worker
+            for worker in self.workers
+            for device in self._guard_gpu_devices[worker.id]
+        }
+        size = alloc.parallel.tp_size * alloc.parallel.pp_size
+        self._inference_workers = [
+            owners[gpu_devices[index]] for index in range(0, len(gpu_devices), size)
+        ]
+        self._inference_gpu_devices = {
+            worker.id: gpu_devices[index * size : (index + 1) * size]
+            for index, worker in enumerate(self._inference_workers)
+        }
+        self._inf_addrs.clear()
+        self._server_infos.clear()
+        args = deepcopy(self._model_server_args)
+        args.update(
+            tp_size=alloc.parallel.tp_size,
+            pp_size=alloc.parallel.pp_size,
+            base_gpu_id=0,
+            load_format="dummy",
+        )
+        await self._async_fork_inf_servers(
+            self.config,
+            alloc,
+            "sglang",
+            self._inference_workers,
+            alloc.parallel.dp_size,
+            1,
+            dict(self.config.scheduling_spec[0].env_vars),
+            args,
+        )
+        responses = await asyncio.gather(
+            *(
+                client.post(f"{addr}/pause_generation", json={})
+                for addr in self._inf_addrs
+            ),
+            return_exceptions=True,
+        )
+        for response in responses:
+            if isinstance(response, BaseException):
+                raise response
+            response.raise_for_status()
+        await self._async_rebind_backends(
+            {
+                proxy: self._inf_addrs[index % len(self._inf_addrs)]
+                for index, proxy in enumerate(self._data_proxy_addrs)
+            }
+        )
+        self.rollout_alloc = alloc
+        self._nnodes_per_instance = 1
+        self.config.backend = str(alloc)
+        self.config.gpu_devices = gpu_devices
+        logger.info(
+            "Rebuilt rollout model servers as %s on GPUs %s", alloc, gpu_devices
+        )
 
     def pause(self) -> None:
         """Pause dispatcher + pause all workers."""
