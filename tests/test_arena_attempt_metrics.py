@@ -9,13 +9,19 @@ import httpx
 import pytest
 
 from examples.swe.arena_agent import ArenaStreamAgentWorkflow
-from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
+from examples.swe.arena_client import (
+    SELFCHECK_BUDGET_KEY,
+    SELFCHECK_CANDIDATE_CHANGED,
+    ArenaTaskFailedError,
+    ArenaTaskResult,
+)
 from tests.test_swe_arena_abbreviated_receipt import _error as _runner_failure_error
 from tests.test_swe_arena_multi_stream import (
     _core_model_failure_error,
     _core_tool_budget_failure_error,
 )
 
+from areal.infra.controller.rollout_controller import _merge_worker_stats
 from areal.utils.rollout_metrics import ConsumedMetrics, capture_metrics
 
 
@@ -44,6 +50,100 @@ async def run_agent(workflow, data_id="data-1"):
             api_key="session-key",
             arena_http_client=client,
         )
+
+
+def test_selfcheck_distribution_merges_consumed_final_reward_groups(workflow):
+    data = {"stream_id": "stream-1", "data_id": "data-1"}
+    prefix = f"rollout/stream/{workflow.default_stream_name}/selfcheck"
+
+    def record(
+        consumer,
+        score,
+        calls=None,
+        budget=None,
+        status="DONE",
+        episode_data=data,
+        changed=None,
+    ):
+        selfcheck = (
+            {} if calls is None else {"calls": calls, SELFCHECK_BUDGET_KEY: budget}
+        )
+        if changed is not None:
+            selfcheck[SELFCHECK_CANDIDATE_CHANGED] = float(changed)
+        workflow._task_result.set(
+            ArenaTaskResult(
+                task_id="task", status=status, score=score, selfcheck_metrics=selfcheck
+            )
+        )
+        with capture_metrics() as metrics:
+            workflow.record_episode_metrics(episode_data, reward=0.5)
+        episode = SimpleNamespace(trajectory={}, metrics=metrics)
+        if consumer is not None:
+            consumer.consume(episode)
+
+    left, right = ConsumedMetrics(), ConsumedMetrics()
+    record(left, 1.0, 0.0, 0.0)
+    record(left, 1.0, 1.0, 2.0)
+    record(left, 1.0)
+    record(left, 0.0, 2.0, 2.0)
+    record(right, 1.0, 4.0, 4.0)
+    record(right, 1.0, 1.0, 4.0)
+    record(right, 0.0)
+    record(right, 0.0, 4.0, 4.0)
+    record(right, 0.0, status="HARNESS_FAILED")
+    record(right, 0.75, 2.0, 4.0)
+    record(None, 1.0, 3.0, 4.0)
+
+    left_stats, right_stats = left.export(), right.export()
+    assert left_stats[f"{prefix}/reward_1/exact_calls_0/ratio"] == 0.5
+    stats = _merge_worker_stats([left_stats, right_stats])
+    with_local_stats = _merge_worker_stats([left_stats], consumed_stats=right_stats)
+    assert {
+        key: value
+        for key, value in with_local_stats.items()
+        if key.startswith(prefix) and not key.endswith("__count")
+    } == {key: value for key, value in stats.items() if key.startswith(prefix)}
+    assert stats[f"{prefix}/unknown_calls_count"] == 2
+    assert stats[f"{prefix}/reward_0/trajectory_count"] == 2
+    assert stats[f"{prefix}/reward_0/mean_calls"] == 3.0
+    assert stats[f"{prefix}/reward_0/exact_calls_4/ratio"] == 0.5
+    assert stats[f"{prefix}/reward_1/trajectory_count"] == 4
+    assert stats[f"{prefix}/reward_1/mean_calls"] == 1.5
+    for count, expected in enumerate((1, 2, 0, 0, 1)):
+        bucket = f"{prefix}/reward_1/exact_calls_{count}"
+        assert stats[f"{bucket}/count"] == expected
+        assert stats[f"{bucket}/ratio"] == expected / 4
+    assert left.export() == right.export() == {}
+
+    second_stream = "second"
+    workflow.stream_configs[second_stream] = replace(
+        workflow.stream_configs[workflow.default_stream_name],
+        name=second_stream,
+        stream_id="stream-2",
+    )
+    second = {**data, "stream_id": "stream-2", "arena_stream_name": second_stream}
+    record(left, 1.0, 0.0, 2.0)
+    record(right, 1.0, 3.0, 4.0, episode_data=second, changed=False)
+    record(right, 1.0, 3.0, 4.0, episode_data=second)
+    record(left, 0.0, 1.0, 2.0, changed=True)
+    record(right, 0.0, episode_data=second)
+    merged = _merge_worker_stats([left.export()], consumed_stats=right.export())
+    global_prefix = "rollout/selfcheck"
+    assert merged[f"{global_prefix}/reward_1/trajectory_count"] == 3
+    assert merged[f"{global_prefix}/reward_1/mean_calls"] == 2.0
+    assert merged[f"{global_prefix}/reward_1/exact_calls_0/count"] == 1
+    assert merged[f"{global_prefix}/reward_1/exact_calls_0/ratio"] == pytest.approx(
+        1 / 3
+    )
+    assert merged[f"{global_prefix}/reward_1/exact_calls_3/count"] == 2
+    assert merged[f"{global_prefix}/reward_1/exact_calls_4/count"] == 0
+    assert merged[f"{global_prefix}/unknown_calls_count"] == 1
+    assert merged[f"{global_prefix}/final_candidate/changed_count"] == 1
+    assert merged[f"{prefix}/final_candidate/changed_count"] == 1
+    assert merged["rollout/stream/second/selfcheck/final_candidate/changed_count"] == 0
+    assert not any(key.endswith("/final_candidate/comparable_count") for key in merged)
+    assert merged[f"{prefix}/reward_1/trajectory_count"] == 1
+    assert merged["rollout/stream/second/selfcheck/reward_1/trajectory_count"] == 2
 
 
 @pytest.mark.asyncio

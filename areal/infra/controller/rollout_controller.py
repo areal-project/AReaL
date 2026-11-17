@@ -49,7 +49,7 @@ from areal.utils.data import cycle_dataloader
 from areal.utils.dynamic_import import bind_filter_kwargs, import_from_string
 from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
-from areal.utils.rollout_metrics import ConsumedMetrics
+from areal.utils.rollout_metrics import ConsumedMetrics, merge_rollout_counters
 
 from ..staleness_manager import StalenessManager
 from ..workflow_executor import (
@@ -68,6 +68,8 @@ logger = logging.getLogger("RolloutController")
 
 def _merge_worker_stats(
     all_raw_stats: list[dict[str, float]],
+    *,
+    consumed_stats: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Merge independently aggregated stats from rollout workers.
 
@@ -84,7 +86,10 @@ def _merge_worker_stats(
     distribution_mins: dict[str, float] = {}
     distribution_maxes: dict[str, float] = {}
 
-    for raw_stats in all_raw_stats:
+    stats_to_merge = (
+        [*all_raw_stats, consumed_stats] if consumed_stats else all_raw_stats
+    )
+    for raw_stats in stats_to_merge:
         for key, value in raw_stats.items():
             if key.endswith("__count"):
                 continue
@@ -143,6 +148,7 @@ def _merge_worker_stats(
             merged[key] = weighted_sum / distribution_counts[key]
     merged.update(distribution_mins)
     merged.update(distribution_maxes)
+    merged.update(merge_rollout_counters(all_raw_stats, consumed_stats))
     return merged
 
 
@@ -1748,11 +1754,9 @@ class RolloutController:
             all_raw_stats += self._proxy_collective_rpc(
                 method="export_stats", http_timeout=60.0
             )
-        consumed = self.consumed_metrics.export()
-        merged = _merge_worker_stats([*all_raw_stats, consumed])
-        # Expose batch-aligned denominators and counters, including stream scopes.
-        merged.update({k: v for k, v in consumed.items() if k.endswith("_count")})
-        return merged
+        return _merge_worker_stats(
+            all_raw_stats, consumed_stats=self.consumed_metrics.export()
+        )
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
         async def _call():

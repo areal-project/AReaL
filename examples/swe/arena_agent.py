@@ -23,6 +23,8 @@ from urllib.parse import urlparse
 import httpx
 
 from examples.swe.arena_client import (
+    SELFCHECK_BUDGET_KEY,
+    SELFCHECK_CANDIDATE_CHANGED,
     ArenaAPIError,
     ArenaOpenAPIClient,
     ArenaTaskFailedError,
@@ -1671,12 +1673,34 @@ class ArenaStreamAgentWorkflow:
                 }
             )
         if result is not None:
-            metrics.update(
-                {
-                    f"stream/{stream_config.name}/selfcheck/{key}": value
-                    for key, value in result.selfcheck_metrics.items()
-                }
-            )
+            selfcheck = result.selfcheck_metrics
+            is_rollout = workflow_context.stat_scope() == "rollout"
+            observations = {
+                key: value
+                for key, value in selfcheck.items()
+                if key != SELFCHECK_BUDGET_KEY
+                and (is_rollout or key != SELFCHECK_CANDIDATE_CHANGED)
+            }
+            if (
+                is_rollout
+                and result.status in {"OK", "DONE"}
+                and result.score in (0.0, 1.0)
+            ):
+                calls = selfcheck.get("calls")
+                max_calls = selfcheck.get(SELFCHECK_BUDGET_KEY)
+                known = calls is not None and max_calls is not None
+                observations["unknown_calls"] = float(not known)
+                if known:
+                    reward_group = f"reward_{int(result.score)}"
+                    observations[f"{reward_group}/mean_calls"] = calls
+                    observations[SELFCHECK_BUDGET_KEY] = max_calls
+            prefixes = [f"stream/{stream_config.name}/selfcheck"]
+            if is_rollout:
+                prefixes.append("selfcheck")
+            for prefix in prefixes:
+                metrics.update(
+                    {f"{prefix}/{key}": value for key, value in observations.items()}
+                )
             reward_metrics = arena_reward_metrics(
                 sub_scores=result.sub_scores, raw=result.raw, score=result.score
             )
@@ -2278,10 +2302,11 @@ class ArenaStreamAgentWorkflow:
                 raise
             if task_result.artifacts_uri:
                 try:
-                    async with asyncio.timeout(min(self.request_timeout, 5.0)):
-                        checker_metrics = await self.client.get_selfcheck_metrics(
-                            task_result, client=client
-                        )
+                    checker_metrics = await self.client.get_selfcheck_metrics(
+                        task_result,
+                        client=client,
+                        timeout=min(self.request_timeout, 5.0),
+                    )
                     task_result = replace(
                         task_result, selfcheck_metrics=checker_metrics
                     )
