@@ -11,7 +11,7 @@ from areal.api.cli_args import GRPOConfig, load_expr_config
 from areal.reward import get_math_verify_worker
 from areal.utils.hf_utils import apply_chat_template, load_hf_tokenizer
 from areal.utils.perf_tracer import record_disposition
-from areal.utils.runtime_versions import tokenizer_identity
+from areal.utils.runtime_versions import math_verifier_identity, tokenizer_identity
 from areal.utils.stats_logger import StatsLogger
 
 
@@ -56,9 +56,16 @@ def boba_reward_fn(
     verified_solutions = 0
     try:
         worker = get_math_verify_worker()
+        record_disposition(
+            "outcome",
+            "verifier",
+            "identity",
+            unit="operation",
+            verifier=math_verifier_identity(worker, boba_reward_fn),
+        )
         for sol in solutions:
             try:
-                score = worker.verify(str(completions), str(sol))
+                score = worker.verify(str(completions), str(sol), raise_errors=True)
                 verified_solutions += 1
                 if score == 1.0:
                     record_disposition(

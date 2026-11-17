@@ -166,6 +166,15 @@ class AsyncRewardWrapper:
                     unit="attempt",
                 )
             try:
+                perf_tracer.record_disposition(
+                    "outcome",
+                    "reward",
+                    "started",
+                    operation_id=operation_id,
+                    attempt=attempt + 1,
+                    layer="reward_pool",
+                    unit="operation",
+                )
                 future = asyncio.get_running_loop().run_in_executor(
                     executor,
                     partial(_invoke_reward, self.reward_fn, args, kwargs),

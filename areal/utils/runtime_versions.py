@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import sys
+from dataclasses import asdict
 from functools import lru_cache
 from importlib import metadata
 from pathlib import Path
@@ -75,6 +76,53 @@ def _source_digest(origin: str, package: bool) -> str:
         with item.open("rb") as stream:
             digest.update(hashlib.file_digest(stream, "sha256").digest())
     return digest.hexdigest()
+
+
+def math_verifier_identity(worker, reward_fn) -> dict:
+    """Fingerprint the loaded BOBA verifier and its effective parameters."""
+    identity = {"implementations": {}, "modules": {}, "parameters": {}}
+    sources = {}
+    try:
+        identity["parameters"] = {
+            "precision": worker.precision,
+            "timeout": worker.timeout,
+            "gold_extraction_target": [
+                asdict(x) for x in worker.gold_extraction_target
+            ],
+            "pred_extraction_target": [
+                asdict(x) for x in worker.pred_extraction_target
+            ],
+        }
+        for label, implementation in (("reward", reward_fn), ("worker", type(worker))):
+            name = implementation.__module__
+            origin = str(Path(sys.modules[name].__file__).resolve())
+            sources[label] = origin
+            identity["implementations"][label] = {
+                "name": name + "." + implementation.__qualname__,
+                "source_sha256": _source_digest(origin, False),
+            }
+        for name, distribution in (
+            ("math_verify", "math-verify"),
+            ("latex2sympy2_extended", "latex2sympy2-extended"),
+            ("sympy", "sympy"),
+            ("antlr4", "antlr4-python3-runtime"),
+        ):
+            module = sys.modules.get(name)
+            if module is None or not getattr(module, "__file__", None):
+                raise ValueError(f"Verifier dependency is not loaded: {name}")
+            origin = str(Path(module.__file__).resolve())
+            sources[name] = origin
+            try:
+                installed = metadata.version(distribution)
+            except metadata.PackageNotFoundError:
+                installed = None
+            identity["modules"][name] = {
+                "distribution_version": installed,
+                "source_sha256": _source_digest(origin, True),
+            }
+    except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
+        return {"identity": identity, "sources": sources, "error": str(error)}
+    return {"sha256": _digest(identity), "identity": identity, "sources": sources}
 
 
 def record_runtime_versions(role: str, **identity) -> None:

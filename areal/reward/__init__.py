@@ -72,7 +72,10 @@ class MathVerifyWorker:
         )
         return 1.0 if result else 0.0
 
-    def verify(self, response: str, ground_truth: str) -> float:
+    def verify(
+        self, response: str, ground_truth: str, *, raise_errors: bool = False
+    ) -> float:
+        """Verify a response, optionally forwarding errors to its reward caller."""
         try:
             if self.timeout is None:
                 return self._verify_impl(response, ground_truth)
@@ -84,12 +87,16 @@ class MathVerifyWorker:
                 f"Timeout ({self.timeout}s) in MathVerifyWorker.verify for "
                 f"response={response!r} and ground_truth={ground_truth!r}",
             )
+            if raise_errors:
+                raise
             return 0.0
         except Exception:
             logger.warning(
                 f"Exception in MathVerifyWorker.verify for response={response} and ground_truth={ground_truth}",
                 exc_info=True,
             )
+            if raise_errors:
+                raise
             return 0.0
 
 
