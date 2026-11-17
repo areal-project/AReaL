@@ -101,7 +101,10 @@ class SerializedTensor(BaseModel):
             storage_tensor = cpu_tensor.to(torch.float32)
 
         # Convert to bytes and encode as base64
-        buffer = storage_tensor.numpy().tobytes()
+        # Encode the contiguous storage directly. Materializing .tobytes() would
+        # retain another full image tensor alongside the Base64 bytes/string.
+        # ravel also handles scalar, empty and non-contiguous tensor inputs.
+        buffer = memoryview(np.ascontiguousarray(storage_tensor.numpy()).ravel())
         data_b64 = base64.b64encode(buffer).decode("utf-8")
 
         return cls(
@@ -203,7 +206,7 @@ class SerializedNDArray(BaseModel):
             raise ValueError(msg)
 
         contiguous = np.ascontiguousarray(array)
-        buffer = contiguous.tobytes()
+        buffer = memoryview(contiguous.ravel())
         data_b64 = base64.b64encode(buffer).decode("utf-8")
         return cls(data=data_b64, shape=list(array.shape), dtype=array.dtype.str)
 

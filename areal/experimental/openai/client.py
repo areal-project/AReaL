@@ -209,8 +209,8 @@ def _process_multimodal_prompt(
     from transformers.image_utils import load_image
 
     image_kwargs = sglang_qwen_image_kwargs(processor) if align_sglang_images else None
-    images = []
-    for encoded_image in image_data:
+
+    def decode_image(encoded_image: str):
         match = _DATA_URI_RE.match(encoded_image)
         payload = match.group(1) if match else encoded_image
         if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", payload):
@@ -225,7 +225,7 @@ def _process_multimodal_prompt(
             with Image.open(BytesIO(image_bytes)) as image:
                 # Match SGLang's PIL branch, including retaining raw EXIF
                 # orientation. HF load_image would transpose EXIF here.
-                images.append(
+                return (
                     image.convert("RGB")
                     if image_kwargs is not None
                     else load_image(image)
@@ -236,12 +236,20 @@ def _process_multimodal_prompt(
             ) from exc
 
     wire_image_data = None
-    if align_sglang_images:
+    if image_kwargs is not None:
+        # Decode full-resolution history only on misses in the per-image cache.
         aligned_images = prepare_sglang_qwen_images(
-            processor, images, cache=processor_cache, image_keys=image_data
+            processor,
+            [lambda encoded=encoded: decode_image(encoded) for encoded in image_data],
+            cache=processor_cache,
+            image_keys=image_data,
         )
-        if aligned_images is not None:
+        if aligned_images is None:
+            images = [decode_image(encoded) for encoded in image_data]
+        else:
             images, wire_image_data = aligned_images
+    else:
+        images = [decode_image(encoded) for encoded in image_data]
 
     prompt_text = apply_chat_template(
         tokenizer,
