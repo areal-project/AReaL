@@ -1395,6 +1395,9 @@ class RemoteInfEngine(InferenceEngine):
                 operation_id=generation_id,
                 segment_index=segment_index,
                 output_start=len(accumulated_output_tokens),
+                input_tokens=len(req.input_ids),
+                output_limit=req.gconfig.max_new_tokens,
+                total_limit=req.gconfig.max_tokens,
                 **last_send,
             )
             return (
