@@ -181,6 +181,7 @@ cuda = [
 ]
 sandbox = [
     "daytona>=0.167.0,<1",
+    "opensandbox>=1.0",
 ]
 cli = [
     "click>=8.1",

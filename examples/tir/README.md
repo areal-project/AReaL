@@ -199,6 +199,7 @@ examples/tir/
 │   ├── base.py                 # Tool base class
 │   ├── python_tool.py          # Python executor
 │   ├── daytona_python_tool.py  # Daytona cloud sandbox executor
+│   ├── opensandbox_python_tool.py  # OpenSandbox cloud sandbox executor
 │   └── calculator_tool.py      # Calculator
 ├── data/                       # Data files
 │   └── sample_math.jsonl       # Sample data
@@ -228,6 +229,31 @@ Notes:
 - The stock `ToolRegistry` uses Daytona's default sandbox settings. If you want to pin a
   snapshot or custom image, update the `daytona_python` factory in
   `examples/tir/tool_manager.py`.
+
+## Cloud sandbox backend (OpenSandbox)
+
+Install the optional OpenSandbox backend and point it at your endpoint:
+
+```bash
+uv sync --extra sandbox
+export OPEN_SANDBOX_DOMAIN=...
+export OPEN_SANDBOX_API_KEY=...   # omit when the endpoint needs no key
+```
+
+Then switch the TIR config to the OpenSandbox-backed tool:
+
+```yaml
+tir:
+  enable_tools: "opensandbox_python"
+```
+
+Notes:
+
+- `opensandbox_python` keeps Python state across tool calls within one trajectory.
+- Sandboxes carry a server-side TTL (one hour by default), so a failed run or killed
+  training process does not leak sandboxes against the endpoint's concurrency budget.
+- The stock `ToolRegistry` uses the SDK's default sandbox settings. To pin an image or
+  snapshot, update the `opensandbox_python` factory in `examples/tir/tool_manager.py`.
 
 ## Data engineering recipe
 
