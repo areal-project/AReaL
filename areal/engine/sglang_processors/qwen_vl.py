@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Preserve text-domain visual IDs using explicit real-image offsets."""
 
-from dataclasses import replace
+from copy import copy
 
 import torch
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
@@ -35,7 +35,9 @@ class AReaLQwenImageProcessor(QwenVLImageProcessor):
             native = await super().process_mm_data_async(
                 image_data, input_text, request_obj, *args, **kwargs
             )
-            return replace(native, mm_items=compact_mm_item_storage(native.mm_items))
+            result = copy(native)
+            result.mm_items = compact_mm_item_storage(native.mm_items)
+            return result
         if (
             not isinstance(input_text, list)
             or request_obj.video_data
@@ -66,14 +68,12 @@ class AReaLQwenImageProcessor(QwenVLImageProcessor):
             raise ValueError("Processed image count does not match real-image spans")
         # Keep offsets request-local: native features/grid may be cached.
         # Compact CPU views below while preserving native hashes and CUDA IPC.
-        items = [
-            replace(
-                item,
-                offsets=[tuple(span)],
-                model_specific_data=dict(item.model_specific_data),
-            )
-            for item, span in zip(native.mm_items, spans, strict=True)
-        ]
+        items = []
+        for item, span in zip(native.mm_items, spans, strict=True):
+            request_item = copy(item)
+            request_item.offsets = [tuple(span)]
+            request_item.model_specific_data = dict(item.model_specific_data)
+            items.append(request_item)
         items = compact_mm_item_storage(items)
         rope = self._compute_image_only_mrope_positions_from_offsets(
             input_len=len(input_text),
@@ -84,13 +84,12 @@ class AReaLQwenImageProcessor(QwenVLImageProcessor):
         if rope is None:
             raise ValueError("Real-image spans do not match processed image grids")
         positions, delta = rope
-        return replace(
-            native,
-            input_ids=list(input_text),
-            mm_items=items,
-            padded_input_ids=MultimodalProcessorOutput.build_padded_input_ids(
-                input_text, items
-            ),
-            mrope_positions=positions.squeeze(1),
-            mrope_position_delta=delta,
+        result = copy(native)
+        result.input_ids = list(input_text)
+        result.mm_items = items
+        result.padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
+            input_text, items
         )
+        result.mrope_positions = positions.squeeze(1)
+        result.mrope_position_delta = delta
+        return result
