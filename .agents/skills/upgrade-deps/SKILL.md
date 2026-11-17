@@ -70,7 +70,7 @@ plus `torch` (tracked for Docker impact only, not API-audited) are listed.
 | `mbridge`         | shared           | `[optional-deps].megatron` (git pin)                           | `[optional-deps].megatron` (git pin)                           | No            |
 | `transformers`    | shared           | `[project].dependencies`                                       | `[project].dependencies`                                       | No            |
 | `peft`            | shared           | `[project].dependencies`                                       | `[project].dependencies`                                       | No            |
-| `torch`           | shared-divergent | `[project].dependencies` (≥2.9.1)                              | `[project].dependencies` (≥2.10.0)                             | Stage 1 torch |
+| `torch`           | shared-divergent | `[project].dependencies` (≥2.9.1)                              | `[project].dependencies` (≥2.14.0)                             | Stage 1 torch |
 | `torchao`         | shared-divergent | `[tool.uv].override-dependencies` (==0.15.0)                   | `[project].dependencies` (==0.16.0)                            | No            |
 
 **Scope rules:**
@@ -314,16 +314,20 @@ pyproject files — they are never installed together in the same environment.
 Review the Package Impact Matrix "Docker impact" column. Only proceed with Dockerfile
 changes if an upgraded package has Docker impact. The most common triggers are:
 
-**Base image change** (triggered by `sglang` upgrade):
+**Base image change** (triggered by `sglang` upgrade, or a CUDA major change in either
+variant's torch):
 
-The Dockerfile base image is `lmsysorg/sglang:v{SGLANG_VERSION}-cu129-amd64-runtime`. If
-`sglang` was upgraded, update line 9 of the `Dockerfile`:
+The Dockerfile selects a base image per variant. Both use the same SGLang release; the
+vLLM variant uses its CUDA 13 build because vLLM >= 0.32 and torch `+cu130` need CUDA 13
+to run and to compile the C++ extensions:
 
 ```dockerfile
-FROM lmsysorg/sglang:v{NEW_SGLANG_VERSION}-cu129-amd64-runtime
+FROM lmsysorg/sglang:v{SGLANG_VERSION}-runtime AS base-sglang
+FROM lmsysorg/sglang:v{SGLANG_VERSION}-cu130-runtime AS base-vllm
 ```
 
-Verify that the new base image tag exists on Docker Hub / GHCR before committing.
+If `sglang` was upgraded, update both tags. Verify that the new base image tags exist on
+Docker Hub / GHCR before committing.
 
 **Torch version change** (triggered by `torch` upgrade):
 
@@ -331,23 +335,27 @@ The Dockerfile Stage 1 installs torch with variant-specific versions. Update the
 mapping in the `RUN uv venv` command:
 
 ```dockerfile
-&& if [ "$VARIANT" = "vllm" ]; then TORCH_VER="{VLLM_TORCH}"; else TORCH_VER="{SGLANG_TORCH}"; fi \
+&& if [ "$VARIANT" = "vllm" ]; then TORCH_VER="{VLLM_TORCH}"; CU="{VLLM_CU}"; else TORCH_VER="{SGLANG_TORCH}"; CU="{SGLANG_CU}"; fi \
 ```
 
+If the CUDA major changes (e.g. `cu129` -> `cu130`), also update the variant's base
+image (see above) and `TMS_CUDA_MAJOR` in the torch_memory_saver install.
+
 Also check flash-attn wheel compatibility — **both** flash-attn-2 and flash-attn-3
-installs use a `TORCH_TAG` that must match the torch major.minor version. Update both
-occurrences in the Dockerfile:
+installs pick a prebuilt wheel from
+[mjun0812/flash-attention-prebuild-wheels](https://github.com/mjun0812/flash-attention-prebuild-wheels/releases)
+by release, CUDA tag and torch major.minor. Update both blocks and confirm the wheel URL
+exists for each variant:
 
 ```dockerfile
-# flash-attn-2 (first flash-attn RUN block)
-&& if [ "$VARIANT" = "vllm" ]; then TORCH_TAG="torch{VLLM_TORCH_MAJOR_MINOR}"; else TORCH_TAG="torch{SGLANG_TORCH_MAJOR_MINOR}"; fi \
-
-# flash-attn-3 (second flash-attn RUN block — same TORCH_TAG pattern)
-&& if [ "$VARIANT" = "vllm" ]; then TORCH_TAG="torch{VLLM_TORCH_MAJOR_MINOR}"; else TORCH_TAG="torch{SGLANG_TORCH_MAJOR_MINOR}"; fi \
+# flash-attn-2 (first flash-attn RUN block); flash-attn-3 uses the same pattern
+&& if [ "$VARIANT" = "vllm" ]; then FA_RELEASE="{RELEASE}"; CU_TAG="{CU}"; TORCH_TAG="torch{VLLM_TORCH_MAJOR_MINOR}"; \
+   else FA_RELEASE="{RELEASE}"; CU_TAG="{CU}"; TORCH_TAG="torch{SGLANG_TORCH_MAJOR_MINOR}"; fi \
 ```
 
 **No Dockerfile changes needed** for: `megatron-core`, `megatron-bridge`,
-`transformers`, `peft`, `vllm`, `torchao`. These are installed via
+`transformers`, `peft`, `vllm`, `torchao` — unless the upgrade also moves torch (a
+`vllm` upgrade usually does; vLLM pins an exact torch). These are installed via
 `uv pip install -r pyproject.toml` in Stage 3, which reads the updated pyproject
 automatically.
 
@@ -542,7 +550,7 @@ ______________________________________________________________________
 | `megatron-core`   | `checklists/megatron-core.md`   | ✅ 23 API entries (parallel_state, DDP, optimizer, pipeline, checkpointing/async internals, transformer config, FP8, GPT/MTP, tensor_parallel, custom attention, layer specs, RoPE) |
 | `megatron-bridge` | `checklists/megatron-bridge.md` | ✅ 9 API entries (AutoBridge, LoRA, save/load HF, Qwen3-VL patch target, AutoMapping, monkey-patch guard)                                                                           |
 | `mbridge`         | `checklists/mbridge.md`         | ✅ 14 API entries (AutoBridge, Bridge properties, weight mappings, LLMBridge subclassing, register_model, monkey-patch target)                                                      |
-| `vllm`            | `checklists/vllm.md`            | ✅ 14 API entries (entrypoints, LoRA manager, worker V0/V1, tool parsers, CLI)                                                                                                      |
+| `vllm`            | `checklists/vllm.md`            | ✅ 16 API entries (entrypoints, LoRA manager, worker V0/V1, tool parsers, CLI, pause_generation, logprob sentinel)                                                                  |
 | `sglang`          | `checklists/sglang.md`          | ✅ 14 API entries (HTTP endpoints, tool/reasoning parsers, CLI flags, version guards)                                                                                               |
 | `transformers`    | `checklists/transformers.md`    | ✅ 12 API entries (Auto\* classes, tokenizer, flash attention monkey-patches, Qwen VL internals, LR schedulers)                                                                     |
 | `peft`            | `checklists/peft.md`            | ✅ 4 API entries (LoraConfig, TaskType, get_peft_model, weight key format)                                                                                                          |

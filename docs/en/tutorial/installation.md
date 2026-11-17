@@ -19,8 +19,8 @@ The following hardware configuration has been extensively tested:
 | Component                |                                                                                                Version                                                                                                 |
 | ------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------: |
 | Operating System         |                                                                  CentOS 7 / Ubuntu 22.04 or any system meeting the requirements below                                                                  |
-| NVIDIA Driver            |                                                                                               550.127.08                                                                                               |
-| CUDA                     |                                                                                                  12.8                                                                                                  |
+| NVIDIA Driver            |                                                                               550.127.08 (SGLang); ≥ 580 (vLLM, CUDA 13)                                                                               |
+| CUDA                     |                                                                                       12.8 (SGLang); 13.0 (vLLM)                                                                                       |
 | Git LFS                  | Required for downloading models, datasets, and AReaL code. See [installation guide](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage) |
 | Docker                   |                                                                                                 27.5.1                                                                                                 |
 | NVIDIA Container Toolkit |                                         See [installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)                                          |
@@ -103,13 +103,15 @@ virtual environment.
 
 This installs CUDA-dependent training packages (Megatron, Torch Memory Saver) plus
 **SGLang** as the default inference backend. These packages require Linux x86_64 with
-CUDA 12.x and compatible NVIDIA drivers.
+CUDA 12.x and compatible NVIDIA drivers. The vLLM variant below uses CUDA 13 and needs
+NVIDIA driver **580 or newer**.
 
 #### Using vLLM Instead of SGLang
 
 SGLang and vLLM pin mutually-incompatible `torch` / `torchao` versions, so they live in
 separate pyproject files. The default `pyproject.toml` uses SGLang; for vLLM, use
-`pyproject.vllm.toml`:
+`pyproject.vllm.toml`. It installs vLLM 0.33 with torch 2.14 built for CUDA 13
+(`+cu130`), so the host needs NVIDIA driver 580 or newer:
 
 ```bash
 cp pyproject.vllm.toml pyproject.toml
@@ -130,9 +132,9 @@ distributions that require CUDA compilation (~30 min). To skip compilation, inst
 **pre-built wheel** before running `uv sync`.
 
 Flash Attention wheels are linked against a specific PyTorch version at compile time.
-SGLang (the default `pyproject.toml`) uses **torch 2.9** and vLLM
-(`pyproject.vllm.toml`) uses **torch 2.10**, so you must pick the matching wheel.
-Replace `cpXYZ` with your Python version (`cp311` for 3.11, `cp312` for 3.12).
+SGLang (the default `pyproject.toml`) uses **torch 2.9** (CUDA 12) and vLLM
+(`pyproject.vllm.toml`) uses **torch 2.14** (CUDA 13), so you must pick the matching
+wheel. Replace `cpXYZ` with your Python version (`cp311` for 3.11, `cp312` for 3.12).
 
 **SGLang** (default, torch 2.9):
 
@@ -145,15 +147,15 @@ uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/rele
 uv sync --extra cuda
 ```
 
-**vLLM** (torch 2.10, requires `pyproject.vllm.toml`):
+**vLLM** (torch 2.14, CUDA 13, requires `pyproject.vllm.toml`):
 
 ```bash
 cp pyproject.vllm.toml pyproject.toml
 cp uv.vllm.lock uv.lock
 # Python 3.12
-uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.10-cp312-cp312-linux_x86_64.whl"
+uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.10.0/flash_attn-2.8.3+cu130torch2.14-cp312-cp312-linux_x86_64.whl"
 # Python 3.11
-# uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.10-cp311-cp311-linux_x86_64.whl"
+# uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.10.0/flash_attn-2.8.3+cu130torch2.14-cp311-cp311-linux_x86_64.whl"
 
 uv sync --extra cuda
 ```

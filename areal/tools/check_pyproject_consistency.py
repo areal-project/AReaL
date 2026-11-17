@@ -264,18 +264,10 @@ class _Checker:
             elif pkg not in sources_b:
                 self._err(f"tool.uv.sources: {pkg!r} missing in {self.file_b}")
             elif _is_escapable(pkg):
-                # Just verify index names match (extra names may differ).
-                idx_a = sorted(
-                    {e.get("index", "") for e in sources_a[pkg] if isinstance(e, dict)}
-                )
-                idx_b = sorted(
-                    {e.get("index", "") for e in sources_b[pkg] if isinstance(e, dict)}
-                )
-                if idx_a != idx_b:
-                    self._err(
-                        f"tool.uv.sources.{pkg}: index names differ — "
-                        f"{self.file_a}={idx_a}, {self.file_b}={idx_b}"
-                    )
+                # Escapable packages (torch & co.) may come from different
+                # indexes, e.g. pytorch-cu129 vs pytorch-cu130, because each
+                # backend pins its own CUDA build. Extra names may differ too.
+                continue
             elif sources_a[pkg] != sources_b[pkg]:
                 self._err(
                     f"tool.uv.sources.{pkg}: differs (non-escapable)\n"
@@ -283,12 +275,44 @@ class _Checker:
                     f"  {self.file_b}: {sources_b[pkg]}"
                 )
 
+    # ── [[tool.uv.index]] ──────────────────────────────────────────────
+
+    @staticmethod
+    def _escapable_only_indexes(sources: dict[str, Any]) -> set[str]:
+        """Index names referenced only by escapable packages' sources."""
+        escapable, shared = set(), set()
+        for pkg, entries in sources.items():
+            entries = entries if isinstance(entries, list) else [entries]
+            names = {
+                e["index"] for e in entries if isinstance(e, dict) and "index" in e
+            }
+            (escapable if _is_escapable(pkg) else shared).update(names)
+        return escapable - shared
+
+    def check_uv_index(
+        self,
+        index_a: list[dict],
+        index_b: list[dict],
+        sources_a: dict[str, Any],
+        sources_b: dict[str, Any],
+    ) -> None:
+        # Indexes used only by escapable packages are backend-specific; all
+        # other indexes must match exactly.
+        skip_a = self._escapable_only_indexes(sources_a)
+        skip_b = self._escapable_only_indexes(sources_b)
+        self._cmp_values(
+            "tool.uv.index",
+            [e for e in index_a if e.get("name") not in skip_a],
+            [e for e in index_b if e.get("name") not in skip_b],
+        )
+
     # ── [tool.uv] (top-level) ──────────────────────────────────────────
 
     def check_tool_uv(self, uv_a: dict, uv_b: dict) -> None:
         special_keys = {
             "override-dependencies",
             "sources",
+            "index",
             "conflicts",
             "dependency-metadata",
         }
@@ -298,6 +322,12 @@ class _Checker:
             uv_b.get("override-dependencies", []),
         )
         self.check_uv_sources(
+            uv_a.get("sources", {}),
+            uv_b.get("sources", {}),
+        )
+        self.check_uv_index(
+            uv_a.get("index", []),
+            uv_b.get("index", []),
             uv_a.get("sources", {}),
             uv_b.get("sources", {}),
         )
