@@ -361,6 +361,11 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             self._record_group_stats(usable_slot_count, trainable=False)
             return None
 
+        query_id = data.get("query_id")
+        query_id = str(query_id) if type(query_id) in (str, int) else None
+        query_id = query_id or None
+        sample_indices = [i for i, result in enumerate(results) if result is not None]
+
         # Check if results are InteractionWithTokenLogpReward dicts
         first = valid_results[0]
         if (
@@ -390,21 +395,21 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                     )
                 for interaction in result.values():
                     interaction.rollout_index = index
+                    interaction.rollout_query_id = query_id
+                    interaction.rollout_sample_index = (
+                        sample_indices[index] if query_id is not None else None
+                    )
                 merged.update(result)
             self._record_group_stats(usable_slot_count, trainable=bool(merged))
             return merged if merged else None
 
         # Otherwise, tensor dicts - concatenate
-        query_id = data.get("query_id")
-        query_id = str(query_id) if type(query_id) in (str, int) else None
         try:
             group = RolloutGroup(
                 tuple(get_batch_size(result) for result in valid_results),
                 tuple(result.get("rollout_reward") for result in valid_results),
-                query_id=query_id or None,
-                sample_indices=tuple(
-                    index for index, result in enumerate(results) if result is not None
-                ),
+                query_id=query_id,
+                sample_indices=tuple(sample_indices),
             )
         except (TypeError, ValueError) as exc:
             raise WorkflowContractError(str(exc)) from exc

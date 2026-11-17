@@ -74,6 +74,10 @@ class InteractionWithTokenLogpReward:
     # Per-interaction dump metadata, kept separate from training tensors.
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    # Frozen-task identity supplied by grouped workflows when a query ID exists.
+    rollout_query_id: str | None = None
+    rollout_sample_index: int | None = None
+
     @property
     def has_tensor_data(self) -> bool:
         return self.model_response is not None or self._cache is not None
@@ -381,18 +385,36 @@ def concat_tensor_interactions(
     counts: list[int] = []
     rewards: list[float | None] = []
     members: dict[int, list[InteractionWithTokenLogpReward]] = {}
+    query_ids = {v.rollout_query_id for v in interactions.values()}
+    if len(query_ids) > 1:
+        raise ValueError("Interactions in one group must share rollout_query_id")
+    sample_indices: list[int] = []
     for interaction in interactions.values():
         index = (
             interaction.rollout_index if interaction.rollout_index is not None else 0
         )
         members.setdefault(index, []).append(interaction)
-    for member in members.values():
+    for index, member in enumerate(members.values()):
+        indices = {v.rollout_sample_index for v in member}
+        if len(indices) != 1 or any(
+            v.rollout_sample_index is not None
+            and type(v.rollout_sample_index) is not int
+            for v in member
+        ):
+            raise ValueError("Interactions in one rollout must share a sample index")
+        sample_index = next(iter(indices))
+        sample_indices.append(index if sample_index is None else sample_index)
         tensors = [v.to_tensor_dict() for v in member]
         batches.extend(tensors)
         counts.append(sum(get_batch_size(t) for t in tensors))
         rewards.append(_interaction_rollout_reward(member))
     result = concat_padded_tensors(batches)
-    result["rollout_group"] = RolloutGroup(tuple(counts), tuple(rewards))
+    result["rollout_group"] = RolloutGroup(
+        tuple(counts),
+        tuple(rewards),
+        query_id=next(iter(query_ids), None),
+        sample_indices=tuple(sample_indices),
+    )
     return result
 
 

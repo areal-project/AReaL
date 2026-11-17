@@ -1,6 +1,8 @@
 """Train Pixel visual-tool reasoning with GRPO and AReaL's PPOTrainer."""
 
+import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +11,7 @@ from datasets import Dataset
 
 from areal import PPOTrainer
 from areal.api.cli_args import GRPOConfig, load_expr_config
+from areal.utils.stats_logger import StatsLogger
 
 
 @dataclass
@@ -53,20 +56,16 @@ def load_manifest(path: str, data_root: str) -> Dataset:
                     raise ValueError(
                         f"Visual input must be an existing file under data_root: {name}"
                     )
-            rows.append(
-                dict(
-                    question=row["question"],
-                    image=row["image"],
-                    answer=answers,
-                    is_video=bool(row.get("is_video", False)),
-                )
-            )
+            item = {**row, "is_video": bool(row.get("is_video", False))}
+            identifier = row.get("qid", row.get("query_id"))
+            item["query_id"] = None if identifier is None else str(identifier)
+            rows.append(item)
     if not rows:
         raise ValueError(f"Empty Pixel manifest: {path}")
     return Dataset.from_list(rows)
 
 
-def main(args: list[str]):
+def _load_inputs(args: list[str], *, record_dataset=False):
     config, _ = load_expr_config(args, PixelReasonerConfig)
     if config.rollout.backend.split(":", 1)[0] != "sglang":
         raise ValueError("The Pixel training example requires the SGLang backend")
@@ -74,9 +73,67 @@ def main(args: list[str]):
         raise ValueError("The Qwen3.8-27B Pixel example requires the Megatron backend")
     if not config.data_root:
         raise ValueError("Set data_root to the shared image/frame bundle")
+    from examples.vlm.pixel_reasoner_workflow import validate_pixel_limits
 
-    train_dataset = load_manifest(config.train_dataset.path, config.data_root)
-    valid_dataset = load_manifest(config.valid_dataset.path, config.data_root)
+    validate_pixel_limits(
+        config.max_turns,
+        config.max_output_tokens,
+        config.original_max_pixels,
+        config.crop_max_pixels,
+    )
+
+    source = Path(config.train_dataset.path)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    train_dataset = load_manifest(str(source), config.data_root)
+    valid_dataset = (
+        load_manifest(config.valid_dataset.path, config.data_root)
+        if config.valid_dataset
+        else None
+    )
+    if (record_dataset or config.rollout.dump_to_file) and os.getenv(
+        "RANK", "0"
+    ) == "0":
+        from transformers import AutoProcessor
+
+        from examples.vlm.pixel_reasoner_workflow import pixel_environment
+
+        processor = AutoProcessor.from_pretrained(config.tokenizer_path)
+        environment = pixel_environment(processor, video=any(train_dataset["is_video"]))
+        if hashlib.sha256(source.read_bytes()).hexdigest() != source_hash:
+            raise ValueError("Pixel source changed while loading the dataset")
+        record = {
+            "source_path": str(source.resolve()),
+            "source_sha256": source_hash,
+            "sample_count": len(train_dataset),
+            "ordered_ids": [row.get("query_id") for row in train_dataset],
+            "data_root": str(Path(config.data_root).resolve()),
+            "media": [
+                {
+                    "query_id": row.get("query_id"),
+                    "image": row["image"],
+                    "is_video": row["is_video"],
+                }
+                for row in train_dataset
+            ],
+            "tokenizer": environment.get("identity", {}).get("tokenizer", {}),
+            "pixel_environment": environment,
+        }
+        path = (
+            Path(StatsLogger.get_log_path(config.stats_logger)) / "loaded-dataset.json"
+        )
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(record, indent=2) + "\n")
+        temporary.replace(path)
+    return config, train_dataset, valid_dataset
+
+
+def preflight(args: list[str]):
+    """Resolve Pixel inputs and CPU dependencies before creating RL workers."""
+    _load_inputs(args, record_dataset=True)
+
+
+def main(args: list[str]):
+    config, train_dataset, valid_dataset = _load_inputs(args)
     workflow_kwargs = dict(
         processor=config.tokenizer_path,
         gconfig=config.gconfig,

@@ -1,16 +1,24 @@
 """Multi-turn Pixel visual-tool episodes for RL training."""
 
 import asyncio
+import hashlib
+import inspect
 import itertools
 import json
 import math
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import unicodedata
 from copy import copy, deepcopy
+from functools import lru_cache
+from importlib import metadata
 from pathlib import Path
+from threading import get_ident
 from typing import Any
+from uuid import uuid4
 
 import torch
 from PIL import Image
@@ -26,11 +34,119 @@ from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCallCache
 from areal.utils import stats_tracker
 from areal.utils.image import image2base64
+from areal.utils.perf_tracer import (
+    disposition_context,
+    record_disposition,
+    session_context,
+)
 from areal.utils.qwen_vl_image import (
     prepare_sglang_qwen_images,
     sglang_qwen_image_kwargs,
 )
+from areal.utils.runtime_versions import (
+    _source_digest,
+    record_runtime_versions,
+    record_tokenizer,
+    tokenizer_identity,
+)
 from areal.utils.sglang_image import image_prompt_metadata
+
+
+@lru_cache(maxsize=1)
+def video_environment() -> dict:
+    """Describe the CPU video tools loaded in this process."""
+    try:
+        from sglang.srt.multimodal.processors import qwen_vl
+        from sglang.srt.utils import load_video
+
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise FileNotFoundError("ffmpeg is unavailable")
+        version = subprocess.run(
+            [ffmpeg, "-version"], capture_output=True, text=True, check=True
+        ).stdout.splitlines()[0]
+        with open(ffmpeg, "rb") as stream:
+            binary_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+        result = {
+            "status": "pass",
+            "ffmpeg": {
+                "path": ffmpeg,
+                "version": version,
+                "sha256": binary_sha256,
+            },
+            "video_preprocessor_sha256": _source_digest(qwen_vl.__file__, False),
+            "video_loader_sha256": _source_digest(inspect.getfile(load_video), False),
+        }
+    except (
+        OSError,
+        ImportError,
+        IndexError,
+        ValueError,
+        TypeError,
+        subprocess.SubprocessError,
+    ) as error:
+        result = {"status": "missing", "error": str(error)}
+    record_runtime_versions("pixel_video", pixel_video=result)
+    return result
+
+
+def pixel_environment(processor, *, video=False) -> dict:
+    """Fingerprint loaded processor parameters, templates and local tools."""
+    try:
+        components = {}
+        for name, component in (
+            ("processor", processor),
+            ("image_processor", getattr(processor, "image_processor", None)),
+            ("video_processor", getattr(processor, "video_processor", None)),
+        ):
+            if component is not None:
+                components[name] = {
+                    "class": type(component).__module__
+                    + "."
+                    + type(component).__qualname__,
+                    "parameters": component.to_dict(),
+                    "source_sha256": _source_digest(
+                        inspect.getfile(type(component)), False
+                    ),
+                }
+        tools = video_environment() if video else None
+        versions = {}
+        for name, module in (
+            ("Pillow", "PIL"),
+            ("transformers", "transformers"),
+            ("torch", "torch"),
+            ("sglang", "sglang"),
+        ):
+            try:
+                installed = metadata.version(name)
+            except metadata.PackageNotFoundError:
+                installed = None
+            versions[name] = {
+                "distribution_version": installed,
+                "loaded_version": getattr(sys.modules.get(module), "__version__", None),
+            }
+        tokenizer = tokenizer_identity(processor.tokenizer)
+        value = {
+            "components": components,
+            "chat_template": processor.chat_template,
+            "tokenizer": tokenizer,
+            "workflow_sha256": _source_digest(__file__, False),
+            "dependencies": versions,
+            "video_tools": tools,
+        }
+        digest = hashlib.sha256(
+            json.dumps(value, sort_keys=True, allow_nan=False).encode()
+        ).hexdigest()
+        return {
+            "status": "pass"
+            if "error" not in tokenizer and (tools is None or tools["status"] == "pass")
+            else "missing",
+            "sha256": digest,
+            "identity": value,
+        }
+    except (OSError, AttributeError, ValueError, TypeError) as error:
+        return {"status": "missing", "error": str(error)}
+
 
 SYSTEM = r"""Inspect the images and answer the question. You may use
 crop_image_normalized with bbox_2d=[x1,y1,x2,y2] in [0,1] and target_image
@@ -55,19 +171,51 @@ from 2 in the order returned. Put the final option letter within \boxed{}.
 )
 
 
+def _pixel_compute(operation: str, function, *args):
+    fields = {
+        "operation": operation,
+        "execution_id": uuid4().hex,
+        "thread_id": get_ident(),
+    }
+    record_disposition(
+        "outcome", "pixel_compute", "started", unit="operation", **fields
+    )
+    try:
+        result = function(*args)
+    except BaseException as error:
+        record_disposition(
+            "outcome",
+            "pixel_compute",
+            "failed",
+            unit="operation",
+            exception=type(error).__name__,
+            **fields,
+        )
+        raise
+    record_disposition(
+        "outcome", "pixel_compute", "completed", unit="operation", **fields
+    )
+    return result
+
+
 async def prepare_video_data(frames, destination):
+    await asyncio.to_thread(video_environment)
     # Use the same container implementation as the server, preserving its geometry.
     from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
     from sglang.srt.utils import load_video
 
-    transport = await asyncio.to_thread(encode_video_frames, frames, destination)
+    transport = await asyncio.to_thread(
+        _pixel_compute, "encode_video", encode_video_frames, frames, destination
+    )
 
     def preprocess():
         # The async SGLang helper performs CPU decoding/resizing synchronously.
         decoded = load_video(str(destination), use_gpu=False)
         return asyncio.run(preprocess_video(decoded))
 
-    pixels, metadata = await asyncio.to_thread(preprocess)
+    pixels, metadata = await asyncio.to_thread(
+        _pixel_compute, "preprocess_video", preprocess
+    )
     actual = [int(i) for i in metadata["frames_indices"]]
     if actual != list(range(transport["transport_frames"])):
         raise ValueError(f"Server preprocessing changed frame order: {actual}")
@@ -265,7 +413,103 @@ def verify(content: str, answers: list[str]) -> dict:
 
 def pixel_reward_fn(completions: str, answer: list[str]) -> float:
     """Example outcome reward, without Pixel's curiosity/exploration bonuses."""
-    return float(verify(completions, answer)["status"] == "matched")
+    record_disposition(
+        "outcome",
+        "verifier",
+        "identity",
+        unit="operation",
+        verifier=pixel_verifier_identity(),
+    )
+    result = verify(completions, answer)
+    reward = float(result["status"] == "matched")
+    record_disposition(
+        "outcome",
+        "verifier",
+        "verdict",
+        unit="verification",
+        verdict_status="scored" if len(answer) == 1 else "unscored",
+        raw_reward=reward,
+        task_success=bool(reward) if len(answer) == 1 else None,
+        prediction=result["prediction"],
+        prediction_missing=result["prediction"] is None,
+        reference_count=len(answer),
+        references_sha256=pixel_digest(answer),
+        completion_sha256=pixel_digest(completions),
+    )
+    return reward
+
+
+def pixel_digest(value) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, allow_nan=False).encode()
+    ).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def pixel_verifier_identity() -> dict:
+    """Identify the exact-match implementation running in the reward process."""
+    try:
+        identity = {
+            "implementations": {
+                function.__name__: {
+                    "source_sha256": hashlib.sha256(
+                        inspect.getsource(function).encode()
+                    ).hexdigest(),
+                }
+                for function in (pixel_reward_fn, verify, boxed_answer, pixel_digest)
+            },
+            "parameters": {
+                "normalization": "NFKC, whitespace collapse, casefold",
+                "unicode_version": unicodedata.unidata_version,
+                "reference_count": 1,
+                "reward": "float(verify.status == matched)",
+            },
+        }
+        return {"identity": identity, "sha256": pixel_digest(identity)}
+    except (OSError, TypeError) as error:
+        return {"error": str(error)}
+
+
+def visual_identity(images) -> list[dict]:
+    """Hash decoded CPU pixels together with their geometry and mode."""
+    return [
+        {
+            "size": list(image.size),
+            "mode": image.mode,
+            "pixels_sha256": hashlib.sha256(image.tobytes()).hexdigest(),
+        }
+        for image in images
+    ]
+
+
+def pixel_input_record(
+    messages, images, image_data, input_ids, wire_ids, token_types, multi_modal_input
+):
+    return {
+        "messages": deepcopy(messages),
+        "images": visual_identity(images),
+        "image_payload_sha256": [
+            hashlib.sha256(value.encode()).hexdigest() for value in image_data
+        ],
+        "input_tokens": len(input_ids),
+        "input_sha256": pixel_digest(input_ids),
+        "wire_input_sha256": None if wire_ids is None else pixel_digest(wire_ids),
+        "wire_input_tokens": None if wire_ids is None else len(wire_ids),
+        "mm_token_types_sha256": pixel_digest(token_types),
+        "image_tokens": token_types.count(1),
+        "video_tokens": token_types.count(2),
+        "processor_outputs": {
+            name: {
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "device": str(value.device),
+                "grid": value.tolist()
+                if name.endswith("grid_thw") and value.device.type == "cpu"
+                else None,
+            }
+            for name, value in multi_modal_input.items()
+        },
+    }
 
 
 class _CachedVideoProcessor:
@@ -280,7 +524,7 @@ class _CachedVideoProcessor:
 
     def __call__(self, *args, **kwargs):
         # This cache belongs to one prepared video, never to arbitrary inputs.
-        key = self.cache.make_key(id(self.processor), kwargs)
+        key = self.cache.make_key("pixel_video_processor", id(self.processor), kwargs)
 
         def process():
             return {
@@ -294,6 +538,18 @@ class _CachedVideoProcessor:
             name: value if torch.is_tensor(value) else deepcopy(value)
             for name, value in result.items()
         }
+
+
+def validate_pixel_limits(
+    max_turns, max_output_tokens, original_max_pixels, crop_max_pixels
+):
+    """Apply the workflow's existing limit checks during preflight as well."""
+    if max_turns is not None and max_turns < 1:
+        raise ValueError("max_turns must be positive or null")
+    if max_output_tokens is not None and max_output_tokens < 1:
+        raise ValueError("max_output_tokens must be positive or null")
+    if min(original_max_pixels, crop_max_pixels) < 1:
+        raise ValueError("Pixel limits must be positive")
 
 
 class PixelReasonerWorkflow(RolloutWorkflow):
@@ -315,16 +571,17 @@ class PixelReasonerWorkflow(RolloutWorkflow):
         crop_max_pixels: int = 784000,
         video_temp_root: str | None = None,
     ):
-        if max_turns is not None and max_turns < 1:
-            raise ValueError("max_turns must be positive or null")
-        if max_output_tokens is not None and max_output_tokens < 1:
-            raise ValueError("max_output_tokens must be positive or null")
-        if min(original_max_pixels, crop_max_pixels) < 1:
-            raise ValueError("Pixel limits must be positive")
+        validate_pixel_limits(
+            max_turns, max_output_tokens, original_max_pixels, crop_max_pixels
+        )
         if isinstance(processor, str):
             processor = AutoProcessor.from_pretrained(processor)
         self.processor = processor
         self.tokenizer = processor.tokenizer
+        record_tokenizer(self.tokenizer)
+        record_runtime_versions(
+            "pixel_processor", pixel_processor=pixel_environment(processor)
+        )
         self.gconfig = gconfig.new_with_stop_and_pad_token_ids(self.tokenizer)
         self.data_root = Path(data_root).resolve()
         self.max_turns = max_turns
@@ -333,7 +590,9 @@ class PixelReasonerWorkflow(RolloutWorkflow):
         self.crop_max_pixels = crop_max_pixels
         self.video_temp_root = video_temp_root
         self.reward_fn = AsyncRewardWrapper(pixel_reward_fn)
-        self._video_groups: dict[ProcessorCallCache, dict[tuple, asyncio.Task]] = {}
+        self._video_groups: dict[
+            ProcessorCallCache, dict[tuple, tuple[str, asyncio.Task]]
+        ] = {}
 
     def prepare(self, messages: list[dict], images: list[Image.Image], video=None):
         """Prepare exact actor tokens/features and separate native video wire IDs."""
@@ -464,28 +723,117 @@ class PixelReasonerWorkflow(RolloutWorkflow):
             with Image.open(path) as image:
                 return image.convert("RGB")
 
-        return await asyncio.to_thread(load)
+        return await asyncio.to_thread(_pixel_compute, "load_image", load)
 
+    @session_context()
     async def arun_episode(
         self, engine, data: dict[str, Any]
     ) -> dict[str, InteractionWithTokenLogpReward] | None:
+        record_disposition(
+            "outcome",
+            "pixel_episode",
+            "started",
+            unit="episode",
+            media_refs=data.get("image"),
+            is_video=data.get("is_video", False),
+        )
         if not data.get("is_video", False):
             return await self._run_episode(engine, data, None)
         group_cache = workflow_context.get().processor_cache
         if group_cache is None:
-            video = await self._prepare_video(data)
+            video = await self._load_video(data, None)
             try:
                 return await self._run_episode(engine, data, video)
             finally:
                 await self._release_video(video)
 
-        preparations = self._video_groups.setdefault(group_cache, {})
+        video = await self._load_video(data, group_cache)
+        return await self._run_episode(engine, data, video)
+
+    async def _load_video(self, data, group_cache):
+        preparations = (
+            self._video_groups.setdefault(group_cache, {})
+            if group_cache is not None
+            else {}
+        )
         key = tuple(data.get("image", []))
         if key not in preparations:
-            preparations[key] = asyncio.create_task(self._prepare_video(data))
-        # One cancelled candidate must not cancel its siblings' preparation.
-        video = await asyncio.shield(preparations[key])
-        return await self._run_episode(engine, data, video)
+            preparation = uuid4().hex
+            with disposition_context(video_preparation_id=preparation):
+                task = (
+                    asyncio.create_task(self._prepare_video_traced(data, preparation))
+                    if group_cache is not None
+                    else None
+                )
+            preparations[key] = (preparation, task)
+            outcome = "miss" if group_cache is not None else "bypass"
+        else:
+            preparation, task = preparations[key]
+            outcome = "wait"
+            if task.done():
+                outcome = (
+                    "reused_failure"
+                    if task.cancelled() or task.exception() is not None
+                    else "hit"
+                )
+        fields = {
+            "lookup_id": uuid4().hex,
+            "video_preparation_id": preparation,
+            "cache_outcome": outcome,
+        }
+        record_disposition(
+            "outcome", "pixel_video_cache", "lookup", unit="operation", **fields
+        )
+        try:
+            with disposition_context(video_preparation_id=preparation):
+                video = (
+                    await asyncio.shield(task)
+                    if task is not None
+                    else await self._prepare_video_traced(data, preparation)
+                )
+        except BaseException as error:
+            reason = (
+                "cancelled" if isinstance(error, asyncio.CancelledError) else "failed"
+            )
+            record_disposition(
+                "outcome",
+                "pixel_video_cache",
+                reason,
+                unit="operation",
+                exception=type(error).__name__,
+                **fields,
+            )
+            raise
+        record_disposition(
+            "outcome", "pixel_video_cache", "returned", unit="operation", **fields
+        )
+        return video
+
+    async def _prepare_video_traced(self, data, preparation):
+        fields = {"execution_id": preparation, "video_preparation_id": preparation}
+        record_disposition(
+            "outcome", "pixel_video_prepare", "started", unit="operation", **fields
+        )
+        try:
+            video = await self._prepare_video(data)
+        except BaseException as error:
+            reason = (
+                "cancelled" if isinstance(error, asyncio.CancelledError) else "failed"
+            )
+            record_disposition(
+                "outcome",
+                "pixel_video_prepare",
+                reason,
+                unit="operation",
+                exception=type(error).__name__,
+                **fields,
+            )
+            raise
+        video["preparation_id"] = preparation
+        record_disposition(
+            "outcome", "pixel_video_prepare", "completed", unit="operation", **fields
+        )
+        return video
 
     async def _prepare_video(self, data: dict[str, Any]) -> dict:
         if not data.get("image"):
@@ -499,12 +847,16 @@ class PixelReasonerWorkflow(RolloutWorkflow):
         )
         try:
             frames = [await self.load_image(name) for name in data["image"]]
+            source_identity = await asyncio.to_thread(visual_identity, frames)
             video = await prepare_video_data(frames, Path(directory.name) / "video.mkv")
         except BaseException:
             await asyncio.to_thread(directory.cleanup)
             raise
         video.update(
-            frames=frames, directory=directory, processor_cache=ProcessorCallCache()
+            frames=frames,
+            directory=directory,
+            processor_cache=ProcessorCallCache(),
+            source_identity=source_identity,
         )
         return video
 
@@ -517,7 +869,9 @@ class PixelReasonerWorkflow(RolloutWorkflow):
         try:
             # Shielded preparation can outlive a cancelled sample. Drain it
             # before removing files still needed by sibling model requests.
-            for result in await asyncio.gather(*tasks.values(), return_exceptions=True):
+            for result in await asyncio.gather(
+                *(task for _, task in tasks.values()), return_exceptions=True
+            ):
                 if not isinstance(result, BaseException):
                     await self._release_video(result)
         finally:
@@ -531,6 +885,21 @@ class PixelReasonerWorkflow(RolloutWorkflow):
             [] if video else [await self.load_image(name) for name in data["image"]]
         )
         video_frames = video["frames"] if video else []
+        source_identity = (
+            video["source_identity"]
+            if video and "source_identity" in video
+            else await asyncio.to_thread(visual_identity, video_frames or originals)
+        )
+        record_disposition(
+            "outcome",
+            "pixel_media",
+            "loaded",
+            unit="episode",
+            media_refs=data["image"],
+            sources=source_identity,
+            video_transport=video.get("transport") if video else None,
+            video_preparation_id=video.get("preparation_id") if video else None,
+        )
         images = []
         content = [{"type": "text", "text": data["question"]}]
         if video_frames:
@@ -546,7 +915,11 @@ class PixelReasonerWorkflow(RolloutWorkflow):
             for original in originals:
                 images.append(
                     await asyncio.to_thread(
-                        bounded_image, original, self.original_max_pixels
+                        _pixel_compute,
+                        "resize_original",
+                        bounded_image,
+                        original,
+                        self.original_max_pixels,
                     )
                 )
                 content.extend(
@@ -563,15 +936,28 @@ class PixelReasonerWorkflow(RolloutWorkflow):
         used = 0
         reward = 0.0
         truncated = True
+        end_reason = "max_turns"
         turns = itertools.count() if self.max_turns is None else range(self.max_turns)
         for turn in turns:
-            (
-                input_ids,
-                image_data,
-                token_types,
-                mm_input,
-                wire_ids,
-            ) = await asyncio.to_thread(self.prepare, messages, images, video)
+            record_disposition("outcome", "pixel_input", "started", pixel_turn=turn)
+            with disposition_context(
+                pixel_turn=turn,
+                video_preparation_id=video.get("preparation_id") if video else None,
+            ):
+                (
+                    input_ids,
+                    image_data,
+                    token_types,
+                    mm_input,
+                    wire_ids,
+                ) = await asyncio.to_thread(
+                    _pixel_compute,
+                    "prepare_input",
+                    self.prepare,
+                    messages,
+                    images,
+                    video,
+                )
             budget = min(
                 self.gconfig.max_new_tokens,
                 self.gconfig.max_tokens - len(input_ids),
@@ -579,6 +965,12 @@ class PixelReasonerWorkflow(RolloutWorkflow):
             if self.max_output_tokens is not None:
                 budget = min(budget, self.max_output_tokens - used)
             if budget <= 0:
+                end_reason = (
+                    "output_budget"
+                    if self.max_output_tokens is not None
+                    and used >= self.max_output_tokens
+                    else "context_budget"
+                )
                 break
             metadata = (
                 image_prompt_metadata(
@@ -599,13 +991,46 @@ class PixelReasonerWorkflow(RolloutWorkflow):
                 tokenizer=self.tokenizer,
                 gconfig=self.gconfig.new(max_new_tokens=budget, n_samples=1),
             )
-            response = await engine.agenerate(request)
+            snapshot = await asyncio.to_thread(
+                pixel_input_record,
+                messages,
+                images,
+                image_data,
+                input_ids,
+                wire_ids,
+                token_types,
+                mm_input,
+            )
+            record_disposition(
+                "outcome",
+                "pixel_input",
+                "prepared",
+                unit="request",
+                pixel_turn=turn,
+                pixel_request_id=request.rid,
+                output_limit=budget,
+                total_limit=self.gconfig.max_tokens,
+                **snapshot,
+            )
+            with disposition_context(pixel_turn=turn, pixel_request_id=request.rid):
+                response = await engine.agenerate(request)
             if response.input_tokens != input_ids:
                 raise ValueError(
                     "Rollout response does not preserve actor prompt tokens"
                 )
             if not response.output_tokens or response.stop_reason == "abort":
                 # Engine failures are not negative answer examples.
+                record_disposition(
+                    "failure",
+                    "pixel_episode",
+                    "generation_abort"
+                    if response.stop_reason == "abort"
+                    else "empty_response",
+                    unit="episode",
+                    pixel_turn=turn,
+                    pixel_request_id=request.rid,
+                    output_tokens=used + response.output_len,
+                )
                 return None
             if not (
                 response.output_len
@@ -620,7 +1045,16 @@ class PixelReasonerWorkflow(RolloutWorkflow):
                 prompt_token_ids=input_ids,
                 mm_token_type_ids=token_types,
                 multi_modal_input=mm_input,
-                metadata={"pixel": {"is_video": video is not None, "turn": turn}},
+                metadata={
+                    "pixel": {
+                        "is_video": video is not None,
+                        "turn": turn,
+                        "request_id": request.rid,
+                        "input_sha256": snapshot["input_sha256"],
+                        "query_id": data.get("query_id"),
+                        "sample_index": workflow_context.get().sample_idx,
+                    }
+                },
             )
             interactions[request.rid] = interaction
             used += response.output_len
@@ -628,63 +1062,145 @@ class PixelReasonerWorkflow(RolloutWorkflow):
                 response.output_tokens_without_stop, skip_special_tokens=False
             )
             reasoning, answer = split_reasoning(text)
+            record_disposition(
+                "outcome",
+                "pixel_turn",
+                "completed",
+                unit="request",
+                pixel_turn=turn,
+                pixel_request_id=request.rid,
+                output_tokens=response.output_len,
+                stop_reason=response.stop_reason,
+                output_sha256=pixel_digest(response.output_tokens),
+                reasoning=reasoning,
+                content=answer,
+            )
             messages.append(
                 {"role": "assistant", "reasoning_content": reasoning, "content": answer}
             )
             if response.stop_reason == "length":
+                end_reason = "generation_length"
                 break
+            action = None
+            tool_phase = "parse"
             try:
                 action = get_action(answer)
                 if action is None:
                     truncated = False
-                    reward = await self.reward_fn(
-                        completions=answer, answer=data["answer"]
-                    )
-                    break
-                arguments = action["arguments"]
-                if action["name"] == "select_frames":
-                    if not video:
-                        raise ValueError("select_frames requires video input")
-                    selected = select_frames(
-                        video_frames, arguments.get("target_frames")
-                    )
-                else:
-                    index = arguments.get("target_image")
-                    if not video and (
-                        type(index) is not int or not 1 <= index <= len(originals)
+                    tool_phase = "reward"
+                    with disposition_context(
+                        pixel_turn=turn, pixel_request_id=request.rid
                     ):
-                        raise ValueError(
-                            "target_image is outside available image indices"
+                        reward = await self.reward_fn(
+                            completions=answer, answer=data["answer"]
                         )
-                    original = (
-                        video_crop_source(video_frames, originals, index)
-                        if video
-                        else originals[index - 1]
+                    end_reason = "final_answer"
+                    break
+                tool_phase = "execute"
+                with disposition_context(pixel_turn=turn, pixel_request_id=request.rid):
+                    record_disposition(
+                        "outcome",
+                        "pixel_tool",
+                        "started",
+                        unit="tool_call",
+                        pixel_turn=turn,
+                        pixel_request_id=request.rid,
+                        action=deepcopy(action),
                     )
-                    selected = [
-                        await asyncio.to_thread(crop_image, original, arguments)
-                    ]
-                feedback = []
-                for original in selected:
-                    image = await asyncio.to_thread(
-                        bounded_image, original, self.crop_max_pixels
-                    )
-                    originals.append(original)
-                    images.append(image)
-                    feedback.extend(
-                        [
-                            {
-                                "type": "text",
-                                "text": f"Tool result: Image {len(images) + int(video is not None)}.",
-                            },
-                            {"type": "image"},
+                    arguments = action["arguments"]
+                    if action["name"] == "select_frames":
+                        if not video:
+                            raise ValueError("select_frames requires video input")
+                        selected = _pixel_compute(
+                            "select_frames",
+                            select_frames,
+                            video_frames,
+                            arguments.get("target_frames"),
+                        )
+                    else:
+                        index = arguments.get("target_image")
+                        if not video and (
+                            type(index) is not int or not 1 <= index <= len(originals)
+                        ):
+                            raise ValueError(
+                                "target_image is outside available image indices"
+                            )
+                        original = (
+                            video_crop_source(video_frames, originals, index)
+                            if video
+                            else originals[index - 1]
+                        )
+                        selected = [
+                            await asyncio.to_thread(
+                                _pixel_compute,
+                                "crop_image",
+                                crop_image,
+                                original,
+                                arguments,
+                            )
                         ]
+                    feedback = []
+                    for original in selected:
+                        image = await asyncio.to_thread(
+                            _pixel_compute,
+                            "resize_tool",
+                            bounded_image,
+                            original,
+                            self.crop_max_pixels,
+                        )
+                        originals.append(original)
+                        images.append(image)
+                        feedback.extend(
+                            [
+                                {
+                                    "type": "text",
+                                    "text": f"Tool result: Image {len(images) + int(video is not None)}.",
+                                },
+                                {"type": "image"},
+                            ]
+                        )
+                    record_disposition(
+                        "outcome",
+                        "pixel_tool",
+                        "completed",
+                        unit="tool_call",
+                        pixel_turn=turn,
+                        pixel_request_id=request.rid,
+                        action=deepcopy(action),
+                        images=await asyncio.to_thread(
+                            visual_identity, images[-len(selected) :]
+                        ),
+                        feedback=deepcopy(feedback),
                     )
             except (ValueError, KeyError, TypeError) as error:
                 feedback = [{"type": "text", "text": f"Execution error: {error}"}]
+                record_disposition(
+                    "failure",
+                    "pixel_tool",
+                    tool_phase + "_error",
+                    unit="tool_call" if tool_phase == "execute" else "turn",
+                    pixel_turn=turn,
+                    pixel_request_id=request.rid,
+                    action=deepcopy(action),
+                    exception=type(error).__name__,
+                    error=str(error),
+                    feedback=deepcopy(feedback),
+                )
             # A real tool response keeps the last user query fixed in Qwen's
             # Thinking template, preserving prior reasoning without re-training it.
             messages.append({"role": "tool", "content": feedback})
+        record_disposition(
+            "outcome",
+            "pixel_episode",
+            "completed",
+            unit="episode",
+            end_reason=end_reason,
+            truncated=truncated,
+            raw_reward=reward,
+            num_turns=len(interactions),
+            output_tokens=used,
+            returned_trajectory=bool(interactions),
+        )
         if not interactions:
             return None
         for turn, interaction in enumerate(interactions.values()):

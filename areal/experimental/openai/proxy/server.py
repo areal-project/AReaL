@@ -298,6 +298,8 @@ def serialize_interactions(
             }
         result[key]["rollout_reward"] = interaction.rollout_reward
         result[key]["rollout_index"] = interaction.rollout_index
+        result[key]["rollout_query_id"] = interaction.rollout_query_id
+        result[key]["rollout_sample_index"] = interaction.rollout_sample_index
         result[key]["metadata"] = dict(interaction.metadata)
     if tensor_store is not None:
         result = tensor_store.encode_multimodal_tensors(result)
@@ -323,6 +325,8 @@ def deserialize_interactions(
         interaction.reward = item["reward"]
         interaction.rollout_reward = item.get("rollout_reward")
         interaction.rollout_index = item.get("rollout_index")
+        interaction.rollout_query_id = item.get("rollout_query_id")
+        interaction.rollout_sample_index = item.get("rollout_sample_index")
         interaction.interaction_id = item["interaction_id"]
         interaction.metadata = dict(item.get("metadata") or {})
         result[key] = interaction
