@@ -4,6 +4,9 @@ github: vllm-project/vllm
 branch_template: v${VERSION}
 upstream_paths:
   - vllm/entrypoints/openai/
+  - vllm/entrypoints/launchers/
+  - vllm/entrypoints/serve/
+  - vllm/v1/engine/async_llm.py
   - vllm/lora/
   - vllm/model_executor/model_loader/
   - vllm/v1/worker/gpu_worker.py
@@ -18,11 +21,12 @@ upstream_paths:
 
 ### Primary (engine layer — most likely to break)
 
-| File                                             | Imports / Usage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `areal/engine/vllm_ext/vllm_worker_extension.py` | `vllm.logger.init_logger`, `vllm.lora.lora_model.LoRAModel`, `vllm.lora.peft_helper.PEFTHelper`, `vllm.lora.request.LoRARequest`, `vllm.model_executor.model_loader.get_model_loader`; **private APIs**: `_adapter_manager._registered_adapters`, `._add_adapter`, `.activate_adapter`                                                                                                                                                                                                                                                                                                          |
-| `areal/engine/vllm_ext/areal_vllm_server.py`     | `vllm.entrypoints.openai.api_server.build_app`, `.run_server`; `vllm.entrypoints.openai.cli_args.make_arg_parser`, `.validate_parsed_serve_args`; `vllm.entrypoints.openai.completion.api_router.create_completion`; `vllm.entrypoints.openai.completion.protocol.CompletionRequest`; `vllm.entrypoints.openai.engine.protocol.ErrorResponse`, `.OpenAIBaseModel`; `vllm.entrypoints.openai.utils.validate_json_request`; `vllm.entrypoints.utils.cli_env_setup`, `.load_aware_call`, `.with_cancellation`; `vllm.lora.request.LoRARequest`; `vllm.utils.argparse_utils.FlexibleArgumentParser` |
-| `areal/engine/vllm_remote.py`                    | HTTP-only — builds vLLM launch commands via `vLLMConfig.build_cmd_from_args()`; sets `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| File                                             | Imports / Usage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `areal/engine/vllm_ext/vllm_worker_extension.py` | `vllm.logger.init_logger`, `vllm.lora.lora_model.LoRAModel`, `vllm.lora.peft_helper.PEFTHelper`, `vllm.lora.request.LoRARequest`, `vllm.model_executor.model_loader.get_model_loader`, `vllm.model_executor.model_loader.reload.initialize_layerwise_reload` / `.finalize_layerwise_reload`, `vllm.config.set_current_vllm_config`, `model_runner.reload_weights`; **private APIs**: `_adapter_manager._registered_adapters`, `._add_adapter`, `.activate_adapter`                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `areal/engine/vllm_ext/areal_vllm_server.py`     | `vllm.entrypoints.openai.api_server.build_app`, `.run_server`; `vllm.entrypoints.common.cli_args.make_arg_parser`, `.validate_parsed_serve_args` (≥0.33; fallbacks `launchers.cli_args` for 0.32, `openai.cli_args` before); `vllm.entrypoints.openai.completion.api_router.create_completion`; `vllm.entrypoints.openai.completion.protocol.CompletionRequest`; `vllm.entrypoints.serve.engine.protocol.ErrorResponse`, `.OpenAIBaseModel` (≥0.32; fallback `openai.engine.protocol`); `vllm.entrypoints.serve.utils.api_utils.load_aware_call`, `.validate_json_request`, `.with_cancellation` (≥0.28; fallback `openai.utils` / `entrypoints.utils`); `vllm.entrypoints.common.startup.cli_env_setup` (≥0.33; fallbacks `serve.utils.api_utils`, `entrypoints.utils`); `engine_client.pause_generation(mode=...)`; `vllm.lora.request.LoRARequest`; `vllm.utils.argparse_utils.FlexibleArgumentParser` |
+| `areal/engine/vllm_remote.py`                    | HTTP-only — builds vLLM launch commands via `vLLMConfig.build_cmd_from_args()`; sets `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `areal/utils/vllm_response.py`                   | HTTP-only — parses `/v1/completions` and chat `logprobs` JSON (`tokens`/`token_logprobs` or `content[].token`/`.logprob`); rejects vLLM's `-9999.0` missing/clamped-logprob sentinel. Used by `vllm_remote.py` and `areal/v2/inference_service/vllm/bridge.py`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 ### Secondary (model / infra layer)
 
@@ -60,16 +64,19 @@ signatures on returned objects**, and **moved/renamed modules**.
 
 ### 1. `vllm.entrypoints.openai.api_server.build_app` and `.run_server`
 
-**Source:** `vllm/entrypoints/openai/api_server.py`
+**Source:** `vllm/entrypoints/openai/api_server.py` (re-export);
+`vllm/entrypoints/launchers/api_server/entry.py` (definition, ≥0.32)
 
-Called in `areal/engine/vllm_ext/areal_vllm_server.py` (lines 10-11, 366-398):
+Called in `areal/engine/vllm_ext/areal_vllm_server.py`:
 
 ```python
 from vllm.entrypoints.openai.api_server import build_app as _original_build_app
 from vllm.entrypoints.openai.api_server import run_server
 
-# build_app is monkey-patched at line 388 to inject AReaL routes:
-import vllm.entrypoints.openai.api_server as _api_server_module
+# build_app is monkey-patched in the module where run_server looks it up:
+# vllm.entrypoints.openai.api_server before 0.32,
+# vllm.entrypoints.launchers.api_server.entry from 0.32 on.
+_api_server_module = sys.modules[run_server.__module__]
 _api_server_module.build_app = _areal_build_app  # replaces the module-level reference
 
 # _areal_build_app calls the original with supported_tasks kwarg (line 371):
@@ -80,21 +87,29 @@ uvloop.run(run_server(args))
 ```
 
 **Check:** Confirm both functions still exist at this path. Verify `build_app` accepts
-`(args, supported_tasks=...)` and returns a FastAPI `app`. Verify `run_server` is an
-async function accepting `(args)`. Check that monkey-patching
-`_api_server_module.build_app` still works (i.e., `run_server` reads `build_app` from
-the module, not a closure).
+`(args, supported_tasks=..., model_config=...)` and returns a FastAPI `app`. Verify
+`run_server` is an async function accepting `(args)`. Check that monkey-patching
+`build_app` in `sys.modules[run_server.__module__]` still works (i.e., `run_server`
+reads `build_app` from its own module, not a closure).
 
 ______________________________________________________________________
 
-### 2. `vllm.entrypoints.openai.cli_args.make_arg_parser` and `.validate_parsed_serve_args`
+### 2. `vllm.entrypoints.common.cli_args.make_arg_parser` and `.validate_parsed_serve_args`
 
-**Source:** `vllm/entrypoints/openai/cli_args.py`
+**Source:** `vllm/entrypoints/common/cli_args.py` (≥0.33);
+`vllm/entrypoints/launchers/cli_args.py` (0.32); `vllm/entrypoints/openai/cli_args.py`
+(\<0.32)
 
-Called in `areal/engine/vllm_ext/areal_vllm_server.py` (lines 12, 391-396):
+Called in `areal/engine/vllm_ext/areal_vllm_server.py`:
 
 ```python
-from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
+try:
+    from vllm.entrypoints.common.cli_args import make_arg_parser, validate_parsed_serve_args  # >=0.33
+except ImportError:
+    try:
+        from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args  # 0.32
+    except ImportError:
+        from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 
 parser = FlexibleArgumentParser(description="vLLM OpenAI-Compatible RESTful API server.")
 parser = make_arg_parser(parser)
@@ -117,25 +132,43 @@ Called in `areal/engine/vllm_ext/areal_vllm_server.py`:
 ```python
 from vllm.entrypoints.openai.completion.api_router import create_completion as original_create_completion
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
-from vllm.entrypoints.openai.engine.protocol import ErrorResponse, OpenAIBaseModel
-from vllm.entrypoints.openai.utils import validate_json_request
+# >=0.32: vllm.entrypoints.serve.engine.protocol; <0.32: vllm.entrypoints.openai.engine.protocol
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse, OpenAIBaseModel
+# >=0.28: vllm.entrypoints.serve.utils.api_utils; older: vllm.entrypoints.openai.utils
+from vllm.entrypoints.serve.utils.api_utils import validate_json_request
 ```
 
 **Check:** Verify the completion sub-package still exists (was restructured in some vLLM
 versions). Confirm `CompletionRequest` Pydantic model fields. Verify `ErrorResponse` and
-`OpenAIBaseModel` are still at `engine.protocol`. Check `validate_json_request` still
-returns a FastAPI `Depends`.
+`OpenAIBaseModel` are still at `serve.engine.protocol`. Check `validate_json_request`
+still returns a FastAPI `Depends`.
 
 ______________________________________________________________________
 
-### 4. `vllm.entrypoints.utils` — server utilities
+### 4. `vllm.entrypoints.serve.utils.api_utils` / `common.startup` — server utilities
 
-**Source:** `vllm/entrypoints/utils.py`
+**Source:** `vllm/entrypoints/serve/utils/api_utils.py` (≥0.28);
+`vllm/entrypoints/utils.py` (older); `cli_env_setup` is in
+`vllm/entrypoints/common/startup.py` from 0.33
 
-Called in `areal/engine/vllm_ext/areal_vllm_server.py` (lines 19, 349-350, 390):
+Called in `areal/engine/vllm_ext/areal_vllm_server.py`:
 
 ```python
-from vllm.entrypoints.utils import cli_env_setup, load_aware_call, with_cancellation
+try:
+    from vllm.entrypoints.serve.utils.api_utils import (
+        load_aware_call, validate_json_request, with_cancellation,
+    )
+except ImportError:
+    from vllm.entrypoints.openai.utils import validate_json_request
+    from vllm.entrypoints.utils import load_aware_call, with_cancellation
+
+try:
+    from vllm.entrypoints.common.startup import cli_env_setup  # >=0.33
+except ImportError:
+    try:
+        from vllm.entrypoints.serve.utils.api_utils import cli_env_setup  # 0.28 - 0.32
+    except ImportError:
+        from vllm.entrypoints.utils import cli_env_setup
 
 # Used as stacked decorators on the create_completion endpoint (lines 349-350):
 @with_cancellation
@@ -147,10 +180,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 cli_env_setup()
 ```
 
-**Check:** Confirm all three are still exported from `vllm.entrypoints.utils`. Verify
-`with_cancellation` is still a decorator compatible with async endpoints. Verify
-`load_aware_call` is still a decorator (not renamed to `load_aware`). Confirm
-`cli_env_setup()` is still a no-arg function.
+**Check:** Confirm the three decorators are still exported from `serve.utils.api_utils`
+and `cli_env_setup` from `common.startup`. Verify `with_cancellation` is still a
+decorator compatible with async endpoints. Verify `load_aware_call` is still a decorator
+(not renamed to `load_aware`). Confirm `cli_env_setup()` is still a no-arg function.
 
 ______________________________________________________________________
 
@@ -367,9 +400,61 @@ Called indirectly via `vLLMConfig.build_cmd_from_args()` in `areal/api/cli_args.
 exists. Pay attention to `--enable-lora` and related LoRA flags. Verify env var
 `VLLM_ALLOW_RUNTIME_LORA_UPDATING` is still respected.
 
+vLLM 0.33 renamed the `--no-enable-prefix-caching` / `--no-enable-chunked-prefill` flags
+to `--disable-*` (`EnableDisableAction`) but still accepts the old spelling with the
+same result; AReaL's `vLLMConfig.no_enable_*` fields still emit the old spelling. If a
+future vLLM drops it, the command will be rejected at startup.
+
+A quick check: build the parser with `make_arg_parser(FlexibleArgumentParser())`, then
+confirm every `dataclasses.fields(vLLMConfig)` name maps to a known `--flag` and that
+`parser.parse_args(vLLMConfig.build_cmd_from_args(...)[3:])` accepts the default
+command.
+
+______________________________________________________________________
+
+### 15. `AsyncLLM.pause_generation` (engine client)
+
+**Source:** `vllm/v1/engine/async_llm.py`
+
+Called in `areal/engine/vllm_ext/areal_vllm_server.py` before every weight update and in
+`areal_pause_generation`:
+
+```python
+llm = raw_request.app.state.engine_client
+await llm.pause_generation(mode="abort", clear_cache=True)
+await llm.reset_mm_cache()
+```
+
+**Check:** Verify `mode` still accepts `"abort"` and `clear_cache` is still a keyword.
+`wait_for_inflight_requests` was deprecated in 0.19 and removed in 0.32; `mode` exists
+in 0.19.1+, so do not reintroduce the old keyword.
+
+______________________________________________________________________
+
+### 16. Logprob sentinel in OpenAI responses
+
+**Source:** `vllm/entrypoints/openai/chat_completion/protocol.py`
+(`ChatCompletionLogProb.logprob` default), `.../chat_completion/serving.py`,
+`.../completion/serving.py` (`max(logprob, -9999.0)` clamp)
+
+Relied on by `areal/utils/vllm_response.py` (`_AMBIGUOUS_VLLM_LOGPROB = -9999.0`):
+
+**Check:** Confirm vLLM still uses `-9999.0` as both the default and the clamp floor. If
+it changes, update `_AMBIGUOUS_VLLM_LOGPROB` and the upstream source links in that file.
+
 ______________________________________________________________________
 
 ## Version-Guarded Code
+
+- `areal/engine/vllm_ext/areal_vllm_server.py` — `common.cli_args` / `common.startup`
+  (≥0.33), `launchers.cli_args` / `serve.engine.protocol` (≥0.32) and
+  `serve.utils.api_utils` (≥0.28) imports fall back to the pre-0.32 `openai.*` /
+  `entrypoints.utils` paths. Keep while `Dockerfile.rocm` still builds vLLM 0.19.1;
+  remove once every image is on ≥0.32.
+
+- `areal/engine/vllm_ext/vllm_worker_extension.py` — `set_current_vllm_config` falls
+  back to a no-op context manager for vLLM \< 0.19. Every supported image is ≥0.19.1, so
+  the fallback can be removed.
 
 - `areal/infra/platforms/cuda.py` and `unknown.py` — tries
   `vllm.v1.worker.gpu_worker.Worker` first, falls back to `vllm.worker.worker.Worker`.
