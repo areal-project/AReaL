@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import mmap
 import os
 import socket
 import tempfile
@@ -72,6 +73,48 @@ def _restore_vision(data: Any, tensors: list[torch.Tensor]) -> Any:
             return items
         return type(data)(*items) if hasattr(data, "_fields") else tuple(items)
     return data
+
+
+_MAPPING_HEADER_SIZE = 64
+
+
+def _open_vision_mapping(path, marker, shape, dtype):
+    # Never create a receiver file: private container mounts must fail rather
+    # than silently map zero pixels. Validate the file through the same fd used
+    # for mmap, avoiding a path check followed by a second, creating open.
+    fd = os.open(path, os.O_RDWR)
+    try:
+        size = (
+            math.prod(shape) * torch.empty((), dtype=dtype, device="cpu").element_size()
+        )
+        if (
+            os.fstat(fd).st_size != _MAPPING_HEADER_SIZE + size
+            or os.pread(fd, _MAPPING_HEADER_SIZE, 0) != marker
+        ):
+            raise ValueError("Vision mapping is not the leader's backing store")
+        storage = mmap.mmap(fd, _MAPPING_HEADER_SIZE + size, access=mmap.ACCESS_WRITE)
+    finally:
+        os.close(fd)
+    try:
+        # frombuffer retains the mmap owner until the last tensor view dies.
+        return torch.frombuffer(
+            storage, dtype=dtype, count=math.prod(shape), offset=_MAPPING_HEADER_SIZE
+        ).reshape(shape)
+    except Exception:
+        storage.close()
+        raise
+
+
+def _check_mapping_errors(error, ranks, group, phase):
+    errors = [None] * len(ranks)
+    dist.all_gather_object(errors, error, group=group)
+    failures = [
+        f"rank {rank}: {message}"
+        for rank, message in zip(ranks, errors, strict=True)
+        if message is not None
+    ]
+    if failures:
+        raise RuntimeError(f"Vision mapping {phase} failed: " + "; ".join(failures))
 
 
 class NodeSharedVisionTransport:
@@ -148,37 +191,55 @@ class NodeSharedVisionTransport:
             path = None
             mapped = None
             try:
-                if dist.get_rank() == leader:
-                    fd, path = tempfile.mkstemp(
-                        prefix=f"areal-vision-{os.environ.get('SLURM_JOB_ID', 'local')}-",
-                        dir=os.environ.get("AREAL_VISION_SHM_DIR", "/dev/shm"),
-                    )
-                    try:
-                        os.ftruncate(
-                            fd,
-                            math.prod(shape)
-                            * torch.empty((), dtype=dtype, device="cpu").element_size(),
+                error = None
+                marker = None
+                try:
+                    if dist.get_rank() == leader:
+                        fd, path = tempfile.mkstemp(
+                            prefix=f"areal-vision-{os.environ.get('SLURM_JOB_ID', 'local')}-",
+                            dir=os.environ.get("AREAL_VISION_SHM_DIR", "/dev/shm"),
                         )
-                    finally:
-                        os.close(fd)
+                        try:
+                            marker = os.urandom(_MAPPING_HEADER_SIZE)
+                            os.ftruncate(
+                                fd,
+                                _MAPPING_HEADER_SIZE
+                                + math.prod(shape)
+                                * torch.empty(
+                                    (), dtype=dtype, device="cpu"
+                                ).element_size(),
+                            )
+                            if os.write(fd, marker) != len(marker):
+                                raise OSError("Incomplete vision mapping header write")
+                        finally:
+                            os.close(fd)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                _check_mapping_errors(error, ranks, group, "creation")
                 names = [None] * len(ranks)
-                dist.all_gather_object(names, path, group=group)
-                mapped = torch.from_file(
-                    names[ranks.index(leader)],
-                    shared=True,
-                    size=math.prod(shape),
-                    dtype=dtype,
-                    device="cpu",
-                ).reshape(shape)
-                # Open every local mapping, then unlink before populating the
-                # file. Unlinked buffers are owned by live mappings and are
-                # reclaimed when their last consumer exits.
-                dist.barrier(group=group)
-                if path is not None:
-                    os.unlink(path)
-                    path = None
+                dist.all_gather_object(names, (path, marker), group=group)
+                error = None
+                try:
+                    local_path, local_marker = names[ranks.index(leader)]
+                    mapped = _open_vision_mapping(
+                        local_path, local_marker, shape, dtype
+                    )
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                # Every rank must report open/validation failures before any
+                # rank unlinks, copies pixels or enters point-to-point calls.
+                _check_mapping_errors(error, ranks, group, "opening")
+                error = None
+                try:
+                    if path is not None:
+                        os.unlink(path)
+                        path = None
+                    if dist.get_rank() == src_rank:
+                        mapped.copy_(tensors[index])
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                _check_mapping_errors(error, ranks, group, "preparation")
                 if dist.get_rank() == src_rank:
-                    mapped.copy_(tensors[index])
                     # Only one rank per destination node receives the pixels.
                     # Reuse the parent group: dynamic subgroups would couple DP
                     # replicas through process-group initialization state.
@@ -199,5 +260,10 @@ class NodeSharedVisionTransport:
                 # Before all mappings open, only a sparse, unpopulated file
                 # exists. Normal failures still remove that name here.
                 if path is not None:
-                    os.unlink(path)
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        # Do not mask the collective error with a local cleanup
+                        # error (e.g. the mapping directory became inaccessible).
+                        pass
         return _restore_vision(skeleton, local_tensors)

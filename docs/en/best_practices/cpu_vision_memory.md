@@ -32,6 +32,13 @@ treated as immutable by consumers; token tensors retain their normal behavior. P
 transfers fan out from the source to one leader per destination node; this preserves
 memory savings but is not a claim of improved throughput at large node counts.
 
+Receivers open existing files without creating them and validate a per-mapping random
+header. Creation, open/validation, and preparation errors are gathered within the DP
+group so every rank raises before pixel transfers begin. This rejects private or
+mismatched container mapping directories instead of silently consuming zero images.
+Fatal process exits and operating-system signals still require distributed job failure
+handling.
+
 Mappings are unlinked after all local ranks open them, before copying data. Their
 lifetime is owned by live tensor references. Do not delete active shared-memory mappings
 as an OOM workaround. This feature does not increase cgroup limits or release

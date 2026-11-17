@@ -203,3 +203,112 @@ def test_dp_vision_sharing_independent_streams_and_isolated_storage(tmp_path, sp
         nprocs=8,
         join=True,
     )
+
+
+def _run_mapping_failures(rank: int, init_method: str, shared_dir: str) -> None:
+    import os
+    from datetime import timedelta
+
+    from areal.infra.rpc import node_shared_vision as module
+
+    os.environ["AREAL_VISION_SHM_DIR"] = shared_dir
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+    )
+    transport = NodeSharedVisionTransport(
+        _broadcast_small_container, node_name="same-node"
+    )
+    private_dir = Path(shared_dir) / f"private-{rank}"
+    private_dir.mkdir()
+    expected = torch.arange(8, dtype=torch.float32)
+
+    def transfer():
+        return transport(
+            {"multi_modal_input": [expected]} if rank == 0 else None,
+            preserve_tensor_aliases=True,
+        )
+
+    try:
+        for failure in ("creation", "missing", "wrong-store", "unlink"):
+            with pytest.MonkeyPatch.context() as patch:
+                if failure == "creation" and rank == 0:
+
+                    def fail_create(*args, **kwargs):
+                        raise OSError("injected creation failure")
+
+                    patch.setattr(module.tempfile, "mkstemp", fail_create)
+                elif failure in ("missing", "wrong-store") and rank == 1:
+                    real_open = os.open
+                    real_from_file = torch.from_file
+
+                    def private_path(path):
+                        shadow = private_dir / Path(path).name
+                        if failure == "wrong-store" and not shadow.exists():
+                            # Same pathname and size in a different namespace
+                            # must not be accepted as the leader's storage.
+                            shadow.write_bytes(bytes(Path(path).stat().st_size))
+                        return str(shadow)
+
+                    def private_open(path, flags, *args, **kwargs):
+                        assert not flags & os.O_CREAT
+                        return real_open(private_path(path), flags, *args, **kwargs)
+
+                    def private_from_file(path, *args, **kwargs):
+                        return real_from_file(private_path(path), *args, **kwargs)
+
+                    # Model a follower's private mount for both the old
+                    # from_file implementation and the non-creating fd path.
+                    patch.setattr(module.os, "open", private_open)
+                    patch.setattr(module.torch, "from_file", private_from_file)
+                elif failure == "unlink" and rank == 0:
+                    real_unlink = os.unlink
+                    attempts = 0
+
+                    def fail_unlink_once(path):
+                        nonlocal attempts
+                        attempts += 1
+                        if attempts == 1:
+                            raise OSError("injected unlink failure")
+                        return real_unlink(path)
+
+                    patch.setattr(module.os, "unlink", fail_unlink_once)
+                with pytest.raises(RuntimeError, match="Vision mapping") as raised:
+                    transfer()
+            messages = [None, None]
+            dist.all_gather_object(messages, str(raised.value))
+            assert messages[0] == messages[1]
+            assert not list(Path(shared_dir).glob("areal-vision-*"))
+            if failure == "missing":
+                assert not list(private_dir.iterdir())
+            for path in private_dir.iterdir():
+                path.unlink()
+            # Recover on the same group after every failure: no peer may be
+            # left in an earlier collective or waiting for a pixel receive.
+            result = transfer()["multi_modal_input"][0]
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+            dist.barrier()
+            if rank == 0:
+                result[0] = 123
+            dist.barrier()
+            assert result[0].item() == 123
+            dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.slow
+@pytest.mark.ci
+def test_mapping_failures_fail_all_ranks_without_creating_follower_files(tmp_path):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    mp.spawn(
+        _run_mapping_failures,
+        args=(f"file://{tmp_path / 'gloo_init'}", str(shared_dir)),
+        nprocs=2,
+        join=True,
+    )

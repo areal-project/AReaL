@@ -206,7 +206,7 @@ class SerializedNDArray(BaseModel):
             raise ValueError(msg)
 
         contiguous = np.ascontiguousarray(array)
-        buffer = memoryview(contiguous.ravel())
+        buffer = memoryview(contiguous.ravel().view(np.uint8))
         data_b64 = base64.b64encode(buffer).decode("utf-8")
         return cls(data=data_b64, shape=list(array.shape), dtype=array.dtype.str)
 
