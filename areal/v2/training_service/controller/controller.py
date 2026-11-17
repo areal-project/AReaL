@@ -1288,6 +1288,18 @@ class GatewayTrainController:
             )
             raise
 
+    def reconfigure_actor(
+        self, backend: str, gpu_devices: list[int], state_path: str
+    ) -> None:
+        """Apply an Actor layout through the unified idle-boundary coordinator."""
+        from areal.v2.reconfiguration import ExecutionLayout, reconfigure
+
+        reconfigure(
+            self,
+            actor_layout=ExecutionLayout.local(backend, gpu_devices),
+            state_path=state_path,
+        )
+
     async def _async_release_engine_rendezvous(self) -> None:
         if self._engine_rendezvous_owner is not None:
             guard, role, index = self._engine_rendezvous_owner
@@ -1492,6 +1504,12 @@ class GatewayTrainController:
             self._weight_update_ctrl.disconnect()
             self._weight_update_connected = False
         self._release_weight_update_port()
+
+    def reconfigure_rollout(self, backend: str, gpu_devices: list[int]) -> None:
+        """Apply a rollout layout through the unified idle-boundary coordinator."""
+        from areal.v2.reconfiguration import ExecutionLayout, reconfigure
+
+        reconfigure(self, rollout_layout=ExecutionLayout.local(backend, gpu_devices))
 
     def update_weights(self, meta: Any, *, resume_generation: bool = True) -> None:
         if self._weight_update_ctrl is None or self.rollout is None:
