@@ -112,6 +112,9 @@ LOGGER_COLORS_EXACT = {
     "DaytonaClientManager": "blue",
     "DaytonaRunner": "light_cyan",
     "DaytonaPythonTool": "light_purple",
+    "OpenSandboxRunner": "light_cyan",
+    "OpenSandboxSession": "blue",
+    "OpenSandboxPythonTool": "light_purple",
     # OpenAI - purple
     "OpenAIClient": "light_purple",
     "OpenAICache": "light_purple",

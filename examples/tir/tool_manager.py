@@ -29,6 +29,17 @@ def _build_daytona_python_tool(timeout: int, debug_mode: bool) -> BaseTool:
     return DaytonaPythonTool(timeout, debug_mode)
 
 
+def _build_opensandbox_python_tool(timeout: int, debug_mode: bool) -> BaseTool:
+    if importlib.util.find_spec("opensandbox") is None:
+        raise ImportError(
+            "opensandbox_python requires the optional 'opensandbox' dependency. Install it with `uv sync --extra sandbox`."
+        )
+
+    from tools.opensandbox_python_tool import OpenSandboxPythonTool
+
+    return OpenSandboxPythonTool(timeout, debug_mode)
+
+
 class ToolRegistry:
     """Tool registry that manages all available tools."""
 
@@ -36,8 +47,16 @@ class ToolRegistry:
         "python": ToolType.PYTHON,
         "calculator": ToolType.CALCULATOR,
         "daytona_python": ToolType.DAYTONA_PYTHON,
+        "opensandbox_python": ToolType.OPENSANDBOX_PYTHON,
     }
     DEFAULT_TOOL_NAMES = ("python", "calculator")
+    # All of these run ```python blocks through one executor, so they share
+    # the same markers and only one can be enabled at a time.
+    PYTHON_BACKENDS = (
+        ToolType.PYTHON,
+        ToolType.DAYTONA_PYTHON,
+        ToolType.OPENSANDBOX_PYTHON,
+    )
 
     def __init__(
         self,
@@ -49,6 +68,9 @@ class ToolRegistry:
             ToolType.PYTHON: lambda: PythonTool(timeout, debug_mode),
             ToolType.CALCULATOR: lambda: CalculatorTool(timeout, debug_mode),
             ToolType.DAYTONA_PYTHON: lambda: _build_daytona_python_tool(
+                timeout, debug_mode
+            ),
+            ToolType.OPENSANDBOX_PYTHON: lambda: _build_opensandbox_python_tool(
                 timeout, debug_mode
             ),
         }
@@ -65,12 +87,15 @@ class ToolRegistry:
             else:
                 logger.warning(f"Unknown tool type: {tool_name}, skipping")
 
-        if (
-            ToolType.PYTHON in self.enabled_tools
-            and ToolType.DAYTONA_PYTHON in self.enabled_tools
-        ):
+        enabled_python_backends = [
+            tool_type
+            for tool_type in self.PYTHON_BACKENDS
+            if tool_type in self.enabled_tools
+        ]
+        if len(enabled_python_backends) > 1:
+            names = ", ".join(t.value for t in enabled_python_backends)
             raise ValueError(
-                "python and daytona_python use the same markers; enable only one Python backend"
+                f"{names} use the same markers; enable only one Python backend"
             )
 
         self.tools = {

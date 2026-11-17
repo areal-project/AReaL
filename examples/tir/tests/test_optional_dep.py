@@ -34,3 +34,30 @@ def test_tools_import_without_daytona():
 
 def test_sandbox_import_is_safe_without_daytona():
     assert DaytonaRunner is not None
+
+
+def test_tools_import_without_opensandbox():
+    original_find_spec = importlib.util.find_spec
+
+    with __import__("pytest").MonkeyPatch.context() as monkeypatch:
+
+        def fake_find_spec(name, *args, **kwargs):
+            if name == "opensandbox":
+                return None
+            return original_find_spec(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+        sys.modules.pop("tools.opensandbox_python_tool", None)
+        reloaded = importlib.reload(tools_module)
+
+        assert hasattr(reloaded, "PythonTool")
+        assert hasattr(reloaded, "CalculatorTool")
+        assert not hasattr(reloaded, "OpenSandboxPythonTool")
+
+    importlib.reload(tools_module)
+
+
+def test_sandbox_import_is_safe_without_opensandbox():
+    from areal.infra.sandbox import OpenSandboxRunner
+
+    assert OpenSandboxRunner is not None
