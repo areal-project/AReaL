@@ -330,3 +330,43 @@ def test_alignment_selects_sglang_backends(
     engine.config = SimpleNamespace(backend=config_backend)
     engine.backend = type(backend_type, (), {})()
     assert _is_sglang_backend(engine) is expected
+
+
+@pytest.mark.asyncio
+async def test_changed_text_prompt_reuses_decoded_history(processor):
+    """A new prompt key must not decode cached source images again."""
+    buffer = BytesIO()
+    Image.new("RGB", (1600, 1200), "red").save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode()
+    kwargs = dict(
+        processor=processor,
+        tokenizer=SimpleNamespace(eos_token_id=2),
+        tokenizer_messages=[],
+        concat_messages=[],
+        image_data=[encoded],
+        parent=None,
+        chat_template_type="hf",
+        tools=None,
+        extra_body={},
+        processor_cache=ProcessorCallCache(),
+        align_sglang_images=True,
+    )
+    with (
+        patch(
+            "areal.experimental.openai.client.apply_chat_template",
+            return_value="prompt",
+        ),
+        patch("base64.b64decode", wraps=base64.b64decode) as decode,
+    ):
+        first = await _prepare_prompt(**kwargs)
+        kwargs["tokenizer_messages"] = [{"role": "user", "content": "changed text"}]
+        second = await _prepare_prompt(**kwargs)
+        assert decode.call_count == 1
+    assert processor.calls == 2
+    assert second.image_data == first.image_data == [encoded]
+    torch.testing.assert_close(
+        first.multi_modal_input["pixel_values"],
+        second.multi_modal_input["pixel_values"],
+        rtol=0,
+        atol=0,
+    )
