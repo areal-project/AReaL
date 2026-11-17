@@ -21,11 +21,16 @@ default is disabled. Local ranks must share a writable mapping directory, select
 vision tensors; the mapping remains charged to host/cgroup memory after unlinking its
 filename.
 
-Sharing applies only to alias-preserving CPU vision payloads on Gloo groups that span
-the entire default world. Proper subgroups, including independently scheduled DP groups,
-and non-Gloo groups use the original broadcast. The source retains its original input in
-addition to the shared mapping. Image tensors must be treated as immutable by consumers;
-token tensors retain their normal behavior.
+Sharing applies to alias-preserving CPU vision payloads on Gloo groups, including
+independently scheduled, disjoint DP groups. Each DP group owns separate mappings on
+each node: different DP batches never share image storage. Metadata collectives and
+leader-to-leader pixel transfers reuse the existing parent group; no additional process
+groups are created, and unrelated DP ranks need not participate. Calls within each
+parent group must remain ordered. Non-Gloo groups use the original broadcast. The source
+retains its original input in addition to the shared mapping. Image tensors must be
+treated as immutable by consumers; token tensors retain their normal behavior. Pixel
+transfers fan out from the source to one leader per destination node; this preserves
+memory savings but is not a claim of improved throughput at large node counts.
 
 Mappings are unlinked after all local ranks open them, before copying data. Their
 lifetime is owned by live tensor references. Do not delete active shared-memory mappings
@@ -106,6 +111,11 @@ allocation does not guarantee a reduction in the maximum of later JSON/transfer 
 Lazy decode accounts for the measurable additional reduction here. Do not add isolated
 microbenchmark savings or extrapolate these percentages to a full training job.
 
-Validation also passed 173 targeted CPU tests and a real two-node/four-rank Gloo run
-covering nonzero source, repeated aliases, independent mappings, unlink lifetime, text
-fallback and proper-subgroup fallback.
+The initial version passed 173 targeted CPU tests and a real two-node/four-rank Gloo
+run. The DP-capable transport passes 175 targeted CPU tests. Additional real
+two-node/eight-rank tests cover both node-local DP replicas and two DP replicas that
+each span both nodes. They verify staggered startup, unequal stream lengths, changing
+source ranks, singleton groups, repeated aliases, actual shared storage, isolation
+between replicas and nodes, and removal of mapping filenames. These are CPU transport
+tests; they do not validate a full GPU training run or establish DP-specific savings
+percentages.

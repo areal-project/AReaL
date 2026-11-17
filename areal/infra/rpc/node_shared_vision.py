@@ -79,9 +79,10 @@ class NodeSharedVisionTransport:
 
     Token tensors use the existing broadcast. Vision tensors are immutable CPU
     inputs; model forward copies the current microbatch to the accelerator.
-    Only groups spanning the default world use shared mappings. Proper
-    subgroups fall back, so independently scheduled DP groups cannot deadlock
-    during subgroup creation. All local ranks must share the mapping directory.
+    Communication stays within the supplied parent group, so disjoint DP
+    groups progress independently without creating extra process groups.
+    Calls within each parent group must follow the same order. Local ranks
+    must share the mapping directory.
     """
 
     def __init__(self, broadcast_container: Callable, *, node_name: str | None = None):
@@ -89,11 +90,11 @@ class NodeSharedVisionTransport:
         self.node_name = (
             node_name or os.environ.get("SLURMD_NODENAME") or socket.gethostname()
         )
-        self._groups: dict[tuple[Any, int], tuple[Any, Any, int]] = {}
+        self._layouts: dict[tuple[Any, int], tuple[list[int], list[int], int]] = {}
 
-    def _node_groups(self, group, src_rank):
+    def _node_layout(self, group, src_rank):
         key = (group, src_rank)
-        if key not in self._groups:
+        if key not in self._layouts:
             ranks = (
                 dist.get_process_group_ranks(group)
                 if group is not None
@@ -104,31 +105,17 @@ class NodeSharedVisionTransport:
             ranks_by_node: dict[str, list[int]] = {}
             for rank, node in zip(ranks, nodes, strict=True):
                 ranks_by_node.setdefault(node, []).append(rank)
-            local_ranks = ranks_by_node[self.node_name]
             leaders = [
                 src_rank if src_rank in members else members[0]
                 for members in ranks_by_node.values()
             ]
+            local_ranks = ranks_by_node[self.node_name]
             leader = src_rank if src_rank in local_ranks else local_ranks[0]
-            # All ranks create every group in the same order, including
-            # nonmembers. Independently creating overlapping local/leader
-            # groups can stall Gloo initialization across physical nodes.
-            local_group = None
-            for node, members in ranks_by_node.items():
-                node_group = dist.new_group(ranks=members, backend="gloo")
-                if node == self.node_name:
-                    local_group = node_group
-            leader_group = dist.new_group(ranks=leaders, backend="gloo")
-            self._groups[key] = (local_group, leader_group, leader)
-        return self._groups[key]
+            self._layouts[key] = (ranks, leaders, leader)
+        return self._layouts[key]
 
     def __call__(self, data, src_rank=0, group=None, *, preserve_tensor_aliases=False):
-        # new_group below must be called by every WORLD rank. Do not enter
-        # it from a proper subgroup, even when that subgroup uses Gloo.
-        if (
-            dist.get_backend(group) != "gloo"
-            or dist.get_world_size(group) != dist.get_world_size()
-        ):
+        if dist.get_backend(group) != "gloo":
             return self.broadcast_container(
                 data,
                 src_rank=src_rank,
@@ -155,7 +142,7 @@ class NodeSharedVisionTransport:
             group=group,
             preserve_tensor_aliases=preserve_tensor_aliases,
         )
-        local_group, leader_group, leader = self._node_groups(group, src_rank)
+        ranks, leaders, leader = self._node_layout(group, src_rank)
         local_tensors = []
         for index, (shape, dtype) in enumerate(specs[0]):
             path = None
@@ -174,29 +161,39 @@ class NodeSharedVisionTransport:
                         )
                     finally:
                         os.close(fd)
-                names = [path]
-                dist.broadcast_object_list(names, src=leader, group=local_group)
+                names = [None] * len(ranks)
+                dist.all_gather_object(names, path, group=group)
                 mapped = torch.from_file(
-                    names[0],
+                    names[ranks.index(leader)],
                     shared=True,
                     size=math.prod(shape),
                     dtype=dtype,
                     device="cpu",
                 ).reshape(shape)
                 # Open every local mapping, then unlink before populating the
-                # file. A kill during the large transfer cannot leave named
-                # image buffers behind; live mappings own their lifetime.
-                dist.barrier(group=local_group)
+                # file. Unlinked buffers are owned by live mappings and are
+                # reclaimed when their last consumer exits.
+                dist.barrier(group=group)
                 if path is not None:
                     os.unlink(path)
                     path = None
                 if dist.get_rank() == src_rank:
                     mapped.copy_(tensors[index])
-                if dist.get_rank() == leader:
-                    dist.broadcast(mapped, src=src_rank, group=leader_group)
+                    # Only one rank per destination node receives the pixels.
+                    # Reuse the parent group: dynamic subgroups would couple DP
+                    # replicas through process-group initialization state.
+                    sends = [
+                        dist.isend(mapped, dst=destination, group=group)
+                        for destination in leaders
+                        if destination != src_rank
+                    ]
+                    for request in sends:
+                        request.wait()
+                elif dist.get_rank() == leader:
+                    dist.recv(mapped, src=src_rank, group=group)
                 # Every local rank has opened the mapping and the leader has
                 # finished receiving before it becomes visible to consumers.
-                dist.barrier(group=local_group)
+                dist.barrier(group=group)
                 local_tensors.append(mapped)
             finally:
                 # Before all mappings open, only a sparse, unpopulated file
