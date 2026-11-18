@@ -414,6 +414,26 @@ kills, and missing or invalid receipts remain rejected. Both recovery paths stil
 require usable interactions and are vetoed by proxy system errors; they do not turn
 setup or evaluation failures into zero rewards.
 
+## Self Check metrics
+
+Set `self_check: true` on each `econfig.arena_streams` entry whose Harness runs Checker.
+The default is `false`. The same field is supported in Stream YAML files and encoded
+Stream configurations.
+
+```yaml
+arena_streams:
+  - name: baseline
+    stream_id: baseline-stream
+  - name: with-checker
+    stream_id: checker-stream
+    self_check: true
+```
+
+Enabled Streams read Checker artifacts and report `rollout/stream/<name>/selfcheck/...`
+metrics. Global `rollout/selfcheck/...` metrics aggregate these enabled Streams,
+weighted by their trajectory counts. This flag controls telemetry collection. Configure
+the Stream's Harness and Env to provide the Checker service.
+
 ## Per-task reward mappings
 
 For a Stream whose tasks use different original graders, set `reward_mapping_file` in

@@ -52,7 +52,54 @@ async def run_agent(workflow, data_id="data-1"):
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_stream_selfcheck_controls_artifact_reads_and_metrics(
+    workflow, monkeypatch, enabled
+):
+    name = workflow.default_stream_name
+    assert workflow.stream_configs[name].self_check is False
+    workflow.stream_configs[name] = replace(
+        workflow.stream_configs[name], self_check=enabled
+    )
+    telemetry = {
+        "calls": 1.0,
+        "check_1/score": 1.0,
+        SELFCHECK_BUDGET_KEY: 3.0,
+        SELFCHECK_CANDIDATE_CHANGED: 1.0,
+    }
+    result = ArenaTaskResult(
+        task_id="task-1",
+        status="DONE",
+        score=1.0,
+        artifacts_uri="tasks/task-1/attempts/1/",
+        selfcheck_metrics=telemetry,
+    )
+    reader = AsyncMock(return_value=telemetry)
+    monkeypatch.setattr(workflow.client, "get_selfcheck_metrics", reader)
+    monkeypatch.setattr(
+        workflow.client, "launch_one_task_result", AsyncMock(return_value=result)
+    )
+    with capture_metrics() as metrics:
+        assert await run_agent(workflow) == 1.0
+        workflow.record_episode_metrics(
+            {"stream_id": "stream-1", "data_id": "data-1"}, reward=1.0
+        )
+    assert reader.await_count == int(enabled)
+    checker_keys = {key for key in metrics if "/selfcheck/" in key}
+    if enabled:
+        assert "rollout/selfcheck/calls" in checker_keys
+        assert f"rollout/stream/{name}/selfcheck/calls" in checker_keys
+    else:
+        assert not checker_keys
+    assert metrics["rollout/arena_score"] == [1.0]
+
+
 def test_selfcheck_distribution_merges_consumed_final_reward_groups(workflow):
+    name = workflow.default_stream_name
+    workflow.stream_configs[name] = replace(
+        workflow.stream_configs[name], self_check=True
+    )
     data = {"stream_id": "stream-1", "data_id": "data-1"}
     prefix = f"rollout/stream/{workflow.default_stream_name}/selfcheck"
 
@@ -127,6 +174,20 @@ def test_selfcheck_distribution_merges_consumed_final_reward_groups(workflow):
     record(right, 1.0, 3.0, 4.0, episode_data=second)
     record(left, 0.0, 1.0, 2.0, changed=True)
     record(right, 0.0, episode_data=second)
+    workflow.stream_configs["baseline"] = replace(
+        workflow.stream_configs[second_stream],
+        name="baseline",
+        stream_id="baseline",
+        self_check=False,
+    )
+    record(
+        right,
+        1.0,
+        4.0,
+        4.0,
+        episode_data={**data, "stream_id": "baseline", "arena_stream_name": "baseline"},
+        changed=True,
+    )
     merged = _merge_worker_stats([left.export()], consumed_stats=right.export())
     global_prefix = "rollout/selfcheck"
     assert merged[f"{global_prefix}/reward_1/trajectory_count"] == 3
@@ -144,6 +205,7 @@ def test_selfcheck_distribution_merges_consumed_final_reward_groups(workflow):
     assert not any(key.endswith("/final_candidate/comparable_count") for key in merged)
     assert merged[f"{prefix}/reward_1/trajectory_count"] == 1
     assert merged["rollout/stream/second/selfcheck/reward_1/trajectory_count"] == 2
+    assert not any("/stream/baseline/selfcheck/" in key for key in merged)
 
 
 @pytest.mark.asyncio

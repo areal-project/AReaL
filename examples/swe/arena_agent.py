@@ -1672,7 +1672,7 @@ class ArenaStreamAgentWorkflow:
                     f"stream/{stream_config.name}/arena_score": result.score,
                 }
             )
-        if result is not None:
+        if result is not None and stream_config.self_check:
             selfcheck = result.selfcheck_metrics
             is_rollout = workflow_context.stat_scope() == "rollout"
             observations = {
@@ -1701,6 +1701,7 @@ class ArenaStreamAgentWorkflow:
                 metrics.update(
                     {f"{prefix}/{key}": value for key, value in observations.items()}
                 )
+        if result is not None:
             reward_metrics = arena_reward_metrics(
                 sub_scores=result.sub_scores, raw=result.raw, score=result.score
             )
@@ -2300,7 +2301,7 @@ class ArenaStreamAgentWorkflow:
                 _record_arena_metrics(**{"arena/result_processing_success": 0.0})
                 _record_arena_metrics(**{"arena/call_success": 0.0})
                 raise
-            if task_result.artifacts_uri:
+            if stream_config.self_check and task_result.artifacts_uri:
                 try:
                     checker_metrics = await self.client.get_selfcheck_metrics(
                         task_result,

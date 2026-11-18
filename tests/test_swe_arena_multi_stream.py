@@ -52,6 +52,7 @@ def test_load_arena_stream_configs_preserves_reward_specs(tmp_path, source):
             "reward_threshold": 0.98,
             "reward_transform_fn": "examples.swe.reward_transforms.astra_partial_reward",
             "dataset_snapshot_file": " /snapshots/astra.json ",
+            "self_check": True,
         },
         {
             "name": "tbench",
@@ -83,6 +84,17 @@ def test_load_arena_stream_configs_preserves_reward_specs(tmp_path, source):
     assert streams[1].reward_transform_fn == ""
     assert streams[0].dataset_snapshot_file == "/snapshots/astra.json"
     assert streams[1].dataset_snapshot_file == ""
+    assert streams[0].self_check is True
+    assert streams[1].self_check is False
+    assert load_arena_stream_configs({"arena_streams": streams}) == streams
+
+
+@pytest.mark.parametrize("self_check", ["true", "false", 0, 1, None, {}, []])
+def test_arena_stream_self_check_requires_boolean(self_check):
+    with pytest.raises(ValueError, match="self_check must be a boolean"):
+        parse_arena_stream_config(
+            {"name": "a", "stream_id": "stream-a", "self_check": self_check}
+        )
 
 
 @pytest.mark.parametrize("source", ["file", "base64"])
