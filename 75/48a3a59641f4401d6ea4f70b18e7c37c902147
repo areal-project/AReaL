@@ -1,0 +1,21 @@
+docs/en/reference/agent_workflow.md
+  s_bc1c666589a651::t_84162164866170 53-62
+docs/zh/reference/agent_workflow.md
+  s_bc1c666589a651::t_1639213b04e7c3 42-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7548a3a59641f4401d6ea4f70b18e7c37c902147",
+  "prompts": {},
+  "sessions": {
+    "s_bc1c666589a651": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e31e-74a0-77c0-af30-e8ec2f9fdb32",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
