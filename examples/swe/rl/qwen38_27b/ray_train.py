@@ -12,38 +12,161 @@ from pathlib import Path
 import yaml
 
 
-def prepare_ray_config(config: dict, repo: Path, env: dict[str, str]) -> dict:
-    """Preserve training settings while replacing the Slurm launch boundary."""
-    config = copy.deepcopy(config)
-    # The grouped Ray path executes each role's wrapper. Equal-replica forks and
-    # multi-node TP have different bootstrap paths and are not this recipe.
-    if config["allocation_mode"] != "megatron[actor]:d1p4t4c4e1|sglang[rollout]:d16t4":
-        raise ValueError("This Ray recipe requires actor d1p4t4c4e1 and rollout d16t4")
-    # The single-controller trainer reads these fields, not allocation_mode.
-    for role, backend in (
-        ("actor", "megatron:d1p4t4c4e1"),
-        ("rollout", "sglang:d16t4"),
-    ):
-        if config[role]["backend"] != backend:
-            raise ValueError(f"This Ray recipe requires {role}.backend={backend}")
+def ray_gpu_bundles(config: dict) -> list[int]:
+    """Validate v1 colocation and derive the per-node GPU placement requests."""
+    from areal.api.alloc_mode import ModelAllocation, ParallelStrategy, _AllocationMode
+    from areal.api.cli_args import ClusterSpecConfig
+
+    allocations = {
+        role: ModelAllocation.from_str(config[role]["backend"], name=role)
+        for role in ("actor", "rollout")
+    }
+    # v1 schedules from per-role backends. Catch stale legacy metadata rather
+    # than silently launching a different topology from the one in the YAML.
+    if config.get("allocation_mode"):
+        legacy = _AllocationMode.from_str(config["allocation_mode"])
+        for role, allocation in allocations.items():
+            if allocation.backend != legacy[
+                role
+            ].backend or not ParallelStrategy.parallelism_eq(
+                allocation.parallel, legacy[role].parallel
+            ):
+                raise ValueError(f"{role}.backend disagrees with allocation_mode")
+    for role, backend in (("actor", "megatron"), ("rollout", "sglang")):
+        if allocations[role].backend != backend:
+            raise ValueError(f"This dense Qwen entry requires {role}.backend={backend}")
+        parallel = allocations[role].parallel
+        if any(
+            getattr(parallel, dim) < 1
+            for dim in ("dp_size", "tp_size", "pp_size", "cp_size", "ep_size")
+        ):
+            raise ValueError(f"{role} parallel dimensions must be positive")
     if (
         config["actor"].get("scheduling_strategy", {}).get("type", "separation")
         != "separation"
     ):
         raise ValueError("This Ray recipe requires actor separation scheduling")
-    if (config["cluster"]["n_nodes"], config["cluster"]["n_gpus_per_node"]) != (8, 8):
-        raise ValueError("This Ray recipe requires 8 nodes with 8 GPUs each")
-    strategy = config["rollout"]["scheduling_strategy"]
+    strategy = config["rollout"].get("scheduling_strategy", {})
     if (
-        strategy["type"] != "colocation"
-        or strategy["target"] != "actor"
+        strategy.get("type") != "colocation"
+        or strategy.get("target") != "actor"
         or not strategy.get("fork", True)
     ):
         raise ValueError(
             "This Ray recipe requires forked rollout colocation with actor"
         )
+    if any(spec.get("gpu", 0) != 1 for spec in config["actor"]["scheduling_spec"]):
+        raise ValueError("The v1 actor requires one GPU per worker")
+    if config["rollout"]["scheduling_spec"][0].get("gpu", 0) <= 0:
+        raise ValueError("The rollout scheduling spec must request GPUs")
+    actor = allocations["actor"].parallel
+    rollout = allocations["rollout"].parallel
+    if rollout.cp_size != 1 or rollout.ep_size != 1:
+        raise ValueError("SGLang rollout requires CP=EP=1")
+    if actor.world_size != rollout.world_size:
+        raise ValueError("Colocated actor and rollout must use the same total GPUs")
+    cluster = config.get("cluster", {})
+    per_node = cluster.get("n_gpus_per_node", ClusterSpecConfig().n_gpus_per_node)
+    if not isinstance(per_node, int) or isinstance(per_node, bool) or per_node < 1:
+        raise ValueError("cluster.n_gpus_per_node must be a positive integer")
+    full, remainder = divmod(actor.world_size, per_node)
+    bundles = [per_node] * full + ([remainder] if remainder else [])
+    node_limit = cluster.get("n_nodes", len(bundles))
+    if (
+        not isinstance(node_limit, int)
+        or isinstance(node_limit, bool)
+        or node_limit < len(bundles)
+    ):
+        raise ValueError(
+            f"cluster.n_nodes must provide at least {len(bundles)} nodes for the actor"
+        )
+    instance_gpus = rollout.tp_size * rollout.pp_size
+    if any(gpus % instance_gpus for gpus in bundles):
+        raise ValueError(
+            "Each node's actor GPUs must be divisible by rollout TP * PP; cross-node rollout is unsupported"
+        )
+    if instance_gpus == 1 and any(
+        not spec.get("ray_runtime_env") for spec in config["rollout"]["scheduling_spec"]
+    ):
+        raise ValueError(
+            "Single-GPU rollout requires a ray_runtime_env (for example a role image) so Ray runs the rollout wrapper"
+        )
+    return bundles
 
-    config["scheduler"]["type"] = "ray"
+
+def validate_ray_capacity(config: dict, nodes: list[dict]) -> None:
+    """Check physical capacity; Ray still controls admission of busy resources."""
+    required = sorted(ray_gpu_bundles(config), reverse=True)
+    available = sorted(
+        (node["Resources"].get("GPU", 0) for node in nodes if node["Alive"]),
+        reverse=True,
+    )
+    # PACK must not place two actor launchers on one physical node: grouped
+    # rollout colocation expects one target launcher per node.
+    if len(required) > 1 and any(gpus > max(required) for gpus in available):
+        raise RuntimeError(
+            "Set cluster.n_gpus_per_node to the Ray worker node GPU capacity; "
+            "larger nodes can pack multiple actor launchers on one node"
+        )
+    if len(available) < len(required) or any(
+        have < need for have, need in zip(available, required)
+    ):
+        raise RuntimeError(
+            f"Ray cluster needs GPU node bundles {required}; live node GPU capacities: {available}"
+        )
+
+
+def prepare_arena_streams(econfig: dict, env: dict[str, str]) -> None:
+    """Keep native stream/reward bindings; legacy overrides target one stream only."""
+    streams = econfig.get("arena_streams", [])
+    overrides = (
+        "QWEN_ARENA_STREAM_ID",
+        "QWEN_ARENA_HARNESS",
+        "QWEN_REWARD_KEY",
+        "QWEN_REWARD_VERSION",
+    )
+    external = any(
+        econfig.get(key) for key in ("arena_streams_file", "arena_streams_yaml_b64")
+    )
+    if any(env.get(key) for key in overrides) and (len(streams) != 1 or external):
+        raise ValueError(
+            "Single-stream QWEN_* overrides require exactly one inline stream; configure each stream in the YAML instead"
+        )
+    if external:
+        return  # Native Arena configuration loading validates external definitions.
+    if not streams:
+        raise ValueError(
+            "Configure econfig.arena_streams or an external stream definition"
+        )
+    for stream in streams:
+        if env.get("QWEN_ARENA_STREAM_ID"):
+            stream["stream_id"] = env["QWEN_ARENA_STREAM_ID"]
+        if env.get("QWEN_ARENA_HARNESS"):
+            stream["harness"] = env["QWEN_ARENA_HARNESS"]
+        for key in ("key", "version"):
+            if env.get(f"QWEN_REWARD_{key.upper()}"):
+                stream.setdefault("expected_reward_ref", {})[key] = env[
+                    f"QWEN_REWARD_{key.upper()}"
+                ]
+        if not stream.get("stream_id") or stream["stream_id"] == "your-stream-id":
+            raise ValueError(
+                "Set a concrete stream_id in the config or QWEN_ARENA_STREAM_ID for a single stream"
+            )
+        reward = stream.get("expected_reward_ref") or {}
+        if stream.get("reward_mapping_file") and any(reward.values()):
+            raise ValueError(
+                "reward_mapping_file and expected_reward_ref are mutually exclusive"
+            )
+        if any(reward.values()) and not all(
+            reward.get(key) for key in ("key", "version")
+        ):
+            raise ValueError("Pin expected_reward_ref key/version together")
+
+
+def prepare_ray_config(config: dict, repo: Path, env: dict[str, str]) -> dict:
+    """Preserve training settings while replacing the Slurm launch boundary."""
+    config = copy.deepcopy(config)
+    config.setdefault("scheduler", {})["type"] = "ray"
     config["experiment_name"] = "${oc.env:QWEN_EXPERIMENT_NAME}"
     config["trial_name"] = "${oc.env:QWEN_ARENA_TRIAL}"
     config["tokenizer_path"] = "${oc.env:QWEN_MODEL}"
@@ -58,24 +181,7 @@ def prepare_ray_config(config: dict, repo: Path, env: dict[str, str]) -> dict:
     config["sglang"]["model_path"] = "${tokenizer_path}"
     config["rollout"]["agent"]["admin_api_key"] = "${oc.env:SWE_RL_ADMIN_API_KEY}"
 
-    streams = config["econfig"]["arena_streams"]
-    if len(streams) != 1:
-        raise ValueError("This recipe expects one Arena stream")
-    stream = streams[0]
-    if env.get("QWEN_ARENA_STREAM_ID"):
-        stream["stream_id"] = env["QWEN_ARENA_STREAM_ID"]
-    if env.get("QWEN_ARENA_HARNESS"):
-        stream["harness"] = env["QWEN_ARENA_HARNESS"]
-    reward = stream.setdefault("expected_reward_ref", {})
-    for key in ("key", "version"):
-        if env.get(f"QWEN_REWARD_{key.upper()}"):
-            reward[key] = env[f"QWEN_REWARD_{key.upper()}"]
-    if not stream.get("stream_id") or stream["stream_id"] == "your-stream-id":
-        raise ValueError(
-            "Set QWEN_ARENA_STREAM_ID or a concrete stream_id in the config"
-        )
-    if not stream.get("harness") or not all(reward.get(k) for k in ("key", "version")):
-        raise ValueError("Pin the Arena harness and expected_reward_ref key/version")
+    prepare_arena_streams(config["econfig"], env)
 
     wrapper = repo / "examples/swe/rl/qwen38_27b/ray_worker.sh"
     for role in ("actor", "rollout"):
@@ -121,7 +227,12 @@ def prepare_ray_config(config: dict, repo: Path, env: dict[str, str]) -> dict:
                 QWEN_SUBMITTED_RUN_DIR=env["QWEN_RUN_DIR"],
                 QWEN_SUBMITTED_OUTPUT_ROOT=env["QWEN_OUTPUT_ROOT"],
                 QWEN_SUBMITTED_USER=env["QWEN_RUN_USER"],
+                QWEN_SUBMITTED_RECIPE_DIR=env.get(
+                    "QWEN_RECIPE_DIR", str(wrapper.parent)
+                ),
             )
+    bundles = ray_gpu_bundles(config)
+    config["cluster"].setdefault("n_nodes", len(bundles))
     return config
 
 
@@ -145,6 +256,7 @@ def main() -> None:
     os.environ["QWEN_ENV_FILE"] = str(
         Path(os.environ["QWEN_ENV_FILE"]).resolve(strict=True)
     )
+    os.environ["QWEN_RECIPE_DIR"] = str(args.config.resolve(strict=True).parent)
     config = prepare_ray_config(
         yaml.safe_load(args.config.read_text()), recipe.parents[3], dict(os.environ)
     )
@@ -180,18 +292,10 @@ def main() -> None:
     import ray
 
     # Unlike the generic convenience initializer, never fall back to a local
-    # cluster when the intended 64-GPU cluster is unreachable.
+    # cluster when the intended training cluster is unreachable.
     ray.init(address=os.environ.get("RAY_ADDRESS", "auto"), ignore_reinit_error=True)
     try:
-        nodes = [
-            node
-            for node in ray.nodes()
-            if node["Alive"] and node["Resources"].get("GPU", 0) >= 8
-        ]
-        if len(nodes) < 8:
-            raise RuntimeError(
-                "Qwen27 requires an existing Ray cluster with eight 8-GPU nodes"
-            )
+        validate_ray_capacity(config, ray.nodes())
         from examples.swe.rl.qwen38_27b import qwen27_train_rl
 
         # Keep the dense-model decorator, CPU optimizer worker, and RPC settings.

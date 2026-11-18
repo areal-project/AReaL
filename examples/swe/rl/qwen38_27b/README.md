@@ -100,12 +100,25 @@ not added by these files.
 ## Ray
 
 Use `ray_worker.sh controller` inside the controller image on an **existing** Ray
-cluster. This entry reuses `train_fine_released64_bs16.yaml`, the dense Qwen controller
-decorator, and `qwen27_actor_worker` (including its CPU optimizer offload). It replaces
-only the Slurm launch settings and runtime paths. Training remains bs16/gs12, with actor
-DP1/PP4/TP4/CP4 and sixteen TP4 rollout replicas colocated on the same 64 GPUs. The
-adapter rejects other allocations: equal-replica forks and cross-node inference TP use
-different bootstrap paths and are not covered by this recipe.
+cluster. Pass `--config /shared/experiment/train.yaml` to reuse a Slurm experiment's
+training configuration, including multiple Arena streams and per-task reward mappings.
+Without `--config`, the default remains `train_fine_released64_bs16.yaml`. The entry
+keeps the dense Qwen controller decorator and `qwen27_actor_worker` CPU optimizer
+offload, and converts deployment settings to Ray.
+
+Resource requirements come from `actor.backend` and `rollout.backend`, not a fixed node
+count. Actor GPUs are DP × TP × PP × CP; colocated rollout must use the same total GPUs.
+The actor is packed into nodes using `cluster.n_gpus_per_node` (framework default: 8),
+including a partial last node. For multiple node bundles this must match the worker node
+GPU capacity: larger nodes could pack multiple actor launchers on one node, which
+grouped colocation cannot use. `cluster.n_nodes`, when supplied, must be large enough.
+For example, actor `d1p2t4c2` with rollout `d4t4` uses two 8-GPU nodes; actor `d2p4t4c4`
+with rollout `d32t4` uses sixteen. A legacy `allocation_mode`, if present, must agree
+with the per-role backends. This entry supports Megatron actor separation with forked
+SGLang colocation targeting actor. Each inference instance (TP × PP GPUs) must fit
+within, and evenly partition, the actor GPUs on its node. Cross-node inference instances
+are unsupported. Single-GPU inference instances need a nonempty rollout
+`ray_runtime_env` (for example a role image) to use the role wrapper.
 
 Prepare the controller and both role images with compatible Ray/Python versions and
 role-specific dependencies. Set `QWEN_RAY_ACTOR_IMAGE` and `QWEN_RAY_ROLLOUT_IMAGE` to
@@ -133,20 +146,28 @@ Optional `QWEN_RAY_ACTOR_PYTHONPATH` and `QWEN_RAY_ROLLOUT_PYTHONPATH` select
 role-specific package directories before Python starts. Leave them empty when the image
 contains the dependencies. A profile can use `QWEN_RUNTIME_ROLE` (`controller`, `actor`,
 or `rollout`) to select native library paths. Do not change the scheduler-provided
-GPU/rank variables.
+GPU/rank variables. The profile is a shell script: it may source existing private
+credential files and set native library paths by role. A Slurm `site.env` often only
+contains paths; recreate its runtime's credential-loading order and dependency overlays
+in the Ray profile. Do not source a Slurm `runtime.sh` that installs task prologs,
+assumes SIF packages or infers roles from Slurm job names.
 
 1. Make the checkout, model, output storage and private profile readable at the same
    absolute paths on every node. Use a fixed checkout for the run; this Ray entry does
-   not create the Slurm submission's source snapshot. Each of the eight nodes needs
-   eight GPUs and enough Ray CPU/memory resources for the actor requests (32 CPUs and
-   512 GiB per node in the preset). CPU optimizer and rollout processes also need
-   sufficient physical host memory.
+   not create the Slurm submission's source snapshot. Nodes need enough GPUs for the
+   derived placement and enough Ray CPU/memory resources for the actor requests (32 CPUs
+   and 512 GiB per full node in the default preset). CPU optimizer and rollout processes
+   also need sufficient physical host memory.
 
 1. Copy `ray.env.example` to an external private profile. Source your existing
    credentials there. Set the model/output paths, explicit experiment/trial identity,
-   shared run directory and `RAY_ADDRESS`. Pin the actual stream, harness and reward
-   key/version used by the experiment; an unspecified reward version is rejected. There
-   is no need to supply Slurm images, partitions, reservations or mounts.
+   shared run directory and `RAY_ADDRESS`. For the default single-stream template, set
+   its stream/harness/reward overrides. For multiple streams, leave those overrides
+   empty and define each stream in the YAML. `sampling_weight`, `reward_mapping_file`,
+   optional harnesses and expected reward references are preserved. A mapping and an
+   explicit reward reference are mutually exclusive. The native Arena loader validates
+   task bindings and resolves missing harness/reward defaults from Arena. There is no
+   need to supply Slurm images, partitions, reservations or mounts.
 
 1. Prepare the configuration without starting Ray workers or training:
 
@@ -158,8 +179,11 @@ GPU/rank variables.
    This writes `$QWEN_RUN_DIR/train-ray.yaml` with credential references, not expanded
    credentials. Review it before running. To edit training settings, copy the bs16
    preset and pass `--config /shared/path/custom.yaml`; this option also works with
-   `--prepare-only`. Changing an existing generated config requires a new run directory,
-   so a running trial's config cannot be overwritten accidentally.
+   `--prepare-only`. `QWEN_RECIPE_DIR` points to the input YAML's directory in both
+   controller and workers, so `${oc.env:QWEN_RECIPE_DIR}/reward-mappings/...` keeps
+   referring to the experiment's files. Mount that directory in both role images.
+   Changing an existing generated config requires a new run directory, so a running
+   trial's config cannot be overwritten accidentally.
 
 1. Verify controller/worker RPC and training communication, worker access to Arena
    Online, and **Arena LLM gateway access back to each rollout proxy's advertised
@@ -171,10 +195,12 @@ GPU/rank variables.
    ```
 
 The driver connects to the selected cluster without falling back to local Ray and checks
-for eight live nodes with at least eight GPUs. `--prepare-only` does not check the
-target images, network or cluster. Validate real multimodal inference, rewards, CPU
-optimizer allocation, initial AWEX synchronization and the first optimizer update before
-treating a submitted job as healthy.
+the derived per-node GPU requirements against live nodes. This checks total physical
+capacity; busy resources may still make Ray wait, and CPU/memory requests still need
+separate capacity planning. `--prepare-only` does not check the target images, network
+or cluster. Validate real multimodal inference, rewards, CPU optimizer allocation,
+initial AWEX synchronization and the first optimizer update before treating a submitted
+job as healthy.
 
 The role wrapper ignores `SLURM_JOB_NAME`, preserves Ray's device/rank assignment, uses
 unique process cache/log paths, and explicitly enables the historical external
