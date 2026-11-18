@@ -348,6 +348,7 @@ def test_awex_weight_update_runs_without_grad_tracking():
     instance = object.__new__(AwexSGLangAdapter)
     instance._initialized = True
     instance._qwen4_frozen_contract = None
+    instance._qwen35_fp8_receiver = None
     instance._ensure_reader = lambda: reader
     instance._rebuild_derived_weights = lambda: None
 
