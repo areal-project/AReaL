@@ -8,6 +8,7 @@ from PIL.Image import Image as ImageObject
 
 
 def image2base64(images: list[ImageObject] | ImageObject) -> list[str]:
+    """Encode each image as a Base64 PNG, preserving input order and pixel mode."""
     if isinstance(images, ImageObject):
         images = [images]
 
@@ -23,6 +24,11 @@ def image2base64(images: list[ImageObject] | ImageObject) -> list[str]:
 
 
 def pad_images_batch_to_max_size(images):
+    """Center images on black RGB canvases; odd remainders go right and bottom.
+
+    Each output uses the batch's maximum width and height. An empty batch raises
+    ValueError.
+    """
     max_width = max(image.size[0] for image in images)
     max_height = max(image.size[1] for image in images)
 
