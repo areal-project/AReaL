@@ -6,6 +6,8 @@ from typing import Any
 
 import pytest
 import torch
+from msgspec import Struct
+from msgspec import field as struct_field
 
 from areal.engine.sglang_processors._tensor_storage import compact_mm_item_storage
 
@@ -20,10 +22,24 @@ class ImageItem:
     offsets: list[tuple[int, int]] = field(default_factory=lambda: [(2, 17)])
 
 
+class StructImageItem(Struct):
+    feature: torch.Tensor | None = None
+    precomputed_embeddings: torch.Tensor | None = None
+    model_specific_data: dict[str, Any] = struct_field(default_factory=dict)
+    hash: int = 12345
+    pad_value: int = 54321
+    offsets: list[tuple[int, int]] = struct_field(default_factory=lambda: [(2, 17)])
+
+
+@pytest.fixture(params=[ImageItem, StructImageItem], ids=["dataclass", "msgspec"])
+def item_type(request):
+    return request.param
+
+
 @pytest.mark.parametrize("image_count", [1, 2, 4, 8])
-def test_split_images_pickle_payload_stays_linear(image_count):
+def test_split_images_pickle_payload_stays_linear(image_count, item_type):
     batch = torch.arange(image_count * 4096, dtype=torch.float32).reshape(-1, 16)
-    items = [ImageItem(feature=part) for part in batch.chunk(image_count)]
+    items = [item_type(feature=part) for part in batch.chunk(image_count)]
     logical_bytes = batch.numel() * batch.element_size()
 
     compacted = compact_mm_item_storage(items)
@@ -45,10 +61,10 @@ def test_split_images_pickle_payload_stays_linear(image_count):
         assert compact.offsets == original.offsets
 
 
-def test_nested_tensor_aliases_remain_shared_without_mutating_cached_items():
+def test_nested_tensor_aliases_remain_shared_without_mutating_cached_items(item_type):
     batch = torch.arange(256, dtype=torch.float32)
     view = batch[16:32]
-    cached = ImageItem(
+    cached = item_type(
         feature=view,
         model_specific_data={"nested": [view, (view,)]},
     )
@@ -64,12 +80,12 @@ def test_nested_tensor_aliases_remain_shared_without_mutating_cached_items():
     assert cached.feature.untyped_storage().nbytes() == batch.numel() * 4
 
 
-def test_precomputed_embedding_views_are_compacted_and_full_tensors_reused():
+def test_precomputed_embedding_views_are_compacted_and_full_tensors_reused(item_type):
     batch = torch.arange(256, dtype=torch.float32)
     full = torch.ones(16)
     items = [
-        ImageItem(precomputed_embeddings=batch[16:32]),
-        ImageItem(feature=full, model_specific_data={"external_transport": object()}),
+        item_type(precomputed_embeddings=batch[16:32]),
+        item_type(feature=full, model_specific_data={"external_transport": object()}),
     ]
 
     compacted = compact_mm_item_storage(items)
@@ -86,9 +102,9 @@ def test_precomputed_embedding_views_are_compacted_and_full_tensors_reused():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_views_keep_native_storage_and_transport():
+def test_cuda_views_keep_native_storage_and_transport(item_type):
     view = torch.ones(256, device="cuda")[16:32]
 
-    compacted = compact_mm_item_storage([ImageItem(feature=view)])
+    compacted = compact_mm_item_storage([item_type(feature=view)])
 
     assert compacted[0].feature is view
