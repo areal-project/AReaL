@@ -376,10 +376,10 @@ async def test_invalid_prm_export_does_not_consume_trajectory(proxy_factory, inv
 
 
 @pytest.mark.asyncio
-async def test_overlapping_exports_score_once_and_preserve_reused_session(
+async def test_overlapping_exports_score_once_and_preserve_recreated_hitl_session(
     proxy_factory,
 ):
-    """An awaiting export owns its old session, not a new session with the same ID."""
+    """An awaiting export must preserve a recreated HITL session."""
     entered, release = asyncio.Event(), asyncio.Event()
 
     class Scorer(_RewardScorer):
@@ -391,16 +391,19 @@ async def test_overlapping_exports_score_once_and_preserve_reused_session(
     scorer = Scorer()
     client, store = await proxy_factory([scorer])
     async with client:
-        sid = _add_session(store, "reused", [_interaction("first")])
+        session = store.get_or_create_hitl_session()
+        sid = session.session_id
+        interaction = _interaction("first")
+        session.active_completions[interaction.interaction_id] = interaction
+        session.set_reward(interaction.interaction_id, interaction.reward)
         pending = asyncio.create_task(_export(client, [sid]))
         try:
             await asyncio.wait_for(entered.wait(), timeout=2)
             repeated = await _export(client, [sid])
             assert repeated.json()["traj"] == {}
             assert repeated.json()["prm_stats"]["turns"] == []
-            new_sid, _ = store.start_session("reused")
-            assert new_sid == sid
-            replacement = store.get_session(new_sid)
+            replacement = store.get_or_create_hitl_session()
+            assert replacement is not session
         finally:
             release.set()
         first = await asyncio.wait_for(pending, timeout=2)
