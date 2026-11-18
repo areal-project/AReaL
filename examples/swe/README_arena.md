@@ -523,6 +523,14 @@ and any Harness request overrides. These differences affect training semantics; 
 profile is intended for Arena integration validation, not a claim of full recipe
 equivalence.
 
+### Externally scored artifacts
+
+For Harnesses that score an artifact and finish with an empty auxiliary response, set
+`econfig.arena_response_validation_policy: artifact_reward` explicitly. This policy
+preserves the external episode reward only for successful concat exports with PRM
+disabled. Malformed tool calls remain invalid. The default `final_response` policy still
+requires usable final text or a tool call.
+
 ### Multiple Harnesses for one Stream
 
 Multiple `arena_streams` entries may share a `stream_id` to run the same dataset through
