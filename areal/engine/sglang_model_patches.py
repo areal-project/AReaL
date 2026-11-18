@@ -308,9 +308,7 @@ def apply_model_patches(server_args: Sequence[str]) -> None:
             != sglang_qwen_vl_cpu.V0520_BASE_SHA256
         ):
             # Earlier installations may need the legacy CPU override restored.
-            source_patches.append(
-                (base_target, sglang_qwen_vl_cpu.patched_base_source)
-            )
+            source_patches.append((base_target, sglang_qwen_vl_cpu.patched_base_source))
     install_source_patches(
         source_patches,
         lock_path=root / ".areal-sglang-patches.lock",
