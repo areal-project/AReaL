@@ -530,3 +530,10 @@ For Harnesses that score an artifact and finish with an empty auxiliary response
 preserves the external episode reward only for successful concat exports with PRM
 disabled. Malformed tool calls remain invalid. The default `final_response` policy still
 requires usable final text or a tool call.
+
+### Multiple Harnesses for one Stream
+
+Multiple `arena_streams` entries may share a `stream_id` to run the same dataset through
+different Harnesses. Give every entry a unique `name`; sampling weights, Harness
+selection, reward settings, and per-stream metrics use that logical name. Each entry
+contributes its own sampling weight even when its Stream ID is shared.

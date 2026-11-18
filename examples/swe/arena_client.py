@@ -326,8 +326,16 @@ class ArenaOpenAPIClient:
     ) -> dict[str, Any]:
         """Fetch the terminal Harness receipt for one failed task."""
 
+        try:
+            return await self._get_failure_artifact_async(
+                task_id, "harness_result.json", client=client, timeout=timeout
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                raise
+        # Some native Harnesses register the same receipt under this name.
         return await self._get_failure_artifact_async(
-            task_id, "harness_result.json", client=client, timeout=timeout
+            task_id, "native-receipt.json", client=client, timeout=timeout
         )
 
     async def get_whitebox_lifecycle_async(
@@ -341,7 +349,9 @@ class ArenaOpenAPIClient:
     async def _get_failure_artifact_async(
         self,
         task_id: str,
-        artifact: Literal["harness_result.json", "whitebox-lifecycle.json"],
+        artifact: Literal[
+            "harness_result.json", "native-receipt.json", "whitebox-lifecycle.json"
+        ],
         *,
         client: httpx.AsyncClient,
         timeout: float,
