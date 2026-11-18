@@ -4479,24 +4479,6 @@ class MegatronEngine(TrainEngine):
                     )
                 inputs = {k: v for k, v in inputs.items() if not k.startswith("_cp_")}
 
-            if perf_tracer.numeric_profile_context() is not None:
-                inputs = dict(inputs)
-                inputs["_numeric_engine"] = {
-                    "dp_rank": mpu.get_data_parallel_rank(),
-                    "tp_rank": mpu.get_tensor_model_parallel_rank(),
-                    "cp_rank": mpu.get_context_parallel_rank(),
-                    "pp_rank": mpu.get_pipeline_model_parallel_rank(),
-                    "pipeline_last_stage": mpu.is_pipeline_last_stage(),
-                    "checkpoint_path": self.config.path,
-                    "model_dtype": str(self.config.dtype),
-                    "configured_learning_rate": getattr(
-                        self.config.optimizer, "lr", None
-                    ),
-                    "temperature": self.config.temperature,
-                    "tree_training": self.enable_tree_training,
-                    "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
-                    "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
-                }
             loss = loss_fn(
                 logprobs,
                 entropy,

@@ -640,39 +640,6 @@ class PPOActor:
             divisor=self.config.loss_aggregation_divisor,
             group_sizes=meta.traj_group_sizes if meta is not None else None,
         )
-        numeric_context = None
-        profile = perf_tracer.numeric_profile_context()
-        if profile is not None:
-            batch_size, sequence_length = data["input_ids"].shape
-            data["_numeric_row_indices"] = (
-                torch.arange(
-                    batch_size, device=data["input_ids"].device, dtype=torch.long
-                )
-                .unsqueeze(1)
-                .expand(-1, sequence_length)
-            )
-            data["_numeric_token_positions"] = (
-                data["attention_mask"].long().cumsum(-1) - 1
-            )
-            numeric_context = {
-                "source_global_step": profile["global_step"],
-                "batch_rows": batch_size,
-                "traj_group_sizes": meta.traj_group_sizes if meta is not None else [],
-                "rollout_groups": [
-                    None
-                    if group is None
-                    else {
-                        "query_id": group.query_id,
-                        "occurrence_id": group.occurrence_id,
-                        "sample_indices": list(group.sample_indices),
-                        "row_counts": list(group.row_counts),
-                    }
-                    for group in (
-                        (meta.rollout_groups or []) if meta is not None else []
-                    )
-                ],
-                "loss_aggregation": self.config.loss_aggregation,
-            }
         stage_batch_for_engine(data, self.engine)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
@@ -717,8 +684,6 @@ class PPOActor:
         )
         work_indices = [mb.pop("_source_row_indices", []) for mb in mb_inputs]
         data.pop("_r3_row_indices", None)
-        data.pop("_numeric_row_indices", None)
-        data.pop("_numeric_token_positions", None)
         r3_mb_inputs = self._split_r3_minibatches(
             routed_experts, routing_valid, mb_inputs
         )
@@ -753,12 +718,6 @@ class PPOActor:
                     use_decoupled_loss=self.config.use_decoupled_loss,
                     loss_step=loss_step,
                     mopd_loss_config=self._mopd_loss_config,
-                    numeric_context={
-                        **numeric_context,
-                        "optimizer_minibatch": minibatch_index,
-                    }
-                    if numeric_context is not None
-                    else None,
                 )
                 with self._r3_side_channel(*r3_mb):
                     train_stat = self.engine.train_batch(
@@ -1049,7 +1008,6 @@ def grpo_loss_fn(
     vocab_norm_logits: torch.Tensor | None = None,
     use_score_centering: bool = False,
     sc_correction: torch.Tensor | None = None,
-    numeric_context: dict[str, Any] | None = None,
 ):
     """Compute loss and logging stats using the actor's assembled reduction."""
     if use_score_centering and (
@@ -1361,61 +1319,6 @@ def grpo_loss_fn(
         )
 
     logp_diff = (old_logp - logprobs.detach()) * loss_mask
-    numeric_engine = input_data.get("_numeric_engine") or {}
-    if (
-        numeric_context is not None
-        and numeric_engine.get("tp_rank") == 0
-        and numeric_engine.get("cp_rank") == 0
-        and numeric_engine.get("pipeline_last_stage") is True
-    ):
-        perf_tracer.record_numeric(
-            {
-                "input_ids": input_data["input_ids"],
-                "target_ids": torch.roll(input_data["input_ids"], shifts=-1, dims=-1),
-                "attention_mask": input_data.get("attention_mask"),
-                "row_indices": input_data.get("_numeric_row_indices"),
-                "token_positions": input_data.get("_numeric_token_positions"),
-                "cu_seqlens": input_data.get("cu_seqlens"),
-                "base_mask": denominator_mask,
-                "version_mask": version_loss_mask,
-                "m2_mask": loss_mask.bool(),
-                "rejection_mask": stat.get("rejection_loss_mask", loss_mask).bool(),
-                "effective_mask": mopd_loss_mask,
-                "new_logp": logprobs,
-                "old_logp": old_logp,
-                "proximal_logp": prox_logp,
-                "logp_diff": logp_diff,
-                "logp_abs_diff": logp_diff.abs(),
-                "advantages": advantages,
-                "token_loss": stat["loss"],
-                "approx_kl": stat["approx_kl"],
-                "clip_mask": stat["clip_mask"],
-                "dual_clip_mask": stat["dual_clip_mask"],
-                "importance_weight": stat["importance_weight"],
-                "behavior_importance_weight": stat.get("behave_imp_weight"),
-                "actor_loss": loss,
-                "loss_normalizer": pg_reduction.normalizer(),
-                "input_versions": input_data.get("versions"),
-                "target_versions": torch.roll(
-                    input_data["versions"], shifts=-1, dims=-1
-                )
-                if "versions" in input_data
-                else None,
-            },
-            {
-                **numeric_context,
-                **numeric_engine,
-                "policy_version": current_version,
-                "old_logp_source": "training_input.logprobs",
-                "proximal_logp_method": str(prox_logp_method),
-                "importance_sampling_level": importance_sampling_level,
-                "use_decoupled_loss": use_decoupled_loss,
-                "eps_clip": eps_clip,
-                "eps_clip_higher": eps_clip_higher,
-                "c_clip": c_clip,
-                "m2_threshold": m2_threshold,
-            },
-        )
     stats_tracker.stat(
         importance_weight=stat["importance_weight"],
         approx_kl=stat["approx_kl"],
