@@ -1,0 +1,21 @@
+areal/utils/qwen_vl_image.py
+  s_bc1c666589a651::t_1125c131b678dc 3,6-10,74,96-98,101-108,112,116,118-121,142,144-146,148,156,163-171,174,177,182,186,188,190-191
+tests/test_qwen_vl_image_alignment.py
+  s_bc1c666589a651::t_92a50ba77335fd 95,112-113,128-156,198,219-225,233,239-241,243,245-246,254-264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e568a4105fcf69501facdccc68c01881d020768a",
+  "prompts": {},
+  "sessions": {
+    "s_bc1c666589a651": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e31e-74a0-77c0-af30-e8ec2f9fdb32",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
