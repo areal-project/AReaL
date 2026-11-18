@@ -492,11 +492,10 @@ def test_ray_prepare_only_pins_custom_yaml_directory(tmp_path):
     result = subprocess.run(
         [
             "bash",
-            str(RECIPE / "ray_worker.sh"),
-            "controller",
-            "--prepare-only",
+            str(RECIPE.parents[1] / "qwen27b/ray_swemm.sh"),
             "--config",
             str(config_path),
+            "--prepare-only",
         ],
         env=env,
         capture_output=True,
@@ -615,3 +614,175 @@ async def test_qwen_entry_selects_backend_and_preserves_training_rpc(
     }
     await scheduler.async_call_engine("actor/0", "other_method", "actor")
     assert original_call.call_args.kwargs == {}
+
+
+def test_gsm8k_ray_config_resolves_without_arena_or_wandb(tmp_path, monkeypatch):
+    from omegaconf import OmegaConf
+
+    from areal.api.cli_args import GRPOConfig
+
+    recipe = RECIPE.parents[1] / "qwen27b"
+    original = yaml.safe_load((recipe / "gsm8k.yaml").read_text())
+    env = _config_env(tmp_path)
+    env.update(QWEN_MODEL="/shared/model", QWEN_GSM8K_PATH="/shared/data")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    for key in (
+        "ARENA_OPENAPI_BASE",
+        "ARENA_OPENAPI_TOKEN",
+        "SWE_RL_ADMIN_API_KEY",
+        "WANDB_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    config = prepare_ray_config(original, RECIPE.parents[3], env, "gsm8k")
+    resolved = OmegaConf.merge(OmegaConf.structured(GRPOConfig), config)
+    OmegaConf.resolve(resolved)
+    assert ray_gpu_bundles(config) == [8, 8]
+    assert resolved.train_dataset.batch_size == resolved.gconfig.n_samples == 8
+    assert resolved.total_train_steps == 25
+    assert resolved.stats_logger.wandb.mode == "disabled"
+    assert resolved.actor.reward_norm.group_size == 8
+    assert not resolved.actor.token_rewards_as_adv
+    assert "econfig" not in config
+    for role in ("actor", "rollout"):
+        assert (
+            config[role]["scheduling_spec"][0]["env_vars"]["QWEN_SUBMITTED_TASK"]
+            == "gsm8k"
+        )
+
+
+def test_gsm8k_shell_prepares_without_arena_and_applies_overrides(tmp_path):
+    env = _worker_environment(tmp_path)
+    env["QWEN_RAY_PYTHON"] = sys.executable
+    with Path(env["QWEN_ENV_FILE"]).open("a") as profile:
+        profile.write(
+            "\nunset ARENA_OPENAPI_BASE ARENA_OPENAPI_TOKEN ARENA_LLM_API_KEY WANDB_API_KEY WANDB_BASE_URL\nQWEN_TASK=swe\n"
+        )
+    script = RECIPE.parents[1] / "qwen27b/ray_gsm8k.sh"
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--prepare-only",
+            "--set",
+            "actor.backend=megatron:d4p2t4c1e1",
+            "--set",
+            "rollout.backend=sglang:d8t4",
+            "--set",
+            "total_train_steps=50",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    config = yaml.safe_load((tmp_path / "run/train-ray.yaml").read_text())
+    assert config["cluster"]["n_nodes"] == 4
+    assert config["total_train_steps"] == 50
+    assert "econfig" not in config
+    assert (
+        config["actor"]["scheduling_spec"][0]["env_vars"]["QWEN_SUBMITTED_TASK"]
+        == "gsm8k"
+    )
+
+
+def test_swemm_shell_requires_explicit_config():
+    script = RECIPE.parents[1] / "qwen27b/ray_swemm.sh"
+    result = subprocess.run(
+        ["bash", str(script)], capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode == 2
+    assert "--config" in result.stderr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True])
+async def test_gsm8k_entry_uses_native_reward_and_checks_recovery(monkeypatch, resume):
+    from examples.swe.qwen27b import gsm8k_train
+
+    import areal
+    from areal.api import cli_args
+    from areal.dataset import gsm8k
+    from areal.engine.sglang_remote import RemoteSGLangEngine
+    from areal.utils import hf_utils
+
+    config = cli_args.GRPOConfig()
+    config.valid_dataset = None
+    config.train_dataset.path = "local-dataset"
+    factory = RemoteSGLangEngine.as_controller
+    monkeypatch.setattr(cli_args, "load_expr_config", lambda *_: (config, None))
+    monkeypatch.setattr(hf_utils, "load_hf_tokenizer", lambda _: "tokenizer")
+    loads = []
+
+    def load_dataset(**kwargs):
+        loads.append(kwargs)
+        return [{"messages": [], "answer": "42"}]
+
+    monkeypatch.setattr(gsm8k, "get_gsm8k_rl_dataset", load_dataset)
+    monkeypatch.setenv("QWEN_REQUIRE_RECOVER", "1" if resume else "0")
+    monkeypatch.setenv("QWEN_GSM8K_ENABLE_THINKING", "true")
+    trained = []
+    original_call = AsyncMock()
+    scheduler = SimpleNamespace(async_call_engine=original_call)
+
+    class Trainer:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.recover_info = None
+            self._init_scheduler()
+
+        def _init_scheduler(self):
+            return scheduler
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def train(self, **kwargs):
+            trained.append(kwargs)
+
+    monkeypatch.setitem(areal.__dict__, "PPOTrainer", Trainer)
+    if resume:
+        with pytest.raises(RuntimeError, match="no checkpoint was loaded"):
+            gsm8k_train.main([])
+        assert not trained
+    else:
+        gsm8k_train.main([])
+        assert trained[0]["workflow"] == "areal.workflow.rlvr.RLVRWorkflow"
+        assert (
+            trained[0]["workflow_kwargs"]["reward_fn"]
+            == "areal.reward.gsm8k.gsm8k_reward_fn"
+        )
+        assert trained[0]["workflow_kwargs"]["enable_thinking"]
+        assert trained[0]["eval_workflow"] is None
+    assert loads[0]["path"] == "local-dataset"
+    assert loads[0]["split"] == "train"
+    assert RemoteSGLangEngine.as_controller is factory
+    await scheduler.async_call_engine("actor/0", "ppo_update", "actor")
+    assert original_call.call_args.kwargs["max_retries"] == 1
+
+
+def test_gsm8k_local_parquet_loads_offline(tmp_path, monkeypatch):
+    import datasets
+
+    from areal.dataset.gsm8k import get_gsm8k_rl_dataset
+
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", tmp_path / "cache")
+    dataset_path = tmp_path / "local data"
+    dataset_path.mkdir()
+    (dataset_path / "README.md").write_text(
+        "---\nconfigs:\n- config_name: main\n  data_files:\n"
+        "  - split: train\n    path: train.parquet\n---\n"
+    )
+    datasets.Dataset.from_dict(
+        {"question": ["What is 1 + 1?"], "answer": ["#### 2"]}
+    ).to_parquet(str(dataset_path / "train.parquet"))
+    loaded = get_gsm8k_rl_dataset(str(dataset_path), "train", tokenizer=None)
+    assert len(loaded) == 1
+    assert loaded[0]["answer"] == "#### 2"
+    assert loaded[0]["messages"][0]["content"].startswith("What is 1 + 1?")
+    assert "\\boxed{}" in loaded[0]["messages"][0]["content"]

@@ -163,8 +163,12 @@ def prepare_arena_streams(econfig: dict, env: dict[str, str]) -> None:
             raise ValueError("Pin expected_reward_ref key/version together")
 
 
-def prepare_ray_config(config: dict, repo: Path, env: dict[str, str]) -> dict:
+def prepare_ray_config(
+    config: dict, repo: Path, env: dict[str, str], task: str = "swe"
+) -> dict:
     """Preserve training settings while replacing the Slurm launch boundary."""
+    if task not in ("swe", "gsm8k"):
+        raise ValueError("Expected task swe or gsm8k")
     config = copy.deepcopy(config)
     config.setdefault("scheduler", {})["type"] = "ray"
     config["experiment_name"] = "${oc.env:QWEN_EXPERIMENT_NAME}"
@@ -175,13 +179,15 @@ def prepare_ray_config(config: dict, repo: Path, env: dict[str, str]) -> dict:
         "type": "nfs",
         "nfs_record_root": "${cluster.fileroot}/name_resolve/${experiment_name}/${trial_name}",
     }
-    config["econfig"]["arena_base_url"] = "${oc.env:ARENA_OPENAPI_BASE}"
     config["actor"]["path"] = "${tokenizer_path}"
     config["rollout"]["tokenizer_path"] = "${tokenizer_path}"
     config["sglang"]["model_path"] = "${tokenizer_path}"
-    config["rollout"]["agent"]["admin_api_key"] = "${oc.env:SWE_RL_ADMIN_API_KEY}"
-
-    prepare_arena_streams(config["econfig"], env)
+    if task == "swe":
+        config["econfig"]["arena_base_url"] = "${oc.env:ARENA_OPENAPI_BASE}"
+        config["rollout"]["agent"]["admin_api_key"] = "${oc.env:SWE_RL_ADMIN_API_KEY}"
+        prepare_arena_streams(config["econfig"], env)
+    elif "econfig" in config:
+        raise ValueError("Use a GSM8K config without Arena econfig")
 
     wrapper = repo / "examples/swe/rl/qwen38_27b/ray_worker.sh"
     for role in ("actor", "rollout"):
@@ -220,6 +226,7 @@ def prepare_ray_config(config: dict, repo: Path, env: dict[str, str]) -> dict:
             ):
                 role_env.pop(key, None)
             role_env.update(
+                QWEN_SUBMITTED_TASK=task,
                 QWEN_ENV_FILE=env["QWEN_ENV_FILE"],
                 QWEN_RAY_PYTHON=env.get(f"QWEN_RAY_{role.upper()}_PYTHON") or "python3",
                 QWEN_SUBMITTED_TRIAL=env["QWEN_ARENA_TRIAL"],
@@ -240,6 +247,14 @@ def main() -> None:
     recipe = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a YAML field; repeat for multiple fields (OmegaConf dotlist)",
+    )
+    parser.add_argument(
         "--config", type=Path, default=recipe / "train_fine_released64_bs16.yaml"
     )
     parser.add_argument(
@@ -253,13 +268,24 @@ def main() -> None:
         help="Require recovery of this trial; stop its old Ray job first",
     )
     args = parser.parse_args()
+    task = os.environ.get("QWEN_TASK", "swe")
     os.environ["QWEN_ENV_FILE"] = str(
         Path(os.environ["QWEN_ENV_FILE"]).resolve(strict=True)
     )
     os.environ["QWEN_RECIPE_DIR"] = str(args.config.resolve(strict=True).parent)
-    config = prepare_ray_config(
-        yaml.safe_load(args.config.read_text()), recipe.parents[3], dict(os.environ)
+    from omegaconf import OmegaConf
+
+    if any("=" not in item for item in args.overrides):
+        parser.error("Each --set requires KEY=VALUE")
+    config = OmegaConf.to_container(
+        OmegaConf.merge(
+            OmegaConf.load(args.config), OmegaConf.from_dotlist(args.overrides)
+        ),
+        resolve=False,
     )
+    if config.get("defaults"):
+        raise ValueError("Pass a complete YAML config without Hydra defaults")
+    config = prepare_ray_config(config, recipe.parents[3], dict(os.environ), task)
     run_dir = Path(os.environ["QWEN_RUN_DIR"])
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     config_path = run_dir / "train-ray.yaml"
@@ -299,7 +325,7 @@ def main() -> None:
         from examples.swe.rl.qwen38_27b import qwen27_train_rl
 
         # Keep the dense-model decorator, CPU optimizer worker, and RPC settings.
-        sys.argv = [sys.argv[0], "swe", "--config", str(config_path)]
+        sys.argv = [sys.argv[0], task, "--config", str(config_path)]
         qwen27_train_rl.main()
     finally:
         ray.shutdown()

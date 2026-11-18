@@ -210,3 +210,7 @@ workers before resuming. The Ray entry does not execute the Slurm job-state pref
 install an `afterany` cleanup job. Configure your Ray job platform to terminate the
 driver/workers and arrange trial-scoped Arena task cleanup after a hard kill; do not run
 the Slurm cleanup script against Ray jobs.
+
+Task-specific [SWE-MM and GSM8K drivers](../../qwen27b/README.md) provide Ray Jobs
+submission examples, a standalone GSM8K preset, and repeatable `--set KEY=VALUE`
+configuration overrides.

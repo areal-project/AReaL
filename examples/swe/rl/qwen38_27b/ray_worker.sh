@@ -11,6 +11,7 @@ ray_recipe=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 : "${QWEN_ENV_FILE:?Set a shared Ray site profile}"
 # These values are pinned by the controller, even if the profile uses defaults.
 ray_profile=$QWEN_ENV_FILE
+ray_task=${QWEN_SUBMITTED_TASK:-${QWEN_TASK:-swe}}
 ray_trial=${QWEN_SUBMITTED_TRIAL:-}
 ray_run_dir=${QWEN_SUBMITTED_RUN_DIR:-}
 ray_experiment=${QWEN_SUBMITTED_EXPERIMENT:-}
@@ -36,6 +37,11 @@ for ray_key in "${ray_device_vars[@]}"; do
   fi
 done
 export QWEN_ENV_FILE=$ray_profile
+export QWEN_TASK=$ray_task
+case "$QWEN_TASK" in
+  swe|gsm8k) ;;
+  *) echo "Unknown Qwen Ray task: $QWEN_TASK" >&2; exit 2 ;;
+esac
 export QWEN_REPO=$(cd "$ray_recipe/../../../.." && pwd)
 export QWEN_RECIPE_DIR=${ray_config_dir:-${QWEN_RECIPE_DIR:-$ray_recipe}}
 export QWEN_RUNTIME_ROLE=$ray_role
@@ -50,7 +56,11 @@ export QWEN_RAY_PYTHON=${ray_python:-${QWEN_RAY_PYTHON:-python3}}
 unset SLURM_PROCID RANK LOCAL_RANK WORLD_SIZE LOCAL_WORLD_SIZE MASTER_ADDR MASTER_PORT AREAL_SPMD_MODE
 export QWEN_ARENA_OUTPUT=$QWEN_OUTPUT_ROOT
 export USER=$QWEN_RUN_USER LOGNAME=$QWEN_RUN_USER
-for ray_key in QWEN_MODEL ARENA_OPENAPI_BASE ARENA_OPENAPI_TOKEN ARENA_LLM_API_KEY WANDB_BASE_URL WANDB_API_KEY; do
+ray_required_vars=(QWEN_MODEL)
+if [[ $QWEN_TASK == swe ]]; then
+  ray_required_vars+=(ARENA_OPENAPI_BASE ARENA_OPENAPI_TOKEN ARENA_LLM_API_KEY)
+fi
+for ray_key in "${ray_required_vars[@]}"; do
   : "${!ray_key:?Set $ray_key in the Ray site profile}"
   export "$ray_key"
 done

@@ -1,0 +1,233 @@
+# Qwen27 dense GSM8K smoke/comparison preset: BS8, GS8, 25 updates.
+# The example layout uses 16 GPUs; override backends to choose another scale.
+# cluster.n_nodes is inferred; n_gpus_per_node must match the Ray workers.
+experiment_name: ${oc.env:QWEN_EXPERIMENT_NAME}
+trial_name: ${oc.env:QWEN_ARENA_TRIAL}
+seed: 42
+enable_offload: false
+total_train_epochs: 100
+total_train_steps: 25
+tokenizer_path: ${oc.env:QWEN_MODEL}
+cluster:
+  n_gpus_per_node: 8
+  fileroot: ${oc.env:QWEN_OUTPUT_ROOT}
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${cluster.fileroot}/name_resolve/${experiment_name}/${trial_name}
+scheduler:
+  type: ray
+gconfig:
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 100000
+  greedy: false
+  ignore_eos: false
+  n_samples: 8
+  max_new_tokens: 4096
+  max_tokens: 8192
+rollout:
+  backend: sglang:d4t4
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 8
+  queue_size: 8
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 1
+  enable_rollout_tracing: false
+  check_trajectory_format: true
+  scheduling_spec:
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    cpu: 4
+    mem: 64
+    cmd: python3 -m areal.infra.rpc.rpc_server
+    env_vars:
+      OMP_NUM_THREADS: '4'
+      NCCL_DEBUG: WARN
+  scheduling_strategy:
+    type: colocation
+    target: actor
+    fork: true
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  setup_timeout: 7200
+  request_timeout: 20000
+  request_retries: 0
+  pause_grace_period: 60
+  return_routed_experts: false
+  _version: v1
+actor:
+  min_usable_group_size: 8
+  backend: megatron:d2p2t4c1e1
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${tokenizer_path}
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  weight_update_mode: awex
+  mb_spec:
+    n_mbs: 4
+    n_mbs_divisor: 2
+    max_tokens_per_mb: 8192
+  optimizer:
+    type: adam
+    lr: 3.0e-06
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1.0e-08
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps: 2
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: false
+    enable_chunked_logits: false
+    lm_head_loss_chunk_size: 0
+    enable_fp32_lm_head: false
+    cross_entropy_loss_fusion: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    bridge_type: megatron-bridge
+    language_model_only: false
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    use_bridge_for_update_weights: false
+    enable_mtp: false
+    use_precision_aware_optimizer: false
+    main_grads_dtype: float32
+    main_params_dtype: float32
+    exp_avg_dtype: float32
+    exp_avg_sq_dtype: float32
+  eps_clip: 0.2
+  eps_clip_higher: 0.28
+  temperature: ${gconfig.temperature}
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  loss_aggregation: token_mean
+  recompute_logprob: false
+  prox_logp_method: reuse_train_logp
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+    lower: 0.5
+  discount: 1.0
+  gae_timestep_unit: token
+  gae_lambda: 1.0
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_clip: 5.0
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm:
+    mean_level: null
+    std_level: null
+  token_rewards_as_adv: false
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    cpu: 4
+    mem: 64
+    cmd: python3 -m areal.infra.rpc.rpc_server
+    env_vars:
+      OMP_NUM_THREADS: '4'
+      NCCL_DEBUG: WARN
+  _version: v1
+ref: null
+sglang:
+  model_path: ${tokenizer_path}
+  random_seed: 42
+  skip_tokenizer_init: true
+  dtype: bfloat16
+  context_length: 8192
+  max_prefill_tokens: 8192
+  chunked_prefill_size: 8192
+  max_running_requests: 16
+  mem_fraction_static: 0.7
+  attention_backend: null
+  sampling_backend: null
+  disable_cuda_graph: false
+  cuda_graph_max_bs: 16
+  disable_radix_cache: false
+  enable_memory_saver: true
+  mamba_ssm_dtype: bfloat16
+  ep_size: 1
+  log_level: info
+  enable_multimodal: true
+train_dataset:
+  batch_size: 8
+  shuffle: true
+  pin_memory: true
+  num_workers: 0
+  path: ${oc.env:QWEN_GSM8K_PATH}
+  type: rl
+  max_length: 2048
+  drop_last: true
+valid_dataset: null
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+recover:
+  mode: auto
+  retries: 3
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: 7200
+  no_save_optim: false
+  no_load_optim: false
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+    project: ${experiment_name}
+    name: ${trial_name}
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false
+eval_gconfig:
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 100000
+  greedy: true
+  ignore_eos: false
+  n_samples: 1
+  max_new_tokens: 4096
+  max_tokens: 8192
