@@ -2783,6 +2783,13 @@ class SGLangConfig:
 
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
+        args = args.copy()
+        if pkg_version.is_version_greater_or_equal("sglang", "0.5.20"):
+            # SGLang split the legacy decode graph options from prefill graphs.
+            for key in ("cuda_graph_max_bs", "cuda_graph_bs"):
+                value = args.pop(key, None)
+                if value is not None:
+                    args.setdefault(f"{key}_decode", value)
         return get_py_cmd("areal.v2.inference_service.sglang.launch_server", args)
 
     @staticmethod
