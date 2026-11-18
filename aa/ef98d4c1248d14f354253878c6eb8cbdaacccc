@@ -1,0 +1,17 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "aaef98d4c1248d14f354253878c6eb8cbdaacccc",
+  "prompts": {},
+  "sessions": {
+    "s_bc1c666589a651": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e31e-74a0-77c0-af30-e8ec2f9fdb32",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}

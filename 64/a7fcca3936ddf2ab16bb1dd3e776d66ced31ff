@@ -1,0 +1,27 @@
+areal/v2/inference_service/sglang/scheduler.py
+  s_d2cc4f3536bafd::t_a2d314d3af3ca3 215
+tests/test_sglang_model_patches.py
+  s_d2cc4f3536bafd::t_44e67678d3de6a 143,144
+  s_d2cc4f3536bafd::t_c139006a124806 152,169,173,176-177
+  s_d2cc4f3536bafd::t_b6d00fe35773af 157,166,168
+  s_d2cc4f3536bafd::t_2ca43ea3b6411a 146-147
+  s_d2cc4f3536bafd::t_ee18ffcb8d9e85 184,186,190-191,192,196,201
+areal/engine/sglang_model_patches.py
+  s_d2cc4f3536bafd::t_792b2865443474 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "64a7fcca3936ddf2ab16bb1dd3e776d66ced31ff",
+  "prompts": {},
+  "sessions": {
+    "s_d2cc4f3536bafd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1335a-3e29-77d3-9130-2955bc5b7e89",
+        "model": "gpt-6-sol"
+      },
+      "human_author": null
+    }
+  }
+}
