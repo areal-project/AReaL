@@ -1,0 +1,128 @@
+examples/swe/rl/qwen38_27b/train_exp_opd_2.yaml
+  s_5fe4f177ea3656::t_508d913b076f85 323,333-334
+  s_5fe4f177ea3656::t_ecdba2890a26be 1-64,66-322,324-332,335-340,343-424
+  s_5fe4f177ea3656::t_01dcd428a8d006 65
+  s_5fe4f177ea3656::t_23ce56fbe12215 341-342
+tests/test_mopd_loss.py
+  s_21d7980f10cabc::t_69c435e2b28ecf 540-542
+  s_21d7980f10cabc::t_56fdd249004229 535-539
+  s_21d7980f10cabc::t_7e9ab57b0d9d5c 504-534,543-545
+tests/test_workflow_executor_filtering.py
+  s_2b1ff524f9de6f::t_39830bda4a1c8f 56-88
+  s_2b1ff524f9de6f::t_a806cc36fe7047 55
+tests/test_swe_arena.py
+  s_5fe4f177ea3656::t_b367d79c600721 1524,1527,1530
+  s_5fe4f177ea3656::t_8ee09e46f96264 1520-1523,1525-1526,1528-1529,1531-1553,1557-1559,1565-1568
+  s_5fe4f177ea3656::t_2a1a68327fef09 16
+  s_5fe4f177ea3656::t_fec41f8f712e2a 1554-1556,1560-1564
+  s_5fe4f177ea3656::t_a2e25491bdee8b 1519
+areal/infra/workflow_executor.py
+  s_2b1ff524f9de6f::t_ae2f036b1879f6 894,1196,1357,1412-1413
+  s_2b1ff524f9de6f::t_1f7f4d69e30e56 25,45,1197,1356,1358,1414-1415
+examples/swe/utils.py
+  s_5fe4f177ea3656::t_aba8c85e1d1304 130-131,133
+  s_5fe4f177ea3656::t_b367d79c600721 139
+  s_5fe4f177ea3656::t_1c577302c996ae 132
+  s_5fe4f177ea3656::t_3daef62f199cdd 136-138,140-141
+  s_5fe4f177ea3656::t_561deb0325291e 127-129,134-135
+tests/test_swe_arena_multi_stream.py
+  s_5fe4f177ea3656::t_44cd8c2fd198dd 46-51
+  s_5fe4f177ea3656::t_6c13541560d16a 899,910,935,972,1053,1059,1094,1147,1153,1266,1379,1408,1424,1439,1469,1582,1611,1631,2012,2121
+  s_5fe4f177ea3656::t_57534cd8f91f0a 484
+  s_99e620026e6114::t_79b48234cf4dfa 16,31-35,38-39,455-472,530-545
+  s_62ceb3170aff2f::t_ec1cbda4bc04ab 473-483,485-529
+  s_99e620026e6114::t_73afbb3b6c198a 546-547
+examples/swe/qwen38_flash_next/train_rl.py
+  s_62ceb3170aff2f::t_efcbf29f1c697e 182-185,223-224
+tests/test_swe_arena_abbreviated_receipt.py
+  s_5fe4f177ea3656::t_44cd8c2fd198dd 12-17
+  s_5fe4f177ea3656::t_6c13541560d16a 68,178
+tests/experimental/openai/test_context_overflow_recovery.py
+  s_5fe4f177ea3656::t_7d0d5d75c73214 188-247
+  s_5fe4f177ea3656::t_44cd8c2fd198dd 34-39
+  s_5fe4f177ea3656::t_947abdde61c6c2 82-134
+  s_5fe4f177ea3656::t_905672eac800be 135-187
+  s_5fe4f177ea3656::t_6c13541560d16a 380,444,486,508
+examples/swe/arena_agent.py
+  s_5fe4f177ea3656::t_adf274fff26d3c 1431,1447,1450,1462
+  s_5fe4f177ea3656::t_3daef62f199cdd 534-542,2176-2178
+  s_5fe4f177ea3656::t_27acfeebfbf02a 1455,1504-1536
+  s_5fe4f177ea3656::t_5191332132d861 1452-1454,1456,1471-1475,1481-1496,1503
+  s_5fe4f177ea3656::t_b367d79c600721 2175
+  s_5fe4f177ea3656::t_920ca6b821e64e 1476-1480,1497-1502
+  s_5fe4f177ea3656::t_561deb0325291e 529-533
+  s_5fe4f177ea3656::t_f257fc303bd7a8 1449,1451,1457-1458
+  s_5fe4f177ea3656::t_b358a33a5b0707 1537
+tests/test_ppo_actor_controller.py
+  s_3d70538560ab39::t_593b5a529b0bad 86-150
+areal/engine/megatron_engine.py
+  s_2b1ff524f9de6f::t_d0e6497a0d2d9e 4474-4476,4480-4485
+examples/swe/train_swe_rl.py
+  s_99e620026e6114::t_b6a9b2304bc731 31,246-262,359-362
+areal/api/cli_args.py
+  s_2b1ff524f9de6f::t_113d9fb156169a 1473-1476
+  s_2b1ff524f9de6f::t_9e36c3a92139b9 22,3176-3179
+areal/trainer/ppo/actor.py
+  s_2b1ff524f9de6f::t_ff896838f56c42 59,139,237-240
+  s_2b1ff524f9de6f::t_7cb25a8dbefe0e 12
+  s_21d7980f10cabc::t_4b11c6f93e1f00 1014-1017
+  s_3d70538560ab39::t_50bd036fe5de2a 838-869,871-885
+examples/swe/rl/qwen38_27b/train_exp_opd.yaml
+  s_5fe4f177ea3656::t_561deb0325291e 1-422
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4486832063af8309d02d87caef1884b62086dd62",
+  "prompts": {},
+  "sessions": {
+    "s_21d7980f10cabc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1aab7-b92d-7f90-a759-2ac6d507f127",
+        "model": "gpt-6-sol"
+      },
+      "human_author": null
+    },
+    "s_2b1ff524f9de6f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19b42-9d52-7c80-bdb6-ef7d7304d07d",
+        "model": "gpt-6-sol"
+      },
+      "human_author": null
+    },
+    "s_3d70538560ab39": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1aa63-34ec-7362-9ec9-e2855d5ed61f",
+        "model": "gpt-6-sol"
+      },
+      "human_author": null
+    },
+    "s_5fe4f177ea3656": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1b580-79e0-71b1-b028-f4354c7ec22a",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "Huaijie Wang <wanghuaijie.whj@antgroup.com>"
+    },
+    "s_62ceb3170aff2f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a00f-6bcd-7c91-9650-611f9f005b3f",
+        "model": "gpt-6-sol"
+      },
+      "human_author": null
+    },
+    "s_99e620026e6114": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19fb8-6e81-76f3-8b7d-1889bc5a1a20",
+        "model": "gpt-6-sol"
+      },
+      "human_author": null
+    }
+  }
+}
