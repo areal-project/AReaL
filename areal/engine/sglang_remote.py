@@ -842,6 +842,10 @@ class RemoteSGLangEngine(InferenceEngine):
         """Transfer the trajectory and quality metrics to the rollout consumer."""
         return self._engine.get_rollout_result(task_id, timeout, raise_timeout)
 
+    def discard_rollout_result(self, task_id: int) -> None:
+        """Drop a rollout result that the controller will never fetch."""
+        self._engine.discard_rollout_result(task_id)
+
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | None:
