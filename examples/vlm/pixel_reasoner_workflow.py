@@ -1203,6 +1203,19 @@ class PixelReasonerWorkflow(RolloutWorkflow):
         )
         if not interactions:
             return None
+        if truncated:
+            record_disposition(
+                "outcome",
+                "reward",
+                "skipped",
+                unit="sample",
+                outcome="unscored",
+                verdict_status="unscored",
+                unscored_reason=end_reason,
+                verifier_invoked=False,
+                raw_reward=reward,
+                task_success=None,
+            )
         for turn, interaction in enumerate(interactions.values()):
             interaction.reward = interaction.rollout_reward = reward
             tensors = interaction.to_tensor_dict()
