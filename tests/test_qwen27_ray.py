@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
-from examples.swe.rl.qwen38_27b.ray_train import prepare_ray_config
+from examples.swe.rl.qwen38_27b.ray_train import (
+    prepare_ray_config,
+    ray_gpu_bundles,
+    validate_ray_capacity,
+)
 
 RECIPE = Path(__file__).parents[1] / "examples/swe/rl/qwen38_27b"
 
@@ -133,9 +137,9 @@ def test_ray_config_preserves_native_container_mounts_and_rejects_image_conflict
     [
         (
             {"allocation_mode": "megatron[actor]:d1p4t4c2e1|sglang[rollout]:d8t4"},
-            "requires actor",
+            "actor.backend",
         ),
-        ({"cluster": {"n_nodes": 1, "n_gpus_per_node": 8}}, "8 nodes"),
+        ({"cluster": {"n_nodes": 1, "n_gpus_per_node": 8}}, "at least 8 nodes"),
     ],
 )
 def test_ray_config_rejects_uncovered_bootstrap_topologies(tmp_path, change, match):
@@ -149,7 +153,7 @@ def test_ray_config_requires_explicit_reward_version(tmp_path):
     config = yaml.safe_load((RECIPE / "train_fine_released64_bs16.yaml").read_text())
     env = _config_env(tmp_path)
     del env["QWEN_REWARD_VERSION"]
-    with pytest.raises(ValueError, match="Pin the Arena harness"):
+    with pytest.raises(ValueError, match="Pin expected_reward_ref"):
         prepare_ray_config(config, RECIPE.parents[3], env)
 
 
@@ -174,6 +178,140 @@ def test_ray_config_rejects_actual_backend_changes_with_old_allocation(
     config[role][field] = value
     with pytest.raises(ValueError, match=match):
         prepare_ray_config(config, RECIPE.parents[3], _config_env(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "actor,rollout,gpus_per_node,node_limit,bundles",
+    [
+        ("d1p2t4c2", "d4t4", 8, 2, [8, 8]),
+        ("d1p4t4c4", "d16t4", 8, 8, [8] * 8),
+        ("d2p4t4c4", "d32t4", 8, 16, [8] * 16),
+        ("d3t4", "d3t4", 8, 4, [8, 4]),
+        ("d2t2", "d2t2", 4, 1, [4]),
+        ("d2", "d2", 2, 1, [2]),
+    ],
+)
+def test_ray_topology_uses_backend_dimensions(
+    tmp_path, actor, rollout, gpus_per_node, node_limit, bundles
+):
+    config = yaml.safe_load((RECIPE / "train_fine_released64_bs16.yaml").read_text())
+    config.pop("allocation_mode")
+    config["actor"]["backend"] = f"megatron:{actor}"
+    config["rollout"]["backend"] = f"sglang:{rollout}"
+    config["cluster"].update(n_nodes=node_limit, n_gpus_per_node=gpus_per_node)
+    env = _config_env(tmp_path)
+    env["QWEN_RAY_ROLLOUT_IMAGE"] = "registry.example/rollout:fixed"
+    result = prepare_ray_config(config, RECIPE.parents[3], env)
+    assert ray_gpu_bundles(result) == bundles
+    nodes = [{"Alive": True, "Resources": {"GPU": gpus}} for gpus in bundles]
+    validate_ray_capacity(result, nodes)
+    nodes[-1]["Alive"] = False
+    with pytest.raises(RuntimeError, match="GPU node bundles"):
+        validate_ray_capacity(result, nodes)
+
+
+def test_ray_capacity_rejects_fragmentation_even_with_enough_total_gpus(tmp_path):
+    config = yaml.safe_load((RECIPE / "train_fine_released64_bs16.yaml").read_text())
+    result = prepare_ray_config(config, RECIPE.parents[3], _config_env(tmp_path))
+    with pytest.raises(RuntimeError, match="GPU node bundles"):
+        validate_ray_capacity(result, [{"Alive": True, "Resources": {"GPU": 4}}] * 16)
+
+
+@pytest.mark.parametrize(
+    "actor,rollout,gpus_per_node,match",
+    [
+        ("d1t8", "d1t4", 8, "same total GPUs"),
+        ("d1t16", "d1t16", 8, "cross-node"),
+        ("d1t12", "d2t6", 8, "divisible"),
+        ("d1t4", "d2t1c2", 8, "Parsing error"),
+        ("d1t4", "d4t1", 8, "Single-GPU rollout"),
+    ],
+)
+def test_ray_topology_rejects_unsupported_colocation(
+    tmp_path, actor, rollout, gpus_per_node, match
+):
+    config = yaml.safe_load((RECIPE / "train_fine_released64_bs16.yaml").read_text())
+    config.pop("allocation_mode")
+    config["actor"]["backend"] = f"megatron:{actor}"
+    config["rollout"]["backend"] = f"sglang:{rollout}"
+    config["cluster"]["n_gpus_per_node"] = gpus_per_node
+    with pytest.raises(ValueError, match=match):
+        prepare_ray_config(config, RECIPE.parents[3], _config_env(tmp_path))
+
+
+def test_ray_config_preserves_multistream_recipe_with_omitted_defaults(tmp_path):
+    config = yaml.safe_load((RECIPE / "train_fine_released64_bs16.yaml").read_text())
+    config["cluster"].pop("n_gpus_per_node")
+    config["actor"].pop("scheduling_strategy", None)
+    config["rollout"]["scheduling_strategy"].pop("fork")
+    config["scheduler"] = {}
+    config["econfig"]["arena_streams"] = [
+        {
+            "name": f"stream-{i}",
+            "stream_id": f"id-{i}",
+            "sampling_weight": i + 1,
+            "reward_mapping_file": f"${{oc.env:QWEN_RECIPE_DIR}}/reward-mappings/{i}.json",
+        }
+        for i in range(6)
+    ]
+    config["train_dataset"]["batch_size"] = 64
+    config["rollout"].update(
+        consumer_batch_size=64, max_concurrent_rollouts=16, queue_size=256
+    )
+    config["gconfig"].update(n_samples=12, reward_normalization_use_std=False)
+    config["sglang"]["max_running_requests"] = 1000
+    original = copy.deepcopy(config)
+    env = {
+        k: v
+        for k, v in _config_env(tmp_path).items()
+        if k
+        not in (
+            "QWEN_ARENA_STREAM_ID",
+            "QWEN_ARENA_HARNESS",
+            "QWEN_REWARD_KEY",
+            "QWEN_REWARD_VERSION",
+        )
+    }
+    env["QWEN_RECIPE_DIR"] = str(tmp_path / "external recipe")
+    result = prepare_ray_config(config, RECIPE.parents[3], env)
+    assert config == original
+    for key in ("econfig", "gconfig", "train_dataset", "sglang", "should_accept_fn"):
+        assert result[key] == original[key]
+    for key in ("consumer_batch_size", "max_concurrent_rollouts", "queue_size"):
+        assert result["rollout"][key] == original["rollout"][key]
+    assert ray_gpu_bundles(result) == [8] * 8
+    for role in ("actor", "rollout"):
+        assert (
+            result[role]["scheduling_spec"][0]["env_vars"]["QWEN_SUBMITTED_RECIPE_DIR"]
+            == env["QWEN_RECIPE_DIR"]
+        )
+    env["QWEN_REWARD_KEY"] = "accidental-global-override"
+    with pytest.raises(ValueError, match="exactly one inline stream"):
+        prepare_ray_config(config, RECIPE.parents[3], env)
+
+
+def test_ray_config_rejects_reward_override_on_mapping(tmp_path):
+    config = yaml.safe_load((RECIPE / "train_fine_released64_bs16.yaml").read_text())
+    config["econfig"]["arena_streams"][0]["reward_mapping_file"] = "external.json"
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        prepare_ray_config(config, RECIPE.parents[3], _config_env(tmp_path))
+
+
+@pytest.mark.parametrize("role", ["actor", "rollout"])
+def test_ray_config_rejects_implicit_cpu_workers(tmp_path, role):
+    config = yaml.safe_load((RECIPE / "train_fine_released64_bs16.yaml").read_text())
+    config[role]["scheduling_spec"][0].pop("gpu")
+    with pytest.raises(ValueError, match="GPU"):
+        prepare_ray_config(config, RECIPE.parents[3], _config_env(tmp_path))
+
+
+def test_ray_capacity_rejects_nodes_that_can_pack_multiple_launchers(tmp_path):
+    config = yaml.safe_load((RECIPE / "train_fine_released64_bs16.yaml").read_text())
+    config["cluster"]["n_gpus_per_node"] = 4
+    config["cluster"]["n_nodes"] = 16
+    result = prepare_ray_config(config, RECIPE.parents[3], _config_env(tmp_path))
+    with pytest.raises(RuntimeError, match="multiple actor launchers"):
+        validate_ray_capacity(result, [{"Alive": True, "Resources": {"GPU": 8}}] * 16)
 
 
 def _worker_environment(tmp_path):
@@ -223,6 +361,7 @@ def _worker_environment(tmp_path):
         SLURM_PROCID="99",
         RANK="99",
         QWEN_SUBMITTED_TRIAL="pinned-trial",
+        QWEN_SUBMITTED_RECIPE_DIR=str(tmp_path / "external recipe"),
     )
     return env
 
@@ -269,6 +408,7 @@ def test_ray_worker_initializes_role_before_python_and_preserves_rpc_args(
     assert actual["PYTHONPATH"].startswith(f"/{role}-only:")
     assert "/wrong-controller-deps" not in actual["PYTHONPATH"]
     assert actual["QWEN_ARENA_TRIAL"] == "pinned-trial"
+    assert actual["QWEN_RECIPE_DIR"] == env["QWEN_SUBMITTED_RECIPE_DIR"]
     for key in (
         "CUDA_VISIBLE_DEVICES",
         "SLURM_LOCALID",
@@ -327,6 +467,49 @@ def test_ray_controller_prepare_only_writes_config_without_cluster_or_secrets(tm
     assert result.returncode != 0
     assert "Ray config changed" in result.stderr
     assert config_path.read_text() == text
+
+
+def test_ray_prepare_only_pins_custom_yaml_directory(tmp_path):
+    env = _worker_environment(tmp_path)
+    env["QWEN_RAY_PYTHON"] = sys.executable
+    recipe_dir = tmp_path / "external experiment"
+    recipe_dir.mkdir()
+    config = yaml.safe_load((RECIPE / "train_fine_released64_bs16.yaml").read_text())
+    config["econfig"]["arena_streams"] = [
+        {
+            "name": f"stream-{i}",
+            "stream_id": f"id-{i}",
+            "reward_mapping_file": f"${{oc.env:QWEN_RECIPE_DIR}}/mapping-{i}.json",
+        }
+        for i in range(2)
+    ]
+    config_path = recipe_dir / "train.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    with Path(env["QWEN_ENV_FILE"]).open("a") as profile:
+        profile.write(
+            "unset QWEN_ARENA_STREAM_ID QWEN_ARENA_HARNESS QWEN_REWARD_KEY QWEN_REWARD_VERSION\n"
+        )
+    result = subprocess.run(
+        [
+            "bash",
+            str(RECIPE / "ray_worker.sh"),
+            "controller",
+            "--prepare-only",
+            "--config",
+            str(config_path),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    generated = yaml.safe_load((tmp_path / "run/train-ray.yaml").read_text())
+    assert generated["econfig"]["arena_streams"] == config["econfig"]["arena_streams"]
+    for role in ("actor", "rollout"):
+        assert generated[role]["scheduling_spec"][0]["env_vars"][
+            "QWEN_SUBMITTED_RECIPE_DIR"
+        ] == str(recipe_dir)
 
 
 @pytest.mark.parametrize("failure", ["role", "profile"])

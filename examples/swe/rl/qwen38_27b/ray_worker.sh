@@ -16,6 +16,7 @@ ray_run_dir=${QWEN_SUBMITTED_RUN_DIR:-}
 ray_experiment=${QWEN_SUBMITTED_EXPERIMENT:-}
 ray_output=${QWEN_SUBMITTED_OUTPUT_ROOT:-}
 ray_user=${QWEN_SUBMITTED_USER:-}
+ray_config_dir=${QWEN_SUBMITTED_RECIPE_DIR:-}
 ray_python=${QWEN_RAY_PYTHON:-}
 # Preserve the device/rank assignment made by Ray, including grouped colocation.
 ray_device_vars=(CUDA_VISIBLE_DEVICES SLURM_LOCALID SLURM_NODEID SLURM_NNODES)
@@ -36,7 +37,7 @@ for ray_key in "${ray_device_vars[@]}"; do
 done
 export QWEN_ENV_FILE=$ray_profile
 export QWEN_REPO=$(cd "$ray_recipe/../../../.." && pwd)
-export QWEN_RECIPE_DIR=$ray_recipe
+export QWEN_RECIPE_DIR=${ray_config_dir:-${QWEN_RECIPE_DIR:-$ray_recipe}}
 export QWEN_RUNTIME_ROLE=$ray_role
 export QWEN_ARENA_TRIAL=${ray_trial:-${QWEN_ARENA_TRIAL:?Set a unique trial}}
 export QWEN_EXPERIMENT_NAME=${ray_experiment:-${QWEN_EXPERIMENT_NAME:-qwen38-27b-arena-rl}}
