@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 import subprocess
 import sys
@@ -106,6 +107,31 @@ class SGLangBackend:
 
     def __init__(self) -> None:
         self._readiness_endpoint = "/health"
+
+    @staticmethod
+    def is_generation_rejection(status: int, error_body: str) -> bool:
+        """Recognize context validation before SGLang sends to its scheduler.
+
+        Other 400s can originate after scheduling and remain uncertain. A
+        truncated or malformed error body cannot establish terminal rejection.
+        """
+        if status != 400:
+            return False
+        try:
+            payload = json.loads(error_body)
+        except (ValueError, TypeError):
+            return False
+        error = payload.get("error") if isinstance(payload, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        return isinstance(message, str) and (
+            message.startswith(
+                "Requested token count exceeds the model's maximum context length"
+            )
+            or (
+                message.startswith("The input (")
+                and "is longer than the model's context length (" in message
+            )
+        )
 
     @staticmethod
     def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
