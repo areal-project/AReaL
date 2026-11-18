@@ -157,7 +157,7 @@ async def test_selfcheck_uses_harness_budget_even_when_no_episode_reaches_it():
         (
             [{"response": {"status": "OK", "score": 1}}],
             {"used_calls": 1, "max_calls": 10**100},
-            {"calls": 1.0},
+            {"calls": 1.0, SELFCHECK_BUDGET_KEY: 10.0},
         ),
         ([], {"used_calls": 10**400, "max_calls": 10**400}, {}),
         (

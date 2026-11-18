@@ -15,6 +15,7 @@ from examples.swe.arena_client import (
     ArenaTaskFailedError,
     ArenaTaskResult,
 )
+from tests.test_selfcheck_metrics import _read_checks
 from tests.test_swe_arena_abbreviated_receipt import _error as _runner_failure_error
 from tests.test_swe_arena_multi_stream import (
     _core_model_failure_error,
@@ -93,6 +94,65 @@ async def test_stream_selfcheck_controls_artifact_reads_and_metrics(
     else:
         assert not checker_keys
     assert metrics["rollout/arena_score"] == [1.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "used_calls,max_calls", [(0, 11), (1, 11), (11, 11), (1, 10**400), (11, None)]
+)
+async def test_selfcheck_large_budget_preserves_known_calls_and_candidate_change(
+    workflow, used_calls, max_calls
+):
+    """Large budgets retain exact counts without creating unbounded score slots."""
+    name = workflow.default_stream_name
+    workflow.stream_configs[name] = replace(
+        workflow.stream_configs[name], self_check=True
+    )
+    budget = {"used_calls": used_calls}
+    if max_calls is not None:
+        budget["max_calls"] = max_calls
+    telemetry = await _read_checks(
+        [
+            {"sha256": "a" * 64, "response": {"status": "OK", "score": 1}}
+            for _ in range(used_calls)
+        ],
+        budget,
+        {"phase": "agent", "sha256": "b" * 64},
+    )
+    assert not any(key.startswith("check_") for key in telemetry)
+    workflow._task_result.set(
+        ArenaTaskResult(
+            task_id="task", status="DONE", score=1.0, selfcheck_metrics=telemetry
+        )
+    )
+    with capture_metrics() as metrics:
+        workflow.record_episode_metrics(
+            {"stream_id": "stream-1", "data_id": "data-1"}, reward=1.0
+        )
+    consumed = ConsumedMetrics()
+    consumed.consume(SimpleNamespace(trajectory={}, metrics=metrics))
+    stats = _merge_worker_stats([consumed.export()])
+
+    for prefix in ("rollout/selfcheck", f"rollout/stream/{name}/selfcheck"):
+        assert stats[f"{prefix}/unknown_calls_count"] == 0
+        group = f"{prefix}/reward_1"
+        assert stats[f"{group}/mean_calls"] == used_calls
+        assert stats[f"{group}/trajectory_count"] == 1
+        assert stats[f"{group}/exact_calls_{used_calls}/count"] == 1
+        assert stats[f"{group}/exact_calls_{used_calls}/ratio"] == 1
+        assert (
+            sum(
+                value
+                for key, value in stats.items()
+                if key.startswith(f"{group}/exact_calls_") and key.endswith("/count")
+            )
+            == 1
+        )
+        assert f"{group}/exact_calls_12/count" not in stats
+        if used_calls:
+            assert stats[f"{prefix}/final_candidate/changed_count"] == 1
+        else:
+            assert f"{prefix}/final_candidate/changed_count" not in stats
 
 
 def test_selfcheck_distribution_merges_consumed_final_reward_groups(workflow):

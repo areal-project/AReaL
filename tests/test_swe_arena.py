@@ -1681,7 +1681,14 @@ def test_agent_records_global_and_domain_raw_reward_after_transform(
     workflow = ArenaStreamAgentWorkflow(
         econfig={
             "arena_base_url": "https://arena.example",
-            "arena_reward_transform_fn": "tests.test_swe_arena.transform",
+            "arena_streams": [
+                {
+                    "name": "default",
+                    "stream_id": "stream-1",
+                    "self_check": True,
+                    "reward_transform_fn": "tests.test_swe_arena.transform",
+                }
+            ],
         }
     )
 
@@ -1696,8 +1703,11 @@ def test_agent_records_global_and_domain_raw_reward_after_transform(
             artifacts_uri="tasks/job:env:0/attempts/3/",
         )
 
+    artifact_requests = []
+
     def artifact_handler(request):
         artifact = request.url.path.rsplit("/", 1)[-1]
+        artifact_requests.append(artifact)
         if artifact == "artifacts":
             if broken_listing:
                 # JSON decoding raises RecursionError rather than ArenaAPIError.
@@ -1760,6 +1770,11 @@ def test_agent_records_global_and_domain_raw_reward_after_transform(
         return reward
 
     assert asyncio.run(run_and_record_metrics()) == pytest.approx(0.075)
+    assert sorted(artifact_requests) == (
+        ["artifacts"]
+        if broken_listing
+        else ["artifacts", "checker-audit.json", "checker-budget.json"]
+    )
     stats = stats_tracker.export_all(reset=True)
     assert stats["rollout/reward"] == pytest.approx(0.075)
     assert stats["rollout/raw_reward"] == pytest.approx(0.75)

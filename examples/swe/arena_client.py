@@ -20,8 +20,8 @@ LLMProtocol = Literal["anthropic", "responses", "chat_completions"]
 
 # Each slot becomes a metric key. Bound the fan-out from artifact data.
 _MAX_SELFCHECK_SCORE_SLOTS = 10
-# Private telemetry metadata. Zero denotes a verified zero-call attempt with
-# no recorded Harness limit.
+# Private telemetry metadata for histogram zero-padding over call counts 0..10.
+# Zero denotes a verified zero-call attempt with no recorded Harness limit.
 SELFCHECK_BUDGET_KEY = "_max_calls"
 SELFCHECK_CANDIDATE_CHANGED = "final_candidate/changed"
 _SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
@@ -469,18 +469,18 @@ class ArenaOpenAPIClient:
         valid_budget = (
             type(used_calls) is int
             and type(max_calls) is int
-            and 1 <= max_calls <= _MAX_SELFCHECK_SCORE_SLOTS
+            and max_calls >= 1
             and 0 <= used_calls <= max_calls
         )
         if valid_budget:
-            metrics[SELFCHECK_BUDGET_KEY] = float(max_calls)
-        elif (
-            max_calls is None
-            and type(used_calls) is int
-            and 0 <= used_calls <= _MAX_SELFCHECK_SCORE_SLOTS
-        ):
+            metrics[SELFCHECK_BUDGET_KEY] = float(
+                min(max_calls, _MAX_SELFCHECK_SCORE_SLOTS)
+            )
+        elif max_calls is None and type(used_calls) is int and used_calls >= 0:
             # Older budgets can confirm the exact count without recording a cap.
-            metrics[SELFCHECK_BUDGET_KEY] = float(used_calls)
+            metrics[SELFCHECK_BUDGET_KEY] = float(
+                min(used_calls, _MAX_SELFCHECK_SCORE_SLOTS)
+            )
         # A gap between reserved calls and audit rows makes the last audited
         # candidate ambiguous. It could belong to an earlier Check.
         if (
@@ -515,6 +515,7 @@ class ArenaOpenAPIClient:
         # failed checks are not an early stop and must not be forward-filled.
         if (
             not valid_budget
+            or max_calls > _MAX_SELFCHECK_SCORE_SLOTS
             or used_calls == 0
             or not isinstance(audit, list)
             or len(audit) != used_calls

@@ -88,7 +88,8 @@ def _export_selfcheck_counts(metrics: Metrics, result: dict[str, float]) -> None
             calls = metrics.get(f"{group}/mean_calls", [])
             buckets = Counter(calls)
             result[f"{group}/trajectory_count"] = len(calls)
-            for count in range(max_calls + 1):
+            counts = set(range(max_calls + 1)) | {int(count) for count in buckets}
+            for count in sorted(counts):
                 result[f"{group}/exact_calls_{count}/count"] = buckets[count]
 
 
