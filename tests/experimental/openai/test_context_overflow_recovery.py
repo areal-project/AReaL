@@ -31,6 +31,12 @@ from areal.infra.workflow_context import WorkflowContext
 from areal.utils import stats_tracker
 
 
+def _classify_arena_failure(error, **kwargs):
+    agent = ArenaStreamAgentWorkflow.__new__(ArenaStreamAgentWorkflow)
+    agent.retain_timeout_trajectories = False
+    return agent.classify_proxy_failure(error, **kwargs)
+
+
 class _FailingAgent:
     async def run(self, data, **kwargs):
         raise RuntimeError("harness failed")
@@ -71,6 +77,172 @@ class _RecordingFailingAgent(_FailingAgent):
 
     async def persist_episode_result(self, data, reward):
         self.persisted_rewards.append((data, reward))
+
+
+@pytest.mark.parametrize(
+    "enabled,status,interactions,system_error,expected",
+    [
+        (True, "TIMEOUT", 2, False, "model_failure_zero"),
+        (False, "TIMEOUT", 2, False, "unknown_failure_reject"),
+        (True, "TIMEOUT", 0, False, "unknown_failure_reject"),
+        (True, "HARNESS_FAILED", 2, False, "unknown_failure_reject"),
+        (True, "TIMEOUT", 2, True, "system_failure_reject"),
+    ],
+)
+def test_arena_terminal_timeout_retention_classifies_only_usable_interactions(
+    monkeypatch, enabled, status, interactions, system_error, expected
+):
+    """The opt-in recovers terminal timeouts without overriding proxy errors."""
+    monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    agent = ArenaStreamAgentWorkflow(
+        econfig={"retain_timeout_trajectories": enabled},
+        reject_terminal_task_failures=True,
+    )
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
+    error = ArenaTaskFailedError(task_id="task", status=status)
+
+    disposition = workflow._classify_agent_failure(
+        error,
+        context_overflow=False,
+        interaction_count=interactions,
+        system_error=system_error,
+    )
+
+    assert disposition == expected
+    if disposition == "model_failure_zero":
+        assert not agent.should_reject_failed_sample(error, disposition)
+
+
+def test_arena_local_wait_timeout_is_not_retained(monkeypatch):
+    """A local wait deadline has no authoritative terminal Arena result."""
+    monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    agent = ArenaStreamAgentWorkflow(
+        econfig={"retain_timeout_trajectories": True}
+    )
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
+
+    disposition = workflow._classify_agent_failure(
+        _ArenaTaskWaitTimeout("task", 15000),
+        context_overflow=False,
+        interaction_count=2,
+    )
+
+    assert disposition == "system_failure_reject"
+
+
+@pytest.mark.parametrize(
+    "enabled,interaction_count,extra_error,expected",
+    [
+        (True, 2, "", "model_failure_zero"),
+        (False, 2, "", "unknown_failure_reject"),
+        (True, 0, "", "unknown_failure_reject"),
+        (True, 2, "harness: connection refused\n", "unknown_failure_reject"),
+    ],
+)
+def test_arena_harness_runner_deadline_retention_requires_usable_interactions(
+    monkeypatch, enabled, interaction_count, extra_error, expected
+):
+    """A completed collect after the runner deadline is a recoverable timeout."""
+    monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    agent = ArenaStreamAgentWorkflow(
+        econfig={"retain_timeout_trajectories": enabled},
+        reject_terminal_task_failures=True,
+    )
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
+    error = ArenaTaskFailedError(
+        task_id="task",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task",
+            status="HARNESS_FAILED",
+            score=0.0,
+            raw={
+                "error": (
+                    "harness: harness agent phase exited with code 1: "
+                    "harness: setup phase completed (elapsed=0s)\n"
+                    "harness: agent phase starting (timeout=1h0m0s)\n"
+                    "harness: agent phase error: runner timed out: signal: killed\n"
+                    "harness: collect phase starting (timeout=3m0s)\n"
+                    "harness: collect phase completed (elapsed=408ms)\n"
+                    + extra_error
+                ),
+                "harness": {"exit_code": 1, "phase": "agent"},
+            },
+        ),
+    )
+
+    disposition = workflow._classify_agent_failure(
+        error,
+        context_overflow=False,
+        interaction_count=interaction_count,
+    )
+
+    assert disposition == expected
+    if disposition == "model_failure_zero":
+        assert not agent.should_reject_failed_sample(error, disposition)
+
+
+@pytest.mark.parametrize(
+    "enabled,interaction_count,source,reason,expected",
+    [
+        (True, 2, "runner_deadline", "process_deadline", "model_failure_zero"),
+        (False, 2, "runner_deadline", "process_deadline", "unknown_failure_reject"),
+        (True, 0, "runner_deadline", "process_deadline", "unknown_failure_reject"),
+        (True, 2, "provider_deadline", "process_deadline", "unknown_failure_reject"),
+        (True, 2, "runner_deadline", "request_timeout", "unknown_failure_reject"),
+    ],
+)
+def test_arena_gameagent_process_deadline_retention_requires_agent_outcome(
+    monkeypatch, enabled, interaction_count, source, reason, expected
+):
+    """Only the typed GameAgent process deadline is retained as a timeout."""
+    monkeypatch.setenv("ARENA_OPENAPI_BASE", "https://arena.example")
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    agent = ArenaStreamAgentWorkflow(
+        econfig={"retain_timeout_trajectories": enabled},
+        reject_terminal_task_failures=True,
+    )
+    workflow = OpenAIProxyWorkflow(mode="inline", agent=agent)
+    summary = "GAMEAGENT_OUTCOME_CODE=AGENT_RUN_TIMEOUT GAMEAGENT_OUTCOME_CLASS=agent"
+    error = ArenaTaskFailedError(
+        task_id="task",
+        status="HARNESS_FAILED",
+        result=ArenaTaskResult(
+            task_id="task",
+            status="HARNESS_FAILED",
+            score=0.0,
+            raw={
+                "error": (
+                    "harness: agent phase starting (timeout=1h0m0s)\n" + summary
+                ),
+                "harness": {
+                    "phase": "agent",
+                    "result_status": "ERROR",
+                    "exit_code": 1,
+                    "summary": summary,
+                },
+                "outcome": {
+                    "code": "AGENT_RUN_TIMEOUT",
+                    "class": "agent",
+                    "source": source,
+                    "details": {"reason": reason},
+                },
+            },
+        ),
+    )
+
+    disposition = workflow._classify_agent_failure(
+        error,
+        context_overflow=False,
+        interaction_count=interaction_count,
+    )
+
+    assert disposition == expected
+    if disposition == "model_failure_zero":
+        assert not agent.should_reject_failed_sample(error, disposition)
 
 
 class _FakeProxyClient:
@@ -205,7 +377,7 @@ def test_runner_overflow_requires_unambiguous_terminal_failure(
             task_id="task", status="HARNESS_FAILED", score=0, raw=raw
         ),
     )
-    actual = ArenaStreamAgentWorkflow.classify_proxy_failure(
+    actual = _classify_arena_failure(
         error, context_overflow=overflow, interaction_count=1
     )
     assert actual == (
@@ -269,7 +441,7 @@ def test_harness_model_failure_uses_terminal_receipt(
         "error": [{"message": message}],
     }
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, interaction_count=interaction_count
         )
         == expected
@@ -311,7 +483,7 @@ def test_harness_model_failure_does_not_override_system_error(message):
         "error": [{"message": message}],
     }
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, interaction_count=12
         )
         == "unknown_failure_reject"
@@ -333,7 +505,7 @@ def test_gameagent_metadata_does_not_change_receipt_family():
         ),
     )
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, interaction_count=1
         )
         == "model_failure_zero"

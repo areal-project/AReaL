@@ -4471,9 +4471,18 @@ class MegatronScoringEngine(MegatronEngine):
 
     def __init__(self, config: MOPDTeacherEngineConfig):
         super().__init__(config)
+        from areal.utils.data_hook import load_data_hook
+
+        self.data_hook = load_data_hook(config.data_hook)
 
     @torch.no_grad()
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
+        from areal.api.data_hook import ComputeLogpHook
+
+        if isinstance(self.data_hook, ComputeLogpHook):
+            data, state = self.data_hook.pre_compute_logp(data)
+            outputs = batched_call(self._compute_logp, data)
+            return self.data_hook.post_compute_logp(outputs, state)
         return batched_call(self._compute_logp, data)
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:

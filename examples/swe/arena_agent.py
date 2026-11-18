@@ -526,6 +526,20 @@ class ArenaStreamAgentWorkflow:
         self.gen_args = gen_args or {}
         self.experiment_name = experiment_name
         self.reject_terminal_task_failures = reject_terminal_task_failures
+        self.retain_timeout_trajectories = self.econfig.get(
+            "retain_timeout_trajectories", False
+        )
+        if not isinstance(self.retain_timeout_trajectories, bool):
+            raise ValueError("retain_timeout_trajectories must be a boolean")
+        self.done_reward_bonus = self.econfig.get("arena_done_reward_bonus", 0.0)
+        if (
+            isinstance(self.done_reward_bonus, bool)
+            or not isinstance(self.done_reward_bonus, Real)
+            or not math.isfinite(self.done_reward_bonus)
+            or self.done_reward_bonus < 0
+        ):
+            raise ValueError("arena_done_reward_bonus must be finite and non-negative")
+        self.done_reward_bonus = float(self.done_reward_bonus)
         self.timeout = float(self.econfig.get("timeout", timeout))
         self.registration_timeout = float(
             self.econfig.get("arena_registration_timeout", 180.0)
@@ -1413,9 +1427,8 @@ class ArenaStreamAgentWorkflow:
         # typed overflow can attribute that otherwise empty agent error.
         return context_overflow
 
-    @classmethod
     def classify_proxy_failure(
-        cls,
+        self,
         error: Exception,
         *,
         context_overflow: bool,
@@ -1431,12 +1444,22 @@ class ArenaStreamAgentWorkflow:
         """
         if not isinstance(error, ArenaTaskFailedError):
             return "system_failure_reject"
-        if error.status in cls._SYSTEM_FAILURE_STATUSES:
+        if error.status in self._SYSTEM_FAILURE_STATUSES:
             return "system_failure_reject"
+        if (
+            self.retain_timeout_trajectories
+            and interaction_count > 0
+            and (
+                error.status == "TIMEOUT"
+                or self._is_harness_agent_execution_timeout(error)
+                or self._is_gameagent_run_timeout(error)
+            )
+        ):
+            return "model_failure_zero"
         if (
             error.status == "HARNESS_FAILED"
             and interaction_count > 0
-            and cls._is_model_attributed_harness_failure(
+            and self._is_model_attributed_harness_failure(
                 error,
                 context_overflow=context_overflow,
                 invalid_tool_json=invalid_tool_json,
@@ -1444,6 +1467,73 @@ class ArenaStreamAgentWorkflow:
         ):
             return "model_failure_zero"
         return "unknown_failure_reject"
+
+    @staticmethod
+    def _is_harness_agent_execution_timeout(error: ArenaTaskFailedError) -> bool:
+        """Recognize the runner deadline after successful setup and collection."""
+        result = error.result
+        raw = result.raw if result is not None else None
+        if (
+            error.status != "HARNESS_FAILED"
+            or not isinstance(raw, dict)
+            or set(raw) != {"error", "harness"}
+        ):
+            return False
+        if raw.get("harness") != {"exit_code": 1, "phase": "agent"}:
+            return False
+        detail = raw.get("error")
+        if not isinstance(detail, str):
+            return False
+        markers = (
+            "harness: setup phase completed",
+            "harness: agent phase starting (timeout=",
+            "harness: agent phase error: runner timed out: signal: killed",
+            "harness: collect phase completed",
+        )
+        positions = [detail.find(marker) for marker in markers]
+        if any(position < 0 for position in positions) or positions != sorted(positions):
+            return False
+        for line in detail.splitlines():
+            expected_timeout = re.sub(r"\(timeout=[0-9.hms]+\)", "", line)
+            expected_timeout = expected_timeout.replace(
+                "runner timed out: signal: killed", ""
+            )
+            if _HARNESS_SYSTEM_ERROR_PATTERN.search(expected_timeout):
+                return False
+        return True
+
+    @classmethod
+    def _is_gameagent_run_timeout(cls, error: ArenaTaskFailedError) -> bool:
+        """Recognize GameAgent's agent-owned process deadline receipt."""
+        result = error.result
+        raw = result.raw if result is not None else None
+        if (
+            error.status != "HARNESS_FAILED"
+            or result is None
+            or result.score != 0.0
+            or not isinstance(raw, dict)
+            or raw.get("failure") is not None
+            or cls._gameagent_outcome_code(raw) != "AGENT_RUN_TIMEOUT"
+        ):
+            return False
+        outcome = raw.get("outcome")
+        harness = raw.get("harness")
+        detail = raw.get("error")
+        summary = "GAMEAGENT_OUTCOME_CODE=AGENT_RUN_TIMEOUT GAMEAGENT_OUTCOME_CLASS=agent"
+        return (
+            isinstance(outcome, dict)
+            and outcome.get("class") == "agent"
+            and outcome.get("source") == "runner_deadline"
+            and outcome.get("details") == {"reason": "process_deadline"}
+            and isinstance(harness, dict)
+            and harness.get("phase") == "agent"
+            and harness.get("result_status") == "ERROR"
+            and harness.get("exit_code") == 1
+            and harness.get("summary") == summary
+            and isinstance(detail, str)
+            and detail.count(summary) == 1
+            and "harness: agent phase starting (timeout=" in detail
+        )
 
     def should_reject_failed_sample(self, error: Exception, disposition: str) -> bool:
         """Drop a failed Arena sample while retaining healthy group siblings."""
@@ -2082,6 +2172,10 @@ class ArenaStreamAgentWorkflow:
                 if not math.isfinite(task_result.score):
                     raise ArenaAPIError("Successful Arena task score must be finite")
                 reward = self._transform_reward(task_result.score, data, stream_config)
+                if task_result.status in {"DONE", "OK"}:
+                    reward += self.done_reward_bonus
+                if not math.isfinite(reward):
+                    raise ArenaAPIError("Arena training reward must be finite")
             except Exception:
                 await self._dump_task_result(
                     data,

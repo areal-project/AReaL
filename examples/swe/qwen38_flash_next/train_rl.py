@@ -179,7 +179,10 @@ def main(profile, args):
     if profile not in ("swe", "swe-eval"):
         raise ValueError("Expected swe or swe-eval")
     evaluation_only = profile == "swe-eval"
-    from examples.swe.train_swe_rl import get_arena_mixture_dataset
+    from examples.swe.train_swe_rl import (
+        get_arena_mixture_dataset,
+        route_arena_mopd_dataset,
+    )
     from examples.swe.utils import SWEPPOConfig
 
     from areal import PPOTrainer
@@ -217,6 +220,8 @@ def main(profile, args):
     config.econfig.arena_streams_yaml_b64 = ""
     if evaluation_only:
         validate_evaluation_only(config, dataset)
+    elif config.mopd is not None:
+        dataset = route_arena_mopd_dataset(dataset, config, streams)
     generation = config.eval_gconfig if evaluation_only else config.gconfig
     workflow = "examples.swe.arena_agent.ArenaStreamAgentWorkflow"
     kwargs = dict(

@@ -22,6 +22,7 @@ import aiofiles.os
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api.cli_args import InferenceEngineConfig
+from areal.api.data_hook import RolloutHook
 from areal.api import RolloutWorkflow
 from areal.infra.rpc.rtensor import RTensor
 from .async_task_runner import (
@@ -41,6 +42,7 @@ from areal.experimental.openai.types import (
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
 from areal.utils.data import RolloutGroup, cycle_dataloader
+from areal.utils.data_hook import load_data_hook
 from areal.utils.perf_tracer import trace_perf, trace_session_event
 from logging import Logger
 
@@ -889,6 +891,7 @@ class WorkflowExecutor:
 
         self.config = config
         self.inference_engine = inference_engine
+        self.data_hook: object | None = None
         # Use provided staleness manager or create a default one
         # The manager will be properly initialized in initialize()
         self._staleness_manager = staleness_manager
@@ -1190,6 +1193,8 @@ class WorkflowExecutor:
             Data parallel world size for capacity scaling. If None, will be inferred
             from distributed state.
         """
+        self.data_hook = load_data_hook(self.config.data_hook)
+
         if logger is None:
             dist_ready = dist.is_initialized()
             name = (
@@ -1348,6 +1353,9 @@ class WorkflowExecutor:
 
             try:
                 workflow_data = pending_task.data
+                hook_state: Any = None
+                if workflow_data is not None and isinstance(self.data_hook, RolloutHook):
+                    workflow_data, hook_state = self.data_hook.pre_rollout(workflow_data)
                 if workflow_data is not None:
                     traj = await pending_task.workflow.arun_episode(
                         self.inference_engine, workflow_data
@@ -1401,6 +1409,10 @@ class WorkflowExecutor:
                         traj = concat_string_interactions(traj)
 
                 assert traj is None or isinstance(traj, dict), traj
+                if traj is not None and "input_ids" in traj and isinstance(
+                    self.data_hook, RolloutHook
+                ):
+                    traj = self.data_hook.post_rollout(traj, hook_state)
                 if traj is not None and "input_ids" in traj:
                     try:
                         rows = traj["input_ids"].shape[0]

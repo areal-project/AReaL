@@ -53,6 +53,40 @@ def _executor():
 
 
 @pytest.mark.asyncio
+async def test_rollout_hook_runs_after_tensor_export():
+    class Hook:
+        def pre_rollout(self, data):
+            return {**data, "value": 7}, "episode-state"
+
+        def post_rollout(self, trajectory, state):
+            assert state == "episode-state"
+            trajectory["hook_value"] = torch.full_like(trajectory["input_ids"], 7)
+            return trajectory
+
+    class Workflow(RolloutWorkflow):
+        async def arun_episode(self, engine, data):
+            assert data["value"] == 7
+            return {
+                "input_ids": torch.tensor([[1, 2]]),
+                "attention_mask": torch.ones((1, 2), dtype=torch.bool),
+            }
+
+    executor, _ = _executor()
+    executor.data_hook = Hook()
+    task = executor._create_workflow_task(
+        _RolloutTaskInput(task_id=1, data={}, workflow=Workflow())
+    )
+
+    result = await task()
+
+    assert result is not None
+    torch.testing.assert_close(
+        result.trajectory["hook_value"], torch.tensor([[7, 7]]), rtol=0, atol=0
+    )
+    assert result.trajectory["rollout_group"].row_counts == (1,)
+
+
+@pytest.mark.asyncio
 async def test_dump_plain_interaction_accepts_rollout_and_writes_file(tmp_path):
     """Default interactions must not be rejected merely because dumping is enabled."""
     interaction = InteractionWithTokenLogpReward(

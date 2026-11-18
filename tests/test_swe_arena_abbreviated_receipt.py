@@ -9,6 +9,12 @@ from examples.swe.arena_agent import ArenaStreamAgentWorkflow
 from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
 
 
+def _classify_arena_failure(error, **kwargs):
+    agent = ArenaStreamAgentWorkflow.__new__(ArenaStreamAgentWorkflow)
+    agent.retain_timeout_trajectories = False
+    return agent.classify_proxy_failure(error, **kwargs)
+
+
 def _error(
     *, adopted=False, message="model stopped without visible output or tool calls"
 ):
@@ -59,7 +65,7 @@ def test_abbreviated_model_failure_with_native_collection_keeps_zero(
         == "native-runner"
     )
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, interaction_count=2
         )
         == "model_failure_zero"
@@ -169,7 +175,7 @@ def test_abbreviated_failure_with_missing_or_conflicting_evidence_rejected(
         error.result.raw["nativeExportHealthy"] = False
 
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error,
             context_overflow=context_overflow,
             interaction_count=interaction_count,

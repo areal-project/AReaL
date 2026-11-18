@@ -19,6 +19,7 @@ from hydra import initialize as hydra_init
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import MISSING, DictConfig, OmegaConf
 
+from areal.api.data_hook import HookConfig
 from areal.engine.fsdp_utils.attn_impl import (
     BUILTIN_ATTN_IMPLS,
     get_attn_impl_validation_error,
@@ -1469,6 +1470,10 @@ class TrainEngineConfig:
     experiment_name: str = MISSING
     trial_name: str = MISSING
     path: str = field(default="", metadata={"help": "Path to HuggingFace checkpoint"})
+    data_hook: HookConfig | None = field(
+        default=None,
+        metadata={"help": "Optional worker-side data hook."},
+    )
     attn_impl: str = field(
         default="flash_attention_2",
         metadata={
@@ -3168,6 +3173,10 @@ class InferenceEngineConfig:
 
     experiment_name: str | None = None
     trial_name: str | None = None
+    data_hook: HookConfig | None = field(
+        default=None,
+        metadata={"help": "Optional worker-side rollout data hook."},
+    )
     fileroot: str | None = field(
         default=None,
         metadata={"help": "Root directory for logs and trajectory dumps."},

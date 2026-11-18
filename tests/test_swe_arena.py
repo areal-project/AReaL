@@ -13,6 +13,7 @@ from examples.swe.arena_client import (
     ArenaAPIError,
     ArenaOpenAPIClient,
     ArenaTaskFailedError,
+    ArenaTaskResult,
     infer_llm_protocol,
     resolve_llm_protocol,
 )
@@ -1513,6 +1514,56 @@ def test_agent_applies_configured_reward_threshold(
         )
 
     assert asyncio.run(run_agent()) == expected_reward
+
+
+@pytest.mark.parametrize(
+    "status,bonus,expected",
+    [
+        ("DONE", 0.0, 0.25),
+        ("DONE", 1.0, 1.25),
+        ("OK", 1.0, 1.25),
+    ],
+)
+def test_agent_adds_done_bonus_to_successful_training_reward(
+    monkeypatch, status, bonus, expected
+):
+    """Both successful Arena statuses receive the configured training bonus."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
+    monkeypatch.setenv("ARENA_LLM_API_KEY", "test-llm-key")
+    workflow = ArenaStreamAgentWorkflow(
+        econfig={
+            "arena_base_url": "https://arena.example",
+            "arena_done_reward_bonus": bonus,
+        }
+    )
+
+    async def fake_register(**_kwargs):
+        return "http://arena.example/proxy", "model-1"
+
+    async def fake_launch(**_kwargs):
+        return ArenaTaskResult(task_id="task-1", status=status, score=0.25)
+
+    async def fake_delete(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(workflow.client, "register_llm_proxy_async", fake_register)
+    monkeypatch.setattr(workflow.client, "launch_one_task_result", fake_launch)
+    monkeypatch.setattr(workflow.client, "delete_llm_proxy_async", fake_delete)
+
+    async def run_agent():
+        data = {"stream_id": "stream-1", "data_id": "data-1"}
+        reward = await workflow.run(
+            data,
+            base_url="http://rollout-proxy",
+            api_key="session-key",
+        )
+        assert workflow._task_result.get().score == 0.25
+        assert workflow.get_episode_reward_for_export(
+            data, reward, export_style="concat"
+        ) == pytest.approx(expected)
+        return reward
+
+    assert asyncio.run(run_agent()) == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(

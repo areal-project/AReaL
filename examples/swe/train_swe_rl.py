@@ -28,6 +28,7 @@ from examples.swe.arena_reward_mapping import (
 from examples.swe.utils import ArenaRewardRefConfig, ArenaStreamConfig, SWEPPOConfig
 
 from areal.api.cli_args import load_expr_config
+from areal.dataset.mopd import RoutedDataset
 from areal.utils import logging
 
 logger = logging.getLogger("SWETrain")
@@ -242,6 +243,23 @@ def get_arena_mixture_dataset(
     return dataset, resolved_streams
 
 
+def route_arena_mopd_dataset(
+    dataset: Dataset, config: SWEPPOConfig, resolved_streams: list[ArenaStreamConfig]
+) -> RoutedDataset:
+    """Attach the single configured teacher group to the Arena mixture."""
+    sources = config.train_dataset.sources
+    source_ids = [source.path for source in sources]
+    stream_ids = {stream.stream_id for stream in resolved_streams}
+    if len(source_ids) != len(set(source_ids)) or set(source_ids) != stream_ids:
+        raise ValueError(
+            "MOPD train_dataset.sources paths must match the resolved Arena Stream IDs"
+        )
+    groups = {source.teacher_group for source in sources}
+    if len(groups) != 1:
+        raise ValueError("Arena MOPD currently requires one teacher group for all Streams")
+    return RoutedDataset([(dataset, groups.pop())])
+
+
 def get_arena_dataset(econfig) -> tuple[Dataset, str]:
     """Load one Arena Stream while retaining the original public return type."""
 
@@ -338,6 +356,10 @@ def main(args):
             econfig, size_multiple=config.train_dataset.batch_size
         )
         valid_dataset = train_dataset
+        if config.mopd is not None:
+            train_dataset = route_arena_mopd_dataset(
+                train_dataset, config, resolved_streams
+            )
         econfig.arena_streams = resolved_streams
         econfig.arena_streams_yaml_b64 = ""
         econfig.arena_streams_file = ""

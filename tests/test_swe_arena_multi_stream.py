@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import yaml
+from datasets import Dataset
 
 from examples.swe.arena_agent import ArenaStreamAgentWorkflow
 from examples.swe.arena_client import (
@@ -27,13 +28,25 @@ from examples.swe.arena_config import (
     parse_arena_stream_config,
 )
 from examples.swe.arena_preflight import _arena_json, _recent_health, validate_streams
-from examples.swe.train_swe_rl import get_arena_dataset, get_arena_mixture_dataset
+from examples.swe.train_swe_rl import (
+    get_arena_dataset,
+    get_arena_mixture_dataset,
+    route_arena_mopd_dataset,
+)
 from examples.swe.utils import ArenaRewardRefConfig, ArenaStreamConfig
 
+from areal.api.cli_args import DatasetSourceConfig, TrainDatasetConfig
+from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY, DatasetRoute
 from areal.utils import stats_tracker
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MULTI_STREAM_CONFIG = REPO_ROOT / "examples/swe/arena_multi_stream.yaml"
+
+
+def _classify_arena_failure(error, **kwargs):
+    agent = ArenaStreamAgentWorkflow.__new__(ArenaStreamAgentWorkflow)
+    agent.retain_timeout_trajectories = False
+    return agent.classify_proxy_failure(error, **kwargs)
 
 
 @pytest.mark.parametrize("source", ["file", "base64", "inline"])
@@ -439,6 +452,99 @@ def test_get_arena_mixture_dataset_resolves_and_mixes_streams(monkeypatch):
     assert [stream.llm_protocol for stream in resolved] == ["anthropic", "responses"]
 
 
+def test_route_arena_mopd_dataset_single_group_adds_route():
+    """Arena rows retain their fields while gaining the configured MOPD route."""
+    dataset = Dataset.from_list([{"data_id": "task-1", "arena_stream_name": "a"}])
+    config = SimpleNamespace(
+        train_dataset=TrainDatasetConfig(
+            sources=[
+                DatasetSourceConfig(path="stream-a", type="rl", teacher_group="default")
+            ]
+        )
+    )
+    streams = [ArenaStreamConfig(name="a", stream_id="stream-a")]
+
+    routed = route_arena_mopd_dataset(dataset, config, streams)
+
+    assert routed[0]["data_id"] == "task-1"
+    assert routed[0][MOPD_ROUTE_METADATA_KEY] == DatasetRoute(0, "default")
+
+
+def test_qwen_arena_mopd_entrypoint_routes_training_dataset(monkeypatch):
+    """The Qwen recipe passes routed Arena samples to its trainer."""
+    import areal
+
+    from examples.swe.qwen38_flash_next import train_rl
+
+    from areal.api import cli_args
+
+    rows = Dataset.from_list([{"data_id": "task-1"}])
+    streams = [ArenaStreamConfig(name="a", stream_id="stream-a")]
+    config = SimpleNamespace(
+        econfig=SimpleNamespace(arena_task_envs={}, timeout=15000.0),
+        train_dataset=TrainDatasetConfig(
+            batch_size=1,
+            sources=[
+                DatasetSourceConfig(path="stream-a", type="rl", teacher_group="default")
+            ],
+        ),
+        mopd=object(),
+        gconfig=SimpleNamespace(temperature=1.0, top_p=1.0, top_k=1, max_new_tokens=8),
+        experiment_name="test",
+        trial_name="trial",
+        should_accept_fn=None,
+    )
+    received = []
+
+    class FakeTrainer:
+        def __init__(self, _config, train_dataset, valid_dataset):
+            received.append(train_dataset[0])
+            assert valid_dataset is None
+            self.recover_info = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def train(self, **_kwargs):
+            pass
+
+    monkeypatch.delenv("QWEN_ARENA_TASK_IDS_FILE", raising=False)
+    monkeypatch.setattr(areal, "PPOTrainer", FakeTrainer)
+    monkeypatch.setattr(cli_args, "load_expr_config", lambda *_args: (config, ""))
+    monkeypatch.setattr(
+        "examples.swe.train_swe_rl.get_arena_mixture_dataset",
+        lambda *_args, **_kwargs: (rows, streams),
+    )
+    monkeypatch.setattr(train_rl, "asdict", lambda _config: {})
+    monkeypatch.setattr(train_rl, "validate_required_recovery", lambda _info: None)
+
+    train_rl.main("swe", [])
+
+    assert received[0]["data_id"] == "task-1"
+    assert received[0][MOPD_ROUTE_METADATA_KEY] == DatasetRoute(0, "default")
+
+
+def test_route_arena_mopd_dataset_mismatched_stream_rejected():
+    """A stale source declaration must fail before rollout routing begins."""
+    dataset = Dataset.from_list([{"data_id": "task-1"}])
+    config = SimpleNamespace(
+        train_dataset=TrainDatasetConfig(
+            sources=[
+                DatasetSourceConfig(
+                    path="stream-old", type="rl", teacher_group="default"
+                )
+            ]
+        )
+    )
+    streams = [ArenaStreamConfig(name="a", stream_id="stream-new")]
+
+    with pytest.raises(ValueError, match="must match the resolved Arena Stream IDs"):
+        route_arena_mopd_dataset(dataset, config, streams)
+
+
 def test_get_arena_dataset_retains_legacy_stream_id_return(monkeypatch):
     """The original single-Stream helper remains scalar-return compatible."""
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
@@ -790,7 +896,7 @@ def test_arena_failure_classifier_is_conservative(
     """A status or overflow flag alone cannot prove healthy model failure."""
     error = ArenaTaskFailedError(task_id="task-1", status=status)
 
-    disposition = ArenaStreamAgentWorkflow.classify_proxy_failure(
+    disposition = _classify_arena_failure(
         error,
         context_overflow=context_overflow,
         interaction_count=interaction_count,
@@ -801,7 +907,7 @@ def test_arena_failure_classifier_is_conservative(
 
 def test_arena_failure_classifier_rejects_non_terminal_api_error():
     """Transport and result-processing errors are system failures."""
-    disposition = ArenaStreamAgentWorkflow.classify_proxy_failure(
+    disposition = _classify_arena_failure(
         ArenaAPIError("request failed"),
         context_overflow=True,
         interaction_count=1,
@@ -826,7 +932,7 @@ def test_arena_failure_classifier_rejects_claude_failure_without_health():
         ),
     )
 
-    disposition = ArenaStreamAgentWorkflow.classify_proxy_failure(
+    disposition = _classify_arena_failure(
         error,
         context_overflow=False,
         interaction_count=3,
@@ -863,7 +969,7 @@ def test_gameagent_failure_uses_model_attribution(code, encoding, interaction_co
         ),
     )
 
-    disposition = ArenaStreamAgentWorkflow.classify_proxy_failure(
+    disposition = _classify_arena_failure(
         error, context_overflow=False, interaction_count=interaction_count
     )
 
@@ -944,13 +1050,13 @@ def test_core_model_failure_with_matching_native_receipt_keeps_zero(
     error = _core_model_failure_error(code, reason, message)
 
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, interaction_count=2
         )
         == "model_failure_zero"
     )
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, interaction_count=0
         )
         == "unknown_failure_reject"
@@ -985,7 +1091,7 @@ def test_core_model_failure_rejects_missing_or_conflicting_evidence(mutation):
         error.result = replace(error.result, score=None)
 
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, interaction_count=2
         )
         == "unknown_failure_reject"
@@ -1038,13 +1144,13 @@ def test_core_context_budget_exhaustion_keeps_zero_with_matching_native_receipt(
     error = _core_context_failure_error()
 
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, interaction_count=2
         )
         == "model_failure_zero"
     )
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, interaction_count=0
         )
         == "unknown_failure_reject"
@@ -1157,7 +1263,7 @@ def test_core_review_terminal_model_failure_keeps_zero(
     before = deepcopy(error.harness_result)
 
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error,
             context_overflow=False,
             invalid_tool_json=failure == "invalid_tool_json",
@@ -1270,7 +1376,7 @@ def test_core_review_missing_or_conflicting_evidence_stays_rejected(mutation):
         _set_core_failure_outcome(error, outcome)
 
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error,
             context_overflow=True,
             invalid_tool_json=mutation != "missing_proxy_flag",
@@ -1299,7 +1405,7 @@ def test_core_review_cleanup_failure_is_not_model_failure():
     )
     _set_core_failure_outcome(error, outcome)
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=True, invalid_tool_json=True, interaction_count=2
         )
         == "unknown_failure_reject"
@@ -1315,7 +1421,7 @@ def test_core_review_context_code_cannot_override_terminal_system_error(message)
     error = _core_review_failure_error("provider_context")
     error.harness_result["error"][-1]["message"] = message
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=True, invalid_tool_json=True, interaction_count=2
         )
         == "unknown_failure_reject"
@@ -1330,7 +1436,7 @@ def test_core_review_explicit_tool_code_does_not_require_legacy_digest(field):
     outcome["details"].pop("diagnosticSignals")
     _set_core_failure_outcome(error, outcome)
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, invalid_tool_json=True, interaction_count=2
         )
         == "model_failure_zero"
@@ -1360,7 +1466,7 @@ def test_core_single_turn_legacy_receipt_keeps_existing_compatibility():
     outcome["details"].pop("diagnosticSignals")
     _set_core_failure_outcome(error, outcome)
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, invalid_tool_json=True, interaction_count=2
         )
         == "model_failure_zero"
@@ -1473,7 +1579,7 @@ def test_core_context_budget_exhaustion_rejects_conflicting_evidence(mutation):
         error.result = replace(error.result, score=None)
 
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error, context_overflow=False, interaction_count=2
         )
         == "unknown_failure_reject"
@@ -1502,7 +1608,7 @@ def test_gameagent_unknown_or_malformed_outcome_is_rejected(raw):
         ),
     )
 
-    disposition = ArenaStreamAgentWorkflow.classify_proxy_failure(
+    disposition = _classify_arena_failure(
         error, context_overflow=False, interaction_count=2
     )
 
@@ -1522,7 +1628,7 @@ def test_arena_failure_classifier_rejects_ambiguous_harness_failure_raw():
         ),
     )
 
-    disposition = ArenaStreamAgentWorkflow.classify_proxy_failure(
+    disposition = _classify_arena_failure(
         error,
         context_overflow=False,
         interaction_count=3,
@@ -1903,7 +2009,7 @@ def _native_failure_disposition(
             task_id="native-task", status=status, score=0.0, raw=raw
         ),
     )
-    return ArenaStreamAgentWorkflow.classify_proxy_failure(
+    return _classify_arena_failure(
         error,
         context_overflow=context_overflow,
         interaction_count=interactions,
@@ -2012,7 +2118,7 @@ def test_grader_error_is_system_failure_even_with_model_evidence(
         ),
     )
     assert (
-        ArenaStreamAgentWorkflow.classify_proxy_failure(
+        _classify_arena_failure(
             error,
             context_overflow=context_overflow,
             interaction_count=interaction_count,

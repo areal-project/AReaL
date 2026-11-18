@@ -213,3 +213,19 @@ sympy/
 
 debug/
 analysis/
+
+# Local environment and credentials
+.env.*
+!.env.example
+!.env.template
+*.env
+!*.env.example
+!*.env.template
+.aws/
+.ssh/
+*.pem
+*.key
+
+# Local scratch files
+/patch.txt
+/examples/mopd/tmp.py

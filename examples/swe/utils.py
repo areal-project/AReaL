@@ -124,6 +124,21 @@ class SWEEnvConfig:
         default=5.0,
         metadata={"help": "Arena task-result polling interval in seconds."},
     )
+    retain_timeout_trajectories: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Keep usable proxy interactions after Arena TIMEOUT or a "
+                "verified Harness/GameAgent runner deadline."
+            )
+        },
+    )
+    arena_done_reward_bonus: float = field(
+        default=0.0,
+        metadata={
+            "help": "Extra training reward for successful Arena tasks (DONE or OK)."
+        },
+    )
     arena_registration_timeout: float = field(
         default=180.0,
         metadata={"help": "Arena LLM registration request timeout in seconds."},

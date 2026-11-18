@@ -501,6 +501,48 @@ def test_mopd_loss_respects_behavioral_rejection_without_renormalizing(
     assert torch.equal(denominator_call.kwargs["n_mopd_tokens"], response_mask)
 
 
+def test_pure_mopd_reuse_train_logp_filters_with_training_forward_logprobs():
+    """Pure MOPD reuses the detached training logprobs for rejection sampling."""
+    logprobs = torch.tensor([[-0.2, -2.0]], dtype=torch.float64, requires_grad=True)
+    old_logprobs = torch.full_like(logprobs, -0.2)
+    loss_mask = torch.ones_like(logprobs, dtype=torch.bool)
+    input_data = {
+        "logprobs": old_logprobs,
+        "versions": torch.zeros_like(logprobs, dtype=torch.long),
+        "loss_mask": loss_mask,
+        "mopd_teacher_logp_sum": torch.full_like(logprobs, -1.0),
+        "mopd_teacher_weight_sum": torch.ones_like(logprobs),
+        "mopd_behavior_logprobs": old_logprobs,
+    }
+    expected_mask = torch.tensor([[True, False]])
+
+    with patch("areal.trainer.ppo.actor.stats_tracker", MagicMock()):
+        loss = grpo_loss_fn(
+            logprobs=logprobs,
+            entropy=torch.zeros_like(logprobs),
+            input_data=input_data,
+            eps_clip=0.2,
+            eps_clip_higher=None,
+            c_clip=None,
+            prox_logp_method="reuse_train_logp",
+            rejection_sampling=RejectionSamplingConfig(
+                level="token", action="mask", metric="ratio", lower=0.5, upper=5.0
+            ),
+            mopd_loss_config=MOPDLossConfig(),
+        )
+    loss.backward()
+
+    # The surviving token has logp - behavior_logp = 0, score 1 - 0.2,
+    # and the original two-token mask remains the normalization denominator.
+    torch.testing.assert_close(
+        loss.detach(), torch.tensor(0.4, dtype=logprobs.dtype), rtol=1e-12, atol=1e-12
+    )
+    torch.testing.assert_close(
+        logprobs.grad[0, 1], torch.zeros_like(logprobs.grad[0, 1]), rtol=0, atol=0
+    )
+    assert logprobs.grad[0, 0] != 0
+
+
 @pytest.mark.parametrize("mode", ["seq_mean", "prompt_mean", "constant"])
 @pytest.mark.parametrize("rl_coefficient", [0.0, 1.0])
 def test_mopd_rejects_non_token_aggregation_before_training(mode, rl_coefficient):

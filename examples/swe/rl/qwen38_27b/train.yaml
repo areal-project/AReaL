@@ -9,7 +9,7 @@ tokenizer_path: ${oc.env:QWEN_MODEL}
 should_accept_fn: examples.swe.filter_function.filter_function
 dynamic_bs: false
 cluster:
-  n_nodes: 8
+  n_nodes: 4
   n_gpus_per_node: 8
   fileroot: ${oc.env:QWEN_ARENA_OUTPUT}
   name_resolve:
@@ -56,7 +56,7 @@ eval_gconfig:
   reward_normalization: false
   drop_incomplete_group: false
 rollout:
-  backend: sglang:d16t4
+  backend: sglang:d8t4
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 1500
@@ -143,7 +143,7 @@ rollout:
   _version: v1
 actor:
   min_usable_group_size: 8
-  backend: megatron:d1p4t4c4e1
+  backend: megatron:d1p2t4c4e1
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${tokenizer_path}

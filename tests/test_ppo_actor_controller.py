@@ -83,6 +83,71 @@ def test_non_megatron_compute_advantages_keeps_existing_payload(monkeypatch):
     assert captured["rpc_meta"] == {"broadcast": True}
 
 
+def test_megatron_prepare_mopd_batch_keeps_multimodal_payload_on_controller(
+    monkeypatch,
+):
+    """Only token fields cross RPC; each trajectory keeps its own image refs."""
+    controller = _make_controller("megatron")
+    images = [torch.arange(4), torch.arange(5)]
+    batch = [
+        {
+            "input_ids": torch.tensor([[index, index + 1]]),
+            "multi_modal_input": [{"pixel_values": image}],
+        }
+        for index, image in enumerate(images)
+    ]
+
+    def fake_call(method, rpc_batch, *, rpc_meta):
+        assert method == "prepare_mopd_batch"
+        assert rpc_meta == {"broadcast": True}
+        assert all("multi_modal_input" not in item for item in rpc_batch)
+        return [dict(item, loss_mask=torch.ones(1, 2)) for item in rpc_batch]
+
+    monkeypatch.setattr(controller, "_custom_function_call", fake_call)
+    result = controller.prepare_mopd_batch(batch)
+
+    for original, updated, image in zip(batch, result, images, strict=True):
+        assert updated["multi_modal_input"] is original["multi_modal_input"]
+        assert updated["multi_modal_input"][0]["pixel_values"] is image
+        torch.testing.assert_close(
+            updated["input_ids"], original["input_ids"], rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("backend,with_images", [("fsdp", True), ("megatron", False)])
+def test_prepare_mopd_batch_other_payloads_keep_existing_rpc(monkeypatch, backend, with_images):
+    """Text-only and non-Megatron calls retain the original dispatch path."""
+    controller = _make_controller(backend)
+    batch = [{"input_ids": torch.ones(1, 2, dtype=torch.long)}]
+    if with_images:
+        batch[0]["multi_modal_input"] = [{"pixel_values": torch.zeros(1)}]
+    expected = [{"unchanged": True}]
+
+    def fake_call(method, *args, rpc_meta, **kwargs):
+        assert method == "prepare_mopd_batch"
+        assert args[0] is batch
+        assert rpc_meta == {"broadcast": True}
+        return expected
+
+    monkeypatch.setattr(controller, "_custom_function_call", fake_call)
+    assert controller.prepare_mopd_batch(batch) is expected
+
+
+@pytest.mark.parametrize("invalid", [None, [], [{}], [{}, {}, None]])
+def test_megatron_prepare_mopd_batch_rejects_invalid_results(monkeypatch, invalid):
+    """Do not attach image references to a mismatched returned batch."""
+    controller = _make_controller("megatron")
+    batch = [
+        {"multi_modal_input": [{"pixel_values": torch.zeros(1)}]}
+        for _ in range(3)
+    ]
+    monkeypatch.setattr(controller, "_custom_function_call", lambda *_args, **_kw: invalid)
+
+    with pytest.raises(RuntimeError, match="Megatron prepare_mopd_batch returned"):
+        controller.prepare_mopd_batch(batch)
+    assert all("multi_modal_input" in item for item in batch)
+
+
 def test_v2_megatron_advantages_preserves_group_vision_references(monkeypatch):
     """Multiple groups must not receive copies of the complete DP image list."""
     controller = object.__new__(PPOActorControllerV2)

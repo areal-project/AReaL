@@ -9,6 +9,7 @@ import torch
 
 from areal.api import TrainEngine
 from areal.api.cli_args import MOPDLossConfig, PPOActorConfig, RejectionSamplingConfig
+from areal.api.data_hook import ComputeLogpHook
 from areal.engine.core import stage_batch_for_engine
 from areal.engine.r3.transport import (
     clear_engine_r3_side_channel,
@@ -55,6 +56,7 @@ from areal.utils.data import (
     is_multi_modal_key,
     split_training_batch_into_microbatches,
 )
+from areal.utils.data_hook import load_data_hook
 from areal.utils.functional import (
     apply_rejection_sampling,
     cispo_loss_fn,
@@ -134,6 +136,7 @@ class PPOActor:
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         self.config = config
         self.engine = engine
+        self.data_hook = load_data_hook(config.data_hook)
 
         self.advantage_fn = resolve_advantage_fn(config)
 
@@ -231,6 +234,10 @@ class PPOActor:
     @trace_perf("ppo_actor.compute_logp", category="compute")
     @torch.no_grad()
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
+        if isinstance(self.data_hook, ComputeLogpHook):
+            data, state = self.data_hook.pre_compute_logp(data)
+            outputs = batched_call(self._compute_logp, data)
+            return self.data_hook.post_compute_logp(outputs, state)
         return batched_call(self._compute_logp, data)
 
     def _engine_r3_enabled(self) -> bool:
@@ -828,9 +835,54 @@ class PPOActorController(TrainController):
         return results
 
     def prepare_mopd_batch(self, *args, **kwargs):
-        return self._custom_function_call(
-            "prepare_mopd_batch", *args, rpc_meta={"broadcast": True}, **kwargs
+        if (
+            self.train_alloc.backend != "megatron"
+            or not args
+            or not isinstance(args[0], list)
+            or not all(isinstance(item, dict) for item in args[0])
+        ):
+            return self._custom_function_call(
+                "prepare_mopd_batch", *args, rpc_meta={"broadcast": True}, **kwargs
+            )
+
+        data = args[0]
+        multi_modal_payloads = [
+            {key: value for key, value in item.items() if is_multi_modal_key(key)}
+            for item in data
+        ]
+        if not any(multi_modal_payloads):
+            return self._custom_function_call(
+                "prepare_mopd_batch", *args, rpc_meta={"broadcast": True}, **kwargs
+            )
+
+        # Token alignment does not consume vision payloads. Keeping them on
+        # the controller avoids deep-copying the full image list in split_batch.
+        rpc_data = [
+            {key: value for key, value in item.items() if not is_multi_modal_key(key)}
+            for item in data
+        ]
+        results = self._custom_function_call(
+            "prepare_mopd_batch",
+            rpc_data,
+            *args[1:],
+            rpc_meta={"broadcast": True},
+            **kwargs,
         )
+        if not isinstance(results, list) or len(results) != len(multi_modal_payloads):
+            raise RuntimeError(
+                "Megatron prepare_mopd_batch returned an invalid trajectory batch: "
+                f"expected {len(multi_modal_payloads)} items, got "
+                f"{type(results).__name__} of length "
+                f"{len(results) if isinstance(results, list) else 'unknown'}"
+            )
+        for result, payload in zip(results, multi_modal_payloads, strict=True):
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    "Megatron prepare_mopd_batch returned a non-dict trajectory: "
+                    f"{type(result).__name__}"
+                )
+            result.update(payload)
+        return results
 
     def aggregate_mopd_targets(self, *args, **kwargs):
         return self._custom_function_call(
@@ -959,6 +1011,10 @@ def grpo_loss_fn(
     loss_mask = denominator_mask
     if "policy_version_mask" in input_data:
         loss_mask = loss_mask & input_data["policy_version_mask"].bool()
+    prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
+    if ProxLogpMethod(prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP:
+        prox_logp_gt = logprobs.detach()
+
     if mopd_loss_config is not None and mopd_loss_config.rl_coefficient == 0:
         teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
         teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")
@@ -970,7 +1026,6 @@ def grpo_loss_fn(
                 "MOPD targets require immutable rollout behavior log-probabilities"
             )
         normalization_mask = denominator_mask
-        prox_logp_gt = input_data.get("prox_logp")
         if m2_threshold is not None or rejection_sampling is not None:
             prox_logp = _resolve_proximal_logp(
                 prox_logp_gt=prox_logp_gt,
@@ -1026,12 +1081,8 @@ def grpo_loss_fn(
 
     old_logp = input_data["logprobs"]
     advantages = input_data["advantages"]
-    prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
     entropy = entropy.detach()
-
-    if ProxLogpMethod(prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP:
-        prox_logp_gt = logprobs.detach()
 
     # Resolve proximal log-probabilities based on method
     prox_logp = _resolve_proximal_logp(
