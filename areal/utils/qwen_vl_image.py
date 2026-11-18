@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Callable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -127,7 +128,7 @@ def sglang_qwen_image_kwargs(processor: Any) -> dict[str, Any] | None:
 
 def prepare_sglang_qwen_images(
     processor: Any,
-    images: list[Image],
+    images: list[Image | Callable[[], Image]],
     *,
     cache: ProcessorCallCache | None = None,
     image_keys: list[str] | None = None,
@@ -143,6 +144,7 @@ def prepare_sglang_qwen_images(
     Return resized training images and an unchanged copy of image_keys for
     inference transport. No image is encoded again. With no image_keys the
     second return value is empty, since the original wire bytes are unavailable.
+    Callable inputs are decoded only on cache misses and closed after resizing.
     Qwen4-Exp and unknown processor/model families keep their own policy.
     """
     policy = _image_policy(processor)
@@ -155,11 +157,16 @@ def prepare_sglang_qwen_images(
     for index, image in enumerate(images):
 
         def prepare(image=image):
-            height, width = _sglang_image_size(
-                image.height, image.width, factor, min_pixels, max_pixels
-            )
-            resized = image.convert("RGB").resize((width, height), resample=resample)
-            return resized
+            owned = callable(image)
+            decoded = image() if owned else image
+            try:
+                height, width = _sglang_image_size(
+                    decoded.height, decoded.width, factor, min_pixels, max_pixels
+                )
+                return decoded.convert("RGB").resize((width, height), resample=resample)
+            finally:
+                if owned:
+                    decoded.close()
 
         if cache is not None and image_keys is not None:
             # Reuse resized historical images when text or appended images

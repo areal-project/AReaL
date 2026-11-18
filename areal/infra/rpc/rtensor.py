@@ -481,15 +481,29 @@ class RTensor:
             # split_and_unpad_tensor auto-derives trim lengths from attention_mask.
             attn_mask = obj.get("attention_mask")
             if isinstance(attn_mask, torch.Tensor) and attn_mask.ndim >= 2:
-                from areal.utils.data import split_and_unpad_tensor
+                from areal.utils.data import is_multi_modal_key, split_and_unpad_tensor
+
+                # Compaction trims token padding, but split_and_unpad_tensor
+                # deep-copies non-tensor fields. Keep immutable vision tensors
+                # out of that copy so aliases across trajectories still reach
+                # the root call's tensor memo.
+                shared_multimodal = (
+                    {k: v for k, v in obj.items() if is_multi_modal_key(k)}
+                    if tensor_memo is not None
+                    else {}
+                )
+                compact_input = {
+                    k: v for k, v in obj.items() if k not in shared_multimodal
+                }
 
                 compacted = split_and_unpad_tensor(
-                    obj,
+                    compact_input,
                     n_trajs=1,
                     traj_group_sizes=[attn_mask.shape[0]],
                 )
                 if compacted is not None:
                     obj = compacted[0]
+                    obj.update(shared_multimodal)
             return {
                 k: RTensor._remotize_recursive(v, node_addr, tensor_memo)
                 for k, v in obj.items()
