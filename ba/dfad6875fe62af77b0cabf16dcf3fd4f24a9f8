@@ -1,0 +1,29 @@
+areal/experimental/openai/client.py
+  s_125ac839b9f4bb::t_3ec0e73656adb3 950
+areal/utils/qwen_vl_image.py
+  s_125ac839b9f4bb::t_a3d1821ba3c9bf 3,6-7,88-89,94,97-98,102-104,108,110-114,135,137-141,143,151,158-162,165,168,176,178,180-181
+docs/en/reference/agent_workflow.md
+  s_125ac839b9f4bb::t_bbe4b5c6e7eaf9 53-58
+docs/zh/reference/agent_workflow.md
+  s_125ac839b9f4bb::t_d3060c199732bf 42-45
+tests/experimental/openai/test_image_alignment.py
+  s_125ac839b9f4bb::t_c604f55cdf996c 63,65,112,116,212-213,265-266,273,312
+tests/test_qwen_vl_image_alignment.py
+  s_125ac839b9f4bb::t_76f7a2fe28c00f 95,112-115,171-178,190,198,201,209,215-216,219,227-228
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "badfad6875fe62af77b0cabf16dcf3fd4f24a9f8",
+  "prompts": {},
+  "sessions": {
+    "s_125ac839b9f4bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1d316-3537-7ed2-bdc5-baa4e87b89ff",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
