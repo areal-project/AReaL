@@ -1,0 +1,21 @@
+areal/experimental/openai/client.py
+  s_bc1c666589a651::t_7c2a670af7ae79 950
+tests/experimental/openai/test_image_alignment.py
+  s_bc1c666589a651::t_8c7a0ad272dbcd 62,64,66-67,114-117,121-123,219-220,271-272,274-277,284-289,328
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9bbd5c930baf89de3594ba4abd6cfcb53f4492fd",
+  "prompts": {},
+  "sessions": {
+    "s_bc1c666589a651": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e31e-74a0-77c0-af30-e8ec2f9fdb32",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
