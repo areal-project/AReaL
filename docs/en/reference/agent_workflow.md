@@ -39,10 +39,10 @@ don't expose token IDs and log probabilities. AReaL solves this by:
 
 ### SGLang image preprocessing
 
-For supported Qwen VLMs, the OpenAI proxy follows SGLang's image resizing by default
-when preparing training inputs. This applies to Chat Completions and Responses,
-including cached prompts and concat history. Original image bytes are forwarded to
-SGLang without re-encoding.
+For supported Qwen VLMs, the OpenAI proxy can prepare training inputs using a
+configurable image policy. This applies to Chat Completions and Responses, including
+cached prompts and concat history. Original image bytes are forwarded to SGLang without
+re-encoding.
 
 Set `AREAL_VLM_ALIGN_SGLANG=false` in the proxy/rollout worker environment to use the
 original Hugging Face image preprocessing. The default is `true`; `1` and `0` are also
@@ -50,13 +50,17 @@ accepted. This switch does not change SGLang's settings or disable the HF proces
 own resizing. The proxy and server can use different image inputs while alignment is
 disabled.
 
-`SGLANG_VLM_QWEN_LIMIT_PIXEL` independently controls SGLang's pixel reduction: its
-default `true` reduces the eligible maximum pixel budget by 16, while `false` retains
-the full budget. When proxy alignment is enabled, it follows either choice. The proxy
-and SGLang must use the same `SGLANG_VLM_QWEN_LIMIT_PIXEL` and `SGLANG_RESIZE_RESAMPLE`
-settings. The alignment switch does not provide an independent pixel budget or JPEG
-quality setting. Set these variables before starting workers; no YAML change is
-required.
+`SGLANG_VLM_QWEN_LIMIT_PIXEL` controls the proxy's legacy image compression when
+alignment is enabled. It defaults to `false`: the proxy retains native pixel bounds and
+leaves resizing to the HF processor. Set it to `true` to restore the legacy preliminary
+PIL resize and 16-fold reduction of eligible maximum pixel budgets. In legacy mode,
+`SGLANG_RESIZE_RESAMPLE` selects the PIL filter. Original wire images remain unchanged
+in both modes, and cached inputs are separated by compression policy.
+
+The default changes from `true` to `false`. Set `SGLANG_VLM_QWEN_LIMIT_PIXEL=true` to
+preserve the previous training-input behavior. Choose the policy to match the inference
+server's image preprocessing; setting it in the proxy does not reconfigure the server.
+Set these variables before starting proxy/rollout workers; no YAML change is required.
 
 The AReaL Qwen3-VL/Qwen3.5 processor on the SGLang server is a separate opt-in. For the
 validated CPU/PIL server path and to preserve real-image spans when sampled text
