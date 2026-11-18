@@ -947,7 +947,7 @@ async def _prepare_prompt(
                 "openai_multimodal",
                 align_sglang_images,
                 (
-                    os.environ.get("SGLANG_VLM_QWEN_LIMIT_PIXEL", "false"),
+                    os.environ.get("SGLANG_VLM_QWEN_LIMIT_PIXEL", "true"),
                     os.environ.get("SGLANG_RESIZE_RESAMPLE", ""),
                 )
                 if align_sglang_images

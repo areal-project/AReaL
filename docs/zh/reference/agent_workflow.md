@@ -39,12 +39,10 @@ Completions、Responses、缓存 prompt 和 concat 历史。 发送给 SGLang �
 图片预处理流程。默认值为 `true`，也支持 `1` 和 `0`。这个开关不会修改 SGLang 的配置， 也不会关闭 HF Processor
 自身的缩放。关闭对齐后，训练和推理使用的图片输入可能不同。
 
-`SGLANG_VLM_QWEN_LIMIT_PIXEL` 在开启对齐时控制 proxy 的旧版图像压缩。针对 SGLang 0.5.20，默认值为
-`false`：保留原生像素预算，由 HF Processor 完成缩放。设为 `true` 时，恢复旧版额外 PIL resize，并将符合条件的最大像素预算缩小 16
-倍。旧版模式下，`SGLANG_RESIZE_RESAMPLE` 用于选择 PIL 插值方式。两种模式都保留原始图片传输字节，缓存会按压缩策略区分。
-
-该设置作用于训练输入，启用它不会改变 SGLang 0.5.20 推理服务的图像预处理。仅在需要旧版行为时开启。请在启动 proxy/rollout worker
-前设置这些环境变量，无需修改 YAML。
+`SGLANG_VLM_QWEN_LIMIT_PIXEL` 独立控制 SGLang 的像素压缩：默认的 `true` 将符合条件的最大像素预算缩小 16 倍， `false`
+则保留完整预算。开启 proxy 对齐时，这两种设置都会按 SGLang 的实际值处理。proxy 和 SGLang 必须使用相同的
+`SGLANG_VLM_QWEN_LIMIT_PIXEL` 和 `SGLANG_RESIZE_RESAMPLE` 设置。对齐开关不另设像素预算或 JPEG 质量参数。 请在启动
+worker 前设置这些环境变量，无需修改 YAML。
 
 SGLang 服务端的 AReaL Qwen3-VL/Qwen3.5 处理器是独立的显式选项。如需经过验证的 CPU/PIL 服务端路径，或采样文本中可能包含字面视觉
 token、需要保留真实图片的位置，请在 SGLang 服务端环境中设置

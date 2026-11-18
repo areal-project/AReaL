@@ -92,7 +92,7 @@ def test_image_size_matches_sglang_pixel_budget(shape, expected):
 
 @pytest.mark.parametrize("shape", [(256, 256), (900, 700), (1600, 1200), (84, 56)])
 @pytest.mark.parametrize("mode", ["RGB", "RGBA", "L"])
-def test_preparation_preserves_original_dimensions_pixels_and_wire_bytes(
+def test_resize_preserves_original_wire_bytes_and_matches_pil_policy(
     aligned_processor, shape, mode
 ):
     rng = np.random.default_rng(1)
@@ -109,8 +109,10 @@ def test_preparation_preserves_original_dimensions_pixels_and_wire_bytes(
     )
 
     assert encoded == [wire]
-    assert prepared[0].size == image.size
-    np.testing.assert_array_equal(np.asarray(prepared[0]), original)
+    height, width = _sglang_image_size(image.height, image.width, 32, 65536, 1048576)
+    expected = image.resize((width, height), resample=None)
+    np.testing.assert_array_equal(np.asarray(prepared[0]), np.asarray(expected))
+    assert width * height <= 1048576
     again, _ = prepare_sglang_qwen_images(aligned_processor, prepared)
     np.testing.assert_array_equal(np.asarray(again[0]), np.asarray(prepared[0]))
     np.testing.assert_array_equal(np.asarray(image), original)
@@ -123,35 +125,6 @@ def test_alignment_honors_disabled_sglang_pixel_limit(aligned_processor, monkeyp
         aligned_processor, [Image.new("RGB", (1600, 1200))]
     )
     assert prepared[0].width * prepared[0].height > 1048576
-
-
-def test_enabled_compression_restores_legacy_pixels_and_preserves_wire(
-    aligned_processor, monkeypatch
-):
-    monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", " TRUE ")
-    monkeypatch.setenv("SGLANG_RESIZE_RESAMPLE", "BILINEAR")
-    rng = np.random.default_rng(2)
-    image = Image.fromarray(rng.integers(0, 256, (1200, 1600, 3), dtype=np.uint8))
-    original = np.asarray(image).copy()
-
-    prepared, wire = prepare_sglang_qwen_images(
-        aligned_processor, [image], image_keys=["original-wire-bytes"]
-    )
-
-    assert prepared[0].size == (1152, 864)
-    expected = image.resize((1152, 864), resample=Image.Resampling.BILINEAR)
-    np.testing.assert_array_equal(np.asarray(prepared[0]), np.asarray(expected))
-    np.testing.assert_array_equal(np.asarray(image), original)
-    assert wire == ["original-wire-bytes"]
-
-
-@pytest.mark.parametrize("value", ["", "treu", "2"])
-def test_image_compression_rejects_invalid_switch_values(
-    aligned_processor, monkeypatch, value
-):
-    monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", value)
-    with pytest.raises(ValueError, match="SGLANG_VLM_QWEN_LIMIT_PIXEL"):
-        sglang_qwen_image_kwargs(aligned_processor)
 
 
 def test_alignment_preserves_unsupported_processors():
@@ -195,7 +168,14 @@ def test_image_preparation_reuses_history_across_changed_prompts(
     cache = ProcessorCallCache()
     image = Image.new("RGB", (900, 700), "red")
     expected, expected_wire = prepare_sglang_qwen_images(aligned_processor, [image])
-    monkeypatch.setattr(Image.Image, "resize", lambda *a, **k: pytest.fail("resize"))
+    calls = []
+    original_resize = Image.Image.resize
+
+    def resize(self, *args, **kwargs):
+        calls.append(self.size)
+        return original_resize(self, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "resize", resize)
     monkeypatch.setattr(Image.Image, "save", lambda *a, **k: pytest.fail("re-encoding"))
     first, first_wire = prepare_sglang_qwen_images(
         aligned_processor, [image], cache=cache, image_keys=["red-image"]
@@ -207,6 +187,7 @@ def test_image_preparation_reuses_history_across_changed_prompts(
         cache=cache,
         image_keys=["red-image", "blue-image"],
     )
+    assert len(calls) == 2  # Each unique image resized once, despite new history.
     assert expected_wire == []
     assert first_wire == second_wire[:1] == ["red-image"]
     np.testing.assert_array_equal(np.asarray(second[0]), np.asarray(expected[0]))
@@ -214,15 +195,10 @@ def test_image_preparation_reuses_history_across_changed_prompts(
     prepare_sglang_qwen_images(
         aligned_processor, [image], cache=cache, image_keys=["red-image"]
     )
+    assert len(calls) == 3
 
 
-@pytest.mark.parametrize(
-    ("value", "max_pixels"), [("false", 16777216), ("true", 1048576)]
-)
-def test_hf_kwargs_match_effective_budget_without_repeated_reduction(
-    aligned_processor, monkeypatch, value, max_pixels
-):
-    monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", value)
+def test_hf_kwargs_match_effective_budget_without_repeated_reduction(aligned_processor):
     first = sglang_qwen_image_kwargs(aligned_processor)
     second = sglang_qwen_image_kwargs(aligned_processor)
     assert (
@@ -230,20 +206,17 @@ def test_hf_kwargs_match_effective_budget_without_repeated_reduction(
         == second
         == {
             "device": "cpu",
-            "size": {"shortest_edge": 65536, "longest_edge": max_pixels},
+            "size": {"shortest_edge": 65536, "longest_edge": 1048576},
         }
     )
     assert aligned_processor.image_processor.size["longest_edge"] == 16777216
 
 
-@pytest.mark.parametrize("max_pixels", [1048575, 16777216])
-def test_image_preparation_switch_does_not_reuse_other_mode_cache(
-    aligned_processor, monkeypatch, max_pixels
+def test_image_preparation_cache_respects_pixel_policy_changes(
+    aligned_processor, monkeypatch
 ):
-    aligned_processor.image_processor.size["longest_edge"] = max_pixels
     cache = ProcessorCallCache()
-    image = Image.new("RGB", (900, 700))
-    monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", "true")
+    image = Image.new("RGB", (1600, 1200))
     first, _ = prepare_sglang_qwen_images(
         aligned_processor, [image], cache=cache, image_keys=["same-image"]
     )
@@ -251,17 +224,8 @@ def test_image_preparation_switch_does_not_reuse_other_mode_cache(
     second, _ = prepare_sglang_qwen_images(
         aligned_processor, [image], cache=cache, image_keys=["same-image"]
     )
-    assert first[0].size == (896, 704)
-    assert second[0].size == image.size
-    assert sglang_qwen_image_kwargs(aligned_processor)["size"] == (
-        aligned_processor.image_processor.size
-    )
-    monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", "true")
-    third, _ = prepare_sglang_qwen_images(
-        aligned_processor, [image], cache=cache, image_keys=["same-image"]
-    )
-    assert third[0].size == first[0].size
-    cache.close()
+    assert first[0].width * first[0].height <= 1048576
+    assert second[0].width * second[0].height > 1048576
 
 
 @pytest.mark.parametrize("shape", [(1, 201), (0, 32)])
