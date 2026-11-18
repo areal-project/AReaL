@@ -35,6 +35,10 @@ from examples.swe.arena_reward_breakdown import arena_reward_metrics
 from examples.swe.arena_reward_mapping import load_harness_mapping, load_reward_mapping
 from examples.swe.arena_types import ArenaRewardRefConfig, ArenaStreamConfig
 
+from areal.experimental.openai.finalization import (
+    ResponseValidationPolicy,
+    response_validator_for_policy,
+)
 from areal.experimental.openai.proxy.workflow import HARNESS_OUTCOME_METRIC_CODES
 from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.infra import workflow_context
@@ -592,6 +596,10 @@ class ArenaStreamAgentWorkflow:
         self.result_dump_dir = str(
             self.econfig.get("arena_result_dump_dir", "") or ""
         ).strip()
+        self.response_validation_policy = self.econfig.get(
+            "arena_response_validation_policy", "final_response"
+        )
+        response_validator_for_policy(self.response_validation_policy)
         self.result_dump_max_bytes = int(
             self.econfig.get("arena_result_dump_max_bytes", 1_000_000)
         )
@@ -1630,6 +1638,21 @@ class ArenaStreamAgentWorkflow:
         ):
             return reward
         return None
+
+    def get_response_validation_policy_for_export(
+        self,
+        data: dict[str, Any],
+        reward: float,
+        *,
+        export_style: str,
+    ) -> ResponseValidationPolicy:
+        """Opt successful artifact episodes into external-score validation only."""
+        if (
+            self.get_episode_reward_for_export(data, reward, export_style=export_style)
+            is None
+        ):
+            return "final_response"
+        return self.response_validation_policy
 
     def get_failure_reward_for_export(
         self, data: dict[str, Any], *, export_style: str
