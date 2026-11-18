@@ -522,3 +522,10 @@ or adaptive thinking controls. Chat rendering uses the checkpoint's template def
 and any Harness request overrides. These differences affect training semantics; the
 profile is intended for Arena integration validation, not a claim of full recipe
 equivalence.
+
+### Multiple Harnesses for one Stream
+
+Multiple `arena_streams` entries may share a `stream_id` to run the same dataset through
+different Harnesses. Give every entry a unique `name`; sampling weights, Harness
+selection, reward settings, and per-stream metrics use that logical name. Each entry
+contributes its own sampling weight even when its Stream ID is shared.

@@ -924,6 +924,30 @@ class FP8EngineConfig:
         },
     )
 
+    def apply_to(self, transformer_config: Any) -> None:
+        """Apply the same precision settings to MCore and Bridge providers."""
+        unprefixed = {
+            "tp_only_amax_red",
+            "first_last_layers_bf16",
+            "num_layers_at_start_in_bf16",
+            "num_layers_at_end_in_bf16",
+        }
+        for option in fields(self):
+            if option.name == "direct_convert":
+                # AReaL's export policy, not a TransformerEngine option.
+                continue
+            target = (
+                "fp8"
+                if option.name == "mode"
+                else option.name
+                if option.name in unprefixed
+                else f"fp8_{option.name}"
+            )
+            if hasattr(transformer_config, target):
+                setattr(transformer_config, target, getattr(self, option.name))
+            else:
+                logger.warning("Unknown FP8 field in TransformerConfig: %s", target)
+
 
 @dataclass
 class CPUStagedOffloadConfig:
@@ -2656,6 +2680,12 @@ class SGLangConfig:
     cuda_graph_max_bs: int | None = None
     cuda_graph_bs: list[int] | None = None
     torchao_config: str = ""
+    fp8_gemm_runner_backend: str | None = field(
+        default=None,
+        metadata={
+            "help": "SGLang FP8 GEMM backend. Qwen3.5 AWEX block-FP8 supports 'triton' or 'deep_gemm'; packed DeepGEMM scales are rebuilt after each weight update."
+        },
+    )
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -2793,6 +2823,11 @@ class SGLangConfig:
 
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
+        args = dict(args)
+        # SGLang's CLI spelling differs from its ServerArgs field name.
+        backend = args.pop("fp8_gemm_runner_backend", None)
+        if backend is not None:
+            args["fp8_gemm_backend"] = backend
         return get_py_cmd("areal.v2.inference_service.sglang.launch_server", args)
 
     @staticmethod
@@ -2822,6 +2857,8 @@ class SGLangConfig:
             )
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
+        if sglang_config.fp8_gemm_runner_backend is None:
+            args.pop("fp8_gemm_runner_backend")
         # build_args also accepts DictConfig, which bypasses __post_init__.
         limits = args.get("limit_mm_data_per_request")
         SGLangConfig._validate_mm_limits(limits)

@@ -230,17 +230,18 @@ def test_parse_arena_stream_config_rejects_metric_unsafe_name():
         parse_arena_stream_config({"name": "bad/name", "stream_id": "stream-a"})
 
 
-def test_load_arena_stream_configs_rejects_duplicate_stream_ids():
-    """A copied Stream id must not silently receive multiple mixture weights."""
-    with pytest.raises(ValueError, match="ids must be unique"):
-        load_arena_stream_configs(
-            {
-                "arena_streams": [
-                    {"name": "a", "stream_id": "stream-a"},
-                    {"name": "b", "stream_id": "stream-a"},
-                ]
-            }
-        )
+def test_load_arena_stream_configs_allows_duplicate_ids_for_logical_harnesses():
+    """One real Stream can have separate logical Harness metric namespaces."""
+    streams = load_arena_stream_configs(
+        {
+            "arena_streams": [
+                {"name": "a", "stream_id": "stream-a"},
+                {"name": "b", "stream_id": "stream-a"},
+            ]
+        }
+    )
+    assert [stream.name for stream in streams] == ["a", "b"]
+    assert [stream.stream_id for stream in streams] == ["stream-a", "stream-a"]
 
 
 def test_build_weighted_arena_rows_uses_attempted_group_weights():
@@ -576,11 +577,13 @@ def test_preflight_health_ignores_tasks_without_exact_provenance():
     assert (terminal, failures) == (1, 1)
 
 
+@pytest.mark.parametrize("shared_stream", [False, True])
 @pytest.mark.parametrize("with_observation", [False, True])
 def test_workflow_routes_harness_transform_and_raw_metrics(
-    monkeypatch, tmp_path, with_observation
+    monkeypatch, tmp_path, with_observation, shared_stream
 ):
     """A row should select all rollout and reward settings from its Stream."""
+    second_stream_id = "stream-a" if shared_stream else "stream-b"
     stats_tracker.export_all(reset=True)
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
@@ -604,7 +607,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(
                 },
                 {
                     "name": "b",
-                    "stream_id": "stream-b",
+                    "stream_id": second_stream_id,
                     "harness": "codex@2",
                     "task_envs": {"MODE": "b"},
                     "expected_reward_ref": {"key": "reward-b", "version": "2"},
@@ -672,7 +675,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(
     monkeypatch.setattr(workflow.client, "delete_llm_proxy_async", delete)
     data = {
         "arena_stream_name": "b",
-        "stream_id": "stream-b",
+        "stream_id": second_stream_id,
         "data_id": "data-b",
         "reward_ref_key": "reward-b",
         "reward_ref_version": "2",
@@ -694,7 +697,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(
     reward = asyncio.run(run_workflow())
 
     assert reward == pytest.approx(0.75)
-    assert launched["stream_id"] == "stream-b"
+    assert launched["stream_id"] == second_stream_id
     assert launched["harness"] == "codex@2"
     assert launched["task_envs"] == {"MODE": "b"}
     stats = stats_tracker.export_all(reset=True)
