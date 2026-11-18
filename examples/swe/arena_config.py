@@ -136,6 +136,7 @@ def parse_arena_stream_config(value: Any) -> ArenaStreamConfig:
         dataset_snapshot_file=dataset_snapshot_file.strip(),
         reward_threshold=threshold,
         reward_transform_fn=str(raw.get("reward_transform_fn") or "").strip(),
+        _harness_is_fallback=raw.get("_harness_is_fallback", False),
     )
 
 
@@ -232,6 +233,8 @@ def load_arena_stream_configs(econfig: Any) -> list[ArenaStreamConfig]:
         replace(
             stream,
             harness=stream.harness or common_harness,
+            _harness_is_fallback=stream._harness_is_fallback
+            or (not stream.harness and bool(common_harness)),
             task_envs={**common_task_envs, **stream.task_envs},
         )
         for stream in streams
@@ -239,9 +242,10 @@ def load_arena_stream_configs(econfig: Any) -> list[ArenaStreamConfig]:
     names = [stream.name for stream in streams]
     if len(names) != len(set(names)):
         raise ValueError("Arena Stream names must be unique")
-    stream_ids = [stream.stream_id for stream in streams]
-    if len(stream_ids) != len(set(stream_ids)):
-        raise ValueError("Arena Stream ids must be unique")
+    # A logical mixture entry may intentionally point at the same Arena Stream
+    # more than once.  This is used when one dataset is evaluated through
+    # multiple Harnesses: ``name`` keeps the metric/reward-routing namespace
+    # separate while ``stream_id`` remains the original platform Stream id.
     return streams
 
 

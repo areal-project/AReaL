@@ -465,7 +465,7 @@ class RecoverHandler:
             )
             return None
         logger.info(f"Loading recover info from {source.manifest}")
-        colocate_restore_started = False
+        inference_restore_started = False
         try:
             recover_info: RecoverInfo = RecoverInfo.load(source.manifest)
             logger.info(
@@ -506,8 +506,8 @@ class RecoverHandler:
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
                 inference_engine.pause()
-                colocate_restore_started = is_awex_colocate
-                can_resume_inference = not is_awex_colocate
+                inference_restore_started = True
+                can_resume_inference = False
                 try:
                     # AWEX colocate transfer requires the full engine-level
                     # pause/offload protocol, not just the controller pause. The
@@ -540,9 +540,9 @@ class RecoverHandler:
                         inference_engine.onload(tags=["cuda_graph"])
                         inference_engine.onload(tags=["kv_cache"])
                         call_maybe_async(inference_engine.continue_generation)
-                        can_resume_inference = True
+                    can_resume_inference = True
                 finally:
-                    # Do not admit work to partially restored colocated workers.
+                    # Do not admit work with partially restored/published weights.
                     if can_resume_inference:
                         inference_engine.resume()
             return recover_info
@@ -551,7 +551,7 @@ class RecoverHandler:
                 raise checkpoint_pointer.CheckpointConsistencyError(
                     f"Published checkpoint {source.label} is not loadable: {e}"
                 ) from e
-            if colocate_restore_started:
+            if inference_restore_started:
                 # A failed restore must not fall back to training while paused.
                 raise
             logger.warning(

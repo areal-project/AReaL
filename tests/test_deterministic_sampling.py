@@ -428,6 +428,7 @@ def test_wait_results_selects_completed_tasks_when_deterministic():
     dispatcher.consume_result = lambda result: result
     dispatcher.deterministic_order = True
     dispatcher.terminal_error_fn = None
+    dispatcher.health_check = None
     dispatcher._result_cv = threading.Condition()
     dispatcher._active_task_ids = {0, 1, 2}
     dispatcher._pending_results = {
@@ -448,6 +449,7 @@ def test_wait_for_task_removes_result_before_deterministic_batch_selection():
     dispatcher.consume_result = lambda result: result
     dispatcher.deterministic_order = True
     dispatcher.terminal_error_fn = None
+    dispatcher.health_check = None
     dispatcher._result_cv = threading.Condition()
     dispatcher._active_task_ids = {0, 1, 2}
     dispatcher._pending_results = {

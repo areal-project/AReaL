@@ -3,12 +3,60 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from typing import Any
 
 import torch
 
 from areal.utils import stats_tracker
+from areal.utils.data import TrajBatchMeta
 from areal.utils.stats_tracker import ReduceType
+
+
+def log_arena_stream_training_counts(
+    meta: TrajBatchMeta, loss_mask: torch.Tensor
+) -> None:
+    """Count training inputs per Arena stream once per successful update.
+
+    Export sums over the engine's DP group without model-parallel duplication.
+    Names and definitions match the global PPO input denominators: n_groups
+    counts input groups, n_seqs counts tensor rows, n_tokens includes all padded
+    positions, and n_valid_tokens counts nonzero preprocessed loss-mask entries.
+    Zero-advantage tokens still count; these are not gradient contribution counts.
+    """
+    if not meta.rollout_groups or not any(
+        group is not None and group.arena_stream_name is not None
+        for group in meta.rollout_groups
+    ):
+        return
+    row_tokens = loss_mask.bool().sum(dim=-1, dtype=torch.float64)
+    counts: dict[str, Counter[str]] = {}
+    tokens: dict[str, torch.Tensor] = {}
+    for group, group_tokens in zip(
+        meta.rollout_groups, row_tokens.split(meta.traj_group_sizes), strict=True
+    ):
+        if group is None or group.arena_stream_name is None:
+            continue
+        name = group.arena_stream_name
+        counts.setdefault(name, Counter()).update(
+            n_groups=1,
+            n_seqs=group_tokens.numel(),
+            n_tokens=group_tokens.numel() * loss_mask.shape[-1],
+        )
+        total = group_tokens.sum().reshape(1)
+        tokens[name] = tokens[name] + total if name in tokens else total
+    for name, stream in counts.items():
+        stats_tracker.stat_compact(
+            torch.ones(1, dtype=torch.bool, device=loss_mask.device),
+            ReduceType.SUM,
+            **{
+                f"stream/{name}/{key}": torch.tensor(
+                    [value], dtype=torch.float64, device=loss_mask.device
+                )
+                for key, value in stream.items()
+            },
+            **{f"stream/{name}/n_valid_tokens": tokens[name]},
+        )
 
 
 def log_train_inference_stats(

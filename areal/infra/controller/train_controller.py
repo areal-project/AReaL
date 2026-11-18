@@ -853,12 +853,14 @@ class TrainController:
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         return self.rollout.prepare_batch(
             dataloader=dataloader,
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             group_size=group_size,
             min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
@@ -878,12 +880,14 @@ class TrainController:
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         return self.rollout.rollout_batch(
             data=data,
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             group_size=group_size,
             min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,

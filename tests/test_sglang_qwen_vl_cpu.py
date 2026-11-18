@@ -75,7 +75,9 @@ def test_qwen_server_without_opt_in_preserves_existing_installation(
         startup, "installed_sglang_root", lambda: pytest.fail("SGLang was accessed")
     )
 
-    startup.apply_model_patches(["--model-path", str(model)])
+    startup.apply_model_patches(
+        ["--model-path", str(model), "--linear-attn-decode-backend", "triton"]
+    )
 
     assert (root / patch.TARGET_RELATIVE).read_bytes() == qwen
     assert (root / patch.BASE_RELATIVE).read_bytes() == base
@@ -89,7 +91,9 @@ def test_cpu_profile_keeps_native_resize_and_budget(cpu_runtime, tmp_path, model
     model.mkdir()
     (model / "config.json").write_text(json.dumps({"model_type": model_type}))
 
-    startup.apply_model_patches(["--model", str(model)])
+    startup.apply_model_patches(
+        ["--model", str(model), "--linear-attn-decode-backend", "triton"]
+    )
     qwen_path = root / patch.TARGET_RELATIVE
     base_path = root / patch.BASE_RELATIVE
     assert qwen_path.read_bytes() == patch.patched_source(qwen)
@@ -115,7 +119,9 @@ def test_cpu_profile_keeps_native_resize_and_budget(cpu_runtime, tmp_path, model
     assert processor.process() == "cuda:0"
 
     mtimes = (qwen_path.stat().st_mtime_ns, base_path.stat().st_mtime_ns)
-    startup.apply_model_patches(["--model-path", str(model)])
+    startup.apply_model_patches(
+        ["--model-path", str(model), "--linear-attn-decode-backend", "triton"]
+    )
     assert (qwen_path.stat().st_mtime_ns, base_path.stat().st_mtime_ns) == mtimes
 
 
@@ -127,7 +133,9 @@ def test_unknown_base_source_does_not_partially_install(cpu_runtime, tmp_path):
     target = root / patch.BASE_RELATIVE
     target.write_bytes(b"# unknown source\n")
     with pytest.raises(RuntimeError, match="Unknown SGLang"):
-        startup.apply_model_patches(["--model-path", str(model)])
+        startup.apply_model_patches(
+            ["--model-path", str(model), "--linear-attn-decode-backend", "triton"]
+        )
     assert (root / patch.TARGET_RELATIVE).read_bytes() == qwen
     assert target.read_bytes() == b"# unknown source\n"
 
@@ -146,7 +154,9 @@ def test_existing_cpu_hf_override_is_restored_to_native_dispatch(
     )
     base_path.write_bytes(legacy)
 
-    startup.apply_model_patches(["--model", str(model)])
+    startup.apply_model_patches(
+        ["--model", str(model), "--linear-attn-decode-backend", "triton"]
+    )
 
     assert base_path.read_bytes() == base
     assert (root / patch.TARGET_RELATIVE).read_bytes() == patch.patched_source(qwen)
@@ -165,3 +175,48 @@ def test_existing_cpu_hf_override_is_restored_to_native_dispatch(
         rl_on_policy_target="target"
     )
     assert processor.process() == "cpu"
+
+
+@pytest.mark.parametrize("processor_opt_in", [False, True])
+def test_gdn_protection_is_independent_of_cpu_processor_opt_in(
+    cpu_runtime, tmp_path, monkeypatch, processor_opt_in
+):
+    """Qwen3.5 keeps default GDN protection with either processor selection."""
+    from areal.engine import sglang_gdn_decode_padding as gdn
+
+    root, qwen, base = cpu_runtime
+    if not processor_opt_in:
+        monkeypatch.delenv("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE")
+    source = (
+        "class Kernel:\n    def decode(self):\n"
+        "        if self.use_state_pool:\n            pass\n" + gdn.PINNED_OLD
+    ).encode()
+    target = root / gdn.TARGET_RELATIVE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(source)
+    patched = source.replace(gdn.PINNED_OLD.encode(), gdn.PINNED_NEW.encode())
+    monkeypatch.setattr(
+        gdn,
+        "_PATCHES",
+        {
+            hashlib.sha256(source).hexdigest(): (
+                gdn.PINNED_OLD,
+                gdn.PINNED_NEW,
+                hashlib.sha256(patched).hexdigest(),
+            )
+        },
+    )
+    monkeypatch.setattr(gdn, "validate_flashinfer_version", lambda: None)
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+
+    startup.apply_model_patches(
+        ["--model-path", str(model), "--linear-attn-decode-backend", "flashinfer"]
+    )
+
+    assert target.read_bytes() == gdn.patched_source(source)
+    assert (root / patch.TARGET_RELATIVE).read_bytes() == (
+        patch.patched_source(qwen) if processor_opt_in else qwen
+    )
+    assert (root / patch.BASE_RELATIVE).read_bytes() == base

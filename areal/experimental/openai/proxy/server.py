@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import threading
 import time
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
@@ -136,6 +137,9 @@ class SessionData:
         metadata: dict[str, Any] | None = None,
     ):
         self.session_id = session_id
+        # Public task/session names may be reused after export. Backend CLOSED
+        # tombstones are run-long, so each physical trajectory needs a nonce.
+        self.backend_session_id = uuid.uuid4().hex
         self.sampling_seed_identity = sampling_seed_identity or session_id
         self.processor_cache = processor_cache
         self.processor_cache_group_id = processor_cache_group_id

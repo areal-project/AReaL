@@ -38,8 +38,8 @@ are retained for reference and are not directly comparable with the current reci
 ## Score centering with SGLang
 
 `gsm8k_score_centering.py` uses the native single-turn `RLVRWorkflow` to carry SGLang's
-sampler head IDs and probabilities into FSDP training. Unlike `gsm8k_rl.py`, it does not
-use the OpenAI agent transport, which does not carry these heads.
+sampler head IDs and probabilities into FSDP or Megatron training. Unlike `gsm8k_rl.py`,
+it does not use the OpenAI agent transport, which does not carry these heads.
 
 Start from the existing recipe with these overrides, and set model paths, resource
 allocation and output directories for your environment:
@@ -83,6 +83,12 @@ allocate four trainer GPUs plus the rollout resources. Vocabulary size must divi
 evenly across TP ranks; model attention-head divisibility constraints also apply. FSDP
 does not provide pipeline parallelism.
 
+Megatron also supports TP, packed CP and PP with the same SC/TIS settings. Use the
+existing actor allocation syntax, for example `megatron:d1t2c2p2` for eight trainer
+GPUs, plus separate rollout resources. The correction is computed on the last pipeline
+stage. See the [Megatron validation notes](score_centering_megatron.md) for tested
+layouts and the corrected-verifier Countdown experiment.
+
 The calculation uses PyTorch operations and checkpointed chunks. TP normalizes across
 vocabulary shards without gathering full-vocabulary logits. CP partitions sampler heads
 with the input tokens and differentiably gathers token outputs. Full local logits remain
@@ -90,16 +96,18 @@ live. No new dependency or SGLang runtime patch is required.
 
 Support requires native SGLang rollout, temperature 1, and no sampling truncation or
 penalties. SAPO/CISPO, decoupled PPO, tree training, OpenAI agent workflows and
-distillation remain unsupported. Evaluation disables head collection. Megatron SC
-support is not included. Other training paths retain their existing behavior when score
-centering is disabled.
+distillation remain unsupported. Megatron additionally requires ordinary packed logits:
+chunked LM-head loss, MTP training and differentiable entropy are unsupported.
+Evaluation disables head collection. Other training paths retain their existing behavior
+when score centering is disabled.
 
 Tests cover dense-reference gradients and optimizer updates, vocabulary shards, CP
 padding and inactive partitions, actor alignment and sampler metadata. Run:
 
 ```bash
 python -m pytest tests/test_score_centering.py tests/test_score_centering_tis.py \
-  tests/test_score_centering_vocab_parallel.py tests/test_score_centering_parallel.py -q
+  tests/test_score_centering_vocab_parallel.py tests/test_score_centering_parallel.py \
+  tests/test_score_centering_megatron.py -q
 ```
 
 The opt-in real-model tests require a local Qwen3 checkpoint and four CUDA devices:
@@ -108,6 +116,10 @@ The opt-in real-model tests require a local Qwen3 checkpoint and four CUDA devic
 AREAL_TEST_MODEL=/path/to/local/qwen3-checkpoint python -m pytest \
   tests/test_score_centering_parallel.py -k local_checkpoint -q
 ```
+
+The Megatron checkpoint tests additionally cover PP and CP=4; the largest layout needs
+eight CUDA devices. Set the same `AREAL_TEST_MODEL` and select
+`tests/test_score_centering_megatron.py -k local_checkpoint` to run them.
 
 The earlier [Countdown reproduction notes](score_centering_countdown.md) describe plain
 SC. Multi-node and NPU execution have not been validated. This feature makes no

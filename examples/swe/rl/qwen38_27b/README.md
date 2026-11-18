@@ -6,6 +6,10 @@ uses 100 MB. The cache setting is applied after the site profile so an inherited
 `SGLANG_VLM_CACHE_SIZE_MB=0` cannot disable it. `train.yaml` retains the earlier preset
 and can be selected explicitly with `QWEN_TRAIN_CONFIG=train.yaml` in the site profile.
 
+The default Fine64 preset centers rewards within each group without dividing by the
+group standard deviation (`reward_normalization_use_std: false`). `reward_normalization`
+remains enabled; other presets retain their own settings.
+
 The example profile uses experiment `qwen38-27b-arena-rl` and generates a dated trial
 name. Choose a unique trial name for each new run. W&B, Slurm names, and log directories
 use this same experiment/trial identity.
