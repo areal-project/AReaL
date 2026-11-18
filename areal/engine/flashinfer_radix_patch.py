@@ -4,6 +4,8 @@
 The leading CTA must not reset a barrier while peers still observe it. This
 backport uses last-CTA reset from FlashInfer 49f2abf and distinct JIT module names
 so previously compiled sampling/top-k binaries cannot bypass the fixed header.
+Checksum profiles cover the locked 0.6.7.post3 release and the original
+experiment sources; each profile has its own patched JIT module names.
 Run preparation inside the inference image, then prepend the output directory
 to the inference workers' PYTHONPATH. No installed package is modified.
 """
@@ -27,15 +29,41 @@ def _specification() -> dict:
 
 def patched_sources(source_root: Path) -> dict[str, bytes]:
     """Validate every pinned file before preparing any runtime output."""
+    return _validated_sources(source_root)[1]
+
+
+def _validated_sources(source_root: Path) -> tuple[dict, dict[str, bytes]]:
+    profiles = _specification()["profiles"]
+    paths = {item["path"] for profile in profiles for item in profile["files"]}
+    sources = {
+        relative: (source_root / relative).read_bytes() for relative in sorted(paths)
+    }
+    digests = {
+        relative: hashlib.sha256(source).hexdigest()
+        for relative, source in sources.items()
+    }
+    # Match the complete source set, including already-patched files. Never
+    # combine a header from one release with JIT wrappers from another.
+    profile = next(
+        (
+            profile
+            for profile in profiles
+            if all(
+                digests[item["path"]] in (item["before"], item["after"])
+                for item in profile["files"]
+            )
+        ),
+        None,
+    )
+    if profile is None:
+        raise ValueError(f"Unsupported FlashInfer source checksums: {digests}")
     result = {}
-    for item in _specification()["files"]:
-        source = (source_root / item["path"]).read_bytes()
-        digest = hashlib.sha256(source).hexdigest()
+    for item in profile["files"]:
+        source = sources[item["path"]]
+        digest = digests[item["path"]]
         if digest == item["after"]:
             result[item["path"]] = source
             continue
-        if digest != item["before"]:
-            raise ValueError(f"Unsupported FlashInfer source: {item['path']}")
         text = source.decode()
         for old, new in item["replacements"]:
             if text.count(old) != 1:
@@ -45,7 +73,7 @@ def patched_sources(source_root: Path) -> dict[str, bytes]:
         if hashlib.sha256(patched).hexdigest() != item["after"]:
             raise ValueError(f"Unexpected patched FlashInfer source: {item['path']}")
         result[item["path"]] = patched
-    return result
+    return profile, result
 
 
 def prepare_runtime(source_root: Path, output: Path) -> dict:
@@ -54,7 +82,7 @@ def prepare_runtime(source_root: Path, output: Path) -> dict:
     output = output.absolute()
     if output == source_root or source_root in output.parents:
         raise ValueError("Runtime output must be outside the installed package")
-    patches = patched_sources(source_root)
+    profile, patches = _validated_sources(source_root)
     output.parent.mkdir(parents=True, exist_ok=True)
     with (output.parent / f".{output.name}.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -75,15 +103,13 @@ def prepare_runtime(source_root: Path, output: Path) -> dict:
                 (package / relative).write_bytes(content)
             manifest = {
                 "upstream": _specification()["upstream"],
+                "source_profile": profile["name"],
                 "source_root": str(source_root),
                 "files": {
                     relative: hashlib.sha256(content).hexdigest()
                     for relative, content in patches.items()
                 },
-                "jit_modules": [
-                    "sampling_areal_radix_reset_9e032f75",
-                    "topk_areal_radix_reset_9e032f75",
-                ],
+                "jit_modules": profile["jit_modules"],
             }
             (staging / "manifest.json").write_text(
                 json.dumps(manifest, indent=2) + "\n"

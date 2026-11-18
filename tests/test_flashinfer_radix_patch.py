@@ -3,6 +3,8 @@
 import hashlib
 import importlib.util
 import json
+import re
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -22,8 +24,9 @@ def runtime(tmp_path, monkeypatch):
     source.mkdir()
     (source / "header.cuh").write_bytes(b"old barrier\n")
     (source / "untouched.py").write_bytes(b"payload\n")
-    specification = {
-        "upstream": "test",
+    profile = {
+        "name": "test",
+        "jit_modules": ["sampling_test", "topk_test"],
         "files": [
             {
                 "path": "header.cuh",
@@ -33,7 +36,9 @@ def runtime(tmp_path, monkeypatch):
             }
         ],
     }
-    monkeypatch.setattr(patch, "_specification", lambda: specification)
+    monkeypatch.setattr(
+        patch, "_specification", lambda: {"upstream": "test", "profiles": [profile]}
+    )
     return source, tmp_path / "output"
 
 
@@ -93,17 +98,101 @@ def test_prepare_runtime_rejects_output_inside_installation(runtime):
 
 
 def test_production_spec_uses_distinct_module_names_and_no_diagnostic_delay():
-    specification = json.loads(
-        Path(patch.__file__).with_name("flashinfer_radix_reset.json").read_text()
-    )
-    assert {item["path"] for item in specification["files"]} == {
-        "data/include/flashinfer/topk.cuh",
-        "jit/sampling.py",
-        "jit/topk.py",
+    names = []
+    for profile in patch._specification()["profiles"]:
+        assert {item["path"] for item in profile["files"]} == {
+            "data/include/flashinfer/topk.cuh",
+            "jit/sampling.py",
+            "jit/topk.py",
+        }
+        text = json.dumps(profile)
+        assert "__nanosleep" not in text
+        assert "RadixGroupResetStateLastCTA" in text
+        header = profile["files"][0]
+        expected = [
+            f"{module}_areal_radix_reset_{header['after'][:8]}"
+            for module in ("sampling", "topk")
+        ]
+        assert profile["jit_modules"] == expected
+        names.extend(expected)
+        for item in profile["files"]:
+            if item["path"].startswith("jit/"):
+                assert expected.pop(0) in item["replacements"][0][1]
+    assert len(names) == len(set(names))
+
+
+@pytest.fixture
+def pinned_runtime(tmp_path):
+    source = tmp_path / "installed"
+    with zipfile.ZipFile(
+        Path(__file__).parent / "fixtures/flashinfer/0.6.7.post3.zip"
+    ) as archive:
+        archive.extractall(source)
+    return source, tmp_path / "output"
+
+
+def test_pinned_wheel_preparation_preserves_source_and_is_idempotent(pinned_runtime):
+    source, output = pinned_runtime
+    originals = {
+        p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()
     }
-    text = json.dumps(specification)
-    assert "__nanosleep" not in text
-    assert "RadixGroupResetStateLastCTA" in text
-    for item in specification["files"]:
-        if item["path"].startswith("jit/"):
-            assert "_areal_radix_reset_9e032f75" in item["replacements"][0][1]
+    manifest = patch.prepare_runtime(source, output)
+    lock = (Path(__file__).parents[1] / "uv.lock").read_text()
+    version = re.search(r'name = "flashinfer-python"\nversion = "([^"]+)"', lock)[1]
+    assert manifest["source_profile"] == f"flashinfer-python=={version}"
+    for relative, content in originals.items():
+        assert (source / relative).read_bytes() == content
+    package = output / "flashinfer"
+    again = patch.patched_sources(package)
+    for relative, content in again.items():
+        assert (package / relative).read_bytes() == content
+        assert hashlib.sha256(content).hexdigest() == manifest["files"][relative]
+    header = (package / "data/include/flashinfer/topk.cuh").read_text()
+    assert header.count("RadixGroupResetStateLastCTA<BLOCK_THREADS>") == 3
+    assert header.count("st_release(&state->arrival_counter, 0)") == 1
+    assert "RadixDeterministicCollectScratch" not in header
+    for module in ("sampling", "topk"):
+        text = (package / f"jit/{module}.py").read_text()
+        assert any(name in text for name in manifest["jit_modules"])
+        compile(text, f"jit/{module}.py", "exec")
+    second = patch.prepare_runtime(package, output.with_name("second"))
+    assert second["files"] == manifest["files"]
+    assert second["jit_modules"] == manifest["jit_modules"]
+
+
+@pytest.mark.parametrize(
+    "relative", ["data/include/flashinfer/topk.cuh", "jit/sampling.py", "jit/topk.py"]
+)
+def test_pinned_wheel_modified_source_is_rejected(pinned_runtime, relative):
+    source, output = pinned_runtime
+    target = source / relative
+    target.write_bytes(target.read_bytes() + b"\n// changed\n")
+    with pytest.raises(ValueError, match="Unsupported FlashInfer source"):
+        patch.prepare_runtime(source, output)
+    assert not output.exists()
+
+
+def test_pinned_wheel_partial_patch_uses_matching_profile(pinned_runtime):
+    source, output = pinned_runtime
+    patched = patch.patched_sources(source)
+    relative = "data/include/flashinfer/topk.cuh"
+    (source / relative).write_bytes(patched[relative])
+    manifest = patch.prepare_runtime(source, output)
+    assert manifest["source_profile"] == "flashinfer-python==0.6.7.post3"
+    assert patch.patched_sources(output / "flashinfer") == patched
+
+
+def test_mixed_release_jit_names_are_rejected(pinned_runtime):
+    source, output = pinned_runtime
+    # sampling.py is identical in both releases, but its patched cache name
+    # identifies the header it was prepared with. A mixed profile must fail.
+    relative = "jit/sampling.py"
+    legacy = patch._specification()["profiles"][1]
+    item = next(item for item in legacy["files"] if item["path"] == relative)
+    text = (source / relative).read_text()
+    for old, new in item["replacements"]:
+        text = text.replace(old, new)
+    (source / relative).write_text(text)
+    with pytest.raises(ValueError, match="Unsupported FlashInfer source"):
+        patch.prepare_runtime(source, output)
+    assert not output.exists()
