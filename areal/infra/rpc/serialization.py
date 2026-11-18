@@ -206,6 +206,8 @@ class SerializedNDArray(BaseModel):
             raise ValueError(msg)
 
         contiguous = np.ascontiguousarray(array)
+        # datetime64/timedelta64 cannot export a buffer directly; a byte view
+        # preserves their wire representation without allocating raw bytes.
         buffer = memoryview(contiguous.ravel().view(np.uint8))
         data_b64 = base64.b64encode(buffer).decode("utf-8")
         return cls(data=data_b64, shape=list(array.shape), dtype=array.dtype.str)

@@ -78,33 +78,6 @@ def _restore_vision(data: Any, tensors: list[torch.Tensor]) -> Any:
 _MAPPING_HEADER_SIZE = 64
 
 
-def _open_vision_mapping(path, marker, shape, dtype):
-    # Never create a receiver file: private container mounts must fail rather
-    # than silently map zero pixels. Validate the file through the same fd used
-    # for mmap, avoiding a path check followed by a second, creating open.
-    fd = os.open(path, os.O_RDWR)
-    try:
-        size = (
-            math.prod(shape) * torch.empty((), dtype=dtype, device="cpu").element_size()
-        )
-        if (
-            os.fstat(fd).st_size != _MAPPING_HEADER_SIZE + size
-            or os.pread(fd, _MAPPING_HEADER_SIZE, 0) != marker
-        ):
-            raise ValueError("Vision mapping is not the leader's backing store")
-        storage = mmap.mmap(fd, _MAPPING_HEADER_SIZE + size, access=mmap.ACCESS_WRITE)
-    finally:
-        os.close(fd)
-    try:
-        # frombuffer retains the mmap owner until the last tensor view dies.
-        return torch.frombuffer(
-            storage, dtype=dtype, count=math.prod(shape), offset=_MAPPING_HEADER_SIZE
-        ).reshape(shape)
-    except Exception:
-        storage.close()
-        raise
-
-
 def _check_mapping_errors(error, ranks, group, phase):
     errors = [None] * len(ranks)
     dist.all_gather_object(errors, error, group=group)
@@ -134,6 +107,39 @@ class NodeSharedVisionTransport:
             node_name or os.environ.get("SLURMD_NODENAME") or socket.gethostname()
         )
         self._layouts: dict[tuple[Any, int], tuple[list[int], list[int], int]] = {}
+
+    @staticmethod
+    def _open_vision_mapping(path, marker, shape, dtype):
+        # Never create a receiver file: private container mounts must fail rather
+        # than silently map zero pixels. Validate the file through the same fd used
+        # for mmap, avoiding a path check followed by a second, creating open.
+        fd = os.open(path, os.O_RDWR)
+        try:
+            size = (
+                math.prod(shape)
+                * torch.empty((), dtype=dtype, device="cpu").element_size()
+            )
+            if (
+                os.fstat(fd).st_size != _MAPPING_HEADER_SIZE + size
+                or os.pread(fd, _MAPPING_HEADER_SIZE, 0) != marker
+            ):
+                raise ValueError("Vision mapping is not the leader's backing store")
+            storage = mmap.mmap(
+                fd, _MAPPING_HEADER_SIZE + size, access=mmap.ACCESS_WRITE
+            )
+        finally:
+            os.close(fd)
+        try:
+            # frombuffer retains the mmap owner until the last tensor view dies.
+            return torch.frombuffer(
+                storage,
+                dtype=dtype,
+                count=math.prod(shape),
+                offset=_MAPPING_HEADER_SIZE,
+            ).reshape(shape)
+        except Exception:
+            storage.close()
+            raise
 
     def _node_layout(self, group, src_rank):
         key = (group, src_rank)
@@ -221,7 +227,7 @@ class NodeSharedVisionTransport:
                 error = None
                 try:
                     local_path, local_marker = names[ranks.index(leader)]
-                    mapped = _open_vision_mapping(
+                    mapped = self._open_vision_mapping(
                         local_path, local_marker, shape, dtype
                     )
                 except Exception as exc:
