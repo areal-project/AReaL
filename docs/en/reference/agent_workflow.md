@@ -50,12 +50,16 @@ accepted. This switch does not change SGLang's settings or disable the HF proces
 own resizing. The proxy and server can use different image inputs while alignment is
 disabled.
 
-`SGLANG_VLM_QWEN_LIMIT_PIXEL` independently controls SGLang's pixel reduction: its
-default `true` reduces the eligible maximum pixel budget by 16, while `false` retains
-the full budget. When proxy alignment is enabled, it follows either choice. The proxy
-and SGLang must use the same `SGLANG_VLM_QWEN_LIMIT_PIXEL` and `SGLANG_RESIZE_RESAMPLE`
-settings. The alignment switch does not provide an independent pixel budget or JPEG
-quality setting. Set these variables before starting workers; no YAML change is
+`SGLANG_VLM_QWEN_LIMIT_PIXEL` controls the proxy's legacy image compression when
+alignment is enabled. It defaults to `false` for SGLang 0.5.20: the proxy retains native
+pixel bounds and leaves resizing to the HF processor. Set it to `true` to restore the
+legacy preliminary PIL resize and 16-fold reduction of eligible maximum pixel budgets.
+In legacy mode, `SGLANG_RESIZE_RESAMPLE` selects the PIL filter. Original wire images
+remain unchanged in both modes, and cached inputs are separated by compression policy.
+
+This is a training-input setting; enabling it does not change the SGLang 0.5.20
+inference server's image preprocessing. Use the legacy mode only when that behavior is
+intended. Set these variables before starting proxy/rollout workers; no YAML change is
 required.
 
 The AReaL Qwen3-VL/Qwen3.5 processor on the SGLang server is a separate opt-in. For the
