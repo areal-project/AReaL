@@ -1555,6 +1555,10 @@ class PPOTrainer:
             self.rollout_alloc = ModelAllocation.from_str(
                 self.config.rollout.backend, name="rollout"
             )
+            layout = request["rollout_layout"]
+            if layout is not None and layout.attention_dp_size is not None:
+                self.config.sglang.dp_size = layout.attention_dp_size
+                self.config.sglang.enable_dp_attention = layout.attention_dp_size > 1
         except BaseException as exc:
             future.set_exception(exc)
             raise

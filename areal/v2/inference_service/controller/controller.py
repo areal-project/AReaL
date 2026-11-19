@@ -1823,7 +1823,11 @@ class RolloutControllerV2:
             self._forked_services.remove((guard, role, index))
 
     async def _async_create_model_servers(
-        self, alloc: ModelAllocation, gpu_devices: list[int]
+        self,
+        alloc: ModelAllocation,
+        gpu_devices: list[int],
+        *,
+        attention_dp_size: int | None = None,
     ) -> None:
         client = await self._get_async_client()
         owners = {
@@ -1848,6 +1852,11 @@ class RolloutControllerV2:
             base_gpu_id=0,
             load_format="dummy",
         )
+        if attention_dp_size is not None:
+            args.update(
+                dp_size=attention_dp_size,
+                enable_dp_attention=attention_dp_size > 1,
+            )
         await self._async_fork_inf_servers(
             self.config,
             alloc,
@@ -1876,6 +1885,7 @@ class RolloutControllerV2:
             }
         )
         self.rollout_alloc = alloc
+        self._model_server_args = args
         self._nnodes_per_instance = 1
         self.config.backend = str(alloc)
         self.config.gpu_devices = gpu_devices

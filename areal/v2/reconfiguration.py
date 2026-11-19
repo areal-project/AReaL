@@ -34,6 +34,8 @@ class ExecutionLayout:
 
     backend: str
     devices: tuple[Device, ...]
+    # SGLang only: None inherits, 1 disables, >1 enables Attention DP.
+    attention_dp_size: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "devices", tuple(self.devices))
@@ -43,9 +45,19 @@ class ExecutionLayout:
             raise ValueError("ExecutionLayout devices must be unique")
 
     @classmethod
-    def local(cls, backend: str, gpu_devices: list[int]) -> ExecutionLayout:
+    def local(
+        cls,
+        backend: str,
+        gpu_devices: list[int],
+        *,
+        attention_dp_size: int | None = None,
+    ) -> ExecutionLayout:
         node = gethostip()
-        return cls(backend, tuple(Device(node, gpu) for gpu in gpu_devices))
+        return cls(
+            backend,
+            tuple(Device(node, gpu) for gpu in gpu_devices),
+            attention_dp_size,
+        )
 
     def local_gpu_devices(self) -> list[int]:
         if {device.node for device in self.devices} != {gethostip()}:
@@ -65,6 +77,7 @@ async def _migrate(
     actor_waits: bool,
     rollout_waits: bool,
     state: SaveLoadMeta | None,
+    attention_dp_size: int | None = None,
 ) -> None:
     # Futures carry either a successful release or its error to the other role.
     # Gather joins both branches, including save/load threads, before returning.
@@ -108,7 +121,14 @@ async def _migrate(
         if rollout_alloc is not None:
             if rollout_waits:
                 await asyncio.shield(released["actor"])
-            await rollout._async_create_model_servers(rollout_alloc, rollout_devices)
+            options = (
+                {"attention_dp_size": attention_dp_size}
+                if attention_dp_size is not None
+                else {}
+            )
+            await rollout._async_create_model_servers(
+                rollout_alloc, rollout_devices, **options
+            )
 
     results = await asyncio.gather(
         actor_branch(), rollout_branch(), return_exceptions=True
@@ -157,6 +177,8 @@ def reconfigure(
         actor_devices = [device.gpu for device in old_actor]
         rollout_devices = [device.gpu for device in old_rollout]
         if actor_layout is not None:
+            if actor_layout.attention_dp_size is not None:
+                raise ValueError("Attention DP applies only to SGLang rollout layouts")
             actor_devices = actor_layout.local_gpu_devices()
             actor_alloc = actor._validate_engine_rebuild(
                 actor_layout.backend, actor_devices
@@ -176,6 +198,16 @@ def reconfigure(
             rollout_alloc = rollout.validate_reconfiguration(
                 rollout_layout.backend, rollout_devices
             )
+            dp = rollout_layout.attention_dp_size
+            if dp is None:
+                args = rollout._model_server_args
+                dp = (
+                    args.get("dp_size", 1)
+                    if args.get("enable_dp_attention", False)
+                    else 1
+                )
+            if type(dp) is not int or dp < 1 or rollout_alloc.parallel.tp_size % dp:
+                raise ValueError("Attention DP must be positive and divide rollout TP")
         if actor_alloc is None and rollout_alloc is None:
             return
         target_actor = (
@@ -220,6 +252,9 @@ def reconfigure(
                 bool(target_actor & old_rollout),
                 bool(target_rollout & old_actor),
                 state,
+                rollout_layout.attention_dp_size
+                if rollout_layout is not None
+                else None,
             )
             if rollout is not None:
                 actor._reconfiguration_phase = "publishing"
