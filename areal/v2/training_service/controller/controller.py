@@ -11,6 +11,7 @@ import traceback
 from copy import deepcopy
 from threading import Lock
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import aiohttp
@@ -1299,6 +1300,40 @@ class GatewayTrainController:
             actor_layout=ExecutionLayout.local(backend, gpu_devices),
             state_path=state_path,
         )
+
+    async def _async_prefetch_model_state(
+        self, path: str, version: int, devices: list[int]
+    ) -> None:
+        workers = {}
+        for device in devices:
+            address = self._worker_pool_devices[device]
+            workers.setdefault(urlsplit(address).hostname, address)
+        client = await self._get_async_client()
+
+        async def prefetch(address: str) -> None:
+            start = time.monotonic()
+            try:
+                response = await client.post(
+                    f"{address}/prefetch_model_state",
+                    json={"path": path, "version": version},
+                    headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+                )
+                response.raise_for_status()
+                logger.info(
+                    "Prefetched Actor v%s on %s: %s model bytes in %.2fs",
+                    version,
+                    address,
+                    response.json()["result"],
+                    time.monotonic() - start,
+                )
+            except Exception:
+                logger.warning(
+                    "Model prefetch failed on %s; restoring normally",
+                    address,
+                    exc_info=True,
+                )
+
+        await asyncio.gather(*(prefetch(address) for address in workers.values()))
 
     async def _async_release_engine_rendezvous(self) -> None:
         if self._engine_rendezvous_owner is not None:

@@ -72,19 +72,30 @@ async def _migrate(
     released = {role: loop.create_future() for role in ("actor", "rollout")}
 
     async def actor_branch():
+        if actor_alloc is None:
+            released["actor"].set_result(None)
+            return
+        prefetch = None
         try:
-            if actor_alloc is not None:
-                await asyncio.to_thread(actor.save, state)
-                await actor._async_release_engines()
-        except BaseException as exc:
-            released["actor"].set_exception(exc)
-            raise
-        released["actor"].set_result(None)
-        if actor_alloc is not None:
+            await asyncio.to_thread(actor.save, state)
+            prefetch = asyncio.create_task(
+                actor._async_prefetch_model_state(
+                    state.path, actor.get_version(), actor_devices
+                )
+            )
+            await actor._async_release_engines()
+            released["actor"].set_result(None)
             if actor_waits:
                 await asyncio.shield(released["rollout"])
             await actor._async_create_engines(actor_alloc, actor_devices)
-            await asyncio.to_thread(actor.load, state)
+        except BaseException as exc:
+            if not released["actor"].done():
+                released["actor"].set_exception(exc)
+            raise
+        finally:
+            if prefetch is not None:
+                await prefetch
+        await asyncio.to_thread(actor.load, state)
 
     async def rollout_branch():
         try:

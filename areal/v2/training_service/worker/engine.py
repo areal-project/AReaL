@@ -115,6 +115,19 @@ def create_engine_module(
             )
             return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
+    @bp.post("/prefetch_model_state")
+    def prefetch_model_state():
+        if request.headers.get("Authorization") != f"Bearer {config.admin_api_key}":
+            return jsonify({"error": "Invalid admin API key"}), 403
+        from areal.engine.megatron_utils import state_transfer
+
+        data = request.get_json()
+        # CPU I/O runs on the request thread while the Engine thread is rebuilt.
+        return run_endpoint(
+            "prefetch_model_state",
+            lambda: state_transfer.prefetch_model_state(data["path"], data["version"]),
+        )
+
     @bp.route("/configure_runtime", methods=["POST"])
     def configure_runtime():
         """Assign a logical rank to an idle, single-GPU persistent worker."""

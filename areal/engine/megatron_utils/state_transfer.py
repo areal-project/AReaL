@@ -18,6 +18,7 @@ import math
 import mmap
 import os
 import pickle
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -775,6 +776,43 @@ def save_state(engine: Any, directory: str) -> dict:
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
     return _gather_results(engine, receipt, error)[0]
+
+
+def prefetch_model_state(directory: str, version: int) -> int:
+    """Warm this host's page cache with only the model ranges of a committed snapshot."""
+    root = Path(directory)
+    manifest = json.loads((root / "complete.json").read_bytes())
+    if manifest["format"] != _FORMAT or manifest["version"] != version:
+        raise ValueError("Unexpected raw snapshot format or version")
+
+    total = 0
+    buffer = memoryview(bytearray(8 * 1024**2))
+    for rank in manifest["ranks"]:
+        name = f"rank-{int(rank['rank'])}.bin"
+        ranges = sorted(
+            (r["byte_offset"], r["byte_offset"] + r["bytes"])
+            for r in rank["records"]
+            if r["file"] == name
+            and r["bytes"]
+            and not re.match(r"^(?:chained_\d+\.)*optimizer\.", r["key"])
+        )
+        if not ranges:
+            continue
+        with (root / name).open("rb", buffering=0) as stream:
+            size = os.fstat(stream.fileno()).st_size
+            if size != rank["files"][name]:
+                raise ValueError(f"Invalid snapshot rank file: {name}")
+            for start, end in ranges:
+                if not 0 <= start <= end <= size:
+                    raise ValueError(f"Invalid model range in {name}")
+                if start > stream.tell():
+                    stream.seek(start)
+                while (remaining := end - stream.tell()) > 0:
+                    count = stream.readinto(buffer[: min(len(buffer), remaining)])
+                    if not count:
+                        raise EOFError(name)
+                    total += count
+    return total
 
 
 def restore_state(engine: Any, directory: str) -> dict:
