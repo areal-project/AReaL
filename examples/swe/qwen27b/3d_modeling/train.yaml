@@ -1,0 +1,334 @@
+# BS64 x GS12 Blender baseline. Site bindings belong in the external Ray profile.
+# Actor/rollout backends determine GPU count; ray.sh infers the required nodes.
+experiment_name: ${oc.env:QWEN_EXPERIMENT_NAME}
+trial_name: ${oc.env:QWEN_ARENA_TRIAL}
+cluster:
+  name_resolve:
+    nfs_record_root: ${cluster.fileroot}/name_resolve/${experiment_name}/${trial_name}
+  fileroot: ${oc.env:QWEN_OUTPUT_ROOT}
+  n_gpus_per_node: 8
+seed: 42
+enable_offload: false
+total_train_epochs: 1000
+total_train_steps: 1000
+tokenizer_path: ${actor.path}
+train_dataset:
+  path: ''
+  type: rl
+  batch_size: 64
+  pin_memory: true
+  drop_last: false
+  max_length: 262144
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_steps: 5
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: online
+    wandb_base_url: ${oc.env:WANDB_BASE_URL}
+    wandb_api_key: ${oc.env:WANDB_API_KEY}
+    project: ${experiment_name}
+    name: ${trial_name}
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  save_interval: 1
+  profile_steps: null
+  session_tracer:
+    enabled: false
+    flush_threshold: 256
+recover:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_secs: 7200
+  mode: disabled
+sglang:
+  model_path: ${actor.path}
+  random_seed: 42
+  skip_tokenizer_init: true
+  disable_cuda_graph: false
+  disable_radix_cache: false
+  cuda_graph_max_bs: 24
+  enable_memory_saver: true
+  attention_backend: null
+  enable_multimodal: true
+  limit_mm_data_per_request:
+    image: 64
+    video: 1
+    audio: 5
+  context_length: 262144
+  mem_fraction_static: 0.7
+  max_running_requests: 1000
+  chunked_prefill_size: 8192
+  max_prefill_tokens: 8192
+  mamba_ssm_dtype: bfloat16
+  log_level: info
+scheduler:
+  type: ray
+gconfig:
+  n_samples: 12
+  max_new_tokens: 65536
+  max_tokens: 262144
+  top_p: 1.0
+  top_k: 100000
+  temperature: 1.0
+  ignore_eos: false
+  lora_name: ''
+  reward_normalization: true
+  reward_normalization_use_std: false
+  drop_incomplete_group: false
+eval_gconfig:
+  n_samples: 12
+  max_new_tokens: 65536
+  min_new_tokens: 0
+  max_tokens: 262144
+  greedy: false
+  top_p: 1.0
+  top_k: 100000
+  temperature: 1.0
+  stop_token_ids: []
+  ignore_eos: false
+  skip_special_tokens: true
+  stop: null
+  frequency_penalty: 0.0
+  seed: null
+  lora_name: ''
+  use_beam_search: false
+  reward_normalization: false
+  reward_normalization_use_std: true
+  drop_incomplete_group: false
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  max_concurrent_rollouts: 16
+  queue_size: 256
+  consumer_batch_size: 64
+  max_head_offpolicyness: 1
+  tokenizer_path: ${actor.path}
+  dump_to_file: true
+  setup_timeout: 7200.0
+  request_timeout: 20000.0
+  request_retries: 0
+  pause_grace_period: 60.0
+  scheduling_spec:
+  - cpu: 4
+    gpu: 1
+    mem: 64
+    env_vars:
+      SGLANG_NUMA_BIND_V2: '0'
+      TMS_INIT_ENABLE: '0'
+      TMS_INIT_ENABLE_CPU_BACKUP: '0'
+      ARENA_OPENAPI_BASE: ${oc.env:ARENA_OPENAPI_BASE}
+      NO_PROXY: '*'
+      no_proxy: '*'
+      TOKENIZERS_PARALLELISM: 'false'
+      AWEX_ACTOR_ALLOC_CONF: expandable_segments:False
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NCCL_DEBUG: WARN
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+      OMP_NUM_THREADS: '4'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      PYTHONUNBUFFERED: '1'
+      QWEN_ENV_FILE: ${oc.env:QWEN_ENV_FILE}
+  backend: sglang:d16t4
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  agent:
+    admin_api_key: ${oc.env:SWE_RL_ADMIN_API_KEY}
+    tool_call_parser: qwen3_coder
+    tool_call_parser_allow_recovery: false
+    chat_template_kwargs:
+      reasoning_effort: medium
+    chat_template_type: concat
+    engine_max_tokens: 262144
+    export_style: concat
+    message_preprocessors:
+    - examples.swe.preprocessors.MergeSystemMessages
+    - examples.swe.preprocessors.StripAnthropicBillingHeader
+    - examples.swe.preprocessors.StripAllSystemReminders
+    - examples.swe.preprocessors.StripAnthropicCacheFields
+    - examples.swe.preprocessors.NormalizeToolCallArguments
+    prefix_matcher: examples.swe.prefix_matchers.swe_prefix_matcher
+    drop_retry_orphans: true
+    session_timeout_seconds: 15600
+    prm:
+      enabled: false
+  admin_api_key: ${oc.env:SWE_RL_ADMIN_API_KEY}
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${oc.env:QWEN_MODEL}
+  mb_spec:
+    n_mbs: 128
+    max_tokens_per_mb: 262144
+    n_mbs_divisor: 8
+  disable_dropout: true
+  gradient_checkpointing: true
+  optimizer:
+    type: adam
+    lr: 3.0e-06
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1.0e-08
+    min_lr_ratio: 0.0
+    lr_scheduler_type: constant
+    warmup_steps_proportion: 0.001
+    warmup_steps: 2
+    initial_loss_scale: 4294967296.0
+    min_loss_scale: 1.0
+    loss_scale_window: 5.0
+    hysteresis: 2
+    gradient_clipping: 1.0
+  weight_update_mode: awex
+  megatron:
+    bridge_type: megatron-bridge
+    enable_mtp: false
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    freeze_ple_table: true
+  scheduling_spec:
+  - cpu: 4
+    gpu: 1
+    mem: 64
+    env_vars:
+      TMS_INIT_ENABLE: '0'
+      TMS_INIT_ENABLE_CPU_BACKUP: '0'
+      QWEN_PLE_CHUNK_TOKENS: '0'
+      QWEN_GDN_CP_COMPAT: '0'
+      ARENA_OPENAPI_BASE: ${oc.env:ARENA_OPENAPI_BASE}
+      NO_PROXY: '*'
+      no_proxy: '*'
+      TOKENIZERS_PARALLELISM: 'false'
+      AWEX_ACTOR_ALLOC_CONF: expandable_segments:True
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,garbage_collection_threshold:0.7
+      NCCL_DEBUG: WARN
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+      NVIDIA_TF32_OVERRIDE: '0'
+      OMP_NUM_THREADS: '4'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      PYTHONUNBUFFERED: '1'
+      QWEN_ENV_FILE: ${oc.env:QWEN_ENV_FILE}
+  backend: megatron:d1p4t4c4e1
+  admin_api_key: ${oc.env:SWE_RL_ADMIN_API_KEY}
+  ppo_n_minibatches: 1
+  eps_clip_higher: 0.28
+  reward_norm: null
+  reward_clip: 5.0
+  gae_lambda: areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae
+  gae_lambda_kwargs:
+    alpha: 1.5
+  gae_timestep_unit: turn
+  adv_norm:
+    mean_level: null
+    mean_leave1out: false
+    std_level: null
+    std_unbiased: true
+    eps: 1.0e-05
+    group_size: 1
+  token_rewards_as_adv: true
+  min_usable_group_size: 8
+  kl_ctl: 0.0
+  loss_aggregation: token_mean
+  recompute_logprob: false
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    agg: mean
+    upper: 5.0
+    lower: 0.5
+  prox_logp_method: reuse_train_logp
+  max_new_tokens: 65536
+econfig:
+  dataset_source: arena
+  arena_streams:
+  - name: heritage-color-noskill
+    stream_id: ${oc.env:QWEN_3D_STREAM_1}
+    reward_mapping_file: ${oc.env:QWEN_3D_REWARD_MAP_1}
+    sampling_weight: 1
+    harness: ${oc.env:QWEN_3D_HARNESS_NOSKILL}
+    llm_protocol: chat_completions
+    task_envs:
+      DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
+  - name: heritage-color-self-implement
+    stream_id: ${oc.env:QWEN_3D_STREAM_1}
+    reward_mapping_file: ${oc.env:QWEN_3D_REWARD_MAP_1}
+    sampling_weight: 1
+    harness: ${oc.env:QWEN_3D_HARNESS_SELF_IMPLEMENT}
+    llm_protocol: chat_completions
+    task_envs:
+      DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
+  - name: component-white-noskill
+    stream_id: ${oc.env:QWEN_3D_STREAM_2}
+    reward_mapping_file: ${oc.env:QWEN_3D_REWARD_MAP_2}
+    sampling_weight: 1
+    harness: ${oc.env:QWEN_3D_HARNESS_NOSKILL}
+    llm_protocol: chat_completions
+    task_envs:
+      DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
+  - name: component-white-self-implement
+    stream_id: ${oc.env:QWEN_3D_STREAM_2}
+    reward_mapping_file: ${oc.env:QWEN_3D_REWARD_MAP_2}
+    sampling_weight: 1
+    harness: ${oc.env:QWEN_3D_HARNESS_SELF_IMPLEMENT}
+    llm_protocol: chat_completions
+    task_envs:
+      DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
+  - name: component-color-noskill
+    stream_id: ${oc.env:QWEN_3D_STREAM_3}
+    reward_mapping_file: ${oc.env:QWEN_3D_REWARD_MAP_3}
+    sampling_weight: 1
+    harness: ${oc.env:QWEN_3D_HARNESS_NOSKILL}
+    llm_protocol: chat_completions
+    task_envs:
+      DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
+  - name: component-color-self-implement
+    stream_id: ${oc.env:QWEN_3D_STREAM_3}
+    reward_mapping_file: ${oc.env:QWEN_3D_REWARD_MAP_3}
+    sampling_weight: 1
+    harness: ${oc.env:QWEN_3D_HARNESS_SELF_IMPLEMENT}
+    llm_protocol: chat_completions
+    task_envs:
+      DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
+  - name: component-color-2-noskill
+    stream_id: ${oc.env:QWEN_3D_STREAM_4}
+    reward_mapping_file: ${oc.env:QWEN_3D_REWARD_MAP_4}
+    sampling_weight: 1
+    harness: ${oc.env:QWEN_3D_HARNESS_NOSKILL}
+    llm_protocol: chat_completions
+    task_envs:
+      DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
+  - name: component-color-2-self-implement
+    stream_id: ${oc.env:QWEN_3D_STREAM_4}
+    reward_mapping_file: ${oc.env:QWEN_3D_REWARD_MAP_4}
+    sampling_weight: 1
+    harness: ${oc.env:QWEN_3D_HARNESS_SELF_IMPLEMENT}
+    llm_protocol: chat_completions
+    task_envs:
+      DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
+  arena_mixture_epoch_size: 0
+  arena_base_url: ${oc.env:ARENA_OPENAPI_BASE}
+  arena_request_timeout: 180.0
+  arena_request_retries: 1
+  arena_task_envs:
+    DSH_LLM_REQUEST_TIMEOUT_SECONDS: '7200'
+  timeout: 15000.0
+should_accept_fn: examples.swe.filter_function.filter_function

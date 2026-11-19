@@ -242,9 +242,19 @@ def load_arena_stream_configs(econfig: Any) -> list[ArenaStreamConfig]:
     names = [stream.name for stream in streams]
     if len(names) != len(set(names)):
         raise ValueError("Arena Stream names must be unique")
-    stream_ids = [stream.stream_id for stream in streams]
-    if len(stream_ids) != len(set(stream_ids)):
-        raise ValueError("Arena Stream ids must be unique")
+    # Mixture provenance and workflow routing use the unique entry name. The
+    # same upstream dataset may intentionally run through different harnesses.
+    # Still reject accidental copies, including ambiguous inherited defaults.
+    harnesses_by_id: dict[str, set[str]] = {}
+    for stream in streams:
+        harnesses = harnesses_by_id.setdefault(stream.stream_id, set())
+        harness = stream.harness_override
+        if harnesses and (not harness or "" in harnesses or harness in harnesses):
+            raise ValueError(
+                "Arena Stream ids must be unique unless each entry specifies "
+                "a distinct explicit harness"
+            )
+        harnesses.add(harness)
     return streams
 
 

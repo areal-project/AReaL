@@ -46,6 +46,11 @@ bash examples/swe/qwen27b/ray_swemm.sh \
 The same entry supports text-only SWE streams; the stream's harness and task definitions
 select the workload. No private stream IDs or reward mappings are bundled here.
 
+## 3D modeling
+
+For the BS64/GS12 Blender workload with four datasets and two harness variants, see the
+[3D modeling baseline](3d_modeling/README.md).
+
 ## GSM8K
 
 [gsm8k.yaml](gsm8k.yaml) uses batch size 8, 8 samples per question, 25 updates, 4096

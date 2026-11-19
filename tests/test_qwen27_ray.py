@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -685,6 +686,144 @@ def test_gsm8k_shell_prepares_without_arena_and_applies_overrides(tmp_path):
         config["actor"]["scheduling_spec"][0]["env_vars"]["QWEN_SUBMITTED_TASK"]
         == "gsm8k"
     )
+
+
+def test_blender_ray_config_resolves_paired_stream_bindings(tmp_path, monkeypatch):
+    from omegaconf import OmegaConf
+
+    from examples.swe.arena_config import load_arena_stream_configs
+    from examples.swe.utils import SWEPPOConfig
+
+    recipe = RECIPE.parents[1] / "qwen27b/3d_modeling"
+    original = yaml.safe_load((recipe / "train.yaml").read_text())
+    env = _config_env(tmp_path)
+    for key in (
+        "QWEN_ARENA_STREAM_ID",
+        "QWEN_ARENA_HARNESS",
+        "QWEN_REWARD_KEY",
+        "QWEN_REWARD_VERSION",
+    ):
+        env.pop(key)
+    env.update(
+        QWEN_MODEL=str(tmp_path / "model"),
+        ARENA_OPENAPI_BASE="https://arena.example.invalid",
+        SWE_RL_ADMIN_API_KEY="test-admin",
+        WANDB_BASE_URL="https://wandb.example.invalid",
+        WANDB_API_KEY="test-wandb",
+        QWEN_3D_HARNESS_NOSKILL="noskill@1",
+        QWEN_3D_HARNESS_SELF_IMPLEMENT="self-implement@2",
+    )
+    for group in range(1, 5):
+        env[f"QWEN_3D_STREAM_{group}"] = f"source-{group}"
+        env[f"QWEN_3D_REWARD_MAP_{group}"] = str(tmp_path / f"map-{group}.json")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    config = prepare_ray_config(original, RECIPE.parents[3], env)
+    effective = OmegaConf.merge(OmegaConf.structured(SWEPPOConfig), config)
+    OmegaConf.resolve(effective)
+    streams = load_arena_stream_configs(effective.econfig)
+    assert len(streams) == 8
+    assert len({stream.name for stream in streams}) == 8
+    for group in range(1, 5):
+        pair = streams[(group - 1) * 2 : group * 2]
+        assert {s.stream_id for s in pair} == {f"source-{group}"}
+        assert {s.reward_mapping_file for s in pair} == {
+            str(tmp_path / f"map-{group}.json")
+        }
+        assert {s.harness for s in pair} == {"noskill@1", "self-implement@2"}
+        assert all(s.sampling_weight == 1 for s in pair)
+    assert ray_gpu_bundles(config) == [8] * 8
+    assert (
+        effective.train_dataset.batch_size
+        == effective.rollout.consumer_batch_size
+        == 64
+    )
+    assert effective.gconfig.n_samples == 12
+    assert effective.gconfig.reward_normalization
+    assert not effective.gconfig.reward_normalization_use_std
+    assert not effective.rollout.agent.prm.enabled
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_blender_shell_selects_config_and_derives_scaled_nodes(tmp_path, custom):
+    recipe = RECIPE.parents[1] / "qwen27b/3d_modeling"
+    env = _worker_environment(tmp_path)
+    env["QWEN_RAY_PYTHON"] = sys.executable
+    with Path(env["QWEN_ENV_FILE"]).open("a") as profile:
+        profile.write(
+            "\nunset QWEN_ARENA_STREAM_ID QWEN_ARENA_HARNESS QWEN_REWARD_KEY QWEN_REWARD_VERSION\n"
+        )
+    args = ["bash", str(recipe / "ray.sh")]
+    if custom:
+        config = yaml.safe_load((recipe / "train.yaml").read_text())
+        config["total_train_steps"] = 25
+        custom_path = tmp_path / "custom.yaml"
+        custom_path.write_text(yaml.safe_dump(config))
+        args += ["--config", str(custom_path)]
+    result = subprocess.run(
+        args
+        + [
+            "--prepare-only",
+            "--set",
+            "actor.backend=megatron:d1p4t4c2e1",
+            "--set",
+            "rollout.backend=sglang:d8t4",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    generated = yaml.safe_load((tmp_path / "run/train-ray.yaml").read_text())
+    assert generated["cluster"]["n_nodes"] == 4
+    assert generated["total_train_steps"] == (25 if custom else 1000)
+    assert len(generated["econfig"]["arena_streams"]) == 8
+    assert "${oc.env:QWEN_3D_STREAM_1}" in (tmp_path / "run/train-ray.yaml").read_text()
+
+
+def test_blender_profile_and_mapping_paths_follow_relocated_directory(tmp_path):
+    recipe = RECIPE.parents[1] / "qwen27b/3d_modeling"
+    deployment = tmp_path / "original site"
+    deployment.mkdir()
+    for name in ("ray", "bindings"):
+        shutil.copyfile(recipe / f"{name}.env.example", deployment / f"{name}.env")
+    (deployment / "credentials.env").write_text(
+        "ARENA_OPENAPI_BASE=https://arena.example.invalid\n"
+    )
+    (deployment / "reward-mappings").mkdir()
+    for group in range(1, 5):
+        (deployment / f"reward-mappings/stream-{group}.json").write_text("{}")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("QWEN_", "ARENA_", "WANDB_"))
+    }
+    for location in (deployment, tmp_path / "destination site"):
+        if location != deployment:
+            deployment.rename(location)
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'set -euo pipefail; source "$1"; '
+                'test -f "$QWEN_3D_REWARD_MAP_4"; '
+                'printf "%s\\n" "$QWEN_3D_REWARD_MAP_1" "$QWEN_OUTPUT_ROOT" "$ARENA_OPENAPI_BASE"',
+                "profile-test",
+                str(location / "ray.env"),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            str(location / "reward-mappings/stream-1.json"),
+            str(location / "output"),
+            "https://arena.example.invalid",
+        ]
 
 
 def test_swemm_shell_requires_explicit_config():
