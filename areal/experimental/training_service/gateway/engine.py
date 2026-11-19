@@ -125,6 +125,18 @@ def register_engine_routes(
     async def actor_compute_logp(request: Request):
         return await _forward_post(request, "/ppo/actor/compute_logp", config)
 
+    @app.post("/ppo/actor/capture_rollout_policy_snapshot")
+    async def actor_capture_rollout_policy_snapshot(request: Request):
+        return await _forward_post(
+            request, "/ppo/actor/capture_rollout_policy_snapshot", config
+        )
+
+    @app.post("/ppo/actor/clear_rollout_policy_snapshot")
+    async def actor_clear_rollout_policy_snapshot(request: Request):
+        return await _forward_post(
+            request, "/ppo/actor/clear_rollout_policy_snapshot", config
+        )
+
     @app.post("/ppo/actor/compute_advantages")
     async def actor_compute_advantages(request: Request):
         return await _forward_post(request, "/ppo/actor/compute_advantages", config)

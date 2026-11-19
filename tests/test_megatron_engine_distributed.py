@@ -11,7 +11,13 @@ pytestmark = [pytest.mark.npu, pytest.mark.multi_npu]
 
 
 def _run_test_with_torchrun(
-    model_type: str, alloc_mode: str, test_type: str, output: str, vpp_size: int = 1
+    model_type: str,
+    alloc_mode: str,
+    test_type: str,
+    output: str,
+    vpp_size: int = 1,
+    fsdp_cpu_offload: bool = False,
+    common_reference_scale: bool = False,
 ):
     port = find_free_ports(1)[0]
     n_gpus = ModelAllocation.from_str(alloc_mode).parallel.world_size
@@ -29,6 +35,8 @@ def _run_test_with_torchrun(
                 f"--output={output}",
                 f"--test_type={test_type}",
                 f"--vpp_size={vpp_size}",
+                *(["--fsdp_cpu_offload"] if fsdp_cpu_offload else []),
+                *(["--common_reference_scale"] if common_reference_scale else []),
             ],
             check=True,
             stdout=sys.stdout,
@@ -36,7 +44,13 @@ def _run_test_with_torchrun(
             text=True,
         )
     except subprocess.CalledProcessError as e:
-        pytest.fail(f"Test failed with error: {e.stderr}")
+        pytest.fail(
+            f"{test_type} failed: backend={alloc_mode}, vpp_size={vpp_size}, "
+            f"fsdp_cpu_offload={fsdp_cpu_offload}, "
+            f"common_reference_scale={common_reference_scale}, "
+            f"exit_code={e.returncode}. "
+            "See the torchrun traceback above."
+        )
     with open(output) as f:
         result = f.read().strip()
     assert result == "Passed", f"Test failed: {result}"
@@ -353,4 +367,69 @@ def test_qwen3_5_moe_hf_save_load(tmp_path_factory):
         f"ffn:d1p{pipeline_parallel_size}t1e2)",
         test_type="train_hf_save_load",
         output=str(output),
+    )
+
+
+@pytest.mark.slow
+def test_qwen3_parameter_snapshot(tmp_path_factory):
+    """Snapshot switching must preserve the next real distributed update."""
+    if current_platform.device_count() < 4:
+        pytest.skip("parameter snapshot gather overlap requires 4 NPUs")
+    output = tmp_path_factory.mktemp("test_output") / "qwen3_parameter_snapshot.out"
+    _run_test_with_torchrun(
+        "qwen3",
+        "megatron:d2p2t1",
+        test_type="parameter_snapshot",
+        output=str(output),
+        vpp_size=2,
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "backend,vpp_size,fsdp_cpu_offload",
+    [
+        ("megatron:d2p1t1", 1, False),
+        ("megatron:d1p2t1", 2, False),
+        ("megatron:d2p2t1", 2, False),
+        ("fsdp:d2p1t1", 1, False),
+        ("fsdp:d2p1t1", 1, True),
+    ],
+)
+def test_chunk_gradient_accumulation_matches_one_packed_window(
+    tmp_path, backend, vpp_size, fsdp_cpu_offload
+):
+    """Check first-update 4/8-MB moments and consecutive optimizer boundaries."""
+    n_gpus = ModelAllocation.from_str(backend).parallel.world_size
+    if current_platform.device_count() < n_gpus:
+        pytest.skip(f"gradient accumulation requires {n_gpus} NPUs")
+    _run_test_with_torchrun(
+        "qwen3",
+        backend,
+        test_type="gradient_accumulation",
+        output=str(tmp_path / "accumulation.out"),
+        vpp_size=vpp_size,
+        fsdp_cpu_offload=fsdp_cpu_offload,
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "backend,vpp_size",
+    [("megatron:d2p1t1", 1), ("megatron:d1p2t1", 2), ("megatron:d2p2t1", 2)],
+)
+def test_chunk_gradient_accumulation_with_common_reference_scale(
+    tmp_path, backend, vpp_size
+):
+    """Aligned 8/8-MB chunks also preserve pointwise parameters and moments."""
+    n_gpus = ModelAllocation.from_str(backend).parallel.world_size
+    if current_platform.device_count() < n_gpus:
+        pytest.skip(f"common-reference accumulation control requires {n_gpus} NPUs")
+    _run_test_with_torchrun(
+        "qwen3",
+        backend,
+        test_type="gradient_accumulation",
+        output=str(tmp_path / "common_reference_scale.out"),
+        common_reference_scale=True,
+        vpp_size=vpp_size,
     )

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -154,8 +155,19 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_logp", category="compute")
     @torch.no_grad()
-    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
-        return batched_call(self._compute_logp, data)
+    def compute_logp(
+        self,
+        data: list[dict[str, Any]],
+        *,
+        use_rollout_policy_snapshot: bool = False,
+    ) -> list[torch.Tensor] | None:
+        snapshot_context = (
+            self.engine.parameter_snapshot_context()
+            if use_rollout_policy_snapshot
+            else nullcontext()
+        )
+        with snapshot_context:
+            return batched_call(self._compute_logp, data)
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         self.engine.eval()
@@ -338,13 +350,42 @@ class PPOActor:
 
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
-    def ppo_update(self, data: list[dict[str, Any]]) -> None:
+    def ppo_update(
+        self,
+        data: list[dict[str, Any]],
+        n_minibatches: int | None = None,
+        *,
+        accumulation_steps: int = 1,
+        accumulation_index: int = 0,
+    ) -> None:
+        if n_minibatches is None:
+            n_minibatches = self.config.ppo_n_minibatches
+        if n_minibatches <= 0:
+            raise ValueError(f"n_minibatches must be positive, got {n_minibatches}")
+        if accumulation_steps < 1 or not 0 <= accumulation_index < accumulation_steps:
+            raise ValueError("Invalid accumulation_steps or accumulation_index")
+        if accumulation_steps > 1 and n_minibatches != 1:
+            raise ValueError("Cross-chunk accumulation requires n_minibatches=1")
         batched, meta = concat_batch(data)
-        self._ppo_update(batched, meta)
+        self._ppo_update(
+            batched,
+            meta,
+            n_minibatches=n_minibatches,
+            accumulation_steps=accumulation_steps,
+            accumulation_index=accumulation_index,
+        )
 
     def _ppo_update(
-        self, data: dict[str, Any], meta: TrajBatchMeta | None = None
+        self,
+        data: dict[str, Any],
+        meta: TrajBatchMeta | None = None,
+        *,
+        n_minibatches: int | None = None,
+        accumulation_steps: int = 1,
+        accumulation_index: int = 0,
     ) -> None:
+        if n_minibatches is None:
+            n_minibatches = self.config.ppo_n_minibatches
         attn_mask = data["attention_mask"]
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
@@ -462,13 +503,28 @@ class PPOActor:
         self.engine.train()
         mb_inputs = split_training_batch_into_microbatches(
             data,
-            n_mbs=self.config.ppo_n_minibatches,
+            n_mbs=n_minibatches,
             group=self.engine.data_parallel_group,
         )
-        loss_steps = prepared_loss.for_steps(
-            mb_inputs,
-            dp_group=self.engine.data_parallel_group,
-            device=self.engine.device,
+        # A chunk is a partial optimizer window. Keep full-unit token weights,
+        # but let the engine normalize over all chunks instead of binding a
+        # separate unit mean to each chunk.
+        loss_steps = (
+            [prepared_loss.reduction]
+            if accumulation_steps > 1
+            else prepared_loss.for_steps(
+                mb_inputs,
+                dp_group=self.engine.data_parallel_group,
+                device=self.engine.device,
+            )
+        )
+        accumulation_kwargs = (
+            dict(
+                accumulation_steps=accumulation_steps,
+                accumulation_index=accumulation_index,
+            )
+            if accumulation_steps > 1
+            else {}
         )
 
         with stats_tracker.scope("update"):
@@ -495,6 +551,7 @@ class PPOActor:
                         pg_reduction=loss_step,
                     ),
                     loss_weight_fn=loss_step.normalizer_fn,
+                    **accumulation_kwargs,
                 )
                 stats_tracker.scalar(**train_stat)
 
@@ -503,6 +560,16 @@ class PPOActorController(TrainController):
     def compute_logp(self, *args, **kwargs):
         return self._custom_function_call(
             "compute_logp", *args, rpc_meta={"broadcast": True}, **kwargs
+        )
+
+    def capture_rollout_policy_snapshot(self) -> None:
+        self._custom_function_call(
+            "capture_parameter_snapshot", rpc_meta={"broadcast": True}
+        )
+
+    def clear_rollout_policy_snapshot(self) -> None:
+        self._custom_function_call(
+            "clear_parameter_snapshot", rpc_meta={"broadcast": True}
         )
 
     def compute_advantages(self, *args, **kwargs):
@@ -569,6 +636,12 @@ class PPOActorControllerV2(GatewayTrainController):
             "kwargs": serialize_value(kwargs),
         }
         return self._gateway_post_result("/ppo/actor/compute_logp", payload)
+
+    def capture_rollout_policy_snapshot(self) -> None:
+        self._gateway_post("/ppo/actor/capture_rollout_policy_snapshot", {})
+
+    def clear_rollout_policy_snapshot(self) -> None:
+        self._gateway_post("/ppo/actor/clear_rollout_policy_snapshot", {})
 
     def compute_advantages(self, *args, **kwargs):
         payload = {

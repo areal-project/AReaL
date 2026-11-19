@@ -280,6 +280,14 @@ def create_engine_module(
     _register_compute_route(
         "/ppo/actor/compute_logp", "compute_logp", endpoint_prefix="ppo_actor_"
     )
+    _register_engine_route(
+        "/ppo/actor/capture_rollout_policy_snapshot",
+        "capture_parameter_snapshot",
+    )
+    _register_engine_route(
+        "/ppo/actor/clear_rollout_policy_snapshot",
+        "clear_parameter_snapshot",
+    )
     _register_compute_route(
         "/ppo/actor/compute_advantages",
         "compute_advantages",

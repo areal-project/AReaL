@@ -997,8 +997,18 @@ class RolloutController:
 
         # Delegate to dispatcher
         assert dataloader.batch_size is not None
+        streaming_batch_size = self.config.streaming_train_batch_size
+        batch_size = (
+            streaming_batch_size
+            if streaming_batch_size is not None
+            and streaming_batch_size < dataloader.batch_size
+            else dataloader.batch_size
+        )
         results = self.dispatcher.active_submit_and_wait(
-            self.data_generator, batch_size=dataloader.batch_size, dynamic_bs=dynamic_bs
+            self.data_generator,
+            batch_size=batch_size,
+            dynamic_bs=dynamic_bs,
+            prefetch_size=dataloader.batch_size,
         )
 
         # Return list of trajectories

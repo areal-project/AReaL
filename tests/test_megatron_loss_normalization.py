@@ -11,6 +11,8 @@ import torch
 
 from tests.test_megatron_bridge_config import _load_function
 
+from areal.engine.core.train_engine import _gradient_accumulation
+
 ENGINE_SOURCE = "areal/engine/megatron_engine.py"
 
 
@@ -91,6 +93,8 @@ def test_train_gradient_matches_global_mean(
             ]
             namespace = {
                 "torch": torch,
+                "_gradient_accumulation": _gradient_accumulation,
+                "nullcontext": nullcontext,
                 "dist": SimpleNamespace(
                     all_reduce=lambda totals, group: totals.copy_(
                         torch.stack((total_weight.float(), total_tokens.float()))
@@ -193,6 +197,8 @@ def test_per_token_output_preserves_weight_and_gradient(weight, cp_size, dtype):
         "_build_per_token_loss_output",
         {
             "torch": torch,
+            "_gradient_accumulation": _gradient_accumulation,
+            "nullcontext": nullcontext,
             "mpu": SimpleNamespace(
                 get_context_parallel_world_size=lambda: cp_size,
                 get_context_parallel_rank=lambda: rank,
@@ -318,6 +324,8 @@ def test_train_all_zero_weight_batch_is_rejected(per_token):
     """Retain the positive global-weight guard before any forward/backward work."""
     namespace = {
         "torch": torch,
+        "_gradient_accumulation": _gradient_accumulation,
+        "nullcontext": nullcontext,
         "dist": SimpleNamespace(all_reduce=lambda *args, **kwargs: None),
         "mpu": SimpleNamespace(get_data_parallel_group=lambda **kwargs: None),
         "get_model_config": lambda model: model.config,
@@ -364,6 +372,8 @@ def test_train_all_masked_rank_uses_global_valid_token_guard(
 
     namespace = {
         "torch": torch,
+        "_gradient_accumulation": _gradient_accumulation,
+        "nullcontext": nullcontext,
         "dist": SimpleNamespace(all_reduce=all_reduce),
         "mpu": SimpleNamespace(
             get_data_parallel_group=lambda with_context_parallel=False: (
@@ -409,6 +419,8 @@ def test_valid_token_guard_keeps_reward_model_count_contract():
     """No-mask reward batches retain their callback's weight units."""
     namespace = {
         "torch": torch,
+        "_gradient_accumulation": _gradient_accumulation,
+        "nullcontext": nullcontext,
         "dist": SimpleNamespace(all_reduce=lambda *args, **kwargs: None),
         "mpu": SimpleNamespace(get_data_parallel_group=lambda **kwargs: None),
     }
@@ -442,6 +454,8 @@ def test_forward_callback_preserves_loss_contract(with_count):
         "forward_backward_batch",
         {
             "torch": torch,
+            "_gradient_accumulation": _gradient_accumulation,
+            "nullcontext": nullcontext,
             "functools": functools,
             "mpu": SimpleNamespace(
                 get_context_parallel_world_size=lambda: 1,
@@ -504,6 +518,8 @@ def test_mtp_scale_uses_physical_tokens_with_sequence_loss(cp_size, vpp_size):
 
     namespace = {
         "torch": torch,
+        "_gradient_accumulation": _gradient_accumulation,
+        "nullcontext": nullcontext,
         "functools": functools,
         "dist": SimpleNamespace(all_reduce=lambda *args, **kwargs: None),
         "mpu": SimpleNamespace(

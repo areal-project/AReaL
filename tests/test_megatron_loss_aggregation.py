@@ -5,6 +5,7 @@
 import os
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -109,6 +110,10 @@ def aggregate_test_loss(values, batch, reduction):
 
 
 def load_engine_callbacks(namespace):
+    from areal.engine.core.train_engine import _gradient_accumulation
+
+    namespace.setdefault("_gradient_accumulation", _gradient_accumulation)
+    namespace.setdefault("nullcontext", nullcontext)
     return tuple(
         _load_function(ENGINE_SOURCE, name, namespace)
         for name in (
@@ -117,6 +122,194 @@ def load_engine_callbacks(namespace):
             "_build_per_token_loss_output",
         )
     )
+
+
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("empty_first_mtp", [False, True])
+def test_chunk_window_preserves_independent_main_and_mtp_token_means(
+    per_token, empty_first_mtp
+):
+    """Run production train/finalize callbacks with unequal W, T, Q and MB counts.
+
+    This models the scalar MCore schedule contract, not its device collectives.
+    The reused token counter is deliberately mutated by the native finalizer.
+    """
+    from contextlib import contextmanager
+    from functools import partial
+
+    from areal.engine.core.train_engine import (
+        _gradient_accumulation,
+        _GradientAccumulationState,
+    )
+
+    class Batch(dict):
+        @property
+        def padded_mb(self):
+            return self
+
+        old_cu_seqlens = None
+
+    counts = ((1, 2) if empty_first_mtp else (3, 7), (2, 4, 8))
+    weights = ((0.2, 3.0), (2.0, 0.5, 8.0))
+    chunks = [
+        _MicroBatches(
+            Batch(
+                input_ids=torch.ones((1, count), dtype=torch.long),
+                loss_mask=torch.ones((1, count), dtype=torch.bool),
+                weight=torch.tensor(weight),
+                target=float(index + chunk_index),
+            )
+            for index, (count, weight) in enumerate(zip(chunk_counts, chunk_weights))
+        )
+        for chunk_index, (chunk_counts, chunk_weights) in enumerate(
+            zip(counts, weights)
+        )
+    ]
+    model = torch.nn.Module()
+    model.trunk = torch.nn.Linear(1, 1, bias=False, dtype=torch.float64)
+    model.mtp = torch.nn.Linear(1, 1, bias=False, dtype=torch.float64)
+    parameters = list(model.parameters())
+    for parameter in parameters:
+        parameter.main_grad = torch.zeros_like(parameter)
+    finalized, steps = [], []
+
+    def native_finalize(models, num_tokens, **kwargs):
+        assert models == [model]
+        assert kwargs == {"pg_collection": "groups"}
+        finalized.append(None if num_tokens is None else num_tokens.clone())
+        if per_token:
+            for parameter in parameters:
+                parameter.main_grad.div_(num_tokens)
+            num_tokens.add_(10000)  # Native finalization may mutate this argument.
+
+    model.ddp_config = SimpleNamespace(overlap_grad_reduce=True)
+    model.config = SimpleNamespace(
+        calculate_per_token_loss=per_token,
+        no_sync_func=object(),
+        grad_sync_func=object(),
+        param_sync_func=object(),
+        finalize_model_grads_func=native_finalize,
+    )
+    originals = vars(model.config).copy()
+    namespace = {
+        "torch": torch,
+        "contextmanager": contextmanager,
+        "_GradientAccumulationState": _GradientAccumulationState,
+        "_gradient_accumulation": _gradient_accumulation,
+        "get_model_config": lambda module: module.config,
+        "unwrap_to_gpt_model": lambda module: module,
+        "dist": SimpleNamespace(all_reduce=lambda *a, **kw: None),
+        "mpu": SimpleNamespace(
+            get_data_parallel_group=lambda **kw: None,
+            get_pipeline_model_parallel_group=lambda: None,
+            get_data_parallel_world_size=lambda **kw: 1,
+            get_context_parallel_world_size=lambda: 1,
+            get_context_parallel_rank=lambda: 0,
+        ),
+    }
+    train, compute, build = load_engine_callbacks(namespace)
+
+    def zero_grad():
+        for parameter in parameters:
+            parameter.main_grad.zero_()
+
+    engine = SimpleNamespace(
+        model=[model],
+        mcore_config=SimpleNamespace(enable_mtp_training=True),
+        config=SimpleNamespace(is_critic=True),
+        device="cpu",
+        enable_tree_training=False,
+        _ensure_ready=lambda: None,
+        _validate_accumulation_model=lambda: None,
+        optimizer_zero_grad=zero_grad,
+        optimizer_step=lambda: steps.append(True) or {},
+        _normalize_batch_input=lambda inputs: (inputs, None),
+        _prepare_mb_list=lambda inputs: inputs,
+    )
+    for name in (
+        "_scale_accumulated_gradients",
+        "_accumulation_mtp_parameter_ids",
+        "_accumulation_schedule_context",
+    ):
+        setattr(
+            engine,
+            name,
+            partial(_load_function(ENGINE_SOURCE, name, namespace), engine),
+        )
+    engine._compute_logprobs_and_loss = partial(compute, engine)
+    engine._build_per_token_loss_output = partial(build, engine)
+    _bind_per_token_loss_methods(engine, namespace)
+    counter = torch.tensor(0)
+
+    def forward_backward(mbs, process_output, forward_only):
+        assert not forward_only
+        counter.zero_()
+        for mb in mbs:
+            result = process_output(model.trunk.weight.reshape(1), mb)
+            mtp_batch = mb["mtp_kwargs"]["batch"]
+            # Independent oracle for two-token targets in these unpadded rows.
+            targets = max(mb["input_ids"].numel() - 2, 0)
+            auxiliary = (model.mtp.weight - mb["target"]).square().sum() * targets
+            mtp_batch["metrics"].add_(torch.tensor([auxiliary.item(), targets]))
+            if per_token:
+                main, tokens = result
+                counter.add_(tokens)
+                loss = main + 0.1 * auxiliary * mtp_batch["scale"]
+            else:
+                loss = (result + 0.1 * auxiliary * mtp_batch["scale"]) / len(mbs)
+            for parameter, grad in zip(
+                parameters, torch.autograd.grad(loss, parameters)
+            ):
+                parameter.main_grad.add_(grad)
+        model.config.finalize_model_grads_func(
+            [model], counter if per_token else None, pg_collection="groups"
+        )
+
+    engine.forward_backward_batch = forward_backward
+    for window in range(2):
+        for index, chunk in enumerate(chunks):
+            stats = train(
+                engine,
+                chunk,
+                lambda values, mb: (values - mb["target"]).square().mean(),
+                lambda mb: mb["weight"],
+                accumulation_steps=2,
+                accumulation_index=index,
+            )
+            assert vars(model.config) == originals
+            assert model.ddp_config.overlap_grad_reduce
+            assert len(steps) == window + int(index == 1)
+            if index == 0:
+                assert stats == {}
+        assert stats["num_micro_batches"] == 5
+        assert len(finalized) == window + 1
+        if per_token:
+            torch.testing.assert_close(
+                finalized[-1], torch.tensor(sum(map(sum, counts))), rtol=0, atol=0
+            )
+        total_weight = sum(mb["weight"] for chunk in chunks for mb in chunk)
+        total_targets = sum(max(count - 2, 0) for chunk in counts for count in chunk)
+        main = (
+            sum(
+                (model.trunk.weight - mb["target"]).square().sum() * mb["weight"]
+                for chunk in chunks
+                for mb in chunk
+            )
+            / total_weight
+        )
+        auxiliary = (
+            sum(
+                (model.mtp.weight - mb["target"]).square().sum()
+                * max(mb["input_ids"].numel() - 2, 0)
+                for chunk in chunks
+                for mb in chunk
+            )
+            / total_targets
+        )
+        expected = torch.autograd.grad(main + 0.1 * auxiliary, parameters)
+        for parameter, grad in zip(parameters, expected):
+            torch.testing.assert_close(parameter.main_grad, grad, rtol=1e-6, atol=1e-7)
+        assert engine._gradient_accumulation_state is None
 
 
 def run_callback_contract(mode, cp_size, dp_size, split, per_token, scenario):

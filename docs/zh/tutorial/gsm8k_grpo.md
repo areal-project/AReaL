@@ -460,6 +460,79 @@ for global_step in range(start_step, max_steps):
 
 所有算法操作都是控制器方法调用，分发到远程工作进程。
 
+### 流式 chunk 与 PPO minibatch
+
+基本流式路径可以这样开启（`ppo_n_minibatches=4` 时每个 chunk 更新一次）：
+
+```yaml
+train_dataset:
+  batch_size: 64
+rollout:
+  consumer_batch_size: 64
+  streaming_train_batch_size: 16
+  max_head_offpolicyness: 0
+actor:
+  ppo_n_minibatches: 4
+dynamic_bs: false
+```
+
+优化目标是让 rollout 和 actor 训练交错执行，缩短等待整个 batch 完成的时间。 该路径要求 single-controller 模式，actor 和
+rollout 分开放置。需要重新计算 proximal log-probability 时，保留更新前 rollout policy 的 CPU 快照；快照 forward
+期间把当前 actor policy 临时备份到 CPU，结束后恢复，避免设备上额外保留一份完整参数副本。 这会增加 CPU
+内存占用和主机与设备之间的数据传输，并不保证所有配置都会加速。 此快照路径不支持 `actor.megatron.fp8_config.param=true`；FP8
+训练本身仍可开启。
+
+设置 `rollout.streaming_train_batch_size=S` 后，无需等待 `train_dataset.batch_size=B` 个 prompt
+groups 全部完成 rollout，就能开始 actor 训练。 每个 chunk 包含完整的 prompt groups，包括每个 prompt 的全部
+`n_samples` 条回答。 记 chunk 数为 `K=B/S`，每个 global step 的优化器更新次数为
+`M=actor.ppo_n_minibatches`。`B` 必须能被 `S` 整除，并满足以下任一关系：
+
+- `M % K == 0`：每个 chunk 包含 `M/K` 个完整 PPO minibatch，沿用原流式路径。
+- `K % M == 0`：每个 PPO minibatch 包含 `K/M` 个完整 chunk。每个 chunk 根据 `actor.mb_spec` 独立划分
+  microbatch，跨 chunk 累积梯度，只在该 minibatch 的最后一个 chunk 完成后裁剪梯度并更新优化器，无需新增累积配置。
+
+例如 `B=64`、`S=16`、`M=2` 时，四个 chunk 分别执行 backward，在第 2、4 个 chunk 后更新权重。`M=1` 时，第一个 chunk
+就开始 backward，但唯一一次优化器更新要等第 4 个 chunk 完成。此时所有 chunk 的 logp 重算都直接使用尚未更新的 actor，不捕获或切换 CPU
+策略快照；每个 chunk 的 logp 前向和梯度累积仍正常执行。`M>1` 保持原有快照行为。 microbatch 划分与已完成 prompt groups 送入
+actor 的顺序可能和非流式训练不同。
+
+流式训练支持 FSDP、Megatron + MindSpeed，推理后端为 vLLM + vLLM-Ascend。loss 权重沿用现有 `loss_weight_fn`
+及各后端的并行归约，在梯度裁剪前按整个 PPO minibatch 的累计权重归一化，不会简单等权累加 各 chunk 的平均梯度。原有的每 chunk
+并行预算、microbatch 约束，以及 `rollout.max_head_offpolicyness=0`、`dynamic_bs=false` 等流式限制仍然适用。
+critic 更新、学习率调度、rollout policy 版本和权重同步仍以 global step 为边界。
+
+Megatron 跨 chunk 模式要求已启用的 MoE 负载均衡辅助 loss 和 router z-loss 系数为零； 实际模型初始化时即校验，不兼容配置会在
+rollout 前报错，不会自动覆盖配置。 目标版本的隔离 MTP 计算图继续按整个 minibatch 的有效两步预测 target 数归一化， 与主 loss 的
+normalizer 独立。保留 Megatron 原生 per-token 和手工归一化两条路径。 FP8、FP4 或 kitchen 模式下，每次 chunk
+schedule 内会临时将 MCore TE linear wrappers 的 `disable_parameter_transpose_cache` 设为
+`True`，向下层传入 `is_first_microbatch=None`， 避免首 microbatch 标记重置后覆盖之前 chunk
+的累计梯度，结束或异常退出后恢复原值。 这项保护也适用于 TENPU，并覆盖量化模型内部的 BF16 层；普通 BF16 模式不改变该开关。 当前 dense fusion
+关闭时仍保留这项保护；FP8 下减少权重 workspace 复用可能带来性能开销。 这些 Megatron 附加规则仅在多个 chunk 共用一次 optimizer
+更新时生效。
+
+依赖沿用目标 Ascend Dockerfile 的固定版本，本次不变更依赖。保留多 teacher 的 mixture/domain 路由和
+`prox_logp_method="reuse"`。domain 路由后的 teacher 子批次仍需满足现有运行时的 DP/microbatch 约束。
+
+CPU 回归测试：
+
+```bash
+python -m pytest -v tests/test_gradient_accumulation.py tests/test_streaming_train_batch.py
+python -m pytest -v tests/test_megatron_loss_normalization.py tests/test_megatron_loss_aggregation.py
+python -m pytest -v tests/experimental/training_service/test_controller_unit.py
+```
+
+目标 Ascend 环境中的 callback 和分布式回归：
+
+```bash
+python -m pytest -v tests/test_megatron_parameter_snapshot.py tests/test_megatron_optimizer_config.py
+python -m pytest -v tests/test_megatron_engine_distributed.py -k "parameter_snapshot or chunk_gradient_accumulation"
+```
+
+分布式测试沿用已有模型查找顺序：环境变量覆盖、本地已有 checkpoint、Hugging Face 下载。 快照测试需要四张 NPU，开启 forward 参数
+gather overlap，关闭 optimizer-step gather overlap， 避开 MindSpeed 的 `list.wait` 兼容问题。累积测试覆盖
+FSDP DP2（含 CPU offload/per-layer optimizer）和 Megatron DP2、PP2/VPP2、DP2/PP2/VPP2。不修改 CI
+配置。
+
 ## 权重同步
 
 每个训练步骤后，更新后的权重必须同步到推理工作进程。AReaL 支持两种传输方式：

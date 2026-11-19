@@ -310,6 +310,11 @@ class GatewayTrainController:
                         kwargs={
                             "addr": kwargs.get("addr"),
                             "ft_spec": ft_spec,
+                            **(
+                                {"validate_gradient_accumulation": True}
+                                if kwargs.get("validate_gradient_accumulation", False)
+                                else {}
+                            ),
                         },
                         timeout=self.config.setup_timeout,
                     )
@@ -705,18 +710,25 @@ class GatewayTrainController:
         input_: list[dict[str, Any]] | None = None,
         loss_fn: Any = None,
         loss_weight_fn: Any = None,
+        *,
+        accumulation_steps: int = 1,
+        accumulation_index: int = 0,
     ) -> Any:
         from areal.infra.rpc.serialization import serialize_value
 
         if input_ is None:
             raise TypeError("train_batch expects non-None list[dict[str, Any]] input.")
         batch = self._require_list_batch(input_, "train_batch")
+        kwargs = {"loss_fn": loss_fn, "loss_weight_fn": loss_weight_fn}
+        if accumulation_steps != 1 or accumulation_index != 0:
+            kwargs.update(
+                accumulation_steps=accumulation_steps,
+                accumulation_index=accumulation_index,
+            )
 
         payload = {
             "args": serialize_value([batch]),
-            "kwargs": serialize_value(
-                {"loss_fn": loss_fn, "loss_weight_fn": loss_weight_fn}
-            ),
+            "kwargs": serialize_value(kwargs),
         }
         return self._gateway_post_result("/train_batch", payload)
 

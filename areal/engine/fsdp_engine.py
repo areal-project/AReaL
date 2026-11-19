@@ -77,6 +77,10 @@ from areal.engine.core.model import (
     is_qwen_vl_model,
     is_valid_vision_model,
 )
+from areal.engine.core.train_engine import (
+    _gradient_accumulation,
+    _scale_local_gradients,
+)
 from areal.engine.fsdp_utils import (
     fsdp2_load_full_state_dict,
     get_cosine_schedule_with_warmup,
@@ -265,6 +269,9 @@ class FSDPEngine(TrainEngine):
         self._offload_depth: int = 0
         self._per_layer_optim_wrapper: PerLayerOptimWrapper | None = None
         self.enable_tree_training: bool = self.config.enable_tree_training
+
+    def _get_policy_model_parts(self) -> list[torch.nn.Module]:
+        return [self.model]
 
     @classmethod
     def from_pretrained(
@@ -779,40 +786,57 @@ class FSDPEngine(TrainEngine):
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        *,
+        accumulation_steps: int = 1,
+        accumulation_index: int = 0,
     ) -> dict[str, float]:
-        self._ensure_ready()
-        self.optimizer_zero_grad()
+        with _gradient_accumulation(
+            self, accumulation_steps, accumulation_index
+        ) as accumulation:
+            self._ensure_ready()
+            if accumulation is None or accumulation.is_first:
+                self.optimizer_zero_grad()
 
-        input_batched, _ = self._normalize_batch_input(input_)
+            input_batched, _ = self._normalize_batch_input(input_)
 
-        # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+            # Each chunk keeps the backend's existing packing and DP synchronization.
+            mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        # Step 2: Compute total loss weight
-        total_loss_weight = compute_total_loss_weight(
-            mb_list, loss_weight_fn, self.dp_group
-        )
-
-        # Step 3: Forward-backward using process_output_fn callback
-        def process_output(
-            logits: torch.Tensor, ctx_dict: dict[str, Any]
-        ) -> torch.Tensor:
-            ctx = FSDPTrainContext(**ctx_dict)
-            return self._compute_logprobs_and_loss(
-                logits,
-                ctx,
-                loss_fn,
-                loss_weight_fn,
-                total_loss_weight,
-                loss_multiplier=self.parallel_helper.dp_size,
+            total_loss_weight = compute_total_loss_weight(
+                mb_list, loss_weight_fn, self.dp_group
             )
+            if accumulation is not None:
+                accumulation.add_chunk(total_loss_weight, len(mb_list))
+                total_loss_weight = accumulation.reference_loss_weight
 
-        self.forward_backward_batch(mb_list, process_output, forward_only=False)
+            def process_output(
+                logits: torch.Tensor, ctx_dict: dict[str, Any]
+            ) -> torch.Tensor:
+                ctx = FSDPTrainContext(**ctx_dict)
+                return self._compute_logprobs_and_loss(
+                    logits,
+                    ctx,
+                    loss_fn,
+                    loss_weight_fn,
+                    total_loss_weight,
+                    loss_multiplier=self.parallel_helper.dp_size,
+                )
 
-        # Step 4: Optimizer step
-        stats = self.optimizer_step()
-        stats["num_micro_batches"] = len(mb_list.mbs)
-        return stats
+            self.forward_backward_batch(mb_list, process_output, forward_only=False)
+            if accumulation is not None:
+                if not accumulation.is_last:
+                    return {}
+                _scale_local_gradients(
+                    self.model.parameters(), accumulation.gradient_scale
+                )
+
+            stats = self.optimizer_step()
+            stats["num_micro_batches"] = (
+                accumulation.num_microbatches
+                if accumulation is not None
+                else len(mb_list.mbs)
+            )
+            return stats
 
     @torch.no_grad()
     def eval_batch(

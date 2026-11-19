@@ -662,6 +662,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         input_generator: Generator[TInput, None, None],
         batch_size: int,
         dynamic_bs: bool = False,
+        prefetch_size: int | None = None,
     ) -> list[TResult]:
         """Continuously submit tasks and wait until a full batch of results is ready.
 
@@ -680,6 +681,11 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             If True, enables dynamic batch sizing. The method will stop collecting
             when (accepted + rejected) >= batch_size, returning only accepted results.
             This results in variable-sized batches of valid data. Default is False.
+        prefetch_size : int | None, optional
+            Number of task inputs to submit per refill while waiting for
+            ``batch_size`` results. Defaults to ``batch_size``. A larger value
+            keeps later rollout work in flight while the caller consumes the
+            returned results.
 
         Returns
         -------
@@ -693,6 +699,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         RuntimeError
             If the input generator is exhausted before the batch is complete.
         """
+        if prefetch_size is None:
+            prefetch_size = batch_size
         accepted_cnt = 0
         total_attempts = 0
         results = []
@@ -717,7 +725,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                         category="scheduler",
                         args={"data": capacity},
                     )
-                for _ in range(min(batch_size, capacity)):
+                for _ in range(min(prefetch_size, capacity)):
                     try:
                         self.submit_task_input(next(input_generator))
                     except StopIteration:
@@ -1510,8 +1518,18 @@ class WorkflowExecutor:
 
         # Delegate to dispatcher
         assert dataloader.batch_size is not None
+        streaming_batch_size = self.config.streaming_train_batch_size
+        batch_size = (
+            streaming_batch_size
+            if streaming_batch_size is not None
+            and streaming_batch_size < dataloader.batch_size
+            else dataloader.batch_size
+        )
         results = self.dispatcher.active_submit_and_wait(
-            self.data_generator, batch_size=dataloader.batch_size, dynamic_bs=dynamic_bs
+            self.data_generator,
+            batch_size=batch_size,
+            dynamic_bs=dynamic_bs,
+            prefetch_size=dataloader.batch_size,
         )
 
         # Return list of trajectory dicts (filter out None)

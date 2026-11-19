@@ -2594,6 +2594,18 @@ class InferenceEngineConfig:
         default=1,
         metadata={"help": "Batch size for consuming rollouts from the queue."},
     )
+    streaming_train_batch_size: int | None = field(
+        default=None,
+        metadata={
+            "help": "Number of complete prompt groups returned to the trainer at "
+            "a time. A value smaller than train_dataset.batch_size streams one "
+            "logical training step in multiple batches; all batches keep the "
+            "same rollout weight version and weight-sync boundary. The chunk "
+            "count and actor.ppo_n_minibatches must divide one another; multiple "
+            "chunks per minibatch accumulate gradients before one update. None uses "
+            "train_dataset.batch_size and preserves the non-streaming path."
+        },
+    )
     max_head_offpolicyness: int = field(
         default=0,
         metadata={
@@ -3699,6 +3711,7 @@ class PPOConfig(BaseExperimentConfig):
         """Validate the eval generation config."""
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
+        self._validate_streaming_train_batch_size()
         # Propagate the LoRA adapter name to the rollout engine so the OpenAI-proxy
         # generation path requests the same adapter the trainer loads. The request
         # side (ArealOpenAI) cannot read gconfig.lora_name, so it must come from
@@ -3706,6 +3719,136 @@ class PPOConfig(BaseExperimentConfig):
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
         super().__post_init__()
+
+    def _validate_streaming_train_batch_size(self) -> None:
+        streaming_batch_size = self.rollout.streaming_train_batch_size
+        if streaming_batch_size is None:
+            return
+
+        train_batch_size = self.train_dataset.batch_size
+        if streaming_batch_size <= 0:
+            raise ValueError(
+                "rollout.streaming_train_batch_size must be positive, got "
+                f"{streaming_batch_size}"
+            )
+        if streaming_batch_size > train_batch_size:
+            raise ValueError(
+                "rollout.streaming_train_batch_size must not exceed "
+                f"train_dataset.batch_size ({train_batch_size}), got "
+                f"{streaming_batch_size}"
+            )
+        if streaming_batch_size == train_batch_size:
+            return
+        if train_batch_size % streaming_batch_size != 0:
+            raise ValueError(
+                "train_dataset.batch_size must be divisible by "
+                "rollout.streaming_train_batch_size, got "
+                f"{train_batch_size} and {streaming_batch_size}"
+            )
+        if self.rollout.consumer_batch_size != train_batch_size:
+            raise ValueError(
+                "streaming rollout training requires "
+                "rollout.consumer_batch_size to equal train_dataset.batch_size, "
+                f"got {self.rollout.consumer_batch_size} and {train_batch_size}"
+            )
+
+        streaming_batch_count = train_batch_size // streaming_batch_size
+        n_minibatches = self.actor.ppo_n_minibatches
+        if n_minibatches <= 0:
+            raise ValueError("actor.ppo_n_minibatches must be positive")
+        if (
+            n_minibatches % streaming_batch_count != 0
+            and streaming_batch_count % n_minibatches != 0
+        ):
+            raise ValueError(
+                "actor.ppo_n_minibatches must divide or be divisible by the number "
+                f"of streaming training batches, got {n_minibatches} and "
+                f"{streaming_batch_count}"
+            )
+        if self.rollout.max_head_offpolicyness != 0:
+            raise ValueError(
+                "streaming rollout training currently requires "
+                "rollout.max_head_offpolicyness=0"
+            )
+        if self.dynamic_bs:
+            raise ValueError(
+                "streaming rollout training does not support dynamic_bs=true"
+            )
+
+        for name, norm_config in (
+            ("actor.reward_norm", self.actor.reward_norm),
+            ("actor.adv_norm", self.actor.adv_norm),
+        ):
+            if norm_config is None:
+                continue
+            if isinstance(norm_config, (dict, DictConfig)):
+                mean_level = norm_config.get("mean_level")
+                std_level = norm_config.get("std_level")
+            else:
+                mean_level = norm_config.mean_level
+                std_level = norm_config.std_level
+            if mean_level == "batch" or std_level == "batch":
+                warnings.warn(
+                    f"streaming rollout training with {name}.mean_level="
+                    f"{mean_level!r} and {name}.std_level={std_level!r} computes "
+                    "batch-level statistics independently within each streaming "
+                    f"training batch ({streaming_batch_size} prompt groups), not "
+                    f"over the full train batch ({train_batch_size} prompt groups); "
+                    "normalization semantics therefore differ from non-streaming "
+                    "training.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        from areal.api.alloc_mode import ModelAllocation
+
+        forward_role_configs = []
+        if self.critic is not None:
+            forward_role_configs.append(("critic", self.critic))
+        if self.actor.kl_ctl > 0 and self.ref is not None:
+            forward_role_configs.append(("ref", self.ref))
+        if self.teacher is not None and self.teacher.routing_mode == "mixture":
+            for index, teacher in enumerate(self.teacher.teachers):
+                if teacher.engine_type == "train":
+                    forward_role_configs.append((f"teacher-{index}", teacher.train))
+        # Domain routing retains its existing per-teacher sub-batch DP constraints.
+
+        for role, role_config in forward_role_configs:
+            role_allocation = ModelAllocation.from_str(role_config.backend, name=role)
+            role_dp_size = role_allocation.parallel.dp_size
+            if streaming_batch_size % role_dp_size != 0:
+                raise ValueError(
+                    "rollout.streaming_train_batch_size must be divisible by "
+                    f"the {role} data-parallel size because prompt groups are "
+                    "dispatched atomically, got "
+                    f"{streaming_batch_size} prompt groups and {role_dp_size}"
+                )
+            rank_response_count = (
+                streaming_batch_size // role_dp_size * self.gconfig.n_samples
+            )
+            mb_spec = role_config.mb_spec
+            granularity = mb_spec.granularity
+            if rank_response_count % granularity != 0:
+                raise ValueError(
+                    "the number of responses per data-parallel rank in a "
+                    "streaming training batch must be divisible by "
+                    f"{role}.mb_spec.granularity, got {rank_response_count} "
+                    f"and {granularity}"
+                )
+            response_groups_per_dp_rank = rank_response_count // granularity
+            minimum_microbatches = max(mb_spec.n_mbs or 1, mb_spec.n_mbs_divisor)
+            minimum_microbatches = (
+                (minimum_microbatches + mb_spec.n_mbs_divisor - 1)
+                // mb_spec.n_mbs_divisor
+                * mb_spec.n_mbs_divisor
+            )
+            if response_groups_per_dp_rank < minimum_microbatches:
+                raise ValueError(
+                    "the number of response groups per data-parallel rank in "
+                    f"a streaming training batch is too small for {role}.mb_spec: "
+                    f"got {response_groups_per_dp_rank}, need at least "
+                    f"{minimum_microbatches}"
+                )
 
 
 @dataclass

@@ -309,7 +309,19 @@ class PPOTrainer:
         # Initialize engines first — the scheduler must know about roles
         # before the data controller can colocate with them.
         engine_init_kwargs = {"addr": None, "ft_spec": ft_spec}
-        self.actor.initialize(**engine_init_kwargs, role="actor")
+        actor_init_kwargs = dict(engine_init_kwargs)
+        streaming_batch_size = config.rollout.streaming_train_batch_size
+        if (
+            self.actor_alloc.backend == "megatron"
+            and streaming_batch_size is not None
+            and config.train_dataset.batch_size // streaming_batch_size
+            > config.actor.ppo_n_minibatches
+        ):
+            actor_init_kwargs["validate_gradient_accumulation"] = True
+            if config.actor._version == "v2":
+                # Complete the model checks before starting any rollout workers.
+                actor_init_kwargs["wait"] = True
+        self.actor.initialize(**actor_init_kwargs, role="actor")
         if self.critic is not None:
             self.critic.initialize(**engine_init_kwargs, role="critic")
         if self.ref is not None:
@@ -779,6 +791,28 @@ class PPOTrainer:
         ) or self._requires_proxy_workflow(eval_workflow, eval_workflow_kwargs):
             self._ensure_proxy_started()
 
+        streaming_train_batch_size = getattr(
+            config.rollout, "streaming_train_batch_size", None
+        )
+        actor_accumulation_steps = 1
+        if streaming_train_batch_size is None:
+            streaming_batch_count = 1
+        else:
+            streaming_batch_count = (
+                config.train_dataset.batch_size // streaming_train_batch_size
+            )
+            actor_minibatches_per_streaming_batch = (
+                config.actor.ppo_n_minibatches // streaming_batch_count
+            )
+            if config.actor.ppo_n_minibatches < streaming_batch_count:
+                actor_accumulation_steps = (
+                    streaming_batch_count // config.actor.ppo_n_minibatches
+                )
+                actor_minibatches_per_streaming_batch = 1
+        # With one PPO minibatch, every logp forward precedes the sole update.
+        needs_policy_snapshot = (
+            streaming_batch_count > 1 and config.actor.ppo_n_minibatches > 1
+        )
         for global_step in range(start_step, max_steps):
             if (
                 config.total_train_steps is not None
@@ -788,137 +822,182 @@ class PPOTrainer:
             epoch = global_step // steps_per_epoch
             step = global_step % steps_per_epoch
 
-            with (
-                stats_tracker.record_timing("rollout"),
-                perf_tracer.trace_scope(
-                    "train.rollout",
-                    category=Category.COMPUTE,
-                    args={
-                        "global_step": global_step,
-                        "epoch_step": step,
-                    },
-                ),
-            ):
-                rollout_batch = self.actor.prepare_batch(
-                    self.train_dataloader,
-                    workflow=workflow,
-                    workflow_kwargs=workflow_kwargs,
-                    should_accept_fn=dynamic_filter_fn,
-                    group_size=config.gconfig.n_samples,
-                    dynamic_bs=self.config.dynamic_bs,
-                )
-            if self._should_offload_rollout:
-                self._offload_rollout()
+            # Retain all chunks for the full-batch critic update and step-end cleanup.
+            accumulated_rollout_batch: list[dict[str, Any]] = []
+            accumulated_adv_batch: list[dict[str, Any]] = []
 
-            if self.critic is not None:
-                if self._should_offload_critic:
-                    self._onload_model(self.critic, role="critic")
+            for streaming_batch_index in range(streaming_batch_count):
+                if self._should_offload_rollout:
+                    self._onload_rollout()
                 with (
-                    stats_tracker.record_timing("critic_values"),
+                    stats_tracker.record_timing("rollout"),
                     perf_tracer.trace_scope(
-                        "train.compute_values",
+                        "train.rollout",
+                        category=Category.COMPUTE,
+                        args={
+                            "global_step": global_step,
+                            "epoch_step": step,
+                        },
+                    ),
+                ):
+                    rollout_batch = self.actor.prepare_batch(
+                        self.train_dataloader,
+                        workflow=workflow,
+                        workflow_kwargs=workflow_kwargs,
+                        should_accept_fn=dynamic_filter_fn,
+                        group_size=config.gconfig.n_samples,
+                        dynamic_bs=self.config.dynamic_bs,
+                    )
+                if self._should_offload_rollout:
+                    self._offload_rollout()
+
+                if self.critic is not None:
+                    if self._should_offload_critic and streaming_batch_index == 0:
+                        self._onload_model(self.critic, role="critic")
+                    with (
+                        stats_tracker.record_timing("critic_values"),
+                        perf_tracer.trace_scope(
+                            "train.compute_values",
+                            category=Category.COMPUTE,
+                            args={"global_step": global_step},
+                        ),
+                    ):
+                        values = self.critic.compute_values(rollout_batch)
+                        for traj, v in zip(rollout_batch, values):
+                            traj["values"] = v
+                        self.critic.get_device_stats().log("critic values")
+                if self.ref is not None:
+                    if self._should_offload_ref:
+                        self._onload_model(self.ref, role="ref")
+                    with (
+                        stats_tracker.record_timing("ref_logp"),
+                        perf_tracer.trace_scope(
+                            "train.ref_logp",
+                            category=Category.COMPUTE,
+                            args={"global_step": global_step},
+                        ),
+                    ):
+                        ref_logps = self.ref.compute_logp(rollout_batch)
+                        for traj, logp in zip(rollout_batch, ref_logps):
+                            traj["ref_logp"] = logp
+                        self.ref.get_device_stats().log("ref logp")
+                    if self._should_offload_ref:
+                        self._offload_model(self.ref, role="ref")
+
+                if len(self.teachers) > 0:
+                    if self._should_offload_teacher:
+                        self._onload_teachers()
+                    with (
+                        stats_tracker.record_timing("teacher_logp"),
+                        perf_tracer.trace_scope(
+                            "train.teacher_logp",
+                            category=Category.COMPUTE,
+                            args={"global_step": global_step},
+                        ),
+                    ):
+                        self._assign_teacher_logps(rollout_batch)
+                    if self._should_offload_teacher:
+                        self._offload_teachers()
+
+                if self._should_offload_actor and streaming_batch_index == 0:
+                    self._onload_model(self.actor, role="actor")
+                if config.actor.should_compute_prox_logp():
+                    with (
+                        stats_tracker.record_timing("recompute_logp"),
+                        perf_tracer.trace_scope(
+                            "train.recompute_logp",
+                            category=Category.COMPUTE,
+                            args={"global_step": global_step},
+                        ),
+                    ):
+                        if needs_policy_snapshot and streaming_batch_index == 0:
+                            self.actor.capture_rollout_policy_snapshot()
+                        # Live weights match the rollout policy until the first update.
+                        if (
+                            needs_policy_snapshot
+                            and streaming_batch_index >= actor_accumulation_steps
+                        ):
+                            prox_logps = self.actor.compute_logp(
+                                rollout_batch,
+                                use_rollout_policy_snapshot=True,
+                            )
+                        else:
+                            prox_logps = self.actor.compute_logp(rollout_batch)
+                        for traj, logp in zip(rollout_batch, prox_logps):
+                            traj["prox_logp"] = logp
+                        if (
+                            needs_policy_snapshot
+                            and streaming_batch_index == streaming_batch_count - 1
+                        ):
+                            self.actor.clear_rollout_policy_snapshot()
+                        self.actor.get_device_stats().log("recompute logp")
+
+                with (
+                    stats_tracker.record_timing("compute_advantage"),
+                    perf_tracer.trace_scope(
+                        "train.compute_advantage",
                         category=Category.COMPUTE,
                         args={"global_step": global_step},
                     ),
                 ):
-                    values = self.critic.compute_values(rollout_batch)
-                    for traj, v in zip(rollout_batch, values):
-                        traj["values"] = v
-                    self.critic.get_device_stats().log("critic values")
-                # Critic stays onloaded — offloaded after ppo_update below
+                    adv_batch = self.actor.compute_advantages(rollout_batch)
+                    self.actor.get_device_stats().log("compute advantages")
 
-            if self.ref is not None:
-                if self._should_offload_ref:
-                    self._onload_model(self.ref, role="ref")
+                # Wait for async checkpoint staging to complete before modifying parameters
+                if streaming_batch_index == 0:
+                    self.saver.maybe_wait_for_staging()
+
+                if (
+                    config.memory_profiler is not None
+                    and global_step in config.memory_profiler.profile_steps
+                    and streaming_batch_index == 0
+                ):
+                    self.actor.start_memory_profile(config.memory_profiler.max_entries)
+
                 with (
-                    stats_tracker.record_timing("ref_logp"),
+                    stats_tracker.record_timing("train_step"),
                     perf_tracer.trace_scope(
-                        "train.ref_logp",
+                        "train.ppo_update",
                         category=Category.COMPUTE,
                         args={"global_step": global_step},
                     ),
                 ):
-                    ref_logps = self.ref.compute_logp(rollout_batch)
-                    for traj, logp in zip(rollout_batch, ref_logps):
-                        traj["ref_logp"] = logp
-                    self.ref.get_device_stats().log("ref logp")
-                if self._should_offload_ref:
-                    self._offload_model(self.ref, role="ref")
+                    if streaming_batch_count == 1:
+                        self.actor.ppo_update(adv_batch)
+                        self.actor.step_lr_scheduler()
+                    elif actor_accumulation_steps > 1:
+                        self.actor.ppo_update(
+                            adv_batch,
+                            n_minibatches=1,
+                            accumulation_steps=actor_accumulation_steps,
+                            accumulation_index=streaming_batch_index
+                            % actor_accumulation_steps,
+                        )
+                    else:
+                        self.actor.ppo_update(
+                            adv_batch,
+                            n_minibatches=actor_minibatches_per_streaming_batch,
+                        )
+                    self.actor.get_device_stats().log("ppo update")
 
-            if len(self.teachers) > 0:
-                if self._should_offload_teacher:
-                    self._onload_teachers()
-                with (
-                    stats_tracker.record_timing("teacher_logp"),
-                    perf_tracer.trace_scope(
-                        "train.teacher_logp",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
+                if (
+                    config.memory_profiler is not None
+                    and global_step in config.memory_profiler.profile_steps
+                    and streaming_batch_index == streaming_batch_count - 1
                 ):
-                    self._assign_teacher_logps(rollout_batch)
-                if self._should_offload_teacher:
-                    self._offload_teachers()
+                    log_dir = StatsLogger.get_log_path(config.stats_logger)
+                    snapshot_dir = os.path.join(
+                        log_dir, "memory_snapshots", f"step_{global_step}"
+                    )
+                    os.makedirs(snapshot_dir, exist_ok=True)
+                    self.actor.stop_memory_profile(snapshot_dir)
+                    logger.info(f"Memory snapshots saved to {snapshot_dir}")
 
-            if self._should_offload_actor:
-                self._onload_model(self.actor, role="actor")
-            if config.actor.should_compute_prox_logp():
-                with (
-                    stats_tracker.record_timing("recompute_logp"),
-                    perf_tracer.trace_scope(
-                        "train.recompute_logp",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    prox_logps = self.actor.compute_logp(rollout_batch)
-                    for traj, logp in zip(rollout_batch, prox_logps):
-                        traj["prox_logp"] = logp
-                    self.actor.get_device_stats().log("recompute logp")
+                accumulated_rollout_batch.extend(rollout_batch)
+                accumulated_adv_batch.extend(adv_batch)
 
-            with (
-                stats_tracker.record_timing("compute_advantage"),
-                perf_tracer.trace_scope(
-                    "train.compute_advantage",
-                    category=Category.COMPUTE,
-                    args={"global_step": global_step},
-                ),
-            ):
-                adv_batch = self.actor.compute_advantages(rollout_batch)
-                self.actor.get_device_stats().log("compute advantages")
-
-            # Wait for async checkpoint staging to complete before modifying parameters
-            self.saver.maybe_wait_for_staging()
-
-            if (
-                config.memory_profiler is not None
-                and global_step in config.memory_profiler.profile_steps
-            ):
-                self.actor.start_memory_profile(config.memory_profiler.max_entries)
-
-            with (
-                stats_tracker.record_timing("train_step"),
-                perf_tracer.trace_scope(
-                    "train.ppo_update",
-                    category=Category.COMPUTE,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self.actor.ppo_update(adv_batch)
+            if streaming_batch_count > 1:
                 self.actor.step_lr_scheduler()
-                self.actor.get_device_stats().log("ppo update")
-
-            if (
-                config.memory_profiler is not None
-                and global_step in config.memory_profiler.profile_steps
-            ):
-                log_dir = StatsLogger.get_log_path(config.stats_logger)
-                snapshot_dir = os.path.join(
-                    log_dir, "memory_snapshots", f"step_{global_step}"
-                )
-                os.makedirs(snapshot_dir, exist_ok=True)
-                self.actor.stop_memory_profile(snapshot_dir)
-                logger.info(f"Memory snapshots saved to {snapshot_dir}")
 
             if self.critic is not None:
                 with (
@@ -929,7 +1008,7 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    self.critic.ppo_update(adv_batch)
+                    self.critic.ppo_update(accumulated_adv_batch)
                     self.critic.step_lr_scheduler()
                     self.critic.get_device_stats().log("ppo critic update")
                 if self._should_offload_critic:
@@ -1026,7 +1105,9 @@ class PPOTrainer:
                     cleanups = [
                         (
                             "actor",
-                            lambda: self.actor.clear_batches(rollout_batch, adv_batch),
+                            lambda: self.actor.clear_batches(
+                                accumulated_rollout_batch, accumulated_adv_batch
+                            ),
                         )
                     ]
                     if self.critic is not None:
@@ -1034,13 +1115,18 @@ class PPOTrainer:
                             (
                                 "critic",
                                 lambda: self.critic.clear_batches(
-                                    rollout_batch, adv_batch
+                                    accumulated_rollout_batch, accumulated_adv_batch
                                 ),
                             )
                         )
                     if self.ref is not None:
                         cleanups.append(
-                            ("ref", lambda: self.ref.clear_batches(rollout_batch))
+                            (
+                                "ref",
+                                lambda: self.ref.clear_batches(
+                                    accumulated_rollout_batch
+                                ),
+                            )
                         )
                     if self.data_controller is not None:
                         cleanups.append(
@@ -1072,6 +1158,22 @@ class PPOTrainer:
                     epoch_step=step,
                     global_step=global_step,
                     actor_stats=actor_stats,
+                    sum_timing_keys=(
+                        (
+                            "rollout",
+                            "critic_values",
+                            "ref_logp",
+                            "teacher_logp",
+                            "recompute_logp",
+                            "compute_advantage",
+                            "train_step",
+                            "critic_train_step",
+                            "critic_onload",
+                            "critic_offload",
+                        )
+                        if streaming_batch_count > 1
+                        else ()
+                    ),
                 )
 
             # Resume rollout
@@ -1495,12 +1597,18 @@ class PPOTrainer:
         epoch_step: int,
         global_step: int,
         actor_stats: dict[str, float] | None = None,
+        sum_timing_keys: tuple[str, ...] = (),
     ):
         # Upload statistics to the logger (e.g., wandb)
         stats = actor_stats if actor_stats is not None else self.actor.export_stats()
         stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
+        for timing_key in sum_timing_keys:
+            full_key = f"timeperf/{timing_key}"
+            count = stats.get(f"{full_key}__count", 0)
+            if full_key in stats and count:
+                stats[full_key] *= count
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
         if not is_single_controller():
@@ -1511,6 +1619,38 @@ class PPOTrainer:
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
         rollout_backend = self.rollout_alloc.backend
         actor_backend = self.actor_alloc.backend
+        streaming_batch_size = self.config.rollout.streaming_train_batch_size
+        streaming_enabled = (
+            streaming_batch_size is not None
+            and streaming_batch_size < self.config.train_dataset.batch_size
+        )
+        if streaming_enabled:
+            if not is_single_controller():
+                raise ValueError(
+                    "streaming rollout training requires single-controller mode"
+                )
+            if actor_backend not in ("fsdp", "megatron") or rollout_backend != "vllm":
+                raise ValueError(
+                    "streaming rollout training requires FSDP or Megatron with vLLM rollout"
+                )
+            if self._is_actor_rollout_colocated(self.config) or (
+                self.config.actor._version == "v1"
+                and self.config.actor.weight_update_mode == "awex"
+                and self.config.awex.enable_colocate_mode
+            ):
+                raise ValueError(
+                    "streaming rollout training does not support colocated actor and rollout engines"
+                )
+            fp8_config = self.config.actor.megatron.fp8_config
+            if (
+                actor_backend == "megatron"
+                and self.config.actor.should_compute_prox_logp()
+                and fp8_config is not None
+                and fp8_config.param
+            ):
+                raise ValueError(
+                    "streaming proximal log-probability recomputation does not support actor.megatron.fp8_config.param=true"
+                )
         if self.config.rollout.initial_weight_source == "actor":
             if self.config.actor.use_lora:
                 raise ValueError(

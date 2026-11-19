@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -29,7 +30,171 @@ if TYPE_CHECKING:
     from areal.utils.data import MicroBatchList
 
 
+class _ParameterSnapshot:
+    """CPU policy snapshot with exception-safe temporary activation.
+
+    Model parameter objects and storage are never replaced. The CPU snapshot
+    holds the old policy. Activation backs up the current policy on CPU, loads
+    the old policy into the model, then restores the current policy on exit.
+    """
+
+    def __init__(self) -> None:
+        self._state = "empty"
+        self._snapshot_tensors_cpu: list[tuple[str, torch.Tensor]] = []
+
+    def capture(self, refs: Iterator[tuple[str, torch.Tensor]]) -> None:
+        from areal.infra.platforms import current_platform
+
+        if self._state != "empty":
+            raise RuntimeError(
+                "Cannot capture a policy snapshot while another snapshot is "
+                f"{self._state}"
+            )
+        model_tensor_refs = list(refs)
+        snapshot_tensors_cpu = []
+        with torch.no_grad():
+            try:
+                for model_key, model_tensor in model_tensor_refs:
+                    snapshot_tensor_cpu = torch.empty_like(
+                        model_tensor,
+                        device="cpu",
+                        pin_memory=model_tensor.device.type != "cpu",
+                        memory_format=torch.preserve_format,
+                    )
+                    snapshot_tensor_cpu.copy_(model_tensor.detach(), non_blocking=True)
+                    snapshot_tensors_cpu.append((model_key, snapshot_tensor_cpu))
+            finally:
+                current_platform.synchronize()
+        self._snapshot_tensors_cpu = snapshot_tensors_cpu
+        self._state = "ready"
+
+    @contextmanager
+    def activate(self, refs: Iterator[tuple[str, torch.Tensor]]):
+        from areal.infra.platforms import current_platform
+
+        if self._state != "ready":
+            raise RuntimeError(
+                "A ready policy snapshot is required for activation, got "
+                f"state={self._state!r}"
+            )
+        model_tensor_refs = list(refs)
+        if len(model_tensor_refs) != len(self._snapshot_tensors_cpu):
+            raise RuntimeError(
+                "Policy state tensor count changed after snapshot capture: "
+                f"expected {len(self._snapshot_tensors_cpu)}, got {len(model_tensor_refs)}"
+            )
+        model_snapshot_pairs = []
+        for (model_key, model_tensor), (snapshot_key, snapshot_tensor_cpu) in zip(
+            model_tensor_refs, self._snapshot_tensors_cpu, strict=True
+        ):
+            if model_key != snapshot_key:
+                raise RuntimeError(
+                    "Policy state tensor order changed after snapshot capture: "
+                    f"expected {snapshot_key!r}, got {model_key!r}"
+                )
+            if (
+                model_tensor.shape != snapshot_tensor_cpu.shape
+                or model_tensor.dtype != snapshot_tensor_cpu.dtype
+            ):
+                raise RuntimeError(
+                    f"Policy state tensor {model_key!r} changed shape or dtype "
+                    "after snapshot capture"
+                )
+            model_snapshot_pairs.append((model_tensor, snapshot_tensor_cpu))
+
+        current_policy_backups_cpu = []
+        try:
+            with torch.no_grad():
+                try:
+                    for model_tensor, _ in model_snapshot_pairs:
+                        current_policy_backup_cpu = torch.empty_like(
+                            model_tensor,
+                            device="cpu",
+                            pin_memory=model_tensor.device.type != "cpu",
+                            memory_format=torch.preserve_format,
+                        )
+                        current_policy_backups_cpu.append(current_policy_backup_cpu)
+                        current_policy_backup_cpu.copy_(
+                            model_tensor.detach(), non_blocking=True
+                        )
+                finally:
+                    # Finish every D2H before overwriting model tensors or
+                    # releasing a destination after a partial backup failure.
+                    current_platform.synchronize()
+
+            self._state = "active"
+            try:
+                with torch.no_grad():
+                    for model_tensor, snapshot_tensor_cpu in model_snapshot_pairs:
+                        model_tensor.copy_(snapshot_tensor_cpu, non_blocking=False)
+                yield
+            finally:
+                self._state = "failed"
+                with torch.no_grad():
+                    for (model_tensor, _), current_policy_backup_cpu in zip(
+                        model_snapshot_pairs, current_policy_backups_cpu, strict=True
+                    ):
+                        model_tensor.copy_(
+                            current_policy_backup_cpu, non_blocking=False
+                        )
+                current_platform.synchronize()
+                self._state = "ready"
+        finally:
+            current_policy_backups_cpu.clear()
+
+    def clear(self) -> None:
+        if self._state == "active":
+            raise RuntimeError("Cannot clear an active policy snapshot")
+        self._snapshot_tensors_cpu.clear()
+        self._state = "empty"
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+
 class TrainEngine(abc.ABC):
+    def _get_policy_model_parts(self) -> list[torch.nn.Module]:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose local policy model parts"
+        )
+
+    def _iter_policy_state_tensors(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield stable local policy parameters/buffers, not forward caches."""
+        from torch.distributed.tensor import DTensor
+
+        from areal.engine.core.train_engine import _iter_persistent_buffers
+
+        def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+        for part_index, module in enumerate(self._get_policy_model_parts()):
+            for name, parameter in module.named_parameters():
+                yield (
+                    f"part:{part_index}:parameter:{name}",
+                    local_tensor(parameter),
+                )
+            for name, buffer in _iter_persistent_buffers(module):
+                yield f"part:{part_index}:buffer:{name}", local_tensor(buffer)
+
+    def _get_parameter_snapshot(self) -> _ParameterSnapshot:
+        snapshot = getattr(self, "_policy_parameter_snapshot", None)
+        if snapshot is None:
+            snapshot = _ParameterSnapshot()
+            self._policy_parameter_snapshot = snapshot
+        return snapshot
+
+    def capture_parameter_snapshot(self) -> None:
+        self._get_parameter_snapshot().capture(self._iter_policy_state_tensors())
+
+    @contextmanager
+    def parameter_snapshot_context(self):
+        with self._get_parameter_snapshot().activate(self._iter_policy_state_tensors()):
+            yield
+
+    def clear_parameter_snapshot(self) -> None:
+        self._get_parameter_snapshot().clear()
+
     @abc.abstractmethod
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         """Initialize PyTorch distributed communication groups.
@@ -365,6 +530,9 @@ class TrainEngine(abc.ABC):
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        *,
+        accumulation_steps: int = 1,
+        accumulation_index: int = 0,
     ) -> dict[str, float]:
         """Update the model with a batch of data and a loss function.
 
@@ -388,12 +556,23 @@ class TrainEngine(abc.ABC):
             loss_fn normalizes the loss for a micro-batch, we need a corresponding
             weight for each micro-batch to normalize the loss globally. The weight
             is usually the number of response tokens in the batch.
+        accumulation_steps : int
+            Consecutive chunk calls per optimizer update. Added for streaming
+            training when K > M and K % M == 0, where K is the number of chunks
+            per global step and M is actor.ppo_n_minibatches. In that path this
+            is K // M; other paths keep the default of one.
+        accumulation_index : int
+            Zero-based chunk position within the above streaming accumulation
+            window, not a microbatch index. Only its first call clears gradients;
+            only its last call normalizes, clips and steps. Each call packs its
+            own input independently. Defaults to zero.
 
         Returns
         -------
         dict[str, float]
             Scalar statistics after training, e.g., the current learning rate,
             gradient norm, etc.
+            Intermediate accumulation calls return an empty dictionary.
         """
         raise NotImplementedError()
 

@@ -11,7 +11,7 @@ import importlib.util
 import math
 import os
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
@@ -83,6 +83,10 @@ from areal.engine.core.model import (
     lang_config,
     resolve_sequence_packing_mode,
     validate_context_parallel_mode,
+)
+from areal.engine.core.train_engine import (
+    _gradient_accumulation,
+    _GradientAccumulationState,
 )
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
@@ -348,6 +352,46 @@ class _MegatronModelList(list):
 
 
 class MegatronEngine(TrainEngine):
+    @contextmanager
+    def _parameter_snapshot_sync_context(self):
+        """Drain parameter gathers before swapping live policy storage."""
+        assert self.model is not None
+        restore_chunks = []
+        try:
+            for module in self.model:
+                if not isinstance(module, DDP) or not module.use_forward_hook:
+                    continue
+                if module.remove_forward_pre_hook_handles:
+                    # Register before disabling: synchronization can fail after
+                    # hooks have already been removed.
+                    restore_chunks.append(module)
+                    module.disable_forward_pre_hook(param_sync=True)
+                else:
+                    module.start_param_sync(force_sync=True)
+            yield
+        finally:
+            for module in reversed(restore_chunks):
+                # Only touch DDP's own handles; cleanup must not dispatch
+                # another collective after a synchronization failure.
+                for handle in tuple(module.remove_forward_pre_hook_handles.values()):
+                    handle.remove()
+                module.remove_forward_pre_hook_handles.clear()
+                module.enable_forward_pre_hook()
+
+    def capture_parameter_snapshot(self) -> None:
+        with self._parameter_snapshot_sync_context():
+            super().capture_parameter_snapshot()
+
+    @contextmanager
+    def parameter_snapshot_context(self):
+        with self._parameter_snapshot_sync_context():
+            with super().parameter_snapshot_context():
+                yield
+
+    def _get_policy_model_parts(self) -> list[torch.nn.Module]:
+        assert self.model is not None
+        return self.model
+
     def __init__(self, config: TrainEngineConfig):
         self.config = config
         self.hf_config: PretrainedConfig
@@ -891,6 +935,9 @@ class MegatronEngine(TrainEngine):
 
         if self.config.use_merged_lora and self.bridge_cls == "mbridge":
             self._apply_merged_lora()
+
+        if kwargs.get("validate_gradient_accumulation", False):
+            self._validate_accumulation_initialization()
 
         if self.config.init_from_scratch:
             if self._mtp_head_dropped:
@@ -1664,115 +1711,348 @@ class MegatronEngine(TrainEngine):
                 forward_only=forward_only,
             )
 
+    def _validate_accumulation_initialization(self) -> None:
+        """Fail every actor rank before HF loading or rollout can start."""
+        error = None
+        try:
+            self._validate_accumulation_model()
+        except ValueError as exc:
+            error = str(exc)
+        errors: list[str | None] = [None] * dist.get_world_size(group=self.cpu_group)
+        dist.all_gather_object(errors, error, group=self.cpu_group)
+        for rank_error in errors:
+            if rank_error is not None:
+                raise ValueError(rank_error)
+
+    def _validate_accumulation_model(self) -> None:
+        """Check the effective router configuration before clearing any gradients."""
+        from megatron.core.transformer.moe.router import TopKRouter
+
+        for model in self.model:
+            for module in model.modules():
+                if not isinstance(module, TopKRouter):
+                    continue
+                if module.is_aux_loss_enabled():
+                    raise ValueError(
+                        "Cross-chunk accumulation requires MoE load-balancing loss "
+                        "to be disabled; set actor.mindspeed.moe_aux_loss_coeff=0 for all enabled "
+                        "auxiliary loss types."
+                    )
+                if getattr(module.config, "moe_z_loss_coeff", None) not in (None, 0):
+                    raise ValueError(
+                        "Cross-chunk accumulation requires moe_z_loss_coeff=0."
+                    )
+        self._accumulation_mtp_parameter_ids()
+
+    def _accumulation_mtp_parameter_ids(self) -> set[int]:
+        """MTP's detached graph permits separate normalization in the same buffer."""
+        if not self.mcore_config.enable_mtp_training:
+            return set()
+        mtp_modules = []
+        for model in self.model:
+            mtp = getattr(unwrap_to_gpt_model(model), "mtp", None)
+            if mtp is not None:
+                mtp_modules.append(mtp)
+        mtp_ids = {id(p) for module in mtp_modules for p in module.parameters()}
+        mtp_module_ids = {id(module) for module in mtp_modules}
+
+        def outside_parameters(module):
+            if id(module) in mtp_module_ids:
+                return
+            yield from module.parameters(recurse=False)
+            for child in module.children():
+                yield from outside_parameters(child)
+
+        if any(
+            id(p) in mtp_ids for model in self.model for p in outside_parameters(model)
+        ):
+            raise ValueError(
+                "Cross-chunk MTP accumulation requires isolated MTP parameters."
+            )
+        return mtp_ids
+
+    @torch.no_grad()
+    def _scale_accumulated_gradients(
+        self,
+        accumulation: _GradientAccumulationState,
+        mtp_ids: set[int],
+        per_token_loss: bool,
+    ) -> None:
+        main_scale = accumulation.gradient_scale
+        mtp_scale = None
+        if mtp_ids:
+            mtp_scale = (
+                accumulation.reference_mtp_tokens
+                / accumulation.total_mtp_tokens.clamp(min=1)
+            )
+        if per_token_loss:
+            # The original finalizer will divide by the whole window's tokens.
+            native_scale = (
+                accumulation.total_num_tokens / accumulation.reference_num_tokens
+            )
+            main_scale = main_scale * native_scale
+            if mtp_scale is not None:
+                mtp_scale = mtp_scale * native_scale
+        seen: set[int] = set()
+        for model in self.model:
+            for parameter in model.parameters():
+                if id(parameter) in seen:
+                    continue
+                seen.add(id(parameter))
+                grad = getattr(parameter, "main_grad", None)
+                if grad is not None:
+                    grad.mul_(mtp_scale if id(parameter) in mtp_ids else main_scale)
+
+    @contextmanager
+    def _accumulation_schedule_context(
+        self, accumulation: _GradientAccumulationState, per_token_loss: bool
+    ) -> Generator[None, None, None]:
+        """Defer native reduction to the final chunk, retaining embedding wgrad."""
+        saved = []
+        touched: set[tuple[int, str]] = set()
+
+        def override(obj, name, value):
+            key = (id(obj), name)
+            if key not in touched and getattr(obj, name, None) is not value:
+                touched.add(key)
+                saved.append((obj, name, getattr(obj, name)))
+                setattr(obj, name, value)
+
+        configs = {id(get_model_config(m)): get_model_config(m) for m in self.model}
+        mtp_ids = self._accumulation_mtp_parameter_ids()
+        try:
+            for model in self.model:
+                override(model.ddp_config, "overlap_grad_reduce", False)
+            for config in configs.values():
+                if getattr(config, "grad_sync_func", None) is not None:
+                    override(config, "grad_sync_func", None)
+                if (
+                    not accumulation.is_first
+                    and getattr(config, "param_sync_func", None) is not None
+                ):
+                    override(config, "param_sync_func", None)
+                original_finalize = config.finalize_model_grads_func
+
+                def finalize(
+                    models,
+                    num_tokens=None,
+                    *args,
+                    _original=original_finalize,
+                    **kwargs,
+                ):
+                    if per_token_loss and num_tokens is not None:
+                        # Only the last PP stage has a nonzero local count.
+                        # Preserve local counts; the original finalizer owns
+                        # PP broadcast and DP/CP reduction, and mutates its input.
+                        tokens = num_tokens.detach().clone()
+                        if accumulation.local_num_tokens is None:
+                            accumulation.local_num_tokens = tokens
+                        else:
+                            accumulation.local_num_tokens = (
+                                accumulation.local_num_tokens + tokens
+                            )
+                    if accumulation.is_last:
+                        self._scale_accumulated_gradients(
+                            accumulation, mtp_ids, per_token_loss
+                        )
+                        if per_token_loss:
+                            num_tokens = accumulation.local_num_tokens
+                        return _original(models, num_tokens, *args, **kwargs)
+
+                # A callable preserves deferred embedding-wgrad computation.
+                override(config, "finalize_model_grads_func", finalize)
+            # Match MCore's conditions for resetting TE's first-MB marker.
+            # Passing None through the wrapper also prevents TENPU fused wgrad
+            # from clearing gradients accumulated by previous chunks.
+            if any(
+                getattr(config, "fp8", None) is not None
+                or getattr(config, "fp4", None) is not None
+                or getattr(config, "use_kitchen", False)
+                for config in configs.values()
+            ):
+                from megatron.core.extensions import transformer_engine as te_ext
+
+                te_types = tuple(
+                    cls
+                    for name in (
+                        "TELinear",
+                        "TELayerNormColumnParallelLinear",
+                        "TEGroupedLinear",
+                    )
+                    if isinstance(cls := getattr(te_ext, name, None), type)
+                )
+                for model in self.model:
+                    for module in model.modules():
+                        if isinstance(module, te_types):
+                            override(module, "disable_parameter_transpose_cache", True)
+            yield
+        finally:
+            for obj, name, original in reversed(saved):
+                setattr(obj, name, original)
+
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        *,
+        accumulation_steps: int = 1,
+        accumulation_index: int = 0,
     ) -> dict[str, float]:
-        self._ensure_ready()
-        self.optimizer_zero_grad()
+        with _gradient_accumulation(
+            self, accumulation_steps, accumulation_index
+        ) as accumulation:
+            self._ensure_ready()
+            if accumulation is not None and accumulation.is_first:
+                self._validate_accumulation_model()
+            if accumulation is None or accumulation.is_first:
+                self.optimizer_zero_grad()
 
-        input_batched, _ = self._normalize_batch_input(input_)
+            input_batched, _ = self._normalize_batch_input(input_)
 
-        # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+            # Step 1: Prepare micro-batches
+            mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        # Loss metadata is replicated across CP. One DP+CP reduction provides
-        # both the manual loss denominator and the physical-token multiplier.
-        total_loss_weight, total_tokens = self._compute_loss_totals(
-            mb_list, loss_weight_fn
-        )
-
-        # Step 2: Select the normalization path from the model's effective config.
-        # Megatron Core requires a 3-tuple loss callback when per-token loss is
-        # enabled. It accumulates the provided token counts and normalizes all
-        # gradients, including MoE auxiliary losses, in finalize_model_grads.
-        # Preserve the existing 2-tuple/manual-normalization path for every model
-        # that does not explicitly enable calculate_per_token_loss.
-        model_config = get_model_config(self.model[0])
-        per_token_loss = model_config.calculate_per_token_loss
-
-        mtp_batch = None
-        if self.mcore_config.enable_mtp_training:
-            from areal.engine.megatron_utils.mtp import (
-                mtp_backward_scale,
-                prepare_mtp_mask,
+            # Loss metadata is replicated across CP. One DP+CP reduction provides
+            # both the manual loss denominator and the physical-token multiplier.
+            total_loss_weight, total_tokens = self._compute_loss_totals(
+                mb_list, loss_weight_fn
             )
 
-            if self.enable_tree_training:
-                raise ValueError("MTP training does not support tree attention")
-            mtp_batch = {
-                "metrics": torch.zeros(2, dtype=torch.float32, device=self.device),
-            }
-            target_counts = []
-            for mb in mb_list:
-                mask = mb.padded_mb.get("loss_mask")
-                if mask is None or mask.shape != mb.padded_mb["input_ids"].shape:
-                    raise ValueError(
-                        "MTP training requires loss_mask matching input_ids"
+            # Step 2: Select the normalization path from the model's effective config.
+            # Megatron Core requires a 3-tuple loss callback when per-token loss is
+            # enabled. It accumulates the provided token counts and normalizes all
+            # gradients, including MoE auxiliary losses, in finalize_model_grads.
+            # Preserve the existing 2-tuple/manual-normalization path for every model
+            # that does not explicitly enable calculate_per_token_loss.
+            model_config = get_model_config(self.model[0])
+            per_token_loss = model_config.calculate_per_token_loss
+            if accumulation is not None:
+                accumulation.add_chunk(total_loss_weight, len(mb_list))
+                total_loss_weight = accumulation.reference_loss_weight
+                if accumulation.is_first:
+                    accumulation.reference_num_tokens = (
+                        total_tokens * accumulation.steps
                     )
-                mask, count = prepare_mtp_mask(
-                    mask, mb.padded_mb.get("cu_seqlens"), mb.old_cu_seqlens
+                    accumulation.total_num_tokens = total_tokens.clone()
+                else:
+                    accumulation.total_num_tokens = (
+                        accumulation.total_num_tokens + total_tokens
+                    )
+                # Native normalization remains fixed while chunks run. Only the
+                # final schedule will reduce and divide by the window token count.
+                total_tokens = accumulation.reference_num_tokens
+
+            mtp_batch = None
+            if self.mcore_config.enable_mtp_training:
+                from areal.engine.megatron_utils.mtp import (
+                    mtp_backward_scale,
+                    prepare_mtp_mask,
                 )
-                mb.padded_mb["mtp_kwargs"] = {
-                    "mtp_labels": mb.padded_mb["input_ids"],
-                    "mtp_loss_mask": mask,
-                    "batch": mtp_batch,
+
+                if self.enable_tree_training:
+                    raise ValueError("MTP training does not support tree attention")
+                mtp_batch = {
+                    "metrics": torch.zeros(2, dtype=torch.float32, device=self.device),
                 }
-                target_counts.append(count)
-            mtp_tokens = torch.stack(target_counts).sum()
-            dist.all_reduce(mtp_tokens, group=mpu.get_data_parallel_group())
-            mtp_batch["scale"] = mtp_backward_scale(
-                total_tokens,
-                mtp_tokens,
-                cp_size=mpu.get_context_parallel_world_size(),
-                dp_cp_size=mpu.get_data_parallel_world_size(with_context_parallel=True),
-                num_microbatches=len(mb_list),
-                per_token=per_token_loss,
+                target_counts = []
+                for mb in mb_list:
+                    mask = mb.padded_mb.get("loss_mask")
+                    if mask is None or mask.shape != mb.padded_mb["input_ids"].shape:
+                        raise ValueError(
+                            "MTP training requires loss_mask matching input_ids"
+                        )
+                    mask, count = prepare_mtp_mask(
+                        mask, mb.padded_mb.get("cu_seqlens"), mb.old_cu_seqlens
+                    )
+                    mb.padded_mb["mtp_kwargs"] = {
+                        "mtp_labels": mb.padded_mb["input_ids"],
+                        "mtp_loss_mask": mask,
+                        "batch": mtp_batch,
+                    }
+                    target_counts.append(count)
+                mtp_tokens = torch.stack(target_counts).sum()
+                dist.all_reduce(mtp_tokens, group=mpu.get_data_parallel_group())
+                if accumulation is not None:
+                    if accumulation.is_first:
+                        accumulation.reference_mtp_tokens = (
+                            mtp_tokens * accumulation.steps
+                        ).clamp(min=1)
+                        accumulation.total_mtp_tokens = mtp_tokens.clone()
+                    else:
+                        accumulation.total_mtp_tokens = (
+                            accumulation.total_mtp_tokens + mtp_tokens
+                        )
+                    mtp_tokens = accumulation.reference_mtp_tokens
+                mtp_batch["scale"] = mtp_backward_scale(
+                    total_tokens,
+                    mtp_tokens,
+                    cp_size=mpu.get_context_parallel_world_size(),
+                    dp_cp_size=mpu.get_data_parallel_world_size(
+                        with_context_parallel=True
+                    ),
+                    num_microbatches=len(mb_list),
+                    per_token=per_token_loss,
+                )
+
+            if per_token_loss:
+                # MCore normalizes auxiliary gradients by original tokens. Convert
+                # the external objective's weight units to that same denominator.
+                loss_multiplier = total_tokens / total_loss_weight
+                total_loss_weight = None
+            else:
+                # The two-value callback is already globally normalized; compensate
+                # Megatron's division by num_microbatches and DDP's averaging.
+                loss_multiplier = mpu.get_data_parallel_world_size() * len(mb_list)
+
+            def process_output(
+                output: torch.Tensor, inputs: dict[str, Any]
+            ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+                return self._compute_logprobs_and_loss(
+                    output,
+                    inputs,
+                    loss_fn,
+                    loss_weight_fn,
+                    total_loss_weight,
+                    loss_multiplier=loss_multiplier,
+                    per_token_loss=per_token_loss,
+                )
+
+            # Step 3: Forward-backward using Megatron's pipeline function.
+            schedule_context = (
+                self._accumulation_schedule_context(accumulation, per_token_loss)
+                if accumulation is not None
+                else nullcontext()
             )
+            with schedule_context:
+                self.forward_backward_batch(mb_list, process_output, forward_only=False)
+            if accumulation is not None:
+                if mtp_batch is not None:
+                    metrics = mtp_batch["metrics"].detach()
+                    if accumulation.mtp_metrics is None:
+                        accumulation.mtp_metrics = metrics.clone()
+                    else:
+                        accumulation.mtp_metrics = accumulation.mtp_metrics + metrics
+                    mtp_batch["metrics"] = accumulation.mtp_metrics
+                if not accumulation.is_last:
+                    return {}
 
-        if per_token_loss:
-            # MCore normalizes auxiliary gradients by original tokens. Convert
-            # the external objective's weight units to that same denominator.
-            loss_multiplier = total_tokens / total_loss_weight
-            total_loss_weight = None
-        else:
-            # The two-value callback is already globally normalized; compensate
-            # Megatron's division by num_microbatches and DDP's averaging.
-            loss_multiplier = mpu.get_data_parallel_world_size() * len(mb_list)
-
-        def process_output(
-            output: torch.Tensor, inputs: dict[str, Any]
-        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-            return self._compute_logprobs_and_loss(
-                output,
-                inputs,
-                loss_fn,
-                loss_weight_fn,
-                total_loss_weight,
-                loss_multiplier=loss_multiplier,
-                per_token_loss=per_token_loss,
+            # Step 4: Optimizer step
+            stats = self.optimizer_step()
+            stats["num_micro_batches"] = (
+                accumulation.num_microbatches
+                if accumulation is not None
+                else len(mb_list.mbs)
             )
-
-        # Step 3: Forward-backward using Megatron's pipeline function.
-        self.forward_backward_batch(
-            mb_list,
-            process_output,
-            forward_only=False,
-        )
-
-        # Step 4: Optimizer step
-        stats = self.optimizer_step()
-        stats["num_micro_batches"] = len(mb_list.mbs)
-        if mtp_batch is not None:
-            metrics = mtp_batch["metrics"]
-            dist.all_reduce(
-                metrics, group=mpu.get_data_parallel_group(with_context_parallel=True)
-            )
-            dist.all_reduce(metrics, group=mpu.get_pipeline_model_parallel_group())
-            stats["mtp_loss"] = (metrics[0] / metrics[1].clamp(min=1)).item()
-        return stats
+            if mtp_batch is not None:
+                metrics = mtp_batch["metrics"]
+                dist.all_reduce(
+                    metrics,
+                    group=mpu.get_data_parallel_group(with_context_parallel=True),
+                )
+                dist.all_reduce(metrics, group=mpu.get_pipeline_model_parallel_group())
+                stats["mtp_loss"] = (metrics[0] / metrics[1].clamp(min=1)).item()
+            return stats
 
     def _compute_loss_totals(
         self,

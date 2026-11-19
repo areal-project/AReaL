@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import torch
 
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
 from areal.experimental.training_service.controller.controller import (
@@ -73,7 +74,10 @@ class _FakeAsyncClient:
 
 class TestGatewayTrainControllerInitialization:
     @pytest.mark.asyncio
-    async def test_async_initialize_offloads_scheduler_and_uses_async_helpers(self):
+    @pytest.mark.parametrize("validate_accumulation", [False, True])
+    async def test_async_initialize_offloads_scheduler_and_uses_async_helpers(
+        self, validate_accumulation
+    ):
         worker0 = MagicMock(ip="127.0.0.1", worker_ports=[18000], id="guard-0")
         worker1 = MagicMock(ip="127.0.0.1", worker_ports=[18001], id="guard-1")
 
@@ -130,7 +134,9 @@ class TestGatewayTrainControllerInitialization:
                 controller, "_register_in_router", new_callable=AsyncMock
             ) as mock_register,
         ):
-            await controller._async_initialize(role="train-role")
+            await controller._async_initialize(
+                role="train-role", validate_gradient_accumulation=validate_accumulation
+            )
 
         assert mock_to_thread.await_count == 2
         create_call = mock_to_thread.await_args_list[0]
@@ -147,6 +153,17 @@ class TestGatewayTrainControllerInitialization:
         mock_sync_fork.assert_not_called()
         assert mock_create_engine.await_count == 2
         assert mock_call_engine.await_count == 4
+        initialization_calls = [
+            call
+            for call in mock_call_engine.await_args_list
+            if call.args[1] == "/initialize"
+        ]
+        assert len(initialization_calls) == 2
+        for call in initialization_calls:
+            assert (
+                call.kwargs["kwargs"].get("validate_gradient_accumulation", False)
+                is validate_accumulation
+            )
         mock_register.assert_awaited_once_with(
             "http://127.0.0.1:18081",
             "http://127.0.0.1:18082",
@@ -162,3 +179,20 @@ class TestGatewayTrainControllerInitialization:
         assert controller._gateway_addr == "http://127.0.0.1:18080"
         assert controller.api_key is not None
         assert controller.api_key.startswith("ak-train-role-")
+
+
+def test_train_batch_serializes_accumulation_window():
+    from areal.infra.rpc.serialization import deserialize_value
+
+    controller = _make_controller()
+    with patch.object(controller, "_gateway_post_result", return_value={}) as post:
+        controller.train_batch(
+            [{"input_ids": torch.tensor([[1, 2]])}],
+            accumulation_steps=4,
+            accumulation_index=2,
+        )
+    path, payload = post.call_args.args
+    assert path == "/train_batch"
+    kwargs = deserialize_value(payload["kwargs"])
+    assert kwargs["accumulation_steps"] == 4
+    assert kwargs["accumulation_index"] == 2

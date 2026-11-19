@@ -1,6 +1,7 @@
 import argparse
 import copy
 import json
+import math
 import os
 import tempfile
 from functools import cache
@@ -22,6 +23,8 @@ from transformers import AutoTokenizer
 from areal.api import FinetuneSpec, SaveLoadMeta
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
+    DistributedDataParallelConfig,
+    FSDPEngineConfig,
     MegatronEngineConfig,
     MicroBatchSpec,
     OptimizerConfig,
@@ -32,6 +35,7 @@ from areal.engine.megatron_utils.frozen_mtp import read_mtp_tensors
 from areal.infra.platforms import current_platform
 from areal.utils import seeding
 from areal.utils.data import broadcast_tensor_container
+from tests.utils import check_gradient_accumulation
 
 _MODEL_PATH_SPECS = {
     "qwen3": (
@@ -149,7 +153,9 @@ def mock_input(
     )
 
 
-def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
+def make_engine(
+    model_type, backend, mb_spec, vpp_size=1, init_optimizer=False, megatron_config=None
+):
     bridge_type = _MODEL_BRIDGE_OVERRIDES.get(model_type, "mbridge")
     config = TrainEngineConfig(
         backend=backend,
@@ -158,7 +164,8 @@ def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
         path=_get_model_path(model_type),
         mb_spec=mb_spec,
         optimizer=OptimizerConfig() if init_optimizer else None,
-        megatron=MegatronEngineConfig(
+        megatron=megatron_config
+        or MegatronEngineConfig(
             virtual_pipeline_parallel_size=vpp_size,
             bridge_type=bridge_type,
         ),
@@ -419,6 +426,130 @@ def test_grad_norm_mb_invariance(
         f"Test: test_grad_norm_mb_invariance(model_type={model_type}, "
         f"alloc_mode={alloc_mode}) Done."
     )
+
+
+def test_parameter_snapshot(
+    model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
+):
+    """DP=2/PP=2/VPP=2: switch policies with forward gather, then train again."""
+    rank = int(os.environ["RANK"])
+    engines = []
+    control_parameters = []
+    control_logp = None
+    ok = True
+    for use_snapshot in (False, True):
+        seeding.set_random_seed(0, key=f"engine{rank}")
+        engine = make_engine(
+            model_type,
+            alloc_mode,
+            MicroBatchSpec(n_mbs=4, max_tokens_per_mb=256),
+            init_optimizer=True,
+            vpp_size=vpp_size,
+            megatron_config=MegatronEngineConfig(
+                virtual_pipeline_parallel_size=vpp_size,
+                bridge_type="mbridge",
+                ddp=DistributedDataParallelConfig(
+                    use_distributed_optimizer=True,
+                    overlap_param_gather=True,
+                    align_param_gather=False,
+                ),
+                overlap_param_gather_with_optimizer_step=False,
+            ),
+        )
+        engines.append(engine)
+        assert mpu.get_data_parallel_world_size() == 2
+        assert mpu.get_pipeline_model_parallel_world_size() == 2
+        assert len(engine.model) == 2
+        seeding.set_random_seed(0, key=f"data{rank}")
+        input_ = mock_input(
+            batch_size=8,
+            min_seqlen=32,
+            max_seqlen=64,
+            device=engine.device,
+            vocab_size=getattr(
+                engine.hf_config, "text_config", engine.hf_config
+            ).vocab_size,
+        )
+        input_ = broadcast_tensor_container(
+            input_,
+            src_rank=engine.current_data_parallel_head(),
+            group=engine.context_and_model_parallel_group,
+        )
+
+        def forward():
+            engine.eval()
+            return engine.forward(
+                input_=input_, aggregate_fn=lambda xs: torch.cat(xs, dim=0)
+            )
+
+        def train():
+            nonlocal ok
+            engine.train()
+            stats = engine.train_batch(
+                input_=input_,
+                loss_fn=mock_loss_fn,
+                loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+            )
+            if (
+                stats["update_successful"] != 1
+                or not math.isfinite(stats["grad_norm"])
+                or stats["grad_norm"] <= 0
+            ):
+                print(f"rank {rank} optimizer did not perform a valid update: {stats}")
+                ok = False
+            return stats
+
+        def check_close(actual, expected):
+            nonlocal ok
+            try:
+                torch.testing.assert_close(actual, expected, rtol=3e-3, atol=1e-6)
+            except AssertionError as exc:
+                print(f"rank {rank} snapshot parity failed: {exc}")
+                ok = False
+
+        initial_logp = forward().detach().cpu()
+        if use_snapshot:
+            check_close(initial_logp, control_logp)
+            engine.capture_parameter_snapshot()
+        else:
+            control_logp = initial_logp
+        train()
+
+        # Keep optimizer-step gather disabled: the supported MindSpeed stack
+        # must not hit the historical list.wait failure. Forward gather remains on.
+        if use_snapshot:
+            with engine.parameter_snapshot_context():
+                check_close(forward().detach().cpu(), initial_logp)
+            engine.clear_parameter_snapshot()
+        # A distinguishable policy change
+        # prevents no-op training/snapshot activation from passing old-logp checks.
+        updated_logp = forward().detach().cpu()
+        if torch.allclose(updated_logp, initial_logp, rtol=3e-3, atol=1e-6):
+            print(f"rank {rank} updated logp is indistinguishable from initial policy")
+            ok = False
+
+        for update_index in range(2):
+            parameters = {
+                name: parameter.detach().cpu()
+                for name, parameter in engine.model.named_parameters()
+            }
+            if use_snapshot:
+                for name, parameter in parameters.items():
+                    check_close(parameter, control_parameters[update_index][name])
+            else:
+                control_parameters.append(parameters)
+            if update_index == 0:
+                # Optimizer master state and gather scheduling must remain valid.
+                train()
+                forward()
+
+    verdict = torch.tensor(int(ok), dtype=torch.int32, device=engines[-1].device)
+    dist.all_reduce(verdict, op=dist.ReduceOp.MIN)
+    ok = bool(verdict.item())
+    for engine in reversed(engines):
+        engine.destroy()
+    if rank == 0 and output is not None:
+        write_result(output, ok)
 
 
 def test_train_dcp_save_load(
@@ -758,6 +889,8 @@ def main():
             "forward",
             "train",
             "grad_norm_mb_invariance",
+            "parameter_snapshot",
+            "gradient_accumulation",
             "simple_dcp_save_load",
             "train_dcp_save_load",
             "train_hf_save_load",
@@ -765,10 +898,86 @@ def main():
         default="forward",
         help="Type of test to run: 'forward' or 'train'",
     )
+    parser.add_argument("--fsdp_cpu_offload", action="store_true")
+    parser.add_argument(
+        "--common_reference_scale",
+        action="store_true",
+        help="Align the Megatron reference backward scale for the accumulation control",
+    )
     args = parser.parse_args()
 
     print(args)
-    if args.test_type == "train":
+    if args.test_type == "gradient_accumulation":
+        if args.common_reference_scale and (
+            not args.backend.startswith("megatron:") or args.model_type != "qwen3"
+        ):
+            parser.error("--common_reference_scale requires Megatron and Qwen3")
+        if args.backend.startswith("fsdp:"):
+
+            def factory():
+                config = TrainEngineConfig(
+                    backend=args.backend,
+                    experiment_name="test",
+                    trial_name="accumulation",
+                    path=_get_model_path(args.model_type),
+                    mb_spec=MicroBatchSpec(n_mbs=4, max_tokens_per_mb=128),
+                    optimizer=OptimizerConfig(),
+                    fsdp=FSDPEngineConfig(
+                        offload_params=args.fsdp_cpu_offload,
+                        per_layer_optim_step=args.fsdp_cpu_offload,
+                        optim_step_prefetch_layers=0,
+                    ),
+                )
+                engine = FSDPEngine(config)
+                engine.create_process_group(
+                    ModelAllocation.from_str(args.backend).parallel
+                )
+                engine.initialize(
+                    None,
+                    FinetuneSpec(
+                        total_train_epochs=1, dataset_size=128, train_batch_size=16
+                    ),
+                )
+                return engine
+        else:
+
+            def factory():
+                return make_engine(
+                    args.model_type,
+                    args.backend,
+                    # Keep the control's native loss compensation binary-exact:
+                    # one 16-MB schedule versus two 8-MB schedules. The original
+                    # test retains unequal 4/8-MB chunks and a 12-MB reference.
+                    MicroBatchSpec(
+                        n_mbs=8 if args.common_reference_scale else 4,
+                        max_tokens_per_mb=128,
+                    ),
+                    init_optimizer=True,
+                    vpp_size=args.vpp_size,
+                    megatron_config=MegatronEngineConfig(
+                        virtual_pipeline_parallel_size=args.vpp_size,
+                        bridge_type="mbridge",
+                        ddp=DistributedDataParallelConfig(
+                            use_distributed_optimizer=True,
+                            overlap_grad_reduce=True,
+                            overlap_param_gather=True,
+                            align_param_gather=True,
+                        ),
+                    ),
+                )
+
+        check_gradient_accumulation(
+            factory,
+            case=(
+                f"{args.backend}, vpp_size={args.vpp_size}, "
+                f"fsdp_cpu_offload={args.fsdp_cpu_offload}, "
+                f"common_reference_scale={args.common_reference_scale}"
+            ),
+            common_reference_scale=args.common_reference_scale,
+        )
+        if args.output:
+            write_result(args.output, True)
+    elif args.test_type == "train":
         test_train(
             args.model_type,
             args.backend,
@@ -788,6 +997,10 @@ def main():
             args.backend,
             output=args.output,
             vpp_size=args.vpp_size,
+        )
+    elif args.test_type == "parameter_snapshot":
+        test_parameter_snapshot(
+            args.model_type, args.backend, output=args.output, vpp_size=args.vpp_size
         )
     elif args.test_type == "simple_dcp_save_load":
         test_simple_dcp_save_load(

@@ -487,6 +487,105 @@ for global_step in range(start_step, max_steps):
 
 All algorithm operations are controller method calls that dispatch to remote workers.
 
+### Streaming chunks and PPO minibatches
+
+Enable the basic streaming path as follows (`ppo_n_minibatches=4` updates once per
+chunk):
+
+```yaml
+train_dataset:
+  batch_size: 64
+rollout:
+  consumer_batch_size: 64
+  streaming_train_batch_size: 16
+  max_head_offpolicyness: 0
+actor:
+  ppo_n_minibatches: 4
+dynamic_bs: false
+```
+
+The goal is to interleave rollout and actor training instead of waiting for the full
+batch. This requires single-controller mode and separate actor and rollout placement.
+When recomputing proximal log-probabilities, the pre-update rollout policy is kept in a
+CPU snapshot. During snapshot forward, current actor parameters are temporarily backed
+up to CPU and restored afterwards, avoiding an additional full parameter copy on the
+device. This uses more host memory and host/device transfers and does not guarantee a
+speedup for every configuration. This snapshot path does not support
+`actor.megatron.fp8_config.param=true`; FP8 training itself remains supported.
+
+Set `rollout.streaming_train_batch_size=S` to start actor work before the full
+`train_dataset.batch_size=B` prompt groups have finished rollout. Each chunk contains
+complete prompt groups (including all `n_samples` responses). Let `K=B/S` be the chunk
+count and `M=actor.ppo_n_minibatches` the number of optimizer updates per global step.
+`B` must be divisible by `S`, and one of these relationships must hold:
+
+- `M % K == 0`: each chunk contains `M/K` complete PPO minibatches, as in the original
+  streaming path.
+- `K % M == 0`: each PPO minibatch contains `K/M` complete chunks. Each chunk is packed
+  into microbatches independently using `actor.mb_spec`; gradients accumulate across
+  chunks, and clipping and the optimizer step run only after the last chunk in that
+  minibatch. No extra accumulation setting is needed.
+
+For example, `B=64`, `S=16`, `M=2` performs backward on four chunks and updates after
+chunks 2 and 4. With `M=1`, backward starts on the first chunk, but the single optimizer
+update waits for chunk 4. Microbatch packing and the order in which completed prompt
+groups reach the actor can differ from non-streaming training. With `M=1`, all logp
+recomputation uses the actor before its update, so CPU policy snapshots are neither
+captured nor activated. Every chunk still runs its logp forward and accumulates
+gradients. With `M>1`, snapshot behavior is unchanged.
+
+Streaming training supports FSDP and Megatron + MindSpeed with vLLM + vLLM-Ascend. Loss
+weighting uses the existing `loss_weight_fn` and backend parallel reductions, then
+normalizes by the whole PPO minibatch's accumulated weight before clipping. It does not
+average chunk mean gradients equally. Existing per-chunk parallelism and microbatch
+budget constraints still apply, as do the streaming requirements
+`rollout.max_head_offpolicyness=0` and `dynamic_bs=false`. Critic updates, LR
+scheduling, rollout policy versions and weight synchronization retain their global-step
+boundaries.
+
+In Megatron cross-chunk mode, enabled MoE auxiliary load-balancing losses and router
+z-loss must have zero coefficients. The actual model is checked during initialization so
+incompatible settings fail before rollout, without overriding their values. The target's
+isolated MTP graph retains normalization by valid two-token-ahead targets across the
+whole minibatch, independently of the main loss normalizer. Both native per-token and
+manual Megatron normalization are preserved. For FP8, FP4 or kitchen mode, each chunk
+schedule temporarily sets `disable_parameter_transpose_cache=True` on MCore TE linear
+wrappers, passing `is_first_microbatch=None` to the underlying implementation. This
+prevents a reset first-microbatch marker from overwriting gradients accumulated by
+earlier chunks. Original values are restored on normal or exceptional exit. This
+protection also applies to TENPU and covers BF16 layers within quantized models;
+ordinary BF16 mode leaves the flag unchanged. It is retained even with dense fusion
+currently disabled. Reduced weight workspace reuse in FP8 mode can have a performance
+cost. These additional Megatron rules apply only when multiple chunks share one
+optimizer update.
+
+Use the dependencies pinned by the target Ascend Dockerfiles; the migration does not
+change their versions. Existing multi-teacher mixture/domain routing and
+`prox_logp_method="reuse"` remain available. Domain-routed teacher batches still need to
+satisfy their existing runtime DP/microbatch budgets.
+
+Run CPU regressions with:
+
+```bash
+python -m pytest -v tests/test_gradient_accumulation.py tests/test_streaming_train_batch.py
+python -m pytest -v tests/test_megatron_loss_normalization.py tests/test_megatron_loss_aggregation.py
+python -m pytest -v tests/experimental/training_service/test_controller_unit.py
+```
+
+On the target Ascend stack, run the callback and distributed regressions with:
+
+```bash
+python -m pytest -v tests/test_megatron_parameter_snapshot.py tests/test_megatron_optimizer_config.py
+python -m pytest -v tests/test_megatron_engine_distributed.py -k "parameter_snapshot or chunk_gradient_accumulation"
+```
+
+The distributed tests reuse the existing model resolver (environment override, existing
+local checkpoint, then Hugging Face download). The snapshot test requires four NPUs and
+keeps forward parameter-gather overlap enabled while disabling optimizer-step gather
+overlap to avoid the MindSpeed `list.wait` incompatibility. The accumulation matrix
+covers FSDP DP2 (including CPU offload/per-layer optimizer) and Megatron DP2, PP2/VPP2,
+and DP2/PP2/VPP2. CI configuration is unchanged.
+
 ## Weight Synchronization
 
 After each training step, updated weights must be synced to inference workers. AReaL

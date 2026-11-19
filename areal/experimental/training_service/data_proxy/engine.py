@@ -144,6 +144,16 @@ def register_engine_routes(
     app.post("/ppo/actor/compute_logp")(
         _dispatch_compute_route("/ppo/actor/compute_logp")
     )
+    app.post("/ppo/actor/capture_rollout_policy_snapshot")(
+        _broadcast_post_route(
+            "/ppo/actor/capture_rollout_policy_snapshot", require_non_empty=True
+        )
+    )
+    app.post("/ppo/actor/clear_rollout_policy_snapshot")(
+        _broadcast_post_route(
+            "/ppo/actor/clear_rollout_policy_snapshot", require_non_empty=True
+        )
+    )
     app.post("/ppo/actor/compute_advantages")(
         _dispatch_compute_route("/ppo/actor/compute_advantages")
     )
