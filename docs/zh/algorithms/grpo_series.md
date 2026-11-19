@@ -441,4 +441,7 @@ AReaL的GRPO实现在两个关键方面与原始DeepSeekMath论文不同：
 **长度归一化**：AReaL从原始GRPO目标中移除了逐token长度归一化项。这与 [Dr.GRPO](https://arxiv.org/abs/2503.20783)
 的建议一致，并消除了优势估计中的偏差。
 
-**KL正则化**：AReaL不是将KL散度项直接添加到目标函数中，而是通过`actor.kl_ctl`将KL正则化纳入actor advantage（PPO风格）。在token模式下，`KLEstimator`计算的惩罚会在GAE之前加入逐token奖励；在turn模式下，它仅作为token局部的actor惩罚，不进入turn递推和critic target。
+**KL正则化**：AReaL同时支持奖励层（PPO风格）与损失层两种参考策略KL正则化方式：
+
+- **奖励层KL（`actor.kl_ctl`）**：在token模式下，`KLEstimator`计算的惩罚会在GAE之前加入逐token奖励；在turn模式下，它仅作为token局部的actor惩罚，不进入turn递推和critic target。
+- **损失层KL（`actor.use_kl_loss=true`、`actor.kl_ctl=0.0`、`actor.kl_loss_coef`、`actor.kl_loss_type`）**：按配置的`actor.loss_aggregation`聚合方式，直接向actor目标函数添加逐token显式KL损失（支持`low_var_kl` / `k3`或`k2` / `mse`）。该方式可避免无critic的GAE在长序列上产生$O(T)$后缀和放大与负优势偏置，推荐在长序列GRPO及Joint OPD/MOPD中使用。

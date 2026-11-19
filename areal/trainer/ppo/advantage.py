@@ -417,9 +417,6 @@ class AdvantagePipeline:
                 # prox logp not available, use inferenced logp
                 data["prox_logp"] = old_logp
         ref_logp = data.get("ref_logp")
-        if ref_logp is None:
-            ref_logp = torch.zeros_like(old_logp)
-        ref_logp *= loss_mask
         old_logp *= loss_mask
 
         # Compute KL-regularized rewards.
@@ -427,7 +424,13 @@ class AdvantagePipeline:
         seqlens = attn_mask.sum(-1).long()
         seq_truncated_mask = _get_truncated_mask(data, seqlens)
         data["is_truncated"] = seq_truncated_mask
-        rewards = -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
+        if self.kl_ctl == 0:
+            rewards = torch.zeros_like(old_logp, dtype=torch.float32)
+        else:
+            masked_ref_logp = (
+                torch.zeros_like(old_logp) if ref_logp is None else ref_logp * loss_mask
+            )
+            rewards = -self.kl_ctl * self.kl_estimator(old_logp, masked_ref_logp)
         kl_rewards = rewards.clone()
         # KL rewards at the next token after eos is zero.
         rewards[batch_indices, seqlens - 1] = 0

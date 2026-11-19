@@ -37,7 +37,11 @@ class MOPDExecutionPlan:
             requires_rl=requires_rl,
             requires_critic=requires_rl and config.critic is not None,
             requires_ref=(
-                requires_rl and config.actor.kl_ctl > 0 and config.ref is not None
+                config.ref is not None
+                and (
+                    (requires_rl and config.actor.kl_ctl > 0)
+                    or config.actor.use_kl_loss
+                )
             ),
             requires_prox_logp=(
                 (requires_rl or requires_distillation_filter)
