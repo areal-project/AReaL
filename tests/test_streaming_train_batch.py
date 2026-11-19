@@ -954,11 +954,11 @@ def test_lr_and_weight_publication_advance_only_at_logical_batch_boundaries(
 @pytest.mark.parametrize(
     "recompute", [False, True], ids=["skip-forward", "fixed-policy-forward"]
 )
-@pytest.mark.parametrize("n_minibatches", [1, 2, 8])
+@pytest.mark.parametrize("n_minibatches", [1, 2, 4, 8])
 def test_proximal_forward_uses_fixed_weights_without_losing_actor_updates(
     trainer_factory, recompute, n_minibatches, monkeypatch
 ):
-    """Numeric snapshot values stay fixed per logical batch, not merely a flag."""
+    """Use live weights before the first update, then the fixed policy snapshot."""
     steps = 2
     trainer = trainer_factory(
         recompute=recompute, steps=steps, n_minibatches=n_minibatches
@@ -978,12 +978,13 @@ def test_proximal_forward_uses_fixed_weights_without_losing_actor_updates(
     trainer.train(workflow=object())
     # This recording actor changes once per completed call/window.
     updates_per_step = min(n_minibatches, 4)
+    chunks_before_first_update = max(1, 4 // n_minibatches)
     if recompute:
         assert actor.logps == [
             (
                 step * 4 + chunk,
                 float(step * updates_per_step),
-                needs_snapshot and chunk > 1,
+                needs_snapshot and chunk > chunks_before_first_update,
             )
             for step in range(steps)
             for chunk in range(1, 5)

@@ -912,7 +912,11 @@ class PPOTrainer:
                     ):
                         if needs_policy_snapshot and streaming_batch_index == 0:
                             self.actor.capture_rollout_policy_snapshot()
-                        if needs_policy_snapshot and streaming_batch_index > 0:
+                        # Live weights match the rollout policy until the first update.
+                        if (
+                            needs_policy_snapshot
+                            and streaming_batch_index >= actor_accumulation_steps
+                        ):
                             prox_logps = self.actor.compute_logp(
                                 rollout_batch,
                                 use_rollout_policy_snapshot=True,
