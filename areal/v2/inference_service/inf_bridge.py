@@ -10,6 +10,7 @@ translates between ModelRequest / raw JSON and endpoint-specific payloads.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -249,7 +250,10 @@ class InfBridge:
         stop_reason: _StopReason | None = None
         final_routed_experts: np.ndarray | None = None
 
+        ready_at = time.time()
         t0 = time.monotonic()
+        first_token: float | None = None
+        last_finish: float | None = None
 
         for _attempt in range(self.max_resubmit_retries):
             # Wait while paused (weight update in progress)
@@ -274,6 +278,7 @@ class InfBridge:
 
                 # A weight update may complete before this segment's response arrives.
                 request_version = self._version
+                sent = time.monotonic() - t0
                 data = await self._send_request(http_req)
                 result = self.backend.parse_generation_response(data)
 
@@ -287,6 +292,16 @@ class InfBridge:
                             "model."
                         )
 
+                if result.output_tokens:
+                    # Anchor each backend interval to its local dispatch, including
+                    # waits between segments without comparing remote clocks.
+                    if not accumulated_tokens and result.first_token_delay is not None:
+                        first_token = sent + result.first_token_delay
+                    last_finish = (
+                        None
+                        if result.finish_delay is None
+                        else sent + result.finish_delay
+                    )
                 accumulated_tokens.extend(result.output_tokens)
                 accumulated_logprobs.extend(result.output_logprobs)
                 accumulated_versions.extend(
@@ -355,6 +370,27 @@ class InfBridge:
             )
 
         latency = time.monotonic() - t0
+        output_len = len(accumulated_tokens)
+        tpot = None
+        if output_len > 1 and first_token is not None and last_finish is not None:
+            if last_finish >= first_token:
+                tpot = (last_finish - first_token) / (output_len - 1)
+        logger.info(
+            "request_timing %s",
+            json.dumps(
+                dict(
+                    request_id=req.rid,
+                    session_id=req.metadata.get("areal_session_id"),
+                    ready_at=ready_at,
+                    completed_at=ready_at + latency,
+                    input_tokens=len(req.input_ids),
+                    output_tokens=output_len,
+                    ttft_seconds=first_token,
+                    tpot_seconds=tpot,
+                    stop_reason=stop_reason,
+                )
+            ),
+        )
 
         return ModelResponse(
             input_tokens=list(req.input_ids),
@@ -364,5 +400,7 @@ class InfBridge:
             stop_reason=stop_reason,
             tokenizer=req.tokenizer,
             latency=latency,
+            ttft=float("inf") if first_token is None else first_token,
+            tpot=tpot,
             routed_experts=final_routed_experts,
         )

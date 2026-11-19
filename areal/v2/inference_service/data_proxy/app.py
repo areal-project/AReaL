@@ -496,6 +496,13 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
         kwargs = dict(body_json)
         kwargs.pop("model", None)
+        # Associate backend calls with the public session used by the workload client.
+        metadata = dict(kwargs.get("metadata") or {})
+        metadata.pop("areal_session_id", None)
+        if session is not None:
+            metadata["areal_session_id"] = session.session_id
+        if metadata or "metadata" in kwargs:
+            kwargs["metadata"] = metadata
         is_streaming = bool(kwargs.get("stream", False))
         kwargs.setdefault("temperature", 1.0)
         kwargs.setdefault("top_p", 1.0)

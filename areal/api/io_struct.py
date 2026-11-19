@@ -89,6 +89,7 @@ class ModelResponse:
     sampler_head_ids: list[list[int]] | None = None
     sampler_head_logprobs: list[list[float]] | None = None
     input_videos: list[str | dict[str, Any]] | None = None
+    tpot: float | None = None  # Mean seconds per token after the first
 
     @property
     def input_len(self) -> int:
@@ -339,6 +340,9 @@ class HttpGenerationResult:
     spec_accept_length: float | None = None
     sampler_head_ids: list[list[int]] | None = None
     sampler_head_logprobs: list[list[float]] | None = None
+    # Seconds since backend receipt, measured on the same backend clock.
+    first_token_delay: float | None = None
+    finish_delay: float | None = None
 
     def __post_init__(self) -> None:
         if len(self.output_tokens) != len(self.output_logprobs):
