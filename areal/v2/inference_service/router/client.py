@@ -17,7 +17,10 @@ from typing import TypeVar
 import aiohttp
 import requests
 
+from areal.utils import logging
 from areal.v2.inference_service.router.backend import LeaseResponse, RoutingError
+
+logger = logging.getLogger("BackendRouter")
 
 T = TypeVar("T")
 current_backend_session: ContextVar[str | None] = ContextVar(
@@ -42,6 +45,10 @@ async def backend_session(engine, session_id: str | None = None, *, close: bool 
 class Execution:
     session_id: str | None
     cancelled: bool = False
+
+
+class GenerationRejectedError(Exception):
+    """A backend adapter confirmed rejection before scheduling generation."""
 
 
 class RouteClient:
@@ -88,7 +95,9 @@ class RouteClient:
         self, session: aiohttp.ClientSession, path: str, body: dict
     ) -> dict:
         deadline = time.monotonic() + self.metadata_timeout
+        attempts = 0
         while True:
+            attempts += 1
             try:
                 async with session.post(
                     self.router_addr + path,
@@ -106,23 +115,40 @@ class RouteClient:
                         raise RoutingError(detail["code"])
                     response.raise_for_status()
                     raise RoutingError("INVALID_RESPONSE")
-            except (TimeoutError, aiohttp.ClientError, ValueError, RuntimeError):
+            except (TimeoutError, aiohttp.ClientError, ValueError, RuntimeError) as exc:
                 if time.monotonic() >= deadline:
+                    # Exception text can contain request URLs or credentials.
+                    logger.warning(
+                        "Router metadata request exhausted retries: "
+                        "operation=%s attempts=%d error_type=%s session_closed=%s",
+                        path,
+                        attempts,
+                        type(exc).__name__,
+                        session.closed,
+                    )
                     raise RoutingError("METADATA_UNCERTAIN") from None
                 await asyncio.sleep(0.1)
 
     async def release(
         self, session: aiohttp.ClientSession, lease: LeaseResponse, outcome: str
     ) -> None:
-        await self._post(
-            session,
-            "/routing/release",
-            {
-                **self.identity,
-                "lease_id": lease.lease_id,
-                "outcome": outcome,
-            },
-        )
+        body = {
+            **self.identity,
+            "lease_id": lease.lease_id,
+            "outcome": outcome,
+        }
+        try:
+            await self._post(session, "/routing/release", body)
+        except RoutingError as exc:
+            if exc.code != "METADATA_UNCERTAIN":
+                raise
+            # Release is idempotent for the same lease, including when its first
+            # response was lost. A broken generation connector must not prevent
+            # confirming a terminal request. Never retry generation here; if this
+            # bounded independent attempt also fails, _execute still fails closed.
+            logger.warning("Retrying router release on an independent HTTP session")
+            async with aiohttp.ClientSession() as metadata_session:
+                await self._post(metadata_session, "/routing/release", body)
 
     def close_local_session(self, session_id: str) -> None:
         with self._lock:
@@ -292,9 +318,17 @@ class RouteClient:
                 if generation is None:
                     await self.release(session, lease, "not_sent")
                     continue
-                result, outcome = await generation
+                try:
+                    result, outcome = await generation
+                except GenerationRejectedError:
+                    # The adapter established that nothing was scheduled. A
+                    # release failure still follows the fail-closed path below.
+                    await self.release(session, lease, "failed")
+                    raise
                 await self.release(session, lease, outcome)
                 return result, lease.weight_version
+            except GenerationRejectedError:
+                raise
             except BaseException as exc:
                 # A timeout/disconnect/5xx or an unparseable response cannot
                 # establish that SGLang has stopped. Do not decrement its lease.

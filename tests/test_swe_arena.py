@@ -76,6 +76,55 @@ async def test_get_harness_result_fetches_authenticated_terminal_artifact(
     assert actual == receipt
 
 
+@pytest.mark.asyncio
+async def test_get_harness_result_missing_primary_fetches_native_receipt(monkeypatch):
+    """A Harness exposing only native-receipt.json still supplies its receipt."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    receipt = {"implementation": "rust-core-runtime", "status": "ERROR"}
+    paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        assert request.headers["Authorization"] == "Bearer test-token"
+        if request.url.path.endswith("/harness_result.json"):
+            return httpx.Response(404)
+        return httpx.Response(200, json=receipt)
+
+    client = ArenaOpenAPIClient(base_url="https://arena.example")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        actual = await client.get_harness_result_async(
+            "job:env:0", client=http_client, timeout=5.0
+        )
+
+    assert actual == receipt
+    assert paths == [
+        "/api/artifacts/job:env:0/harness_result.json",
+        "/api/artifacts/job:env:0/native-receipt.json",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 403, 500])
+async def test_get_harness_result_non404_error_propagates(monkeypatch, status_code):
+    """Authentication and server failures must not trigger receipt fallback."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(status_code)
+
+    client = ArenaOpenAPIClient(base_url="https://arena.example", request_retries=0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            await client.get_harness_result_async(
+                "job:env:0", client=http_client, timeout=5.0
+            )
+
+    assert exc_info.value.response.status_code == status_code
+    assert paths == ["/api/artifacts/job:env:0/harness_result.json"]
+
+
 def test_resolve_stream_id_when_unspecified_returns_first_active(monkeypatch):
     """The first active Stream should be selected when no id is configured."""
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")

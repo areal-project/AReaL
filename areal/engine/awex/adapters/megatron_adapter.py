@@ -202,6 +202,18 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
             infer_conf["hf_config"] = SimpleNamespace(**infer_conf["hf_config"])
 
+        from areal.engine.awex.qwen3_5_fp8 import Qwen35FP8Policy
+
+        fp8_policy = None
+        if self._engine.hf_config.architectures[0] in Qwen35FP8Policy.architectures:
+            fp8_policy = Qwen35FP8Policy.from_config(infer_conf.get("hf_config", {}))
+            if fp8_policy is not None:
+                if self._dte_config.enabled:
+                    raise ValueError(
+                        "Qwen3.5 FP8 AWEX requires full weight transfer; disable DTE delta transfer"
+                    )
+                Qwen35FP8Policy.register_awex()
+
         if self._engine.hf_config.architectures == ["Qwen4ExpForConditionalGeneration"]:
             from awex.models.qwen4_exp import register_qwen4_exp_awex
 
@@ -237,6 +249,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             _EngineShim(self._engine), self._engine.hf_config, infer_conf
         )
         self._parameters_meta = resolver.get_parameters_meta()
+        if fp8_policy is not None:
+            fp8_policy.validate_metadata(self._parameters_meta)
         self._rank_info = get_rank_info_extractor("mcore")()
         self._weight_converter = get_train_weights_converter(
             "mcore",

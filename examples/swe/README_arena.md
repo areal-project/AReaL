@@ -522,3 +522,18 @@ or adaptive thinking controls. Chat rendering uses the checkpoint's template def
 and any Harness request overrides. These differences affect training semantics; the
 profile is intended for Arena integration validation, not a claim of full recipe
 equivalence.
+
+### Externally scored artifacts
+
+For Harnesses that score an artifact and finish with an empty auxiliary response, set
+`econfig.arena_response_validation_policy: artifact_reward` explicitly. This policy
+preserves the external episode reward only for successful concat exports with PRM
+disabled. Malformed tool calls remain invalid. The default `final_response` policy still
+requires usable final text or a tool call.
+
+### Multiple Harnesses for one Stream
+
+Multiple `arena_streams` entries may share a `stream_id` to run the same dataset through
+different Harnesses. Give every entry a unique `name`; sampling weights, Harness
+selection, reward settings, and per-stream metrics use that logical name. Each entry
+contributes its own sampling weight even when its Stream ID is shared.

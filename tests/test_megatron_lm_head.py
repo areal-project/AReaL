@@ -1041,3 +1041,45 @@ def test_fused_loss_preserves_public_logits_hook_and_retain_grad(monkeypatch):
         atol=2e-5,
     )
     assert pack_calls == 0
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@pytest.mark.parametrize("arity", [9, 10])
+@pytest.mark.parametrize("fp32_output", [False, True])
+def test_linear_backward_megatron_arity_preserves_gradients(
+    monkeypatch, arity, fp32_output
+):
+    """Both runtime signatures must satisfy autograd and preserve tensor gradients."""
+
+    def backward(ctx, grad_output):
+        input_, weight = ctx.saved_tensors
+        gradients = (
+            grad_output @ weight,
+            grad_output.t() @ input_,
+            grad_output.sum(0),
+        )
+        return gradients + (None,) * (arity - 3)
+
+    monkeypatch.setattr(
+        mcore_layers.LinearWithGradAccumulationAndAsyncCommunication,
+        "backward",
+        staticmethod(backward),
+    )
+    input_ = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(16, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    bias = torch.randn(16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    linear = (
+        lm_head_module._LinearWithFp32Output
+        if fp32_output
+        else lm_head_module._LinearWithNativeOutput
+    )
+    output = linear.apply(input_, weight, bias, False, False, False, None, 0, None, 1)
+    gradient = torch.randn_like(output)
+    output.backward(gradient)
+    cast_gradient = gradient.to(weight.dtype)
+    for actual, expected in (
+        (input_.grad, cast_gradient @ weight.detach()),
+        (weight.grad, cast_gradient.t() @ input_.detach()),
+        (bias.grad, cast_gradient.sum(0)),
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
