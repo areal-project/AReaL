@@ -61,7 +61,8 @@ class BaseInstallationValidator:
     CUDA_SUBMODULES = {
         "torch": ["torch.cuda"],
         "sglang": ["sgl_kernel", "sgl_kernel.flash_attn"],
-        "vllm": ["vllm._C"],
+        # vLLM >= 0.32 no longer builds vllm._C; _C_stable_libtorch exists in 0.19.1+.
+        "vllm": ["vllm._C_stable_libtorch"],
         "flash-attn": ["flash_attn_2_cuda"],
         "megatron-core": [
             "megatron.core.parallel_state",

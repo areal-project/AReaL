@@ -19,8 +19,8 @@
 | 组件                     |                                                                                  版本                                                                                  |
 | ------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------: |
 | 操作系统                 |                                                            CentOS 7 / Ubuntu 22.04 或满足以下要求的任何系统                                                            |
-| NVIDIA 驱动              |                                                                               550.127.08                                                                               |
-| CUDA                     |                                                                                  12.8                                                                                  |
+| NVIDIA 驱动              |                                                              550.127.08（SGLang）；≥ 580（vLLM，CUDA 13）                                                              |
+| CUDA                     |                                                                      12.8（SGLang）；13.0（vLLM）                                                                      |
 | Git LFS                  | 用于下载模型、数据集和 AReaL 代码。请参阅[安装指南](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage) |
 | Docker                   |                                                                                 27.5.1                                                                                 |
 | NVIDIA Container Toolkit |                             请参阅[安装指南](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)                              |
@@ -86,12 +86,13 @@ uv sync --extra cuda
 ```
 
 这将安装 CUDA 依赖的训练包（Megatron、Torch Memory Saver）以及 **SGLang** 作为默认推理后端。这些包需要 Linux x86_64 和
-CUDA 12.x 及兼容的 NVIDIA 驱动。
+CUDA 12.x 及兼容的 NVIDIA 驱动。下文的 vLLM 版本使用 CUDA 13，需要 NVIDIA 驱动 **580 或更高版本**。
 
 #### 使用 vLLM 替代 SGLang
 
 SGLang 和 vLLM 锁定了互不兼容的 `torch` / `torchao` 版本，因此它们位于独立的 pyproject 文件中。默认的
-`pyproject.toml` 使用 SGLang；若需使用 vLLM，请使用 `pyproject.vllm.toml`：
+`pyproject.toml` 使用 SGLang；若需使用 vLLM，请使用 `pyproject.vllm.toml`。它会安装 vLLM 0.33 及基于 CUDA
+13 （`+cu130`）构建的 torch 2.14，因此主机需要 NVIDIA 驱动 580 或更高版本：
 
 ```bash
 cp pyproject.vllm.toml pyproject.toml
@@ -111,8 +112,8 @@ Flash Attention v2 包含在 `--extra cuda` 中，但 PyPI 仅提供源码分发
 `uv sync` **之前**安装**预编译 wheel**。
 
 Flash Attention wheel 在编译时与特定 PyTorch 版本绑定。SGLang（默认 `pyproject.toml`）使用 **torch
-2.9**，vLLM（`pyproject.vllm.toml`）使用 **torch 2.10**，请选择对应的 wheel。将 `cpXYZ` 替换为您的 Python
-版本（3.11 对应 `cp311`，3.12 对应 `cp312`）。
+2.9**（CUDA 12），vLLM（`pyproject.vllm.toml`）使用 **torch 2.14**（CUDA 13），请选择对应的 wheel。将
+`cpXYZ` 替换为您的 Python 版本（3.11 对应 `cp311`，3.12 对应 `cp312`）。
 
 **SGLang**（默认，torch 2.9）：
 
@@ -125,15 +126,15 @@ uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/rele
 uv sync --extra cuda
 ```
 
-**vLLM**（torch 2.10，需要 `pyproject.vllm.toml`）：
+**vLLM**（torch 2.14，CUDA 13，需要 `pyproject.vllm.toml`）：
 
 ```bash
 cp pyproject.vllm.toml pyproject.toml
 cp uv.vllm.lock uv.lock
 # Python 3.12
-uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.10-cp312-cp312-linux_x86_64.whl"
+uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.10.0/flash_attn-2.8.3+cu130torch2.14-cp312-cp312-linux_x86_64.whl"
 # Python 3.11
-# uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.10-cp311-cp311-linux_x86_64.whl"
+# uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.10.0/flash_attn-2.8.3+cu130torch2.14-cp311-cp311-linux_x86_64.whl"
 
 uv sync --extra cuda
 ```

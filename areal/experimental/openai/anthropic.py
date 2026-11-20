@@ -9,13 +9,24 @@ from collections.abc import AsyncGenerator, Callable, Iterable
 from typing import Any
 
 from anthropic.types.message import Message
-from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (
-    AnthropicStreamWrapper,
-)
-from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
-    AnthropicAdapter,
-)
 from litellm.types.utils import ModelResponse as LitellmModelResponse
+
+try:
+    # litellm >= 1.10x (pulled in by vLLM >= 0.32 via mcp>=2) moved the
+    # Anthropic adapters out of experimental_pass_through.
+    from litellm.llms.anthropic.messages.adapters.streaming_iterator import (
+        AnthropicStreamWrapper,
+    )
+    from litellm.llms.anthropic.messages.adapters.transformation import (
+        AnthropicAdapter,
+    )
+except ImportError:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (
+        AnthropicStreamWrapper,
+    )
+    from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+        AnthropicAdapter,
+    )
 
 MessagePreprocessor = Callable[[list[dict[str, Any]]], list[dict[str, Any]]]
 

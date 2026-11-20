@@ -31,7 +31,8 @@ class DockerInstallationValidator(BaseInstallationValidator):
         "apex": ["apex.optimizers", "apex.normalization"],
         "transformer_engine": ["transformer_engine.pytorch"],
         "flash_attn_3": ["flash_attn_3"],
-        "vllm": ["vllm._C"],
+        # vLLM >= 0.32 no longer builds vllm._C; _C_stable_libtorch exists in 0.19.1+.
+        "vllm": ["vllm._C_stable_libtorch"],
         "sglang": ["sgl_kernel", "sgl_kernel.flash_attn"],
         "megatron-core": [
             "megatron.core.parallel_state",

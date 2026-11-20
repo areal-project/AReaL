@@ -2013,7 +2013,10 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
 
         usage = ResponseUsage(
             input_tokens=len(engine_resp.input_tokens),
-            input_tokens_details=InputTokensDetails(cached_tokens=0),
+            # cache_write_tokens is required from openai 2.5x; older SDKs keep it as an extra field.
+            input_tokens_details=InputTokensDetails(
+                cached_tokens=0, cache_write_tokens=0
+            ),
             output_tokens=len(engine_resp.output_tokens),
             output_tokens_details=OutputTokensDetails(
                 reasoning_tokens=reasoning_token_count

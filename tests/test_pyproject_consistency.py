@@ -54,3 +54,42 @@ def test_default_transformers_can_differ_but_qwen_group_must_match():
 
     b["dependency-groups"]["qwen-flash-next"] = ["transformers==5.3.0"]
     assert _Checker("sglang", "vllm").run(a, b) == 1
+
+
+def _torch_uv(cuda: str) -> dict:
+    index = f"pytorch-{cuda}"
+    return {
+        "tool": {
+            "uv": {
+                "index": [
+                    {
+                        "name": index,
+                        "url": f"https://download.pytorch.org/whl/{cuda}",
+                        "explicit": True,
+                    }
+                ],
+                "sources": {
+                    pkg: [{"index": index, "extra": "cuda"}]
+                    for pkg in ("torch", "torchaudio", "torchvision")
+                },
+            }
+        }
+    }
+
+
+def test_torch_index_can_differ_between_backends():
+    assert _Checker("sglang", "vllm").run(_torch_uv("cu129"), _torch_uv("cu130")) == 0
+
+
+def test_shared_index_must_match_even_when_torch_uses_it():
+    a, b = _torch_uv("cu129"), _torch_uv("cu130")
+    # A non-escapable package on the torch index makes that index shared.
+    a["tool"]["uv"]["sources"]["triton"] = [{"index": "pytorch-cu129"}]
+    b["tool"]["uv"]["sources"]["triton"] = [{"index": "pytorch-cu130"}]
+    assert _Checker("sglang", "vllm").run(a, b) == 1
+
+
+def test_non_torch_index_must_match():
+    a, b = _torch_uv("cu129"), _torch_uv("cu129")
+    b["tool"]["uv"]["index"].append({"name": "extra", "url": "https://example.invalid"})
+    assert _Checker("sglang", "vllm").run(a, b) == 1

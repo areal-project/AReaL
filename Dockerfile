@@ -1,18 +1,26 @@
 # Supports sglang and vllm variants via the VARIANT build argument.
-# VARIANT is declared early so each variant gets the correct torch version
-# and C++ extensions compiled against it.
+# VARIANT is declared early so each variant gets the correct base image, torch
+# version and C++ extensions compiled against it.
 #
 # Usage:
 #   docker build -t areal-runtime:dev-sglang .                          # default (sglang)
 #   docker build --build-arg VARIANT=vllm -t areal-runtime:dev-vllm .    # vllm variant
 
+# Inference backend selector: sglang (default) or vllm
+ARG VARIANT=sglang
+
+# Variant-specific base images. Same SGLang release, different CUDA toolkit:
+# vLLM >= 0.32 and its torch +cu130 build need CUDA 13 to run and to compile the
+# C++ extensions below. Only the stage selected by VARIANT is pulled.
+FROM lmsysorg/sglang:v0.5.10.post1-runtime AS base-sglang
+FROM lmsysorg/sglang:v0.5.10.post1-cu130-runtime AS base-vllm
+
 # ============================================================
 # BUILDER STAGE: compile C++ extensions and install all deps
 # ============================================================
-FROM lmsysorg/sglang:v0.5.10.post1-runtime AS builder
+FROM base-${VARIANT} AS builder
 
-# Inference backend selector: sglang (default) or vllm
-ARG VARIANT=sglang
+ARG VARIANT
 
 WORKDIR /
 
@@ -30,7 +38,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install pip and uv
-RUN pip install -U pip uv
+# --force-reinstall: the cu130 base ships the uv package without its CLI binary, and a
+# no-op "already satisfied" upgrade would leave `uv` missing.
+RUN pip install -U pip \
+    && pip install -U --force-reinstall uv \
+    && uv --version
 
 # Enable bytecode compilation
 ENV UV_COMPILE_BYTECODE=1
@@ -57,11 +69,11 @@ ENV CUDA_HOME=/usr/local/cuda
 ##############################################################
 
 # Create venv and install torch with CUDA support
-# Version is variant-specific: sglang pins 2.9.1, vllm pins 2.10.0
+# Version is variant-specific: sglang pins 2.9.1+cu129, vllm pins 2.14.0+cu130
 RUN uv venv $VIRTUAL_ENV \
-    && if [ "$VARIANT" = "vllm" ]; then TORCH_VER="2.10.0"; else TORCH_VER="2.9.1"; fi \
-    && uv pip install --index-url https://download.pytorch.org/whl/cu129 \
-    "torch==${TORCH_VER}+cu129" "torchaudio" "torchvision"
+    && if [ "$VARIANT" = "vllm" ]; then TORCH_VER="2.14.0"; CU="cu130"; else TORCH_VER="2.9.1"; CU="cu129"; fi \
+    && uv pip install --index-url "https://download.pytorch.org/whl/${CU}" \
+    "torch==${TORCH_VER}+${CU}" "torchaudio" "torchvision"
 
 RUN uv pip install "setuptools>=77.0.3,<80" pybind11 nvidia-mathdx wheel
 
@@ -72,13 +84,23 @@ RUN uv pip install "setuptools>=77.0.3,<80" pybind11 nvidia-mathdx wheel
 # pyproject.toml/uv.lock changes (C++ packages stay cached).
 ##############################################################
 
-# Install torch memory saver
-RUN TMS_CUDA_MAJOR=12 uv pip install --no-build-isolation --no-cache-dir --force-reinstall \
+# Install torch memory saver (CUDA major must match the variant's torch build)
+RUN if [ "$VARIANT" = "vllm" ]; then TMS_CUDA_MAJOR=13; else TMS_CUDA_MAJOR=12; fi \
+    && TMS_CUDA_MAJOR=$TMS_CUDA_MAJOR uv pip install --no-build-isolation --no-cache-dir --force-reinstall \
     git+https://github.com/fzyzcjy/torch_memory_saver.git
 
+# torch >= 2.14 (vllm variant) refuses to compile its headers below C++20, but
+# grouped_gemm, DeepGEMM and causal-conv1d hard-code -std=c++17 in setup.py, which
+# overrides torch's default. Those three steps bump the flag to -std=c++20 for the
+# vllm variant only; the sglang variant (torch 2.9) builds unchanged. DeepGEMM's
+# setup.py refuses a dirty git tree, so its edit is marked --assume-unchanged.
+
 # Install grouped_gemm (for MoE models)
-RUN uv pip install --no-build-isolation --no-cache-dir \
-    git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
+RUN git clone --depth 1 -b v1.1.4 --recurse-submodules --shallow-submodules \
+       https://github.com/fanshiqing/grouped_gemm /grouped_gemm \
+    && cd /grouped_gemm && if [ "$VARIANT" = "vllm" ]; then sed -i 's/-std=c++17/-std=c++20/g' setup.py; fi \
+    && uv pip install --no-build-isolation --no-cache-dir . \
+    && rm -rf /grouped_gemm
 
 # Install apex (NVIDIA apex for mixed precision training)
 RUN NVCC_APPEND_FLAGS="--threads 4" APEX_PARALLEL_BUILD=8 APEX_CPP_EXT=1 APEX_CUDA_EXT=1 \
@@ -86,8 +108,17 @@ RUN NVCC_APPEND_FLAGS="--threads 4" APEX_PARALLEL_BUILD=8 APEX_CPP_EXT=1 APEX_CU
     git+https://github.com/NVIDIA/apex.git
 
 # Install transformer engine (for FP8 training)
+# Pinned to the release in the current dev images. The moving `stable` branch (2.21)
+# needs nvidia-cudnn-frontend>=1.29 at build time and an NCCL newer than the base
+# images ship for its NCCL EP extension.
 RUN uv pip -v install --no-build-isolation --no-cache-dir \
-    git+https://github.com/NVIDIA/TransformerEngine.git@stable
+    git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1
+
+# CUDA 13 moved the CCCL headers (cuda/std/*, thrust, cub) to include/cccl. nvcc adds
+# that path itself, but host-compiled .cpp sources that include CUTLASS (FlashMLA,
+# DeepGEMM, DeepEP) need it on the g++ include path. No-op for CUDA 12, where the
+# directory does not exist.
+ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
 # FlashMLA (Multi-head Latent Attention for DeepSeek-V3)
 RUN git clone https://github.com/deepseek-ai/FlashMLA.git /flash-mla \
@@ -100,6 +131,8 @@ RUN git clone https://github.com/deepseek-ai/FlashMLA.git /flash-mla \
 RUN git clone https://github.com/deepseek-ai/DeepGEMM /DeepGEMM \
     && cd /DeepGEMM && git checkout d30fc36 \
     && git submodule update --init --recursive \
+    && if [ "$VARIANT" = "vllm" ]; then sed -i 's/-std=c++17/-std=c++20/g' setup.py \
+       && git update-index --assume-unchanged setup.py; fi \
     && uv pip install -v . --no-build-isolation --no-cache-dir \
     && rm -rf /DeepGEMM
 
@@ -113,17 +146,17 @@ RUN git clone https://github.com/deepseek-ai/DeepEP /DeepEP \
 
 # conv1d, required by Qwen-3.5
 RUN git clone https://github.com/Dao-AILab/causal-conv1d -b v1.6.0 /causal-conv1d \
-    && cd /causal-conv1d \
+    && cd /causal-conv1d && if [ "$VARIANT" = "vllm" ]; then sed -i 's/-std=c++17/-std=c++20/g' setup.py; fi \
     && uv pip install -v . --no-build-isolation --no-cache-dir \
     && rm -rf /causal-conv1d
 
 # flash-attn 2: download pre-built wheel, strip local version, repack & install
 RUN set -ex \
     && FA_VER="2.8.3" \
-    && FA_RELEASE="v0.7.16" \
-    && if [ "$VARIANT" = "vllm" ]; then TORCH_TAG="torch2.10"; else TORCH_TAG="torch2.9"; fi \
+    && if [ "$VARIANT" = "vllm" ]; then FA_RELEASE="v0.10.0"; CU_TAG="cu130"; TORCH_TAG="torch2.14"; \
+       else FA_RELEASE="v0.7.16"; CU_TAG="cu128"; TORCH_TAG="torch2.9"; fi \
     && PY_TAG=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')") \
-    && LOCAL="+cu128${TORCH_TAG}" \
+    && LOCAL="+${CU_TAG}${TORCH_TAG}" \
     && WHL="flash_attn-${FA_VER}${LOCAL}-${PY_TAG}-${PY_TAG}-linux_x86_64.whl" \
     && URL="https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/${FA_RELEASE}/${WHL}" \
     && WORK="/tmp/flash-attn-repack" \
@@ -141,10 +174,10 @@ RUN set -ex \
 # flash-attn-3: install pre-built wheel (C extension only) + Python interface from source
 RUN set -ex \
     && FA3_VER="3.0.0" \
-    && FA3_RELEASE="v0.8.2" \
     && FA3_SRC_TAG="v2.8.3" \
-    && if [ "$VARIANT" = "vllm" ]; then TORCH_TAG="torch2.10"; else TORCH_TAG="torch2.9"; fi \
-    && LOCAL="+cu128${TORCH_TAG}gite2743ab" \
+    && if [ "$VARIANT" = "vllm" ]; then FA3_RELEASE="v0.10.0"; CU_TAG="cu130"; TORCH_TAG="torch2.14"; \
+       else FA3_RELEASE="v0.8.2"; CU_TAG="cu128"; TORCH_TAG="torch2.9"; fi \
+    && LOCAL="+${CU_TAG}${TORCH_TAG}gite2743ab" \
     && WHL="flash_attn_3-${FA3_VER}${LOCAL}-cp39-abi3-linux_x86_64.whl" \
     && URL="https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/${FA3_RELEASE}/${WHL}" \
     && curl -fSL --retry 3 -o "/tmp/${WHL}" "$URL" \
@@ -186,9 +219,9 @@ RUN uv pip install --no-cache-dir -U setuptools nvidia-ml-py
 # RUNTIME STAGE: lean final image (no build tools, no source
 # checkouts, no intermediate compilation artifacts)
 # ============================================================
-FROM lmsysorg/sglang:v0.5.10.post1-runtime
+FROM base-${VARIANT}
 
-ARG VARIANT=sglang
+ARG VARIANT
 
 WORKDIR /
 
@@ -224,7 +257,9 @@ RUN apt-get --purge remove -y --allow-change-held-packages libcudnn9* \
     && rm -rf /var/lib/apt/lists/*
 
 # Install pip and uv (needed for editable install and nanobot-ai)
-RUN pip install --no-cache-dir -U pip uv
+RUN pip install --no-cache-dir -U pip \
+    && pip install --no-cache-dir -U --force-reinstall uv \
+    && uv --version
 
 WORKDIR /AReaL
 
