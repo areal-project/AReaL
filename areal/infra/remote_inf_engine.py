@@ -1656,6 +1656,14 @@ class RemoteInfEngine(InferenceEngine):
         # Keep tensors inside plain containers for RPC RTensor.remotize.
         return {"trajectory": result.trajectory, "metrics": result.metrics}
 
+    def discard_rollout_result(self, task_id: int) -> None:
+        """Drop a rollout result that the controller will never fetch.
+
+        Called after the controller times out or fails waiting for a task, so
+        the trajectory does not stay on this worker until it exits.
+        """
+        self.workflow_executor.dispatcher.discard_task(task_id)
+
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | None:
