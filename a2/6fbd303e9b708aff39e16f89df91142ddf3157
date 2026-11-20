@@ -1,0 +1,124 @@
+areal/api/cli_args.py
+  h_06d481e665ee92 927-950,2694-2699,2837-2841,2871-2872
+areal/engine/awex/adapters/megatron_adapter.py
+  h_06d481e665ee92 205-216,252-253
+areal/engine/awex/adapters/sglang_adapter.py
+  h_06d481e665ee92 182-202,336,583-589,600-610,627-647,748,750-751,754-788,800-802,809-811,878-879,897-903,1001-1002,1019,1249,1278-1279,1292,1296-1305,1314-1321,1489-1490,1511
+areal/engine/awex/frozen_draft.py
+  h_06d481e665ee92 1-79
+areal/engine/awex/plugins/sglang_plugin.py
+  h_06d481e665ee92 38,356-360,386,395-405,416-420
+areal/engine/awex/qwen3_5_fp8.py
+  h_06d481e665ee92 1-502
+areal/engine/flashinfer_radix_patch.py
+  h_06d481e665ee92 1-139
+areal/engine/flashinfer_radix_reset.json
+  h_06d481e665ee92 1-130
+areal/engine/megatron_engine.py
+  h_06d481e665ee92 2858,2867,2869-2889
+areal/engine/megatron_utils/qwen3_5_fp8.py
+  h_06d481e665ee92 1-47
+areal/engine/sglang_remote.py
+  h_06d481e665ee92 3,111-135
+areal/experimental/openai/client.py
+  h_06d481e665ee92 212-213,228,239-240,242-245,247-249,251-252,958
+areal/experimental/openai/finalization.py
+  h_06d481e665ee92 6,14,35-56
+areal/experimental/openai/proxy/client_session.py
+  h_06d481e665ee92 38,171,202-204,232-233
+areal/experimental/openai/proxy/proxy_rollout_server.py
+  h_06d481e665ee92 1630-1636
+areal/experimental/openai/proxy/server.py
+  h_06d481e665ee92 16-20,117,248,250-254,262
+areal/experimental/openai/proxy/workflow.py
+  h_06d481e665ee92 718-725
+areal/infra/remote_inf_engine.py
+  h_06d481e665ee92 46-50,64,1235-1252
+areal/infra/rpc/guard/engine_blueprint.py
+  h_06d481e665ee92 35,44-46,539-543,545,552
+areal/infra/rpc/node_shared_vision.py
+  h_06d481e665ee92 1-275
+areal/infra/rpc/rtensor.py
+  h_06d481e665ee92 484-497,500,506
+areal/infra/rpc/serialization.py
+  h_06d481e665ee92 104-107,209-211
+areal/models/mcore/registry.py
+  h_06d481e665ee92 467-476
+areal/models/mcore/vocab_parallel_head.py
+  h_06d481e665ee92 124-140,218-221,320
+areal/tools/prepare_qwen35_fp8.py
+  h_06d481e665ee92 1-108
+areal/utils/logging.py
+  h_06d481e665ee92 147
+areal/utils/qwen_vl_image.py
+  h_06d481e665ee92 3,6-10,17,75,97-99,102-109,113,117,119-122,138,143,145-147,149,152,158,165-179,182,185,190,194,196,198-199
+areal/v2/inference_service/router/client.py
+  h_06d481e665ee92 20,23-24,50-53,98,100,118,120-128,135-151,321-327,330-331
+docs/en/best_practices/cpu_vision_memory.md
+  h_06d481e665ee92 1-128
+docs/en/cli_reference.md
+  h_06d481e665ee92 649
+docs/en/reference/agent_workflow.md
+  h_06d481e665ee92 42-45,53-63
+docs/zh/cli_reference.md
+  h_06d481e665ee92 647
+docs/zh/reference/agent_workflow.md
+  h_06d481e665ee92 35-36,42-48
+examples/swe/README_arena.md
+  h_06d481e665ee92 525-539
+examples/swe/arena_agent.py
+  h_06d481e665ee92 38-41,599-602,1642-1656
+examples/swe/arena_client.py
+  h_06d481e665ee92 329-336,338,352-354
+examples/swe/rl/qwen38_27b/README.md
+  h_06d481e665ee92 9-12
+examples/swe/rl/qwen38_27b/train_fine_released64_bs16.yaml
+  h_06d481e665ee92 38
+tests/benchmarks/vision_memory.py
+  h_06d481e665ee92 1-324
+tests/experimental/openai/test_arena_episode_reward.py
+  h_06d481e665ee92 8-9,85,87,93,122-126,607-610,624-628,635-771
+tests/experimental/openai/test_image_alignment.py
+  h_06d481e665ee92 62,64,66-67,114-117,121-123,219-220,271-272,274-277,284-289,328,349-393
+tests/test_awex_frozen_draft.py
+  h_06d481e665ee92 1-79
+tests/test_awex_separation_delta.py
+  h_06d481e665ee92 342
+tests/test_awex_sglang_plugin.py
+  h_06d481e665ee92 4,7,352,361-404,847-898
+tests/test_flashinfer_radix_patch.py
+  h_06d481e665ee92 1-119
+tests/test_lazy_image_memory.py
+  h_06d481e665ee92 1-85
+tests/test_megatron_bridge_deterministic.py
+  h_06d481e665ee92 10,18-20,85,95,214-258
+tests/test_megatron_lm_head.py
+  h_06d481e665ee92 1044-1085
+tests/test_node_shared_vision.py
+  h_06d481e665ee92 1-314
+tests/test_qwen35_fp8.py
+  h_06d481e665ee92 1-323
+tests/test_qwen35_fp8_deepgemm.py
+  h_06d481e665ee92 1-363
+tests/test_qwen_vl_image_alignment.py
+  h_06d481e665ee92 95,112-113,128-156,198,219-225,233,239-241,243,245-246,254-264
+tests/test_rtensor.py
+  h_06d481e665ee92 950-983
+tests/test_serialization_memory.py
+  h_06d481e665ee92 1-105
+tests/test_swe_arena.py
+  h_06d481e665ee92 79-127
+tests/v2/inference_service/test_backend_router.py
+  h_06d481e665ee92 23-26,463-517,703-838
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a26fbd303e9b708aff39e16f89df91142ddf3157",
+  "prompts": {},
+  "humans": {
+    "h_06d481e665ee92": {
+      "author": "dingzhiqiang <982887058@qq.com>"
+    }
+  }
+}
