@@ -28,6 +28,37 @@ class Device:
             raise ValueError("Device.gpu must be a nonnegative integer")
 
 
+class RayDevicePool:
+    """Ordered physical devices. A Ray pool slot is an index into this sequence."""
+
+    def __init__(self, devices: tuple[Device, ...]):
+        self.devices = tuple(devices)
+        self.slots = {device: slot for slot, device in enumerate(self.devices)}
+        if (
+            not self.devices
+            or len(self.slots) != len(self.devices)
+            or not all(isinstance(device, Device) for device in self.devices)
+        ):
+            raise ValueError("Ray reconfiguration requires unique physical devices")
+
+    @classmethod
+    def for_scheduler(cls, scheduler: Any) -> RayDevicePool | None:
+        pool = getattr(scheduler, "reconfiguration_pool", None)
+        return pool if isinstance(pool, cls) else None
+
+    def local_gpu_ids(self, node: str, slots: list[int]) -> list[int]:
+        devices = [self.devices[slot] for slot in slots]
+        if any(device.node != node for device in devices):
+            raise ValueError("All GPUs of one SGLang replica must be on its Guard node")
+        return [device.gpu for device in devices]
+
+    def validate_replicas(self, slots: list[int], replica_size: int) -> None:
+        for start in range(0, len(slots), replica_size):
+            self.local_gpu_ids(
+                self.devices[slots[start]].node, slots[start : start + replica_size]
+            )
+
+
 @dataclass(frozen=True)
 class ExecutionLayout:
     """One role's parallel backend and ordered rank-to-device placement."""
@@ -61,10 +92,27 @@ class ExecutionLayout:
 
     def local_gpu_devices(self) -> list[int]:
         if {device.node for device in self.devices} != {gethostip()}:
-            raise ValueError(
-                "Reconfiguration currently requires local single-node pools"
-            )
+            raise ValueError("LocalScheduler requires target GPUs on the Trainer node")
         return [device.gpu for device in self.devices]
+
+    def gpu_slots(self, pool: RayDevicePool | None) -> list[int]:
+        if pool is None:
+            return self.local_gpu_devices()
+        if not all(device in pool.slots for device in self.devices):
+            raise ValueError("Target layout contains a device outside the Ray pool")
+        return [pool.slots[device] for device in self.devices]
+
+    @classmethod
+    def from_gpu_slots(
+        cls, backend: str, slots: list[int], pool: RayDevicePool | None
+    ) -> ExecutionLayout:
+        if pool is None:
+            return cls.local(backend, slots)
+        if any(
+            type(slot) is not int or not 0 <= slot < len(pool.devices) for slot in slots
+        ):
+            raise ValueError("GPU slots must belong to the Ray reconfiguration pool")
+        return cls(backend, tuple(pool.devices[slot] for slot in slots))
 
 
 async def _migrate(
@@ -152,21 +200,20 @@ def reconfigure(
 
     Omitted roles retain their layout. Enter synchronously after update/statistics
     and batch cleanup. Actor changes require a fresh shared-filesystem directory.
-    Current execution uses local single-node pools. Device identities also carry
-    a node IP for future multi-node placement.
+    Controllers use the same pool slots for ownership and device handoff.
     """
     with actor._reconfiguration_lock, actor._clear_batches_lock:
         actor._ensure_initialized()
         rollout = actor.rollout
-        node = gethostip()
+        pool = RayDevicePool.for_scheduler(actor.scheduler)
         old_actor = {
-            Device(node, device)
+            device
             for device, address in actor._worker_pool_devices.items()
             if address in actor._worker_addrs
         }
         old_rollout = (
             {
-                Device(node, device)
+                device
                 for devices in rollout._inference_gpu_devices.values()
                 for device in devices
             }
@@ -174,12 +221,12 @@ def reconfigure(
             else set()
         )
         actor_alloc = rollout_alloc = state = None
-        actor_devices = [device.gpu for device in old_actor]
-        rollout_devices = [device.gpu for device in old_rollout]
+        actor_devices = list(old_actor)
+        rollout_devices = list(old_rollout)
         if actor_layout is not None:
             if actor_layout.attention_dp_size is not None:
                 raise ValueError("Attention DP applies only to SGLang rollout layouts")
-            actor_devices = actor_layout.local_gpu_devices()
+            actor_devices = actor_layout.gpu_slots(pool)
             actor_alloc = actor._validate_engine_rebuild(
                 actor_layout.backend, actor_devices
             )
@@ -194,7 +241,7 @@ def reconfigure(
         if rollout_layout is not None:
             if rollout is None:
                 raise RuntimeError("Connect rollout before requesting its layout")
-            rollout_devices = rollout_layout.local_gpu_devices()
+            rollout_devices = rollout_layout.gpu_slots(pool)
             rollout_alloc = rollout.validate_reconfiguration(
                 rollout_layout.backend, rollout_devices
             )
@@ -210,12 +257,8 @@ def reconfigure(
                 raise ValueError("Attention DP must be positive and divide rollout TP")
         if actor_alloc is None and rollout_alloc is None:
             return
-        target_actor = (
-            set(actor_layout.devices) if actor_layout is not None else old_actor
-        )
-        target_rollout = (
-            set(rollout_layout.devices) if rollout_layout is not None else old_rollout
-        )
+        target_actor = set(actor_devices)
+        target_rollout = set(rollout_devices)
         if target_actor & target_rollout:
             raise ValueError("Target Actor and rollout devices must be disjoint")
         if actor._pending_clear_shards:

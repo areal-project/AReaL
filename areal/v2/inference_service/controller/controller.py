@@ -41,6 +41,7 @@ from areal.api.io_struct import LocalInfServerInfo
 from areal.utils import logging, stats_tracker
 from areal.utils.dynamic_import import bind_filter_kwargs
 from areal.utils.network import format_hostport
+from areal.v2.reconfiguration import RayDevicePool
 
 logger = logging.getLogger("RolloutControllerV2")
 
@@ -115,12 +116,13 @@ class RolloutControllerV2:
             )
         self.config = config
         self.scheduler = scheduler
+        self._ray_pool = RayDevicePool.for_scheduler(scheduler)
 
         if config.gpu_devices is not None:
             from areal.infra.scheduler.local import LocalScheduler
 
-            if not isinstance(scheduler, LocalScheduler):
-                raise ValueError("gpu_devices requires LocalScheduler")
+            if not isinstance(scheduler, LocalScheduler) and self._ray_pool is None:
+                raise ValueError("gpu_devices requires a local or Ray GPU pool")
             if config.api_url is not None:
                 raise ValueError("gpu_devices requires locally launched model servers")
 
@@ -132,8 +134,8 @@ class RolloutControllerV2:
             self.rollout_alloc = ModelAllocation.from_str(config.backend)
 
         # Multi-node: derive nnodes_per_instance from scheduler's n_gpus_per_node.
-        # External mode has no local inference servers, so always single-node.
-        if self.rollout_alloc is None:
+        # External servers and explicit Ray pools use one Guard per replica head.
+        if self.rollout_alloc is None or self._ray_pool is not None:
             nnodes_per_instance = 1
         else:
             total_gpus = (
@@ -384,7 +386,7 @@ class RolloutControllerV2:
         fixed_guard_pool = False
         guard_pool = kwargs.pop("guard_gpu_devices", None)
         if guard_pool is not None and (
-            not isinstance(self.scheduler, LocalScheduler)
+            (not isinstance(self.scheduler, LocalScheduler) and self._ray_pool is None)
             or self.external_mode
             or server_infos is not None
             or not isinstance(guard_pool, list)
@@ -399,9 +401,7 @@ class RolloutControllerV2:
             or not set(cfg.gpu_devices).issubset(guard_pool)
             or cfg.scheduling_spec[0].gpu <= 0
         ):
-            raise ValueError(
-                "guard_gpu_devices must contain the active local GPU slots"
-            )
+            raise ValueError("guard_gpu_devices must contain the active GPU slots")
 
         if self.external_mode:
             dp_size = 1
@@ -434,8 +434,9 @@ class RolloutControllerV2:
                 inf_spec.gpu = 0
             else:
                 fixed_guard_pool = (
-                    isinstance(self.scheduler, LocalScheduler) and inf_spec.gpu > 0
-                )
+                    isinstance(self.scheduler, LocalScheduler)
+                    or self._ray_pool is not None
+                ) and inf_spec.gpu > 0
                 if fixed_guard_pool:
                     total_workers = (
                         len(guard_pool)
@@ -878,6 +879,10 @@ class RolloutControllerV2:
                 if devices is not None:
                     from areal.infra.platforms import current_platform
 
+                    if self._ray_pool is not None:
+                        devices = self._ray_pool.local_gpu_ids(
+                            group_workers[node_rank].ip, devices
+                        )
                     fork_payload.setdefault("env", {})[
                         current_platform.device_control_env_var
                     ] = ",".join(str(device) for device in devices)
@@ -1761,7 +1766,7 @@ class RolloutControllerV2:
     def validate_reconfiguration(
         self, backend: str, gpu_devices: list[int]
     ) -> ModelAllocation:
-        """Resolve a target within the original locally allocated Guard pool."""
+        """Resolve a target within the original Guard pool."""
         from areal.api.alloc_mode import ModelAllocation
 
         self._ensure_initialized()
@@ -1787,6 +1792,10 @@ class RolloutControllerV2:
         ):
             raise ValueError(
                 "Target GPUs must match the layout and original Guard pool"
+            )
+        if self._ray_pool is not None:
+            self._ray_pool.validate_replicas(
+                gpu_devices, alloc.parallel.tp_size * alloc.parallel.pp_size
             )
         return alloc
 

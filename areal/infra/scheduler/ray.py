@@ -7,6 +7,7 @@ import os
 import shlex
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,7 @@ from areal.utils.network import (
     split_hostport,
 )
 from areal.utils.offload import get_tms_env_vars
+from areal.v2.reconfiguration import Device, RayDevicePool
 
 logger = logging.getLogger("RayScheduler")
 
@@ -410,6 +412,7 @@ class RayWorkerInfo:
     task_index: int
     launchers: list[ActorHandle] = field(default_factory=list)
     spec: SchedulingSpec | None = None
+    pool_slot: int | None = None
 
 
 def group_colocated_gpus(
@@ -585,6 +588,8 @@ class RayMultiNodeRolloutCoordinator:
 
 
 class RayScheduler(Scheduler):
+    _pool_owner: str | None = None
+
     def __init__(
         self,
         n_gpus_per_node: int = 8,
@@ -598,6 +603,7 @@ class RayScheduler(Scheduler):
         nfs_record_root: str = "/tmp/areal/name_resolve",
         etcd3_addr: str = "localhost:2379",
         exp_config: BaseExperimentConfig | None = None,
+        reconfiguration_devices: tuple[Device, ...] | None = None,
     ):
         initialize_ray()
 
@@ -653,6 +659,12 @@ class RayScheduler(Scheduler):
         self.startup_timeout = startup_timeout
         self.health_check_interval = health_check_interval
         self.exp_config = exp_config
+        self.reconfiguration_pool = (
+            RayDevicePool(reconfiguration_devices)
+            if reconfiguration_devices is not None
+            else None
+        )
+        self.gpu_devices = list(range(len(reconfiguration_devices or ())))
 
         # Internal state
         self._workers: dict[str, list[RayWorkerInfo]] = {}
@@ -677,6 +689,12 @@ class RayScheduler(Scheduler):
     @property
     def n_gpus_per_node(self) -> int:
         return self._n_gpus_per_node
+
+    def _get_colocated_gpus(self, role: str, worker_idx: int) -> list[int]:
+        slot = self._workers[role][worker_idx].pool_slot
+        if slot is None:
+            raise ValueError(f"{role}/{worker_idx} is outside the reconfiguration pool")
+        return [slot]
 
     def _log_path_of(self, role: str) -> str:
         log_path = (
@@ -1412,7 +1430,7 @@ class RayScheduler(Scheduler):
         return pg
 
     def _build_node_plan(
-        self, replicas: int, spec: SchedulingSpec
+        self, replicas: int, spec: SchedulingSpec, pool: RayDevicePool | None = None
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
         if spec.gpu <= 0:
             bundles = [
@@ -1461,9 +1479,15 @@ class RayScheduler(Scheduler):
         total_gpus = spec.gpu * replicas
         bundles = []
         plan = []
-        remaining_workers = replicas
-        while remaining_workers > 0:
-            workers_on_node = min(remaining_workers, self.n_gpus_per_node // spec.gpu)
+        per_node = self.n_gpus_per_node // spec.gpu
+        if pool is not None:
+            counts = list(Counter(device.node for device in pool.devices).items())
+        else:
+            counts = [
+                (None, min(per_node, replicas - start))
+                for start in range(0, replicas, per_node)
+            ]
+        for node, workers_on_node in counts:
             gpus_on_node = workers_on_node * spec.gpu
             bundle_index = len(bundles)
             bundles.append(
@@ -1473,6 +1497,8 @@ class RayScheduler(Scheduler):
                     "memory": spec.mem * workers_on_node * 1024**3,
                 }
             )
+            if node is not None:
+                bundles[-1][f"node:{node}"] = 0.001
             plan.append(
                 dict(
                     bundle_index=bundle_index,
@@ -1481,7 +1507,6 @@ class RayScheduler(Scheduler):
                     gpus_on_node=gpus_on_node,
                 )
             )
-            remaining_workers -= workers_on_node
 
         if (
             total_gpus >= self.n_gpus_per_node
@@ -1529,6 +1554,23 @@ class RayScheduler(Scheduler):
 
         # Prepare scheduling specs
         schedulings = self._prepare_worker_specs(role, num_workers, job.tasks)
+
+        pool = (
+            self.reconfiguration_pool if kwargs.get("gpu_devices") is not None else None
+        )
+        if pool is not None:
+            if (
+                kwargs["gpu_devices"] != self.gpu_devices
+                or num_workers != len(pool.devices)
+                or any(spec.gpu != 1 for spec in schedulings)
+            ):
+                raise ValueError(
+                    "Guard pools require one worker for every allocated GPU"
+                )
+            if self._pool_owner is not None:
+                return self._create_grouped_colocated_workers(
+                    role, self._pool_owner, schedulings, pool=pool
+                )
 
         strategy = job.scheduling_strategy
         strategy_type = SchedulingStrategyType(strategy.type)
@@ -1612,7 +1654,9 @@ class RayScheduler(Scheduler):
 
         launchers = []
         try:
-            bundles, plan, nodes_per_worker = self._build_node_plan(replicas, spec)
+            bundles, plan, nodes_per_worker = self._build_node_plan(
+                replicas, spec, pool
+            )
             pg = self._create_placement_group(role, bundles, self.startup_timeout)
             self._placement_groups[role] = pg
 
@@ -1652,6 +1696,16 @@ class RayScheduler(Scheduler):
                 ),
             )
             self._launchers[role] = [launcher for (_, launcher), _ in ordered]
+            if pool is not None:
+                assigned = [
+                    Device(info["host"], int(gpu))
+                    for info in node_infos
+                    for gpu in info["visible_devices"]
+                ]
+                if len(assigned) != replicas or set(assigned) != set(pool.devices):
+                    raise ValueError(
+                        "Ray launcher GPU assignments differ from the requested pool"
+                    )
 
             workers = []
             start_refs = []
@@ -1737,9 +1791,12 @@ class RayScheduler(Scheduler):
                         batch.append(
                             build_worker_spec(worker_idx, gpu_devices, worker_spec)
                         )
-                        workers.append(
-                            build_worker_info(worker_idx, [launcher], worker_spec)
-                        )
+                        worker = build_worker_info(worker_idx, [launcher], worker_spec)
+                        if pool is not None:
+                            worker.pool_slot = pool.slots[
+                                Device(info["host"], int(gpu_devices[0]))
+                            ]
+                        workers.append(worker)
                     if batch:
                         start_refs.append(launcher.start_workers.remote(batch))
 
@@ -1749,6 +1806,8 @@ class RayScheduler(Scheduler):
             )
 
             self._workers[role] = workers
+            if pool is not None:
+                self._pool_owner = role
             worker_ids = [worker_info.worker.id for worker_info in workers]
 
             logger.info(f"Created {replicas} workers for role '{role}' with Ray")
@@ -1775,6 +1834,8 @@ class RayScheduler(Scheduler):
         role: str,
         colocate_role: str,
         schedulings: list[SchedulingSpec],
+        *,
+        pool: RayDevicePool | None = None,
     ) -> list[str]:
         """Create multi-GPU workers colocated over the target role's GPUs.
 
@@ -1854,7 +1915,9 @@ class RayScheduler(Scheduler):
                         dict(
                             role=role,
                             worker_index=worker_idx,
-                            gpu_devices=list(info["visible_devices"]),
+                            gpu_devices=group["gpu_devices"]
+                            if pool is not None
+                            else list(info["visible_devices"]),
                             extra_env=extra_env,
                             cmd=worker_spec.cmd,
                             experiment_name=self.experiment_name,
@@ -1877,6 +1940,13 @@ class RayScheduler(Scheduler):
                             launchers=[launcher],
                             task_index=worker_idx,
                             spec=worker_spec,
+                            pool_slot=(
+                                pool.slots[
+                                    Device(info["host"], int(group["gpu_devices"][0]))
+                                ]
+                                if pool is not None
+                                else None
+                            ),
                         )
                     )
                     worker_idx += 1
@@ -2163,6 +2233,8 @@ class RayScheduler(Scheduler):
                 logger.warning(f"Failed to remove placement group for role {role}: {e}")
 
         # Clean up internal state
+        if role == self._pool_owner:
+            self._pool_owner = None
         del self._workers[role]
         self._launchers.pop(role, None)
         self._placement_groups.pop(role, None)

@@ -211,6 +211,11 @@ class PPOTrainer:
         *,
         reconfiguration_devices: Sequence[Device] | None = None,
     ):
+        """With a Ray pool, actor/rollout gpu_devices index reconfiguration_devices.
+
+        LocalScheduler accepts node-local GPU IDs. Layout requests on either
+        scheduler identify each GPU by its worker node IP and local ID.
+        """
         self._reconfiguration_devices = (
             tuple(reconfiguration_devices)
             if reconfiguration_devices is not None
@@ -1431,11 +1436,12 @@ class PPOTrainer:
         if devices is None:
             return None
         from areal.utils.network import gethostip
-        from areal.v2.reconfiguration import Device, ExecutionLayout
+        from areal.v2.reconfiguration import Device, ExecutionLayout, RayDevicePool
 
         config = self.config
+        ray_pool = RayDevicePool.for_scheduler(self.scheduler)
         if (
-            not isinstance(self.scheduler, LocalScheduler)
+            (not isinstance(self.scheduler, LocalScheduler) and ray_pool is None)
             or config.actor._version != "v2"
             or config.rollout._version != "v2"
             or self.actor_alloc.backend != "megatron"
@@ -1443,7 +1449,7 @@ class PPOTrainer:
             or config.actor.use_lora
         ):
             raise ValueError(
-                "Trainer reconfiguration requires local v2 Megatron/SGLang full-model training"
+                "Trainer reconfiguration requires a local or Ray GPU pool and v2 Megatron/SGLang full-model training"
             )
         if (
             self.critic is not None
@@ -1460,10 +1466,14 @@ class PPOTrainer:
             not devices
             or any(not isinstance(device, Device) for device in devices)
             or len(set(devices)) != len(devices)
-            or {device.node for device in devices} != {gethostip()}
         ):
-            raise ValueError("reconfiguration_devices must identify unique local GPUs")
-        pool = [device.gpu for device in devices]
+            raise ValueError("reconfiguration_devices must identify unique GPUs")
+        if ray_pool is None:
+            if {device.node for device in devices} != {gethostip()}:
+                raise ValueError("LocalScheduler requires devices on the Trainer node")
+            pool = [device.gpu for device in devices]
+        else:
+            pool = [ray_pool.slots[device] for device in devices]
         if not set(pool).issubset(self.scheduler.gpu_devices):
             raise ValueError(
                 "Reconfiguration pool must belong to the allocated scheduler devices"
@@ -1472,7 +1482,9 @@ class PPOTrainer:
             (config.actor, self.actor_alloc),
             (config.rollout, self.rollout_alloc),
         ):
-            active = ExecutionLayout.local(engine.backend, engine.gpu_devices or [])
+            active = ExecutionLayout.from_gpu_slots(
+                engine.backend, engine.gpu_devices or [], ray_pool
+            )
             if len(active.devices) != alloc.parallel.world_size or not set(
                 active.devices
             ).issubset(devices):
@@ -1481,6 +1493,11 @@ class PPOTrainer:
                 )
         if set(config.actor.gpu_devices) & set(config.rollout.gpu_devices):
             raise ValueError("Initial Actor and rollout devices must be disjoint")
+        if ray_pool is not None:
+            parallel = self.rollout_alloc.parallel
+            ray_pool.validate_replicas(
+                config.rollout.gpu_devices, parallel.tp_size * parallel.pp_size
+            )
         return pool
 
     def request_reconfiguration(
@@ -1663,7 +1680,10 @@ class PPOTrainer:
         if cfg.type == "local":
             return LocalScheduler(exp_config=self.config)
         elif cfg.type == "ray":
-            return RayScheduler(exp_config=self.config)
+            return RayScheduler(
+                exp_config=self.config,
+                reconfiguration_devices=self._reconfiguration_devices,
+            )
         elif cfg.type == "slurm":
             return SlurmScheduler(exp_config=self.config)
         raise NotImplementedError(f"Unknown scheduler type: {cfg.type}")

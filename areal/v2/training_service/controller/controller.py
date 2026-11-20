@@ -20,6 +20,7 @@ from areal.infra.utils.concurrent import get_executor, run_async_task
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
 from areal.utils.network import format_hostport, gethostip
+from areal.v2.reconfiguration import RayDevicePool
 
 if TYPE_CHECKING:
     from areal.api import ParallelStrategy, TrainEngine
@@ -45,12 +46,13 @@ class GatewayTrainController:
 
         self.train_engine = train_engine
         self.scheduler = scheduler
+        self._ray_pool = RayDevicePool.for_scheduler(scheduler)
         self.config = config
         if config.gpu_devices is not None:
             from areal.infra.scheduler.local import LocalScheduler
 
-            if not isinstance(scheduler, LocalScheduler):
-                raise ValueError("gpu_devices requires LocalScheduler")
+            if not isinstance(scheduler, LocalScheduler) and self._ray_pool is None:
+                raise ValueError("gpu_devices requires a local or Ray GPU pool")
         self.train_alloc = ModelAllocation.from_str(config.backend)
         self.api_key: str | None = None
         self._gateway_addr: str = ""
@@ -191,8 +193,11 @@ class GatewayTrainController:
         if pool_devices is not None:
             from areal.infra.scheduler.local import LocalScheduler
 
-            if not isinstance(self.scheduler, LocalScheduler):
-                raise ValueError("worker_gpu_devices requires LocalScheduler")
+            if (
+                not isinstance(self.scheduler, LocalScheduler)
+                and self._ray_pool is None
+            ):
+                raise ValueError("worker_gpu_devices requires a local or Ray GPU pool")
             if not isinstance(pool_devices, list) or not pool_devices:
                 raise ValueError("worker_gpu_devices must be a non-empty GPU list")
             active = (
@@ -269,9 +274,6 @@ class GatewayTrainController:
             # ==============================================================
             # Step 1: Allocate master addr/port for NCCL rendezvous
             # ==============================================================
-            guard_addr_0 = f"http://{format_hostport(guard_workers[0].ip, int(guard_workers[0].worker_ports[0]))}"
-            master_addr = guard_workers[0].ip
-
             # Persist guard addresses so connect_engine() can allocate
             # ports later (e.g. for the weight-update NCCL group).
             def _guard_addr(worker: Worker) -> str:
@@ -280,16 +282,19 @@ class GatewayTrainController:
                 )
 
             self._guard_addrs = [_guard_addr(w) for w in guard_workers]
+            guard_addr_0 = self._guard_addrs[0]
+            master_guard = self._rendezvous_guard(cfg.gpu_devices)
 
             client = await self._get_async_client()
-            self._engine_rendezvous_owner = (guard_addr_0, f"{role}-engine", 0)
+            self._engine_rendezvous_owner = (master_guard, f"{role}-engine", 0)
             resp = await client.post(
-                f"{guard_addr_0}/alloc_ports",
+                f"{master_guard}/alloc_ports",
                 json={"count": 1, "role": f"{role}-engine", "worker_index": 0},
                 timeout=30.0,
             )
             resp.raise_for_status()
-            master_port = resp.json()["ports"][0]
+            rendezvous = resp.json()
+            master_addr, master_port = rendezvous["host"], rendezvous["ports"][0]
 
             # ==============================================================
             # Step 1.5: Set NCCL env on each guard so forked workers inherit it
@@ -332,7 +337,9 @@ class GatewayTrainController:
             self._worker_addrs = list(self._worker_pool_addrs)
             from areal.infra.scheduler.local import LocalScheduler
 
-            if isinstance(self.scheduler, LocalScheduler) and guard_spec.gpu == 1:
+            if (
+                isinstance(self.scheduler, LocalScheduler) or self._ray_pool is not None
+            ) and guard_spec.gpu == 1:
                 self._worker_pool_devices = {
                     device: self._worker_pool_addrs[index]
                     for index in range(pool_size)
@@ -1297,7 +1304,9 @@ class GatewayTrainController:
 
         reconfigure(
             self,
-            actor_layout=ExecutionLayout.local(backend, gpu_devices),
+            actor_layout=ExecutionLayout.from_gpu_slots(
+                backend, gpu_devices, self._ray_pool
+            ),
             state_path=state_path,
         )
 
@@ -1335,6 +1344,18 @@ class GatewayTrainController:
 
         await asyncio.gather(*(prefetch(address) for address in workers.values()))
 
+    def _rendezvous_guard(self, gpu_devices: list[int] | None) -> str:
+        if self._ray_pool is None:
+            return self._guard_addrs[0]
+        assert gpu_devices
+        role = f"{self._role}{self._GUARD_SUFFIX}"
+        for index, guard in enumerate(self._guard_addrs):
+            if self.scheduler._get_colocated_gpus(role, index) == [gpu_devices[0]]:
+                return guard
+        raise ValueError(
+            f"No rendezvous Guard owns Actor rank 0 (slot {gpu_devices[0]})"
+        )
+
     async def _async_release_engine_rendezvous(self) -> None:
         if self._engine_rendezvous_owner is not None:
             guard, role, index = self._engine_rendezvous_owner
@@ -1368,7 +1389,7 @@ class GatewayTrainController:
 
     async def _async_create_engines(self, alloc: Any, gpu_devices: list[int]) -> None:
         client = await self._get_async_client()
-        guard = self._guard_addrs[0]
+        guard = self._rendezvous_guard(gpu_devices)
         owner = (guard, f"{self._role}-engine", 0)
         self._engine_rendezvous_owner = owner
         response = await client.post(
@@ -1544,7 +1565,12 @@ class GatewayTrainController:
         """Apply a rollout layout through the unified idle-boundary coordinator."""
         from areal.v2.reconfiguration import ExecutionLayout, reconfigure
 
-        reconfigure(self, rollout_layout=ExecutionLayout.local(backend, gpu_devices))
+        reconfigure(
+            self,
+            rollout_layout=ExecutionLayout.from_gpu_slots(
+                backend, gpu_devices, self._ray_pool
+            ),
+        )
 
     def update_weights(self, meta: Any, *, resume_generation: bool = True) -> None:
         if self._weight_update_ctrl is None or self.rollout is None:
