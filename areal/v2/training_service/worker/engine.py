@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import traceback
 from collections.abc import Callable
 from typing import Any
+
+import torch
 
 from areal.api import TrainEngine
 from areal.infra.rpc.rtensor import RTensor
@@ -21,13 +24,14 @@ def create_engine_module(
     flask_module: Any,
     config: Any,
     get_engine: Callable[[], TrainEngine | None],
-    set_engine: Callable[[TrainEngine], None],
+    set_engine: Callable[[TrainEngine | None], None],
     submit_to_engine_thread: Callable[..., Any],
     parse_args_kwargs: Callable[[dict[str, Any] | None], tuple[Any, Any]],
     require_engine: Callable[[], TrainEngine],
     run_endpoint: Callable[[str, Callable[[], Any]], Any],
     execute_compute: Callable[..., Any],
     get_node_addr: Callable[[], str],
+    before_destroy: Callable[[], None] | None = None,
 ) -> Any:
     Blueprint = flask_module.Blueprint
     jsonify = flask_module.jsonify
@@ -68,8 +72,6 @@ def create_engine_module(
                 return jsonify(
                     {"error": "Missing 'engine_class' field in request"}
                 ), 400
-            if get_engine() is not None:
-                return jsonify({"error": "Engine already exists on this worker"}), 400
 
             try:
                 engine_class = import_from_string(engine_class_path)
@@ -93,10 +95,11 @@ def create_engine_module(
                 return jsonify({"error": str(e)}), 400
 
             def create_in_engine_thread():
-                return engine_class(*init_args, **init_kwargs)
+                if get_engine() is not None:
+                    raise RuntimeError("Engine already exists on this worker")
+                set_engine(engine_class(*init_args, **init_kwargs))
 
-            engine = submit_to_engine_thread("create_engine", create_in_engine_thread)
-            set_engine(engine)
+            submit_to_engine_thread("create_engine", create_in_engine_thread)
             return jsonify(
                 {
                     "status": "success",
@@ -104,11 +107,63 @@ def create_engine_module(
                     "result": None,
                 }
             )
+        except RuntimeError as e:
+            return jsonify({"error": str(e)}), 400
         except Exception as e:
             logger.error(
                 f"Unexpected error in create_engine: {e}\n{traceback.format_exc()}"
             )
             return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
+    @bp.post("/prefetch_model_state")
+    def prefetch_model_state():
+        if request.headers.get("Authorization") != f"Bearer {config.admin_api_key}":
+            return jsonify({"error": "Invalid admin API key"}), 403
+        from areal.engine.megatron_utils import state_transfer
+
+        data = request.get_json()
+        # CPU I/O runs on the request thread while the Engine thread is rebuilt.
+        return run_endpoint(
+            "prefetch_model_state",
+            lambda: state_transfer.prefetch_model_state(data["path"], data["version"]),
+        )
+
+    @bp.route("/configure_runtime", methods=["POST"])
+    def configure_runtime():
+        """Assign a logical rank to an idle, single-GPU persistent worker."""
+        if request.headers.get("Authorization") != f"Bearer {config.admin_api_key}":
+            return jsonify({"error": "Invalid admin API key"}), 403
+        data = request.get_json(silent=True) or {}
+
+        def action():
+            if get_engine() is not None:
+                raise RuntimeError("Destroy the Engine before changing its rank")
+            rank, world_size = data.get("rank"), data.get("world_size")
+            address, port = data.get("master_addr"), data.get("master_port")
+            if (
+                type(rank) is not int
+                or type(world_size) is not int
+                or not 0 <= rank < world_size
+                or not isinstance(address, str)
+                or not address
+                or type(port) is not int
+                or not 0 < port < 65536
+            ):
+                raise ValueError(
+                    "Valid rank, world_size and rendezvous address are required"
+                )
+            os.environ.update(
+                RANK=str(rank),
+                WORLD_SIZE=str(world_size),
+                LOCAL_RANK="0",
+                MASTER_ADDR=address,
+                MASTER_PORT=str(port),
+            )
+
+        return run_endpoint(
+            "configure_runtime",
+            lambda: submit_to_engine_thread("configure_runtime", action),
+        )
 
     @bp.route("/configure", methods=["POST"])
     def configure():
@@ -129,18 +184,24 @@ def create_engine_module(
 
     @bp.route("/topology", methods=["GET"])
     def topology():
-        try:
+        def action():
             engine = require_engine()
-            return jsonify(
-                {
-                    "rank": int(os.environ.get("RANK", 0)),
-                    "world_size": int(os.environ.get("WORLD_SIZE", 1)),
-                    "dp_rank": engine.data_parallel_rank,
-                    "dp_size": engine.data_parallel_world_size,
-                    "is_dp_head": engine.is_data_parallel_head(),
-                    "local_rank": int(os.environ.get("LOCAL_RANK", 0)),
-                }
-            )
+            parallel = getattr(engine, "parallel_strategy", None)
+            return {
+                "rank": int(os.environ.get("RANK", 0)),
+                "world_size": int(os.environ.get("WORLD_SIZE", 1)),
+                "dp_rank": engine.data_parallel_rank,
+                "dp_size": engine.data_parallel_world_size,
+                "is_dp_head": engine.is_data_parallel_head(),
+                "local_rank": int(os.environ.get("LOCAL_RANK", 0)),
+                "tp_size": getattr(parallel, "tensor_parallel_size", 1),
+                "pp_size": getattr(parallel, "pipeline_parallel_size", 1),
+                "cp_size": getattr(parallel, "context_parallel_size", 1),
+                "ep_size": getattr(parallel, "expert_parallel_size", 1),
+            }
+
+        try:
+            return jsonify(submit_to_engine_thread("topology", action))
         except RuntimeError as e:
             return jsonify({"error": str(e)}), 400
         except Exception as e:
@@ -254,12 +315,19 @@ def create_engine_module(
         any process exits so that rank-0's TCPStore server outlives every
         other rank's HeartbeatMonitor thread.
         """
-        engine = get_engine()
-        if engine is None:
-            return jsonify({"status": "success", "message": "No engine to destroy"})
 
         def action():
+            engine = get_engine()
+            if engine is None:
+                return
+            if before_destroy is not None:
+                before_destroy()
             engine.destroy()
+            set_engine(None)
+            del engine
+            gc.collect()
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
 
         return run_endpoint(
             "destroy_engine",

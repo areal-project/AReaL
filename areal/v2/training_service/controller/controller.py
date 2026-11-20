@@ -8,8 +8,10 @@ import sys
 import threading
 import time
 import traceback
+from copy import deepcopy
 from threading import Lock
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import aiohttp
@@ -22,7 +24,7 @@ from areal.utils.network import format_hostport, gethostip
 if TYPE_CHECKING:
     from areal.api import ParallelStrategy, TrainEngine
     from areal.api.cli_args import TrainEngineConfig
-    from areal.api.io_struct import FinetuneSpec
+    from areal.api.io_struct import FinetuneSpec, WeightUpdateMeta
     from areal.api.scheduler_api import Scheduler, Worker
 
 logger = logging.getLogger("GatewayTrainController")
@@ -44,12 +46,23 @@ class GatewayTrainController:
         self.train_engine = train_engine
         self.scheduler = scheduler
         self.config = config
+        if config.gpu_devices is not None:
+            from areal.infra.scheduler.local import LocalScheduler
+
+            if not isinstance(scheduler, LocalScheduler):
+                raise ValueError("gpu_devices requires LocalScheduler")
         self.train_alloc = ModelAllocation.from_str(config.backend)
         self.api_key: str | None = None
         self._gateway_addr: str = ""
         self._router_addr: str = ""
         self._model_addr: str = ""
         self._worker_addrs: list[str] = []
+        self._worker_pool_addrs: list[str] = []
+        self._worker_pool_devices: dict[int, str] = {}
+        self._engine_initialize_kwargs: dict[str, Any] = {}
+        self._engine_rendezvous_owner: tuple[str, str, int] | None = None
+        self._training_held = False
+        self._engine_rebuild_ready = True
         self._guard_addrs: list[str] = []
         self._forked_services: list[tuple[str, str, int]] = []
         self._service_roles: list[str] = []
@@ -58,6 +71,11 @@ class GatewayTrainController:
         self._own_process_group = False
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
+        self._weight_update_meta: WeightUpdateMeta | None = None
+        self._weight_update_connected = False
+        self._weight_update_port_owner: tuple[str, str, int] | None = None
+        self._reconfiguration_lock = Lock()
+        self._reconfiguration_phase = "idle"
 
         # Version management
         self._version_lock = Lock()
@@ -168,6 +186,41 @@ class GatewayTrainController:
         cfg = self.config
 
         world_size = self.train_alloc.parallel.world_size
+        pool_devices = kwargs.pop("worker_gpu_devices", None)
+        pool_size = world_size
+        if pool_devices is not None:
+            from areal.infra.scheduler.local import LocalScheduler
+
+            if not isinstance(self.scheduler, LocalScheduler):
+                raise ValueError("worker_gpu_devices requires LocalScheduler")
+            if not isinstance(pool_devices, list) or not pool_devices:
+                raise ValueError("worker_gpu_devices must be a non-empty GPU list")
+            active = (
+                cfg.gpu_devices
+                if cfg.gpu_devices is not None
+                else pool_devices[:world_size]
+            )
+            if (
+                len(pool_devices) < world_size
+                or any(type(device) is not int for device in pool_devices)
+                or len(set(pool_devices)) != len(pool_devices)
+                or not set(pool_devices).issubset(self.scheduler.gpu_devices)
+                or len(active) != world_size
+                or not set(active).issubset(pool_devices)
+                or any(type(device) is not int for device in active)
+                or len(set(active)) != world_size
+                or len(cfg.scheduling_spec) != 1
+                or cfg.scheduling_spec[0].gpu != 1
+            ):
+                raise ValueError(
+                    "Worker GPU pool must contain the active single-GPU slots"
+                )
+            pool_size = len(pool_devices)
+            cfg.gpu_devices = list(active)
+        self._engine_initialize_kwargs = {
+            "addr": kwargs.get("addr"),
+            "ft_spec": ft_spec,
+        }
 
         try:
             # ==============================================================
@@ -187,12 +240,19 @@ class GatewayTrainController:
 
             guard_role = f"{role}{self._GUARD_SUFFIX}"
             guard_job = Job(
-                replicas=world_size,
+                replicas=pool_size,
                 tasks=[guard_spec],
                 scheduling_strategy=cfg.scheduling_strategy,
                 role=guard_role,
             )
-            await asyncio.to_thread(self.scheduler.create_workers, job=guard_job)
+            placement = {}
+            if pool_devices is not None:
+                placement["gpu_devices"] = pool_devices
+            elif cfg.gpu_devices is not None:
+                placement["gpu_devices"] = cfg.gpu_devices
+            await asyncio.to_thread(
+                self.scheduler.create_workers, job=guard_job, **placement
+            )
             self._service_roles.append(guard_role)
             guard_workers = await asyncio.to_thread(
                 self.scheduler.get_workers,
@@ -222,8 +282,11 @@ class GatewayTrainController:
             self._guard_addrs = [_guard_addr(w) for w in guard_workers]
 
             client = await self._get_async_client()
+            self._engine_rendezvous_owner = (guard_addr_0, f"{role}-engine", 0)
             resp = await client.post(
-                f"{guard_addr_0}/alloc_ports", json={"count": 1}, timeout=30.0
+                f"{guard_addr_0}/alloc_ports",
+                json={"count": 1, "role": f"{role}-engine", "worker_index": 0},
+                timeout=30.0,
             )
             resp.raise_for_status()
             master_port = resp.json()["ports"][0]
@@ -263,65 +326,31 @@ class GatewayTrainController:
                 )
                 return f"http://{format_hostport(host, port)}"
 
-            self._worker_addrs = list(
-                await asyncio.gather(
-                    *[_fork_worker(rank) for rank in range(world_size)]
-                )
+            self._worker_pool_addrs = list(
+                await asyncio.gather(*[_fork_worker(rank) for rank in range(pool_size)])
             )
+            self._worker_addrs = list(self._worker_pool_addrs)
+            from areal.infra.scheduler.local import LocalScheduler
+
+            if isinstance(self.scheduler, LocalScheduler) and guard_spec.gpu == 1:
+                self._worker_pool_devices = {
+                    device: self._worker_pool_addrs[index]
+                    for index in range(pool_size)
+                    for device in self.scheduler._get_colocated_gpus(guard_role, index)
+                }
+            if pool_devices is not None:
+                self._worker_addrs = [
+                    self._worker_pool_devices[device] for device in cfg.gpu_devices
+                ]
+                await self._async_configure_worker_ranks(
+                    self._worker_addrs, master_addr, master_port
+                )
             logger.info("Workers: %s", self._worker_addrs)
 
             # ==============================================================
             # Step 3: Create engines on all workers (coordinated NCCL init)
             # ==============================================================
-            if isinstance(self.train_engine, str):
-                engine_class = self.train_engine
-            else:
-                engine_class = (
-                    f"{self.train_engine.__module__}.{self.train_engine.__name__}"
-                )
-            await asyncio.gather(
-                *[
-                    self._create_engine_on_worker(
-                        worker_addr=addr,
-                        engine_class=engine_class,
-                        init_args=[],
-                        init_kwargs={"config": self.config},
-                    )
-                    for addr in self._worker_addrs
-                ]
-            )
-            logger.info("Engines created on all workers")
-
-            pg_kwargs = {"parallel_strategy": self._parallel_strategy}
-            await asyncio.gather(
-                *[
-                    self._call_worker_engine_endpoint(
-                        addr,
-                        "/create_process_group",
-                        args=[],
-                        kwargs=pg_kwargs,
-                        timeout=self.config.setup_timeout,
-                    )
-                    for addr in self._worker_addrs
-                ]
-            )
-
-            await asyncio.gather(
-                *[
-                    self._call_worker_engine_endpoint(
-                        addr,
-                        "/initialize",
-                        args=[],
-                        kwargs={
-                            "addr": kwargs.get("addr"),
-                            "ft_spec": ft_spec,
-                        },
-                        timeout=self.config.setup_timeout,
-                    )
-                    for addr in self._worker_addrs
-                ]
-            )
-            logger.info("Engines initialized on all workers")
+            await self._async_initialize_engines(self.train_alloc, self.config)
 
             if self._shutdown_requested.is_set():
                 return
@@ -420,6 +449,79 @@ class GatewayTrainController:
             raise
 
     # -- Engine creation ---------------------------------------------------
+
+    async def _async_configure_worker_ranks(
+        self, addresses: list[str], master_addr: str, master_port: int
+    ) -> None:
+        client = await self._get_async_client()
+
+        async def configure(rank: int, address: str) -> None:
+            response = await client.post(
+                f"{address}/configure_runtime",
+                json={
+                    "rank": rank,
+                    "world_size": len(addresses),
+                    "master_addr": master_addr,
+                    "master_port": master_port,
+                },
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
+            response.raise_for_status()
+
+        await asyncio.gather(
+            *(configure(rank, address) for rank, address in enumerate(addresses))
+        )
+
+    async def _async_initialize_engines(self, alloc: Any, config: Any) -> None:
+        if isinstance(self.train_engine, str):
+            engine_class = self.train_engine
+        else:
+            engine_class = (
+                f"{self.train_engine.__module__}.{self.train_engine.__name__}"
+            )
+        await asyncio.gather(
+            *[
+                self._create_engine_on_worker(
+                    worker_addr=addr,
+                    engine_class=engine_class,
+                    init_args=[],
+                    init_kwargs={"config": config},
+                )
+                for addr in self._worker_addrs
+            ]
+        )
+        logger.info("Engines created on all workers")
+
+        pg_kwargs = {"parallel_strategy": alloc.parallel}
+        await asyncio.gather(
+            *[
+                self._call_worker_engine_endpoint(
+                    addr,
+                    "/create_process_group",
+                    args=[],
+                    kwargs=pg_kwargs,
+                    timeout=self.config.setup_timeout,
+                )
+                for addr in self._worker_addrs
+            ]
+        )
+
+        await asyncio.gather(
+            *[
+                self._call_worker_engine_endpoint(
+                    addr,
+                    "/initialize",
+                    args=[],
+                    kwargs={
+                        "addr": self._engine_initialize_kwargs.get("addr"),
+                        "ft_spec": self._engine_initialize_kwargs["ft_spec"],
+                    },
+                    timeout=self.config.setup_timeout,
+                )
+                for addr in self._worker_addrs
+            ]
+        )
+        logger.info("Engines initialized on all workers")
 
     async def _async_set_guards_env(
         self,
@@ -675,10 +777,34 @@ class GatewayTrainController:
 
     # -- Gateway HTTP helpers (duck-type TrainController interface) ---------
 
+    async def _async_held_state_post(self, path: str, payload: Any) -> Any:
+        """Restore state through active worker endpoints while compute stays held."""
+        if not self._engine_rebuild_ready or not self._worker_addrs:
+            raise RuntimeError("Complete Engine initialization before accessing state")
+        client = await self._get_async_client()
+        responses = await asyncio.gather(
+            *(
+                client.post(
+                    f"{address}{path}",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+                )
+                for address in self._worker_addrs
+            ),
+            return_exceptions=True,
+        )
+        for response in responses:
+            if isinstance(response, BaseException):
+                raise response
+            response.raise_for_status()
+        return responses[0].json()
+
     def _gateway_post(self, path: str, payload: Any = None) -> Any:
         import requests
 
         self._ensure_initialized()
+        if self._training_held and path in {"/save", "/load", "/set_version"}:
+            return run_async_task(self._async_held_state_post, path, payload)
         url = f"{self._gateway_addr}{path}"
         resp = requests.post(
             url,
@@ -811,9 +937,6 @@ class GatewayTrainController:
     def set_version(self, version: int) -> None:
         from areal.infra.rpc.serialization import serialize_value
 
-        with self._version_lock:
-            self._version = version
-
         self._gateway_post(
             "/set_version",
             {
@@ -821,6 +944,8 @@ class GatewayTrainController:
                 "kwargs": serialize_value({}),
             },
         )
+        with self._version_lock:
+            self._version = version
 
     def get_version(self) -> int:
         with self._version_lock:
@@ -840,13 +965,28 @@ class GatewayTrainController:
     def load(self, meta: Any) -> None:
         from areal.infra.rpc.serialization import serialize_value
 
-        self._gateway_post(
-            "/load",
-            {
-                "args": serialize_value([meta]),
-                "kwargs": serialize_value({}),
-            },
-        )
+        payload = {
+            "args": serialize_value([meta]),
+            "kwargs": serialize_value({}),
+        }
+        if getattr(meta, "weight_format", None) == "raw":
+            self.hold_training()
+            try:
+                receipt = self._gateway_post_result("/load", payload)
+                if (
+                    not isinstance(receipt, dict)
+                    or type(receipt.get("version")) is not int
+                    or receipt["version"] < 0
+                ):
+                    raise RuntimeError("Raw state load returned no restored version")
+                with self._version_lock:
+                    self._version = receipt["version"]
+            except BaseException:
+                self._engine_rebuild_ready = False
+                raise
+            self._engine_rebuild_ready = True
+        else:
+            self._gateway_post("/load", payload)
 
     def offload(self) -> None:
         self._gateway_post("/offload")
@@ -1063,6 +1203,201 @@ class GatewayTrainController:
 
     # -- RL parity methods (connect_engine / update_weights / batch) --------
 
+    async def _async_training_control(
+        self, endpoint: str, payload: dict[str, Any]
+    ) -> None:
+        client = await self._get_async_client()
+        response = await client.post(
+            f"{self._model_addr}{endpoint}",
+            json=payload,
+            headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+        )
+        response.raise_for_status()
+
+    def hold_training(self) -> None:
+        """Hold new frontend calls and wait for current worker RPCs to finish."""
+        self._ensure_initialized()
+        if not self._model_addr:
+            raise RuntimeError("Initialize the training frontend before holding it")
+        self._training_held = True
+        run_async_task(self._async_training_control, "/hold_training", {})
+
+    def release_training(self) -> None:
+        """Release calls after state restoration and any required AWEX publication."""
+        self._ensure_initialized()
+        if not self._engine_rebuild_ready:
+            raise RuntimeError(
+                "Complete Engine initialization and topology binding first"
+            )
+        if self.rollout is not None and (
+            not self._weight_update_connected
+            or self.rollout.get_version() != self.get_version()
+        ):
+            raise RuntimeError(
+                "Reconnect and publish the matching rollout version first"
+            )
+        run_async_task(self._async_training_control, "/release_training", {})
+        self._training_held = False
+
+    def rebuild_engines(self, backend: str, gpu_devices: list[int]) -> None:
+        """Replace Engines in the fixed worker pool, returning held with fresh state."""
+        with self._reconfiguration_lock, self._clear_batches_lock:
+            alloc = self._validate_engine_rebuild(backend, gpu_devices)
+            self._rebuild_engines_locked(alloc, gpu_devices)
+
+    def _validate_engine_rebuild(self, backend: str, gpu_devices: list[int]):
+        from areal.api.alloc_mode import ModelAllocation
+
+        self._ensure_initialized()
+        alloc = ModelAllocation.from_str(backend)
+        if (
+            not self._worker_pool_devices
+            or self.train_alloc.backend != "megatron"
+            or alloc.backend != "megatron"
+        ):
+            raise ValueError(
+                "Engine rebuilding requires a local single-GPU Megatron worker pool"
+            )
+        if (
+            not isinstance(gpu_devices, list)
+            or len(gpu_devices) != alloc.parallel.world_size
+            or any(type(device) is not int for device in gpu_devices)
+            or len(set(gpu_devices)) != len(gpu_devices)
+            or not set(gpu_devices).issubset(self._worker_pool_devices)
+        ):
+            raise ValueError(
+                "Target GPUs must match the layout and original worker pool"
+            )
+        if self._pending_clear_shards:
+            raise RuntimeError(
+                "Finish pending batch storage cleanup before rebuilding Engines"
+            )
+        return alloc
+
+    def _rebuild_engines_locked(self, alloc: Any, gpu_devices: list[int]) -> None:
+        self.hold_training()
+        self._engine_rebuild_ready = False
+        try:
+            self._reconfiguration_phase = "disconnecting-actor"
+            self.disconnect_engine()
+            self._reconfiguration_phase = "rebuilding-engines"
+            run_async_task(self._async_rebuild_engines, alloc, list(gpu_devices))
+            self._reconfiguration_phase = "actor-held"
+        except BaseException:
+            logger.exception(
+                "Actor Engine rebuild failed during %s", self._reconfiguration_phase
+            )
+            raise
+
+    def reconfigure_actor(
+        self, backend: str, gpu_devices: list[int], state_path: str
+    ) -> None:
+        """Apply an Actor layout through the unified idle-boundary coordinator."""
+        from areal.v2.reconfiguration import ExecutionLayout, reconfigure
+
+        reconfigure(
+            self,
+            actor_layout=ExecutionLayout.local(backend, gpu_devices),
+            state_path=state_path,
+        )
+
+    async def _async_prefetch_model_state(
+        self, path: str, version: int, devices: list[int]
+    ) -> None:
+        workers = {}
+        for device in devices:
+            address = self._worker_pool_devices[device]
+            workers.setdefault(urlsplit(address).hostname, address)
+        client = await self._get_async_client()
+
+        async def prefetch(address: str) -> None:
+            start = time.monotonic()
+            try:
+                response = await client.post(
+                    f"{address}/prefetch_model_state",
+                    json={"path": path, "version": version},
+                    headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+                )
+                response.raise_for_status()
+                logger.info(
+                    "Prefetched Actor v%s on %s: %s model bytes in %.2fs",
+                    version,
+                    address,
+                    response.json()["result"],
+                    time.monotonic() - start,
+                )
+            except Exception:
+                logger.warning(
+                    "Model prefetch failed on %s; restoring normally",
+                    address,
+                    exc_info=True,
+                )
+
+        await asyncio.gather(*(prefetch(address) for address in workers.values()))
+
+    async def _async_release_engine_rendezvous(self) -> None:
+        if self._engine_rendezvous_owner is not None:
+            guard, role, index = self._engine_rendezvous_owner
+            client = await self._get_async_client()
+            response = await client.post(
+                f"{guard}/release_ports", json={"role": role, "worker_index": index}
+            )
+            response.raise_for_status()
+            self._engine_rendezvous_owner = None
+
+    async def _async_rebuild_engines(self, alloc: Any, gpu_devices: list[int]) -> None:
+        await self._async_release_engines()
+        await self._async_create_engines(alloc, gpu_devices)
+
+    async def _async_release_engines(self) -> None:
+        self._engine_rebuild_ready = False
+        client = await self._get_async_client()
+
+        async def destroy(address: str) -> None:
+            response = await client.post(f"{address}/destroy_engine", json={})
+            response.raise_for_status()
+
+        results = await asyncio.gather(
+            *(destroy(address) for address in self._worker_addrs),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        await self._async_release_engine_rendezvous()
+
+    async def _async_create_engines(self, alloc: Any, gpu_devices: list[int]) -> None:
+        client = await self._get_async_client()
+        guard = self._guard_addrs[0]
+        owner = (guard, f"{self._role}-engine", 0)
+        self._engine_rendezvous_owner = owner
+        response = await client.post(
+            f"{guard}/alloc_ports",
+            json={"count": 1, "role": owner[1], "worker_index": owner[2]},
+        )
+        response.raise_for_status()
+        rendezvous = response.json()
+        self._worker_addrs = [
+            self._worker_pool_devices[device] for device in gpu_devices
+        ]
+        await self._async_configure_worker_ranks(
+            self._worker_addrs, rendezvous["host"], rendezvous["ports"][0]
+        )
+        config = deepcopy(self.config)
+        config.backend, config.gpu_devices = str(alloc), gpu_devices
+        await self._async_initialize_engines(alloc, config)
+        await self._async_training_control(
+            "/configure_workers", {"worker_addrs": self._worker_addrs}
+        )
+        self.train_alloc, self._parallel_strategy, self.config = (
+            alloc,
+            alloc.parallel,
+            config,
+        )
+        with self._version_lock:
+            self._version = 0
+        self._engine_rebuild_ready = True
+
     def connect_engine(self, rollout: Any, meta: Any) -> None:
         self._ensure_initialized()
         import requests
@@ -1084,40 +1419,57 @@ class GatewayTrainController:
                 f"Ensure _version='v2' is set on InferenceEngineConfig."
             )
 
-        self.rollout = rollout
-
         if meta.type not in ("awex", "disk"):
             raise ValueError(
                 f"GatewayTrainController supports 'awex' or 'disk' weight "
                 f"updates, got '{meta.type}'"
             )
-
-        ctrl = WeightUpdateController(
-            WeightUpdateControllerConfig(
-                # Bind gateway to this node's outbound IP so cross-host
-                # train/inf workers can reach the kv_store_url the gateway
-                # publishes. Default "127.0.0.1" only works single-machine.
-                host=gethostip(),
-                admin_api_key=self.config.admin_api_key,
-                log_level=self.config.log_level,
-                request_timeout=self.config.request_timeout,
-                init_timeout_s=self.config.request_timeout,
-                update_timeout_s=self.config.request_timeout,
+        if self._weight_update_connected:
+            raise RuntimeError(
+                "Disconnect the current weight-transfer pair before reconnecting"
             )
-        )
-        ctrl.initialize()
+        self.rollout = rollout
+
+        ctrl = self._weight_update_ctrl
+        if ctrl is None:
+            ctrl = WeightUpdateController(
+                WeightUpdateControllerConfig(
+                    # Bind gateway to this node's outbound IP so cross-host
+                    # train/inf workers can reach the kv_store_url the gateway
+                    # publishes. Default "127.0.0.1" only works single-machine.
+                    host=gethostip(),
+                    admin_api_key=self.config.admin_api_key,
+                    log_level=self.config.log_level,
+                    request_timeout=self.config.request_timeout,
+                    init_timeout_s=self.config.request_timeout,
+                    update_timeout_s=self.config.request_timeout,
+                )
+            )
+            self._weight_update_ctrl = ctrl
+            try:
+                ctrl.initialize()
+            except BaseException:
+                ctrl.destroy()
+                self._weight_update_ctrl = None
+                raise
 
         inference_urls: list[str] = rollout.inference_worker_urls
+        if not inference_urls:
+            raise RuntimeError("No inference servers available for weight transfer")
         pair_name = f"{self._role}-rollout"
+        self._weight_update_meta = meta
+        self._weight_update_connected = True
 
         if meta.type == "awex":
             # NCCL rendezvous master must live on the rank-0 process's node.
             # awex assigns rank 0 to inference[0], so allocate on the inference
             # rank-0 guard rather than a train guard.
             inf_guard_addrs = rollout.inference_guard_addrs
+            owner_role = f"{pair_name}-awex"
+            self._weight_update_port_owner = (inf_guard_addrs[0], owner_role, 0)
             resp = requests.post(
                 f"{inf_guard_addrs[0]}/alloc_ports",
-                json={"count": 1},
+                json={"count": 1, "role": owner_role, "worker_index": 0},
                 timeout=30,
             )
             resp.raise_for_status()
@@ -1141,7 +1493,6 @@ class GatewayTrainController:
                 lora_name=meta.lora_name,
                 lora_keep_versions=meta.lora_keep_versions,
             )
-        self._weight_update_ctrl = ctrl
         logger.info(
             "WeightUpdateController connected (pair=%s, train=%d, inf=%d)",
             pair_name,
@@ -1149,15 +1500,64 @@ class GatewayTrainController:
             len(inference_urls),
         )
 
-    def update_weights(self, meta: Any) -> None:
+    def _release_weight_update_port(self) -> None:
+        import requests
+
+        if self._weight_update_port_owner is not None:
+            if self.rollout is not None and self.rollout._destroyed:
+                # The rollout Guard has already released all of its reservations.
+                self._weight_update_port_owner = None
+                return
+            guard, role, index = self._weight_update_port_owner
+            response = requests.post(
+                f"{guard}/release_ports",
+                json={"role": role, "worker_index": index},
+                timeout=30,
+            )
+            response.raise_for_status()
+            self._weight_update_port_owner = None
+
+    def disconnect_engine(self) -> None:
+        """Release weight-transfer groups while retaining the training engine."""
+        self._ensure_initialized()
+        if self._weight_update_connected:
+            if self._weight_update_meta.type == "awex":
+                urls = self._worker_addrs + self.rollout.inference_worker_urls
+
+                async def teardown() -> None:
+                    client = await self._get_async_client()
+                    responses = await asyncio.gather(
+                        *(client.post(f"{url}/awex/teardown", json={}) for url in urls),
+                        return_exceptions=True,
+                    )
+                    for response in responses:
+                        if isinstance(response, BaseException):
+                            raise response
+                        response.raise_for_status()
+
+                run_async_task(teardown)
+            self._weight_update_ctrl.disconnect()
+            self._weight_update_connected = False
+        self._release_weight_update_port()
+
+    def reconfigure_rollout(self, backend: str, gpu_devices: list[int]) -> None:
+        """Apply a rollout layout through the unified idle-boundary coordinator."""
+        from areal.v2.reconfiguration import ExecutionLayout, reconfigure
+
+        reconfigure(self, rollout_layout=ExecutionLayout.local(backend, gpu_devices))
+
+    def update_weights(self, meta: Any, *, resume_generation: bool = True) -> None:
         if self._weight_update_ctrl is None or self.rollout is None:
             raise RuntimeError(
                 "connect_engine() must be called before update_weights()"
             )
         self.rollout.pause_generation()
-        assert meta.version is not None and meta.version > 0, (
-            f"meta.version must be a positive integer, got {meta.version}"
-        )
+        if resume_generation:
+            assert meta.version is not None and meta.version > 0, (
+                f"meta.version must be a positive integer, got {meta.version}"
+            )
+        elif meta.version is None or meta.version < 0:
+            raise ValueError("meta.version must be a non-negative integer")
         result = self._weight_update_ctrl.update_weights(version=meta.version)
         # Publish the version before resuming generation. Requests unblocked by
         # continue_generation() are served by the new weights, so they must be
@@ -1165,9 +1565,18 @@ class GatewayTrainController:
         # the version broadcast is recorded as pre-update policy and downstream
         # importance ratios pick the wrong behavior policy for it.
         try:
+            if not resume_generation and (
+                result.status != "ok" or result.version != meta.version
+            ):
+                raise RuntimeError(
+                    f"Weight publication failed for version {meta.version}: {result.error}"
+                )
             self.rollout.set_version(meta.version)
+            if not resume_generation:
+                self.rollout.verify_proxy_versions(meta.version)
         finally:
-            self.rollout.continue_generation()
+            if resume_generation:
+                self.rollout.continue_generation()
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",
             meta.version,
@@ -1307,7 +1716,25 @@ class GatewayTrainController:
             except Exception:
                 logger.error("Failed to unregister model: %s", traceback.format_exc())
 
+        if self._weight_update_ctrl is not None:
+            try:
+                self._weight_update_ctrl.destroy()
+            except Exception:
+                logger.error("Failed to destroy weight-update gateway", exc_info=True)
+            self._weight_update_ctrl = None
+            self._weight_update_connected = False
         self._graceful_shutdown_workers()
+        try:
+            run_async_task(self._async_release_engine_rendezvous)
+        except Exception:
+            logger.warning("Failed to release Engine rendezvous port", exc_info=True)
+        try:
+            self._release_weight_update_port()
+        except Exception:
+            logger.warning(
+                "Failed to release weight-update rendezvous port", exc_info=True
+            )
+        self._weight_update_meta = None
 
         for guard_addr, role, worker_index in reversed(self._forked_services):
             try:
@@ -1331,6 +1758,11 @@ class GatewayTrainController:
                 )
         self._service_roles.clear()
         self._worker_addrs.clear()
+        self._worker_pool_addrs.clear()
+        self._worker_pool_devices.clear()
+        self._engine_initialize_kwargs.clear()
+        self._training_held = False
+        self._engine_rebuild_ready = True
         self._router_addr = ""
         self._gateway_addr = ""
         self._model_addr = ""

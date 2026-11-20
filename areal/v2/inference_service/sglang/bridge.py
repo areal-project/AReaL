@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -17,6 +18,13 @@ from areal.utils.sglang_image import image_request_kwargs
 
 if TYPE_CHECKING:
     from areal.api.io_struct import ModelRequest
+
+
+def _elapsed(start: float | None, end: float | None) -> float | None:
+    if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+        if 0 < start <= end and math.isfinite(end):
+            return end - start
+    return None
 
 
 class SGLangBridgeBackend:
@@ -131,6 +139,7 @@ class SGLangBridgeBackend:
         # launched with a speculative_algorithm; None otherwise).
         spec_accept_rate = meta_info.get("spec_accept_rate")
         spec_accept_length = meta_info.get("spec_accept_length")
+        received = meta_info.get("request_received_ts")
 
         return HttpGenerationResult(
             output_tokens=output_tokens,
@@ -139,6 +148,10 @@ class SGLangBridgeBackend:
             routed_experts=routed_experts,
             spec_accept_rate=spec_accept_rate,
             spec_accept_length=spec_accept_length,
+            first_token_delay=_elapsed(
+                received, meta_info.get("prefill_finished_time")
+            ),
+            finish_delay=_elapsed(received, meta_info.get("request_finished_ts")),
         )
 
     # -- pause / resume -----------------------------------------------------

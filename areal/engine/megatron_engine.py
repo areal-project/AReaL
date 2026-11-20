@@ -1343,6 +1343,12 @@ class MegatronEngine(TrainEngine):
         return self._version
 
     def save(self, meta: SaveLoadMeta):
+        if meta.weight_format == "raw":
+            from areal.engine.megatron_utils.state_transfer import validate_engine
+
+            if not meta.with_optim:
+                raise ValueError("Raw state transfer requires with_optim=True")
+            validate_engine(self)
         if self._weight_residency is not None:
             # Post-ppo_update the fp32 grad buffers (~2x param bytes) are
             # dead weight until the next train_batch (which rebuilds them via
@@ -1412,6 +1418,10 @@ class MegatronEngine(TrainEngine):
                 self.checkpointer.save_checkpoint(meta.path, **save_kwargs)
                 if meta.wait_for_async_save:
                     self.checkpointer.wait_async_saves()
+            elif meta.weight_format == "raw":
+                from areal.engine.megatron_utils.state_transfer import save_state
+
+                return save_state(self, meta.path)
             else:
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
 
@@ -1419,6 +1429,23 @@ class MegatronEngine(TrainEngine):
         binder = getattr(self, "_qwen4_awex_frozen_binder", None)
         if binder is not None:
             binder.invalidate()
+        if meta.weight_format == "raw":
+            from areal.engine.megatron_utils.state_transfer import (
+                restore_state,
+                validate_engine,
+            )
+
+            if not meta.with_optim:
+                raise ValueError("Raw state transfer requires with_optim=True")
+            validate_engine(self)
+            if self.is_offload:
+                self.onload()
+            residency = self._ensure_weight_residency()
+            residency.resume_memory()
+            receipt = restore_state(self, meta.path)
+            residency.ensure_grad_buffers()
+            current_platform.synchronize()
+            return receipt
         with self._checkpoint_aware_context(
             with_model=True, with_optimizer=meta.with_optim
         ):

@@ -377,6 +377,23 @@ async def _ready_trajectory_loop(app: FastAPI) -> None:
         await asyncio.sleep(0.1)
 
 
+async def _online_control(
+    app: FastAPI, endpoint: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    config: DataProxyConfig = app.state.config
+    if not config.callback_server_addr:
+        return {"enabled": False}
+    response = await app.state.http_client.post(
+        f"{config.callback_server_addr.rstrip('/')}/callback/{endpoint}",
+        json=payload,
+        headers={"Authorization": f"Bearer {config.admin_api_key}"},
+        timeout=config.request_timeout,
+    )
+    if response.is_error:
+        raise HTTPException(status_code=response.status_code, detail=response.json())
+    return response.json()
+
+
 def create_app(config: DataProxyConfig) -> FastAPI:
     """Factory that creates the FastAPI app with lifespan-managed resources."""
 
@@ -471,12 +488,21 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         body_json: dict[str, Any],
         session: SessionData | None,
     ) -> tuple[Any, bool]:
+        if session is not None and session.execution_failed:
+            raise HTTPException(status_code=409, detail="Session execution failed")
         areal_client: ArealOpenAI | None = app.state.areal_client
         if areal_client is None:
             raise HTTPException(status_code=503, detail="Inference backend unavailable")
 
         kwargs = dict(body_json)
         kwargs.pop("model", None)
+        # Associate backend calls with the public session used by the workload client.
+        metadata = dict(kwargs.get("metadata") or {})
+        metadata.pop("areal_session_id", None)
+        if session is not None:
+            metadata["areal_session_id"] = session.session_id
+        if metadata or "metadata" in kwargs:
+            kwargs["metadata"] = metadata
         is_streaming = bool(kwargs.get("stream", False))
         kwargs.setdefault("temperature", 1.0)
         kwargs.setdefault("top_p", 1.0)
@@ -523,7 +549,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         pause_state: PauseState = app.state.pause_state
         return DataProxyHealthResponse(
             status="ok",
-            backend=config.backend_addr,
+            backend=app.state.config.backend_addr,
             sessions=store.session_count,
             paused=await pause_state.is_paused(),
             version=app.state.version,
@@ -536,6 +562,29 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     # =========================================================================
     # Pause/Resume — internal control plane (no auth at data proxy level)
     # =========================================================================
+
+    def require_bridge(request: Request) -> InfBridge:
+        _require_admin_key(request, app.state.session_store)
+        if app.state.inf_bridge is None:
+            raise HTTPException(
+                status_code=503, detail="No inference backend configured"
+            )
+        return app.state.inf_bridge
+
+    @app.post("/hold_generation")
+    async def hold_generation(request: Request):
+        await require_bridge(request).hold_generation()
+        return {"status": "ok"}
+
+    @app.post("/wait_generation_idle")
+    async def wait_generation_idle(request: Request):
+        await require_bridge(request).wait_generation_idle()
+        return {"status": "ok"}
+
+    @app.post("/release_generation")
+    async def release_generation(request: Request):
+        await require_bridge(request).release_generation()
+        return {"status": "ok"}
 
     @app.post("/pause_generation", response_model=PauseGenerationResponse)
     async def pause_generation():
@@ -616,7 +665,14 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
 
-        group_id = f"grp-{uuid.uuid4()}"
+        admission_payload = {
+            "task_id": body.task_id,
+            "worker_addr": config.serving_addr,
+            "group_size": body.group_size,
+        }
+        admission = await _online_control(app, "online_admission", admission_payload)
+        admitted = admission["enabled"]
+        group_id = f"grp-{body.task_id}" if admitted else f"grp-{uuid.uuid4()}"
         group_size = max(body.group_size, 1)
         credentials: list[SessionCredentials] = []
         for i in range(group_size):
@@ -629,13 +685,26 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     ),
                     processor_cache_group_id=group_id if group_size > 1 else None,
                     processor_cache_group_size=group_size,
+                    idempotent=admitted,
                 )
             except ValueError as e:
+                if admitted:
+                    await _online_control(
+                        app,
+                        "online_ready",
+                        {"task_id": body.task_id, "execution_failed": True},
+                    )
                 raise HTTPException(status_code=409, detail=str(e))
             credentials.append(
                 SessionCredentials(
                     session_id=session_id, session_api_key=session_api_key
                 )
+            )
+        if admitted:
+            await _online_control(
+                app,
+                "online_admission",
+                {**admission_payload, "session_id": credentials[0].session_id},
             )
         return StartSessionResponse(group_id=group_id, sessions=credentials)
 
@@ -649,6 +718,25 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 status_code=401, detail="Invalid or expired session API key."
             )
 
+        if body.execution_failed:
+            try:
+                session.mark_execution_failed()
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            await _online_control(
+                app,
+                "online_ready",
+                {"session_id": session.session_id, "execution_failed": True},
+            )
+            return SetRewardResponse(
+                message="execution_failed",
+                interaction_count=0,
+                session_id=session.session_id,
+                trajectory_id=None,
+                trajectory_ready=False,
+                ready_transition=False,
+            )
+
         try:
             if body.rewards is not None:
                 if not body.rewards:
@@ -657,6 +745,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     )
                 reward_result = session.set_rewards(body.rewards)
             else:
+                assert body.reward is not None
                 reward_result = session.set_reward(
                     interaction_id=body.interaction_id,
                     reward=body.reward,
@@ -1113,17 +1202,26 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/configure_backend", response_model=ConfigureBackendResponse)
     async def configure_backend(request: Request):
-        """Reconfigure the inference backend address after process start."""
+        """Bind a backend, preserving an existing held InfBridge and its calls."""
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
         body = await request.json()
         new_addr = body.get("backend_addr")
-        if not new_addr:
+        if not isinstance(new_addr, str) or not new_addr:
             raise HTTPException(status_code=400, detail="backend_addr is required")
         pause_state: PauseState = app.state.pause_state
         tok: TokenizerProxy = app.state.tokenizer
 
         old_inf_bridge: InfBridge | None = app.state.inf_bridge
+        if old_inf_bridge is not None and body.get("preserve_requests", False):
+            try:
+                await old_inf_bridge.rebind(new_addr)
+            except (RuntimeError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            from dataclasses import replace as _dc_replace
+
+            app.state.config = _dc_replace(app.state.config, backend_addr=new_addr)
+            return ConfigureBackendResponse(status="ok", backend_addr=new_addr)
 
         # Recreate InfBridge + ArealOpenAI with new backend address
         new_inf_bridge = _create_inf_bridge(new_addr, pause_state, app.state.config)
@@ -1144,8 +1242,6 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         app.state.inf_bridge = new_inf_bridge
         app.state.areal_client = new_areal_client
 
-        # Close old InfBridge after the swap so in-flight requests that already
-        # hold a reference to the old bridge can still finish their HTTP calls.
         if old_inf_bridge is not None:
             await old_inf_bridge.aclose()
 

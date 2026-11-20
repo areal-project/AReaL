@@ -5,8 +5,12 @@ from __future__ import annotations
 import functools
 import os
 import time
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Sequence
+from concurrent.futures import Future
 from copy import deepcopy
+from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
 
 import torch.distributed as dist
@@ -87,6 +91,7 @@ if TYPE_CHECKING:
     from areal.experimental.engine.archon_engine import ArchonPPOActor, ArchonPPOCritic
     from areal.trainer.ppo.actor import PPOActorController
     from areal.trainer.ppo.critic import PPOCriticController
+    from areal.v2.reconfiguration import Device, ExecutionLayout
 
 logger = logging.getLogger("RLTrainer")
 
@@ -203,7 +208,20 @@ class PPOTrainer:
         config: PPOConfig,
         train_dataset: Dataset | None = None,
         valid_dataset: Dataset | None = None,
+        *,
+        reconfiguration_devices: Sequence[Device] | None = None,
     ):
+        self._reconfiguration_devices = (
+            tuple(reconfiguration_devices)
+            if reconfiguration_devices is not None
+            else None
+        )
+        self._reconfiguration_pool: list[int] | None = None
+        self._reconfiguration_requests: deque[tuple[dict[str, Any], Future[None]]] = (
+            deque()
+        )
+        self._reconfiguration_lock = Lock()
+        self._reconfiguration_closed = False
         try:
             self._init_impl(config, train_dataset, valid_dataset)
         except Exception:
@@ -423,8 +441,12 @@ class PPOTrainer:
 
         # Initialize engines first — the scheduler must know about roles
         # before the data controller can colocate with them.
+        self._reconfiguration_pool = self._prepare_reconfiguration_pool()
         engine_init_kwargs = {"addr": None, "ft_spec": ft_spec}
-        self.actor.initialize(**engine_init_kwargs, role="actor")
+        actor_init_kwargs = dict(engine_init_kwargs)
+        if self._reconfiguration_pool is not None:
+            actor_init_kwargs["worker_gpu_devices"] = self._reconfiguration_pool
+        self.actor.initialize(**actor_init_kwargs, role="actor")
         if self.config.mopd is not None:
             self.actor.configure_mopd_loss(self.config.mopd.loss)
         if self.critic is not None:
@@ -886,13 +908,6 @@ class PPOTrainer:
             if config.teacher is not None and config.teacher.engine_type == "train"
             else None
         )
-        min_consumer_batch_size = (
-            _minimum_consumer_batch_size(
-                self.actor, self.critic, self.ref, train_teacher
-            )
-            if is_single_controller()
-            else 1
-        )
         start_step = (
             self.recover_info.last_step_info.next().global_step
             if self.recover_info is not None
@@ -974,6 +989,13 @@ class PPOTrainer:
                     prepare_kwargs["reward_normalization_use_std"] = (
                         config.gconfig.reward_normalization_use_std
                     )
+                min_consumer_batch_size = (
+                    _minimum_consumer_batch_size(
+                        self.actor, self.critic, self.ref, train_teacher
+                    )
+                    if is_single_controller()
+                    else 1
+                )
                 rollout_batch = _collect_trainable_rollout_batch(
                     functools.partial(
                         self.actor.prepare_batch,
@@ -1352,6 +1374,7 @@ class PPOTrainer:
             if not self._is_final_train_step(
                 global_step=global_step, max_steps=max_steps
             ):
+                self._apply_pending_reconfiguration()
                 self.rollout.resume()
             else:
                 logger.info(
@@ -1361,6 +1384,7 @@ class PPOTrainer:
                 )
 
             self._save_perf_tracer(step=global_step)
+        self._cancel_reconfiguration_requests()
 
     def _save_training_state(
         self,
@@ -1402,7 +1426,156 @@ class PPOTrainer:
             and next_step >= self.config.total_train_steps
         )
 
+    def _prepare_reconfiguration_pool(self) -> list[int] | None:
+        devices = getattr(self, "_reconfiguration_devices", None)
+        if devices is None:
+            return None
+        from areal.utils.network import gethostip
+        from areal.v2.reconfiguration import Device, ExecutionLayout
+
+        config = self.config
+        if (
+            not isinstance(self.scheduler, LocalScheduler)
+            or config.actor._version != "v2"
+            or config.rollout._version != "v2"
+            or self.actor_alloc.backend != "megatron"
+            or self.rollout_alloc.backend != "sglang"
+            or config.actor.use_lora
+        ):
+            raise ValueError(
+                "Trainer reconfiguration requires local v2 Megatron/SGLang full-model training"
+            )
+        if (
+            self.critic is not None
+            or self.ref is not None
+            or config.teacher is not None
+            or config.mopd is not None
+            or self._should_initialize_eval_rollout()
+            or self._is_actor_rollout_colocated(config)
+        ):
+            raise ValueError(
+                "Trainer reconfiguration currently covers disjoint Actor/rollout without auxiliary or evaluation models"
+            )
+        if (
+            not devices
+            or any(not isinstance(device, Device) for device in devices)
+            or len(set(devices)) != len(devices)
+            or {device.node for device in devices} != {gethostip()}
+        ):
+            raise ValueError("reconfiguration_devices must identify unique local GPUs")
+        pool = [device.gpu for device in devices]
+        if not set(pool).issubset(self.scheduler.gpu_devices):
+            raise ValueError(
+                "Reconfiguration pool must belong to the allocated scheduler devices"
+            )
+        for engine, alloc in (
+            (config.actor, self.actor_alloc),
+            (config.rollout, self.rollout_alloc),
+        ):
+            active = ExecutionLayout.local(engine.backend, engine.gpu_devices or [])
+            if len(active.devices) != alloc.parallel.world_size or not set(
+                active.devices
+            ).issubset(devices):
+                raise ValueError(
+                    "Initial layouts must identify active devices within the reconfiguration pool"
+                )
+        if set(config.actor.gpu_devices) & set(config.rollout.gpu_devices):
+            raise ValueError("Initial Actor and rollout devices must be disjoint")
+        return pool
+
+    def request_reconfiguration(
+        self,
+        *,
+        actor_layout: ExecutionLayout | None = None,
+        rollout_layout: ExecutionLayout | None = None,
+        state_path: str | None = None,
+    ) -> Future[None]:
+        """Queue a layout change for an update boundary; completion reports success.
+
+        Requires reconfiguration_devices at construction. Requests execute FIFO,
+        at most one per boundary preceding another update. Training completion
+        and close() cancel queued requests. A running change reports its original
+        exception on failure.
+        """
+        from areal.v2.reconfiguration import ExecutionLayout
+
+        if self._reconfiguration_pool is None:
+            raise RuntimeError(
+                "Enable reconfiguration_devices when constructing the Trainer"
+            )
+        if actor_layout is None and rollout_layout is None:
+            raise ValueError("Supply an Actor or rollout target layout")
+        pool = set(self._reconfiguration_devices)
+        for layout in (actor_layout, rollout_layout):
+            if layout is not None and (
+                not isinstance(layout, ExecutionLayout)
+                or not set(layout.devices).issubset(pool)
+            ):
+                raise ValueError(
+                    "Target layouts must belong to reconfiguration_devices"
+                )
+        if actor_layout is not None and state_path is None:
+            raise ValueError("Actor reconfiguration requires a fresh state_path")
+        request = dict(
+            actor_layout=actor_layout,
+            rollout_layout=rollout_layout,
+            state_path=str(Path(state_path).resolve())
+            if state_path is not None
+            else None,
+        )
+        future: Future[None] = Future()
+        with self._reconfiguration_lock:
+            if self._reconfiguration_closed:
+                raise RuntimeError("Trainer is closed")
+            self._reconfiguration_requests.append((request, future))
+        return future
+
+    def _apply_pending_reconfiguration(self) -> None:
+        if getattr(self, "_reconfiguration_pool", None) is None:
+            return
+        from areal.v2.reconfiguration import reconfigure
+
+        with self._reconfiguration_lock:
+            while self._reconfiguration_requests:
+                request, future = self._reconfiguration_requests.popleft()
+                if future.set_running_or_notify_cancel():
+                    break
+            else:
+                return
+        try:
+            reconfigure(self.actor, **request)
+            for name in ("actor", "rollout"):
+                current = getattr(self, name).config
+                configured = getattr(self.config, name)
+                configured.backend = current.backend
+                configured.gpu_devices = list(current.gpu_devices)
+            self.actor_alloc = ModelAllocation.from_str(
+                self.config.actor.backend, name="actor"
+            )
+            self.rollout_alloc = ModelAllocation.from_str(
+                self.config.rollout.backend, name="rollout"
+            )
+            layout = request["rollout_layout"]
+            if layout is not None and layout.attention_dp_size is not None:
+                self.config.sglang.dp_size = layout.attention_dp_size
+                self.config.sglang.enable_dp_attention = layout.attention_dp_size > 1
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        future.set_result(None)
+
+    def _cancel_reconfiguration_requests(self, *, closing: bool = False) -> None:
+        if not hasattr(self, "_reconfiguration_requests"):
+            return
+        with self._reconfiguration_lock:
+            self._reconfiguration_closed |= closing
+            pending = list(self._reconfiguration_requests)
+            self._reconfiguration_requests.clear()
+        for _, future in pending:
+            future.cancel()
+
     def close(self):
+        self._cancel_reconfiguration_requests(closing=True)
         # P87: must tolerate a partially-constructed trainer (called from
         # __init__'s failure path), and one engine's destroy() failure must
         # not keep the remaining workers alive.
@@ -1745,6 +1918,9 @@ class PPOTrainer:
             role="rollout",
             server_args=server_args,
         )
+        pool = getattr(self, "_reconfiguration_pool", None)
+        if not is_eval and pool is not None:
+            init_kwargs["guard_gpu_devices"] = pool
         if config._version == "v2" and self.config.rollout.return_routed_experts:
             r3_config = self._resolve_actor_r3_moe_config()
             init_kwargs["r3_num_moe_layers"] = r3_config.num_moe_layers

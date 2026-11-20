@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from areal.experimental.openai.cache import InteractionCache, PrefixMatcher
 from areal.experimental.openai.finalization import finalize_interactions
@@ -61,9 +61,17 @@ class SetRewardRequest(BaseModel):
     """Request to set reward for an interaction."""
 
     interaction_id: str | None = None
-    reward: float
+    reward: float | None = None
     rewards: dict[str, float] | None = None
     model: str | None = None
+    execution_failed: bool = False
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> SetRewardRequest:
+        has_reward = self.reward is not None or self.rewards is not None
+        if self.execution_failed == has_reward:
+            raise ValueError("Provide either rewards or an execution failure")
+        return self
 
 
 class ExportTrajectoriesRequest(BaseModel):
@@ -152,6 +160,7 @@ class SessionData:
         processor_cache_group_id: str | None = None,
     ):
         self.session_id = session_id
+        self.execution_failed = False
         self.processor_cache = processor_cache
         self.processor_cache_group_id = processor_cache_group_id
         self.sampling_seed_identity = sampling_seed_identity or session_id
@@ -269,6 +278,12 @@ class SessionData:
         """Record reward for the active trajectory."""
         return self.set_rewards({interaction_id: reward})
 
+    def mark_execution_failed(self) -> None:
+        with self._lock:
+            if self._ready_trajectories or self._last_set_reward_time is not None:
+                raise ValueError("Session already rewarded")
+            self.execution_failed = True
+
     def set_rewards(
         self,
         rewards: Mapping[str | None, float],
@@ -284,6 +299,8 @@ class SessionData:
             raise ValueError("No rewards provided")
 
         with self._lock:
+            if self.execution_failed:
+                raise ValueError("Session execution failed")
             now = time.time()
             self._last_access_time = now
 
@@ -438,6 +455,7 @@ class SessionStore:
         self._session_to_api_key: dict[str, str] = {}
         self._lock = threading.Lock()
         self._capacity: int = 0
+        self._online_task_sessions: dict[str, str] = {}
         self._admin_api_key: str = "areal-admin-key"
         self._set_reward_finish_timeout = set_reward_finish_timeout
         self._prefix_matcher = prefix_matcher
@@ -461,6 +479,7 @@ class SessionStore:
         sampling_seed_identity: str | None = None,
         processor_cache_group_id: str | None = None,
         processor_cache_group_size: int = 1,
+        idempotent: bool = False,
     ) -> tuple[str, str]:
         """Start a new session, returning (session_id, session_api_key).
 
@@ -468,6 +487,12 @@ class SessionStore:
         fresh opaque key is generated.
         """
         with self._lock:
+            if idempotent and task_id in self._online_task_sessions:
+                session_id = self._online_task_sessions[task_id]
+                session_api_key = self._session_to_api_key.get(session_id)
+                if session_api_key is None:
+                    raise ValueError("Online request session has already closed")
+                return session_id, session_api_key
             if processor_cache_group_id is not None and processor_cache_group_size < 2:
                 raise ValueError(
                     "A shared processor cache requires at least two sessions"
@@ -514,6 +539,8 @@ class SessionStore:
             )
             self._api_key_to_session[session_api_key] = session_id
             self._session_to_api_key[session_id] = session_api_key
+            if idempotent:
+                self._online_task_sessions[task_id] = session_id
 
         return (session_id, session_api_key)
 
