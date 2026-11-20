@@ -236,6 +236,8 @@ class ExecutionConfig:
 
     d/t/p/c denote data/tensor/pipeline/context parallelism.
     EP/ETP search is suspended pending reconfiguration validation.
+    The optimizer varies the backends and SGLang Attention DP. The other
+    seven settings come from the run template for every candidate.
     None leaves an optional setting for the run/backend to resolve.
     """
 

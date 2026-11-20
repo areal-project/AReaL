@@ -1,23 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Automatic layout search with an injected evaluator and submission function.
-
-The evaluator owns workload prediction and model support. The caller owns
-observations, triggering and the native Trainer. This module starts no services.
-"""
+"""Budgeted hierarchical search over physical Actor and Rollout layouts."""
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
-from collections.abc import Callable, Mapping, Sequence
+from collections import defaultdict
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
-from itertools import product
-from math import inf
+from functools import cache
+from heapq import merge
+from itertools import product, repeat
+from math import inf, isfinite
 from time import monotonic
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+
+if TYPE_CHECKING:
+    from .evaluator import Observation, ReplayEvaluator
+    from .evaluator.workload import ExecutionConfig
+
 
 Value = bool | int | float | str | None
+ATTENTION_DP_OPTIONS = frozenset(("sglang_dp_size", "sglang_enable_dp_attention"))
 
 
 @dataclass(frozen=True)
@@ -104,114 +108,107 @@ class SearchSpace:
         return result[0], result[1]
 
     @classmethod
-    def full_roles(cls, gpu_capacity, evaluator):
-        """Reference's Megatron/SGLang grid. Expand each role, never the joint product."""
-        models = evaluator.models
-        base = models.resolve(evaluator.template)
-        if base.rollout_max_concurrent_rollouts is None:
-            base = replace(base, rollout_max_concurrent_rollouts=evaluator.batch_size)
-        models.validate_layout(base)
-        moe = models.actor_model.model.mlp_type == "moe"
+    def for_pool(cls, gpu_capacity: int, batch_size: int):
+        """Default physical axes for a Megatron Actor and homogeneous SGLang replicas."""
         counts = range(1, gpu_capacity)
         tp = (1, 2, 4, 8)
         stages = (*tp, 16)
-        space = cls(
+        return cls(
             gpu_capacity,
-            evaluator.batch_size,
-            dict(
-                dp=counts,
-                tp=tp,
-                pp=stages,
-                cp=stages,
-                # Expert-parallel search awaits reconfiguration validation.
-                ep=(1,),
-                etp=(1,),
-            ),
+            batch_size,
+            dict(dp=counts, tp=tp, pp=stages, cp=stages),
             dict(replicas=counts, tp=tp, pp=stages),
-            moe=moe,
         )
-        actors, rollouts = space.roles()
 
-        # Omit inherited values from the identity so the current configuration
-        # and its copy in the generated space compare equal.
-        def options(axes):
-            names = sorted(axes)
-            choices = [
-                tuple(dict.fromkeys((*axes[n], getattr(base, n)))) for n in names
-            ]
-            return [
-                tuple((n, v) for n, v in zip(names, values) if v != getattr(base, n))
-                for values in product(*choices)
-            ]
+    @classmethod
+    def full_roles(cls, gpu_capacity, evaluator):
+        grid = cls.for_pool(gpu_capacity, evaluator.batch_size)
+        return supported_space(grid, evaluator, (1, 2, 4, 8)).roles()
 
-        actor_options = options(
-            dict(
-                actor_n_mbs=(1, 2, 4, 8),
-                actor_max_tokens_per_mb=(8192, 16384, 32768, 65536),
-                actor_pad_to_maximum=(False, True),
-            )
+
+@dataclass
+class PhysicalSpace:
+    gpu_capacity: int
+    inherited_attention_dp: int
+    actors: tuple[RoleLayout, ...]
+    rollouts: tuple[RoleLayout, ...]
+
+    def roles(self):
+        return self.actors, self.rollouts
+
+
+def physical_space(base: SearchSpace, template: ExecutionConfig, attention_dp_sizes):
+    """Enumerate only the parallelism controls accepted by the Trainer API."""
+    if any(value != 1 for dim in ("ep", "etp") for value in base.actor.get(dim, ())):
+        raise ValueError("Expert parallel reconfiguration is not supported")
+    if base.parameters.keys() - ATTENTION_DP_OPTIONS:
+        raise ValueError(
+            "Supply physical parallelism axes only; engine tuning remains fixed"
         )
-        concurrency = evaluator.concurrency
-        rollout_options = options(
-            dict(
-                rollout_max_concurrent_rollouts=tuple(
-                    max(1, concurrency // n) for n in (8, 4, 2, 1)
-                ),
-                sglang_max_running_requests=(8, 16, 32, 64),
-                sglang_max_prefill_tokens=(8192, 16384, 32768),
-            )
-        )
-        valid_actors, valid_rollouts = [], []
-        for role in actors:
-            cfg = replace(base, actor_backend=role.backend)
-            if cfg.actor_pp > models.actor_model.model.layers:
+    sizes = base.parameters.get("sglang_dp_size", attention_dp_sizes)
+    enabled = base.parameters.get("sglang_enable_dp_attention", (True, False))
+    actors, rollouts = replace(base, parameters={}).roles()
+    rows = []
+    for role in rollouts:
+        for dp in dict.fromkeys((*sizes, template.sglang_dp_size)):
+            if type(dp) is not int or dp < 1:
+                raise ValueError("Attention DP must be a positive integer")
+            if coordinates(role)[1] % dp:
                 continue
-            try:
-                models.validate_layout(cfg)
-            except ValueError:
+            if dp != template.sglang_dp_size and (dp > 1) not in enabled:
                 continue
-            valid_actors.extend(replace(role, options=o) for o in actor_options)
-        for role in rollouts:
-            cfg = replace(
-                base,
-                rollout_backend=role.backend,
-                sglang_dp_size=1,
-                sglang_enable_dp_attention=False,
-            )
-            divisors = [d for d in tp if cfg.rollout_tp % d == 0]
-            for dp in divisors:
-                internal = dict(
-                    sglang_dp_size=dp,
-                    sglang_enable_dp_attention=dp > 1,
-                )
-                # Check the mesh with at least one running slot per DP group.
-                try:
-                    models.validate_layout(
-                        replace(
-                            cfg,
-                            **internal,
-                            sglang_max_running_requests=max(
-                                base.sglang_max_running_requests, dp
-                            ),
-                        )
-                    )
-                except ValueError:
-                    continue
-                changed = [(k, v) for k, v in internal.items() if v != getattr(base, k)]
-                for o in rollout_options:
-                    values = dict(o)
-                    if (
-                        values.get(
-                            "sglang_max_running_requests",
-                            base.sglang_max_running_requests,
-                        )
-                        < dp
-                    ):
-                        continue
-                    valid_rollouts.append(
-                        replace(role, options=tuple(sorted((*changed, *o))))
-                    )
-        return tuple(valid_actors), tuple(valid_rollouts)
+            opts = {"sglang_dp_size": dp, "sglang_enable_dp_attention": dp > 1}
+            # The frozen template has dp=1, sometimes with the enable flag set.
+            # Preserve its exact representation for the incumbent.
+            if dp == template.sglang_dp_size:
+                opts = {}
+            rows.append(replace(role, options=tuple(sorted(opts.items()))))
+    return PhysicalSpace(
+        base.gpu_capacity, template.sglang_dp_size, actors, tuple(rows)
+    )
+
+
+@cache
+def coordinates(role, inherited_dp=1):
+    """Expose physical layout dimensions; CP belongs to the Actor."""
+    from .evaluator.workload import ExecutionConfig, parse_actor_parallel
+
+    if role.backend.startswith("megatron:"):
+        return parse_actor_parallel(role.backend)
+    config = ExecutionConfig("megatron:d1", role.backend)
+    return (
+        *config.rollout_parallel,
+        dict(role.options).get("sglang_dp_size", inherited_dp),
+    )
+
+
+def supported_space(grid, evaluator, attention_dp_sizes):
+    from .evaluator.cost_model.actor.megatron import MegatronCosts
+    from .evaluator.workload import ExecutionConfig
+
+    template = getattr(evaluator, "template", None)
+    if template is None:
+        template = ExecutionConfig("megatron:d1", "sglang:d1")
+    space = physical_space(grid, template, attention_dp_sizes)
+    models = getattr(evaluator, "models", None)
+    if models is None:
+        return space
+    actors = []
+    for role in space.actors:
+        config = replace(template, actor_backend=role.backend)
+        if MegatronCosts.mesh_is_valid(
+            models.actor_config(config), models.actor_model.model
+        ):
+            actors.append(role)
+    rollouts = []
+    for role in space.rollouts:
+        config = replace(template, rollout_backend=role.backend, **dict(role.options))
+        try:
+            models.rollout_config(config)  # model shape and weight/KV capacity
+        except ValueError:
+            continue
+        rollouts.append(role)
+    return replace(space, actors=tuple(actors), rollouts=tuple(rollouts))
 
 
 @dataclass(frozen=True)
@@ -313,22 +310,17 @@ def select(
     )
 
 
-class Optimizer:
-    """One owner calls decide/request; Future callbacks record completion only.
-
-    max_evaluations bounds policy computation, not training or Agent execution.
-    No token, episode, training-update or runtime stop budget is introduced.
-    """
+class BaseOptimizer:
+    """Shared decision budget and submission lifecycle for layout policies."""
 
     def __init__(
         self,
-        space: SearchSpace | None = None,
-        evaluator: Evaluator | None = None,
+        space,
+        evaluator,
         *,
-        gpu_capacity: int | None = None,
-        minimum_request_fraction: float,
-        max_evaluations: int = 64,
-        clock: Callable[[], float] = monotonic,
+        minimum_request_fraction,
+        max_evaluations=64,
+        clock=monotonic,
     ):
         if (
             not 0 < minimum_request_fraction <= 1
@@ -338,169 +330,18 @@ class Optimizer:
             raise ValueError(
                 "A valid SLO target and positive search allowance are required"
             )
-        if evaluator is None or (space is None) == (gpu_capacity is None):
-            raise ValueError(
-                "Supply an evaluator and either GPU capacity or an explicit search space"
-            )
-        if space is None:
-            self.actors, self.rollouts = SearchSpace.full_roles(gpu_capacity, evaluator)
-        else:
-            self.actors, self.rollouts = space.roles()
-            gpu_capacity = space.gpu_capacity
+        self.actors, self.rollouts = space.roles()
         self._actors, self._rollouts = set(self.actors), set(self.rollouts)
-        self.gpu_capacity = gpu_capacity
+        self.gpu_capacity = space.gpu_capacity
         self.evaluator, self.target, self.limit = (
             evaluator,
             minimum_request_fraction,
             max_evaluations,
         )
         self.clock = clock
-        self.history: deque[Layout] = deque(maxlen=7)
         self.pending: Future | None = None
         self.last_application: Application | None = None
         self.last_switch: float | None = None
-
-    def _diverse(self, recovering: bool):
-        """Visit each GPU allocation in turn, expanding its role combinations lazily."""
-        actors, rollouts = defaultdict(list), defaultdict(list)
-        for role in self.actors:
-            actors[role.gpus].append(role)
-        for role in self.rollouts:
-            rollouts[role.gpus].append(role)
-        allocations = [
-            (a, r) for a in actors for r in rollouts if a + r <= self.gpu_capacity
-        ]
-        allocations.sort(
-            key=lambda pair: (-pair[0] if recovering else -min(pair), -sum(pair), pair)
-        )
-        streams = deque(
-            iter(
-                product(
-                    sorted(actors[a], key=lambda x: x.key),
-                    sorted(rollouts[r], key=lambda x: x.key),
-                )
-            )
-            for a, r in allocations
-        )
-        while streams:
-            stream = streams.popleft()
-            pair = next(stream, None)
-            if pair is not None:
-                yield Layout(*pair)
-                streams.append(stream)
-
-    @staticmethod
-    def _distance(left: Layout, right: Layout) -> int:
-        changes = 0
-        for a, b in ((left.actor, right.actor), (left.rollout, right.rollout)):
-            changes += a.backend != b.backend
-            x, y = dict(a.options), dict(b.options)
-            changes += sum(x.get(k) != y.get(k) for k in x.keys() | y.keys())
-        return changes
-
-    def decide(
-        self,
-        observation: Any,
-        current: Layout,
-        *,
-        trigger: Literal["pressure", "slack", "none"],
-        recovering: bool = False,
-    ) -> Decision:
-        if self.pending is not None or trigger == "none":
-            return Decision(
-                current,
-                current,
-                (),
-                "Adjustment pending" if self.pending else "No trigger",
-            )
-        context = self.evaluator.prepare(observation)
-        pool, seen, predictions = [], set(), []
-
-        def add(layout):
-            allowed = layout == current or (
-                layout.actor in self._actors and layout.rollout in self._rollouts
-            )
-            if allowed and layout.gpus <= self.gpu_capacity and layout not in seen:
-                seen.add(layout)
-                pool.append(layout)
-
-        def evaluate_until(stop):
-            layouts = pool[len(predictions) : min(stop, len(pool), self.limit)]
-            evaluate_many = getattr(self.evaluator, "evaluate_many", None)
-            predictions.extend(
-                evaluate_many(context, layouts)
-                if evaluate_many is not None
-                else (self.evaluator.evaluate(context, layout) for layout in layouts)
-            )
-
-        add(current)
-        for previous in reversed(self.history):
-            add(previous)
-        for role, choices in (("actor", self.actors), ("rollout", self.rollouts)):
-            neighbors = 0
-            for choice in sorted(choices, key=lambda x: x.key):
-                layout = (
-                    Layout(choice, current.rollout)
-                    if role == "actor"
-                    else Layout(current.actor, choice)
-                )
-                if (
-                    neighbors < 4
-                    and layout not in seen
-                    and self._distance(layout, current) == 1
-                ):
-                    before = len(pool)
-                    add(layout)
-                    neighbors += len(pool) > before
-        diverse = self._diverse(recovering)
-        initial = max(1, self.limit - 16)
-        while len(pool) < initial:
-            candidate = next(diverse, None)
-            if candidate is None:
-                break
-            add(candidate)
-        evaluate_until(initial)
-
-        ranked = sorted(
-            (p for p in predictions if _usable(p)),
-            key=lambda p: (
-                not _meets(p, self.target),
-                -p.request_fraction,
-                *_recovery_key(p),
-            ),
-        )
-        actors = tuple(dict.fromkeys(p.layout.actor for p in ranked))[:4]
-        rollouts = tuple(dict.fromkeys(p.layout.rollout for p in ranked))[:4]
-        for a, r in product(actors, rollouts):
-            if len(pool) < self.limit:
-                add(Layout(a, r))
-        while len(pool) < self.limit:
-            candidate = next(diverse, None)
-            if candidate is None:
-                break
-            add(candidate)
-        evaluate_until(self.limit)
-        best = select(
-            predictions, current, self.target, trigger=trigger, recovering=recovering
-        )
-        if best is None:
-            return Decision(
-                current, current, tuple(predictions), "No supported prediction"
-            )
-        if best.layout in self.history:
-            self.history.remove(best.layout)
-        self.history.append(best.layout)
-        reason = (
-            "Minimum GPU cost satisfying SLO and Actor supply"
-            if _meets(best, self.target)
-            else "Retain current layout"
-            if trigger == "slack"
-            else "Recover queue within SLO tolerance"
-            if recovering
-            and not any(_meets(p, self.target) for p in predictions if _usable(p))
-            else "Best request fraction, then Actor deficit and GPU cost"
-        )
-        return Decision(current, best.layout, tuple(predictions), reason)
 
     def request(
         self, decision: Decision, current: Layout, submit: Callable[[Layout], Future]
@@ -533,3 +374,259 @@ class Optimizer:
 
         future.add_done_callback(completed)
         return future
+
+
+class _RankedRole(NamedTuple):
+    changed: bool
+    distance: int
+    role: RoleLayout
+
+
+def _rank_roles(roles, source, inherited_dp):
+    origin = coordinates(source, inherited_dp)
+    by_gpus = defaultdict(list)
+    for role in roles:
+        distance = sum(
+            a != b for a, b in zip(origin, coordinates(role, inherited_dp), strict=True)
+        )
+        by_gpus[role.gpus].append(_RankedRole(role != source, distance, role))
+    for group in by_gpus.values():
+        group.sort(key=lambda item: (item.changed, item.distance, item.role.key))
+    return by_gpus
+
+
+def _joint_layouts(actors, rollouts, current):
+    # Each fixed-Actor stream already has the desired ordering. Merge without
+    # materializing the product of all Actor and rollout configurations.
+    streams = (zip(repeat(actor), rollouts) for actor in actors)
+
+    def order(pair):
+        a, r = pair
+        return a.changed + r.changed, a.distance + r.distance, a.role.key, r.role.key
+
+    for a, r in merge(*streams, key=order):
+        layout = Layout(a.role, r.role)
+        if layout != current:
+            yield layout
+
+
+@dataclass
+class _Split:
+    actor_gpus: int
+    rollout_gpus: int
+    layouts: Iterator[Layout]
+    count: int
+    queried: int
+
+    @property
+    def gpus(self):
+        return self.actor_gpus + self.rollout_gpus
+
+
+class Optimizer(BaseOptimizer):
+    """Search complete layouts by GPU split with a bounded number of replay queries."""
+
+    def __init__(
+        self,
+        space: SearchSpace | PhysicalSpace | None = None,
+        evaluator: Evaluator | None = None,
+        *,
+        gpu_capacity: int | None = None,
+        minimum_request_fraction: float,
+        max_evaluations: int = 64,
+        clock: Callable[[], float] = monotonic,
+        attention_dp_sizes: Sequence[int] = (1, 2, 4, 8),
+    ):
+        if evaluator is None or (space is None) == (gpu_capacity is None):
+            raise ValueError(
+                "Supply an evaluator and either GPU capacity or an explicit search space"
+            )
+        if space is None:
+            space = SearchSpace.for_pool(gpu_capacity, evaluator.batch_size)
+        if isinstance(space, SearchSpace):
+            space = supported_space(space, evaluator, attention_dp_sizes)
+        if any(role.options for role in space.actors) or any(
+            key not in ATTENTION_DP_OPTIONS
+            for role in space.rollouts
+            for key, _ in role.options
+        ):
+            raise ValueError("Set fixed runtime settings on the evaluator template")
+        super().__init__(
+            space,
+            evaluator,
+            minimum_request_fraction=minimum_request_fraction,
+            max_evaluations=max_evaluations,
+            clock=clock,
+        )
+        self.inherited_dp = space.inherited_attention_dp
+
+    @classmethod
+    def from_grid(
+        cls,
+        grid: SearchSpace,
+        evaluator: ReplayEvaluator,
+        *,
+        attention_dp_sizes,
+        max_evaluations=64,
+    ):
+        """Normal entry point. Build a physical catalogue from the native profiles once."""
+        return cls(
+            grid,
+            evaluator,
+            minimum_request_fraction=evaluator.slo.minimum_request_fraction,
+            max_evaluations=max_evaluations,
+            attention_dp_sizes=attention_dp_sizes,
+        )
+
+    def _actors_for_forecast(self, forecast):
+        from .evaluator import ReplayEvaluator
+        from .evaluator.cost_model.models import AnalyticalCostModels
+
+        evaluator = self.evaluator
+        if not isinstance(evaluator, ReplayEvaluator) or not isinstance(
+            evaluator.models, AnalyticalCostModels
+        ):
+            return self.actors
+        # Replay checks this first batch for every layout, before scheduling any
+        # rollout. The analytical Actor memory estimate uses only Actor settings.
+        episodes = forecast.episodes
+        batch = tuple(
+            episodes[i % len(episodes)].turns for i in range(evaluator.batch_size)
+        )
+        actors = []
+        for role in self.actors:
+            config = replace(
+                evaluator.template, actor_backend=role.backend, **dict(role.options)
+            )
+            try:
+                peak, capacity, oom = evaluator.models.actor_memory(config, batch)
+            except ValueError:
+                continue  # Replay also marks this mandatory batch unsupported.
+            if not (oom or peak > capacity * (1 - evaluator.reserve)):
+                actors.append(role)
+        return actors
+
+    def _splits(self, current, eligible_actors):
+        actors = _rank_roles(eligible_actors, current.actor, self.inherited_dp)
+        rollouts = _rank_roles(self.rollouts, current.rollout, self.inherited_dp)
+        source_in_catalogue = (
+            current.actor in eligible_actors and current.rollout in self._rollouts
+        )
+        splits = []
+        for a, r in product(actors, rollouts):
+            if a + r > self.gpu_capacity:
+                continue
+            queried = int(
+                source_in_catalogue
+                and (a, r) == (current.actor.gpus, current.rollout.gpus)
+            )
+            count = len(actors[a]) * len(rollouts[r])
+            if queried < count:
+                splits.append(
+                    _Split(
+                        a,
+                        r,
+                        _joint_layouts(actors[a], rollouts[r], current),
+                        count,
+                        queried,
+                    )
+                )
+        return splits
+
+    def decide(
+        self, observation: Observation, current: Layout, *, trigger, recovering=False
+    ) -> Decision:
+        if self.pending is not None or trigger == "none":
+            return Decision(current, current, (), "Adjustment pending or no trigger")
+        if current != observation.current or current.gpus > self.gpu_capacity:
+            raise ValueError(
+                "Current layout must match the observation and fit the pool"
+            )
+        if (
+            current.actor.options
+            or dict(current.rollout.options).keys() - ATTENTION_DP_OPTIONS
+        ):
+            raise ValueError("Set fixed runtime settings on the evaluator template")
+        view = observation.view
+        if view.busy or view.training_version != view.provider_version:
+            return Decision(
+                current, current, (), "Waiting for a published update boundary"
+            )
+        context = self.evaluator.prepare(observation)
+        forecast = context[1]
+        if forecast is None or not forecast.episodes:
+            return Decision(current, current, (), "No forecast arrivals")
+        horizon = forecast.input_closes_at - view.now
+        if not isfinite(horizon) or horizon <= 0:
+            raise ValueError("Expected a positive, finite forecast horizon")
+
+        predictions = []
+        best_cost = inf
+
+        def query(layout):
+            nonlocal best_cost
+            row = self.evaluator.evaluate(context, layout)
+            if row.layout != layout:
+                raise ValueError("Evaluator returned a different layout")
+            if row.gpu_seconds is not None and (
+                not isfinite(row.gpu_seconds) or row.gpu_seconds < horizon * layout.gpus
+            ):
+                raise ValueError(
+                    "Prediction violates the native replay GPU-time lower bound"
+                )
+            if _usable(row) and _meets(row, self.target):
+                best_cost = min(best_cost, row.gpu_seconds)
+            predictions.append(row)
+            return row
+
+        source = query(current)
+        splits = self._splits(current, self._actors_for_forecast(forecast))
+
+        def discovery_order(split):
+            preferred = True
+            if source.supported and source.actor_sustainable is False:
+                preferred = split.actor_gpus > current.actor.gpus
+            elif (
+                source.supported
+                and source.actor_sustainable is True
+                and source.request_fraction is not None
+                and source.request_fraction < self.target
+            ):
+                preferred = split.rollout_gpus > current.rollout.gpus
+            distance = abs(split.actor_gpus - current.actor.gpus) + abs(
+                split.rollout_gpus - current.rollout.gpus
+            )
+            return (
+                split.queried,
+                not preferred,
+                distance,
+                split.actor_gpus,
+                split.rollout_gpus,
+            )
+
+        while splits:
+            if best_cost < inf:
+                split = min(
+                    splits,
+                    key=lambda s: (s.gpus, s.queried, s.actor_gpus, s.rollout_gpus),
+                )
+                if horizon * split.gpus >= best_cost:
+                    reason = "Minimum cost certified by GPU-time bound"
+                    break
+            else:
+                split = min(splits, key=discovery_order)
+            if len(predictions) == self.limit:
+                reason = "Query budget exhausted"
+                break
+            query(next(split.layouts))
+            split.queried += 1
+            if split.queried == split.count:
+                splits.remove(split)
+        else:
+            reason = "Catalogue exhausted"
+        winner = select(
+            predictions, current, self.target, trigger=trigger, recovering=recovering
+        )
+        return Decision(
+            current, winner.layout if winner else current, tuple(predictions), reason
+        )
