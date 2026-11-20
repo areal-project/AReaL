@@ -162,6 +162,20 @@ are retained for audit, not parsed for training rewards. Model-attributed failur
 retain interactions with zero reward; system and ambiguous failures are rejected. Result
 shards are written under `arena_result_dump_dir` when configured.
 
+### Per-task reward metrics
+
+Arena logs aggregate and per-Stream rewards by default. To also log
+`debug/task/<data_id>/raw_reward`, add this to the training YAML.
+
+```yaml
+econfig:
+  arena_log_per_task_reward: true
+```
+
+If the field is absent from the YAML, the equivalent CLI override is
+`+econfig.arena_log_per_task_reward=true`. Each distinct dataset task adds a separate
+metric series in W&B.
+
 ### Multimodal request limits
 
 Configure SGLang's item-count limits through the training YAML:

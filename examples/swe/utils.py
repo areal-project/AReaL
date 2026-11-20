@@ -104,6 +104,12 @@ class SWEEnvConfig:
             "help": "Maximum serialized Arena raw payload bytes per audit record."
         },
     )
+    arena_log_per_task_reward: bool = field(
+        default=False,
+        metadata={
+            "help": "Emit a separate raw reward metric for each Arena dataset task."
+        },
+    )
     arena_base_url: str = field(
         default="",
         metadata={
