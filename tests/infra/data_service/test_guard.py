@@ -513,3 +513,23 @@ def test_cleanup_kills_all_running_children(mock_kill, state: GuardState):
     assert mock_kill.call_count == 2
     assert state.forked_children == []
     assert state.forked_children_map == {}
+
+
+@patch("areal.infra.rpc.guard.app.run_with_streaming_logs")
+def test_fork_uses_target_python_when_requested(mock_run, client, state):
+    import sys
+
+    mock_run.return_value = _make_mock_process()
+    state.owned_ports[("worker", 6)] = {9013}
+    state.allocated_ports.add(9013)
+    response = client.post(
+        "/fork",
+        json={
+            "role": "worker",
+            "worker_index": 6,
+            "raw_cmd": ["/actor-only/python", "-m", "some.module"],
+            "use_local_python": True,
+        },
+    )
+    assert response.status_code == 200
+    assert mock_run.call_args.args[0] == [sys.executable, "-m", "some.module"]

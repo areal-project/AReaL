@@ -946,6 +946,9 @@ class RayScheduler(Scheduler):
         if schedulings is None or len(schedulings) == 0:
             raise ValueError(f"No scheduling specs provided for role '{role}'")
 
+        # Never mutate caller configuration: these specs may be reused for roles
+        # running in different images or for a second create_workers call.
+        schedulings = copy.deepcopy(schedulings)
         # Amend environment variables
         for sch in schedulings:
             if sch.additional_bash_cmds:
@@ -953,15 +956,37 @@ class RayScheduler(Scheduler):
                     "RayScheduler does not support SchedulingSpec.additional_bash_cmds. "
                     "Use SchedulingSpec.env_vars for Ray worker environment setup."
                 )
-            # AReaL env var forwarding
+            runtime_env = sch.ray_runtime_env
+            runtime_vars = runtime_env.get("env_vars", {})
+            defaults = get_env_vars()
+            if runtime_env.get("image_uri") or runtime_env.get("container"):
+                # The driver sys.path includes its site-packages. Copying it
+                # into another image silently mixes torch/CUDA installations.
+                defaults.pop("PYTHONPATH", None)
             if self.enable_tms_offload:
-                sch.env_vars.update(get_tms_env_vars())
-            sch.env_vars.update(get_env_vars())
-            thread_env = get_thread_env_vars(
-                cpus_per_task=sch.cpu,
-                existing_env_vars=sch.env_vars,
+                defaults.update(get_tms_env_vars())
+            sch.env_vars = {**defaults, **runtime_vars, **sch.env_vars}
+            sch.env_vars.update(
+                get_thread_env_vars(
+                    cpus_per_task=sch.cpu, existing_env_vars=sch.env_vars
+                )
             )
-            sch.env_vars.update(thread_env)
+            if runtime_env:
+                # Apply before Ray deserializes the launcher, not just to its
+                # child process: AReaL must be importable in the target image.
+                runtime_env["env_vars"] = dict(sch.env_vars)
+
+        if any(sch.ray_runtime_env for sch in schedulings):
+            first = schedulings[0]
+            for sch in schedulings[1:]:
+                if any(
+                    getattr(sch, key) != getattr(first, key)
+                    for key in ("ray_runtime_env", "env_vars", "gpu", "cpu", "mem")
+                ):
+                    raise ValueError(
+                        "Ray runtime environments require uniform runtime_env, "
+                        "env_vars and resources within each role"
+                    )
 
         if len(schedulings) == 1:
             # Expand single spec to all workers
@@ -1078,6 +1103,7 @@ class RayScheduler(Scheduler):
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "use_local_python": True,
                 "env": env or {},
             }
             async with session.post(
@@ -1553,8 +1579,22 @@ class RayScheduler(Scheduler):
                 )
 
             target_workers = self._workers[colocate_role]
-            if num_workers != len(target_workers):
+            if schedulings[0].ray_runtime_env and not strategy.fork:
+                raise WorkerCreationError(
+                    role,
+                    "A role runtime environment cannot reuse the target process",
+                    "Set fork=True for a separate role environment, or leave "
+                    "ray_runtime_env empty to reuse the target worker",
+                )
+            if num_workers != len(target_workers) or schedulings[0].ray_runtime_env:
                 spec = schedulings[0]
+                if spec.ray_runtime_env and spec.gpu <= 0:
+                    raise WorkerCreationError(
+                        role,
+                        "Native runtime environment colocation requires GPUs",
+                        "Use separation for CPU-only roles, or inherit the target "
+                        "environment by leaving ray_runtime_env empty",
+                    )
                 target_gpus = sum(
                     (worker.spec.gpu if worker.spec is not None else 1)
                     for worker in target_workers
@@ -1629,6 +1669,8 @@ class RayScheduler(Scheduler):
                     placement_group_bundle_index=item["bundle_index"],
                     placement_group_capture_child_tasks=True,
                 )
+                if spec.ray_runtime_env:
+                    options["runtime_env"] = spec.ray_runtime_env
                 launcher = RayWorkerProcessLauncher.options(**options).remote(
                     role,
                     self._log_path_of(role),
@@ -1795,6 +1837,13 @@ class RayScheduler(Scheduler):
             [launcher.get_node_info.remote() for launcher in target_launchers],
             timeout=self.startup_timeout,
         )
+        node_ids = [info["node_id"] for info in node_infos]
+        if len(set(node_ids)) != len(node_ids):
+            raise WorkerCreationError(
+                role,
+                "Grouped colocation requires one target launcher per node",
+                "Multiple target launchers on the same node are not supported",
+            )
         groups = group_colocated_gpus(node_infos, gpus_per_worker=spec.gpu)
         if len(groups) != len(schedulings):
             raise WorkerCreationError(
@@ -1823,6 +1872,11 @@ class RayScheduler(Scheduler):
                 launcher = RayWorkerProcessLauncher.options(
                     num_cpus=0,
                     num_gpus=0,
+                    **(
+                        {"runtime_env": spec.ray_runtime_env}
+                        if spec.ray_runtime_env
+                        else {}
+                    ),
                     scheduling_strategy=NodeAffinitySchedulingStrategy(
                         node_id=info["node_id"], soft=False
                     ),
@@ -1839,12 +1893,11 @@ class RayScheduler(Scheduler):
                 batch = []
                 for local_idx, group in enumerate(node_groups):
                     worker_spec = schedulings[worker_idx]
-                    # SGLang colocate derives its physical GPU range from
-                    # SLURM_LOCALID x gpus_per_server, and the AWEX plugin
-                    # derives its transfer rank from SLURM_NODEID/NNODES, so
-                    # grouped workers see the whole node (identity visible
-                    # devices) plus the same env contract the Slurm launcher
-                    # provides.
+                    # Native image workers use their own device namespace;
+                    # training LOCAL_RANK=0 must select this worker's GPU.
+                    # SGLang supports isolated visibility while preserving
+                    # the global AWEX transfer rank through the Slurm IDs.
+                    # Keep the existing full-node mask for legacy launchers.
                     extra_env = {
                         "SLURM_LOCALID": str(local_idx),
                         "SLURM_NODEID": str(node_idx),
@@ -1854,7 +1907,11 @@ class RayScheduler(Scheduler):
                         dict(
                             role=role,
                             worker_index=worker_idx,
-                            gpu_devices=list(info["visible_devices"]),
+                            gpu_devices=(
+                                group["gpu_devices"]
+                                if spec.ray_runtime_env
+                                else list(info["visible_devices"])
+                            ),
                             extra_env=extra_env,
                             cmd=worker_spec.cmd,
                             experiment_name=self.experiment_name,
