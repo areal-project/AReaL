@@ -1,0 +1,35 @@
+tests/test_ray_scheduler.py
+  h_06d481e665ee92 648-655,671-689
+  h_06d481e665ee92 108-110,551-647,656-670,690-772
+areal/infra/scheduler/ray.py
+  h_06d481e665ee92 1582-1588
+  h_06d481e665ee92 949-951,959-965,967-972,974-989,1106,1589,1591-1597,1672-1673,1840-1846,1875-1879,1896-1900,1910-1914
+examples/ray/README.md
+  h_06d481e665ee92 26-35,71-73
+  h_06d481e665ee92 1-25,36-70,74-77
+areal/api/cli_args.py
+  h_06d481e665ee92 1430-1440
+areal/infra/rpc/guard/app.py
+  h_06d481e665ee92 27,416-428
+areal/infra/utils/proc.py
+  h_06d481e665ee92 132
+docs/en/cli_reference.md
+  h_06d481e665ee92 1520-1539
+docs/zh/cli_reference.md
+  h_06d481e665ee92 1518-1537
+tests/infra/data_service/test_guard.py
+  h_06d481e665ee92 516-535
+tests/infra/test_proc.py
+  h_06d481e665ee92 52,230-241
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fb0aa5a268be6051c33e678fc2a447ee418a36f3",
+  "prompts": {},
+  "humans": {
+    "h_06d481e665ee92": {
+      "author": "dingzhiqiang <982887058@qq.com>"
+    }
+  }
+}
