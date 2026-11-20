@@ -23,11 +23,6 @@ def decorate_dense_controller(controller):
 
 
 def main():
-    if sys.argv[1] == "gsm8k":
-        from examples.swe.qwen27b.gsm8k_train import main as gsm8k_main
-
-        gsm8k_main(sys.argv[2:])
-        return
     flash_entry.decorate_controller = decorate_dense_controller
     flash_entry.main(sys.argv[1], sys.argv[2:])
 

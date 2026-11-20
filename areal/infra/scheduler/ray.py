@@ -1579,6 +1579,13 @@ class RayScheduler(Scheduler):
                 )
 
             target_workers = self._workers[colocate_role]
+            if schedulings[0].ray_runtime_env and not strategy.fork:
+                raise WorkerCreationError(
+                    role,
+                    "A role runtime environment cannot reuse the target process",
+                    "Set fork=True for a separate role environment, or leave "
+                    "ray_runtime_env empty to reuse the target worker",
+                )
             if num_workers != len(target_workers) or schedulings[0].ray_runtime_env:
                 spec = schedulings[0]
                 if spec.ray_runtime_env and spec.gpu <= 0:

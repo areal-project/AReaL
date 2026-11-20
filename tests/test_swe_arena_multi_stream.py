@@ -230,93 +230,18 @@ def test_parse_arena_stream_config_rejects_metric_unsafe_name():
         parse_arena_stream_config({"name": "bad/name", "stream_id": "stream-a"})
 
 
-@pytest.mark.parametrize("harnesses", [("", ""), ("h@1", "h@1"), ("", "h@2")])
-def test_load_arena_stream_configs_rejects_duplicate_stream_ids(harnesses):
-    """A copied Stream id must not silently receive multiple mixture weights."""
-    with pytest.raises(ValueError, match="ids must be unique"):
-        load_arena_stream_configs(
-            {
-                "arena_streams": [
-                    {"name": "a", "stream_id": "stream-a", "harness": harnesses[0]},
-                    {"name": "b", "stream_id": "stream-a", "harness": harnesses[1]},
-                ]
-            }
-        )
-
-
-def test_shared_upstream_harness_variants_keep_routing_and_replacement_separate(
-    tmp_path, monkeypatch
-):
-    from areal.api.cli_args import TrainDatasetConfig
-    from areal.dataset.arena_stream import ArenaStreamDataset
-    from areal.utils.dataloader import create_dataloader
-
-    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
-    mapping = tmp_path / "rewards.json"
-    mapping.write_text(
-        json.dumps(
-            {
-                "stream_id": "shared",
-                "count": 1,
-                "items": [
-                    {
-                        "data_id": "env:task@1",
-                        "reward_ref": {"key": "reward", "version": "3"},
-                    }
-                ],
-            }
-        )
-    )
-    entries = [
+def test_load_arena_stream_configs_allows_duplicate_ids_for_logical_harnesses():
+    """One real Stream can have separate logical Harness metric namespaces."""
+    streams = load_arena_stream_configs(
         {
-            "name": variant,
-            "stream_id": "shared",
-            "harness": f"{variant}@1",
-            "llm_protocol": "chat_completions",
-            "reward_mapping_file": str(mapping),
-        }
-        for variant in ("noskill", "self-implement")
-    ]
-    workflow = ArenaStreamAgentWorkflow(
-        econfig={"arena_base_url": "https://arena.example", "arena_streams": entries}
-    )
-    streams = load_arena_stream_configs({"arena_streams": entries})
-    rows = build_weighted_arena_rows(
-        {
-            stream.name: [
-                {
-                    "arena_stream_name": stream.name,
-                    "stream_id": "shared",
-                    "data_id": "env:task@1",
-                }
+            "arena_streams": [
+                {"name": "a", "stream_id": "stream-a"},
+                {"name": "b", "stream_id": "stream-a"},
             ]
-            for stream in streams
-        },
-        streams,
+        }
     )
-    loader = create_dataloader(
-        ArenaStreamDataset(rows, stream_key="arena_stream_name"),
-        rank=0,
-        world_size=1,
-        dataset_config=TrainDatasetConfig(batch_size=2, shuffle=False, drop_last=False),
-    )
-    first = loader.next_arena_rollout(0)
-    second = loader.next_arena_rollout(1)
-    assert first["data_id"] == second["data_id"]
-    assert first["arena_stream_name"] != second["arena_stream_name"]
-    for row in (first, second):
-        stream = workflow._stream_config_for_data(row)
-        assert (
-            workflow._expected_harness(row, stream) == f"{row['arena_stream_name']}@1"
-        )
-        assert workflow._expected_reward_ref(row, stream) == ArenaRewardRefConfig(
-            "reward", "3"
-        )
-    loader.complete_arena_rollout(0, accepted=False)
-    loader.complete_arena_rollout(1, accepted=True)
-    replacement = loader.next_arena_rollout(2)
-    assert replacement["arena_stream_name"] == first["arena_stream_name"]
-    assert loader.state_dict()["debt"][second["arena_stream_name"]] == 0
+    assert [stream.name for stream in streams] == ["a", "b"]
+    assert [stream.stream_id for stream in streams] == ["stream-a", "stream-a"]
 
 
 def test_build_weighted_arena_rows_uses_attempted_group_weights():
@@ -652,11 +577,13 @@ def test_preflight_health_ignores_tasks_without_exact_provenance():
     assert (terminal, failures) == (1, 1)
 
 
+@pytest.mark.parametrize("shared_stream", [False, True])
 @pytest.mark.parametrize("with_observation", [False, True])
 def test_workflow_routes_harness_transform_and_raw_metrics(
-    monkeypatch, tmp_path, with_observation
+    monkeypatch, tmp_path, with_observation, shared_stream
 ):
     """A row should select all rollout and reward settings from its Stream."""
+    second_stream_id = "stream-a" if shared_stream else "stream-b"
     stats_tracker.export_all(reset=True)
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
@@ -680,7 +607,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(
                 },
                 {
                     "name": "b",
-                    "stream_id": "stream-b",
+                    "stream_id": second_stream_id,
                     "harness": "codex@2",
                     "task_envs": {"MODE": "b"},
                     "expected_reward_ref": {"key": "reward-b", "version": "2"},
@@ -748,7 +675,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(
     monkeypatch.setattr(workflow.client, "delete_llm_proxy_async", delete)
     data = {
         "arena_stream_name": "b",
-        "stream_id": "stream-b",
+        "stream_id": second_stream_id,
         "data_id": "data-b",
         "reward_ref_key": "reward-b",
         "reward_ref_version": "2",
@@ -770,7 +697,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(
     reward = asyncio.run(run_workflow())
 
     assert reward == pytest.approx(0.75)
-    assert launched["stream_id"] == "stream-b"
+    assert launched["stream_id"] == second_stream_id
     assert launched["harness"] == "codex@2"
     assert launched["task_envs"] == {"MODE": "b"}
     stats = stats_tracker.export_all(reset=True)

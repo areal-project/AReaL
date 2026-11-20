@@ -645,6 +645,14 @@ def test_native_colocation_creates_image_launcher_without_more_gpus(
             type="colocation", target="actor", fork=fork
         ),
     )
+    if not fork:
+        with pytest.raises(
+            WorkerCreationError, match="cannot reuse the target process"
+        ):
+            scheduler.create_workers(job)
+        assert not options_seen
+        assert not batches
+        return
     assert scheduler.create_workers(job) == [f"rollout/{i}" for i in range(replicas)]
     assert len(options_seen) == 1
     opts = options_seen[0]
@@ -658,6 +666,25 @@ def test_native_colocation_creates_image_launcher_without_more_gpus(
     assert [w["gpu_devices"] for w in batches[0]] == [
         [str(j) for j in range(i * gpus, (i + 1) * gpus)] for i in range(replicas)
     ]
+
+
+def test_colocation_env_only_runtime_cannot_override_process_reuse(tmp_path):
+    scheduler = _scheduler(tmp_path)
+    scheduler._workers["actor"] = [_worker_info("actor/0")]
+    job = Job(
+        role="rollout",
+        replicas=1,
+        tasks=[
+            SchedulingSpec(
+                cpu=1, gpu=1, ray_runtime_env={"env_vars": {"ROLE_ENV": "rollout"}}
+            )
+        ],
+        scheduling_strategy=SchedulingStrategy(
+            type="colocation", target="actor", fork=False
+        ),
+    )
+    with pytest.raises(WorkerCreationError, match="cannot reuse the target process"):
+        scheduler.create_workers(job)
 
 
 def test_native_separation_passes_runtime_env_before_launcher_import(

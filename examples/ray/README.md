@@ -23,11 +23,16 @@ rollout:
 ```
 
 Use an allocation mode and scheduling strategy appropriate for the experiment. For
-colocation, AReaL places a separate launcher for the second role on each target node,
-without reserving the GPUs again. Each worker receives its assigned GPU visibility mask.
-Proxy workers inherit the rollout environment and use its Python interpreter. The
-existing controller still manages model offload, reload and weight transfer; selecting
-an image does not release GPU memory.
+colocation with a role runtime environment, set `fork: true`. `fork: false` reuses the
+target process and cannot provide a separate environment, even if the runtime
+environment contains only `env_vars`. To reuse the target process, leave
+`ray_runtime_env` empty and configure the environment on the target role before it
+starts. A reused process cannot provide an independent environment for the second role.
+Conflicting settings are rejected before launching workers. AReaL places a separate
+launcher for the second role on each target node, without reserving the GPUs again. Each
+worker receives its assigned GPU visibility mask. Proxy workers inherit the rollout
+environment and use its Python interpreter. The existing controller still manages model
+offload, reload and weight transfer; selecting an image does not release GPU memory.
 
 Ray's native image support uses Podman on the raylet node. The worker containers connect
 to the existing raylet; they do not start additional raylets. If the raylet itself runs
@@ -62,6 +67,9 @@ environment variables and CPU/GPU/memory requests. Explicit `env_vars` on the sc
 specification override `ray_runtime_env.env_vars`. With image runtime environments,
 AReaL does not copy the driver's generated `PYTHONPATH`; set an explicit path only if
 the corresponding source is mounted inside that image.
+
+This example covers container images. Isolation for non-image runtime environments such
+as Ray `pip` or `conda` environments has not been validated by this recipe.
 
 See Ray's
 [runtime environment API](https://docs.ray.io/en/latest/ray-core/api/doc/ray.runtime_env.RuntimeEnv.html)

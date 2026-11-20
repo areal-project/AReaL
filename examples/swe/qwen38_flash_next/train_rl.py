@@ -277,15 +277,13 @@ def main(profile, args):
 
     class RecipeTrainer(PPOTrainer):
         def _init_scheduler(self):
-            if self.config.scheduler.type == "slurm":
-                scheduler = SlurmScheduler(
+            return configure_training_rpc(
+                SlurmScheduler(
                     exp_config=self.config,
                     container_mounts=os.environ["QWEN_MOUNTS"],
                     startup_timeout=86400,
                 )
-            else:
-                scheduler = super()._init_scheduler()
-            return configure_training_rpc(scheduler)
+            )
 
     # This public controller hook supplies SGLang options missing from the config
     # schema. Restore the factory even if initialization or training fails.
