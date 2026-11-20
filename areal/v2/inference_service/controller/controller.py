@@ -15,6 +15,7 @@ import concurrent.futures
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -23,6 +24,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, Callable
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
 
@@ -565,6 +567,8 @@ class RolloutControllerV2:
                 dict(inf_spec.env_vars),
                 server_args,
             )
+            if self._ray_pool is not None and inf_backend == "sglang":
+                await self._async_stage_sglang_jit_cache()
         logger.info("Inference servers: %s", self._inf_addrs)
 
         router_host, router_port = await router_task
@@ -702,6 +706,46 @@ class RolloutControllerV2:
         self._forked_services.append((guard_addr_0, "gateway", 0))
         self._gateway_addr = f"http://{format_hostport(gw_host, gw_port)}"
         logger.info("Gateway: %s", self._gateway_addr)
+
+    async def _async_stage_sglang_jit_cache(self) -> None:
+        # Guard and SGLang share the node-local TVM cache. One RPC per host.
+        pool = {w.ip: w for w in self.workers}
+        sources = {w.ip: w for w in self._inference_workers}
+        targets = [pool[ip] for ip in sorted(pool.keys() - sources.keys())]
+        if not targets or not self.scheduler.fileroot:
+            return
+        client = await self._get_async_client()
+
+        async def configure(worker: Worker, action: str, directory: str) -> None:
+            addr = format_hostport(worker.ip, int(worker.worker_ports[0]))
+            response = await client.post(
+                f"http://{addr}/configure",
+                json={"sglang_jit_cache": {"action": action, "directory": directory}},
+                timeout=self.config.setup_timeout,
+            )
+            response.raise_for_status()
+            logger.info("SGLang JIT %s on %s: %s", action, worker.ip, response.json())
+
+        try:
+            parent = logging.get_experiment_log_path(
+                self.scheduler.experiment_name,
+                self.scheduler.trial_name,
+                self.scheduler.fileroot,
+            )
+            with tempfile.TemporaryDirectory(dir=parent, prefix=".sglang-jit-") as tmp:
+                for action, workers in (
+                    ("export", sources.values()),
+                    ("install", targets),
+                ):
+                    results = await asyncio.gather(
+                        *(configure(w, action, Path(tmp).name) for w in workers),
+                        return_exceptions=True,
+                    )
+                    for result in results:
+                        if isinstance(result, Exception):
+                            logger.warning("SGLang JIT %s skipped: %s", action, result)
+        except OSError as exc:
+            logger.warning("SGLang JIT staging unavailable: %s", exc)
 
     async def _async_fork_inf_servers(
         self,
