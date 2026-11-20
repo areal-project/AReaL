@@ -185,6 +185,20 @@ it. Ray worker-death and OOM errors enter the launcher's failure/post-exit path;
 does not prove that a dead worker's Arena jobs have been reclaimed. Guaranteed recovery
 of these cases requires service-side expiry or reconciliation.
 
+### Per-task reward metrics
+
+Arena logs aggregate and per-Stream rewards by default. To also log
+`debug/task/<data_id>/raw_reward`, add this to the training YAML.
+
+```yaml
+econfig:
+  arena_log_per_task_reward: true
+```
+
+If the field is absent from the YAML, the equivalent CLI override is
+`+econfig.arena_log_per_task_reward=true`. Each distinct dataset task adds a separate
+metric series in W&B.
+
 ### Multimodal request limits
 
 Configure SGLang's item-count limits through the training YAML:

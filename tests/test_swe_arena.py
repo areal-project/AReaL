@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -17,6 +18,7 @@ from examples.swe.arena_client import (
     resolve_llm_protocol,
 )
 from examples.swe.filter_function import filter_function
+from examples.swe.utils import SWEEnvConfig
 
 from areal.experimental.openai.proxy.workflow import OpenAIProxyWorkflow
 from areal.infra import workflow_context
@@ -1711,8 +1713,18 @@ def test_agent_passes_configured_threshold_to_custom_reward_transform(monkeypatc
     assert asyncio.run(run_agent()) == 0.875
 
 
-def test_agent_records_global_and_domain_raw_reward_after_transform(monkeypatch):
-    """Reward metrics should expose values on both sides of the transform."""
+@pytest.mark.parametrize(
+    ("config_override", "expect_per_task_reward"),
+    [
+        pytest.param({}, False, id="default"),
+        pytest.param({"arena_log_per_task_reward": False}, False, id="disabled"),
+        pytest.param({"arena_log_per_task_reward": True}, True, id="enabled"),
+    ],
+)
+def test_agent_records_per_task_raw_reward_only_when_enabled(
+    monkeypatch, config_override, expect_per_task_reward
+):
+    """Publish aggregate rewards in all modes and per-task rewards only on opt-in."""
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "test-llm-key")
     _reset_stats()
@@ -1724,10 +1736,13 @@ def test_agent_records_global_and_domain_raw_reward_after_transform(monkeypatch)
         "examples.swe.arena_agent.import_from_string", lambda _: transform
     )
     workflow = ArenaStreamAgentWorkflow(
-        econfig={
-            "arena_base_url": "https://arena.example",
-            "arena_reward_transform_fn": "tests.test_swe_arena.transform",
-        }
+        econfig=asdict(
+            SWEEnvConfig(
+                arena_base_url="https://arena.example",
+                arena_reward_transform_fn="tests.test_swe_arena.transform",
+                **config_override,
+            )
+        )
     )
 
     async def fake_register(**_kwargs):
@@ -1745,7 +1760,7 @@ def test_agent_records_global_and_domain_raw_reward_after_transform(monkeypatch)
 
     data = {
         "stream_id": "stream-1",
-        "data_id": "data-1",
+        "data_id": "env:example@1.0.0",
         "arena_task_type": "swe",
     }
 
@@ -1767,8 +1782,14 @@ def test_agent_records_global_and_domain_raw_reward_after_transform(monkeypatch)
     assert stats["rollout/raw_reward"] == pytest.approx(0.75)
     assert stats["rollout/swe/reward"] == pytest.approx(0.075)
     assert stats["rollout/swe/raw_reward"] == pytest.approx(0.75)
-    assert stats["debug/task/data-1/raw_reward"] == pytest.approx(0.75)
-    assert "rollout/task/data-1/raw_reward" not in stats
+    assert stats["rollout/stream/default/arena_score"] == pytest.approx(0.75)
+    assert stats["rollout/stream/default/training_score"] == pytest.approx(0.075)
+    task_metric = f"task/{data['data_id']}/raw_reward"
+    if expect_per_task_reward:
+        assert stats[f"debug/{task_metric}"] == pytest.approx(0.75)
+    else:
+        assert f"debug/{task_metric}" not in stats
+    assert f"rollout/{task_metric}" not in stats
 
 
 def test_agent_records_global_and_domain_pass_at_k(monkeypatch):
