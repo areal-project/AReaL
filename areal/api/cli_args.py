@@ -2696,6 +2696,20 @@ class SGLangConfig:
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
     mm_attention_backend: str | None = None
+    linear_attn_decode_backend: str | None = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": "Linear attention kernel backend for decode. None lets SGLang select the backend."
+        },
+    )
+    linear_attn_prefill_backend: str | None = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": "Linear attention kernel backend for prefill. None lets SGLang select the backend."
+        },
+    )
     enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
     limit_mm_data_per_request: dict[str, int] | None = field(
