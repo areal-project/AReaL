@@ -26,6 +26,7 @@ from areal.v2.inference_service.data_proxy.session import (
     SessionData,
     SessionStore,
 )
+from areal.v2.inference_service.router.state import SessionRegistry
 
 # =============================================================================
 # Fixtures
@@ -198,7 +199,7 @@ class TestSessionStore:
     def test_start_session_returns_ids(self):
         store = SessionStore()
         session_id, api_key = store.start_session("task-1")
-        assert session_id == "task-1-0"
+        assert session_id.startswith("task-1-")
         assert isinstance(api_key, str)
         assert len(api_key) > 0
 
@@ -359,12 +360,27 @@ class TestSessionStore:
         assert store.get_session(session_id) is None
         assert store.get_session_by_api_key(api_key) is None
 
-    def test_duplicate_session_ids_increment(self):
+    def test_start_session_does_not_reuse_id_for_same_task(self):
+        """A new session for the same task gets a distinct ID after cleanup."""
         store = SessionStore()
         sid1, _ = store.start_session("task-1")
         sid2, _ = store.start_session("task-1")
-        assert sid1 == "task-1-0"
-        assert sid2 == "task-1-1"
+        store.remove_session(sid1)
+        sid3, _ = store.start_session("task-1")
+        assert len({sid1, sid2, sid3}) == 3
+
+    @pytest.mark.asyncio
+    async def test_late_registration_preserves_retry_route(self) -> None:
+        first_id, first_key = SessionStore().start_session("task-1")
+        retry_id, retry_key = SessionStore().start_session("task-1")
+        registry = SessionRegistry()
+
+        await registry.register_session(retry_key, retry_id, "proxy-b")
+        await registry.register_session(first_key, first_id, "proxy-a")
+
+        assert await registry.lookup_by_id(retry_id) == "proxy-b"
+        assert await registry.revoke_session(retry_id)
+        assert await registry.lookup_by_id(first_id) == "proxy-a"
 
     def test_get_or_create_hitl_session_reuses_same_session(self):
         store = SessionStore()
@@ -690,13 +706,21 @@ async def test_chat_completions_passes_sampling_params(client, mock_areal_client
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_deterministic_seed_distinguishes_group_sessions(
-    client, config, mock_areal_client
+@pytest.mark.parametrize(
+    ("task_id", "seed_identities"),
+    [
+        pytest.param("seed-test", ["seed-test:0", "seed-test:1"], id="group"),
+        pytest.param("", [""], id="empty-task-id"),
+    ],
+)
+async def test_chat_completions_deterministic_seed_uses_task_identity(
+    client, config, mock_areal_client, task_id, seed_identities
 ):
+    """Derive seeds from logical task identities independently of session IDs."""
     config.deterministic_sampling = True
     resp = await client.post(
         "/rl/start_session",
-        json={"task_id": "seed-test", "group_size": 2},
+        json={"task_id": task_id, "group_size": len(seed_identities)},
         headers=admin_headers(),
     )
     sessions = resp.json()["sessions"]
@@ -717,10 +741,9 @@ async def test_chat_completions_deterministic_seed_distinguishes_group_sessions(
         for call in mock_areal_client.chat.completions.create.call_args_list
     ]
     assert seeds == [
-        derive_deterministic_seed("seed-test:0", 0),
-        derive_deterministic_seed("seed-test:1", 0),
+        derive_deterministic_seed(identity, 0) for identity in seed_identities
     ]
-    assert seeds[0] != seeds[1]
+    assert len(set(seeds)) == len(seed_identities)
 
 
 @pytest.mark.asyncio

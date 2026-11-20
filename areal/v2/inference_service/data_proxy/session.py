@@ -154,7 +154,9 @@ class SessionData:
         self.session_id = session_id
         self.processor_cache = processor_cache
         self.processor_cache_group_id = processor_cache_group_id
-        self.sampling_seed_identity = sampling_seed_identity or session_id
+        self.sampling_seed_identity = (
+            session_id if sampling_seed_identity is None else sampling_seed_identity
+        )
         self._set_reward_finish_timeout = set_reward_finish_timeout
         self._prefix_matcher = prefix_matcher
         self._last_access_time = time.time()
@@ -472,10 +474,8 @@ class SessionStore:
                 raise ValueError(
                     "A shared processor cache requires at least two sessions"
                 )
-            idx = 0
-            while f"{task_id}-{idx}" in self._sessions:
-                idx += 1
-            session_id = f"{task_id}-{idx}"
+            # The Router indexes sessions from every Data Proxy by ID.
+            session_id = f"{task_id}-{uuid.uuid4().hex}"
 
             if api_key:
                 session_api_key = api_key
@@ -545,8 +545,8 @@ class SessionStore:
         self, session_id: str, *, expected_session: SessionData | None = None
     ) -> None:
         with self._lock:
-            # Scoring awaits external code. Another exporter may remove this
-            # session and a new request may reuse its ID while we are waiting.
+            # Scoring awaits external code. The HITL session can be removed
+            # and recreated with the same ID during that wait.
             if (
                 expected_session is not None
                 and self._sessions.get(session_id) is not expected_session
