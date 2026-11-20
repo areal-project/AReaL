@@ -4,6 +4,7 @@ import importlib.util
 import json
 import subprocess
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from omegaconf import OmegaConf
@@ -49,6 +50,74 @@ def test_bootstrap_head_registers_npu_resource(monkeypatch):
     assert not any(arg.startswith("--num-gpus") for arg in start_command)
     resources_arg = next(arg for arg in start_command if arg.startswith("--resources="))
     assert json.loads(resources_arg.split("=", 1)[1]) == {"NPU": 8}
+
+
+@pytest.mark.parametrize("available_gpus", [15, 16])
+def test_run_node_checks_resources_before_running_head_command(
+    monkeypatch, tmp_path, available_gpus
+):
+    """The same module assembles, checks, and eventually stops Ray."""
+    import areal.infra.launcher.ray_bootstrap as bootstrap
+
+    config = bootstrap.BootstrapConfig(
+        "head", "192.0.2.1", 2, 8, rendezvous_file=tmp_path / "job" / "head"
+    )
+    start, shutdown, stop = Mock(), Mock(), Mock()
+    driver = Mock(return_value=SimpleNamespace(returncode=-15))
+    monkeypatch.setattr(bootstrap, "bootstrap_head", start)
+    monkeypatch.setattr(bootstrap, "stop_local_ray", stop)
+    monkeypatch.setattr(bootstrap.ray, "shutdown", shutdown)
+    monkeypatch.setattr(
+        bootstrap.ray, "nodes", lambda: [{"Alive": True, "Resources": {"GPU": 8}}] * 2
+    )
+    monkeypatch.setattr(
+        bootstrap.ray, "available_resources", lambda: {"GPU": available_gpus}
+    )
+    monkeypatch.setattr(bootstrap.subprocess, "run", driver)
+    monkeypatch.setenv("RAY_ADDRESS", "inherited")
+
+    if available_gpus == 16:
+        assert bootstrap.run_node(config, ["bash", "train.sh"]) == 143
+        assert driver.call_args.kwargs["env"]["RAY_ADDRESS"] == "192.0.2.1:6379"
+    else:
+        with pytest.raises(RuntimeError, match="Only 15"):
+            bootstrap.run_node(config, ["bash", "train.sh"])
+        driver.assert_not_called()
+
+    assert (tmp_path / "job" / "head").read_text() == "192.0.2.1:6379\n"
+    assert bootstrap.os.environ["RAY_ADDRESS"] == "inherited"
+    start.assert_called_once()
+    shutdown.assert_called_once()
+    stop.assert_called_once()
+
+
+def test_run_node_worker_reads_rendezvous_and_does_not_run_command(
+    monkeypatch, tmp_path
+):
+    """The worker joins the published head and never starts training."""
+    import areal.infra.launcher.ray_bootstrap as bootstrap
+
+    address_file = tmp_path / "job" / "head"
+    config = bootstrap.BootstrapConfig(
+        "worker", "192.0.2.2", 2, 8, rendezvous_file=address_file
+    )
+    bootstrap.reserve_rendezvous(address_file)
+    bootstrap.publish_head(address_file, "192.0.2.1:6380")
+    with pytest.raises(FileExistsError):
+        bootstrap.reserve_rendezvous(address_file)
+
+    def join(*_args, **_kwargs):
+        assert bootstrap.os.environ["AREAL_MASTER_ADDR"] == "192.0.2.1"
+
+    worker, driver = Mock(side_effect=join), Mock()
+    monkeypatch.delenv("AREAL_MASTER_ADDR", raising=False)
+    monkeypatch.setattr(bootstrap, "bootstrap_worker", worker)
+    monkeypatch.setattr(bootstrap.subprocess, "run", driver)
+
+    assert bootstrap.run_node(config, ["bash", "train.sh"]) == 0
+    worker.assert_called_once_with("192.0.2.2", 8, ray_port=6380, wait_timeout=900)
+    driver.assert_not_called()
+    assert "AREAL_MASTER_ADDR" not in bootstrap.os.environ
 
 
 def test_bootstrap_worker_times_out_and_cleans_up(monkeypatch):
