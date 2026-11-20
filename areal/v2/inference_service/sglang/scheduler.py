@@ -37,10 +37,10 @@ class AwexSchedulerBridge:
         self._result_push: zmq.Socket | None = None
 
         result_ipc = os.environ.get(RESULT_IPC_ENV)
-        # Only tp_rank==0 AND dp_rank==0 should push results to avoid
-        # duplicate/corrupted messages on the single PULL socket.
+        # All ranks participate in the commands. One rank replies per replica.
         if (
             result_ipc
+            and scheduler.pp_rank == 0
             and scheduler.tp_rank == 0
             and (getattr(scheduler, "dp_rank", None) is None or scheduler.dp_rank == 0)
         ):
@@ -71,6 +71,41 @@ class AwexSchedulerBridge:
         for name in methods:
             setattr(self._scheduler, name, getattr(self, name))
 
+        if self._scheduler.pp_size > 1 and not self._scheduler.pp_group.is_last_rank:
+            self._forward_before_awex()
+
+    def _forward_before_awex(self) -> None:
+        """Let downstream stages receive AWEX RPCs before entering collectives."""
+        from sglang.srt.managers.io_struct import RpcReqInput
+
+        scheduler = self._scheduler
+        process = scheduler.process_input_requests
+        send = scheduler._pp_send_pyobj_to_next_stage
+        # SGLang passes the same request list to process_input_requests and
+        # then to the asynchronous PP send. Dispatch AWEX after that send.
+        deferred = None
+
+        def process_requests(requests: list[Any]) -> None:
+            nonlocal deferred
+            if any(
+                isinstance(req, RpcReqInput) and req.method.startswith("awex_")
+                for req in requests
+            ):
+                deferred = requests
+            else:
+                process(requests)
+
+        def forward(data: Any, async_send: bool = False):
+            nonlocal deferred
+            work = send(data, async_send=async_send)
+            if deferred is not None and data is deferred:
+                deferred = None
+                process(data)
+            return work
+
+        scheduler.process_input_requests = process_requests
+        scheduler._pp_send_pyobj_to_next_stage = forward
+
     def _require_adapter(self) -> Any:
         if self._adapter is None:
             from areal.engine.awex.adapters.sglang_adapter import (
@@ -89,10 +124,10 @@ class AwexSchedulerBridge:
         local_meta = adapter.get_weight_metadata(parameter_layout=parameter_layout)
         s = self._scheduler
 
-        # All-gather across TP ranks so rank 0 returns aggregated metadata
-        if s.tp_size > 1:
-            gathered: list[list] = [[] for _ in range(s.tp_size)]
-            dist.all_gather_object(gathered, local_meta, group=s.tp_cpu_group)
+        if s.pp_size > 1 or s.tp_size > 1:
+            group = s.world_group.cpu_group if s.pp_size > 1 else s.tp_cpu_group
+            gathered = [[] for _ in range(dist.get_world_size(group))]
+            dist.all_gather_object(gathered, local_meta, group=group)
             all_meta: list = []
             for rank_meta in gathered:
                 all_meta.extend(rank_meta)
