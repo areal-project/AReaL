@@ -2014,10 +2014,25 @@ class RolloutControllerV2:
     async def _async_pause_generation(self) -> None:
         self._reconfiguration_prepared = False
         await self._post_to_proxies(self._data_proxy_addrs, "/hold_generation", {})
-        await self._post_to_proxies(
-            self._backend_proxy_addrs(), "/pause_generation", {}
-        )
-        await self._post_to_proxies(self._data_proxy_addrs, "/wait_generation_idle", {})
+        backends = self._backend_proxy_addrs()
+        if self.rollout_alloc is not None and self.rollout_alloc.backend == "sglang":
+            # Keep SGLang admission open until segments already sent by the
+            # proxies have arrived and returned their (possibly partial) tokens.
+            async with asyncio.TaskGroup() as group:
+                idle = group.create_task(
+                    self._post_to_proxies(
+                        self._data_proxy_addrs, "/wait_generation_idle", {}
+                    )
+                )
+                while not idle.done():
+                    await self._post_to_proxies(backends, "/interrupt_generation", {})
+                    await asyncio.wait({idle}, timeout=1.0)
+            await self._post_to_proxies(backends, "/pause_generation", {})
+        else:
+            await self._post_to_proxies(backends, "/pause_generation", {})
+            await self._post_to_proxies(
+                self._data_proxy_addrs, "/wait_generation_idle", {}
+            )
         self._reconfiguration_prepared = True
 
     def rebind_backends(self, proxy_backends: dict[str, str]) -> None:

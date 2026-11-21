@@ -139,6 +139,15 @@ class InfBridge:
 
     # -- pause / resume -----------------------------------------------------
 
+    async def interrupt_sglang_generation(self) -> None:
+        """Abort scheduled segments while late arrivals can still be admitted."""
+        if not self._generation_held:
+            raise RuntimeError("Hold generation before interrupting segments")
+        response = await self._control_client.post(
+            f"{self.backend_addr}/abort_request", json={"abort_all": True}, timeout=10.0
+        )
+        response.raise_for_status()  # SGLang returns an empty 200 response.
+
     async def pause(self) -> None:
         """Pause generation by setting pause_state and calling the backend."""
         await self.pause_state.set_paused(True)

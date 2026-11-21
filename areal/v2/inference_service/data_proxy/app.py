@@ -581,6 +581,13 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         await require_bridge(request).wait_generation_idle()
         return {"status": "ok"}
 
+    @app.post("/interrupt_generation")
+    async def interrupt_generation(request: Request):
+        if app.state.config.backend_type != "sglang":
+            raise HTTPException(status_code=400, detail="Requires SGLang")
+        await require_bridge(request).interrupt_sglang_generation()
+        return {"status": "ok"}
+
     @app.post("/release_generation")
     async def release_generation(request: Request):
         await require_bridge(request).release_generation()

@@ -2651,11 +2651,13 @@ class MegatronEngine(TrainEngine):
                 res = reorder_and_pad_outputs(
                     outputs, output_seqlens, mb_list, aggregate_fn
                 )
-        res = broadcast_tensor(
-            res,
-            src_rank=mpu.get_pipeline_model_parallel_last_rank(),
-            group=mpu.get_pipeline_model_parallel_group(),
-        )
+        if mpu.get_pipeline_model_parallel_world_size() > 1:
+            res = broadcast_tensor(
+                res,
+                src_rank=mpu.get_pipeline_model_parallel_last_rank(),
+                group=mpu.get_pipeline_model_parallel_group(),
+            )
+        assert res is not None
         if meta is None:
             return res
         return split_batch(res, meta)
