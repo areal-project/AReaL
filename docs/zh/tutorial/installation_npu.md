@@ -29,6 +29,7 @@
 | Docker          |                                                                                 27.2.0                                                                                 |
 | AReaL 镜像 (A2) |                                                           `ghcr.io/hwvanici/areal_npu:v1.0.5-a2`（详见下文）                                                           |
 | AReaL 镜像 (A3) |                                                           `ghcr.io/hwvanici/areal_npu:v1.0.5-a3`（详见下文）                                                           |
+| AReaL 镜像 (A5) |                                                           `ghcr.io/hwvanici/areal_npu:v1.0.5-a5`（详见下文）                                                           |
 
 **注意**：本教程不涵盖 CANN 的安装或共享存储挂载，因为这些取决于您特定的节点配置和系统版本。请独立完成这些安装。您可以从 vLLM-Ascend
 社区查看更多详情[此页面](https://docs.vllm.ai/projects/ascend/en/latest/installation.html)。
@@ -39,15 +40,18 @@
 `ascend-v1.0.5` 分支上的
 [`Dockerfile.a2`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.5/Dockerfile.a2)
 /
-[`Dockerfile.a3`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.5/Dockerfile.a3)），并预装以下依赖栈。下表版本与已发布的
-`v1.0.5` 镜像一致：
+[`Dockerfile.a3`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.5/Dockerfile.a3)）。A5
+镜像面向昇腾 950，使用
+[`Dockerfile.a5`](https://github.com/HwVanICI/AReaL/blob/33d8d7b14be86bbc559364927abee8ffaea62ffa/Dockerfile.a5)
+构建。下表列出了各发布镜像的运行环境版本。
 
 | 组件            |                        版本                         |
 | --------------- | :-------------------------------------------------: |
 | 基础镜像 (A2)   | `quay.io/ascend/cann:9.0.1-910b-ubuntu22.04-py3.11` |
 | 基础镜像 (A3)   |  `quay.io/ascend/cann:9.0.1-a3-ubuntu22.04-py3.11`  |
-| 运行时操作系统  |                 Ubuntu 22.04.5 LTS                  |
-| Python          |                       3.11.15                       |
+| 基础镜像 (A5)   | `quay.io/ascend/cann:9.0.1-950-ubuntu22.04-py3.12`  |
+| 运行时操作系统  |   Ubuntu 22.04.5 LTS（A2/A3）、Ubuntu 22.04（A5）   |
+| Python          |           3.11.15（A2/A3）、3.12.13（A5）           |
 | CANN            |                        9.0.1                        |
 | PyTorch         |                       2.10.0                        |
 | torch_npu       |                    2.10.0.post2                     |
@@ -67,9 +71,10 @@
 WORK_DIR=<your_workspace>
 CONTAINER_WORK_DIR=<your_container_workspace>
 
-# 根据您的硬件类型使用 A2/A3 镜像
+# 根据您的硬件类型使用 A2/A3/A5 镜像
 # IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.5-a2
 IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.5-a3
+# IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.5-a5
 CONTAINER_NAME=areal_npu
 
 cd ${WORK_DIR}
@@ -120,11 +125,11 @@ ${IMAGE}  \
 ```bash
 rm -rf /AReaL
 
-git clone https://github.com/areal-project/AReaL
+# A2/A3
+git clone -b ascend-v1.0.5 https://github.com/areal-project/AReaL
+# 如果使用 A5，请改用下面这条克隆命令：
+# git clone -b ascend-950-dev https://github.com/HwVanICI/AReaL
 cd AReaL
-
-# 切换到 ascend 分支
-git checkout ascend-v1.0.5
 
 # 安装 AReaL。所有 Python 依赖（来自 pyproject.npu.toml）已预装在镜像中，
 # 因此只需安装 AReaL 包本身。
