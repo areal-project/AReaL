@@ -158,3 +158,67 @@ def get_gsm8k_rl_dataset(
 
     return dataset
 ```
+
+## Prepare and validate a local dataset offline
+
+Run this example in the prepared Python 3.12+ CPU environment. The neutral directory
+names select the generic loader. It reads prepared records as saved. Apply any
+tokenization or length filtering before saving them. For text RL, the workflow uses
+`messages` as the prompt and passes the row's fields to the reward function, including
+the reference `answer` consumed by the GSM8K reward.
+
+```python
+from pathlib import Path
+from subprocess import run
+from sys import executable
+from tempfile import TemporaryDirectory
+
+from datasets import Dataset, DatasetDict
+
+from areal.dataset import get_custom_dataset
+
+rows = [
+    {"messages": [{"role": "user", "content": question}], "answer": answer}
+    for question, answer in [("8 + 3 = ?", "11"), ("14 - 6 = ?", "8"), ("4 * 7 = ?", "28")]
+]
+with TemporaryDirectory(prefix="local-math-") as root:
+    data = Dataset.from_list(rows)
+    single = str(Path(root) / "examples")
+    data.save_to_disk(single)
+    loaded = get_custom_dataset(path=single, type="rl")
+    assert len(loaded) == 3
+    assert list(loaded) == rows
+
+    splits = str(Path(root) / "splits")
+    DatasetDict(train=data.select([0, 1]), validation=data.select([2])).save_to_disk(splits)
+    for name, count in [("train", 2), ("validation", 1)]:
+        assert len(get_custom_dataset(path=splits, type="rl", split=name)) == count
+    try:
+        get_custom_dataset(path=splits, type="rl", split="holdout")
+    except ValueError as error:
+        assert all(name in str(error) for name in ("holdout", "train", "validation"))
+    else:
+        raise AssertionError("Expected ValueError for missing holdout split")
+
+    run(
+        [executable, "-m", "areal.dataset.validate", single,
+         "--profile", "text-rl", "--require-field", "answer"],
+        check=True,
+    )
+```
+
+The final command prints `checked=3 valid=3 invalid=0`. For a saved DatasetDict, pass
+`--split train` or another available split. JSONL files can be checked directly. The
+supported text profiles are:
+
+- `text-rl` checks message objects with a system, user, or assistant role and string
+  content. Repeat `--require-field` to require additional keys.
+- `tokenized-sft` checks equal non-empty lists of non-negative integer token IDs
+  (excluding booleans) and binary loss masks (including booleans), with at least one
+  supervised token. Use `--max-length N` to bound sequence length.
+
+Use `--report PATH` for JSON counts and ordered diagnostics with a field, code, and
+one-based file line or zero-based dataset row. JSONL is read one line at a time.
+`--max-errors N` bounds stored diagnostics (default 20); scanning continues and
+`truncated` records omitted details. Exit status is 0 for valid data, 1 for invalid or
+empty data, and 2 for usage or I/O errors.
