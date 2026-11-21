@@ -73,9 +73,42 @@ actor:
 
 TIS uses detached current-trainer/sampler probability ratios, capped at `upper`. The
 correction centers the weighted scores; it is not multiplied by the sampled weight
-again. Sequence-level rejection, masking, KL metrics and positive lower bounds are
-unsupported. `upper` must be finite, greater than one and representable in FP32. The
-existing default cap remains unchanged.
+again. TIS requires `lower: null`. `upper` must be finite, greater than one and
+representable in FP32. The existing default cap remains unchanged.
+
+To combine SC with token-level IcePop, replace the rejection configuration with:
+
+```yaml
+actor:
+  use_score_centering: true
+  recompute_logprob: false
+  use_decoupled_loss: false
+  rejection_sampling:
+    level: token
+    metric: ratio
+    action: mask
+    lower: 0.5
+    upper: 5.0
+```
+
+The sampled-token weight is the detached current-trainer/sampler probability ratio
+inside the inclusive bounds and zero outside. A null lower bound means zero; the upper
+bound must be finite, greater than one and representable in FP32. The correction centers
+this same weighted score using the sampler heads and a tail modeled as proportional to
+the trainer distribution. All correction coefficients are detached; only the final
+trainer log-probability factor is differentiated.
+
+With SC enabled, rejecting a sampled token does **not** remove its context from the
+correction or change the original loss normalization. This differs from the ordinary
+rejection path's loss-mask filtering. Sampling itself remains untruncated:
+`score_centering_top_k` collects a head for the correction, rather than restricting
+which tokens can be sampled. Sequence-level rejection, KL-based filters and decoupled
+PPO remain unsupported with SC.
+
+IcePop reuses the existing FSDP and Megatron loss paths without new configuration fields
+or dependencies. The proportional-tail model, denominator floor and floating-point
+behavior at hard thresholds remain approximation/numerical limits. This support does not
+establish a reward or convergence improvement over IcePop alone.
 
 Ordinary FSDP training supports TP and Ulysses CP, including TP=2/CP=2. Configure the
 actor allocation with the existing parallelism syntax, for example `fsdp:d1t2c2`, and
@@ -106,6 +139,7 @@ padding and inactive partitions, actor alignment and sampler metadata. Run:
 
 ```bash
 python -m pytest tests/test_score_centering.py tests/test_score_centering_tis.py \
+  tests/test_score_centering_icepop.py \
   tests/test_score_centering_vocab_parallel.py tests/test_score_centering_parallel.py \
   tests/test_score_centering_megatron.py -q
 ```
