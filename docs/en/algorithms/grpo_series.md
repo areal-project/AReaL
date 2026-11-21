@@ -510,8 +510,15 @@ ways:
 original GRPO objective. This aligns with recommendations from
 [Dr.GRPO](https://arxiv.org/abs/2503.20783) and eliminates bias in advantage estimation.
 
-**KL Regularization**: Instead of adding a KL divergence term directly to the objective
-function, AReaL incorporates KL regularization into actor advantages (PPO-style),
-controlled by `actor.kl_ctl`. In token mode, the `KLEstimator` penalty is added to
-per-token rewards before GAE. In turn mode, it remains a token-local actor penalty and
-is excluded from the turn recurrence and critic targets.
+**KL Regularization**: AReaL supports both reward-level (PPO-style) and loss-level
+reference KL regularization:
+
+- **Reward-level KL (`actor.kl_ctl`)**: Adds `KLEstimator` penalties to per-token
+  rewards before GAE in token mode (or as a token-local actor term outside the turn
+  recurrence and critic targets in turn mode).
+- **Loss-level KL (`actor.use_kl_loss=true`, `actor.kl_ctl=0.0`,
+  `actor.kl_loss_coef`, `actor.kl_loss_type`)**: Adds an explicit per-token KL penalty
+  (`low_var_kl` / `k3` or `k2` / `mse`) directly to the actor objective using the
+  configured `actor.loss_aggregation` reduction. This avoids $O(T)$ suffix-sum
+  accumulation in critic-free GAE and is recommended for long-sequence GRPO and Joint
+  OPD/MOPD.

@@ -66,6 +66,7 @@ from areal.utils.functional import (
 )
 from areal.utils.functional.loss_aggregation import (
     LossAggregationMode,
+    PolicyGradientReduction,
     TokenMean,
 )
 from areal.utils.perf_tracer import trace_perf
@@ -693,6 +694,9 @@ class PPOActor:
                     sapo_tau_neg=self.config.sapo_tau_neg,
                     use_cispo_loss=self.config.use_cispo_loss,
                     use_decoupled_loss=self.config.use_decoupled_loss,
+                    use_kl_loss=self.config.use_kl_loss,
+                    kl_loss_coef=self.config.kl_loss_coef,
+                    kl_loss_type=self.config.kl_loss_type,
                     loss_step=loss_step,
                     mopd_loss_config=self._mopd_loss_config,
                 )
@@ -923,6 +927,48 @@ class PPOActorControllerV2(GatewayTrainController):
         self._gateway_post("/ppo/actor/update", payload)
 
 
+_VALID_KL_LOSS_TYPES = ("low_var_kl", "k3", "k2", "mse")
+
+
+def _compute_explicit_kl_loss(
+    logprobs: torch.Tensor,
+    ref_logp: torch.Tensor | None,
+    kl_loss_type: str,
+    loss_mask: torch.Tensor,
+    pg_reduction: PolicyGradientReduction,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-token explicit reference-policy KL loss aggregated via pg_reduction."""
+    if ref_logp is None:
+        raise ValueError("use_kl_loss=True requires 'ref_logp' in the training batch")
+    if ref_logp.shape != logprobs.shape:
+        raise ValueError(
+            f"ref_logp shape {tuple(ref_logp.shape)} must match "
+            f"logprobs shape {tuple(logprobs.shape)}"
+        )
+    if kl_loss_type not in _VALID_KL_LOSS_TYPES:
+        raise ValueError(
+            f"Unsupported kl_loss_type: {kl_loss_type!r}. "
+            f"Expected one of {_VALID_KL_LOSS_TYPES}."
+        )
+    mask = loss_mask.bool()
+    calc_dtype = torch.float64 if logprobs.dtype == torch.float64 else torch.float32
+    zeros = torch.zeros_like(logprobs, dtype=calc_dtype)
+    # Detach ref_logp and sanitize masked entries before nonlinear ops so
+    # non-finite values at inactive positions cannot produce 0 * inf = NaN grads.
+    safe_logprobs = torch.where(mask, logprobs.to(calc_dtype), zeros)
+    safe_ref_logp = torch.where(mask, ref_logp.detach().to(calc_dtype), zeros)
+    if kl_loss_type in ("low_var_kl", "k3"):
+        log_ratio = torch.clamp(safe_ref_logp - safe_logprobs, min=-20.0, max=20.0)
+        token_kl = torch.clamp(
+            torch.exp(log_ratio) - log_ratio - 1.0, min=-10.0, max=10.0
+        )
+    else:
+        log_ratio = torch.clamp(safe_logprobs - safe_ref_logp, min=-20.0, max=20.0)
+        token_kl = 0.5 * log_ratio.square()
+    kl_loss = pg_reduction.aggregate(token_kl, mask)
+    return kl_loss, token_kl.detach()
+
+
 def grpo_loss_fn(
     logprobs: torch.Tensor,
     entropy: torch.Tensor,
@@ -940,6 +986,9 @@ def grpo_loss_fn(
     sapo_tau_neg: float = 1.05,
     use_cispo_loss: bool = False,
     use_decoupled_loss: bool = False,
+    use_kl_loss: bool = False,
+    kl_loss_coef: float = 0.0,
+    kl_loss_type: str = "low_var_kl",
     loss_step: PreparedLossStep | None = None,
     mopd_loss_config: MOPDLossConfig | None = None,
     vocab_min_logits: torch.Tensor | None = None,
@@ -1006,6 +1055,16 @@ def grpo_loss_fn(
             loss_mask=loss_mask,
             normalization_mask=normalization_mask,
         )
+        explicit_kl_stat = None
+        if use_kl_loss:
+            kl_loss, explicit_kl_stat = _compute_explicit_kl_loss(
+                logprobs=logprobs,
+                ref_logp=input_data.get("ref_logp"),
+                kl_loss_type=kl_loss_type,
+                loss_mask=loss_mask,
+                pg_reduction=pg_reduction,
+            )
+            loss = loss + kl_loss_coef * kl_loss
         stats_tracker.denominator(
             n_tokens=infer_token_denominator(input_data, loss_mask),
             n_valid_tokens=normalization_mask,
@@ -1021,6 +1080,13 @@ def grpo_loss_fn(
             entropy=entropy.detach().float(),
             denominator="n_mopd_tokens",
         )
+        if explicit_kl_stat is not None:
+            stats_tracker.denominator(n_kl_tokens=loss_mask.bool())
+            stats_tracker.stat(
+                explicit_kl_loss=explicit_kl_stat.float(),
+                denominator="n_kl_tokens",
+            )
+            stats_tracker.scalar(kl_loss_coef=kl_loss_coef)
         stats_tracker.weighted_mean(
             "actor_loss/avg",
             loss,
@@ -1205,6 +1271,18 @@ def grpo_loss_fn(
         loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
         rkl_stat = log_ratio.detach() * loss_mask
 
+    # Explicit per-token reference KL loss, separate from reward-level kl_ctl.
+    explicit_kl_stat = None
+    if use_kl_loss:
+        kl_loss, explicit_kl_stat = _compute_explicit_kl_loss(
+            logprobs=logprobs,
+            ref_logp=input_data.get("ref_logp"),
+            kl_loss_type=kl_loss_type,
+            loss_mask=loss_mask,
+            pg_reduction=pg_reduction,
+        )
+        loss = loss + kl_loss_coef * kl_loss
+
     # Match the engine's aggregation across microbatches and data-parallel ranks.
     stats_tracker.weighted_mean(
         "actor_loss/avg",
@@ -1219,6 +1297,13 @@ def grpo_loss_fn(
         clipped_tokens=stat["clip_mask"],
         dual_clipped_tokens=stat["dual_clip_mask"],
     )
+
+    if explicit_kl_stat is not None:
+        stats_tracker.stat(
+            explicit_kl_loss=explicit_kl_stat.float(),
+            denominator="n_valid_tokens",
+        )
+        stats_tracker.scalar(kl_loss_coef=kl_loss_coef)
 
     if rkl_stat is not None:
         if mopd_stats:

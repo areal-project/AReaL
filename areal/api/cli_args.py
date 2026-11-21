@@ -2140,6 +2140,34 @@ class PPOActorConfig(TrainEngineConfig):
         default="k1",
         metadata={"help": "KL divergence estimator", "choices": ["k1", "k2", "k3"]},
     )
+    use_kl_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Add an explicit per-token reference-policy KL penalty directly to "
+            "the actor loss instead of shaping rewards before advantage estimation. "
+            "Recommended for critic-free RL (GRPO / Joint OPD) on long sequences to "
+            "avoid O(T) GAE accumulation. Requires actor.kl_ctl=0.0 and a configured "
+            "'ref' model."
+        },
+    )
+    kl_loss_coef: float = field(
+        default=0.0,
+        metadata={
+            "help": "Coefficient for the explicit reference-policy KL loss when "
+            "use_kl_loss=True. Must be finite and non-negative."
+        },
+    )
+    kl_loss_type: str = field(
+        default="low_var_kl",
+        metadata={
+            "help": "Estimator for explicit reference-policy KL loss. "
+            "'low_var_kl' / 'k3': Schulman non-negative k3 estimator "
+            "(exp(r) - r - 1, r = log pi_ref - log pi_theta; forward-KL expected "
+            "gradient). 'k2' / 'mse': 0.5 * (log pi_theta - log pi_ref)^2 "
+            "(reverse-KL expected gradient).",
+            "choices": ["low_var_kl", "k3", "k2", "mse"],
+        },
+    )
 
     # SAPO (Soft Adaptive Policy Optimization) - https://arxiv.org/abs/2511.20347
     use_sapo_loss: bool = field(
@@ -2395,6 +2423,36 @@ class PPOActorConfig(TrainEngineConfig):
                 "    metric: ratio\n"
                 "    upper: 5.0"
             )
+
+        # Validate explicit KL loss configuration
+        if self.kl_loss_type not in ("low_var_kl", "k3", "k2", "mse"):
+            raise ValueError(
+                "kl_loss_type must be one of 'low_var_kl', 'k3', 'k2', 'mse', "
+                f"got {self.kl_loss_type!r}."
+            )
+        if (
+            isinstance(self.kl_loss_coef, bool)
+            or not isinstance(self.kl_loss_coef, int | float)
+            or not math.isfinite(self.kl_loss_coef)
+            or self.kl_loss_coef < 0
+        ):
+            raise ValueError(
+                "kl_loss_coef must be a finite non-negative number, "
+                f"got {self.kl_loss_coef!r}."
+            )
+        if self.use_kl_loss:
+            if self.kl_ctl > 0:
+                raise ValueError(
+                    "actor.use_kl_loss=True cannot be combined with "
+                    f"actor.kl_ctl={self.kl_ctl} > 0: KL regularization would be "
+                    "applied in both advantage estimation and actor loss. Set "
+                    "actor.kl_ctl=0.0 when using explicit KL loss."
+                )
+            if self.kl_loss_coef == 0:
+                logger.warning(
+                    "actor.use_kl_loss=True with actor.kl_loss_coef=0.0: reference KL "
+                    "will be computed and logged, but adds zero penalty to the actor loss."
+                )
 
         # Validate SAPO configuration
         if self.use_sapo_loss:
@@ -4531,6 +4589,10 @@ class PPOConfig(BaseExperimentConfig):
 
     def __post_init__(self):
         """Validate the eval generation config."""
+        if self.actor.use_kl_loss and self.ref is None:
+            raise ValueError(
+                "actor.use_kl_loss=True requires a reference model ('ref' config)."
+            )
         if self.teacher is not None and self.mopd is not None:
             raise ValueError("teacher and mopd cannot be configured at the same time")
         if self.mopd is not None:
