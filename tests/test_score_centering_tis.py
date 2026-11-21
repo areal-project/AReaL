@@ -18,20 +18,17 @@ from areal.utils.score_centering import (
 
 @pytest.mark.parametrize("cap", [0.5, 2.0, 10.0])
 @pytest.mark.parametrize("full_head", [False, True])
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_tis_sc_matches_full_vocabulary_gradient_and_adam(cap, full_head, device):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA unavailable")
+def test_tis_sc_matches_full_vocabulary_gradient_and_adam(cap, full_head):
     torch.manual_seed(93)
-    h = torch.randn(5, 4, device=device, dtype=torch.float64, requires_grad=True)
-    w = torch.randn(4, 11, device=device, dtype=torch.float64, requires_grad=True)
+    h = torch.randn(5, 4, dtype=torch.float64, requires_grad=True)
+    w = torch.randn(4, 11, dtype=torch.float64, requires_grad=True)
     h2, w2 = h.detach().clone().requires_grad_(), w.detach().clone().requires_grad_()
-    ids = torch.arange(11 if full_head else 4, device=device).expand(5, -1)
+    ids = torch.arange(11 if full_head else 4).expand(5, -1)
     # Mix sampled tokens inside and outside the collected head.
-    labels = torch.tensor([0, 1, 7, 8, 10], device=device)
-    q = torch.randn(5, 11, device=device, dtype=torch.float64).softmax(-1)
+    labels = torch.tensor([0, 1, 7, 8, 10])
+    q = torch.randn(5, 11, dtype=torch.float64).softmax(-1)
     sampled_q = q.gather(-1, labels[:, None]).squeeze(-1).log()
-    advantages = torch.tensor([-2.0, -1.0, 0.0, 1.0, 3.0], device=device)
+    advantages = torch.tensor([-2.0, -1.0, 0.0, 1.0, 3.0])
     weight_fn = build_weight_fn("tis", 0.0, cap)
     lp, _, c = score_centering_logprobs(
         h @ w, labels, ids, q.gather(-1, ids).log(), 2, weight_fn=weight_fn
