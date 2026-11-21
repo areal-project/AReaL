@@ -1,4 +1,5 @@
 import asyncio
+import socket
 from unittest.mock import Mock
 
 import pytest
@@ -494,6 +495,40 @@ class TestRolloutControllerInitialization:
             assert write_calls[0]["source"] == "provided"
 
         controller.destroy()
+
+    def test_dead_inference_server_fails_health_check_without_backend_routing(self):
+        """A server that stops listening must surface through the dispatcher."""
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=create_test_config(backend="sglang:d1"),
+            scheduler=MockScheduler(),
+        )
+        controller.initialize(
+            role="rollout",
+            server_args={},
+            server_infos=[
+                LocalInfServerInfo(host="127.0.0.1", port=port, process=None)
+            ],
+        )
+        try:
+            watchdog = controller._server_watchdog
+            assert controller.dispatcher.health_check == watchdog.check_health
+            watchdog._probe()
+            watchdog.check_health()
+
+            listener.close()
+            for _ in range(watchdog._max_failures):
+                watchdog._probe()
+
+            with pytest.raises(RuntimeError, match="refused"):
+                controller.dispatcher.wait_results(count=1, timeout=5)
+        finally:
+            listener.close()
+            controller.destroy()
 
 
 class TestRolloutControllerDestroy:

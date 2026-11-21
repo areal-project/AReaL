@@ -40,6 +40,7 @@ from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY, DatasetRoute
 from areal.infra.backend_router import BackendRouterService
 from areal.infra.rpc.rtensor import flatten_shard_ids
 from areal.infra.rpc.serialization import deserialize_value
+from areal.infra.server_watchdog import InferenceServerWatchdog
 from areal.infra.utils.concurrent import run_async_task
 from areal.infra.utils.exp_metadata import get_metadata_dir
 from areal.infra.utils.inference_targets import write_inference_targets
@@ -196,6 +197,7 @@ class RolloutController:
         self._version = 0
         self._backend_router: BackendRouterService | None = None
         self._owns_backend_router = True
+        self._server_watchdog: InferenceServerWatchdog | None = None
         self._routing_members = [self]
         self._routing_active = True
 
@@ -361,6 +363,19 @@ class RolloutController:
                     control_seq=self._backend_router.control_seq,
                 )
 
+        else:
+            # The backend router owns liveness when enabled. Without it nothing
+            # notices a server that exits after launch, and rollouts would be
+            # resubmitted to the dead address forever.
+            self._server_watchdog = InferenceServerWatchdog(
+                [
+                    (info.host, info.port)
+                    for info in self.server_infos
+                    if isinstance(info, LocalInfServerInfo)
+                ]
+            )
+            self._server_watchdog.start()
+
         # Initialize staleness manager for global capacity control
         max_concurrent_rollouts = (
             self.config.max_concurrent_rollouts or self.config.consumer_batch_size
@@ -391,6 +406,8 @@ class RolloutController:
             deterministic_order=getattr(self.config, "deterministic_sampling", False),
             health_check=self._backend_router.check_health
             if self._backend_router
+            else self._server_watchdog.check_health
+            if self._server_watchdog
             else None,
         )
         # Initialize the dispatcher's async task runner
@@ -649,6 +666,8 @@ class RolloutController:
         errors: list[str] = []
 
         # Stop externally reachable/background work before deleting any role.
+        if self._server_watchdog is not None:
+            self._server_watchdog.stop()
         self._stop_proxy_gateway()
         if self._dispatcher is not None:
             self._dispatcher.destroy()
