@@ -493,6 +493,9 @@ class AdvantagePipeline:
         else:
             values = data["values"]
         bootstrap_values = values[batch_indices, seqlens - 1]
+        # A truncated trajectory whose graded reward is kept is already terminal;
+        # bootstrap from its final value only when truncation masked out the reward.
+        seq_bootstrap_mask = seq_truncated_mask & bool(self.mask_no_eos_with_zero)
         temporal_inputs = TemporalInputs(
             rewards=gae_outcome_rewards,
             kl_rewards=gae_kl_rewards,
@@ -500,7 +503,7 @@ class AdvantagePipeline:
             values=values,
             loss_mask=loss_mask,
             turn_ids=turn_ids,
-            seq_no_eos_mask=seq_truncated_mask,
+            seq_no_eos_mask=seq_bootstrap_mask,
             bootstrap_values=bootstrap_values,
             discount=self.discount,
             gae_lambda=self.gae_lambda_fn

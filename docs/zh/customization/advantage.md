@@ -71,7 +71,8 @@ tensor row 数，`meta.logical_group_sizes` 统计 logical rollout 数。Shaped 
 
 时序函数接收 `areal.trainer.ppo.advantage_algorithms.TemporalInputs`，返回
 `TemporalResult(advantages, returns, total_rewards)`。输入已按 next-token prediction
-对齐，outcome、KL 和折叠后的 process rewards 分开传递。显式 `bootstrap_values` 来自每条轨迹实际最后一个有效 token。自定义
+对齐，outcome、KL 和折叠后的 process rewards 分开传递。显式 `bootstrap_values` 来自每条轨迹实际最后一个有效
+token。`seq_no_eos_mask` 仅对由 `mask_no_eos_with_zero=True` 屏蔽了终局奖励的截断轨迹启用末尾自举。自定义
 estimator 可调用 `areal.trainer.ppo.gae.compute_gae_lambda`，传入自身的时间单位以解析 callable
 lambda。`total_rewards` 是按 token 对齐的监控奖励。
 

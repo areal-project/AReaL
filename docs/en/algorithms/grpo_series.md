@@ -425,8 +425,10 @@ $$
 
 where $\gamma$ is `actor.discount` and $\lambda$ is the resolved per-trajectory value
 configured by `actor.gae_lambda`. The reward $r_t$ contains the outcome reward increment
-and the token-level KL penalty. EOS-terminated trajectories use zero terminal bootstrap,
-while truncated trajectories without EOS bootstrap from the final value estimate.
+and the token-level KL penalty. EOS-terminated trajectories—and truncated trajectories
+whose outcome reward is kept (`actor.mask_no_eos_with_zero=False`, the default)—use zero
+terminal bootstrap; truncated trajectories bootstrap from the final value estimate only
+when `actor.mask_no_eos_with_zero=True` masks out their terminal reward.
 
 #### Turn-level GAE
 
