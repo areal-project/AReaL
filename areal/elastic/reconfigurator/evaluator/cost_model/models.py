@@ -13,7 +13,7 @@ from ..workload import ActorMemoryRejected, WorkloadStats
 from ..workload import ExecutionConfig as CandidateConfig
 from . import fingerprint
 from .actor.model import Advantages
-from .contracts import ParallelLayout, ServiceState, nonnegative
+from .contracts import ActorConfig, ParallelLayout, ServiceState, nonnegative
 from .loader import (
     Catalog,
     _load_profile_components,
@@ -70,25 +70,35 @@ class AnalyticalCostModels:
         inter_node_GBps=None,
         catalog: Catalog,
         calibration: Path | None = None,
+        actor_runtime: ActorConfig | None = None,
     ):
         """Load profiles and optional fitted coefficients from JSON.
 
         A calibration names its hardware and model profiles. Each fitted role
         (actor, rollout) supplies runtime_revision, source_ids and a sparse
         parameters object (e.g. rollout's hbm efficiency). Include the
-        topology profile when fitting network efficiency.
+        topology profile when fitting network efficiency. For a live Actor pass
+        ActorConfig.from_areal(resolved_actor) to use its execution settings.
         """
-        components = _load_profile_components(
-            catalog,
-            hardware,
-            topology,
-            model,
-            actor,
-            rollout,
-            inter_node_GBps,
-            calibration,
+        actor_model, actor_template, rollout_model, rollout_template = (
+            _load_profile_components(
+                catalog,
+                hardware,
+                topology,
+                model,
+                actor,
+                rollout,
+                inter_node_GBps,
+                calibration,
+            )
         )
-        result = cls(*components, bandwidth_GBps)
+        result = cls(
+            actor_model,
+            actor_runtime if actor_runtime is not None else actor_template,
+            rollout_model,
+            rollout_template,
+            bandwidth_GBps,
+        )
         result.worker_spec = (
             "analytical",
             hardware,
@@ -99,9 +109,9 @@ class AnalyticalCostModels:
             bandwidth_GBps,
             inter_node_GBps,
             str(catalog.root),
+            str(Path(calibration).resolve()) if calibration is not None else None,
+            actor_runtime,
         )
-        if calibration is not None:
-            result.worker_spec += (str(Path(calibration).resolve()),)
         return result
 
     def validate_layout(self, candidate):

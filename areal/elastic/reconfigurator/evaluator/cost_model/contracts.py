@@ -302,6 +302,7 @@ class ActorConfig:
     enable_chunked_logits: bool = False
     lm_head_loss_chunk_size: int = 0
     entropy_requires_grad: bool = True
+    logprobs_chunk_size: int = 1024
 
     def __post_init__(self) -> None:
         if self.pipeline_layers is not None:
@@ -362,6 +363,7 @@ class ActorConfig:
             "granularity",
             "ppo_n_minibatches",
             "grad_bytes",
+            "logprobs_chunk_size",
         ):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -465,6 +467,7 @@ class ActorConfig:
                     "use_decoupled_loss",
                     "prox_logp_method",
                     "enable_tree_training",
+                    "logprobs_chunk_size",
                 )
                 if k in actor
             },

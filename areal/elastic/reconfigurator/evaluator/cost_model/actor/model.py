@@ -39,6 +39,33 @@ from areal.elastic.reconfigurator.evaluator.workload import (
 from .megatron import backend_for
 
 
+def _loss_peak_bytes(config: ActorConfig, packed_tokens: int, vocab_size: int) -> int:
+    """Capacity prior for the pipeline last stage's FP32 vocabulary tensors."""
+    rows = math.ceil(packed_tokens / config.parallel.cp)
+    row_bytes = 4 * math.ceil(vocab_size / config.parallel.tp)
+    if config.enable_chunked_logits and config.lm_head_loss_chunk_size:
+        # The fused LM head projects and backpropagates one token chunk at a time.
+        return min(rows, config.lm_head_loss_chunk_size) * row_bytes
+    logits = rows * row_bytes
+    if config.enable_chunked_logits and not config.entropy_requires_grad:
+        # Native Megatron's contiguous FP32 head output supports in-place reuse.
+        return logits
+
+    # Regular loss retains per-chunk normalized values for backward. Budget the
+    # head output as live too; compiled autograd may shorten its lifetime.
+    chunk_rows = min(rows, config.logprobs_chunk_size)
+    chunk = chunk_rows * row_bytes
+    forward = logits + 2 * chunk  # normalized chunks plus chunk-local temporaries
+    last_chunk = ((rows - 1) % chunk_rows + 1) * row_bytes
+    # At slice backward the processed chunk's graph releases its saved values.
+    # The first full-size gradient becomes the accumulator. From the second
+    # slice on, the accumulator overlaps another full-size incoming gradient.
+    backward = logits + (logits - last_chunk)
+    if rows > chunk_rows:
+        backward = max(backward, 2 * logits + (logits - last_chunk - chunk))
+    return logits + max(forward, backward)
+
+
 @dataclass(frozen=True)
 class Advantages:
     """Bandwidth + elementwise launch prior; not a fitted public GAE measurement."""
@@ -692,10 +719,16 @@ class ExpertActorModel:
             workspace = local_tokens * (
                 8 * m.hidden_size + 4 * m.intermediate_size * m.top_k
             )
-            logits_tokens = maximum_tokens / p.cp
-            if config.enable_chunked_logits and config.lm_head_loss_chunk_size:
-                logits_tokens = min(logits_tokens, config.lm_head_loss_chunk_size)
-            logits = 4 * logits_tokens * m.vocab_size / p.tp if ctx.last else 0
+            logits = (
+                _loss_peak_bytes(config, maximum_tokens, m.vocab_size)
+                if ctx.last
+                else 0
+            )
+            if ctx.last:
+                features += (
+                    ("largest_packed_microbatch_tokens", float(maximum_tokens)),
+                    ("loss_peak_bytes", float(logits)),
+                )
             # Unknown precision-aware master/remainder storage uses an explicit
             # full-master capacity prior rather than silently treating it as zero.
             unknown_master = (

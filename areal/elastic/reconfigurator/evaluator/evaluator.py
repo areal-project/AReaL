@@ -15,13 +15,23 @@ from pathlib import Path
 
 from ..optimizer import Layout, Prediction
 from .cost_model.reconfiguration.model import Cutover, ReconfigurationModel
-from .workload import ExecutionConfig, Forecast, OnlineObservation, ServingSLO
+from .workload import (
+    Backlog,
+    ExecutionConfig,
+    Forecast,
+    InflightCall,
+    OnlineObservation,
+    ServingSLO,
+    WorkloadPattern,
+)
 
 
 @dataclass(frozen=True)
 class Observation:
-    view: OnlineObservation  # post-update decision boundary
+    view: OnlineObservation
     current: Layout
+    backlog: Backlog | None = None
+    search_ready_at: float | None = None  # earliest time a decision can be applied
 
 
 @dataclass(frozen=True)
@@ -53,7 +63,8 @@ def _worker_models(spec, expected_ids):
         bandwidth,
         link,
         root,
-        *calibration,
+        calibration,
+        actor_runtime,
     ) = spec
     if kind != "analytical":
         raise ValueError(
@@ -68,7 +79,8 @@ def _worker_models(spec, expected_ids):
         bandwidth_GBps=bandwidth,
         inter_node_GBps=link,
         catalog=Catalog(Path(root)),
-        calibration=Path(calibration[0]) if calibration else None,
+        calibration=Path(calibration) if calibration else None,
+        actor_runtime=actor_runtime,
     )
     if models.source_ids != expected_ids:
         raise ValueError("CPU worker loaded different cost models or source revisions")
@@ -200,11 +212,34 @@ class ReplayEvaluator:
         self.executor = executor
         self.request_type, self.scheduler = Request, scheduler_for("sglang")
 
-    def prepare(self, observation):
-        forecasts = self.forecaster.predict(observation.view, 0)
-        if len(forecasts) > 1:
-            raise ValueError("Expected deterministic HistoricalReplay")
-        return observation, next(iter(forecasts), None)
+    def prepare(self, observation, *, pattern: WorkloadPattern | None = None):
+        if pattern is not None:
+            forecast = pattern.forecast(
+                observation.view.now, self.forecaster.horizon_seconds
+            )
+        else:
+            forecasts = self.forecaster.predict(observation.view, 0)
+            if len(forecasts) > 1:
+                raise ValueError("Expected deterministic HistoricalReplay")
+            forecast = next(iter(forecasts), None)
+        context = observation, forecast
+        if observation.search_ready_at is None or not forecast or not forecast.episodes:
+            return context
+        cfg, cut, pub = self._prepare_candidate(context, observation.current)
+        # Run the common prefix once. Only time and work after publication
+        # can differ in cost across candidates.
+        boundary = self._predict(
+            *context,
+            cfg,
+            observation.current,
+            cut,
+            pub,
+            None,
+            stop_at_publication=observation.search_ready_at,
+        )
+        if isinstance(boundary, Prediction):
+            return observation, None  # no usable publication in the forecast horizon
+        return boundary
 
     def evaluate(self, context, layout, *, on_batch=None):
         try:
@@ -290,7 +325,18 @@ class ReplayEvaluator:
             )
         return cfg, cut, pub
 
-    def _predict(self, obs, forecast, cfg, layout, cut, pub, on_batch):
+    def _predict(
+        self,
+        obs,
+        forecast,
+        cfg,
+        layout,
+        cut,
+        pub,
+        on_batch,
+        *,
+        stop_at_publication=None,
+    ):
         view, size = obs.view, self.batch_size
         if view.busy or view.provider_version != view.training_version:
             raise ValueError("Expected an idle Actor at the published update boundary")
@@ -302,7 +348,10 @@ class ReplayEvaluator:
         def actor_time(batch):
             peak, cap, oom = self.models.actor_memory(cfg, batch)
             if oom or peak > cap * (1 - self.reserve):
-                raise ValueError("Batch exceeds Actor memory allowance")
+                raise ValueError(
+                    f"Batch exceeds Actor memory allowance (peak={peak:.2f} GiB, "
+                    f"allowance={cap * (1 - self.reserve):.2f} GiB, oom={oom})"
+                )
             stages = self.models.actor(cfg, batch)
             duration = sum(t for _, t in stages)
             if not stages or not isfinite(duration) or duration <= 0:
@@ -368,6 +417,40 @@ class ReplayEvaluator:
             event = next(offers, None)
             if event is not None:
                 heappush(events, event)
+
+        backlog = obs.backlog
+        if backlog is not None:
+            shapes.update(backlog.shapes)
+            arrivals.extend(backlog.queued)
+            ready.extend(backlog.ready)
+            accepted = len(ready)
+            passed, completed = backlog.passed_calls, backlog.completed_calls
+            unknown_timing = backlog.unknown_timing
+            for progress in backlog.running:
+                key = progress.episode_id
+                call = add_call(key, progress.turn, progress.ready_at)
+                call.first = progress.first_token_at
+                call.prefilled, call.generated = progress.prefilled, progress.generated
+                call.retained = progress.retained
+                call.request = replace(
+                    call.request,
+                    input_tokens=call.request.input_tokens + call.retained,
+                    output_tokens=call.request.output_tokens - call.retained,
+                )
+                active.add(key)
+                if cut.seconds:
+                    call.resume()
+                elif progress.replica is not None:
+                    replicas[progress.replica].rows[key] = waiting.pop(key)
+            for key, turn, at in backlog.tools:
+                active.add(key)
+                push(at, "tool", (key, turn))
+            if backlog.actor_event is not None:
+                kind, remaining = backlog.actor_event
+                accepted += size
+                actor_busy = True
+                paused = paused or kind == "published"
+                push(start + cut.seconds + remaining, kind)
 
         enqueue_offer()
         if paused:
@@ -498,8 +581,61 @@ class ReplayEvaluator:
                 elif kind == "published":
                     paused = actor_busy = False
                     updates += 1
+                    if stop_at_publication is not None and now >= stop_at_publication:
+                        if now >= end:
+                            return obs, None
+                        # Publishing flushed replica KV. Calls waiting for the
+                        # new weights still own their acknowledged output.
+                        running = tuple(
+                            InflightCall(
+                                c.group_id,
+                                c.index,
+                                c.ready_at,
+                                c.first,
+                                c.prefilled,
+                                c.generated,
+                                c.retained,
+                            )
+                            for c in waiting.values()
+                        )
+                        tools = tuple(
+                            (*item, at)
+                            for at, _, event, item in events
+                            if event == "tool"
+                        )
+                        keys = set(active) | set(ready) | {k for k, _ in arrivals}
+                        carry = Backlog(
+                            {k: shapes[k] for k in keys},
+                            tuple(arrivals),
+                            running,
+                            tools,
+                            tuple(ready),
+                            passed_calls=passed,
+                            completed_calls=completed,
+                            unknown_timing=unknown_timing,
+                        )
+                        unseen = {
+                            item[0]
+                            for _, _, event, item in events
+                            if event == "arrival"
+                        }
+                        unseen.update(item[0] for _, _, _, item in offers)
+                        rest = tuple(
+                            e for e in forecast.episodes if e.episode_id in unseen
+                        )
+                        version = view.training_version + updates
+                        next_view = replace(
+                            view,
+                            now=now,
+                            training_version=version,
+                            provider_version=version,
+                        )
+                        return (
+                            Observation(next_view, layout, carry),
+                            replace(forecast, episodes=rest),
+                        )
                 elif kind == "resume":
-                    paused = False
+                    paused = any(event[2] == "published" for event in events)
                 elif kind == "tokens":
                     gen, rid, items = payload
                     if gen != generation:

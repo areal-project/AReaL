@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import math
 import re
+from collections import defaultdict
 from dataclasses import dataclass, replace
 from functools import cached_property
+from typing import Literal, NamedTuple
 
 
 def nonnegative(name: str, value: float, *, positive: bool = False) -> None:
@@ -437,6 +439,36 @@ class EpisodeView:
     initial_input_tokens: int | None = None
 
 
+class InflightCall(NamedTuple):
+    episode_id: str
+    turn: int
+    ready_at: float
+    first_token_at: float | None = None
+    prefilled: int = 0
+    generated: int = 0
+    retained: int = 0
+    replica: int | None = None
+
+
+@dataclass(frozen=True)
+class Backlog:
+    """Outstanding work at one observation time, with measured or estimated shapes.
+
+    Timestamps share the arrival clock. A tool entry identifies the next turn
+    and its expected start. An Actor event gives its next phase and time left.
+    """
+
+    shapes: dict[str, tuple[Turn, ...]]
+    queued: tuple[tuple[str, float], ...] = ()
+    running: tuple[InflightCall, ...] = ()
+    tools: tuple[tuple[str, int, float], ...] = ()
+    ready: tuple[str, ...] = ()
+    actor_event: tuple[Literal["actor", "published"], float] | None = None
+    passed_calls: int = 0
+    completed_calls: int = 0
+    unknown_timing: bool = False
+
+
 @dataclass(frozen=True)
 class OnlineObservation:
     now: float
@@ -451,6 +483,42 @@ class OnlineObservation:
 class Forecast:
     episodes: tuple[EpisodeSample, ...]
     input_closes_at: float
+
+
+@dataclass(frozen=True)
+class WorkloadPattern:
+    """One confirmed arrival period and whole, observed episodes for its request mix."""
+
+    period_seconds: float
+    # Offsets in [0, period_seconds), preserving interarrival gaps and bursts.
+    arrivals: tuple[tuple[float, str], ...]
+    templates: tuple[EpisodeView, ...]
+
+    def forecast(self, start: float, horizon_seconds: float) -> Forecast | None:
+        nonnegative("horizon_seconds", horizon_seconds, positive=True)
+        by_family = defaultdict(list)
+        for episode in self.templates:
+            by_family[episode.family].append(episode.completed_turns)
+        if not self.arrivals or any(
+            family not in by_family for _, family in self.arrivals
+        ):
+            return None
+        positions = defaultdict(int)
+        samples = []
+        for cycle in range(math.ceil(horizon_seconds / self.period_seconds)):
+            for offset, family in self.arrivals:
+                delay = cycle * self.period_seconds + offset
+                if delay >= horizon_seconds:
+                    break
+                pool = by_family[family]
+                turns = pool[positions[family] % len(pool)]
+                positions[family] += 1
+                samples.append(
+                    EpisodeSample(
+                        f"pattern-{len(samples)}", family, start + delay, turns
+                    )
+                )
+        return Forecast(tuple(samples), start + horizon_seconds)
 
 
 class ActorMemoryRejected(ValueError):
@@ -522,6 +590,10 @@ class HistoricalReplay:
     """Replay recent arrival slots using the latest compatible completed trajectories."""
 
     config: HistoryReplayConfig
+
+    @property
+    def horizon_seconds(self) -> float:
+        return self.config.history_seconds
 
     def predict(self, view: OnlineObservation, decision: int) -> tuple[Forecast, ...]:
         history = sorted(

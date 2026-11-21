@@ -15,9 +15,11 @@ from math import inf, isfinite
 from time import monotonic
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from .trigger import WorkloadTrigger
+
 if TYPE_CHECKING:
     from .evaluator import Observation, ReplayEvaluator
-    from .evaluator.workload import ExecutionConfig
+    from .evaluator.workload import ExecutionConfig, WorkloadPattern
 
 
 Value = bool | int | float | str | None
@@ -123,7 +125,7 @@ class SearchSpace:
     @classmethod
     def full_roles(cls, gpu_capacity, evaluator):
         grid = cls.for_pool(gpu_capacity, evaluator.batch_size)
-        return supported_space(grid, evaluator, (1, 2, 4, 8)).roles()
+        return supported_space(grid, evaluator, (1,)).roles()
 
 
 @dataclass
@@ -146,26 +148,17 @@ def physical_space(base: SearchSpace, template: ExecutionConfig, attention_dp_si
             "Supply physical parallelism axes only; engine tuning remains fixed"
         )
     sizes = base.parameters.get("sglang_dp_size", attention_dp_sizes)
-    enabled = base.parameters.get("sglang_enable_dp_attention", (True, False))
+    if any(type(dp) is not int or dp < 1 for dp in sizes):
+        raise ValueError("Attention DP must be a positive integer")
+    enabled = base.parameters.get("sglang_enable_dp_attention", (False,))
     actors, rollouts = replace(base, parameters={}).roles()
-    rows = []
-    for role in rollouts:
-        for dp in dict.fromkeys((*sizes, template.sglang_dp_size)):
-            if type(dp) is not int or dp < 1:
-                raise ValueError("Attention DP must be a positive integer")
-            if coordinates(role)[1] % dp:
-                continue
-            if dp != template.sglang_dp_size and (dp > 1) not in enabled:
-                continue
-            opts = {"sglang_dp_size": dp, "sglang_enable_dp_attention": dp > 1}
-            # The frozen template has dp=1, sometimes with the enable flag set.
-            # Preserve its exact representation for the incumbent.
-            if dp == template.sglang_dp_size:
-                opts = {}
-            rows.append(replace(role, options=tuple(sorted(opts.items()))))
-    return PhysicalSpace(
-        base.gpu_capacity, template.sglang_dp_size, actors, tuple(rows)
-    )
+    if 1 not in sizes or False not in enabled:
+        rollouts = ()
+    elif template.sglang_enable_dp_attention or template.sglang_dp_size != 1:
+        # Disable inherited Attention DP for new targets, including TP > 1.
+        off = (("sglang_dp_size", 1), ("sglang_enable_dp_attention", False))
+        rollouts = tuple(replace(role, options=off) for role in rollouts)
+    return PhysicalSpace(base.gpu_capacity, template.sglang_dp_size, actors, rollouts)
 
 
 @cache
@@ -226,7 +219,7 @@ class Prediction:
 
 
 class Evaluator(Protocol):
-    def prepare(self, observation: Any) -> Any: ...
+    def prepare(self, observation: Any, *, pattern: WorkloadPattern) -> Any: ...
 
     def evaluate(self, context: Any, layout: Layout) -> Prediction: ...
 
@@ -237,6 +230,7 @@ class Decision:
     target: Layout
     predictions: tuple[Prediction, ...]
     reason: str
+    workload_change: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -255,57 +249,13 @@ def _meets(p: Prediction, target: float) -> bool:
     return p.actor_sustainable is True and p.request_fraction + 1e-12 >= target
 
 
-def _recovery_key(p: Prediction) -> tuple:
-    deficit = (
-        max(0.0, p.actor_deficit)
-        if p.actor_deficit is not None
-        else 0.0
-        if p.actor_sustainable is True
-        else inf
-    )
-    return (
-        -(p.completed_updates or 0),
-        p.pending_requests if p.pending_requests is not None else inf,
-        -(p.completed_requests or 0),
-        deficit,
-        -p.request_fraction,
-        p.gpu_seconds,
-        p.layout.key,
-    )
-
-
 def select(
-    predictions: Sequence[Prediction],
-    current: Layout,
-    target: float,
-    *,
-    trigger: str,
-    recovering: bool = False,
+    predictions: Sequence[Prediction], current: Layout, target: float
 ) -> Prediction | None:
-    """Choose the lowest-cost feasible layout, keeping the current layout on ties."""
-    rows = [p for p in predictions if _usable(p)]
-    feasible = [p for p in rows if _meets(p, target)]
-    if feasible:
-        return min(
-            feasible,
-            key=lambda p: (p.gpu_seconds, p.layout != current, p.layout.key),
-        )
-    if trigger == "slack":
-        return next((p for p in rows if p.layout == current), None)
-    if recovering and rows:
-        best = max(p.request_fraction for p in rows)
-        return min(
-            (p for p in rows if p.request_fraction >= best - 0.02), key=_recovery_key
-        )
+    """Minimize GPU seconds subject to serving SLO and sustainable training."""
     return min(
-        rows,
-        key=lambda p: (
-            -p.request_fraction,
-            _recovery_key(p)[3],
-            p.gpu_seconds,
-            p.layout != current,
-            p.layout.key,
-        ),
+        (p for p in predictions if _usable(p) and _meets(p, target)),
+        key=lambda p: (p.gpu_seconds, p.layout != current, p.layout.key),
         default=None,
     )
 
@@ -435,7 +385,7 @@ class Optimizer(BaseOptimizer):
         minimum_request_fraction: float,
         max_evaluations: int = 64,
         clock: Callable[[], float] = monotonic,
-        attention_dp_sizes: Sequence[int] = (1, 2, 4, 8),
+        attention_dp_sizes: Sequence[int] = (1,),
     ):
         if evaluator is None or (space is None) == (gpu_capacity is None):
             raise ValueError(
@@ -445,12 +395,30 @@ class Optimizer(BaseOptimizer):
             space = SearchSpace.for_pool(gpu_capacity, evaluator.batch_size)
         if isinstance(space, SearchSpace):
             space = supported_space(space, evaluator, attention_dp_sizes)
-        if any(role.options for role in space.actors) or any(
-            key not in ATTENTION_DP_OPTIONS
-            for role in space.rollouts
-            for key, _ in role.options
-        ):
-            raise ValueError("Set fixed runtime settings on the evaluator template")
+        else:
+            if any(role.options for role in space.actors) or any(
+                key not in ATTENTION_DP_OPTIONS
+                for role in space.rollouts
+                for key, _ in role.options
+            ):
+                raise ValueError("Set fixed runtime settings on the evaluator template")
+            template = getattr(evaluator, "template", None)
+            inherited_size = getattr(
+                template, "sglang_dp_size", space.inherited_attention_dp
+            )
+            inherited_enabled = getattr(
+                template, "sglang_enable_dp_attention", inherited_size > 1
+            )
+
+            def attention_dp_off(role):
+                options = dict(role.options)
+                return options.get("sglang_dp_size", inherited_size) == 1 and not (
+                    options.get("sglang_enable_dp_attention", inherited_enabled)
+                )
+
+            space = replace(
+                space, rollouts=tuple(r for r in space.rollouts if attention_dp_off(r))
+            )
         super().__init__(
             space,
             evaluator,
@@ -458,6 +426,7 @@ class Optimizer(BaseOptimizer):
             max_evaluations=max_evaluations,
             clock=clock,
         )
+        self.workload_trigger = WorkloadTrigger()
         self.inherited_dp = space.inherited_attention_dp
 
     @classmethod
@@ -466,7 +435,7 @@ class Optimizer(BaseOptimizer):
         grid: SearchSpace,
         evaluator: ReplayEvaluator,
         *,
-        attention_dp_sizes,
+        attention_dp_sizes=(1,),
         max_evaluations=64,
     ):
         """Normal entry point. Build a physical catalogue from the native profiles once."""
@@ -490,6 +459,8 @@ class Optimizer(BaseOptimizer):
         # Replay checks this first batch for every layout, before scheduling any
         # rollout. The analytical Actor memory estimate uses only Actor settings.
         episodes = forecast.episodes
+        if not episodes:
+            return self.actors  # Only the carried backlog remains.
         batch = tuple(
             episodes[i % len(episodes)].turns for i in range(evaluator.batch_size)
         )
@@ -533,11 +504,9 @@ class Optimizer(BaseOptimizer):
                 )
         return splits
 
-    def decide(
-        self, observation: Observation, current: Layout, *, trigger, recovering=False
-    ) -> Decision:
-        if self.pending is not None or trigger == "none":
-            return Decision(current, current, (), "Adjustment pending or no trigger")
+    def decide(self, observation: Observation, current: Layout) -> Decision:
+        if self.pending is not None:
+            return Decision(current, current, (), "Adjustment pending")
         if current != observation.current or current.gpus > self.gpu_capacity:
             raise ValueError(
                 "Current layout must match the observation and fit the pool"
@@ -552,11 +521,22 @@ class Optimizer(BaseOptimizer):
             return Decision(
                 current, current, (), "Waiting for a published update boundary"
             )
-        context = self.evaluator.prepare(observation)
+        change = self.workload_trigger.observe(view)
+        if change is None:
+            return Decision(current, current, (), "No stable workload change")
+        context = self.evaluator.prepare(observation, pattern=change.pattern)
         forecast = context[1]
-        if forecast is None or not forecast.episodes:
-            return Decision(current, current, (), "No forecast arrivals")
-        horizon = forecast.input_closes_at - view.now
+        if forecast is None or (
+            not forecast.episodes
+            and not (context[0].backlog and context[0].backlog.shapes)
+        ):
+            return Decision(
+                current,
+                current,
+                (),
+                "No workload or publication in the forecast window",
+            )
+        horizon = forecast.input_closes_at - context[0].view.now
         if not isfinite(horizon) or horizon <= 0:
             raise ValueError("Expected a positive, finite forecast horizon")
 
@@ -624,9 +604,36 @@ class Optimizer(BaseOptimizer):
                 splits.remove(split)
         else:
             reason = "Catalogue exhausted"
-        winner = select(
-            predictions, current, self.target, trigger=trigger, recovering=recovering
-        )
+        winner = select(predictions, current, self.target)
+        self.workload_trigger.searched(change)
+        if winner is None:
+            reason = (
+                f"No feasible candidate among {len(predictions)} evaluated ({reason})"
+            )
+            usable = (p for p in predictions if _usable(p))
+            winner = min(
+                usable,
+                key=lambda p: (
+                    p.actor_sustainable is not True,
+                    0
+                    if p.actor_sustainable
+                    else p.actor_deficit
+                    if p.actor_deficit is not None
+                    else inf,
+                    -p.request_fraction,
+                    p.pending_requests if p.pending_requests is not None else inf,
+                    p.gpu_seconds,
+                    p.layout != current,
+                    p.layout.key,
+                ),
+                default=None,
+            )
+            if winner is not None:
+                reason += "; selected best available"
         return Decision(
-            current, winner.layout if winner else current, tuple(predictions), reason
+            current,
+            winner.layout if winner else current,
+            tuple(predictions),
+            reason,
+            change.reasons,
         )
