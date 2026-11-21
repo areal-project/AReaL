@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import json
+import math
 import os
 import time
 from collections import defaultdict
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from glob import glob
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -679,6 +683,254 @@ def make_filename_bins(
     return grouped_local_names, grouped_filenames
 
 
+_FP8_DTYPES = tuple(
+    getattr(torch, name)
+    for name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    )
+    if hasattr(torch, name)
+)
+
+
+def _is_fp8_tensor(tensor: torch.Tensor) -> bool:
+    return isinstance(tensor, torch.Tensor) and tensor.dtype in _FP8_DTYPES
+
+
+def _dequantize_fp8_hf_weight(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    quantization_config: Mapping[str, Any] | None = None,
+    dst_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize an FP8 HF tensor (scalar, channelwise, or blockwise) to ``dst_dtype``."""
+    w_fp32 = weight.to(torch.float32)
+    s_fp32 = scale.to(device=weight.device, dtype=torch.float32)
+
+    if s_fp32.numel() == 1:
+        return (w_fp32 * s_fp32.reshape(())).to(dst_dtype).contiguous()
+
+    if weight.ndim < 2:
+        if s_fp32.shape != weight.shape:
+            raise ValueError(
+                f"Incompatible FP8 scale shape {tuple(scale.shape)} for weight shape {tuple(weight.shape)}."
+            )
+        return (w_fp32 * s_fp32).to(dst_dtype).contiguous()
+
+    if s_fp32.ndim != weight.ndim or s_fp32.shape[:-2] != weight.shape[:-2]:
+        raise ValueError(
+            f"Incompatible FP8 scale shape {tuple(scale.shape)} for weight shape {tuple(weight.shape)}."
+        )
+
+    m, n = weight.shape[-2], weight.shape[-1]
+    sm, sn = s_fp32.shape[-2], s_fp32.shape[-1]
+    weight_block_size = (
+        quantization_config.get("weight_block_size")
+        if isinstance(quantization_config, Mapping)
+        else None
+    )
+    if weight_block_size is None and sm in (1, m) and sn in (1, n):
+        return (w_fp32 * s_fp32).to(dst_dtype).contiguous()
+
+    if weight_block_size is not None:
+        if (
+            not isinstance(weight_block_size, (list, tuple))
+            or len(weight_block_size) != 2
+            or int(weight_block_size[0]) <= 0
+            or int(weight_block_size[1]) <= 0
+        ):
+            raise ValueError(
+                f"Invalid weight_block_size in quantization_config: {weight_block_size!r}"
+            )
+        bm, bn = int(weight_block_size[0]), int(weight_block_size[1])
+    else:
+        bm = bn = get_block_size_from_config(dict(quantization_config or {}))
+
+    if math.ceil(m / bm) != sm or math.ceil(n / bn) != sn:
+        raise ValueError(
+            f"Incompatible FP8 scale shape {tuple(scale.shape)} for weight shape "
+            f"{tuple(weight.shape)} and block_size=({bm}, {bn})."
+        )
+    if sm != m:
+        s_fp32 = s_fp32.repeat_interleave(bm, dim=-2)[..., :m, :]
+    if sn != n:
+        s_fp32 = s_fp32.repeat_interleave(bn, dim=-1)[..., :, :n]
+    return (w_fp32 * s_fp32).to(dst_dtype).contiguous()
+
+
+class _DequantFP8SafeTensorIO:
+    """Adapter around mbridge ``SafeTensorIO`` that dequantizes FP8 weights on load."""
+
+    def __init__(
+        self,
+        native_io: Any,
+        *,
+        quantization_config: Mapping[str, Any] | None = None,
+        dst_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        self._native = native_io
+        self._quantization_config = quantization_config
+        self._dst_dtype = dst_dtype
+        self._fallback_index: dict[str, str] | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._native, name)
+
+    def _get_key_to_file(self) -> Mapping[str, str]:
+        index = getattr(self._native, "index", None)
+        if index:
+            return index
+        if self._fallback_index is None:
+            built: dict[str, str] = {}
+            for sf_path in sorted(
+                glob(os.path.join(self._native.hf_dir, "*.safetensors"))
+            ):
+                fname = os.path.basename(sf_path)
+                with safe_open(sf_path, framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        built[key] = fname
+            self._fallback_index = built
+        return self._fallback_index
+
+    def load_some_hf_weight(
+        self, hf_weight_names: list[str]
+    ) -> dict[str, torch.Tensor]:
+        ret = self._native.load_some_hf_weight(hf_weight_names)
+        fp8_keys = [k for k, v in ret.items() if _is_fp8_tensor(v)]
+        if not fp8_keys:
+            return ret
+
+        caller_to_disk: dict[str, str] = {}
+        map_old2new = getattr(self._native, "_mapping_weight_names_old2new", None)
+        if callable(map_old2new):
+            _, disk_to_caller = map_old2new(hf_weight_names)
+            caller_to_disk = {
+                caller_key: disk_key for disk_key, caller_key in disk_to_caller.items()
+            }
+
+        key_to_file = self._get_key_to_file()
+        scales_by_file: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for caller_key in fp8_keys:
+            disk_key = caller_to_disk.get(caller_key, caller_key)
+            candidates = [f"{disk_key}_scale_inv", f"{disk_key}_scale"]
+            if disk_key != caller_key:
+                candidates.extend([f"{caller_key}_scale_inv", f"{caller_key}_scale"])
+            scale_key = next((cand for cand in candidates if cand in key_to_file), None)
+            if scale_key is None:
+                raise RuntimeError(
+                    f"FP8 weight {caller_key!r} ({ret[caller_key].dtype}) has no matching "
+                    f"scale tensor ({candidates[0]!r} or {candidates[1]!r}) in "
+                    f"{self._native.hf_dir}."
+                )
+            scales_by_file[key_to_file[scale_key]].append((caller_key, scale_key))
+
+        for shard_file, items in scales_by_file.items():
+            shard_path = (
+                shard_file
+                if os.path.isabs(shard_file)
+                else os.path.join(self._native.hf_dir, shard_file)
+            )
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for caller_key, scale_key in items:
+                    scale = f.get_tensor(scale_key)
+                    ret[caller_key] = _dequantize_fp8_hf_weight(
+                        ret[caller_key],
+                        scale,
+                        quantization_config=self._quantization_config,
+                        dst_dtype=self._dst_dtype,
+                    )
+        return ret
+
+    def load_one_hf_weight(self, hf_weight_name: str) -> torch.Tensor:
+        return self.load_some_hf_weight([hf_weight_name])[hf_weight_name]
+
+
+@contextlib.contextmanager
+def dequant_fp8_safetensor_io(
+    bridge: Any,
+    *,
+    quantization_config: Mapping[str, Any] | None = None,
+    dst_dtype: torch.dtype | None = None,
+):
+    """Wrap ``bridge._get_safetensor_io`` so ``bridge.load_weights`` dequantizes FP8."""
+    get_io = getattr(bridge, "_get_safetensor_io", None)
+    if not callable(get_io):
+        yield
+        return
+    bridge_dict = getattr(bridge, "__dict__", None)
+    had_instance_attr = (
+        isinstance(bridge_dict, dict) and "_get_safetensor_io" in bridge_dict
+    )
+    orig_instance_attr = (
+        bridge_dict["_get_safetensor_io"] if had_instance_attr else None
+    )
+    hf_cfg = getattr(bridge, "hf_config", None)
+    resolved_qconfig = (
+        quantization_config
+        if quantization_config is not None
+        else (
+            getattr(hf_cfg, "quantization_config", None)
+            or getattr(
+                getattr(hf_cfg, "text_config", None), "quantization_config", None
+            )
+        )
+    )
+    resolved_dtype = (
+        dst_dtype
+        if dst_dtype is not None
+        else getattr(bridge, "dtype", None) or torch.bfloat16
+    )
+
+    def wrapped_get_safetensor_io(weights_path: str):
+        return _DequantFP8SafeTensorIO(
+            get_io(weights_path),
+            quantization_config=resolved_qconfig,
+            dst_dtype=resolved_dtype,
+        )
+
+    bridge._get_safetensor_io = wrapped_get_safetensor_io
+    try:
+        yield
+    finally:
+        if had_instance_attr:
+            bridge._get_safetensor_io = orig_instance_attr
+        else:
+            delattr(bridge, "_get_safetensor_io")
+
+
+def load_critic_value_head(
+    models: list[torch.nn.Module],
+    weights_path: str,
+    *,
+    bridge: Bridge | None = None,
+) -> None:
+    """Load ``value_head.pt`` saved next to a critic HF checkpoint, if present.
+
+    Base-model HF checkpoints have no value head; the ValueHead then keeps its
+    zero initialization.
+    """
+    if not mpu.is_pipeline_last_stage():
+        return
+    if bridge is not None and hasattr(bridge, "_get_actual_hf_path"):
+        weights_path = bridge._get_actual_hf_path(weights_path)
+    value_head_path = os.path.join(weights_path, "value_head.pt")
+    if os.path.exists(value_head_path):
+        value_head_state = torch.load(value_head_path, weights_only=True)
+        for model in models:
+            _model = unwrap_to_gpt_model(model)
+            if hasattr(_model, "output_layer"):
+                _model.output_layer.load_state_dict(value_head_state)
+        logger.info(f"Loaded ValueHead weights from {value_head_path}")
+    else:
+        logger.info(
+            f"ValueHead checkpoint not found at {value_head_path}, "
+            "keeping zero-initialized ValueHead (normal for first training)."
+        )
+
+
 def load_weights_from_hf_with_mbridge_fast(
     bridge: Bridge,
     models: list[torch.nn.Module],
@@ -779,18 +1031,5 @@ def load_weights_from_hf_with_mbridge_fast(
         for _ in results:
             pass
 
-    # Load value_head weights for critic models.
-    if is_critic and mpu.is_pipeline_last_stage():
-        value_head_path = os.path.join(weights_path, "value_head.pt")
-        if os.path.exists(value_head_path):
-            value_head_state = torch.load(value_head_path, weights_only=True)
-            for model in models:
-                _model = unwrap_to_gpt_model(model)
-                if hasattr(_model, "output_layer"):
-                    _model.output_layer.load_state_dict(value_head_state)
-            logger.info(f"Loaded ValueHead weights from {value_head_path}")
-        else:
-            logger.info(
-                f"ValueHead checkpoint not found at {value_head_path}, "
-                "using random initialization (normal for first training)."
-            )
+    if is_critic:
+        load_critic_value_head(models, weights_path)
