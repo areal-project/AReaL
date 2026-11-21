@@ -422,7 +422,7 @@ class PPOActor:
             for key in ("sampler_head_ids", "sampler_head_logprobs"):
                 if key not in data:
                     raise ValueError(
-                        "Score centering requires SGLang sampler heads on every trajectory."
+                        "Score centering requires sampler heads on every trajectory."
                     )
                 if (
                     data[key].ndim != 3

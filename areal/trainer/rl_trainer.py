@@ -1713,6 +1713,18 @@ class PPOTrainer:
                 vllm_config=self.config.vllm,
                 tp_size=self.rollout_alloc.parallel.tp_size,
                 pp_size=self.rollout_alloc.parallel.pp_size,
+                score_centering_top_k=max(
+                    getattr(
+                        getattr(self.config, "gconfig", None),
+                        "score_centering_top_k",
+                        0,
+                    ),
+                    getattr(
+                        getattr(self.config, "eval_gconfig", None),
+                        "score_centering_top_k",
+                        0,
+                    ),
+                ),
             )
             # vLLM does not require LoRA paths during initialization.
             # LoRA is attached to generation requests.
