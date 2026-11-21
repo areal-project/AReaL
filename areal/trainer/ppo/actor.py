@@ -923,6 +923,61 @@ class PPOActorControllerV2(GatewayTrainController):
         self._gateway_post("/ppo/actor/update", payload)
 
 
+# Saturation caps for the detached forward values. The selected scalar is a
+# straight-through carrier, so these caps change only the reported number and
+# never the gradient, which comes from the clipped policy loss.
+_K2_MAX_ABS_X = 1e9
+_K3_MAX_X = 60.0
+
+
+def _sampled_rkl_forward(
+    teacher_logp: torch.Tensor,
+    logprobs: torch.Tensor,
+    mask: torch.Tensor,
+    estimator: str,
+) -> torch.Tensor:
+    """Per-token sampled reverse-KL forward values on ``mask``.
+
+    Inputs are expected to be detached. Masked positions contribute exactly
+    zero (``torch.where``, not multiplication, so a sentinel ``-inf`` cannot
+    become ``NaN``). A non-finite gap on a valid token is dropped for the
+    reported value. k2 clamps ``|x|`` and k3 clamps ``x`` before
+    ``expm1``, so a finite input can never yield an infinite reported scalar;
+    this is a documented saturation, not a silent overflow.
+    """
+    mask = mask.bool()
+    x = torch.where(mask, teacher_logp - logprobs, torch.zeros_like(logprobs))
+    if x.dtype not in (torch.float32, torch.float64):
+        x = x.float()
+    x = torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+    if estimator == "k1":
+        return -x
+    if estimator == "k2":
+        return 0.5 * torch.clamp(x, -_K2_MAX_ABS_X, _K2_MAX_ABS_X).square()
+    x = torch.clamp(x, max=_K3_MAX_X)
+    return torch.expm1(x) - x
+
+
+def _selected_rkl_scalar(
+    per_token: torch.Tensor,
+    weight: float,
+    denominator: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reduce selected per-token values without overflowing the loss dtype.
+
+    Every per-token value is finite, but their sum need not be: eight values of
+    5e17 already exceed fp32's maximum. Accumulate in float64, then saturate the
+    final scalar at the loss dtype's maximum before the straight-through
+    carrier. The saturation affects only the reported number, never the
+    gradient.
+    """
+    total = per_token.sum(dtype=torch.float64)
+    count = denominator.sum().clamp(min=1).to(torch.float64)
+    value = weight * total / count
+    return torch.clamp(value, max=torch.finfo(dtype).max).to(dtype)
+
+
 def grpo_loss_fn(
     logprobs: torch.Tensor,
     entropy: torch.Tensor,
@@ -1055,7 +1110,19 @@ def grpo_loss_fn(
     teacher_logp = input_data.get("teacher_logp")
     rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
     distill_loss_weight = input_data.get("distill_loss_weight", 0.005)
+    kl_estimator = input_data.get("kl_estimator", "k1")
+    if kl_estimator not in ("k1", "k2", "k3"):
+        raise ValueError(
+            f"kl_estimator must be 'k1', 'k2', or 'k3', got {kl_estimator!r}."
+        )
     pure_distill = teacher_logp is not None and rl_loss_weight == 0
+    if kl_estimator != "k1" and not pure_distill:
+        # Reject rather than silently falling back to k1. The selected value is
+        # only defined for the pure-KD path; joint KD+RL keeps its own term.
+        raise ValueError(
+            f"kl_estimator={kl_estimator!r} is only supported for sampled "
+            "pure-KD distillation (rl_loss_weight=0)."
+        )
     if pure_distill:
         # Pure KD: the per-token reverse-KL reward log pi_T - log pi_theta replaces
         # the task advantage, so the policy loss below clips its importance ratio
@@ -1194,6 +1261,33 @@ def grpo_loss_fn(
     elif pure_distill:
         loss = distill_loss_weight * loss
         rkl_stat = -advantages
+        # Optional forward-value selection. The policy loss above owns clipping,
+        # rejection and the backward pass; selecting a different estimator
+        # changes only the reported scalar, not the update. A straight-through
+        # carrier swaps the forward value while keeping d(loss)/d(params) from
+        # the clipped policy loss, so all three estimators remain
+        # gradient-equivalent on matched finite inputs.
+        #
+        # The selected scalar describes the tokens the update actually uses: its
+        # numerator follows the post-rejection effective mask, while the
+        # denominator is the same pre-rejection valid-token count the policy
+        # loss uses. ``rkl_loss`` for k1 stays the legacy pre-rejection value.
+        if kl_estimator != "k1":
+            effective_mask = stat.get("behave_mask", loss_mask).bool()
+            selected_per_token = _sampled_rkl_forward(
+                teacher_logp.detach(),
+                logprobs.detach(),
+                effective_mask,
+                kl_estimator,
+            ).to(logprobs.dtype)
+            selected_value = _selected_rkl_scalar(
+                selected_per_token,
+                distill_loss_weight,
+                denominator_mask,
+                logprobs.dtype,
+            )
+            loss = selected_value + (loss - loss.detach())
+            rkl_stat = selected_per_token
     elif teacher_logp is not None:
         # KDRL joint loss. The teacher term of log pi_theta - log pi_T is constant,
         # so backpropagating it drops the teacher. The k2 estimate
@@ -1204,6 +1298,23 @@ def grpo_loss_fn(
         rkl_penalty = rkl_penalty / denominator_mask.sum().clamp(min=1)
         loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
         rkl_stat = log_ratio.detach() * loss_mask
+
+    # Optional same-token diagnostics for all three estimates. Detached and
+    # unweighted: these describe the behavior-distribution draws, not an
+    # importance-weighted current-student KL. They use the same post-rejection
+    # effective mask as the selected scalar (numerator), with the usual
+    # pre-rejection valid-token denominator, and do not affect the loss, its
+    # gradient, or ``rkl_loss``. The helper's caps keep the reported values
+    # finite on large but finite gaps.
+    distill_diag = None
+    if teacher_logp is not None and input_data.get("log_distill_diagnostics", False):
+        effective_mask = stat.get("behave_mask", loss_mask).bool()
+        distill_diag = {
+            name: _sampled_rkl_forward(
+                teacher_logp.detach(), logprobs.detach(), effective_mask, name
+            ).to(logprobs.dtype)
+            for name in ("k1", "k2", "k3")
+        }
 
     # Match the engine's aggregation across microbatches and data-parallel ranks.
     stats_tracker.weighted_mean(
@@ -1235,6 +1346,15 @@ def grpo_loss_fn(
                 rkl_loss=rkl_stat,
                 denominator="n_valid_tokens",
             )
+
+    if distill_diag is not None:
+        # Same-token, unweighted diagnostics, averaged over valid tokens.
+        stats_tracker.stat(
+            distill_kl_k1=distill_diag["k1"],
+            distill_kl_k2=distill_diag["k2"],
+            distill_kl_k3=distill_diag["k3"],
+            denominator="n_valid_tokens",
+        )
 
     if use_score_centering:
         stats_tracker.stat(
