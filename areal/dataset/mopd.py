@@ -7,12 +7,13 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
-
-from areal.api.cli_args import _DatasetConfig
+from typing import TYPE_CHECKING, Any
 
 ROUTE_METADATA_KEY = "__areal_route"
 MOPD_ROUTE_METADATA_KEY = ROUTE_METADATA_KEY
+
+if TYPE_CHECKING:
+    from areal.api.cli_args import _DatasetConfig
 
 
 @dataclass(frozen=True)
@@ -182,6 +183,8 @@ def get_routed_dataset(
     source_loader: Callable[..., Any] | None = None,
 ) -> RoutedDataset:
     """Load configured sources and attach optional teacher-group metadata."""
+    from areal.api.cli_args import _DatasetConfig
+
     if not dataset_config.sources:
         raise ValueError("Dataset mixture config must contain at least one source")
 

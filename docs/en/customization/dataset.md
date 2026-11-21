@@ -158,3 +158,154 @@ def get_gsm8k_rl_dataset(
 
     return dataset
 ```
+
+## Offline prepared records
+
+The generic loader branch accepts records that you have already prepared and saved with
+`Dataset.save_to_disk()`. It reads those records from local disk and does not tokenize
+them, apply a chat template, or filter them by `max_length`. For text RL, `RLVRWorkflow`
+uses `messages` to build the generation prompt and passes every record field to the
+reward function. In the GSM8K example, `answer` therefore reaches `gsm8k_reward_fn`; the
+validator below only checks that `answer` exists and does not grade the answer.
+
+The validator has two local profiles. `text-rl` checks object-shaped records, non-empty
+`messages`, supported roles, and string message content. `tokenized-sft` checks
+non-empty `input_ids` and `loss_mask`, matching lengths, non-negative non-boolean token
+IDs, masks that are booleans or exact numeric `0`/`1`, and at least one supervised
+position. It can also enforce `--max-length`.
+
+The JSON report contains `profile`, `checked`, `valid`, `invalid`,
+`diagnostics_truncated`, and ordered `diagnostics`. Exit code 0 means the input is
+non-empty and valid; 1 means the selected input is empty or has invalid records; 2 means
+an argument, path, load, split, or report error. The `--max-errors` option limits stored
+diagnostics, not the number of records scanned. A persisted `DatasetDict` with `train`
+and `validation` requires `--split train` or `--split validation` to select one
+partition. JSONL is read one physical line at a time, so memory is affected by the
+largest line, runtime libraries, and stored diagnostics rather than the whole file.
+Hugging Face directories use the local `datasets` Arrow loader, whose memory behavior
+belongs to that library.
+
+Adapter matching uses the complete path, including parent directories. Keep the
+prepared-data directory and its parents away from names such as `gsm8k` and
+`geometry3k`. The temporary-directory prefix below avoids those names.
+
+Run the following complete example from the AReaL repository root. It creates three
+local math records, saves a `Dataset` and a `DatasetDict`, reloads both through the
+existing loader, checks the selected split, and calls the real validator module before
+the temporary directory is removed.
+
+<!-- areal: offline-dataset-example start -->
+
+```python
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from datasets import Dataset, DatasetDict
+
+from areal.dataset import get_custom_dataset
+
+
+records = [
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 1 + 1? Put the final answer within \\boxed{}.",
+            }
+        ],
+        "answer": "2",
+    },
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 2 + 3? Put the final answer within \\boxed{}.",
+            }
+        ],
+        "answer": "5",
+    },
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 6 - 4? Put the final answer within \\boxed{}.",
+            }
+        ],
+        "answer": "2",
+    },
+]
+
+with TemporaryDirectory(prefix="areal-offline-math-") as work_dir:
+    work = Path(work_dir)
+    dataset_dir = work / "offline_math_dataset"
+    split_dir = work / "offline_math_splits"
+
+    Dataset.from_list(records).save_to_disk(dataset_dir)
+    loaded_records = list(
+        get_custom_dataset(path=str(dataset_dir), type="rl", split=None)
+    )
+    assert len(loaded_records) == 3
+    for original, loaded_record in zip(records, loaded_records, strict=True):
+        assert loaded_record["messages"] == original["messages"]
+        assert loaded_record["answer"] == original["answer"]
+
+    DatasetDict(
+        {
+            "train": Dataset.from_list(records[:2]),
+            "validation": Dataset.from_list(records[2:]),
+        }
+    ).save_to_disk(split_dir)
+    loaded_train = list(
+        get_custom_dataset(path=str(split_dir), type="rl", split="train")
+    )
+    loaded_validation = list(
+        get_custom_dataset(path=str(split_dir), type="rl", split="validation")
+    )
+    assert len(loaded_train) == 2
+    assert len(loaded_validation) == 1
+
+    try:
+        get_custom_dataset(path=str(split_dir), type="rl", split="test")
+    except ValueError as error:
+        assert "test" in str(error)
+        assert "train" in str(error)
+        assert "validation" in str(error)
+    else:
+        raise AssertionError("Expected a missing-split ValueError")
+
+    report_path = work / "validation-report.json"
+    environment = os.environ.copy()
+    environment["HF_HUB_OFFLINE"] = "1"
+    environment["HF_DATASETS_OFFLINE"] = "1"
+    validator = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "areal.dataset.validate",
+            str(dataset_dir),
+            "--profile",
+            "text-rl",
+            "--require-field",
+            "answer",
+            "--report",
+            str(report_path),
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert validator.returncode == 0, validator.stderr
+    assert json.loads(validator.stdout)["checked"] == 3
+    validation_report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert validation_report["checked"] == 3
+    assert validation_report["valid"] == 3
+    assert validation_report["invalid"] == 0
+    assert not validation_report["diagnostics_truncated"]
+```
+
+<!-- areal: offline-dataset-example end -->

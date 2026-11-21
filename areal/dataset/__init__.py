@@ -5,7 +5,6 @@ import os
 import re
 from typing import TYPE_CHECKING, Optional
 
-from areal.api.cli_args import _DatasetConfig
 from areal.dataset.mopd import (
     ROUTE_METADATA_KEY,
     DatasetRoute,
@@ -21,6 +20,7 @@ if TYPE_CHECKING:
     from transformers.processing_utils import ProcessorMixin
     from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 
+    from areal.api.cli_args import _DatasetConfig
     from areal.infra.data_service.rdataset import RDataset
 
 VALID_DATASETS = [
@@ -231,7 +231,7 @@ def _get_custom_dataset(
 
 def get_custom_dataset(
     split: str | None = None,
-    dataset_config: _DatasetConfig | None = None,
+    dataset_config: "_DatasetConfig | None" = None,
     tokenizer: Optional["PreTrainedTokenizerFast"] = None,
     processor: Optional["ProcessorMixin"] = None,
     **kwargs,

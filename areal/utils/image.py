@@ -8,6 +8,8 @@ from PIL.Image import Image as ImageObject
 
 
 def image2base64(images: list[ImageObject] | ImageObject) -> list[str]:
+    """将单张或图片列表按原顺序编码为 PNG Base64 字符串。"""
+
     if isinstance(images, ImageObject):
         images = [images]
 
@@ -23,6 +25,8 @@ def image2base64(images: list[ImageObject] | ImageObject) -> list[str]:
 
 
 def pad_images_batch_to_max_size(images):
+    """将非空图片批次补边到黑色最大画布，奇数差值向下取整。"""
+
     max_width = max(image.size[0] for image in images)
     max_height = max(image.size[1] for image in images)
 
