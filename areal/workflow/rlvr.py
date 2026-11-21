@@ -23,6 +23,11 @@ from areal.utils.perf_tracer import (
     session_context,
     trace_session,
 )
+from areal.utils.topk_padding import (
+    pad_topk_ids,
+    pad_topk_logps,
+    truncate_topk,
+)
 from areal.workflow.reward_metrics import log_reward_metrics
 
 logger = logging.getLogger("RLVRWorkflow")
@@ -178,4 +183,64 @@ class RLVRWorkflow(RolloutWorkflow):
                 resp.stop_reason == "length", dtype=torch.bool
             ),
         }
-        return {k: v.unsqueeze(0) for k, v in res.items()}
+
+        # Score Centering: propagate sampler top-k data if available
+        if resp.sampler_head_ids is not None and resp.sampler_head_logprobs is not None:
+            raw_max_k = (
+                max(len(k) for k in resp.sampler_head_ids)
+                if resp.sampler_head_ids
+                else 0
+            )
+            if raw_max_k > 0:
+                # Rows are [sampled token] + top-k (k or k + 1); truncate_topk cuts them to k.
+                score_centering_top_k = getattr(
+                    self.gconfig, "score_centering_top_k", 0
+                )
+                k_dim = (
+                    score_centering_top_k if score_centering_top_k > 0 else raw_max_k
+                )
+                # Fewer than k entries cannot estimate the tail mass ratio.
+                if score_centering_top_k > 0 and raw_max_k < score_centering_top_k:
+                    raise RuntimeError(
+                        f"Score Centering requires score_centering_top_k={score_centering_top_k} "
+                        f"but the sampler returned only {raw_max_k} "
+                        "top-k entries. Increase vLLM max_logprobs or "
+                        "reduce score_centering_top_k."
+                    )
+                # Cap by logprob, not by arrival order: vLLM puts the sampled token
+                # first, so a [:k] slice would drop the true k-th alternative.
+                kept = [
+                    truncate_topk(ids, logps, k_dim)
+                    for ids, logps in zip(
+                        resp.sampler_head_ids, resp.sampler_head_logprobs
+                    )
+                ]
+                narrow = min(len(row) for row, _ in kept) if kept else k_dim
+                if narrow != k_dim:
+                    logger.warning(
+                        "Sampler top-k rows are narrower than k=%d (min width %d); "
+                        "padded slots bias the score-centering correction.",
+                        k_dim,
+                        narrow,
+                    )
+                # Input positions carry no sampler data: id 0 / -inf is zero mass.
+                input_topk_ids = [
+                    pad_topk_ids([], k_dim) for _ in range(resp.input_len)
+                ]
+                input_topk_logps = [
+                    pad_topk_logps([], k_dim) for _ in range(resp.input_len)
+                ]
+                sampler_head_ids = [pad_topk_ids(ids, k_dim) for ids, _ in kept]
+                sampler_head_logprobs = [
+                    pad_topk_logps(logps, k_dim) for _, logps in kept
+                ]
+                res["sampler_head_ids"] = torch.tensor(
+                    input_topk_ids + sampler_head_ids, dtype=torch.int32
+                )  # [seq_len, k]
+                res["sampler_head_logprobs"] = torch.tensor(
+                    input_topk_logps + sampler_head_logprobs, dtype=torch.float32
+                )  # [seq_len, k]
+
+        result = {k: v.unsqueeze(0) for k, v in res.items()}
+
+        return result

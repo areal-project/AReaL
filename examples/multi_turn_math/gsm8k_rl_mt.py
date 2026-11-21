@@ -83,6 +83,8 @@ class MultiturnRLVRWorkflow(RolloutWorkflow):
         if export_style not in ["individual", "concat"]:
             raise ValueError(f"Invalid export style: {export_style}")
         self.chat_template_type = "concat" if export_style == "concat" else "hf"
+        # The SDK drops score_centering_top_k, so the client must carry it.
+        self.score_centering_top_k = gconfig.score_centering_top_k
 
         # Search hyper-parameters
         self.agent = MultiTurnMathAgent(
@@ -96,6 +98,7 @@ class MultiturnRLVRWorkflow(RolloutWorkflow):
             engine=engine,
             tokenizer=self.tokenizer,
             chat_template_type=self.chat_template_type,
+            score_centering_top_k=self.score_centering_top_k,
         )
 
         # Collect single trajectory

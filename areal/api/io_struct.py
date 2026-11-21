@@ -101,6 +101,10 @@ class ModelResponse:
     # MoE routing (only populated when return_routed_experts=True)
     routed_experts: np.ndarray | None = None
 
+    # Width is k or k + 1: [sampled token] + top-k, de-duplicated by token id.
+    sampler_head_ids: list[list[int]] | None = None  # [n_output_tokens, k]
+    sampler_head_logprobs: list[list[float]] | None = None  # [n_output_tokens, k]
+
     @property
     def input_len(self) -> int:
         return len(self.input_tokens)
@@ -411,6 +415,11 @@ class HttpGenerationResult:
     output_logprobs: list[float]
     stop_reason: str
     routed_experts: np.ndarray | None = None
+    # Score Centering: per-token top-k token IDs and log-probs from sampler
+    # Width equals the requested k: vLLM puts the sampled token first and then
+    # k-1 alternatives (measured on 0.30 with logprobs=k -> 8 entries for k=8).
+    sampler_head_ids: list[list[int]] | None = None  # [n_output_tokens, k]
+    sampler_head_logprobs: list[list[float]] | None = None  # [n_output_tokens, k]
 
 
 @dataclass

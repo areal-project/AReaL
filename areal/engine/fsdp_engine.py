@@ -400,6 +400,16 @@ class FSDPEngine(TrainEngine):
             raise ValueError(
                 "Tree training currently cannot be enabled with sp_size > 1."
             )
+        # SC rides vLLM: no sharded heads, reject before the forward pass.
+        if getattr(self.config, "use_score_centering", False) and (
+            self.parallel_helper.sp_size > 1
+            or self.parallel_helper.tp_size > 1
+            or self.enable_tree_training
+        ):
+            raise ValueError(
+                "Score centering requires sp_size == 1, tp_size == 1 and ordinary "
+                "sequences on the vLLM transport."
+            )
         # Monkey patch: replace attention's forward() with Ulysses variant.
         apply_monkey_patch(
             model=self.model,
@@ -732,6 +742,28 @@ class FSDPEngine(TrainEngine):
     def lr_scheduler_step(self):
         assert self.lr_scheduler is not None
         self.lr_scheduler.step()
+
+    def _warn_sc_head_padding(self, q, loss_mask) -> None:
+        """Warn once if generated positions carry padded or zero-mass sampler heads."""
+        if getattr(self, "_sc_pad_warned", False):
+            return
+        rows = q.reshape(-1, q.shape[-1])
+        if loss_mask is not None:
+            keep = loss_mask.reshape(-1).bool()
+            if keep.numel() == rows.shape[0]:
+                rows = rows[keep]
+        if rows.numel() == 0:
+            return
+        pad_slots = int((rows <= -1e30).sum())
+        zero_rows = int((rows.exp().sum(-1) <= 0).sum())
+        if pad_slots or zero_rows:
+            self._sc_pad_warned = True
+            self.logger.warning(
+                "score centering: %d padded head slots and %d zero-mass rows in "
+                "generated positions; sampler top-k is incomplete",
+                pad_slots,
+                zero_rows,
+            )
 
     def forward_backward_batch(
         self,
@@ -2030,6 +2062,9 @@ class FSDPEngine(TrainEngine):
 
         inputs.pop("unit_weights", None)
         inputs.pop("is_truncated", None)
+        # Sampler heads feed the score-centering loss, not the model forward.
+        for head_key in ("sampler_head_ids", "sampler_head_logprobs"):
+            inputs.pop(head_key, None)
         ctx = FSDPTrainContext(
             model_inputs=inputs,
             mb_input=mb_item.orig_mb,
@@ -2185,12 +2220,66 @@ class FSDPEngine(TrainEngine):
                     entropy = entropy[: -ctx.pad_length]
                     vocab_min_logits = vocab_min_logits[: -ctx.pad_length]
                     vocab_max_logits = vocab_max_logits[: -ctx.pad_length]
+            # grpo_loss_fn takes sc_correction as a keyword-only argument.
+            sc_kwargs: dict[str, object] = {}
+            if getattr(self.config, "use_score_centering", False):
+                from areal.utils.score_centering import (
+                    build_weight_fn,
+                    score_centering_logprobs,
+                )
+
+                ids = ctx.mb_input.get("sampler_head_ids")
+                q = ctx.mb_input.get("sampler_head_logprobs")
+                if q is not None:
+                    self._warn_sc_head_padding(q, ctx.mb_input.get("loss_mask"))
+                if ids is None or q is None:
+                    missing = (
+                        "sampler_head_ids" if ids is None else "sampler_head_logprobs"
+                    )
+                    raise ValueError(
+                        "use_score_centering=True but this micro-batch carries no "
+                        f"sampler top-k heads (missing {missing}); "
+                        f"mb_input keys={list(ctx.mb_input.keys())[:18]}. Check that "
+                        "the workflow propagates sampler_head_ids / "
+                        "sampler_head_logprobs for every generated token."
+                    )
+                n_tokens = ctx.mb_input["input_ids"].numel()
+                if logits.shape[0] < n_tokens:
+                    raise ValueError(
+                        "Score centering needs at least "
+                        f"{n_tokens} logit rows, got {logits.shape[0]}."
+                    )
+                if ids.ndim != 2 or ids.shape[0] != n_tokens or ids.shape != q.shape:
+                    raise ValueError(
+                        "Packed sampler heads must have shape [real_tokens, K]."
+                    )
+                labels = torch.roll(
+                    ctx.mb_input["input_ids"], shifts=-1, dims=-1
+                ).reshape(-1)
+                sc_metrics: dict[str, torch.Tensor] = {}
+                logprobs, entropy, sc_kwargs["sc_correction"] = (
+                    score_centering_logprobs(
+                        logits[:n_tokens],
+                        labels,
+                        ids,
+                        q,
+                        chunk_size=self.config.logprobs_chunk_size,
+                        weight_fn=build_weight_fn(
+                            self.config.sc_mode,
+                            self.config.sc_clip_low,
+                            self.config.sc_clip_high,
+                        ),
+                        metrics_out=sc_metrics,
+                    )
+                )
+                sc_kwargs["sc_metrics"] = sc_metrics
             loss = loss_fn(
                 logprobs,
                 entropy,
                 ctx.mb_input,
                 vocab_min_logits=vocab_min_logits,
                 vocab_max_logits=vocab_max_logits,
+                **sc_kwargs,
             )
         else:
             values = self._compute_values(logits.squeeze(-1), ctx.ulysses_pad_size)

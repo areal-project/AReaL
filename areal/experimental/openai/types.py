@@ -14,6 +14,12 @@ from openai.types.responses.response_input_param import ResponseInputParam
 
 from areal.api import ModelResponse
 from areal.utils import logging
+from areal.utils.topk_padding import (
+    NEG_INF_PAD,
+    pad_topk_ids,
+    pad_topk_logps,
+    truncate_topk,
+)
 
 logger = logging.getLogger("TokenLogpReward")
 
@@ -68,6 +74,9 @@ class InteractionWithTokenLogpReward:
     chat_template_type: str = "hf"
     trajectory_metadata: dict[str, str] = field(default_factory=dict)
     _cache: dict[str, torch.Tensor] | None = None
+
+    # score_centering_top_k from the engine config; caps k_dim in to_tensor_dict().  0 = SC off.
+    score_centering_top_k: int = 0
 
     # Vision payload for VLM training. ``mm_token_type_ids`` covers the prompt
     # only (it is extended with zeros over the output at tensor-dict time);
@@ -197,6 +206,9 @@ class InteractionWithTokenLogpReward:
         resp = self.model_response
         assert resp is not None, "Model response is not set."
         self.seq_tokens = seq = resp.input_tokens + resp.output_tokens
+        # SC: a concat child reuses the parent's head rows for the prefix they share.
+        stitched_parent = False
+        parent_heads = None
         if self.chat_template_type == "concat" and self.parent is not None:
             parent_res = self.parent.to_tensor_dict()
             parent_logprobs = parent_res["logprobs"].squeeze(0).tolist()
@@ -205,6 +217,12 @@ class InteractionWithTokenLogpReward:
             parent_len = len(parent_logprobs)
             assert parent_len == len(parent_loss_mask) == len(parent_versions)
             if resp.input_len > parent_len:
+                stitched_parent = True
+                if "sampler_head_ids" in parent_res:
+                    parent_heads = (
+                        parent_res["sampler_head_ids"].squeeze(0),
+                        parent_res["sampler_head_logprobs"].squeeze(0),
+                    )
                 logprobs = (
                     parent_logprobs
                     + [0.0] * (resp.input_len - parent_len)
@@ -261,6 +279,74 @@ class InteractionWithTokenLogpReward:
                 _align_mm_token_type_ids(self.mm_token_type_ids, resp, len(seq)),
                 dtype=torch.long,
             ).unsqueeze(0)
+        # SC: input positions get zero top-k, output positions get the sampler heads.
+        own_heads = None
+        if resp.sampler_head_ids is not None and resp.sampler_head_logprobs is not None:
+            pad_k = (
+                max(len(k) for k in resp.sampler_head_ids)
+                if resp.sampler_head_ids
+                else 0
+            )
+            if pad_k > 0:
+                # Rows are [sampled token] + top-k (k or k + 1); truncate_topk cuts them to k.
+                score_centering_top_k = self.score_centering_top_k
+                k_dim = score_centering_top_k if score_centering_top_k > 0 else pad_k
+                if score_centering_top_k > 0 and pad_k < score_centering_top_k:
+                    raise RuntimeError(
+                        f"Score Centering requires score_centering_top_k={score_centering_top_k} "
+                        f"but the sampler returned only {pad_k} "
+                        "top-k entries. Increase vLLM max_logprobs or "
+                        "reduce score_centering_top_k."
+                    )
+                # Cap by logprob, not by arrival order: vLLM puts the sampled token
+                # first, so a [:k] slice would drop the true k-th alternative.
+                kept = [
+                    truncate_topk(ids, logps, k_dim)
+                    for ids, logps in zip(
+                        resp.sampler_head_ids, resp.sampler_head_logprobs
+                    )
+                ]
+                narrow = min(len(row) for row, _ in kept) if kept else k_dim
+                if narrow != k_dim:
+                    logger.warning(
+                        "Sampler top-k rows are narrower than k=%d (min width %d); "
+                        "padded slots bias the score-centering correction.",
+                        k_dim,
+                        narrow,
+                    )
+                # Output tokens: cap by logprob, then pad each row to k_dim.
+                own_heads = (
+                    k_dim,
+                    [pad_topk_ids(ids, k_dim) for ids, _ in kept],
+                    [pad_topk_logps(logps, k_dim) for _, logps in kept],
+                )
+        if stitched_parent and (parent_heads is None) != (own_heads is None):
+            raise ValueError(
+                "Every turn of a concat trajectory must carry sampler heads, or none "
+                "of them: a turn without heads leaves its generated tokens with no "
+                "sampler distribution to center against."
+            )
+        if own_heads is not None:
+            k_dim, own_ids, own_logps = own_heads
+            # Prompt and tool-output tokens have no sampler data: id 0 and -inf
+            # give them zero mass. Generated tokens keep the head of the turn that
+            # sampled them, so a concat child copies its parent's rows.
+            head_ids = torch.zeros((len(seq), k_dim), dtype=torch.int32)
+            head_logps = torch.full((len(seq), k_dim), NEG_INF_PAD, dtype=torch.float32)
+            if parent_heads is not None:
+                parent_ids, parent_logps = parent_heads
+                if parent_ids.shape[-1] != k_dim:
+                    raise ValueError(
+                        "Sampler heads differ in width across concat turns "
+                        f"({parent_ids.shape[-1]} vs {k_dim}); set "
+                        "score_centering_top_k so every turn keeps the same width."
+                    )
+                head_ids[: len(parent_ids)] = parent_ids
+                head_logps[: len(parent_logps)] = parent_logps
+            head_ids[resp.input_len :] = torch.tensor(own_ids, dtype=torch.int32)
+            head_logps[resp.input_len :] = torch.tensor(own_logps, dtype=torch.float32)
+            result["sampler_head_ids"] = head_ids.unsqueeze(0)  # [1, seq_len, k]
+            result["sampler_head_logprobs"] = head_logps.unsqueeze(0)  # [1, seq_len, k]
         self._cache = result
         return result
 
