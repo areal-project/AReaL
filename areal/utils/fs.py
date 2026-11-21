@@ -85,13 +85,16 @@ def validate_shared_path(path: str, name: str = "path", warn_nfs: bool = True) -
     real_path = os.path.realpath(path)
     partitions = psutil.disk_partitions(all=True)
 
-    # Find the best matching mountpoint (longest prefix match)
+    # Find the longest mountpoint that contains the path.
     best_match = None
     best_match_len = 0
 
     for partition in partitions:
         mountpoint = partition.mountpoint
-        if real_path.startswith(mountpoint) and len(mountpoint) > best_match_len:
+        if (
+            Path(real_path).is_relative_to(mountpoint)
+            and len(mountpoint) > best_match_len
+        ):
             best_match = partition
             best_match_len = len(mountpoint)
 
