@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from areal.api.cli_args import PPOActorConfig
+from areal.api.cli_args import MOPDLossConfig, PPOActorConfig, RejectionSamplingConfig
 from areal.trainer.ppo.actor import (
     PPOActor,
     _policy_version_loss_mask,
@@ -135,10 +135,85 @@ def test_actor_version_mask_is_opt_in_and_applied_before_packing(enabled):
     assert packed["mtp_version_mask"].tolist() == [False, False, True, True]
 
 
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("method", ["loglinear", "metrics"])
+def test_actor_proximal_approximation_uses_target_versions(packed, method):
+    """Use the sampled target's version across turn and sequence boundaries."""
+    engine = MagicMock()
+    engine.get_version.return_value = 4
+    actor = PPOActor(
+        PPOActorConfig(
+            backend="fsdp:d1",
+            use_decoupled_loss=True,
+            prox_logp_method=method,
+            ppo_n_minibatches=1,
+        ),
+        engine,
+    )
+    versions = torch.tensor([[-1, -1, 2, 2, -1, 3, 3], [-1, 2, 3, 0, 0, 0, 0]])
+    expected_versions = torch.tensor(
+        [[-1, 2, 2, -1, 3, 3, -1], [2, 3, -1, -1, -1, -1, -1]]
+    )
+    raw_mask = torch.tensor(
+        [[0, 0, 1, 1, 0, 1, 1], [0, 1, 1, 0, 0, 0, 0]], dtype=torch.bool
+    )
+    loss_mask = raw_mask.roll(-1, dims=-1)
+    proximal = torch.where(expected_versions == 2, -1.9, -2.0)
+    data = {
+        "input_ids": torch.arange(14).reshape(2, 7),
+        "attention_mask": torch.arange(7)[None, :] < torch.tensor([[7], [3]]),
+        "loss_mask": loss_mask,
+        "versions": versions.clone(),
+        "logprobs": torch.where(loss_mask, -2.0, 0.0),
+        "advantages": -torch.ones((2, 7)),
+        "kl_rewards": torch.zeros((2, 7)),
+        "tot_rewards": torch.zeros((2, 7)),
+        "rewards": torch.ones(2),
+    }
+    if method == "metrics":
+        data["prox_logp"] = proximal
+
+    def train_batch(batch, *, loss_fn, loss_weight_fn):
+        if packed:
+            batch = pack_tensor_dict(batch)
+        mask = batch["loss_mask"]
+        logprobs = torch.full_like(batch["logprobs"], -1.8, requires_grad=True)
+        loss = loss_fn(logprobs, torch.zeros_like(logprobs), batch)
+        loss.backward()
+
+        expected_ratios = (-1.8 - proximal.flatten()[batch["input_ids"][mask]]).exp()
+        torch.testing.assert_close(loss, expected_ratios.mean(), rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(
+            logprobs.grad[mask], expected_ratios / 6, rtol=1e-6, atol=1e-7
+        )
+        assert not logprobs.grad[~mask].any()
+        return {}
+
+    engine.train_batch.side_effect = train_batch
+    tracker = DistributedStatsTracker()
+    with (
+        patch("areal.trainer.ppo.actor.stats_tracker", tracker),
+        patch("areal.trainer.ppo.actor.stage_batch_for_engine"),
+    ):
+        actor._ppo_update(data)
+
+    engine.train_batch.assert_called_once()
+    torch.testing.assert_close(data["versions"], versions, rtol=0, atol=0)
+    torch.testing.assert_close(
+        data["prediction_versions"], expected_versions, rtol=0, atol=0
+    )
+    metrics = tracker.export()
+    assert metrics["update/compute_logp/loglinear/approx_logp/avg"] == pytest.approx(
+        -1.95
+    )
+    if method == "metrics":
+        assert metrics["update/compute_logp/loglinear/abs_error/avg"] == pytest.approx(
+            0.0, abs=1e-7
+        )
+
+
 @pytest.mark.parametrize("all_expired", [False, True])
 def test_pure_distillation_masks_expired_tokens_with_original_denominator(all_expired):
-    from areal.api.cli_args import MOPDLossConfig
-
     logits = torch.zeros((1, 3), requires_grad=True)
     mask = torch.tensor([[False, not all_expired, False]])
     data = {
@@ -163,3 +238,37 @@ def test_pure_distillation_masks_expired_tokens_with_original_denominator(all_ex
     expected = torch.tensor([[0.0, 0.0 if all_expired else -1 / 3, 0.0]])
     torch.testing.assert_close(logits.grad, expected, rtol=1e-6, atol=1e-7)
     assert torch.isfinite(loss)
+
+
+def test_pure_distillation_rejects_using_target_version():
+    """The target version makes this token exceed the behavior-ratio bound."""
+    logprobs = torch.tensor([[-1.8, -1.8]], requires_grad=True)
+    behavior_logprobs = torch.tensor([[-2.0, 0.0]])
+    data = {
+        "loss_mask": torch.tensor([[True, False]]),
+        "versions": torch.tensor([[-1, 2]]),
+        "prediction_versions": torch.tensor([[2, -1]]),
+        "logprobs": behavior_logprobs,
+        "mopd_behavior_logprobs": behavior_logprobs,
+        "mopd_teacher_logp_sum": torch.tensor([[-1.0, 0.0]]),
+        "mopd_teacher_weight_sum": torch.tensor([[1.0, 0.0]]),
+    }
+    with patch("areal.trainer.ppo.actor.stats_tracker", MagicMock()):
+        loss = grpo_loss_fn(
+            logprobs=logprobs,
+            entropy=torch.zeros_like(logprobs),
+            input_data=data,
+            eps_clip=0.2,
+            eps_clip_higher=None,
+            c_clip=None,
+            rejection_sampling=RejectionSamplingConfig(upper=1.05),
+            current_version=4,
+            prox_logp_method="loglinear",
+            use_decoupled_loss=True,
+            mopd_loss_config=MOPDLossConfig(),
+        )
+    loss.backward()
+    torch.testing.assert_close(loss, torch.zeros_like(loss), rtol=0, atol=0)
+    torch.testing.assert_close(
+        logprobs.grad, torch.zeros_like(logprobs), rtol=0, atol=0
+    )
