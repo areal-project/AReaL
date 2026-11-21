@@ -347,9 +347,9 @@ class GenerationHyperparameters:
     ) -> dict[str, Any]:
         """Convert the generation hyperparameters to a dictionary of arguments for OpenAI client."""
         if self.score_centering_top_k:
-            raise ValueError(
-                "Score centering requires the native SGLang RLVR workflow, not OpenAI clients."
-            )
+            from areal.utils.score_centering import validate_sampling
+
+            validate_sampling(self)
         final_exclude_args = set(exclude_args) if exclude_args is not None else set()
         final_exclude_args.update(self._OPENAI_UNSUPPORTED_ARGS)
         # TODO: move the excluded args into extra body, so they can be passed through the client request
@@ -367,7 +367,7 @@ class GenerationHyperparameters:
 
         res = {}
         for k, v in asdict(self).items():
-            if k in self._WORKFLOW_ONLY_ARGS:
+            if k in self._WORKFLOW_ONLY_ARGS or k == "score_centering_top_k":
                 continue
             if k in final_exclude_args:
                 should_warn = False
@@ -393,6 +393,10 @@ class GenerationHyperparameters:
                 logger.warning(f"Overriding key: {key} from {k} with value: {v}")
             res[key] = v
 
+        if self.score_centering_top_k:
+            # AReaL's proxy retains these heads internally for training. The
+            # standard OpenAI response schema remains unchanged.
+            res["extra_body"] = {"score_centering_top_k": self.score_centering_top_k}
         return res
 
 

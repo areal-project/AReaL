@@ -95,9 +95,11 @@ with the input tokens and differentiably gathers token outputs. Full local logit
 live. No new dependency or SGLang runtime patch is required.
 
 Support requires native SGLang rollout, temperature 1, and no sampling truncation or
-penalties. SAPO/CISPO, decoupled PPO, tree training, OpenAI agent workflows and
-distillation remain unsupported. Megatron additionally requires ordinary packed logits:
-chunked LM-head loss, MTP training and differentiable entropy are unsupported.
+penalties. Native multi-turn workflows and text-only OpenAI agent workflows can retain
+sampler heads across turns and tool calls; see the
+[agentic guide](score_centering_agentic.md). SAPO/CISPO, decoupled PPO, tree training
+and distillation remain unsupported. Megatron additionally requires ordinary packed
+logits: chunked LM-head loss, MTP training and differentiable entropy are unsupported.
 Evaluation disables head collection. Other training paths retain their existing behavior
 when score centering is disabled.
 
