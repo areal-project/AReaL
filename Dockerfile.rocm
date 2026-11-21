@@ -97,6 +97,12 @@ RUN if [ "$VARIANT" = "vllm" ]; then \
 ENV LD_LIBRARY_PATH=${SITE_PACKAGES}/_rocm_sdk_core/lib:${SITE_PACKAGES}/_rocm_sdk_core/lib/llvm/lib:${SITE_PACKAGES}/_rocm_sdk_core/lib/host-math/lib:${SITE_PACKAGES}/_rocm_sdk_core/lib/rocm_sysdeps/lib:${SITE_PACKAGES}/_rocm_sdk_libraries/lib:/opt/openmpi/lib
 # The base sets NVTE_FLASH_ATTN=0; megatron-core's attention_backend=auto requires both on.
 ENV NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=1
+# aiter 0.1.14 truncates fp32 to bf16 in its RMSNorm and CK attention kernels. On gfx942 this
+# doubles the train-vs-rollout logprob difference with aiter on; 0 rounds to nearest even instead.
+# gfx950 converts in hardware, so both archs use the same value. Only kernels JIT-compiled after
+# these are set are affected. Do not use 3 (fused-add RMSNorm returns inf). Remove at aiter >= v0.1.28.
+ENV OPUS_FP32_to_BF16_DEFAULT=0 \
+    CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0
 
 ##############################################################
 # Install AReaL from local source (last for fast iteration)
