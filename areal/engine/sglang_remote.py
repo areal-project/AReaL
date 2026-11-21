@@ -127,6 +127,10 @@ class SGLangBackend:
             message.startswith(
                 "Requested token count exceeds the model's maximum context length"
             )
+            or message.startswith(
+                "Multimodal prompt is too long after expanding multimodal tokens. "
+                "After expanding len(req.origin_input_ids_unpadded)="
+            )
             or (
                 message.startswith("The input (")
                 and "is longer than the model's context length (" in message
