@@ -19,12 +19,33 @@ def _compute_token_level_gae(
     bootstrap_values: torch.Tensor,
     discount: float,
     gae_lambda: float | torch.Tensor,
+    *,
+    zero_values: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute GAE with each generated token treated as one timestep.
 
     ``bootstrap_values`` contains each trajectory's value at its final valid token,
-    independent of the padded batch width.
+    independent of the padded batch width. ``zero_values`` asserts that ``values``
+    and ``bootstrap_values`` are all zero, as when training without a critic.
     """
+    if (
+        zero_values
+        and discount == 1.0
+        and isinstance(gae_lambda, float)
+        and gae_lambda == 1.0
+        and (
+            rewards.device.type == "cpu"
+            or not torch.are_deterministic_algorithms_enabled()
+        )
+    ):
+        # The recurrence reduces to a masked reward-to-go. PyTorch lists CUDA
+        # cumsum as nondeterministic, so deterministic accelerator runs keep the loop.
+        dtype = torch.promote_types(rewards.dtype, torch.float32)
+        active_rewards = rewards[:, :-1].to(dtype) * loss_mask[:, :-1]
+        reward_to_go = active_rewards.flip(-1).cumsum(-1).flip(-1)
+        advantages = torch.nn.functional.pad(reward_to_go, (0, 1))
+        return advantages, advantages + values
+
     bs, max_seqlen = rewards.shape
     advantages_reversed = [torch.zeros(bs, dtype=torch.float32, device=values.device)]
     lastgaelam = torch.zeros(bs, dtype=torch.float32, device=values.device)
