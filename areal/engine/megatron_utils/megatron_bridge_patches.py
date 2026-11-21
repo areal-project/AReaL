@@ -12,19 +12,27 @@ import areal.utils.logging as logging
 logger = logging.getLogger("MegatronBridgePatches")
 
 
-def patch_qwen35_hybrid_lora_specs() -> None:
-    """Unfuse Qwen3.5 attention/MLP inputs without changing its GDN layout.
+def patch_qwen35_hybrid_lora_specs(unfuse_gdn: bool = True) -> None:
+    """Unfuse Qwen3.5 attention and MLP inputs without dropping GDN layers.
 
     Megatron-Bridge builds Qwen3.5 as a heterogeneous list containing both
     Gated DeltaNet and full-attention layers. Replacing that list with a Qwen3
     dense spec would drop GDN entirely. Instead, wrap the native block-spec
-    builder and replace only the fused LayerNorm+ColumnParallelLinear modules
-    that LoRA targets. GDN's fused ``in_proj`` is deliberately retained until
-    it has matching adapter and export support.
+    builder and replace fused LayerNorm+linear modules that LoRA targets.
+    Full-attention ``linear_qkv`` and MLP ``linear_fc1`` are always unfused.
+    When ``unfuse_gdn`` is true, Gated DeltaNet ``in_proj`` is split into
+    ``PTNorm`` plus ``ColumnParallelLinear`` and ``out_proj`` becomes
+    ``RowParallelLinear``. The hybrid layer layout itself is preserved.
+
+    The resulting ``in_proj`` is still one LoRA adapter on the concatenated
+    qkv/z/b/a matrix. See ``docs/qwen35-gdn-lora.md``.
     """
     try:
         from megatron.bridge.models.qwen_vl import qwen35_vl_provider
-        from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+        from megatron.core.tensor_parallel.layers import (
+            ColumnParallelLinear,
+            RowParallelLinear,
+        )
         from mindspeed.core.megatron_basic.megatron_basic import PTNorm
     except ImportError:
         return
@@ -40,13 +48,27 @@ def patch_qwen35_hybrid_lora_specs() -> None:
 
             attention = submodules.self_attention
             attention_submodules = getattr(attention, "submodules", None)
-            # Full-attention layers expose linear_qkv; GDN layers expose
-            # in_proj instead and must keep their native fused implementation.
+            # Full-attention layers expose linear_qkv. GDN layers expose
+            # in_proj (fused with the input layernorm) and out_proj.
             if attention_submodules is not None and hasattr(
                 attention_submodules, "linear_qkv"
             ):
                 submodules.input_layernorm = PTNorm
                 attention_submodules.linear_qkv = ColumnParallelLinear
+                if getattr(attention, "metainfo", None) is not None:
+                    attention.metainfo["fuse_input_layernorm"] = False
+            elif (
+                unfuse_gdn
+                and attention_submodules is not None
+                and hasattr(attention_submodules, "in_proj")
+            ):
+                # MindSpeed's fused LayerNorm+linear does not return the
+                # normalized activation Megatron-Bridge LoRA needs. Split GDN
+                # in_proj the same way as full-attention QKV, and use a plain
+                # row-parallel out_proj so that projection can take an adapter.
+                submodules.input_layernorm = PTNorm
+                attention_submodules.in_proj = ColumnParallelLinear
+                attention_submodules.out_proj = RowParallelLinear
                 if getattr(attention, "metainfo", None) is not None:
                     attention.metainfo["fuse_input_layernorm"] = False
 
@@ -61,10 +83,16 @@ def patch_qwen35_hybrid_lora_specs() -> None:
 
     _unfused_block_spec._areal_qwen35_hybrid_lora_applied = True
     qwen35_vl_provider.get_transformer_block_with_experimental_attention_variant_spec = _unfused_block_spec
-    logger.info(
-        "Using unfused full-attention QKV and MLP FC1 specs for Qwen3.5 LoRA; "
-        "the native hybrid GDN layer layout is preserved."
-    )
+    if unfuse_gdn:
+        logger.info(
+            "Using unfused full-attention QKV, GDN in_proj/out_proj, and MLP FC1 "
+            "specs for Qwen3.5 LoRA; the native hybrid layer layout is preserved."
+        )
+    else:
+        logger.info(
+            "Using unfused full-attention QKV and MLP FC1 specs for Qwen3.5 LoRA; "
+            "the native hybrid GDN layer layout is preserved."
+        )
 
 
 def patch_qwen3_moe_lora_spec(provider: Any) -> None:

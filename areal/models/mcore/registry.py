@@ -247,7 +247,10 @@ def _enable_fp32_lm_head_forward(
                 continue
             if (
                 native_fp32_cls is not None and isinstance(submodule, native_fp32_cls)
-            ) or type(submodule).__name__ == "ColumnParallelLinearFP32":
+            ) or type(submodule).__name__ in (
+                "ColumnParallelLinearFP32",
+                "PointerHead",
+            ):
                 already_fp32.append(f"model{model_idx}:{name}")
                 continue
             if getattr(submodule, "_areal_fp32_lm_head_enabled", False):
