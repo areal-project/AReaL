@@ -199,6 +199,7 @@ examples/tir/
 │   ├── base.py                 # Tool base class
 │   ├── python_tool.py          # Python executor
 │   ├── daytona_python_tool.py  # Daytona cloud sandbox executor
+│   ├── runta_python_tool.py    # Runta cloud sandbox executor
 │   └── calculator_tool.py      # Calculator
 ├── data/                       # Data files
 │   └── sample_math.jsonl       # Sample data
@@ -228,6 +229,38 @@ Notes:
 - The stock `ToolRegistry` uses Daytona's default sandbox settings. If you want to pin a
   snapshot or custom image, update the `daytona_python` factory in
   `examples/tir/tool_manager.py`.
+
+## Cloud sandbox backend (Runta)
+
+Install the optional Runta backend and export your token:
+
+```bash
+uv pip install "runta-sdk>=0.2.6,<0.3"
+export RUNTA_TOKEN=...
+```
+
+Then switch the TIR config to the Runta-backed tool:
+
+```yaml
+tir:
+  enable_tools: "runta_python"
+```
+
+Notes:
+
+- `runta_python` runs every tool call in a fresh interpreter inside one runtime per
+  trajectory: files written by earlier calls persist, Python variables do not.
+- **The stock `runta_python` sandbox has only the Python standard library.** The stock
+  `ToolRegistry` runs code on the runtime's own Python, so a tool call that does
+  `import numpy` (or `sympy`, `scipy`, ...) fails with
+  `ModuleNotFoundError: No module named 'numpy'`. Nothing is installed for you. If your
+  task needs packages, update the `runta_python` factory in
+  `examples/tir/tool_manager.py` to pass `image=...` (a Docker image that already
+  contains them) or `checkpoint_id=...` (a Runta checkpoint of a runtime you prepared
+  with them installed) to `RuntaPythonTool`.
+- The same factory is where you change resources or block network access.
+- Enable only one of `python`, `daytona_python` and `runta_python`; they share the same
+  code-block markers.
 
 ## Data engineering recipe
 

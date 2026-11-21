@@ -29,6 +29,17 @@ def _build_daytona_python_tool(timeout: int, debug_mode: bool) -> BaseTool:
     return DaytonaPythonTool(timeout, debug_mode)
 
 
+def _build_runta_python_tool(timeout: int, debug_mode: bool) -> BaseTool:
+    if importlib.util.find_spec("runta") is None:
+        raise ImportError(
+            "runta_python requires the optional 'runta-sdk' dependency. Install it with `uv pip install 'runta-sdk>=0.2.6,<0.3'`."
+        )
+
+    from tools.runta_python_tool import RuntaPythonTool
+
+    return RuntaPythonTool(timeout, debug_mode)
+
+
 class ToolRegistry:
     """Tool registry that manages all available tools."""
 
@@ -36,8 +47,14 @@ class ToolRegistry:
         "python": ToolType.PYTHON,
         "calculator": ToolType.CALCULATOR,
         "daytona_python": ToolType.DAYTONA_PYTHON,
+        "runta_python": ToolType.RUNTA_PYTHON,
     }
     DEFAULT_TOOL_NAMES = ("python", "calculator")
+    PYTHON_BACKENDS = (
+        ToolType.PYTHON,
+        ToolType.DAYTONA_PYTHON,
+        ToolType.RUNTA_PYTHON,
+    )
 
     def __init__(
         self,
@@ -49,6 +66,9 @@ class ToolRegistry:
             ToolType.PYTHON: lambda: PythonTool(timeout, debug_mode),
             ToolType.CALCULATOR: lambda: CalculatorTool(timeout, debug_mode),
             ToolType.DAYTONA_PYTHON: lambda: _build_daytona_python_tool(
+                timeout, debug_mode
+            ),
+            ToolType.RUNTA_PYTHON: lambda: _build_runta_python_tool(
                 timeout, debug_mode
             ),
         }
@@ -65,12 +85,14 @@ class ToolRegistry:
             else:
                 logger.warning(f"Unknown tool type: {tool_name}, skipping")
 
-        if (
-            ToolType.PYTHON in self.enabled_tools
-            and ToolType.DAYTONA_PYTHON in self.enabled_tools
-        ):
+        python_backends = [
+            tool_type.value
+            for tool_type in self.enabled_tools
+            if tool_type in self.PYTHON_BACKENDS
+        ]
+        if len(python_backends) > 1:
             raise ValueError(
-                "python and daytona_python use the same markers; enable only one Python backend"
+                f"{' and '.join(python_backends)} use the same markers; enable only one Python backend"
             )
 
         self.tools = {
