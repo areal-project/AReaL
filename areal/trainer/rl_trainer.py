@@ -60,6 +60,7 @@ from areal.trainer.mopd.teacher_manager import (
     PersistentTeacherManager,
 )
 from areal.trainer.mopd.teacher_phase import MOPDTeacherPhase
+from areal.trainer.stream_trainer import StreamTrainer
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.cleanup import run_batch_cleanups
 from areal.utils.dataloader import create_dataloader
@@ -926,6 +927,12 @@ class PPOTrainer:
         elif self._requires_proxy_workflow(workflow):
             self._ensure_proxy_started()
 
+        stream_trainer = (
+            StreamTrainer(self.actor, self.rollout, config.stream_trainer)
+            if config.stream_trainer.enabled
+            else None
+        )
+
         if self.recover_info is None and self._evaluate_before_train(
             eval_workflow=eval_workflow,
             eval_workflow_kwargs=eval_workflow_kwargs,
@@ -974,7 +981,8 @@ class PPOTrainer:
                     prepare_kwargs["reward_normalization_use_std"] = (
                         config.gconfig.reward_normalization_use_std
                     )
-                rollout_batch = _collect_trainable_rollout_batch(
+                collect_batch = functools.partial(
+                    _collect_trainable_rollout_batch,
                     functools.partial(
                         self.actor.prepare_batch,
                         self.train_dataloader,
@@ -983,9 +991,16 @@ class PPOTrainer:
                     dynamic_bs=config.dynamic_bs,
                     min_batch_size=min_consumer_batch_size,
                 )
+                rollout_batch = (
+                    stream_trainer.collect_and_accumulate(
+                        collect_batch, global_step=global_step
+                    )
+                    if stream_trainer is not None
+                    else collect_batch()
+                )
             if self._should_offload_rollout:
                 self._offload_rollout()
-            elif self._is_v1_awex_colocate(self.config):
+            elif self._is_v1_awex_colocate(self.config) and stream_trainer is None:
                 # Auxiliary models may share the rollout GPUs too.
                 logger.info("[AWEX] colocate: pausing rollout...")
                 self.rollout.pause()
@@ -1061,7 +1076,7 @@ class PPOTrainer:
                     self._offload_model(self.teacher, role="teacher")
 
             # TODO(agent): Keep actor onload after auxiliary scoring on shared GPUs.
-            if self._is_v1_awex_colocate(self.config):
+            if self._is_v1_awex_colocate(self.config) and stream_trainer is None:
                 try:
                     if self.mopd_teacher_phase is not None:
                         rollout_batch = self.mopd_teacher_phase.materialize(
@@ -1102,7 +1117,7 @@ class PPOTrainer:
                 if self.mopd_execution_plan is not None
                 else config.actor.should_compute_prox_logp()
             )
-            if should_compute_prox_logp:
+            if should_compute_prox_logp and stream_trainer is None:
                 with (
                     stats_tracker.record_timing("recompute_logp"),
                     perf_tracer.trace_scope(
@@ -1124,7 +1139,11 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                if (
+                if stream_trainer is not None:
+                    # Scoring and backward already consumed these groups on
+                    # selected replicas; retain only original cleanup targets.
+                    adv_batch = []
+                elif (
                     self.mopd_execution_plan is not None
                     and not self.mopd_execution_plan.requires_rl
                 ):
@@ -1169,7 +1188,10 @@ class PPOTrainer:
                     if config.rollout.mask_stale_tokens
                     else {}
                 )
-                self.actor.ppo_update(adv_batch, **update_kwargs)
+                if stream_trainer is not None:
+                    stream_trainer.commit()
+                else:
+                    self.actor.ppo_update(adv_batch, **update_kwargs)
                 self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("ppo update")
 
@@ -1309,6 +1331,8 @@ class PPOTrainer:
 
             # Evaluation shares the paused AWEX inference servers. Reduce GPU
             # stats before restoring their KV pool, but commit only after eval.
+            if stream_trainer is not None:
+                stream_trainer.release_rollout()
             prepared_stats = self._prepare_awex_evaluation()
             if self._should_offload_rollout:
                 self._onload_rollout(is_eval=True)
@@ -1352,7 +1376,10 @@ class PPOTrainer:
             if not self._is_final_train_step(
                 global_step=global_step, max_steps=max_steps
             ):
-                self.rollout.resume()
+                # Streaming must install its next collection observer before
+                # the dispatcher admits any prefetched workflows.
+                if stream_trainer is None:
+                    self.rollout.resume()
             else:
                 logger.info(
                     "Skipping rollout resume after final training step "
@@ -1693,6 +1720,9 @@ class PPOTrainer:
             if self._is_v1_awex_colocate(self.config):
                 server_args["awex_colocate_mode"] = True
                 server_args["awex_meta_server_addr"] = self._awex_meta_server_addr
+                server_args["_areal_stream_topology"] = (
+                    self.config.stream_trainer.enabled
+                )
                 # SGLang's release/resume endpoints are no-ops unless its
                 # torch-memory-saver regions were enabled at server startup.
                 # AWEX relies on those endpoints to hand the colocated GPU to
@@ -2137,6 +2167,8 @@ class PPOTrainer:
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
         rollout_backend = self.rollout_alloc.backend
         actor_backend = self.actor_alloc.backend
+        if self.config.stream_trainer.enabled and not is_single_controller():
+            raise ValueError("stream_trainer requires single-controller mode")
         requires_train_engine_offload = any(
             (
                 self._should_offload_rollout,

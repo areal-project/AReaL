@@ -452,6 +452,7 @@ class PPOActor:
         meta: TrajBatchMeta | None = None,
         *,
         max_head_offpolicyness: int | None = None,
+        stream_accumulate: bool = False,
     ) -> None:
         if self.config.loss_aggregation != "token_mean" and (
             data.get("teacher_logp") is not None
@@ -655,11 +656,17 @@ class PPOActor:
                 .unsqueeze(1)
                 .expand(-1, seq_len)
             )
-        mb_inputs = split_training_batch_into_microbatches(
-            data,
-            n_mbs=self.config.ppo_n_minibatches,
-            group=self.engine.data_parallel_group,
-        )
+        if stream_accumulate:
+            if self.config.ppo_n_minibatches != 1:
+                raise ValueError("Stream Trainer requires one PPO optimizer minibatch")
+            # A complete local group is independent of unfinished DP replicas.
+            mb_inputs = [data]
+        else:
+            mb_inputs = split_training_batch_into_microbatches(
+                data,
+                n_mbs=self.config.ppo_n_minibatches,
+                group=self.engine.data_parallel_group,
+            )
         data.pop("_r3_row_indices", None)
         r3_mb_inputs = self._split_r3_minibatches(
             routed_experts, routing_valid, mb_inputs
@@ -697,7 +704,12 @@ class PPOActor:
                     mopd_loss_config=self._mopd_loss_config,
                 )
                 with self._r3_side_channel(*r3_mb):
-                    train_stat = self.engine.train_batch(
+                    train_batch = (
+                        self.engine.stream_backward_batch
+                        if stream_accumulate
+                        else self.engine.train_batch
+                    )
+                    train_stat = train_batch(
                         mb,
                         loss_fn=loss_fn,
                         loss_weight_fn=loss_step.loss_weight,

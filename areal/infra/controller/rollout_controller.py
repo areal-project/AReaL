@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import shutil
 import threading
 import traceback
@@ -190,6 +191,15 @@ class RolloutController:
 
         # Round-robin scheduling
         self._current_worker_idx = 0
+        # Reservations cover whole workflows, including time spent in tools.
+        self._stream_lock = threading.RLock()
+        self._stream_collecting = False
+        self._stream_events: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._stream_active: dict[int, int] = defaultdict(int)
+        self._stream_closed: set[int] = set()
+        self._stream_drained: set[int] = set()
+        self._stream_task_workers: dict[int, int] = {}
+        self._stream_failure: BaseException | None = None
 
         # State
         self._version_lock = Lock()
@@ -380,11 +390,7 @@ class RolloutController:
         ](
             max_queue_size=qsize,
             task_factory=self._create_submit_callback,
-            consume_result=lambda result: (
-                result
-                if isinstance(result, WorkflowContractFailure)
-                else self.consumed_metrics.consume(result)
-            ),
+            consume_result=self._consume_rollout_result,
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
             terminal_error_fn=get_workflow_result_error,
@@ -1133,7 +1139,7 @@ class RolloutController:
                 await asyncio.to_thread(self._backend_router.fail, exc)
             raise
 
-    def _choose_worker(self) -> tuple[Worker, int]:
+    def _choose_worker(self, *, reserve_workflow: bool = False) -> tuple[Worker, int]:
         """Choose a worker for the next request using round-robin scheduling.
 
         Returns
@@ -1143,10 +1149,215 @@ class RolloutController:
         """
         if not self.workers:
             raise RuntimeError("No workers available to choose from.")
-        worker = self.workers[self._current_worker_idx]
-        rank = self._current_worker_idx
-        self._current_worker_idx = (self._current_worker_idx + 1) % len(self.workers)
-        return worker, rank
+        with self._stream_lock:
+            self._check_stream_failure()
+            for offset in range(len(self.workers)):
+                rank = (self._current_worker_idx + offset) % len(self.workers)
+                if rank in self._stream_closed:
+                    continue
+                self._current_worker_idx = (rank + 1) % len(self.workers)
+                if reserve_workflow:
+                    self._stream_active[rank] += 1
+                return self.workers[rank], rank
+        raise RuntimeError("All rollout replicas have closed admission")
+
+    def _check_stream_failure(self) -> None:
+        if self._stream_failure is not None:
+            raise RuntimeError(
+                "Stream rollout replica transition failed"
+            ) from self._stream_failure
+
+    def _consume_rollout_result(
+        self, result: WorkflowTaskResult | None
+    ) -> WorkflowTaskResult | None:
+        if isinstance(result, WorkflowContractFailure):
+            return result
+        consumed = self.consumed_metrics.consume(result)
+        with self._stream_lock:
+            rank = (
+                self._stream_task_workers.pop(result.task_id, None)
+                if result is not None
+                else None
+            )
+            if self._stream_collecting and consumed is not None:
+                if rank is None:
+                    raise RuntimeError(
+                        "Consumed rollout has no stream worker reservation"
+                    )
+                self._stream_events.put(
+                    {
+                        "task_id": consumed.task_id,
+                        "worker_rank": rank,
+                        "trajectory": consumed.trajectory,
+                    }
+                )
+        return consumed
+
+    def begin_stream_collection(self) -> None:
+        """Observe groups consumed by one prepare_batch without changing filtering."""
+        with self._stream_lock:
+            if self._backend_router is not None:
+                raise ValueError(
+                    "Stream training requires backend_routing.enabled=False"
+                )
+            self._check_stream_failure()
+            if self._stream_collecting or self._stream_closed:
+                raise RuntimeError(
+                    "A stream collection or replica transition is already active"
+                )
+            if any(self._stream_active.values()):
+                raise RuntimeError(
+                    "Stream collection must begin before submitting workflows"
+                )
+            self._stream_events = queue.Queue()
+            self._stream_task_workers.clear()
+            self._stream_collecting = True
+
+    def get_stream_completed(self, timeout: float = 0.0) -> list[dict[str, Any]]:
+        """Return newly consumed accepted groups; timeout is in seconds."""
+        if timeout < 0:
+            raise ValueError("timeout must be nonnegative")
+        with self._stream_lock:
+            self._check_stream_failure()
+        try:
+            first = self._stream_events.get(timeout=timeout)
+        except queue.Empty:
+            return []
+        events = [first]
+        while True:
+            try:
+                events.append(self._stream_events.get_nowait())
+            except queue.Empty:
+                return events
+
+    def try_drain_stream_replica(self, worker_rank: int, keep_one: bool = True) -> bool:
+        """Fence and release one idle replica, preserving the single-server API."""
+        return self.try_drain_stream_replicas([worker_rank], keep_one=keep_one)
+
+    def try_drain_stream_replicas(
+        self, worker_ranks: list[int], keep_one: bool = True
+    ) -> bool:
+        """Atomically fence the inference replicas sharing one actor TP replica.
+
+        A failed RPC keeps admission closed and poisons the collection; it must
+        never be treated as a successful switch to actor ownership.
+        """
+        if not worker_ranks or len(set(worker_ranks)) != len(worker_ranks):
+            raise ValueError("Stream draining requires distinct nonempty worker ranks")
+        ranks = set(worker_ranks)
+        with self._stream_lock:
+            self._check_stream_failure()
+            if not self._stream_collecting:
+                raise RuntimeError("No active stream collection")
+            if any(
+                not isinstance(rank, int) or not 0 <= rank < len(self.workers)
+                for rank in ranks
+            ):
+                raise ValueError("worker_rank is outside rollout workers")
+            if ranks <= self._stream_drained:
+                return True
+            if ranks.intersection(self._stream_closed):
+                raise RuntimeError(
+                    "Stream replica memory transition is incomplete or partially drained"
+                )
+            if any(self._stream_active[rank] for rank in ranks):
+                return False
+            if keep_one and len(self._stream_closed | ranks) >= len(self.workers):
+                return False
+            self._stream_closed.update(ranks)
+
+        async def _drain(worker_rank: int):
+            if self._proxy_started:
+                await self.scheduler.async_call_engine(
+                    worker_id=self.proxy_workers[worker_rank].id,
+                    method="pause",
+                    engine_name=self._proxy_engine_name(worker_rank),
+                    http_timeout=60.0,
+                )
+            worker = self.workers[worker_rank]
+            for method, kwargs in (
+                ("pause", {}),
+                ("pause_generation", {}),
+                ("offload", {"tags": ["kv_cache", "weights", "cuda_graph"]}),
+            ):
+                await self.scheduler.async_call_engine(
+                    worker_id=worker.id,
+                    method=method,
+                    engine_name=self._engine_name(worker_rank),
+                    http_timeout=600.0,
+                    max_retries=1,
+                    **kwargs,
+                )
+
+        async def _drain_all():
+            await asyncio.gather(*(_drain(rank) for rank in sorted(ranks)))
+
+        try:
+            run_async_task(_drain_all)
+        except BaseException as exc:
+            with self._stream_lock:
+                self._stream_failure = exc
+            raise
+        with self._stream_lock:
+            self._stream_drained.update(ranks)
+        return True
+
+    def finish_stream_draining(self) -> list[int]:
+        """Drain remaining replicas once the fixed batch has finished collection.
+
+        Keep admission fenced throughout this final transition. The caller must
+        join prepare_batch first so no further replacement workflows are needed.
+        """
+        with self._stream_lock:
+            self._check_stream_failure()
+            if not self._stream_collecting:
+                raise RuntimeError("No active stream collection")
+            if any(self._stream_active.values()):
+                raise RuntimeError("Cannot finish draining while workflows are active")
+            remaining = sorted(set(range(len(self.workers))) - self._stream_drained)
+            if remaining:
+                if not self.try_drain_stream_replicas(remaining, keep_one=False):
+                    raise RuntimeError(
+                        "Rollout admission changed during final draining"
+                    )
+            if self._stream_drained != set(range(len(self.workers))):
+                raise RuntimeError("Not all rollout replicas released GPU memory")
+            return sorted(self._stream_drained)
+
+    def end_stream_collection(self) -> None:
+        """Stop observation; switched replicas stay fenced until global restore."""
+        with self._stream_lock:
+            self._stream_collecting = False
+            self._stream_task_workers.clear()
+
+    def restore_stream_replicas(self) -> None:
+        """Reopen admission after the trainer's ordinary global AWEX restore."""
+        with self._stream_lock:
+            self._check_stream_failure()
+            if self._stream_collecting or any(self._stream_active.values()):
+                raise RuntimeError("Cannot restore stream admission during collection")
+            self._stream_closed.clear()
+            self._stream_drained.clear()
+
+    def stream_topology(self) -> list[dict[str, Any]]:
+        """Read actual SGLang process GPU UUIDs without initializing CUDA here."""
+        records = self._collective_rpc("get_stream_topology", http_timeout=60.0)
+        topology = []
+        occupied = set()
+        for rank, record in enumerate(records):
+            uuids = record["gpu_uuids"]
+            if len(uuids) != self._gpus_per_server or len(set(uuids)) != len(uuids):
+                raise ValueError(
+                    "SGLang topology does not match a whole rollout replica: "
+                    f"worker={rank}, expected_gpus={self._gpus_per_server}, "
+                    f"record={record!r}"
+                )
+            devices = {(record["host"], uuid) for uuid in uuids}
+            if devices & occupied:
+                raise ValueError("Rollout replicas overlap physical GPUs")
+            occupied.update(devices)
+            topology.append({"worker_rank": rank, **record})
+        return topology
 
     def _resolve_workflow_str(self, workflow: WorkflowLike | None) -> str | None:
         """Resolve workflow to a string import path.
@@ -1216,12 +1427,16 @@ class RolloutController:
             # This function will be passed to `BatchTaskDispather` where
             # `on_rollout_submitted` will be called upon dispatching
             task_id = pending_task.task_id
-
             manager = self.staleness_manager
+            rank: int | None = None
+            workflow_finished = False
 
             try:
-                # Choose worker via round-robin.
-                worker, rank = self._choose_worker()
+                # Reserve one whole workflow on the selected physical replica.
+                worker, rank = self._choose_worker(reserve_workflow=True)
+                with self._stream_lock:
+                    if self._stream_collecting:
+                        self._stream_task_workers[task_id] = rank
                 engine_name = self._engine_name(rank)
                 # Set future for this task
                 future = asyncio.get_event_loop().create_future()
@@ -1267,6 +1482,7 @@ class RolloutController:
                     raise_timeout=False,
                     http_timeout=self.config.request_timeout,
                 )
+                workflow_finished = True
 
                 if isinstance(result, WorkflowContractFailure):
                     manager.on_rollout_rejected()
@@ -1305,6 +1521,20 @@ class RolloutController:
                 manager.on_rollout_rejected()
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
                 return None
+            finally:
+                if rank is not None:
+                    with self._stream_lock:
+                        self._stream_active[rank] -= 1
+                        if (
+                            not workflow_finished
+                            and self._stream_collecting
+                            and self._stream_failure is None
+                        ):
+                            # A timed-out RPC may still be running remotely. Never
+                            # infer safe memory ownership from its local coroutine.
+                            self._stream_failure = RuntimeError(
+                                f"Workflow {task_id} on replica {rank} has ambiguous completion"
+                            )
 
         if pending_task.arena_stream_dataloader is None:
             return _submit_then_wait
@@ -1516,6 +1746,7 @@ class RolloutController:
                 self.data_generator,
                 batch_size=dataloader.batch_size,
                 dynamic_bs=dynamic_bs,
+                stream_results=self._stream_collecting,
             )
         ]
 
