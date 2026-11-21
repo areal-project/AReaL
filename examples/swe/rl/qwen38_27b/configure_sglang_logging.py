@@ -12,7 +12,7 @@ config = {
     "disable_existing_loggers": False,
     "formatters": {
         "sglang": {
-            "class": "sglang.srt.utils.NewLineFormatter",
+            "class": "logging.Formatter",
             "datefmt": "%Y-%m-%d %H:%M:%S",
             "format": "%(asctime)s.%(msecs)03d %(levelname)s %(process)d ["
             + worker
@@ -21,7 +21,7 @@ config = {
     },
     "handlers": {
         "sglang": {
-            "class": "concurrent_log_handler.ConcurrentRotatingFileHandler",
+            "class": "logging.handlers.RotatingFileHandler",
             "formatter": "sglang",
             "level": "INFO",
             "filename": str(path.with_suffix(".log")),

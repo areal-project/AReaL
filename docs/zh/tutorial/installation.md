@@ -34,7 +34,8 @@
 
 ### 方式 1：Docker（推荐）
 
-我们推荐使用 Docker 和提供的镜像。Dockerfile 位于 AReaL 仓库的顶级目录。
+我们推荐使用 Docker 和提供的镜像。AReaL 仓库根目录中的 `Dockerfile` 用于构建两种镜像。默认构建 SGLang 0.5.20，传入
+`--build-arg VARIANT=vllm` 可构建 vLLM 镜像。
 
 ```bash
 docker pull ghcr.io/areal-project/areal-runtime:v2.1.1-sglang
@@ -107,23 +108,15 @@ uv pip install -r pyproject.vllm.toml --extra cuda
 
 #### Flash Attention 预编译 Wheel
 
-Flash Attention v2 包含在 `--extra cuda` 中，但 PyPI 仅提供源码分发包，从源码编译耗时约 30 分钟。为跳过编译，请在运行
-`uv sync` **之前**安装**预编译 wheel**。
-
-Flash Attention wheel 在编译时与特定 PyTorch 版本绑定。SGLang（默认 `pyproject.toml`）使用 **torch
-2.9**，vLLM（`pyproject.vllm.toml`）使用 **torch 2.10**，请选择对应的 wheel。将 `cpXYZ` 替换为您的 Python
-版本（3.11 对应 `cp311`，3.12 对应 `cp312`）。
-
-**SGLang**（默认，torch 2.9）：
+SGLang 0.5.20（默认 `pyproject.toml`）使用 **torch 2.13 / CUDA 13**，并通过锁文件安装 Flash Attention
+4。 直接安装锁文件中的依赖：
 
 ```bash
-# Python 3.12
-uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl"
-# Python 3.11
-# uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.9-cp311-cp311-linux_x86_64.whl"
-
 uv sync --extra cuda
 ```
+
+独立的 vLLM 环境使用 Flash Attention v2。其 wheel 在编译时与特定 PyTorch 版本绑定。为避免从源码编译， 请在运行 `uv sync`
+**之前**安装对应的预编译 wheel。将 `cpXYZ` 替换为 Python 版本（3.11 对应 `cp311`， 3.12 对应 `cp312`）。
 
 **vLLM**（torch 2.10，需要 `pyproject.vllm.toml`）：
 
@@ -149,10 +142,9 @@ CUDA 的训练和推理功能将不可用。此配置仅适用于开发、测试
 - `vllm`：vLLM 推理引擎（在 `pyproject.vllm.toml` 中）
 - `megatron`：Megatron 训练后端
 - `tms`：Torch Memory Saver
-- `flash-attn`：Flash Attention v2
 - `kernels`：Hugging Face Kernels 运行时
-- `cuda-train`：仅训练包（megatron + tms + kernels，不含推理后端）
-- `cuda`：cuda-train + 推理后端 + flash-attn
+- `cuda-train`：仅训练包（megatron + tms + kernels + torchao，不含推理后端）
+- `cuda`：cuda-train + SGLang 推理后端（包括 Flash Attention 4）
 
 ### 在训练中使用 Hugging Face Kernels
 
@@ -208,7 +200,7 @@ Docker）且需要这些包的优化（例如 FP8 训练、融合 Adam 内核）
 **注意**：
 
 - FlashMLA 和 DeepGEMM 需要 Hopper（H100/H800）或更新的 GPU。
-- DeepEP 需要 NVSHMEM 用于节点间和低延迟功能。Docker 镜像通过 pip 安装 `nvidia-nvshmem-cu12`，DeepEP 会自动检测。
+- DeepEP 需要 NVSHMEM 用于节点间和低延迟功能。SGLang 镜像通过锁文件安装 `nvidia-nvshmem-cu13`，DeepEP 会自动检测。
 - flash-linear-attention 使用纯 Triton 内核，可在任意 GPU 上运行。
 - 这些包在 Docker 构建期间从 GitHub 克隆和编译。手动安装时，确保为 FlashMLA 和 DeepGEMM 初始化 git
   子模块（`git submodule update --init --recursive`），因为它们依赖 CUTLASS。
