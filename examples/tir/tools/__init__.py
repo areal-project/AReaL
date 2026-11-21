@@ -38,3 +38,15 @@ if importlib.util.find_spec("daytona") is not None:
         __all__.append("DaytonaPythonTool")
 else:
     globals().pop("DaytonaPythonTool", None)
+
+if importlib.util.find_spec("opensandbox") is not None:
+    try:
+        OpenSandboxPythonTool = importlib.import_module(
+            ".opensandbox_python_tool", __name__
+        ).OpenSandboxPythonTool
+    except ImportError:
+        globals().pop("OpenSandboxPythonTool", None)
+    else:
+        __all__.append("OpenSandboxPythonTool")
+else:
+    globals().pop("OpenSandboxPythonTool", None)
