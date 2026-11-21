@@ -118,9 +118,7 @@ actor:
     mean_level: group
     std_level: group
     group_size: ${gconfig.n_samples}
-  adv_norm:
-    mean_level: batch
-    std_level: batch
+  adv_norm: null
   weight_update_mode: awex
   enable_delta_weight_update: true
   weight_update_delta_method: adamw

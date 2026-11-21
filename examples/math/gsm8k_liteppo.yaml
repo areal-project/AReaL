@@ -80,9 +80,7 @@ actor:
     mean_level: group
     std_level: batch
     group_size: ${gconfig.n_samples}
-  adv_norm:
-    mean_level: batch
-    std_level: batch
+  adv_norm: null
   scheduling_spec:
     - task_type: worker
       port_count: 2
