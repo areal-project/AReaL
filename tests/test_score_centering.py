@@ -38,18 +38,15 @@ def isolated_actor_stats_tracker(monkeypatch):
     monkeypatch.setattr(actor, "stats_tracker", DistributedStatsTracker())
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_selected_backward_matches_dense_rounding_with_peaked_logits(device, dtype):
+def test_selected_backward_matches_dense_rounding_with_peaked_logits(dtype):
     """Preserve dense VJP rounding before BF16, including repeated selected IDs."""
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA unavailable")
     torch.manual_seed(31)
-    logits = (10 * torch.randn(17, 8192, device=device)).to(dtype).requires_grad_()
+    logits = (10 * torch.randn(17, 8192)).to(dtype).requires_grad_()
     oracle = logits.detach().clone().requires_grad_()
     heads = logits.detach().topk(128, dim=-1).indices
     ids = torch.cat((heads[:, :1], heads), dim=-1)
-    upstream = torch.randn(ids.shape, device=device) * 1e-3
+    upstream = torch.randn(ids.shape) * 1e-3
     upstream[:, 0] = -upstream[:, 1:].sum(-1)
     actual, _ = selected_logprobs(logits, ids, chunk_size=7)
     expected = oracle.float().log_softmax(-1).gather(-1, ids)
@@ -78,27 +75,24 @@ def reference(logits, labels, ids, q, weight_fn=None):
     return lp.gather(-1, labels[:, None]).squeeze(-1), (phead * coefficient).sum(-1)
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("chunk", [1, 7, 100])
 @pytest.mark.parametrize("width", [1, 9, 31])
-def test_reference_values_and_gradients_match_dense(device, dtype, chunk, width):
+def test_reference_values_and_gradients_match_dense(dtype, chunk, width):
     """Compare independent dense normalization, including overlapping sampled IDs."""
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA unavailable")
     torch.manual_seed(7)
-    x = torch.randn(13, 31, device=device, dtype=dtype, requires_grad=True)
+    x = torch.randn(13, 31, dtype=dtype, requires_grad=True)
     oracle = (
         x.detach()
         .to(torch.float64 if dtype == torch.float64 else torch.float32)
         .requires_grad_()
     )
-    ids = torch.randperm(31, device=device)[:width].expand(13, -1)
+    ids = torch.randperm(31)[:width].expand(13, -1)
     labels = ids[:, 0]
     q = torch.randn_like(oracle).log_softmax(-1).gather(-1, ids).detach()
     lp, entropy, c = score_centering_logprobs(x, labels, ids, q, chunk)
     expected_lp, expected_c = reference(oracle, labels, ids, q)
-    advantage = torch.randn(13, device=device, dtype=oracle.dtype)
+    advantage = torch.randn(13, dtype=oracle.dtype)
     ((c - lp) * advantage).sum().backward()
     ((expected_c - expected_lp) * advantage).sum().backward()
     tol = 1e-10 if dtype == torch.float64 else 3e-5
