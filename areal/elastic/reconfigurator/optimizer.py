@@ -15,7 +15,7 @@ from math import inf, isfinite
 from time import monotonic
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
-from .trigger import WorkloadTrigger
+from .trigger import WorkloadChange, WorkloadTrigger
 
 if TYPE_CHECKING:
     from .evaluator import Observation, ReplayEvaluator
@@ -504,7 +504,14 @@ class Optimizer(BaseOptimizer):
                 )
         return splits
 
-    def decide(self, observation: Observation, current: Layout) -> Decision:
+    def decide(
+        self,
+        observation: Observation,
+        current: Layout,
+        *,
+        confirmed: WorkloadChange | None = None,
+    ) -> Decision:
+        """A caller supplying a confirmed change owns its trigger's observation clock."""
         if self.pending is not None:
             return Decision(current, current, (), "Adjustment pending")
         if current != observation.current or current.gpus > self.gpu_capacity:
@@ -521,7 +528,9 @@ class Optimizer(BaseOptimizer):
             return Decision(
                 current, current, (), "Waiting for a published update boundary"
             )
-        change = self.workload_trigger.observe(view)
+        change = (
+            confirmed if confirmed is not None else self.workload_trigger.observe(view)
+        )
         if change is None:
             return Decision(current, current, (), "No stable workload change")
         context = self.evaluator.prepare(observation, pattern=change.pattern)
@@ -605,7 +614,8 @@ class Optimizer(BaseOptimizer):
         else:
             reason = "Catalogue exhausted"
         winner = select(predictions, current, self.target)
-        self.workload_trigger.searched(change)
+        if confirmed is None:
+            self.workload_trigger.searched(change)
         if winner is None:
             reason = (
                 f"No feasible candidate among {len(predictions)} evaluated ({reason})"

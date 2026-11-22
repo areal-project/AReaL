@@ -1,5 +1,18 @@
 # Hermes via the native Agent Service and v2 online PPO.
 # Model, data and run budgets are explicit environment settings.
+# Optional automatic layouts. Use the same fresh, shared AREAL_ELASTIC_EVENT_DIR
+# for this Trainer and its EpisodeClient. Supply absolute paths to the profile
+# catalog directory and policy settings JSON. List the allocated GPUs in rank
+# order as JSON strings "worker-ip:local-gpu-id" in AREAL_ELASTIC_DEVICES.
+# elastic:
+#   run_dir: ${oc.env:AREAL_ELASTIC_EVENT_DIR}
+#   catalog: ${oc.env:AREAL_ELASTIC_CATALOG}
+#   settings: ${oc.env:AREAL_ELASTIC_SETTINGS}
+#   devices: ${oc.decode:${oc.env:AREAL_ELASTIC_DEVICES}}
+# For multiple nodes, use scheduler.type=ray and set cluster.n_nodes.
+# Set actor.gpu_devices and rollout.gpu_devices to disjoint lists of pool indices.
+# External timed producers call EpisodeClient.record_arrival(id, time.time())
+# at enqueue, before handing the request to a concurrency-limited worker.
 experiment_name: hermes-dapo-ppo
 trial_name: trial0
 seed: 1

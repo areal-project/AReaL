@@ -4447,6 +4447,19 @@ class MOPDConfig:
 
 
 @dataclass
+class ElasticConfig:
+    """Reference policy inputs and shared storage for one online PPO run."""
+
+    run_dir: str
+    catalog: str
+    settings: str
+    devices: list[str] = field(default_factory=list)
+    poll_seconds: float = 5.0
+    forecast_seconds: float = 360.0
+    estimated_search_seconds: float = 40.0
+
+
+@dataclass
 class PPOConfig(BaseExperimentConfig):
     """Configuration for Proximal Policy Optimization (PPO) reinforcement learning experiments."""
 
@@ -4486,6 +4499,8 @@ class PPOConfig(BaseExperimentConfig):
             "This results in variable-sized batches of valid data."
         },
     )
+
+    elastic: ElasticConfig | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         """Validate the eval generation config."""

@@ -80,6 +80,7 @@ python3 train.py --config path/to/config.yaml actor.lr=1e-4 seed=42
 - [DPOEngine Configuration](section-dpo-engine)
 - [DatasetSource Configuration](section-dataset-source)
 - [DistributedDataParallel Configuration](section-distributed-data-parallel)
+- [Elastic Configuration](section-elastic)
 - [FP8Engine Configuration](section-fp8-engine)
 - [MOPD Configuration](section-mopd)
 - [MOPDLoss Configuration](section-mopd-loss)
@@ -171,6 +172,7 @@ A dummy place holder of GRPO config for backward compatibility.
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`                      | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
 | `mopd`               | [`MOPDConfig`](section-mopd) \| None                                      | `None`                      | Optional multi-teacher on-policy distillation config.                                                                                                                                                                                                               |
 | `dynamic_bs`         | boolean                                                                   | `False`                     | Enable dynamic batch sizing in prepare_batch. When True, batch collection stops when (accepted + rejected) >= batch_size, returning only accepted results. This results in variable-sized batches of valid data.                                                    |
+| `elastic`            | [`ElasticConfig`](section-elastic) \| None                                | `None`                      | -                                                                                                                                                                                                                                                                   |
 
 (section-ppo)=
 
@@ -211,6 +213,7 @@ Configuration for Proximal Policy Optimization (PPO) reinforcement learning expe
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`                      | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
 | `mopd`               | [`MOPDConfig`](section-mopd) \| None                                      | `None`                      | Optional multi-teacher on-policy distillation config.                                                                                                                                                                                                               |
 | `dynamic_bs`         | boolean                                                                   | `False`                     | Enable dynamic batch sizing in prepare_batch. When True, batch collection stops when (accepted + rejected) >= batch_size, returning only accepted results. This results in variable-sized batches of valid data.                                                    |
+| `elastic`            | [`ElasticConfig`](section-elastic) \| None                                | `None`                      | -                                                                                                                                                                                                                                                                   |
 
 (section-rw)=
 
@@ -1204,6 +1207,22 @@ Refer to Megatron-LM documentation for details.
 | `bucket_size`               | integer \| None | `None`  | -           |
 | `average_in_collective`     | boolean         | `False` | -           |
 | `fp8_param_gather`          | boolean         | `False` | -           |
+
+(section-elastic)=
+
+## Elastic Configuration
+
+Reference policy inputs and shared storage for one online PPO run.
+
+| Parameter                  | Type           | Default      | Description |
+| -------------------------- | -------------- | ------------ | ----------- |
+| `run_dir`                  | string         | **Required** | -           |
+| `catalog`                  | string         | **Required** | -           |
+| `settings`                 | string         | **Required** | -           |
+| `devices`                  | list of string | `[]`         | -           |
+| `poll_seconds`             | float          | `5.0`        | -           |
+| `forecast_seconds`         | float          | `360.0`      | -           |
+| `estimated_search_seconds` | float          | `40.0`       | -           |
 
 (section-fp8-engine)=
 

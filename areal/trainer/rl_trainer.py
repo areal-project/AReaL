@@ -5,12 +5,8 @@ from __future__ import annotations
 import functools
 import os
 import time
-from collections import deque
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future
 from copy import deepcopy
-from pathlib import Path
-from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
 
 import torch.distributed as dist
@@ -203,6 +199,8 @@ class _EmptyDataLoader:
 
 
 class PPOTrainer:
+    _elastic_controller = None
+
     def __init__(
         self,
         config: PPOConfig,
@@ -216,19 +214,23 @@ class PPOTrainer:
         LocalScheduler accepts node-local GPU IDs. Layout requests on either
         scheduler identify each GPU by its worker node IP and local ID.
         """
+        if config.elastic is not None:
+            from areal.elastic.reconfigurator.controller import configure_devices
+
+            config = deepcopy(config)
+            reconfiguration_devices = configure_devices(config, reconfiguration_devices)
         self._reconfiguration_devices = (
             tuple(reconfiguration_devices)
             if reconfiguration_devices is not None
             else None
         )
         self._reconfiguration_pool: list[int] | None = None
-        self._reconfiguration_requests: deque[tuple[dict[str, Any], Future[None]]] = (
-            deque()
-        )
-        self._reconfiguration_lock = Lock()
-        self._reconfiguration_closed = False
         try:
             self._init_impl(config, train_dataset, valid_dataset)
+            if config.elastic is not None:
+                from areal.elastic.reconfigurator.controller import ElasticController
+
+                self._elastic_controller = ElasticController(self)
         except Exception:
             logger.error(
                 "PPOTrainer construction failed; tearing down partially "
@@ -719,12 +721,16 @@ class PPOTrainer:
         self, meta: WeightUpdateMeta, new_version: int
     ) -> None:
         """Update weights, publish their version, and discard stale AWEX requests."""
+        if self._elastic_controller is not None:
+            self._elastic_controller.record("publish")
         self.actor.update_weights(meta)
 
         self.actor.set_version(new_version)
         if self.critic is not None:
             self.critic.set_version(new_version)
         self.rollout.set_version(new_version)
+        if self._elastic_controller is not None:
+            self._elastic_controller.record("done")
         if self.eval_rollout is not None:
             self.eval_rollout.set_version(new_version)
 
@@ -1010,6 +1016,8 @@ class PPOTrainer:
                     dynamic_bs=config.dynamic_bs,
                     min_batch_size=min_consumer_batch_size,
                 )
+                if self._elastic_controller is not None:
+                    self._elastic_controller.record("take", len(rollout_batch))
             if self._should_offload_rollout:
                 self._offload_rollout()
             elif self._is_v1_awex_colocate(self.config):
@@ -1379,7 +1387,8 @@ class PPOTrainer:
             if not self._is_final_train_step(
                 global_step=global_step, max_steps=max_steps
             ):
-                self._apply_pending_reconfiguration()
+                if self._elastic_controller is not None:
+                    self._elastic_controller.at_boundary()
                 self.rollout.resume()
             else:
                 logger.info(
@@ -1389,7 +1398,6 @@ class PPOTrainer:
                 )
 
             self._save_perf_tracer(step=global_step)
-        self._cancel_reconfiguration_requests()
 
     def _save_training_state(
         self,
@@ -1500,99 +1508,41 @@ class PPOTrainer:
             )
         return pool
 
-    def request_reconfiguration(
+    def _apply_reconfiguration(
         self,
         *,
         actor_layout: ExecutionLayout | None = None,
         rollout_layout: ExecutionLayout | None = None,
         state_path: str | None = None,
-    ) -> Future[None]:
-        """Queue a layout change for an update boundary; completion reports success.
-
-        Requires reconfiguration_devices at construction. Requests execute FIFO,
-        at most one per boundary preceding another update. Training completion
-        and close() cancel queued requests. A running change reports its original
-        exception on failure.
-        """
-        from areal.v2.reconfiguration import ExecutionLayout
-
-        if self._reconfiguration_pool is None:
-            raise RuntimeError(
-                "Enable reconfiguration_devices when constructing the Trainer"
-            )
-        if actor_layout is None and rollout_layout is None:
-            raise ValueError("Supply an Actor or rollout target layout")
-        pool = set(self._reconfiguration_devices)
-        for layout in (actor_layout, rollout_layout):
-            if layout is not None and (
-                not isinstance(layout, ExecutionLayout)
-                or not set(layout.devices).issubset(pool)
-            ):
-                raise ValueError(
-                    "Target layouts must belong to reconfiguration_devices"
-                )
-        if actor_layout is not None and state_path is None:
-            raise ValueError("Actor reconfiguration requires a fresh state_path")
-        request = dict(
-            actor_layout=actor_layout,
-            rollout_layout=rollout_layout,
-            state_path=str(Path(state_path).resolve())
-            if state_path is not None
-            else None,
-        )
-        future: Future[None] = Future()
-        with self._reconfiguration_lock:
-            if self._reconfiguration_closed:
-                raise RuntimeError("Trainer is closed")
-            self._reconfiguration_requests.append((request, future))
-        return future
-
-    def _apply_pending_reconfiguration(self) -> None:
-        if getattr(self, "_reconfiguration_pool", None) is None:
-            return
+    ) -> None:
         from areal.v2.reconfiguration import reconfigure
 
-        with self._reconfiguration_lock:
-            while self._reconfiguration_requests:
-                request, future = self._reconfiguration_requests.popleft()
-                if future.set_running_or_notify_cancel():
-                    break
-            else:
-                return
-        try:
-            reconfigure(self.actor, **request)
-            for name in ("actor", "rollout"):
-                current = getattr(self, name).config
-                configured = getattr(self.config, name)
-                configured.backend = current.backend
-                configured.gpu_devices = list(current.gpu_devices)
-            self.actor_alloc = ModelAllocation.from_str(
-                self.config.actor.backend, name="actor"
+        reconfigure(
+            self.actor,
+            actor_layout=actor_layout,
+            rollout_layout=rollout_layout,
+            state_path=state_path,
+        )
+        for name in ("actor", "rollout"):
+            current = getattr(self, name).config
+            configured = getattr(self.config, name)
+            configured.backend = current.backend
+            configured.gpu_devices = list(current.gpu_devices)
+        self.actor_alloc = ModelAllocation.from_str(
+            self.config.actor.backend, name="actor"
+        )
+        self.rollout_alloc = ModelAllocation.from_str(
+            self.config.rollout.backend, name="rollout"
+        )
+        if rollout_layout is not None and rollout_layout.attention_dp_size is not None:
+            self.config.sglang.dp_size = rollout_layout.attention_dp_size
+            self.config.sglang.enable_dp_attention = (
+                rollout_layout.attention_dp_size > 1
             )
-            self.rollout_alloc = ModelAllocation.from_str(
-                self.config.rollout.backend, name="rollout"
-            )
-            layout = request["rollout_layout"]
-            if layout is not None and layout.attention_dp_size is not None:
-                self.config.sglang.dp_size = layout.attention_dp_size
-                self.config.sglang.enable_dp_attention = layout.attention_dp_size > 1
-        except BaseException as exc:
-            future.set_exception(exc)
-            raise
-        future.set_result(None)
-
-    def _cancel_reconfiguration_requests(self, *, closing: bool = False) -> None:
-        if not hasattr(self, "_reconfiguration_requests"):
-            return
-        with self._reconfiguration_lock:
-            self._reconfiguration_closed |= closing
-            pending = list(self._reconfiguration_requests)
-            self._reconfiguration_requests.clear()
-        for _, future in pending:
-            future.cancel()
 
     def close(self):
-        self._cancel_reconfiguration_requests(closing=True)
+        if self._elastic_controller is not None:
+            self._elastic_controller.close()
         # P87: must tolerate a partially-constructed trainer (called from
         # __init__'s failure path), and one engine's destroy() failure must
         # not keep the remaining workers alive.
