@@ -37,6 +37,7 @@ class EpisodeClient:
         output: Path,
         concurrency: int,
         grade_pool=None,
+        elastic_event_dir: str | None = None,
     ):
         if concurrency < 1:
             raise ValueError("Concurrency must be positive")
@@ -45,6 +46,17 @@ class EpisodeClient:
         self.inference_key, self.model = inference_key, model
         self.output, self.concurrency = output, concurrency
         self.grade_pool = grade_pool
+        self._events = None
+        directory = elastic_event_dir or os.getenv("AREAL_ELASTIC_EVENT_DIR")
+        if directory:
+            from areal.elastic.reconfigurator.observation import EventWriter
+
+            self._events = EventWriter(directory)
+
+    def record_arrival(self, request_id: str, at: float) -> None:
+        """Call at offer time, before admission to a concurrent client worker."""
+        if self._events is not None:
+            self._events.write("offered", request_id=request_id, at=at)
 
     async def _start_session(self, request_id: str) -> dict:
         while True:
@@ -93,6 +105,13 @@ class EpisodeClient:
             row["phase"] = "start_session"
             session = await self._start_session(request_id)
             row["session_id"] = session["session_id"]
+            if self._events is not None:
+                self._events.write(
+                    "session",
+                    request_id=request_id,
+                    session_id=row["session_id"],
+                    at=time.time(),
+                )
             row["phase"] = "agent"
             result = await self.harness.run(
                 self.benchmark.prepare(task),
@@ -148,6 +167,15 @@ class EpisodeClient:
                 except Exception as exc:
                     row["cleanup_error_type"] = type(exc).__name__
             row["finished"] = time.time()
+            if self._events is not None:
+                self._events.write(
+                    "finished",
+                    request_id=request_id,
+                    status=row.get("status"),
+                    started=row["started"],
+                    finished=row["finished"],
+                    api_calls=(row.get("metadata") or {}).get("api_calls"),
+                )
         return row
 
     async def run(self, tasks: list) -> dict:
@@ -164,6 +192,9 @@ class EpisodeClient:
                 "requests": requests,
             },
         )
+        if self._events is not None:
+            for request in requests:
+                self.record_arrival(request["request_id"], available_at)
         pending = iter(zip(tasks, requests))
         rows = []
 

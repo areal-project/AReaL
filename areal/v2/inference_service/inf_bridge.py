@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -80,6 +81,11 @@ class InfBridge:
         self.return_routed_experts = return_routed_experts
         self._client = httpx.AsyncClient(timeout=request_timeout)
         self._control_client = httpx.AsyncClient(timeout=request_timeout)
+        self._elastic_events = None
+        if directory := os.getenv("AREAL_ELASTIC_EVENT_DIR"):
+            from areal.elastic.reconfigurator.observation import EventWriter
+
+            self._elastic_events = EventWriter(directory)
         self._segments = asyncio.Condition()
         self._generation_held = False
         self._active_segments = 0
@@ -384,22 +390,20 @@ class InfBridge:
         if output_len > 1 and first_token is not None and last_finish is not None:
             if last_finish >= first_token:
                 tpot = (last_finish - first_token) / (output_len - 1)
-        logger.info(
-            "request_timing %s",
-            json.dumps(
-                dict(
-                    request_id=req.rid,
-                    session_id=req.metadata.get("areal_session_id"),
-                    ready_at=ready_at,
-                    completed_at=ready_at + latency,
-                    input_tokens=len(req.input_ids),
-                    output_tokens=output_len,
-                    ttft_seconds=first_token,
-                    tpot_seconds=tpot,
-                    stop_reason=stop_reason,
-                )
-            ),
+        timing = dict(
+            request_id=req.rid,
+            session_id=req.metadata.get("areal_session_id"),
+            ready_at=ready_at,
+            completed_at=ready_at + latency,
+            input_tokens=len(req.input_ids),
+            output_tokens=output_len,
+            ttft_seconds=first_token,
+            tpot_seconds=tpot,
+            stop_reason=stop_reason,
         )
+        logger.info("request_timing %s", json.dumps(timing))
+        if self._elastic_events is not None and timing["session_id"] is not None:
+            await asyncio.to_thread(self._elastic_events.write, "call", **timing)
 
         return ModelResponse(
             input_tokens=list(req.input_ids),
