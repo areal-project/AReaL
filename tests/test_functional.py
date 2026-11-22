@@ -8,6 +8,24 @@ from areal.utils.functional import (
 )
 
 
+def test_ppo_token_ratio_masks_overflow_before_backward():
+    logprobs = torch.tensor([[-1.0, -1.0]], requires_grad=True)
+    proximal = torch.tensor([[-1.0, -101.0]])
+    loss, stats = ppo_actor_loss_fn(
+        logprobs=logprobs,
+        proximal_logprobs=proximal,
+        old_logprobs=proximal,
+        advantages=torch.ones_like(logprobs),
+        eps_clip=0.2,
+        loss_mask=torch.tensor([[True, False]]),
+    )
+
+    (grad,) = torch.autograd.grad(loss, logprobs)
+    torch.testing.assert_close(loss, torch.tensor(-1.0))
+    torch.testing.assert_close(grad, torch.tensor([[-1.0, 0.0]]))
+    torch.testing.assert_close(stats["importance_weight"], torch.tensor([[1.0, 0.0]]))
+
+
 class TestPPOActorLossFnSequenceLevel:
     """Test cases for ppo_actor_loss_fn with importance_sampling_level='sequence'."""
 

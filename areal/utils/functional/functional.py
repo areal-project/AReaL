@@ -545,7 +545,8 @@ def ppo_actor_loss_fn(
         )
     elif importance_sampling_level == "token":
         # Standard PPO: per-token ratio
-        ratio = torch.where(stat_loss_mask, torch.exp(logprobs - proximal_logprobs), 0)
+        log_ratio = torch.where(stat_loss_mask, logprobs - proximal_logprobs, 0.0)
+        ratio = torch.where(stat_loss_mask, log_ratio.exp(), 0.0)
     else:
         raise ValueError(
             f"Invalid importance_sampling_level: {importance_sampling_level}. "
