@@ -84,7 +84,7 @@ RUN export PIP_EXTRA_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pyp
 # Install the optional AWEX source override.
 # Set AWEX_COMMIT="" to use the pyproject.npu.toml package instead.
 ARG AWEX_REPO=https://github.com/HwVanICI/asystem-awex.git
-ARG AWEX_COMMIT=2bff8835beb287ca853a52d463b697a0e3da3e81
+ARG AWEX_COMMIT=f3e6f53ae41442995e37e154dff80e6e2daf5888
 RUN touch /areal-workspace/awex-manifest.sed && \
     if [ -n "${AWEX_COMMIT}" ]; then \
         git clone "${AWEX_REPO}" /areal-workspace/awex && \
