@@ -162,6 +162,29 @@ are retained for audit, not parsed for training rewards. Model-attributed failur
 retain interactions with zero reward; system and ambiguous failures are rejected. Result
 shards are written under `arena_result_dump_dir` when configured.
 
+### Pending jobs during shutdown
+
+An accepted Arena launch remains owned by its waiting workflow. If that wait is
+cancelled, times out, or raises an error, the client attempts to cancel the exact
+launched Job before releasing the workflow's proxy registration. This also runs when
+normal trainer shutdown destroys pending workflows, including while unwinding Python
+`MemoryError` or CUDA allocator OOM exceptions. Completed Arena results and their reward
+receipts are preserved. No additional cleanup job is launched.
+
+Cleanup uses the returned `job_id`, or resolves it from the exact `task_id` for older
+launch responses. It never scans or cancels by shared model name. Lookup and
+cancellation share a ten-second budget, capped by the client timeout; failures are
+logged without replacing the original workflow or training exception. Transient lookup
+and cancellation failures retry within that same budget, independently of the
+task-creation retry setting.
+
+This is in-process, best-effort cleanup. A lost launch response can leave an unknown
+Job. `ray.kill`, SIGKILL, host OOM killing, and node loss cannot execute Python cleanup.
+The RPC guard attempts cleanup on SIGTERM, but a platform kill deadline can interrupt
+it. Ray worker-death and OOM errors enter the launcher's failure/post-exit path; that
+does not prove that a dead worker's Arena jobs have been reclaimed. Guaranteed recovery
+of these cases requires service-side expiry or reconciliation.
+
 ### Multimodal request limits
 
 Configure SGLang's item-count limits through the training YAML:

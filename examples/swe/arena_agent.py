@@ -2002,8 +2002,8 @@ class ArenaStreamAgentWorkflow:
         async def audit_incomplete_task(status: str) -> None:
             if not launched_task_id:
                 return
-            # TODO(agent): call Arena task cancellation here once a supported
-            # endpoint is present in the published OpenAPI schema.
+            # The client cancels the launched job before propagating a local
+            # cancellation/timeout. Keep the local failure receipt unscored.
             incomplete_result = ArenaTaskResult(
                 task_id=launched_task_id,
                 status=status,

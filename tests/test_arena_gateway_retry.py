@@ -22,8 +22,15 @@ def test_result_redirect_retries_same_task_without_following_or_relaunching(
 
     def handler(request):
         requests.append((request.method, request.url.path))
+        if request.url.path.endswith("/cancel"):
+            assert request.method == "POST"
+            assert request.url.path == "/openapi/v1/jobs/job-1/cancel"
+            return httpx.Response(200, json={})
         if request.method == "POST":
-            return httpx.Response(200, json={"task_id": "task-1", "status": "RUNNING"})
+            return httpx.Response(
+                200,
+                json={"task_id": "task-1", "job_id": "job-1", "status": "RUNNING"},
+            )
         assert request.url.path == "/openapi/v1/tasks/task-1/result"
         if len(requests) == 2:
             query = "fromspanner=apigwmoe_502" if transient else "return_to=login"
@@ -57,9 +64,13 @@ def test_result_redirect_retries_same_task_without_following_or_relaunching(
     else:
         with pytest.raises(ArenaAPIError, match="HTTP 302"):
             asyncio.run(run())
-        assert len(requests) == 2
+        assert requests == [
+            ("POST", "/openapi/v1/streams/stream-1/launch_one_task"),
+            ("GET", "/openapi/v1/tasks/task-1/result"),
+            ("POST", "/openapi/v1/jobs/job-1/cancel"),
+        ]
         assert not sleeps
-    assert sum(method == "POST" for method, _ in requests) == 1
+    assert sum(path.endswith("/launch_one_task") for _, path in requests) == 1
 
 
 def test_gateway_redirect_exhausts_retry_budget(monkeypatch):
