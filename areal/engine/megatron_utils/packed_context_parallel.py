@@ -102,8 +102,12 @@ def split_packed_seqs_for_context_parallel(
     tensor: torch.Tensor,
     cu_seqlens: torch.Tensor,
 ) -> torch.Tensor:
-    """Split a 1D packed tensor using the same interleaved pattern as
-    preprocess_packed_seqs_context_parallel."""
+    """Split a packed tensor's token rows using the interleaved CP pattern.
+
+    ``tensor`` is indexed on the leading (token) dimension; trailing dimensions
+    are carried along unchanged, so both 1D per-token tensors (labels, log-probs)
+    and [tokens, K] tensors (sampler top-k heads) split consistently.
+    """
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
     if cp_size <= 1:
@@ -113,7 +117,9 @@ def split_packed_seqs_for_context_parallel(
     batch_size = input_lens.shape[0]
     output_len = input_lens.sum().item() // cp_size
 
-    splitted = torch.zeros(output_len, dtype=tensor.dtype, device=tensor.device)
+    splitted = torch.zeros(
+        (output_len, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device
+    )
     for i in range(batch_size):
         seqlen = input_lens[i] // cp_size
         half_seqlen = seqlen // 2
