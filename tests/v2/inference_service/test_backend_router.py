@@ -722,6 +722,16 @@ async def test_engine_direct_http_abort_continuation_uses_lease_versions(
             },
             True,
         ),
+        (
+            400,
+            {
+                "error": {
+                    "message": "Multimodal prompt is too long after expanding multimodal tokens. "
+                    "After expanding len(req.origin_input_ids_unpadded)=9000 + max_new_tokens=512 >= context_len=8192"
+                }
+            },
+            True,
+        ),
         (400, {"error": {"message": "Unknown scheduler error"}}, False),
         (400, {"error": {"code": "context_length_exceeded"}}, False),
         (400, "invalid JSON", False),
