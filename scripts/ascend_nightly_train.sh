@@ -18,19 +18,25 @@ case "$suite" in
         export USE_OPTIMIZED_MODEL=0
         config=tests/configs/ascend_nightly_geometry3k_grpo.yaml
         entry=examples.vlm.geometry3k_agent_grpo
-        model=${GRPO_MODEL_PATH:-Qwen/Qwen3.5-35B-A3B}
+        model_name=Qwen3.5-35B-A3B
+        override=${GRPO_MODEL_PATH:-}
+        valid_split=test
         ;;
     sft)
         config=tests/configs/ascend_nightly_geometry3k_sft.yaml
         entry=examples.vlm.geometry3k_sft
-        model=${SFT_MODEL_PATH:-Qwen/Qwen3.6-27B}
+        model_name=Qwen3.6-27B
+        override=${SFT_MODEL_PATH:-}
+        valid_split=validation
         ;;
     *) exit 2 ;;
 esac
-# AWEX and the Megatron bridge both need a local HF model directory.
-if [[ ! -d "$model" ]]; then
-    model=$(python -c 'import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1]))' "$model")
-fi
+source scripts/ascend_ci_inputs.sh
+model=$(resolve_cached_qwen_model "$model_name" "$override")
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_DISABLE_XET=1
+prepare_geometry3k "${DATASET_PATH:-hiyouga/geometry3k}" train "$valid_split"
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 experiment="ascend-nightly-geometry3k-$suite"
 args=(
     --config "$config"
