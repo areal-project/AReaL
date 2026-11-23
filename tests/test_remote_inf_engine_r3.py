@@ -74,7 +74,12 @@ async def test_sampling_mask_resubmit_keeps_reference_alignment_and_http_totals(
 
     tracker = DistributedStatsTracker("sampling_mask/http")
     monkeypatch.setattr(metrics.stats_tracker, "get", lambda name: tracker)
-    refs = [[encode_endpoint("127.0.0.1", 1234), 7, row, 1, 0] for row in [1, 2, 3]]
+    from areal.utils.sampling_mask import PROTOCOL_VERSION
+
+    refs = [
+        [encode_endpoint("127.0.0.1", 1234), 7, row, PROTOCOL_VERSION, 0]
+        for row in [1, 2, 3]
+    ]
     calls = []
 
     async def session():
@@ -97,7 +102,13 @@ async def test_sampling_mask_resubmit_keeps_reference_alignment_and_http_totals(
     monkeypatch.setattr(remote_inf_engine, "arequest_with_retry", request)
     engine = _make_engine(return_routed_experts=False)
     engine.config._sampling_mask_sampling = GenerationHyperparameters(top_k=8)
-    response = await engine.agenerate(_make_request())
+    req = _make_request()
+    req.metadata["_sampling_mask_lease"] = [1, 2, 3]
+    response = await engine.agenerate(req)
+    assert all(
+        c["sampling_params"]["custom_params"]["_sampling_mask_lease"] == (1, 2, 3)
+        for c in calls
+    )
     assert response.output_tokens == [100, 101, 200]
     assert response.sampling_mask_refs == refs
     assert calls[1]["input_ids"] == [1, 2, 3, 100, 101]

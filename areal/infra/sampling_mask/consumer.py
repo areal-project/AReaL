@@ -214,9 +214,8 @@ class SamplingMaskConsumer:
         self.id_bytes += total_bytes
         self.offset_bytes += offsets.numel() * 8
         self._candidate_histogram += np.bincount(counts, minlength=self.vocab_size + 1)
-        # GIN's credit signal already acknowledges completion. Source lifetime
-        # is governed by policy versions, so a second HTTP acknowledgement is
-        # unnecessary and must not delete a shared prefix.
+        # Only the workflow lease owner releases source rows after every
+        # training consumer has finished. A shard must not delete shared prefixes.
 
     def load(
         self, inputs: dict, labels: torch.Tensor, versions: torch.Tensor | None = None

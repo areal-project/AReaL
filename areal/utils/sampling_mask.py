@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 UINT24_LIMIT = 1 << 24
 
 

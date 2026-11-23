@@ -508,6 +508,16 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
 
         http_session = await workflow_context.get_aiohttp_session()
 
+        from areal.infra.sampling_mask.lifetime import LEASE_KEY, current_lease
+
+        mask_lease = current_lease.get()
+        if self.mode == "online" and mask_lease is not None:
+            from areal.infra.workflow_executor import WorkflowContractError
+
+            raise WorkflowContractError(
+                "sampling_mask_transfer requires workflow-owned proxy sessions"
+            )
+
         # Grant capacity for clients, otherwise agent sessions are rejected.
         # Designed for online mode. Users' requests do not have any staleness
         # control, which may be detrimental to RL training. We use a hacky way
@@ -571,7 +581,10 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             processor_cache_group_id=processor_cache_group_id,
             processor_cache_group_size=context.group_size,
             shared_tensor_resolver=self._shared_tensor_resolver,
-            metadata=await self._get_agent_session_metadata(data),
+            metadata={
+                **(await self._get_agent_session_metadata(data) or {}),
+                **({LEASE_KEY: mask_lease} if mask_lease is not None else {}),
+            },
         )
         agent_error: Exception | None = None
         async with proxy_client:

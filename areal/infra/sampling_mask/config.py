@@ -68,9 +68,6 @@ def configure(config) -> None:
     config.actor.prox_logp_method = "recompute"
     config.actor.importance_sampling_level = "token"
     config.sglang.sampling_backend = "areal_sampling_mask"
-    config.sglang._sampling_mask_retained_versions = (
-        config.rollout.max_head_offpolicyness + 2
-    )
     config.sglang._sampling_mask_top_k = config.gconfig.top_k
     config.sglang._sampling_mask_receivers = allocation.parallel.world_size
     # Torch wheels may bundle an older library with the same SONAME. Choose the
@@ -121,9 +118,9 @@ def preflight(config, vocab_size: int) -> dict:
         chunk_tokens=config.actor.mb_spec.max_tokens_per_mb or max_tokens,
         buffer_bytes=(8 << 20) * allocation.parallel.world_size,
     )
-    # Acknowledgements are shard-local: shared prefixes can still be requested
-    # by another shard. Source history is reclaimed only after policy expiry.
-    retained = config.sglang._sampling_mask_retained_versions + 1
+    # Admission bounds queued/in-flight work; one extra batch may be training.
+    # This estimates capacity, never authorizes eviction by policy version.
+    retained = config.rollout.max_head_offpolicyness + 2
     source = {**common, "max_tokens": max_tokens * retained}
     return {
         "rollout_owner": estimate_mask_memory(data_parallel_size=1, **source),

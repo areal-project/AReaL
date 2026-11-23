@@ -654,6 +654,12 @@ class RolloutController:
         if self._dispatcher is not None:
             self._dispatcher.destroy()
         self._stop_callback_server()
+        owner = getattr(self, "_sampling_mask_owner", None)
+        if owner is not None:
+            try:
+                owner.close()
+            except Exception as exc:
+                errors.append(f"sampling-mask lease shutdown: {exc}")
 
         # Proxy is a logical leaf of rollout. Destroy its engines and workers
         # while the rollout alias still resolves to the actual process owner.
@@ -1219,6 +1225,20 @@ class RolloutController:
             task_id = pending_task.task_id
 
             manager = self.staleness_manager
+            from areal.infra.sampling_mask.lifetime import (
+                LEASE_KEY,
+                LeaseRegistry,
+                arelease,
+            )
+
+            lease = None
+            transferred = False
+            data = pending_task.data
+            if getattr(self.config, "_sampling_mask_sampling", None) is not None:
+                if getattr(self, "_sampling_mask_owner", None) is None:
+                    self._sampling_mask_owner = LeaseRegistry()
+                lease = self._sampling_mask_owner.create()
+                data = {**data, LEASE_KEY: lease}
 
             try:
                 # Choose worker via round-robin.
@@ -1236,7 +1256,7 @@ class RolloutController:
                     worker.id,
                     "submit",
                     engine_name=engine_name,
-                    data=pending_task.data,
+                    data=data,
                     workflow=pending_task.workflow,
                     workflow_kwargs=pending_task.workflow_kwargs,
                     should_accept_fn=pending_task.should_accept_fn,
@@ -1281,6 +1301,7 @@ class RolloutController:
                         logger.info(
                             f"Finish and accept rollout. {self._rollout_stats()}"
                         )
+                    transferred = True
                     return _RolloutResult(
                         task_id=task_id, trajectory=traj, metrics=result["metrics"]
                     )
@@ -1306,6 +1327,12 @@ class RolloutController:
                 manager.on_rollout_rejected()
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
                 return None
+
+            finally:
+                with self._futures_lock:
+                    self._pending_futures.pop(task_id, None)
+                if lease is not None and not transferred:
+                    await arelease(lease)
 
         if pending_task.arena_stream_dataloader is None:
             return _submit_then_wait

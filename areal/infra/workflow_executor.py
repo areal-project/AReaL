@@ -1269,6 +1269,15 @@ class WorkflowExecutor:
         if self._dispatcher is not None:
             self._dispatcher.destroy()
 
+        owner = getattr(self, "_sampling_mask_owner", None)
+        if owner is not None:
+            try:
+                owner.close()
+            except Exception:
+                self.logger.warning(
+                    "Sampling-mask lease shutdown failed", exc_info=True
+                )
+
         # Flush performance tracer
         tracer = perf_tracer.get_session_tracer()
         if tracer is not None:
@@ -1385,8 +1394,33 @@ class WorkflowExecutor:
             should_accept: bool | None = None
             reason: str | None = None
 
+            from areal.infra.sampling_mask.lifetime import (
+                LEASE_KEY,
+                LEASES_KEY,
+                LeaseRegistry,
+                arelease,
+                current_lease,
+                validate_lease,
+            )
+
+            workflow_data = pending_task.data
+            lease = workflow_data.get(LEASE_KEY) if workflow_data is not None else None
+            if (
+                lease is None
+                and workflow_data is not None
+                and getattr(self.config, "_sampling_mask_sampling", None) is not None
+            ):
+                if getattr(self, "_sampling_mask_owner", None) is None:
+                    self._sampling_mask_owner = LeaseRegistry()
+                lease = self._sampling_mask_owner.create()
+            if lease is not None:
+                lease = validate_lease(lease)
+                workflow_data = {
+                    k: v for k, v in workflow_data.items() if k != LEASE_KEY
+                }
+            lease_token = current_lease.set(lease)
+            transferred = False
             try:
-                workflow_data = pending_task.data
                 if workflow_data is not None:
                     async with backend_session(self.inference_engine):
                         traj = await pending_task.workflow.arun_episode(
@@ -1495,6 +1529,9 @@ class WorkflowExecutor:
                             f"Finish and accept rollout. {self._rollout_stats()}",
                         )
                     assert traj is not None
+                    if lease is not None:
+                        traj[LEASES_KEY] = [lease]
+                    transferred = True
                     return _RolloutResult(task_id=task_id, trajectory=traj)
 
                 manager.on_rollout_rejected()
@@ -1543,6 +1580,11 @@ class WorkflowExecutor:
                     )
                 await self._clear_rejected_trajectory(traj)
                 return None
+
+            finally:
+                current_lease.reset(lease_token)
+                if lease is not None and not transferred:
+                    await arelease(lease)
 
         async def _execute_with_metrics() -> WorkflowTaskResult:
             with capture_metrics() as metrics:

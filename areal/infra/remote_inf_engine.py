@@ -1138,6 +1138,15 @@ class RemoteInfEngine(InferenceEngine):
         gconfig = req.gconfig
         mask_sampling = self.config._sampling_mask_sampling
         if mask_sampling is not None:
+            from areal.infra.sampling_mask.lifetime import (
+                LEASE_KEY,
+                current_lease,
+                validate_lease,
+            )
+
+            req.metadata[LEASE_KEY] = validate_lease(
+                current_lease.get() or req.metadata.get(LEASE_KEY)
+            )
             if (
                 gconfig.temperature != mask_sampling.temperature
                 or gconfig.top_p != mask_sampling.top_p

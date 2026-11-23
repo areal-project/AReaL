@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from areal.utils.sampling_mask import (
+    PROTOCOL_VERSION,
     SamplingMask,
     estimate_mask_memory,
     pack_uint24,
@@ -171,7 +172,7 @@ def test_invalid_support_fails_explicitly(case):
         torch.tensor([0, 2]),
         torch.tensor([1]),
     )
-    version, protocol = 3, 1
+    version, protocol = 3, PROTOCOL_VERSION
     if case == "empty":
         offsets, labels = torch.tensor([0, 0, 2]), torch.tensor([1, 1])
     elif case == "duplicate":
@@ -183,7 +184,7 @@ def test_invalid_support_fails_explicitly(case):
     elif case == "version":
         version = 4
     elif case == "protocol":
-        protocol = 2
+        protocol = PROTOCOL_VERSION + 1
     support = SamplingMask(pack_uint24(ids), offsets, 11, version, protocol)
     with pytest.raises(ValueError):
         support.validate(labels, weight_version=3)
@@ -313,7 +314,8 @@ def test_mask_references_survive_sequence_reorder_pack_padding():
             output_tokens=list(range(length)),
             output_versions=[3] * length,
             sampling_mask_refs=[
-                [123, 456, index * 10 + i + 1, 1, 3] for i in range(length)
+                [123, 456, index * 10 + i + 1, PROTOCOL_VERSION, 3]
+                for i in range(length)
             ],
         )
         references = trajectory_references(response)
@@ -632,7 +634,15 @@ def test_scheduler_merge_preserves_explicit_seeds_and_row_alignment(seeded_first
     from areal.engine.sglang_sampling_mask import merge_sampling_batches
 
     def batch(size, seeded, version):
+        import inspect
+
+        extra = (
+            {"is_any_greedy": False}
+            if "is_any_greedy" in inspect.signature(SamplingBatchInfo).parameters
+            else {}
+        )
         value = SamplingBatchInfo(
+            **extra,
             temperatures=torch.ones(size, 1),
             top_ps=torch.ones(size),
             top_ks=torch.full((size,), 8),
@@ -647,6 +657,7 @@ def test_scheduler_merge_preserves_explicit_seeds_and_row_alignment(seeded_first
             penalizer_orchestrator=SimpleNamespace(merge=lambda other: None),
         )
         value._areal_mask_versions = [version] * size
+        value._areal_mask_leases = [(1, 2, version)] * size
         return value
 
     left, right = batch(2, seeded_first, 5), batch(3, not seeded_first, 6)
@@ -660,6 +671,7 @@ def test_scheduler_merge_preserves_explicit_seeds_and_row_alignment(seeded_first
         rtol=0,
     )
     assert left._areal_mask_versions == [5, 5, 6, 6, 6]
+    assert left._areal_mask_leases == [(1, 2, 5)] * 2 + [(1, 2, 6)] * 3
 
 
 @pytest.mark.parametrize(

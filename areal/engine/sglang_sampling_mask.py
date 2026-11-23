@@ -89,6 +89,7 @@ def sample_candidate_columns(logp, sampling_seed, positions):
 def merge_sampling_batches(left, right, original_merge) -> None:
     """Preserve seeded requests when SGLang merges independently built batches."""
     versions = left._areal_mask_versions + right._areal_mask_versions
+    leases = left._areal_mask_leases + right._areal_mask_leases
     if left.sampling_seed is not None or right.sampling_seed is not None:
         for batch in (left, right):
             if batch.sampling_seed is None:
@@ -97,6 +98,34 @@ def merge_sampling_batches(left, right, original_merge) -> None:
                 )
     original_merge(left, right)
     left._areal_mask_versions = versions
+    left._areal_mask_leases = leases
+
+
+def publish_sampling_masks(producer, ids, counts, tokens, versions, leases):
+    """Readiness probes never own training data or acquire a workflow lease."""
+    if len(leases) != len(versions) or len(leases) != ids.shape[0]:
+        raise ValueError("Sampling-mask lease metadata is misaligned")
+    if any(
+        lease is None and version != -1
+        for lease, version in zip(leases, versions, strict=True)
+    ):
+        raise ValueError("Training request is missing sampling-mask workflow lease")
+    if all(lease is not None for lease in leases):
+        return producer.publish(ids, counts, tokens, versions, leases)
+    live = [i for i, lease in enumerate(leases) if lease is not None]
+    refs = [[0] * 5 for _ in leases]
+    if live:
+        indices = torch.tensor(live, dtype=torch.int64, device=ids.device)
+        published = producer.publish(
+            ids[indices],
+            counts[indices],
+            tokens[indices],
+            [versions[i] for i in live],
+            [leases[i] for i in live],
+        )
+        for index, reference in zip(live, published, strict=True):
+            refs[index] = reference
+    return refs
 
 
 def register_backend() -> None:
@@ -107,6 +136,8 @@ def register_backend() -> None:
         register_sampler_backend,
     )
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+    from areal.infra.sampling_mask.lifetime import LEASE_KEY, validate_lease
 
     if getattr(SamplingBatchInfo, "_areal_mask_installed", False):
         return
@@ -140,7 +171,7 @@ def register_backend() -> None:
                 dtype=torch.int64,
                 device=batch.device,
             )
-        versions = []
+        versions, leases = [], []
         for request in batch.reqs:
             params = request.sampling_params
             custom = params.custom_params or {}
@@ -159,13 +190,21 @@ def register_backend() -> None:
                     "sampling_mask_transfer does not yet support sampling penalties, min-p, or logit bias"
                 )
             versions.append(int(custom["areal_sampling_mask_version"]))
+            leases.append(
+                None
+                if request.rid.startswith(HEALTH_CHECK_RID_PREFIX)
+                else validate_lease(custom.get(LEASE_KEY))
+            )
         result._areal_mask_versions = versions
+        result._areal_mask_leases = leases
         return result
 
     def filter_batch(self, indices, indices_device):
         versions = [self._areal_mask_versions[i] for i in indices]
+        leases = [self._areal_mask_leases[i] for i in indices]
         original_filter(self, indices, indices_device)
         self._areal_mask_versions = versions
+        self._areal_mask_leases = leases
 
     def merge_batch(self, other):
         merge_sampling_batches(self, other, original_merge)
@@ -173,6 +212,7 @@ def register_backend() -> None:
     def copy_for_forward(self):
         result = original_copy(self)
         result._areal_mask_versions = self._areal_mask_versions.copy()
+        result._areal_mask_leases = self._areal_mask_leases.copy()
         return result
 
     SamplingBatchInfo.copy_for_forward = copy_for_forward
@@ -201,9 +241,6 @@ def register_backend() -> None:
                 MaskProducer(
                     torch.cuda.current_device(),
                     max_sessions=int(os.environ["AREAL_SAMPLING_MASK_RECEIVERS"]),
-                    retained_versions=int(
-                        os.environ.get("AREAL_SAMPLING_MASK_RETAINED_VERSIONS", "2")
-                    ),
                 )
                 if torch.distributed.get_rank(self.tp_sync_group) == 0
                 else None
@@ -254,8 +291,13 @@ def register_backend() -> None:
             column = matches.to(torch.int32).argmax(-1, keepdim=True)
             logits_output.next_token_logprobs = logp.gather(1, column).reshape(-1)
             logits_output.customized_info = {
-                "sampling_mask_refs": self.producer.publish(
-                    ids, counts, tokens, sampling_info._areal_mask_versions
+                "sampling_mask_refs": publish_sampling_masks(
+                    self.producer,
+                    ids,
+                    counts,
+                    tokens,
+                    sampling_info._areal_mask_versions,
+                    sampling_info._areal_mask_leases,
                 )
                 if self.producer is not None
                 else [[0] * 5 for _ in range(ids.shape[0])]

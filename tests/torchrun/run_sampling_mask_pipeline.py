@@ -10,6 +10,7 @@ from areal.engine.sglang_sampling_mask import candidate_distribution
 from areal.infra.sampling_mask import consumer as consumer_module
 from areal.infra.sampling_mask import service as service_module
 from areal.infra.sampling_mask.consumer import SamplingMaskConsumer
+from areal.infra.sampling_mask.lifetime import LeaseRegistry
 from areal.infra.sampling_mask.protocol import REFERENCE_KEYS
 from areal.infra.sampling_mask.service import MaskProducer
 from areal.utils.functional import ppo_actor_loss_fn
@@ -27,7 +28,10 @@ def main():
     logits = torch.randn(129, 257, device=device)
     metadata = [None]
     producer = None
+    owner = None
     if rank == 0:
+        owner = LeaseRegistry()
+        lease = owner.create()
         producer = MaskProducer(device, max_sessions=1)
         ids, logp, counts = candidate_distribution(
             logits,
@@ -48,8 +52,14 @@ def main():
                     counts[step : step + 1],
                     tokens[step : step + 1],
                     [7],
+                    [lease],
                 )
             )
+        # Advance far beyond the former retention window while this batch is
+        # still queued. A different completed workflow must not expire it.
+        later = owner.create()
+        producer.publish(ids[:1], counts[:1], tokens[:1], [200], [later])
+        owner.release(later[2])
         metadata[0] = (
             refs,
             tokens.cpu().tolist(),
@@ -132,6 +142,8 @@ def main():
     dist.destroy_process_group()
     if producer is not None:
         assert len(producer._store._blocks) == 1
+        owner.close()
+        assert producer._store.nbytes == 0
         producer.close()
 
 

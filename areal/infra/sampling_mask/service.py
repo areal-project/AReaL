@@ -4,6 +4,7 @@
 import hashlib
 import json
 import secrets
+from array import array
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Condition, Lock, Semaphore, Thread
@@ -12,6 +13,7 @@ import numpy as np
 import torch
 
 from areal.infra.sampling_mask.gin import GinEndpoint, load_extension
+from areal.infra.sampling_mask.lifetime import call, validate_lease
 from areal.infra.sampling_mask.protocol import encode_endpoint
 from areal.infra.sampling_mask.store import RowStore
 from areal.utils.network import gethostip
@@ -30,7 +32,7 @@ class MaskProducer:
     sampling owners; no assumption that inference TP0 owns all samples is made.
     """
 
-    def __init__(self, device: int, max_sessions: int, retained_versions: int = 2):
+    def __init__(self, device: int, max_sessions: int):
         self.device = device
         self.nonce = secrets.randbits(62) + 1
         self.uuid = str(torch.cuda.get_device_properties(device).uuid)
@@ -39,8 +41,7 @@ class MaskProducer:
         self._store = RowStore(CACHE_BYTES)
         self._fatal_error = None
         self._persisted_until = 1
-        self._retained_versions = retained_versions
-        self._expiry_watermark = -1
+        self._leases: dict[tuple[int, int, int], array] = {}
         self._pending = Semaphore(2)
         self._writer = ThreadPoolExecutor(max_workers=1)
         self._sessions = {}
@@ -85,8 +86,11 @@ class MaskProducer:
         self.source = encode_endpoint(*self._server.server_address)
         Thread(target=self._server.serve_forever, daemon=True).start()
 
-    def publish(self, ids, counts, tokens, versions) -> list[list[int]]:
+    def publish(self, ids, counts, tokens, versions, leases) -> list[list[int]]:
         """Enqueue bounded asynchronous D2H; return only CPU-generated row handles."""
+        leases = [validate_lease(lease) for lease in leases]
+        if len(leases) != ids.shape[0]:
+            raise ValueError("Sampling-mask leases do not align with sampler batch")
         self._pending.acquire()
         with self._condition:
             if self._fatal_error is not None:
@@ -125,18 +129,15 @@ class MaskProducer:
                 valid = torch.arange(host_ids.shape[1])[None, :] < host_counts[:, None]
                 compact = host_ids[valid]
                 offsets = torch.cat([host_counts.new_zeros(1), host_counts.cumsum(0)])
+                self._persist_rows(
+                    np.arange(start, start + batch_size),
+                    compact,
+                    offsets,
+                    host_tokens.long(),
+                    torch.tensor(versions, dtype=torch.int64),
+                    leases,
+                )
                 with self._condition:
-                    expiry = min(versions) - self._retained_versions
-                    if expiry > self._expiry_watermark:
-                        self._store.discard_before(expiry)
-                        self._expiry_watermark = expiry
-                    self._store.add(
-                        np.arange(start, start + batch_size),
-                        compact,
-                        offsets,
-                        host_tokens.long(),
-                        torch.tensor(versions, dtype=torch.int64),
-                    )
                     self._persisted_until = start + batch_size
                     self._condition.notify_all()
             except Exception as exc:
@@ -159,6 +160,51 @@ class MaskProducer:
             for i in range(batch_size)
         ]
 
+    def _persist_rows(self, rows, packed, offsets, tokens, versions, leases):
+        # Only the single writer registers sources. Install local admission
+        # *before* the callback so a concurrent release can fence this writer.
+        active = set()
+        for lease in set(leases):
+            with self._condition:
+                known = lease in self._leases
+                if not known:
+                    self._leases[lease] = array("q")
+            if not known:
+                owner, nonce, lease_id = lease
+                admitted = call(
+                    owner,
+                    nonce,
+                    "/register",
+                    lease_id=lease_id,
+                    source=self.source,
+                    source_nonce=self.nonce,
+                )["active"]
+                if not admitted:
+                    with self._condition:
+                        self._leases.pop(lease, None)
+                    continue
+            active.add(lease)
+        with self._condition:
+            # Persist as one compact block, then remove cancelled rows. The
+            # lock makes publication atomic with the final release callback.
+            keep = np.array(
+                [lease in active and lease in self._leases for lease in leases]
+            )
+            if not keep.any():
+                return
+            self._store.add(rows, packed, offsets, tokens, versions)
+            for row, lease, live in zip(rows, leases, keep, strict=True):
+                if live:
+                    self._leases[lease].append(int(row))
+            if not keep.all():
+                self._store.delete(rows[~keep])
+
+    def _release_lease(self, lease):
+        with self._condition:
+            rows = self._leases.pop(validate_lease(lease), None)
+            if rows:
+                self._store.delete(np.frombuffer(rows, dtype=np.int64))
+
     def _lookup(self, row_ids):
         if len(row_ids) > 65536 or len(set(row_ids)) != len(row_ids):
             raise ValueError("Invalid sampling-mask row request")
@@ -179,6 +225,9 @@ class MaskProducer:
             return self._store.describe(rows)
 
     def _handle(self, path: str, request: dict) -> dict:
+        if path == "/release_lease":
+            self._release_lease(request["lease"])
+            return {"released": True}
         if path == "/info":
             return {
                 "uuid": self.uuid,
@@ -244,12 +293,6 @@ class MaskProducer:
                     device_payload = payload.to(device=self.device)
                     endpoint.transfer(device_payload)
             return {"bytes": total, "sha256": checksum}
-        if path == "/release":
-            # A parent prefix can appear in multiple training shards. One
-            # shard's acknowledgement cannot invalidate another shard's handle.
-            # Retain source rows until their policy version expires; per-shard
-            # caches prevent retransmission on subsequent PPO epochs.
-            return {"released": len(request["rows"])}
         raise ValueError("Unknown sampling-mask control operation")
 
     def close(self):
