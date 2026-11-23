@@ -1,0 +1,24 @@
+areal/experimental/openai/proxy/proxy_rollout_server.py
+  s_939c926397942f::t_6f9d54cd2e2849 123-124,527,541-545,1282-1286,1292-1293
+tests/experimental/openai/test_streaming_chat_completions.py
+  s_939c926397942f::t_fca9682ac0cfc4 685-687,692-694,696-700,706-709,721-728
+  s_939c926397942f::t_70f9271a91467e 17,680
+  s_939c926397942f::t_6f9d54cd2e2849 669-679,681-684,688-691,695,701-705,710-720,729
+  s_939c926397942f::t_0eeb6747178f36 730
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5bb58f0161ec0e5e7a3ee537e9d04878c5cd250b",
+  "prompts": {},
+  "sessions": {
+    "s_939c926397942f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20716-108f-7473-a6a0-3ee8e7a82f5c",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
