@@ -334,7 +334,9 @@ def test_verify_critic_value_heads_raises_when_installed_after_ddp(
     monkeypatch.setattr(registry, "GPTModel", _FakeGPTModel)
     monkeypatch.setattr(registry, "DDP", _FakeDDP)
 
-    tf_config = SimpleNamespace(hidden_size=4, params_dtype=torch.float32)
+    tf_config = SimpleNamespace(
+        hidden_size=4, params_dtype=torch.float32, sequence_parallel=False
+    )
     ddp_model = _FakeDDP(
         _FakeGPTModel(hidden_size=4, vocab_size=8, post_process=True),
     )
@@ -354,7 +356,9 @@ def test_critic_rejects_enable_mtp_and_drops_disabled_checkpoint_mtp(
     with pytest.raises(ValueError, match="do not support MTP"):
         registry.make_mcore_model(
             hf_config=SimpleNamespace(),
-            tf_config=SimpleNamespace(hidden_size=4, params_dtype=torch.float32),
+            tf_config=SimpleNamespace(
+                hidden_size=4, params_dtype=torch.float32, sequence_parallel=False
+            ),
             mcore_config=MegatronEngineConfig(bridge_type="mbridge", enable_mtp=True),
             bridge=object(),
             bridge_type="mbridge",
