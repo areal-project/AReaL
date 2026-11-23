@@ -603,6 +603,8 @@ class SGLangBackend:
             )
         sampling_mask_top_k = server_args.pop("_sampling_mask_top_k", None)
         sampling_mask_receivers = server_args.pop("_sampling_mask_receivers", 0)
+        # Accept historical configs; workflow leases now own mask lifetime.
+        server_args.pop("_sampling_mask_retained_versions", None)
         if sampling_mask_top_k is not None:
             server_args["skip_server_warmup"] = True
         cmd = SGLangConfig.build_cmd_from_args(server_args)
