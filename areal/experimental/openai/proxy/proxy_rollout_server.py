@@ -120,6 +120,8 @@ def _warn_once(msg: str) -> None:
 # Engine and client (created via /create_engine and /call with method "initialize")
 _engine: InferenceEngine | None = None
 _openai_client: ArealOpenAI | None = None
+# Set only while this proxy worker is paused. All waiters share its resume signal.
+_resume_streams: asyncio.Event | None = None
 _prm_runner = None
 
 # Session management
@@ -522,7 +524,7 @@ async def create_engine(raw_request: Request):
 
 @app.post("/call")
 async def call_engine_method(raw_request: Request):
-    global _engine, _openai_client
+    global _engine, _openai_client, _resume_streams
     if _engine is None:
         raise HTTPException(status_code=400, detail="Engine not initialized")
 
@@ -536,6 +538,11 @@ async def call_engine_method(raw_request: Request):
 
     if method_name == "initialize":
         _setup_openai_client()
+    elif method_name == "pause" and _resume_streams is None:
+        _resume_streams = asyncio.Event()
+    elif method_name == "resume" and _resume_streams is not None:
+        _resume_streams.set()
+        _resume_streams = None
 
     return {"status": "success", "result": serialize_value(result)}
 
@@ -1272,14 +1279,18 @@ async def _deferred_openai_sse_stream(
     }
     yield f"data: {json.dumps(initial_chunk, separators=(',', ':'))}\n\n"
 
-    create_task = asyncio.create_task(
-        _call_client_create(
+    async def create_when_resumed():
+        # The trainer can pause again before a woken request gets to run.
+        while _resume_streams is not None:
+            await _resume_streams.wait()
+        return await _call_client_create(
             create_fn=_openai_client.chat.completions.create,
             request=request,
             session_id=session_id,
             stream=True,
         )
-    )
+
+    create_task = asyncio.create_task(create_when_resumed())
     openai_stream: AsyncGenerator[ChatCompletionChunk, None] | None = None
     real_completion_id: str | None = None
     try:
