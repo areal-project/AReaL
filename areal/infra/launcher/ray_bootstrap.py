@@ -28,9 +28,10 @@ package imports ray transitively, so setting them here would be too late.
 Likewise, dependency installation (``uv pip install -e .``) must happen
 before invoking the launcher.
 
-Other job runners can pass explicit node information to ``run_node`` (or the
-CLI) to start Ray and run a separate command on the head. Workers can discover
-the head using a per-job file on shared storage or an explicit address.
+Other job runners can pass explicit node information to ``RayBootstrap``, the
+``run_node`` wrapper, or the CLI to start Ray and run a separate command on the
+head. Workers can discover the head using a per-job file on shared storage
+or an explicit address.
 """
 
 from __future__ import annotations
@@ -370,44 +371,113 @@ class BootstrapConfig:
         return f"{host}:{self.port}"
 
 
-def reserve_rendezvous(path: Path) -> None:
-    """Refuse to reuse either an active or a stale per-job address file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8"):
-        pass
+class RayBootstrap:
+    """Run the Ray startup and shutdown flow for one exclusively allocated node."""
 
+    def __init__(self, config: BootstrapConfig) -> None:
+        self.config = config
 
-def publish_head(path: Path, address: str) -> None:
-    staging = path.with_name(path.name + ".tmp")
-    with staging.open("x", encoding="utf-8") as output:
-        output.write(address + "\n")
-    staging.replace(path)
+    def run(
+        self,
+        command: Sequence[str] = (),
+        *,
+        command_env: Mapping[str, str] | None = None,
+    ) -> int:
+        """Start or join Ray; execute the command only on the head."""
+        child_env = dict(os.environ if command_env is None else command_env)
+        with patch.dict(os.environ):
+            os.environ.pop("RAY_ADDRESS", None)
+            if self.config.role == "worker":
+                return self._run_worker()
+            return self._run_head(command, child_env)
 
-
-def wait_for_head(path: Path, deadline: float) -> str:
-    while time.monotonic() < deadline:
-        try:
-            address = path.read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            pass
-        else:
-            if address:
-                split_address(address)
-                return address
-        time.sleep(POLL_INTERVAL)
-    raise TimeoutError(f"Timed out waiting for the Ray head at {path}.")
-
-
-def ready_for_training(
-    nodes: list[dict], available_gpus: float, expected_nodes: int, gpus_per_node: int
-) -> None:
-    gpu_counts = [node["Resources"].get("GPU", 0) for node in nodes if node["Alive"]]
-    if len(gpu_counts) != expected_nodes or any(n != gpus_per_node for n in gpu_counts):
-        raise RuntimeError(
-            f"Expected {expected_nodes} × {gpus_per_node} GPUs; got {gpu_counts}."
+    def _run_worker(self) -> int:
+        config = self.config
+        address = config.head_address
+        if address is None:
+            path = config.rendezvous_file
+            assert path is not None
+            address = self._wait_for_head(path)
+        host, port = split_address(address)
+        os.environ["AREAL_MASTER_ADDR"] = host
+        bootstrap_worker(
+            config.node_ip,
+            config.gpus_per_node,
+            ray_port=port,
+            wait_timeout=config.timeout,
         )
-    if available_gpus < expected_nodes * gpus_per_node:
-        raise RuntimeError(f"Only {available_gpus:g} Ray GPUs are available.")
+        return 0
+
+    def _run_head(self, command: Sequence[str], child_env: dict[str, str]) -> int:
+        if not command:
+            raise ValueError("The head needs a command to run after Ray is ready.")
+        config = self.config
+        address = config.local_address
+        if config.rendezvous_file is not None:
+            # Workers retry while the GCS is starting, and the existing head
+            # bootstrap waits for them before returning.
+            self._publish_head(config.rendezvous_file, address)
+        try:
+            try:
+                bootstrap_head(
+                    config.node_ip,
+                    config.nodes,
+                    config.gpus_per_node,
+                    ray_port=config.port,
+                    dashboard_port=config.dashboard_port,
+                    wait_timeout=config.timeout,
+                )
+                self._check_gpus()
+            finally:
+                ray.shutdown()
+            logger.info("Ray ready: %s × %s GPUs", config.nodes, config.gpus_per_node)
+            child_env["RAY_ADDRESS"] = address
+            code = subprocess.run(command, env=child_env, check=False).returncode
+            return code if code >= 0 else 128 - code
+        finally:
+            # The caller must allocate exclusive nodes, one Ray session per node.
+            stop_local_ray()
+
+    @staticmethod
+    def _publish_head(path: Path, address: str) -> None:
+        """Publish the address atomically without reusing an existing file."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8"):
+            pass
+        staging = path.with_name(path.name + ".tmp")
+        with staging.open("x", encoding="utf-8") as output:
+            output.write(address + "\n")
+        staging.replace(path)
+
+    def _wait_for_head(self, path: Path) -> str:
+        deadline = time.monotonic() + self.config.timeout
+        while time.monotonic() < deadline:
+            try:
+                address = path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                pass
+            else:
+                if address:
+                    split_address(address)
+                    return address
+            time.sleep(POLL_INTERVAL)
+        raise TimeoutError(f"Timed out waiting for the Ray head at {path}.")
+
+    def _check_gpus(self) -> None:
+        nodes = ray.nodes()
+        available_gpus = ray.available_resources().get("GPU", 0)
+        expected_nodes, gpus_per_node = self.config.nodes, self.config.gpus_per_node
+        gpu_counts = [
+            node["Resources"].get("GPU", 0) for node in nodes if node["Alive"]
+        ]
+        if len(gpu_counts) != expected_nodes or any(
+            n != gpus_per_node for n in gpu_counts
+        ):
+            raise RuntimeError(
+                f"Expected {expected_nodes} × {gpus_per_node} GPUs; got {gpu_counts}."
+            )
+        if available_gpus < expected_nodes * gpus_per_node:
+            raise RuntimeError(f"Only {available_gpus:g} Ray GPUs are available.")
 
 
 @contextmanager
@@ -430,59 +500,8 @@ def run_node(
     *,
     command_env: Mapping[str, str] | None = None,
 ) -> int:
-    """Start Ray on one exclusive node; execute the command only on the head."""
-    path = config.rendezvous_file
-    child_env = dict(os.environ if command_env is None else command_env)
-    with patch.dict(os.environ):
-        os.environ.pop("RAY_ADDRESS", None)
-        if config.role == "worker":
-            address = config.head_address
-            if address is None:
-                assert path is not None
-                address = wait_for_head(path, time.monotonic() + config.timeout)
-            host, port = split_address(address)
-            os.environ["AREAL_MASTER_ADDR"] = host
-            bootstrap_worker(
-                config.node_ip,
-                config.gpus_per_node,
-                ray_port=port,
-                wait_timeout=config.timeout,
-            )
-            return 0
-
-        if not command:
-            raise ValueError("The head needs a command to run after Ray is ready.")
-        address = config.local_address
-        if path is not None:
-            reserve_rendezvous(path)
-            # Workers retry while the GCS is starting, and the existing head
-            # bootstrap waits for them before returning.
-            publish_head(path, address)
-        try:
-            try:
-                bootstrap_head(
-                    config.node_ip,
-                    config.nodes,
-                    config.gpus_per_node,
-                    ray_port=config.port,
-                    dashboard_port=config.dashboard_port,
-                    wait_timeout=config.timeout,
-                )
-                ready_for_training(
-                    ray.nodes(),
-                    ray.available_resources().get("GPU", 0),
-                    config.nodes,
-                    config.gpus_per_node,
-                )
-            finally:
-                ray.shutdown()
-            logger.info("Ray ready: %s × %s GPUs", config.nodes, config.gpus_per_node)
-            child_env["RAY_ADDRESS"] = address
-            code = subprocess.run(command, env=child_env, check=False).returncode
-            return code if code >= 0 else 128 - code
-        finally:
-            # The caller must allocate exclusive nodes, one Ray session per node.
-            stop_local_ray()
+    """Start or join Ray on one node using the function-style entry point."""
+    return RayBootstrap(config).run(command, command_env=command_env)
 
 
 def main() -> int:
