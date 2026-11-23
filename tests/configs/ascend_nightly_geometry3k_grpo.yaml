@@ -131,7 +131,7 @@ actor:
       port_count: 2
       cpu: 8
       gpu: 1
-      mem: 32
+      mem: 20
       cmd: python3 -m areal.infra.rpc.rpc_server
       env_vars:
         AWEX_USE_BATCH_SEND_RECV: "1"
