@@ -81,6 +81,10 @@ def parse_arena_stream_config(value: Any) -> ArenaStreamConfig:
     if not stream_id:
         raise ValueError(f"Arena Stream {name!r} requires a non-empty stream_id")
 
+    self_check = raw.get("self_check", False)
+    if type(self_check) is not bool:
+        raise ValueError(f"Arena Stream {name!r} self_check must be a boolean")
+
     weight = raw.get("sampling_weight", 1.0)
     if isinstance(weight, bool) or not isinstance(weight, (int, float)):
         raise ValueError(f"Arena Stream {name!r} sampling_weight must be numeric")
@@ -134,6 +138,7 @@ def parse_arena_stream_config(value: Any) -> ArenaStreamConfig:
         expected_reward_ref=expected_reward_ref,
         reward_mapping_file=reward_mapping_file,
         dataset_snapshot_file=dataset_snapshot_file.strip(),
+        self_check=self_check,
         reward_threshold=threshold,
         reward_transform_fn=str(raw.get("reward_transform_fn") or "").strip(),
         _harness_is_fallback=raw.get("_harness_is_fallback", False),

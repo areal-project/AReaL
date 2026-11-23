@@ -14,7 +14,7 @@ import stat
 import uuid
 from contextlib import suppress
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Real
 from pathlib import Path
 from typing import Any, Literal
@@ -23,6 +23,8 @@ from urllib.parse import urlparse
 import httpx
 
 from examples.swe.arena_client import (
+    SELFCHECK_BUDGET_KEY,
+    SELFCHECK_CANDIDATE_CHANGED,
     ArenaAPIError,
     ArenaOpenAPIClient,
     ArenaTaskFailedError,
@@ -1693,6 +1695,35 @@ class ArenaStreamAgentWorkflow:
                     f"stream/{stream_config.name}/arena_score": result.score,
                 }
             )
+        if result is not None and stream_config.self_check:
+            selfcheck = result.selfcheck_metrics
+            is_rollout = workflow_context.stat_scope() == "rollout"
+            observations = {
+                key: value
+                for key, value in selfcheck.items()
+                if key != SELFCHECK_BUDGET_KEY
+                and (is_rollout or key != SELFCHECK_CANDIDATE_CHANGED)
+            }
+            if (
+                is_rollout
+                and result.status in {"OK", "DONE"}
+                and result.score in (0.0, 1.0)
+            ):
+                calls = selfcheck.get("calls")
+                max_calls = selfcheck.get(SELFCHECK_BUDGET_KEY)
+                known = calls is not None and max_calls is not None
+                observations["unknown_calls"] = float(not known)
+                if known:
+                    reward_group = f"reward_{int(result.score)}"
+                    observations[f"{reward_group}/mean_calls"] = calls
+                    observations[SELFCHECK_BUDGET_KEY] = max_calls
+            prefixes = [f"stream/{stream_config.name}/selfcheck"]
+            if is_rollout:
+                prefixes.append("selfcheck")
+            for prefix in prefixes:
+                metrics.update(
+                    {f"{prefix}/{key}": value for key, value in observations.items()}
+                )
         if result is not None:
             reward_metrics = arena_reward_metrics(
                 sub_scores=result.sub_scores, raw=result.raw, score=result.score
@@ -2293,6 +2324,23 @@ class ArenaStreamAgentWorkflow:
                 _record_arena_metrics(**{"arena/result_processing_success": 0.0})
                 _record_arena_metrics(**{"arena/call_success": 0.0})
                 raise
+            if stream_config.self_check and task_result.artifacts_uri:
+                try:
+                    checker_metrics = await self.client.get_selfcheck_metrics(
+                        task_result,
+                        client=client,
+                        timeout=min(self.request_timeout, 5.0),
+                    )
+                    task_result = replace(
+                        task_result, selfcheck_metrics=checker_metrics
+                    )
+                except Exception as exc:
+                    # Optional telemetry must not invalidate a successful rollout.
+                    logger.warning(
+                        "Could not read Checker metrics for Arena task %s (%s)",
+                        task_result.task_id,
+                        type(exc).__name__,
+                    )
             _record_arena_metrics(**{"arena/result_processing_success": 1.0})
             _record_arena_metrics(**{"arena/terminal_success": 1.0})
             _record_arena_metrics(**{"arena/call_success": 1.0})

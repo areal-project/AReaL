@@ -9,13 +9,20 @@ import httpx
 import pytest
 
 from examples.swe.arena_agent import ArenaStreamAgentWorkflow
-from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
+from examples.swe.arena_client import (
+    SELFCHECK_BUDGET_KEY,
+    SELFCHECK_CANDIDATE_CHANGED,
+    ArenaTaskFailedError,
+    ArenaTaskResult,
+)
+from tests.test_selfcheck_metrics import _read_checks
 from tests.test_swe_arena_abbreviated_receipt import _error as _runner_failure_error
 from tests.test_swe_arena_multi_stream import (
     _core_model_failure_error,
     _core_tool_budget_failure_error,
 )
 
+from areal.infra.controller.rollout_controller import _merge_worker_stats
 from areal.utils.rollout_metrics import ConsumedMetrics, capture_metrics
 
 
@@ -44,6 +51,221 @@ async def run_agent(workflow, data_id="data-1"):
             api_key="session-key",
             arena_http_client=client,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_stream_selfcheck_controls_artifact_reads_and_metrics(
+    workflow, monkeypatch, enabled
+):
+    name = workflow.default_stream_name
+    assert workflow.stream_configs[name].self_check is False
+    workflow.stream_configs[name] = replace(
+        workflow.stream_configs[name], self_check=enabled
+    )
+    telemetry = {
+        "calls": 1.0,
+        "check_1/score": 1.0,
+        SELFCHECK_BUDGET_KEY: 3.0,
+        SELFCHECK_CANDIDATE_CHANGED: 1.0,
+    }
+    result = ArenaTaskResult(
+        task_id="task-1",
+        status="DONE",
+        score=1.0,
+        artifacts_uri="tasks/task-1/attempts/1/",
+        selfcheck_metrics=telemetry,
+    )
+    reader = AsyncMock(return_value=telemetry)
+    monkeypatch.setattr(workflow.client, "get_selfcheck_metrics", reader)
+    monkeypatch.setattr(
+        workflow.client, "launch_one_task_result", AsyncMock(return_value=result)
+    )
+    with capture_metrics() as metrics:
+        assert await run_agent(workflow) == 1.0
+        workflow.record_episode_metrics(
+            {"stream_id": "stream-1", "data_id": "data-1"}, reward=1.0
+        )
+    assert reader.await_count == int(enabled)
+    checker_keys = {key for key in metrics if "/selfcheck/" in key}
+    if enabled:
+        assert "rollout/selfcheck/calls" in checker_keys
+        assert f"rollout/stream/{name}/selfcheck/calls" in checker_keys
+    else:
+        assert not checker_keys
+    assert metrics["rollout/arena_score"] == [1.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "used_calls,max_calls", [(0, 11), (1, 11), (11, 11), (1, 10**400), (11, None)]
+)
+async def test_selfcheck_large_budget_preserves_known_calls_and_candidate_change(
+    workflow, used_calls, max_calls
+):
+    """Large budgets retain exact counts without creating unbounded score slots."""
+    name = workflow.default_stream_name
+    workflow.stream_configs[name] = replace(
+        workflow.stream_configs[name], self_check=True
+    )
+    budget = {"used_calls": used_calls}
+    if max_calls is not None:
+        budget["max_calls"] = max_calls
+    telemetry = await _read_checks(
+        [
+            {"sha256": "a" * 64, "response": {"status": "OK", "score": 1}}
+            for _ in range(used_calls)
+        ],
+        budget,
+        {"phase": "agent", "sha256": "b" * 64},
+    )
+    assert not any(key.startswith("check_") for key in telemetry)
+    workflow._task_result.set(
+        ArenaTaskResult(
+            task_id="task", status="DONE", score=1.0, selfcheck_metrics=telemetry
+        )
+    )
+    with capture_metrics() as metrics:
+        workflow.record_episode_metrics(
+            {"stream_id": "stream-1", "data_id": "data-1"}, reward=1.0
+        )
+    consumed = ConsumedMetrics()
+    consumed.consume(SimpleNamespace(trajectory={}, metrics=metrics))
+    stats = _merge_worker_stats([consumed.export()])
+
+    for prefix in ("rollout/selfcheck", f"rollout/stream/{name}/selfcheck"):
+        assert stats[f"{prefix}/unknown_calls_count"] == 0
+        group = f"{prefix}/reward_1"
+        assert stats[f"{group}/mean_calls"] == used_calls
+        assert stats[f"{group}/trajectory_count"] == 1
+        assert stats[f"{group}/exact_calls_{used_calls}/count"] == 1
+        assert stats[f"{group}/exact_calls_{used_calls}/ratio"] == 1
+        assert (
+            sum(
+                value
+                for key, value in stats.items()
+                if key.startswith(f"{group}/exact_calls_") and key.endswith("/count")
+            )
+            == 1
+        )
+        assert f"{group}/exact_calls_12/count" not in stats
+        if used_calls:
+            assert stats[f"{prefix}/final_candidate/changed_count"] == 1
+        else:
+            assert f"{prefix}/final_candidate/changed_count" not in stats
+
+
+def test_selfcheck_distribution_merges_consumed_final_reward_groups(workflow):
+    name = workflow.default_stream_name
+    workflow.stream_configs[name] = replace(
+        workflow.stream_configs[name], self_check=True
+    )
+    data = {"stream_id": "stream-1", "data_id": "data-1"}
+    prefix = f"rollout/stream/{workflow.default_stream_name}/selfcheck"
+
+    def record(
+        consumer,
+        score,
+        calls=None,
+        budget=None,
+        status="DONE",
+        episode_data=data,
+        changed=None,
+    ):
+        selfcheck = (
+            {} if calls is None else {"calls": calls, SELFCHECK_BUDGET_KEY: budget}
+        )
+        if changed is not None:
+            selfcheck[SELFCHECK_CANDIDATE_CHANGED] = float(changed)
+        workflow._task_result.set(
+            ArenaTaskResult(
+                task_id="task", status=status, score=score, selfcheck_metrics=selfcheck
+            )
+        )
+        with capture_metrics() as metrics:
+            workflow.record_episode_metrics(episode_data, reward=0.5)
+        episode = SimpleNamespace(trajectory={}, metrics=metrics)
+        if consumer is not None:
+            consumer.consume(episode)
+
+    left, right = ConsumedMetrics(), ConsumedMetrics()
+    record(left, 1.0, 0.0, 0.0)
+    record(left, 1.0, 1.0, 2.0)
+    record(left, 1.0)
+    record(left, 0.0, 2.0, 2.0)
+    record(right, 1.0, 4.0, 4.0)
+    record(right, 1.0, 1.0, 4.0)
+    record(right, 0.0)
+    record(right, 0.0, 4.0, 4.0)
+    record(right, 0.0, status="HARNESS_FAILED")
+    record(right, 0.75, 2.0, 4.0)
+    record(None, 1.0, 3.0, 4.0)
+
+    left_stats, right_stats = left.export(), right.export()
+    assert left_stats[f"{prefix}/reward_1/exact_calls_0/ratio"] == 0.5
+    stats = _merge_worker_stats([left_stats, right_stats])
+    with_local_stats = _merge_worker_stats([left_stats], consumed_stats=right_stats)
+    assert {
+        key: value
+        for key, value in with_local_stats.items()
+        if key.startswith(prefix) and not key.endswith("__count")
+    } == {key: value for key, value in stats.items() if key.startswith(prefix)}
+    assert stats[f"{prefix}/unknown_calls_count"] == 2
+    assert stats[f"{prefix}/reward_0/trajectory_count"] == 2
+    assert stats[f"{prefix}/reward_0/mean_calls"] == 3.0
+    assert stats[f"{prefix}/reward_0/exact_calls_4/ratio"] == 0.5
+    assert stats[f"{prefix}/reward_1/trajectory_count"] == 4
+    assert stats[f"{prefix}/reward_1/mean_calls"] == 1.5
+    for count, expected in enumerate((1, 2, 0, 0, 1)):
+        bucket = f"{prefix}/reward_1/exact_calls_{count}"
+        assert stats[f"{bucket}/count"] == expected
+        assert stats[f"{bucket}/ratio"] == expected / 4
+    assert left.export() == right.export() == {}
+
+    second_stream = "second"
+    workflow.stream_configs[second_stream] = replace(
+        workflow.stream_configs[workflow.default_stream_name],
+        name=second_stream,
+        stream_id="stream-2",
+    )
+    second = {**data, "stream_id": "stream-2", "arena_stream_name": second_stream}
+    record(left, 1.0, 0.0, 2.0)
+    record(right, 1.0, 3.0, 4.0, episode_data=second, changed=False)
+    record(right, 1.0, 3.0, 4.0, episode_data=second)
+    record(left, 0.0, 1.0, 2.0, changed=True)
+    record(right, 0.0, episode_data=second)
+    workflow.stream_configs["baseline"] = replace(
+        workflow.stream_configs[second_stream],
+        name="baseline",
+        stream_id="baseline",
+        self_check=False,
+    )
+    record(
+        right,
+        1.0,
+        4.0,
+        4.0,
+        episode_data={**data, "stream_id": "baseline", "arena_stream_name": "baseline"},
+        changed=True,
+    )
+    merged = _merge_worker_stats([left.export()], consumed_stats=right.export())
+    global_prefix = "rollout/selfcheck"
+    assert merged[f"{global_prefix}/reward_1/trajectory_count"] == 3
+    assert merged[f"{global_prefix}/reward_1/mean_calls"] == 2.0
+    assert merged[f"{global_prefix}/reward_1/exact_calls_0/count"] == 1
+    assert merged[f"{global_prefix}/reward_1/exact_calls_0/ratio"] == pytest.approx(
+        1 / 3
+    )
+    assert merged[f"{global_prefix}/reward_1/exact_calls_3/count"] == 2
+    assert merged[f"{global_prefix}/reward_1/exact_calls_4/count"] == 0
+    assert merged[f"{global_prefix}/unknown_calls_count"] == 1
+    assert merged[f"{global_prefix}/final_candidate/changed_count"] == 1
+    assert merged[f"{prefix}/final_candidate/changed_count"] == 1
+    assert merged["rollout/stream/second/selfcheck/final_candidate/changed_count"] == 0
+    assert not any(key.endswith("/final_candidate/comparable_count") for key in merged)
+    assert merged[f"{prefix}/reward_1/trajectory_count"] == 1
+    assert merged["rollout/stream/second/selfcheck/reward_1/trajectory_count"] == 2
+    assert not any("/stream/baseline/selfcheck/" in key for key in merged)
 
 
 @pytest.mark.asyncio

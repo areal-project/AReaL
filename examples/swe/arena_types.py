@@ -37,6 +37,8 @@ class ArenaStreamConfig:
     # Exact published versions are validated before any workers are created.
     # Without this field, dataset selection continues to use the live Stream.
     dataset_snapshot_file: str = ""
+    # Collect Checker artifacts and Self Check metrics for this Stream.
+    self_check: bool = False
     # Preserve inherited arena_harness provenance across controller/worker serialization.
     _harness_is_fallback: bool = False
 

@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import re
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Real
 from typing import Any, Literal
 from urllib.parse import parse_qs, quote, urlsplit
@@ -16,6 +17,14 @@ from urllib.parse import parse_qs, quote, urlsplit
 import httpx
 
 LLMProtocol = Literal["anthropic", "responses", "chat_completions"]
+
+# Each slot becomes a metric key. Bound the fan-out from artifact data.
+_MAX_SELFCHECK_SCORE_SLOTS = 10
+# Private telemetry metadata for histogram zero-padding over call counts 0..10.
+# Zero denotes a verified zero-call attempt with no recorded Harness limit.
+SELFCHECK_BUDGET_KEY = "_max_calls"
+SELFCHECK_CANDIDATE_CHANGED = "final_candidate/changed"
+_SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 
 
 class ArenaAPIError(RuntimeError):
@@ -39,6 +48,7 @@ class ArenaTaskResult:
     computed_at: str | None = None
     # Optional telemetry is validated separately from the authoritative score.
     sub_scores: Any = None
+    selfcheck_metrics: dict[str, float] = field(default_factory=dict)
 
 
 def _arena_task_type_from_tags(tags: Any) -> str:
@@ -371,6 +381,174 @@ class ArenaOpenAPIClient:
         if not isinstance(result, dict):
             raise ArenaAPIError("Harness result artifact must be a JSON object")
         return result
+
+    async def get_selfcheck_metrics(
+        self,
+        result: ArenaTaskResult,
+        *,
+        client: httpx.AsyncClient,
+        timeout: float | None = None,
+    ) -> dict[str, float]:
+        """Read attempt-scoped Checker scores and compare the final candidate."""
+        deadline = (
+            asyncio.get_running_loop().time() + timeout if timeout is not None else None
+        )
+        prefix, separator, suffix = (
+            (result.artifacts_uri or "").rstrip("/").rpartition("/attempts/")
+        )
+        if (
+            not separator
+            or not prefix
+            or not suffix.isascii()
+            or not suffix.isdecimal()
+        ):
+            return {}
+        try:
+            result_attempt = int(suffix)
+        except ValueError:
+            return {}
+        if result_attempt <= 0:
+            return {}
+        task_id = quote(result.task_id, safe="")
+        url = f"{self.base_url}/openapi/v1/tasks/{task_id}/artifacts"
+        async with asyncio.timeout_at(deadline):
+            response = await self._async_request(
+                client, "GET", url, headers=self._headers
+            )
+        items = _response_json(response)
+        if not isinstance(items, Mapping) or not isinstance(items.get("items"), list):
+            raise ArenaAPIError("Arena artifact listing is missing items")
+        agent_items = [
+            item
+            for item in items["items"]
+            if isinstance(item, Mapping)
+            and isinstance(item.get("name"), str)
+            and item.get("role") in ("agent", "harness")
+            and type(item.get("attempt")) is int
+            and 0 < item["attempt"] <= result_attempt
+        ]
+        attempt = max((item["attempt"] for item in agent_items), default=0)
+        names = {item.get("name") for item in agent_items if item["attempt"] == attempt}
+
+        async def read_artifact(name: str) -> Any:
+            if name not in names:
+                return None
+            response = await self._async_request(
+                client,
+                "GET",
+                f"{url}/{name}",
+                params={"attempt": attempt},
+                headers=self._headers,
+            )
+            return _response_json(response)
+
+        if "checker-budget.json" not in names:
+            if not {"checker-audit.json", "checker-final.json"} <= names:
+                return {}
+            async with asyncio.timeout_at(deadline):
+                audit, final = await asyncio.gather(
+                    read_artifact("checker-audit.json"),
+                    read_artifact("checker-final.json"),
+                    return_exceptions=True,
+                )
+            if (
+                audit == []
+                and isinstance(final, Mapping)
+                and final.get("phase") == "agent"
+                and final.get("status") != "agent_failed"
+                and type(final.get("hint_calls")) is int
+                and final["hint_calls"] == 0
+            ):
+                return {"calls": 0.0, SELFCHECK_BUDGET_KEY: 0.0}
+            return {}
+
+        async with asyncio.timeout_at(deadline):
+            audit, budget = await asyncio.gather(
+                read_artifact("checker-audit.json"),
+                read_artifact("checker-budget.json"),
+                return_exceptions=True,
+            )
+        metrics: dict[str, float] = {}
+        used_calls = budget.get("used_calls") if isinstance(budget, Mapping) else None
+        max_calls = budget.get("max_calls") if isinstance(budget, Mapping) else None
+        if type(used_calls) is int and used_calls >= 0:
+            try:
+                metrics["calls"] = float(used_calls)
+            except OverflowError:
+                return metrics
+        valid_budget = (
+            type(used_calls) is int
+            and type(max_calls) is int
+            and max_calls >= 1
+            and 0 <= used_calls <= max_calls
+        )
+        if valid_budget:
+            metrics[SELFCHECK_BUDGET_KEY] = float(
+                min(max_calls, _MAX_SELFCHECK_SCORE_SLOTS)
+            )
+        elif max_calls is None and type(used_calls) is int and used_calls >= 0:
+            # Older budgets can confirm the exact count without recording a cap.
+            metrics[SELFCHECK_BUDGET_KEY] = float(
+                min(used_calls, _MAX_SELFCHECK_SCORE_SLOTS)
+            )
+        # A gap between reserved calls and audit rows makes the last audited
+        # candidate ambiguous. It could belong to an earlier Check.
+        if (
+            SELFCHECK_BUDGET_KEY in metrics
+            and used_calls > 0
+            and isinstance(audit, list)
+            and len(audit) == used_calls
+            and isinstance(audit[-1], Mapping)
+        ):
+            checked_hash = audit[-1].get("sha256")
+            if isinstance(checked_hash, str) and _SHA256_PATTERN.fullmatch(
+                checked_hash
+            ):
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        final = await read_artifact("checker-final.json")
+                except (ArenaAPIError, httpx.HTTPError, TimeoutError):
+                    final = None
+                if (
+                    isinstance(final, Mapping)
+                    and final.get("phase") == "agent"
+                    and final.get("status") != "agent_failed"
+                ):
+                    final_hash = final.get("sha256")
+                    if isinstance(final_hash, str) and _SHA256_PATTERN.fullmatch(
+                        final_hash
+                    ):
+                        metrics[SELFCHECK_CANDIDATE_CHANGED] = float(
+                            final_hash.lower() != checked_hash.lower()
+                        )
+        # A common cohort requires a complete, valid check history. Missing or
+        # failed checks are not an early stop and must not be forward-filled.
+        if (
+            not valid_budget
+            or max_calls > _MAX_SELFCHECK_SCORE_SLOTS
+            or used_calls == 0
+            or not isinstance(audit, list)
+            or len(audit) != used_calls
+        ):
+            return metrics
+        scores: list[float] = []
+        for row in audit:
+            report = row.get("response") if isinstance(row, Mapping) else None
+            if not isinstance(report, Mapping) or report.get("status") != "OK":
+                return metrics
+            score = report.get("score")
+            if type(score) not in (float, int):
+                return metrics
+            try:
+                score = float(score)
+            except OverflowError:
+                return metrics
+            if not math.isfinite(score):
+                return metrics
+            scores.append(score)
+        for index in range(1, max_calls + 1):
+            metrics[f"check_{index}/score"] = scores[min(index, used_calls) - 1]
+        return metrics
 
     def __init__(
         self,
