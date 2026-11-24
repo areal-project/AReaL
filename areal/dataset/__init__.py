@@ -6,6 +6,7 @@ import re
 from typing import TYPE_CHECKING, Optional
 
 from areal.api.cli_args import _DatasetConfig
+from areal.dataset.contracts import validate_dataset_contract
 from areal.dataset.mopd import (
     ROUTE_METADATA_KEY,
     DatasetRoute,
@@ -210,7 +211,9 @@ def _get_custom_dataset(
             if isinstance(dataset, DatasetDict):
                 if split is not None:
                     if split in dataset:
-                        return dataset[split]
+                        selected = dataset[split]
+                        validate_dataset_contract(selected, type, path)
+                        return selected
                     available = list(dataset.keys())
                     raise ValueError(
                         f"Requested split '{split}' not found in DatasetDict at {path}. "
@@ -218,8 +221,11 @@ def _get_custom_dataset(
                     )
                 available = list(dataset.keys())
                 if available:
-                    return dataset[available[0]]
+                    selected = dataset[available[0]]
+                    validate_dataset_contract(selected, type, path)
+                    return selected
                 raise ValueError(f"Empty DatasetDict at {path}")
+            validate_dataset_contract(dataset, type, path)
             return dataset
         except Exception as load_err:
             raise ValueError(

@@ -158,3 +158,81 @@ def get_gsm8k_rl_dataset(
 
     return dataset
 ```
+
+## Custom local RL dataset, end to end
+
+The examples above show how the built-in loaders build records. This section
+covers the other end of the contract: authoring your own local dataset, saving it
+with `Dataset.save_to_disk`, and loading it through `get_custom_dataset` without
+writing a new loader.
+
+### 1. Create and save the records
+
+A text RL record needs a `messages` field, because rollout workflows such as
+`RLVRWorkflow` use it as the prompt. Extra fields are forwarded to the reward
+function as keyword arguments, so `answer` can stay on the record.
+
+```python
+from datasets import Dataset, DatasetDict
+
+records = [
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 12 * 7? Return the answer in \\boxed{}.",
+            }
+        ],
+        "answer": "84",
+        "task_id": "arith-0001",
+    },
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 9 + 14? Return the answer in \\boxed{}.",
+            }
+        ],
+        "answer": "23",
+        "task_id": "arith-0002",
+    },
+]
+
+dataset = DatasetDict({"train": Dataset.from_list(records)})
+dataset.save_to_disk("/absolute/path/to/arith_rl")
+```
+
+### 2. Point the configuration at the directory
+
+```yaml
+train_dataset:
+  path: /absolute/path/to/arith_rl
+  type: rl
+  max_length: 2048
+```
+
+`path` must be the directory written by `save_to_disk`, and `type: rl` selects
+the text RL contract. For tokenized SFT data use `type: sft` and keep the
+`input_ids` and `loss_mask` columns.
+
+### 3. Load and inspect before training
+
+```python
+from areal.dataset import get_custom_dataset
+
+ds = get_custom_dataset(split="train", path="/absolute/path/to/arith_rl", type="rl")
+print(ds)
+print(ds.column_names)  # ['messages', 'answer', 'task_id']
+print(ds[0]["messages"])
+```
+
+### Required columns by data type
+
+| `type` | Required columns | Consumer |
+| --- | --- | --- |
+| `rl` | `messages` | rollout workflows (`RLVRWorkflow`, agent workflows) |
+| `sft` | `input_ids`, `loss_mask` | `LMEngine.train_lm` (tokenized SFT) |
+
+Datasets loaded from disk are checked against this table. A missing column raises
+a `ValueError` that names the missing field when the dataset is loaded, instead
+of failing later inside the trainer.

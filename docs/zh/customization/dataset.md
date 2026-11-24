@@ -144,3 +144,72 @@ def get_gsm8k_rl_dataset(
 
     return dataset
 ```
+
+## 自定义本地 RL 数据集：端到端示例
+
+上面的例子展示了内置加载器如何构造记录。本节覆盖约定的另一端：自己编写本地数据集，用 `Dataset.save_to_disk` 保存，再通过 `get_custom_dataset` 加载，无需新增加载器。
+
+### 1. 创建并保存记录
+
+文本 RL 记录需要 `messages` 字段，因为 `RLVRWorkflow` 等 rollout workflow 会把它作为 prompt。额外字段会作为关键字参数传给 reward 函数，因此 `answer` 可以保留在记录中。
+
+```python
+from datasets import Dataset, DatasetDict
+
+records = [
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 12 * 7? Return the answer in \\boxed{}.",
+            }
+        ],
+        "answer": "84",
+        "task_id": "arith-0001",
+    },
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 9 + 14? Return the answer in \\boxed{}.",
+            }
+        ],
+        "answer": "23",
+        "task_id": "arith-0002",
+    },
+]
+
+dataset = DatasetDict({"train": Dataset.from_list(records)})
+dataset.save_to_disk("/absolute/path/to/arith_rl")
+```
+
+### 2. 在配置中指向该目录
+
+```yaml
+train_dataset:
+  path: /absolute/path/to/arith_rl
+  type: rl
+  max_length: 2048
+```
+
+`path` 必须是 `save_to_disk` 写出的目录，`type: rl` 表示使用文本 RL 契约。已 tokenize 的 SFT 数据请使用 `type: sft`，并保留 `input_ids` 与 `loss_mask` 两列。
+
+### 3. 训练前先加载并检查
+
+```python
+from areal.dataset import get_custom_dataset
+
+ds = get_custom_dataset(split="train", path="/absolute/path/to/arith_rl", type="rl")
+print(ds)
+print(ds.column_names)  # ['messages', 'answer', 'task_id']
+print(ds[0]["messages"])
+```
+
+### 各数据类型要求的列
+
+| `type` | 必需列 | 使用方 |
+| --- | --- | --- |
+| `rl` | `messages` | rollout workflow（`RLVRWorkflow`、agent workflow） |
+| `sft` | `input_ids`、`loss_mask` | `LMEngine.train_lm`（已 tokenize 的 SFT） |
+
+从磁盘加载的数据集会在加载时按上表校验。缺少列会抛出 `ValueError` 并指明缺少的字段，而不是等到训练器内部才失败。
