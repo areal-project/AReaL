@@ -4,8 +4,9 @@
 The numeric end-to-end checks need accelerator hardware; these tests cover the
 parts that are purely local:
 
-* the config-level backend matrix (``PPOActorConfig.__post_init__``),
-* the packed-row alignment used when context parallelism slices token rows,
+* the packed-row alignment and reassembly when context parallelism slices rows,
+* the config-level backend matrix (kept in ``test_score_centering_megatron_config``
+  so it runs without the optional megatron import),
 * the Megatron engine helper's validation, shape checks and diagnostics,
 * the score-centering math against a plain ``log_softmax`` reference.
 
@@ -21,97 +22,14 @@ import torch
 
 pytest.importorskip("megatron.core")
 
-from areal.api.cli_args import MegatronEngineConfig, PPOActorConfig  # noqa: E402
 from areal.engine.megatron_utils.packed_context_parallel import (  # noqa: E402
+    _build_cp_reassemble_indices,
     split_packed_seqs_for_context_parallel,
 )
 from areal.utils.score_centering import (  # noqa: E402
     build_weight_fn,
     score_centering_logprobs,
 )
-
-BASE_CONFIG = dict(experiment_name="x", trial_name="y", path="p")
-
-
-def _actor_config(**overrides) -> PPOActorConfig:
-    """Build a PPOActorConfig from the minimal required fields plus overrides."""
-    return PPOActorConfig(**BASE_CONFIG, **overrides)
-
-
-@pytest.mark.parametrize(
-    "backend",
-    [
-        "megatron:d1p1t1",
-        "megatron:d2p1t1",  # data parallel
-        "megatron:d1p1t2",  # tensor parallel
-        "megatron:d2p1t2",  # dp x tp
-        "megatron:d2p2t2",  # + pipeline parallel
-        "megatron:d2p1t2c2",  # + context parallel
-        "megatron:(attn:d2p1t1c1|ffn:d1p1t1e2)",  # + expert parallel (MoE)
-    ],
-)
-def test_sc_config_megatron_parallel_axes_accepted(backend):
-    """Test that every Megatron parallel axis is accepted when SC is enabled."""
-    config = _actor_config(backend=backend, use_score_centering=True)
-
-    assert config.backend == backend
-
-
-def test_sc_config_fsdp_backend_still_accepted():
-    """Test that the FSDP path keeps working unchanged."""
-    config = _actor_config(backend="fsdp:d2p1t1", use_score_centering=True)
-
-    assert config.backend == "fsdp:d2p1t1"
-
-
-def test_sc_config_mtp_training_enabled_rejected():
-    """Test that Megatron MTP training is rejected because it scores extra rows."""
-    with pytest.raises(ValueError, match="MTP"):
-        _actor_config(
-            backend="megatron:d2p1t1",
-            use_score_centering=True,
-            megatron=MegatronEngineConfig(
-                bridge_type="megatron-bridge", enable_mtp_training=True
-            ),
-        )
-
-
-def test_sc_config_chunked_logits_enabled_rejected():
-    """Test that the chunked LM head is rejected because it hides full logits."""
-    with pytest.raises(ValueError, match="chunked_logits"):
-        _actor_config(
-            backend="megatron:d2p1t1",
-            use_score_centering=True,
-            megatron=MegatronEngineConfig(enable_chunked_logits=True),
-        )
-
-
-def test_sc_config_critic_rejected():
-    """Test that a critic actor is rejected: SC scores sampler heads only."""
-    with pytest.raises(ValueError, match="actor"):
-        _actor_config(
-            backend="megatron:d2p1t1", use_score_centering=True, is_critic=True
-        )
-
-
-def test_sc_config_pipeline_parallel_allowed_when_sc_disabled():
-    """Test that PP configs without SC are untouched by the new validation."""
-    config = _actor_config(backend="megatron:d2p2t2", use_score_centering=False)
-
-    assert config.use_score_centering is False
-
-
-def test_sc_config_guard_skipped_when_sc_disabled():
-    """Test that MTP is only rejected while SC is enabled."""
-    config = _actor_config(
-        backend="megatron:d2p1t1",
-        use_score_centering=False,
-        megatron=MegatronEngineConfig(
-            bridge_type="megatron-bridge", enable_mtp_training=True
-        ),
-    )
-
-    assert config.use_score_centering is False
 
 
 @pytest.fixture
@@ -152,6 +70,32 @@ def test_cp_split_leaves_rows_untouched_without_context_parallel(
     cu_seqlens, rows, _ = packed_rows
 
     assert split_packed_seqs_for_context_parallel(rows, cu_seqlens) is rows
+
+
+def test_cp_reassembly_index_restores_token_order(monkeypatch, packed_rows):
+    """Test that gathered CP chunks map back onto their original token rows.
+
+    This is the layout transform the score-centering correction relies on when it
+    is reassembled with the log-probs; a wrong permutation would attach every
+    correction to the wrong token.
+    """
+    from megatron.core import parallel_state as mpu
+
+    cu_seqlens, rows, heads = packed_rows
+    chunks = []
+    head_chunks = []
+    for cp_rank in (0, 1):
+        monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(
+            mpu, "get_context_parallel_rank", lambda cp_rank=cp_rank: cp_rank
+        )
+        chunks.append(split_packed_seqs_for_context_parallel(rows, cu_seqlens))
+        head_chunks.append(split_packed_seqs_for_context_parallel(heads, cu_seqlens))
+
+    indices = _build_cp_reassemble_indices(cu_seqlens, 2)
+
+    torch.testing.assert_close(torch.cat(chunks)[indices], rows, rtol=0, atol=0)
+    torch.testing.assert_close(torch.cat(head_chunks)[indices], heads, rtol=0, atol=0)
 
 
 class _StubEngine:
@@ -391,6 +335,58 @@ def test_engine_sc_guard_caches_success_only(engine_cls):
 
     assert first and second
     assert raised and cached_after_failure is False
+
+
+def test_engine_sc_correction_matches_hand_computed_residual(engine_cls):
+    """Test the helper's correction against the paper's closed form.
+
+    p = (.2, .3, .5) and q = (.4, .1, .5) over the head H = [2, 0] give
+    q_mass = .9, p_mass = .7 and rho = 1/3, so the residual is q - rho * p and
+    the correction is (log .2 + log .5) / 3 = log(.1) / 3.
+    """
+    import math
+
+    engine = engine_cls(vocab_size=3)
+    logits = torch.tensor([[0.2, 0.3, 0.5]], dtype=torch.float64).log()
+    labels = torch.tensor([2])
+    ids = torch.tensor([[2, 0]])
+    sampler = torch.tensor([[0.5, 0.4]], dtype=torch.float64).log()
+
+    _, _, kwargs = engine._score_centering_logprobs(
+        logits,
+        {
+            "sampler_head_ids": ids,
+            "sampler_head_logprobs": sampler,
+            "loss_mask": torch.ones(1),
+        },
+        labels,
+    )
+
+    torch.testing.assert_close(
+        kwargs["sc_correction"],
+        torch.tensor([math.log(0.1) / 3], dtype=torch.float64),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    metrics = kwargs["sc_metrics"]
+    torch.testing.assert_close(
+        metrics["rho"],
+        torch.tensor([1 / 3], dtype=torch.float64),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    torch.testing.assert_close(
+        metrics["q_mass"],
+        torch.tensor([0.9], dtype=torch.float64),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    torch.testing.assert_close(
+        metrics["p_mass"],
+        torch.tensor([0.7], dtype=torch.float64),
+        rtol=1e-10,
+        atol=1e-12,
+    )
 
 
 def test_sc_logprobs_reference_matches_vocab_softmax():
