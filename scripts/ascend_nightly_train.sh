@@ -51,5 +51,18 @@ args=(
 if [[ -n "${DATASET_PATH:-}" ]]; then
     args+=("train_dataset.path=$DATASET_PATH" "valid_dataset.path=$DATASET_PATH")
 fi
-python -m "$entry" "${args[@]}"
+run_user=$(python -c 'import getpass; print(getpass.getuser())')
+log_dir="$work/logs/$run_user/$experiment/nightly"
+mkdir -p "$log_dir"
+# The controller opens main.log in append mode. Follow it from the first line.
+touch "$log_dir/main.log"
+python -m "$entry" "${args[@]}" >"$work/console.log" 2>&1 &
+trainer_pid=$!
+tail --pid="$trainer_pid" -n +1 -f "$log_dir/main.log"
+wait "$trainer_pid" || {
+    status=$?
+    echo "Training exited with status $status. Last trainer console messages:" >&2
+    tail -n 5000 "$work/console.log" >&2
+    exit "$status"
+}
 python -m scripts.ascend_nightly_verify "$work" "$experiment" "$suite" nightly-output/metrics.json

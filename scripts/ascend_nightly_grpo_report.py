@@ -280,6 +280,57 @@ def report(
     return "\n\n".join(sections) + "\n"
 
 
+def inline_summary(markdown: str, runs: dict[str, list[Step]]) -> str:
+    """Embed chart data directly because job summaries cannot resolve artifact paths."""
+    keys = {key for steps in runs.values() for step in steps for key in step.metrics}
+    groups = {
+        "quality": [key for key in METRICS if key in keys],
+        "training-times": [f"timeperf/{name}" for name in MAIN_TIMERS],
+        "other-times": sorted(
+            key
+            for key in keys
+            if key.startswith("timeperf/")
+            and key.removeprefix("timeperf/") not in MAIN_TIMERS
+        ),
+    }
+
+    def charts(match: re.Match[str]) -> str:
+        blocks = []
+        for key in groups[match[1]]:
+            for label, steps in runs.items():
+                pairs = observations(steps, key)
+                if not pairs:
+                    continue
+                x, y = zip(*pairs, strict=True)
+                title = METRICS.get(key, key.removeprefix("timeperf/"))
+                if key.startswith("timeperf/"):
+                    title += " (s)"
+                if key.endswith("acceptance_rate"):
+                    title += " (%)"
+                    y = tuple(v * 100 for v in y)
+                axis = f"{x[0]} --> {x[-1]}"
+                if len(x) < 3 or x[-1] - x[0] + 1 != len(x):
+                    axis = "[" + ", ".join(str(step) for step in x) + "]"
+                values = ", ".join(f"{v:.10f}".rstrip("0").rstrip(".") for v in y)
+                series = "bar" if len(x) == 1 else "line"
+                blocks.append(
+                    f'```mermaid\nxychart-beta\n    title "{title} · {label}"\n'
+                    f'    x-axis "Training step" {axis}\n    {series} [{values}]\n```'
+                )
+        return "\n\n".join(blocks)
+
+    markdown = markdown.replace(
+        "Lines show individual steps and trailing five-step means. Dots mark sparse observations.",
+        "Charts show logged values by training step.",
+    )
+    return re.sub(
+        r"^!\[.*?\]\(.*/(quality|training-times|other-times)\.png\)$",
+        charts,
+        markdown,
+        flags=re.M,
+    )
+
+
 def read_snapshot(path: Path) -> list[Step]:
     return [Step(**row) for row in json.loads(path.read_text())]
 
@@ -297,6 +348,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--image-prefix", help="Published chart URL prefix for the Actions summary"
+    )
+    parser.add_argument(
+        "--summary-output", type=Path, help="Write inline charts for Actions"
     )
     args = parser.parse_args()
     current = read_log(args.current) if args.current else read_snapshot(args.snapshot)
@@ -324,6 +378,8 @@ def main() -> None:
     charts = args.output.parent / args.output.stem
     markdown = report(runs, charts, args.image_prefix or charts.name, args.suite)
     args.output.write_text(markdown, encoding="utf-8")
+    if args.summary_output:
+        args.summary_output.write_text(inline_summary(markdown, runs), encoding="utf-8")
 
 
 if __name__ == "__main__":
