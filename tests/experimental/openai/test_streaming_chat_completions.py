@@ -14,7 +14,7 @@ import json
 import sys
 import threading
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 from openai import AsyncOpenAI
@@ -665,6 +665,68 @@ class TestChatCompletionsEndpoint:
         release_generation.set()
         remaining = [chunk async for chunk in iterator]
         assert remaining[-1] == "data: [DONE]\n\n"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("disconnect", [False, True])
+    async def test_paused_stream_defers_generation_until_resume(
+        self, monkeypatch, _mock_openai_client, disconnect
+    ):
+        engine = MagicMock()
+        engine.config.agent.chat_template_kwargs = {}
+        monkeypatch.setattr(srv, "_engine", engine)
+        monkeypatch.setattr(srv, "_resume_streams", None)
+        monkeypatch.setattr(srv, "_STREAM_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+        monkeypatch.setattr(srv, "_capacity", 1)
+        create = create_autospec(_fake_create, side_effect=_fake_create)
+        monkeypatch.setattr(srv._openai_client.chat.completions, "create", create)
+
+        async with _client() as client:
+            session = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={"task_id": "paused"},
+            )
+            session.raise_for_status()
+            # The colocated trainer pauses before PPO and again before weight sync.
+            for _ in range(2):
+                (
+                    await client.post("/call", json={"method": "pause"})
+                ).raise_for_status()
+            response = await srv.chat_completions(
+                {
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "model": "test",
+                    "stream": True,
+                },
+                session_id=session.json()["session_id"],
+            )
+            assert response.status_code == 200
+            iterator = response.body_iterator
+            prelude = json.loads((await anext(iterator)).removeprefix("data: "))
+            assert prelude["choices"][0]["delta"] == {
+                "role": "assistant",
+                "content": "",
+            }
+            for _ in range(2):
+                assert await asyncio.wait_for(anext(iterator), 1) == ": ping\n\n"
+                create.assert_not_awaited()
+            if disconnect:
+                await iterator.aclose()
+            (await client.post("/call", json={"method": "resume"})).raise_for_status()
+            if disconnect:
+                create.assert_not_awaited()
+            else:
+                events = [event async for event in iterator]
+                assert events[-1] == "data: [DONE]\n\n"
+                chunks = [
+                    json.loads(e.removeprefix("data: "))
+                    for e in events[:-1]
+                    if e.startswith("data: ")
+                ]
+                assert [c["choices"][0]["delta"]["content"] for c in chunks] == [
+                    "hello"
+                ]
+                create.assert_awaited_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", ["/chat/completions", "/v1/chat/completions"])
