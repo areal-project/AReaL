@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from copy import deepcopy
@@ -205,6 +206,283 @@ async def test_auxiliary_policy_checks_effective_session_tools(
     cache, effective_tools = observed[0]
     assert effective_tools == ([] if disable_default_tools else tools)
     assert (cache is session.completions) is not disable_default_tools
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tools", [False, True])
+async def test_responses_http_auxiliary_materializes_tools(monkeypatch, with_tools):
+    """FastAPI's lazy tools iterator must retain both emptiness and tool values."""
+    from fastapi.responses import JSONResponse
+
+    tool = {
+        "type": "function",
+        "name": "solve",
+        "parameters": {"type": "object"},
+        "strict": False,
+    }
+    session = SessionData(
+        session_id="task",
+        metadata={
+            "auxiliary_system_prompts": ["Title"],
+            "generation_args": {"tools": [tool]},
+        },
+    )
+    session.completions["solve"] = _prm_interaction("solve", [1], [2], [])
+    observed = []
+
+    async def create(input, areal_cache, tools=None, **kwargs):
+        observed.append(list(tools))
+        interaction = _prm_interaction("title", [3], [4], [])
+        interaction.reward = None
+        interaction.metadata["response_parse"] = {
+            "has_content": with_tools,
+            "has_tool_calls": False,
+            "tool_call_parse_failed": False,
+        }
+        areal_cache["title"] = interaction
+        return JSONResponse({"id": "title"})
+
+    monkeypatch.setattr(
+        srv, "_openai_client", SimpleNamespace(responses=SimpleNamespace(create=create))
+    )
+    srv._session_cache["task"] = session
+    srv._api_key_to_session["task-key"] = "task"
+    headers = {"Authorization": "Bearer task-key"}
+    async with _client() as client:
+        response = await client.post(
+            "/responses",
+            headers=headers,
+            json={
+                "model": "test",
+                "instructions": "Title",
+                "input": "Summarize",
+                "tools": [tool] if with_tools else [],
+            },
+        )
+        assert response.status_code == 200, response.text
+        rewarded = await client.post(
+            "/rl/set_reward", headers=headers, json={"reward": 1.0}
+        )
+    assert rewarded.status_code == 200
+    assert observed == [[tool] if with_tools else []]
+    exported = session.export_interactions(
+        discount=1.0, style="concat", episode_reward=1.0
+    )
+    assert set(exported) == ({"solve", "title"} if with_tools else {"solve"})
+    assert exported["title" if with_tools else "solve"].reward == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint,payload,auxiliary",
+    [
+        (
+            "/v1/chat/completions",
+            {
+                "messages": [
+                    {"role": "system", "content": "Title"},
+                    {"role": "system", "content": "Solve"},
+                ]
+            },
+            False,
+        ),
+        (
+            "/v1/chat/completions",
+            {
+                "messages": [
+                    {"role": "system", "content": "Title"},
+                    {"role": "developer", "content": "Solve"},
+                ]
+            },
+            False,
+        ),
+        (
+            "/v1/chat/completions",
+            {
+                "messages": [
+                    {"role": "system", "content": "Title"},
+                    {"role": "system", "content": ""},
+                ]
+            },
+            True,
+        ),
+        (
+            "/v1/chat/completions",
+            {
+                "messages": [
+                    {"role": "user", "content": "Solve"},
+                    {"role": "system", "content": "Title"},
+                ]
+            },
+            False,
+        ),
+        (
+            "/responses",
+            {
+                "instructions": "Title",
+                "input": [{"role": "system", "content": "Solve"}],
+            },
+            False,
+        ),
+        (
+            "/responses",
+            {
+                "instructions": "Title",
+                "input": [{"role": "developer", "content": "Solve"}],
+            },
+            False,
+        ),
+        (
+            "/responses",
+            {
+                "instructions": "",
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": "Title"}],
+                    }
+                ],
+            },
+            True,
+        ),
+        (
+            "/responses",
+            {"instructions": "  ", "input": [{"role": "system", "content": "Title"}]},
+            True,
+        ),
+        ("/responses", {"input": [{"role": "system", "content": "Title"}]}, True),
+    ],
+)
+async def test_auxiliary_http_requires_one_unambiguous_instruction(
+    monkeypatch, endpoint, payload, auxiliary
+):
+    """Extra instructions retain training; empty instructions cannot hide a title."""
+    from fastapi.responses import JSONResponse
+
+    session = SessionData(
+        session_id="task", metadata={"auxiliary_system_prompts": ["Title"]}
+    )
+    session.completions["solve"] = _prm_interaction("solve", [1], [2], [])
+
+    async def create(
+        areal_cache, messages=None, input=None, instructions=None, **kwargs
+    ):
+        interaction = _prm_interaction("followup", [3], [4], [])
+        interaction.reward = None
+        interaction.metadata["response_parse"] = {
+            "has_content": not auxiliary,
+            "has_tool_calls": False,
+            "tool_call_parse_failed": False,
+        }
+        areal_cache["followup"] = interaction
+        return JSONResponse({"id": "followup"})
+
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+            responses=SimpleNamespace(create=create),
+        ),
+    )
+    srv._session_cache["task"] = session
+    srv._api_key_to_session["task-key"] = "task"
+    headers = {"Authorization": "Bearer task-key"}
+    async with _client() as client:
+        response = await client.post(
+            endpoint, headers=headers, json={"model": "test", **payload}
+        )
+        assert response.status_code == 200
+        rewarded = await client.post(
+            "/rl/set_reward", headers=headers, json={"reward": 1.0}
+        )
+    assert rewarded.status_code == 200
+    exported = session.export_interactions(
+        discount=1.0, style="concat", episode_reward=1.0
+    )
+    assert set(exported) == ({"solve"} if auxiliary else {"solve", "followup"})
+    assert exported["solve" if auxiliary else "followup"].reward == 1.0
+
+
+@pytest.mark.asyncio
+async def test_chat_auxiliary_policy_ignores_responses_only_session_instructions(
+    monkeypatch,
+):
+    """Unsupported Responses defaults cannot hide an ordinary Chat training call."""
+    session = SessionData(
+        session_id="task",
+        metadata={
+            "auxiliary_system_prompts": ["Title"],
+            "generation_args": {"instructions": "Title"},
+        },
+    )
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+
+    async def create(messages, areal_cache, temperature=1.0, top_p=1.0):
+        return areal_cache
+
+    cache = await srv._call_client_create(
+        create, {"messages": [{"role": "user", "content": "Solve task"}]}, "task"
+    )
+    assert cache is session.completions
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_stream_does_not_register_training_completion_alias(
+    monkeypatch,
+):
+    """Concurrent streams may only alias interactions in the real training cache."""
+    from openai.types.chat import ChatCompletionChunk
+
+    session = SessionData(
+        session_id="task", metadata={"auxiliary_system_prompts": ["Title"]}
+    )
+
+    async def create(messages, areal_cache, **kwargs):
+        key = "title" if messages[0]["role"] == "system" else "solve"
+        areal_cache[key] = _prm_interaction(key, [1], [2], messages)
+
+        async def chunks():
+            yield ChatCompletionChunk(
+                id=key,
+                created=0,
+                model="test",
+                object="chat.completion.chunk",
+                choices=[
+                    {"index": 0, "delta": {"content": key}, "finish_reason": "stop"}
+                ],
+            )
+
+        return chunks()
+
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    srv._session_cache["task"] = session
+    srv._api_key_to_session["task-key"] = "task"
+    async with _client() as client:
+        replies = await asyncio.gather(
+            *[
+                client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer task-key"},
+                    json={"model": "test", "messages": [message], "stream": True},
+                )
+                for message in [
+                    {"role": "user", "content": "Solve"},
+                    {"role": "system", "content": "Title"},
+                ]
+            ]
+        )
+    assert all(response.status_code == 200 for response in replies)
+    assert all("[DONE]" in response.text for response in replies)
+    assert set(session.completions) == {"solve"}
+    assert list(session.stream_completion_aliases.values()) == ["solve"]
 
 
 @pytest.mark.asyncio

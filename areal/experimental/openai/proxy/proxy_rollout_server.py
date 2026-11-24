@@ -850,6 +850,47 @@ def _content_block_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def _auxiliary_system_prompt(kwargs: dict[str, Any]) -> str | None:
+    """Recognize a sole leading instruction without hiding additional guidance."""
+    # Chat does not consume Responses-only session defaults, even when that
+    # unsupported field is still present before client-argument filtering.
+    instructions = (
+        kwargs.get("instructions") if kwargs.get("messages") is None else None
+    )
+    system_prompt = (
+        instructions if isinstance(instructions, str) and instructions.strip() else None
+    )
+    prompts = [system_prompt] if system_prompt is not None else []
+    messages_key = "messages" if kwargs.get("messages") is not None else "input"
+    messages = kwargs.get(messages_key)
+    if isinstance(messages, list):
+        # Responses content can also be a lazily validated iterator. Retain its
+        # materialized value for generation rather than consuming it only here.
+        messages = list(messages)
+        kwargs[messages_key] = messages
+        for index, message in enumerate(messages):
+            if not isinstance(message, Mapping) or message.get("role") not in {
+                "system",
+                "developer",
+            }:
+                continue
+            content = message.get("content")
+            if content is None:
+                continue
+            if isinstance(content, Iterable) and not isinstance(
+                content, (str, Mapping)
+            ):
+                content = list(content)
+                messages[index] = {**message, "content": content}
+            text = _content_block_text(content)
+            if not text.strip():
+                continue
+            prompts.append(text)
+            if index == 0 and message.get("role") == "system" and system_prompt is None:
+                system_prompt = text
+    return system_prompt if len(prompts) == 1 else None
+
+
 def _flatten_text_content_lists(messages: list[dict]) -> None:
     """Flatten text-only content block lists to strings in-place.
 
@@ -1010,21 +1051,15 @@ async def _call_client_create(
             kwargs.pop(key, None)
         kwargs.setdefault(key, value)
 
+    # FastAPI validates OpenAI Iterable fields lazily. An empty tools iterator
+    # is truthy; materialize it before classification and pass the same values
+    # to generation. Apply this after merging session defaults and overrides.
+    for key in ("tools", "messages", "input"):
+        value = kwargs.get(key)
+        if isinstance(value, Iterable) and not isinstance(value, (str, Mapping, list)):
+            kwargs[key] = list(value)
     auxiliary_prompts = session_data.metadata.get("auxiliary_system_prompts", [])
-    request_messages = kwargs.get("messages")
-    system_prompt = None
-    if request_messages is None:
-        # Responses uses instructions or a leading system message in input.
-        system_prompt = kwargs.get("instructions")
-        request_messages = kwargs.get("input")
-    if (
-        system_prompt is None
-        and isinstance(request_messages, list)
-        and request_messages
-    ):
-        first_message = request_messages[0]
-        if isinstance(first_message, Mapping) and first_message.get("role") == "system":
-            system_prompt = _content_block_text(first_message.get("content"))
+    system_prompt = _auxiliary_system_prompt(kwargs)
     is_auxiliary = (
         isinstance(auxiliary_prompts, list)
         and isinstance(system_prompt, str)
@@ -1338,7 +1373,10 @@ async def _deferred_openai_sse_stream(
                 if real_completion_id != stream_id:
                     with _lock:
                         session = _session_cache.get(session_id)
-                        if session is not None:
+                        if (
+                            session is not None
+                            and real_completion_id in session.completions
+                        ):
                             session.stream_completion_aliases[stream_id] = (
                                 real_completion_id
                             )

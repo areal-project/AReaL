@@ -582,11 +582,12 @@ econfig:
 
 Replace the example with the exact prompt emitted by the Harness. The default empty list
 disables exclusion. Chat Completions matches the leading system message; Responses
-matches `instructions` or a leading system message in `input`. Matching uses the
-effective request after session defaults are merged. Calls with tools, including
-inherited tools, remain in training; an explicit empty tools list can disable inherited
-tools. Matched tool-free calls use isolated interaction and failure state so they cannot
-replace the task's reward target.
+matches non-empty `instructions` or a leading system message in `input`. Empty
+instructions are ignored, and additional non-empty system or developer instructions keep
+the request in training. Matching uses the effective request after session defaults are
+merged. Calls with tools, including inherited tools, remain in training; an explicit
+empty tools list can disable inherited tools. Matched tool-free calls use isolated
+interaction and failure state so they cannot replace the task's reward target.
 
 ### Multiple Harnesses for one Stream
 
