@@ -1,0 +1,24 @@
+areal/infra/scheduler/ray.py
+  h_06d481e665ee92 1582-1588
+examples/ray/README.md
+  h_06d481e665ee92 26-35,71-73
+examples/swe/arena_config.py
+  h_06d481e665ee92 245-248
+examples/swe/qwen38_flash_next/train_rl.py
+  h_06d481e665ee92 280-281,286
+tests/test_ray_scheduler.py
+  h_06d481e665ee92 648-655,671-689
+tests/test_swe_arena_multi_stream.py
+  h_06d481e665ee92 233-235,237-239,241,243-244,580,583,586,610,678,700
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "21ba038d0f9bad9239e785045476055c8c9c88e6",
+  "prompts": {},
+  "humans": {
+    "h_06d481e665ee92": {
+      "author": "dingzhiqiang <982887058@qq.com>"
+    }
+  }
+}

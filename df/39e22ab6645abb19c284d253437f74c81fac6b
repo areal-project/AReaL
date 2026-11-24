@@ -1,0 +1,21 @@
+areal/infra/launcher/ray_bootstrap.py
+  s_e597c6ffa97881::t_10844c9043d4c4 31-34,374-407,409,411,414,416,419,430,441-469,473-504
+  s_e597c6ffa97881::t_584d498284f86b 470-472
+  s_e597c6ffa97881::t_2d7e48eb143309 505
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "df39e22ab6645abb19c284d253437f74c81fac6b",
+  "prompts": {},
+  "sessions": {
+    "s_e597c6ffa97881": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e856-f5a8-78e0-9289-bdd188400587",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "Ran <ran@U-0266R2HC-2254.local>"
+    }
+  }
+}
