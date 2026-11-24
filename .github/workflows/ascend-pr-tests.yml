@@ -420,43 +420,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          verify_model() {
-            local model_path="$1"
-            local weight_file
-
-            [[ -f "${model_path}/config.json" ]] || return 1
-            weight_file=$(find -L "${model_path}" -maxdepth 1 -type f \
-              \( -name '*.safetensors' -o -name '*.bin' \) -print -quit)
-            [[ -n "${weight_file}" ]]
-          }
-
+          source scripts/ascend_ci_inputs.sh
           resolve_model() {
-            local env_name="$1"
-            local model_name="$2"
-            local encoded_name="${model_name//./___}"
-            local modelscope_root="${HOME}/.cache/modelscope/hub/models"
-            local huggingface_root="${HF_HUB_CACHE:-${HF_HOME:-${HOME}/.cache/huggingface}/hub}"
-            local candidate
-            local -a candidates=(
-              "${!env_name}"
-              "${modelscope_root}/Qwen/${model_name}"
-              "${modelscope_root}/Qwen/${encoded_name}"
-              "${modelscope_root}/${model_name}"
-              "${modelscope_root}/${encoded_name}"
-              "${huggingface_root}/models--Qwen--${model_name}/snapshots/"*
-            )
-
-            for candidate in "${candidates[@]}"; do
-              if verify_model "${candidate}"; then
-                echo "${env_name}=${candidate}" >> "${GITHUB_ENV}"
-                echo "Using cached model for ${model_name}: ${candidate}"
-                return 0
-              fi
-            done
-
-            echo "::error title=Cached model unavailable::${model_name} requires config.json and a top-level .safetensors or .bin weight file"
-            printf 'Checked: %s\n' "${candidates[@]}"
-            return 1
+            local env_name=$1 model_name=$2 path
+            path=$(resolve_cached_qwen_model "$model_name" "${!env_name}") || return 1
+            echo "${env_name}=${path}" >> "$GITHUB_ENV"
+            echo "Using cached model for $model_name: $path"
           }
 
           failed=0
@@ -878,32 +847,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          prepare_dataset() {
-            python - <<'PY'
-          from datasets import load_dataset
-
-          for split in ("train", "test"):
-              dataset = load_dataset("hiyouga/geometry3k", split=split)
-              assert len(dataset) > 0, f"Geometry3K {split} split is empty"
-              print(f"Cached Geometry3K {split}: {len(dataset)} examples")
-          PY
-          }
-
-          if HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 prepare_dataset; then
-            exit 0
-          fi
-
-          for attempt in 1 2 3; do
-            if prepare_dataset; then
-              exit 0
-            fi
-            if [[ "${attempt}" -lt 3 ]]; then
-              echo "Geometry3K download attempt ${attempt} failed; retrying"
-              sleep "$((attempt * 30))"
-            fi
-          done
-          echo "::error::Geometry3K preparation failed after 3 attempts"
-          exit 1
+          source scripts/ascend_ci_inputs.sh
+          prepare_geometry3k hiyouga/geometry3k train test
 
       - name: Run Geometry3K training E2E
         timeout-minutes: 32
@@ -994,3 +939,107 @@ jobs:
       - name: Collect final NPU diagnostics
         if: always()
         run: npu-smi info || true
+
+  # Temporary validation on the nightly E2E trial PR.
+  nightly-e2e-train:
+    if: github.repository == 'areal-project/AReaL' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == 'Adiactive/AReaL' && github.head_ref == 'ci/ascend-nightly-e2e-trial'
+    name: Nightly Geometry3K ${{ matrix.suite }}
+    runs-on: linux-aarch64-a3-800i-16
+    timeout-minutes: 720
+    permissions:
+      contents: read
+    container:
+      image: swr.cn-north-12.myhuaweicloud.com/ascend/areal_npu:a3-nightly
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        suite: [grpo, sft]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install the tested revision
+        run: |
+          cp pyproject.npu.toml pyproject.toml
+          python -m pip install -e . --no-deps
+      - name: Train and verify final checkpoint
+        env:
+          GRPO_MODEL_PATH: ${{ vars.ASCEND_NIGHTLY_GRPO_MODEL }}
+          SFT_MODEL_PATH: ${{ vars.ASCEND_NIGHTLY_SFT_MODEL }}
+          DATASET_PATH: ${{ vars.ASCEND_NIGHTLY_GEOMETRY3K }}
+        run: bash scripts/ascend_nightly_train.sh ${{ matrix.suite }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ascend-nightly-${{ matrix.suite }}
+          path: nightly-output/metrics.json
+          if-no-files-found: error
+          overwrite: true
+
+  nightly-e2e-report:
+    needs: nightly-e2e-train
+    if: ${{ !cancelled() && (needs.nightly-e2e-train.result == 'success' || needs.nightly-e2e-train.result == 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: ascend-nightly-{grpo,sft}
+          path: artifacts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install matplotlib
+      - name: Generate reports
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          refs=$(git ls-remote origin refs/heads/ascend-nightly-results)
+          if [[ -n "$refs" ]]; then
+            git fetch --depth=1 origin refs/heads/ascend-nightly-results
+            baseline=$(git rev-parse FETCH_HEAD)
+          fi
+          for suite in grpo sft; do
+            snapshot="artifacts/ascend-nightly-$suite/metrics.json"
+            [[ -f "$snapshot" ]] || continue
+            args=(--suite "$suite" --snapshot "$snapshot" --output "nightly-reports/$suite.md")
+            if [[ -n "${baseline:-}" ]] && git cat-file -e "$baseline:$suite/metrics.json" 2>/dev/null; then
+              git show "$baseline:$suite/metrics.json" > "$RUNNER_TEMP/$suite-baseline.json"
+              args+=(--baseline-snapshot "$RUNNER_TEMP/$suite-baseline.json")
+            fi
+            python scripts/ascend_nightly_grpo_report.py "${args[@]}" --summary-output "$RUNNER_TEMP/$suite-summary.md"
+          done
+      - name: Upload tables and charts
+        id: reports
+        if: hashFiles('nightly-reports/*.md') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-e2e-reports
+          path: nightly-reports/
+          if-no-files-found: error
+          overwrite: true
+      - name: Show results
+        env:
+          REPORT_URL: ${{ steps.reports.outputs.artifact-url }}
+        run: |
+          for suite in grpo sft; do
+            if [[ ! -f "$RUNNER_TEMP/$suite-summary.md" ]]; then
+              echo "No verified metrics available for ${suite^^}." >> "$GITHUB_STEP_SUMMARY"
+              echo >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            cat "$RUNNER_TEMP/$suite-summary.md" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [[ -n "$REPORT_URL" ]]; then
+            echo "[Download reports and charts]($REPORT_URL)" >> "$GITHUB_STEP_SUMMARY"
+          fi
