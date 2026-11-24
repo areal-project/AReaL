@@ -4093,7 +4093,9 @@ class MegatronEngine(TrainEngine):
             # At tp>1 the logits are vocabulary shards: tp_group/vocab_size must
             # reach the reduction, or probabilities are read off a shard.
             tp_group=mpu.get_tensor_model_parallel_group() if tp_size > 1 else None,
-            vocab_size=vocab_size if tp_size > 1 else None,
+            # Passed at every degree: the logits carry padding columns even on one
+            # device, and both paths must normalize over the model vocabulary.
+            vocab_size=vocab_size,
             weight_fn=build_weight_fn(
                 self.config.sc_mode,
                 self.config.sc_clip_low,

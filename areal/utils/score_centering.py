@@ -106,22 +106,42 @@ def selected_logprobs(
     ids: torch.Tensor,
     chunk_size: int = 256,
     compute_entropy: bool = True,
+    vocab_size: int | None = None,
 ):
     """Selected log-probabilities using ordinary PyTorch autograd.
 
     Checkpoint row chunks to avoid saving full FP32 log-probabilities for
     backward. Full input logits remain live. Entropy is diagnostic-only.
+
+    ``vocab_size`` is the model vocabulary; a wider ``logits`` tensor carries
+    Megatron's padding columns, which are masked out so the normalization matches
+    the sampler's distribution and does not depend on the padding a given
+    parallelism degree happens to add.
     """
     if logits.ndim != 2 or ids.ndim != 2 or logits.shape[0] != ids.shape[0]:
         raise ValueError("Expected logits [N,V] and token IDs [N,K].")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
+    if vocab_size is not None and not 0 < vocab_size <= logits.shape[-1]:
+        raise ValueError(
+            f"vocab_size must be in [1, {logits.shape[-1]}]; got {vocab_size}."
+        )
     dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
 
     def compute(chunk, indices):
-        logp = chunk.to(dtype).log_softmax(-1)
+        work = chunk.to(dtype)
+        valid = None
+        if vocab_size is not None and vocab_size < work.shape[-1]:
+            valid = torch.arange(work.shape[-1], device=work.device) < vocab_size
+            work = work.masked_fill(~valid, -torch.inf)
+        logp = work.log_softmax(-1)
         selected = logp.gather(-1, indices.long())
-        entropy = -(logp.exp() * logp).sum(-1).detach() if compute_entropy else None
+        entropy = None
+        if compute_entropy:
+            terms = logp.exp() * (
+                logp if valid is None else logp.masked_fill(~valid, 0)
+            )
+            entropy = -terms.sum(-1).detach()
         return selected, entropy
 
     if logits.shape[0] == 0:
@@ -309,6 +329,11 @@ def score_centering_logprobs(
         if tp_group is not None:
             raise ValueError("Vocabulary-parallel score centering requires vocab_size.")
         selected, entropy = selected_logprobs(logits, ids, chunk_size)
+    elif tp_group is None:
+        # Single device: the logits may still carry padding columns.
+        selected, entropy = selected_logprobs(
+            logits, ids, chunk_size, vocab_size=vocab_size
+        )
     else:
         selected, entropy = vocab_parallel_selected_logprobs(
             logits, ids, tp_group=tp_group, vocab_size=vocab_size, chunk_size=chunk_size
