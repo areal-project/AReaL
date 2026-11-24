@@ -917,6 +917,10 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Preserve the prepared dataset cache and give SwanLab a private cache.
+          export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}"
+          export XDG_CACHE_HOME="${AREAL_E2E_WORK_DIR:?}/cache"
+          install -d -m 700 "$XDG_CACHE_HOME"
           mkdir -p npu-test-logs
           timeout --kill-after=60s 1800s \
             pytest -q -s -p scripts.ci_test_report tests/test_ascend_training_e2e.py \
