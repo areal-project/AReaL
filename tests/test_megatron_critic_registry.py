@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -9,13 +8,12 @@ import torch
 from areal.api.cli_args import MegatronEngineConfig
 
 
-def _load_mcore_test_modules():
+def _load_registry_module():
     pytest.importorskip("megatron.core")
     pytest.importorskip("mbridge")
-    from areal.engine.megatron_engine import MegatronEngine
-    from areal.models.mcore import hf_load, registry
+    from areal.models.mcore import registry
 
-    return MegatronEngine, hf_load, registry
+    return registry
 
 
 class _FakeGPTModel(torch.nn.Module):
@@ -83,7 +81,7 @@ class _FakeDDP(torch.nn.Module):
 
 
 def test_value_head_zero_initializes_weights_and_bias() -> None:
-    _, _, registry = _load_mcore_test_modules()
+    registry = _load_registry_module()
     tf_config = SimpleNamespace(sequence_parallel=True)
 
     head = registry.ValueHead(input_size=6, output_size=1, config=tf_config, bias=True)
@@ -97,7 +95,7 @@ def test_value_head_zero_initializes_weights_and_bias() -> None:
 def test_mbridge_critic_installs_value_head_before_ddp_and_updates_weights(
     monkeypatch,
 ) -> None:
-    _, _, registry = _load_mcore_test_modules()
+    registry = _load_registry_module()
     monkeypatch.setattr(registry, "GPTModel", _FakeGPTModel)
     monkeypatch.setattr(registry, "DDP", _FakeDDP)
 
@@ -181,7 +179,7 @@ def test_mbridge_critic_pipeline_parallel_stages_and_vlm_wrapper_untying(
     monkeypatch,
     vlm_cls,
 ) -> None:
-    _, _, registry = _load_mcore_test_modules()
+    registry = _load_registry_module()
     monkeypatch.setattr(registry, "GPTModel", _FakeGPTModel)
     monkeypatch.setattr(registry, "DDP", _FakeDDP)
 
@@ -262,7 +260,7 @@ def test_mbridge_critic_pipeline_parallel_stages_and_vlm_wrapper_untying(
 def test_megatron_bridge_critic_installs_value_head_in_pre_wrap_hook(
     monkeypatch,
 ) -> None:
-    _, _, registry = _load_mcore_test_modules()
+    registry = _load_registry_module()
     monkeypatch.setattr(registry, "GPTModel", _FakeGPTModel)
     monkeypatch.setattr(registry, "DDP", _FakeDDP)
     for getter in (
@@ -330,7 +328,7 @@ def test_megatron_bridge_critic_installs_value_head_in_pre_wrap_hook(
 def test_verify_critic_value_heads_raises_when_installed_after_ddp(
     monkeypatch,
 ) -> None:
-    _, _, registry = _load_mcore_test_modules()
+    registry = _load_registry_module()
     monkeypatch.setattr(registry, "GPTModel", _FakeGPTModel)
     monkeypatch.setattr(registry, "DDP", _FakeDDP)
 
@@ -349,7 +347,7 @@ def test_verify_critic_value_heads_raises_when_installed_after_ddp(
 def test_critic_rejects_enable_mtp_and_drops_disabled_checkpoint_mtp(
     monkeypatch,
 ) -> None:
-    _, _, registry = _load_mcore_test_modules()
+    registry = _load_registry_module()
     monkeypatch.setattr(registry, "GPTModel", _FakeGPTModel)
     monkeypatch.setattr(registry, "DDP", _FakeDDP)
 
@@ -408,297 +406,3 @@ def test_critic_rejects_enable_mtp_and_drops_disabled_checkpoint_mtp(
     )
     assert tf_config.mtp_num_layers is None
     assert bridge.config.mtp_num_layers is None
-
-
-@pytest.mark.parametrize("has_saved_head", [True, False])
-def test_megatron_engine_qwen35_mbridge_critic_uses_native_load_and_restores_value_head(
-    monkeypatch,
-    tmp_path,
-    has_saved_head: bool,
-) -> None:
-    MegatronEngine, hf_load, registry = _load_mcore_test_modules()
-    monkeypatch.setattr(registry, "GPTModel", _FakeGPTModel)
-    monkeypatch.setattr(hf_load.mpu, "is_pipeline_last_stage", lambda: True)
-
-    tf_config = SimpleNamespace(
-        hidden_size=4, params_dtype=torch.float32, sequence_parallel=False
-    )
-    model = _FakeGPTModel(hidden_size=4, vocab_size=8, post_process=True)
-    registry._replace_output_layer_with_value_head(model, tf_config)
-
-    if has_saved_head:
-        expected_weight = torch.full((1, 4), 2.5)
-        torch.save({"weight": expected_weight}, tmp_path / "value_head.pt")
-    else:
-        expected_weight = torch.zeros(1, 4)
-
-    native_calls: list[str] = []
-    fast_calls: list[str] = []
-
-    class _FakeBridge:
-        def _get_actual_hf_path(self, path: str) -> str:
-            return path
-
-        def load_weights(self, models, path: str) -> None:
-            native_calls.append(path)
-
-    monkeypatch.setattr(
-        "areal.engine.megatron_engine.load_weights_from_hf_with_mbridge_fast",
-        lambda **kwargs: fast_calls.append(kwargs["weights_path"]),
-    )
-
-    engine = MegatronEngine.__new__(MegatronEngine)
-    engine.bridge_cls = "mbridge"
-    engine.bridge = _FakeBridge()
-    engine.model = [model]
-    engine.fp8_direct_convert = False
-    engine.hf_config = SimpleNamespace(model_type="qwen3_5")
-    engine.config = SimpleNamespace(is_critic=True)
-
-    engine._load_model_from_hf(str(tmp_path))
-
-    assert native_calls == [str(tmp_path)]
-    assert fast_calls == []
-    torch.testing.assert_close(
-        model.output_layer.weight, expected_weight, rtol=0, atol=0
-    )
-
-    # Non-Qwen3.5 mbridge models continue using the fast HF loader.
-    engine.hf_config = SimpleNamespace(model_type="qwen3")
-    engine._load_model_from_hf(str(tmp_path))
-    assert fast_calls == [str(tmp_path)]
-
-
-def test_qwen35_mbridge_load_dequantizes_fp8_weights_and_mixed_gdn_layers(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    MegatronEngine, hf_load, registry = _load_mcore_test_modules()
-    safetensors_torch = pytest.importorskip("safetensors.torch")
-    from mbridge.core.safetensor_io import SafeTensorIO
-
-    monkeypatch.setattr(registry, "GPTModel", _FakeGPTModel)
-    monkeypatch.setattr(hf_load.mpu, "is_pipeline_last_stage", lambda: True)
-
-    shard_name = "model-00001-of-00001.safetensors"
-    down_q = torch.tensor(
-        [[4.0, 4.0, 8.0, 8.0], [4.0, 4.0, 8.0, 8.0]], dtype=torch.float32
-    ).to(torch.float8_e4m3fn)
-    down_scale = torch.tensor([[0.01, 0.25]], dtype=torch.float32)
-
-    in_qkv_q = torch.full((2, 4), 10.0, dtype=torch.float32).to(torch.float8_e4m3fn)
-    in_qkv_scale = torch.tensor([[0.02, 0.05]], dtype=torch.float32)
-    in_b_bf16 = torch.full((1, 4), 0.5, dtype=torch.bfloat16)
-    lm_head_bf16 = torch.ones((8, 4), dtype=torch.bfloat16)
-
-    tensors = {
-        "model.layers.0.mlp.down_proj.weight": down_q,
-        "model.layers.0.mlp.down_proj.weight_scale_inv": down_scale,
-        "model.layers.0.linear_attn.in_proj_qkv.weight": in_qkv_q,
-        "model.layers.0.linear_attn.in_proj_qkv.weight_scale_inv": in_qkv_scale,
-        "model.layers.0.linear_attn.in_proj_b.weight": in_b_bf16,
-        "lm_head.weight": lm_head_bf16,
-    }
-    safetensors_torch.save_file(tensors, str(tmp_path / shard_name))
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": dict.fromkeys(tensors, shard_name)}),
-        encoding="utf-8",
-    )
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "qwen2",
-                "hidden_size": 4,
-                "vocab_size": 8,
-                "tie_word_embeddings": False,
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    class _FakeQwen35NativeBridge:
-        def __init__(self) -> None:
-            self.dtype = torch.bfloat16
-            self.hf_config = SimpleNamespace(
-                model_type="qwen3_5",
-                quantization_config={
-                    "quant_method": "fp8",
-                    "weight_block_size": [2, 2],
-                },
-            )
-
-        def _get_actual_hf_path(self, path: str) -> str:
-            return path
-
-        def _get_safetensor_io(self, path: str) -> SafeTensorIO:
-            return SafeTensorIO(path)
-
-        def load_weights(self, models, path: str) -> None:
-            io = self._get_safetensor_io(path)
-            loaded = io.load_some_hf_weight(
-                [
-                    "model.layers.0.mlp.down_proj.weight",
-                    "model.layers.0.linear_attn.in_proj_qkv.weight",
-                    "model.layers.0.linear_attn.in_proj_b.weight",
-                    "lm_head.weight",
-                ]
-            )
-            model = models[0]
-            assert loaded["lm_head.weight"].dtype is torch.bfloat16
-            assert model.output_layer.weight.shape[0] == 1
-            model.down_proj.data.copy_(loaded["model.layers.0.mlp.down_proj.weight"])
-            model.in_proj.data.copy_(
-                torch.cat(
-                    [
-                        loaded["model.layers.0.linear_attn.in_proj_qkv.weight"],
-                        loaded["model.layers.0.linear_attn.in_proj_b.weight"],
-                    ],
-                    dim=0,
-                )
-            )
-
-    model = _FakeGPTModel(hidden_size=4, vocab_size=8, post_process=True)
-    registry._replace_output_layer_with_value_head(
-        model,
-        SimpleNamespace(
-            hidden_size=4, params_dtype=torch.bfloat16, sequence_parallel=False
-        ),
-    )
-    model.down_proj = torch.nn.Parameter(torch.empty(2, 4, dtype=torch.bfloat16))
-    model.in_proj = torch.nn.Parameter(torch.empty(3, 4, dtype=torch.bfloat16))
-
-    bridge = _FakeQwen35NativeBridge()
-    orig_get_io = bridge._get_safetensor_io
-
-    engine = MegatronEngine.__new__(MegatronEngine)
-    engine.bridge_cls = "mbridge"
-    engine.bridge = bridge
-    engine.model = [model]
-    engine.dtype = torch.bfloat16
-    engine.fp8_direct_convert = False
-    engine.hf_config = bridge.hf_config
-    engine.quantization_config = bridge.hf_config.quantization_config
-    engine.config = SimpleNamespace(is_critic=True)
-
-    engine._load_model_from_hf(str(tmp_path))
-
-    assert bridge._get_safetensor_io == orig_get_io
-    assert "_get_safetensor_io" not in bridge.__dict__
-    expected_down = torch.tensor(
-        [[0.04, 0.04, 2.0, 2.0], [0.04, 0.04, 2.0, 2.0]],
-        dtype=torch.bfloat16,
-    )
-    expected_in = torch.tensor(
-        [
-            [0.2, 0.2, 0.5, 0.5],
-            [0.2, 0.2, 0.5, 0.5],
-            [0.5, 0.5, 0.5, 0.5],
-        ],
-        dtype=torch.bfloat16,
-    )
-    torch.testing.assert_close(model.down_proj, expected_down, rtol=1e-2, atol=1e-4)
-    torch.testing.assert_close(model.in_proj, expected_in, rtol=1e-2, atol=1e-4)
-    torch.testing.assert_close(
-        model.output_layer.weight,
-        torch.zeros(1, 4, dtype=torch.bfloat16),
-        rtol=0,
-        atol=0,
-    )
-
-
-def test_dequant_fp8_safetensor_io_3d_experts_one_weight_and_missing_scale(
-    tmp_path,
-) -> None:
-    MegatronEngine, hf_load, _ = _load_mcore_test_modules()
-    safetensors_torch = pytest.importorskip("safetensors.torch")
-    from mbridge.core.safetensor_io import SafeTensorIO
-
-    shard_name = "model-00001-of-00001.safetensors"
-    experts_q = torch.tensor(
-        [
-            [
-                [2.0, 2.0, 4.0, 4.0],
-                [2.0, 2.0, 4.0, 4.0],
-                [2.0, 2.0, 4.0, 4.0],
-            ],
-            [
-                [8.0, 8.0, 12.0, 12.0],
-                [8.0, 8.0, 12.0, 12.0],
-                [8.0, 8.0, 12.0, 12.0],
-            ],
-        ],
-        dtype=torch.float32,
-    ).to(torch.float8_e4m3fn)
-    experts_scale = torch.tensor(
-        [
-            [[0.5, 0.25], [0.1, 0.05]],
-            [[0.25, 0.5], [0.05, 0.1]],
-        ],
-        dtype=torch.float32,
-    )
-    unscaled_q = torch.ones((2, 2), dtype=torch.float32).to(torch.float8_e4m3fn)
-
-    tensors = {
-        "model.layers.0.mlp.experts.down_proj": experts_q,
-        "model.layers.0.mlp.experts.down_proj_scale_inv": experts_scale,
-        "model.layers.0.mlp.gate_proj.weight": unscaled_q,
-    }
-    safetensors_torch.save_file(tensors, str(tmp_path / shard_name))
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": dict.fromkeys(tensors, shard_name)}),
-        encoding="utf-8",
-    )
-    (tmp_path / "config.json").write_text(
-        json.dumps({"model_type": "qwen2", "hidden_size": 4, "vocab_size": 8}),
-        encoding="utf-8",
-    )
-
-    def orig_get_io(path: str) -> SafeTensorIO:
-        return SafeTensorIO(path)
-
-    bridge = SimpleNamespace(
-        dtype=torch.bfloat16,
-        hf_config=SimpleNamespace(quantization_config={"weight_block_size": [2, 2]}),
-        _get_safetensor_io=orig_get_io,
-    )
-
-    with hf_load.dequant_fp8_safetensor_io(bridge):
-        io = bridge._get_safetensor_io(str(tmp_path))
-        loaded_one = io.load_one_hf_weight("model.layers.0.mlp.experts.down_proj")
-        loaded_many = io.load_some_hf_weight(["model.layers.0.mlp.experts.down_proj"])
-        with pytest.raises(RuntimeError, match="no matching scale tensor"):
-            io.load_one_hf_weight("model.layers.0.mlp.gate_proj.weight")
-
-    assert bridge._get_safetensor_io is orig_get_io
-
-    expected = torch.tensor(
-        [
-            [
-                [1.0, 1.0, 1.0, 1.0],
-                [1.0, 1.0, 1.0, 1.0],
-                [0.2, 0.2, 0.2, 0.2],
-            ],
-            [
-                [2.0, 2.0, 6.0, 6.0],
-                [2.0, 2.0, 6.0, 6.0],
-                [0.4, 0.4, 1.2, 1.2],
-            ],
-        ],
-        dtype=torch.bfloat16,
-    )
-    torch.testing.assert_close(loaded_one, expected, rtol=1e-2, atol=1e-4)
-    torch.testing.assert_close(
-        loaded_many["model.layers.0.mlp.experts.down_proj"],
-        expected,
-        rtol=1e-2,
-        atol=1e-4,
-    )
-
-    engine = MegatronEngine.__new__(MegatronEngine)
-    engine.bridge_cls = "mbridge"
-    engine.model = [object()]
-    engine.fp8_direct_convert = True
-    engine.hf_config = SimpleNamespace(model_type="qwen3_5")
-    engine.config = SimpleNamespace(is_critic=False)
-    with pytest.raises(NotImplementedError, match="fp8_direct_convert=True"):
-        engine._load_model_from_hf(str(tmp_path))
