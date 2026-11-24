@@ -122,6 +122,7 @@ LOGGER_COLORS_EXACT = {
     "ProxyUtils": "light_purple",
     "AReaL-SWEAgent": "light_purple",
     "ArenaStreamAgent": "light_purple",
+    "ArenaOpenAPIClient": "light_purple",
     "SWETrain": "light_green",
     "SWEPrefixMatcher": "light_yellow",
     # Agent Service - purple
