@@ -1,0 +1,103 @@
+name: Ascend nightly E2E
+on: workflow_call
+
+concurrency:
+  group: ascend-nightly-e2e
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.prepare.outputs.sha }}
+      baseline: ${{ steps.prepare.outputs.baseline }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ascend
+          fetch-depth: 0
+          persist-credentials: false
+      - id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh auth setup-git
+          bash scripts/ascend_nightly_state.sh prepare "$RUNNER_TEMP/results"
+
+  train:
+    needs: prepare
+    if: needs.prepare.outputs.sha != ''
+    name: Geometry3K ${{ matrix.suite }}
+    runs-on: linux-aarch64-a3-800i-16
+    timeout-minutes: 720
+    permissions:
+      contents: read
+    container:
+      image: swr.cn-north-12.myhuaweicloud.com/ascend/areal_npu:a3-nightly
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        suite: [grpo, sft]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - name: Install the tested revision
+        run: |
+          cp pyproject.npu.toml pyproject.toml
+          python -m pip install -e . --no-deps
+      - name: Train and verify final checkpoint
+        env:
+          GRPO_MODEL_PATH: ${{ vars.ASCEND_NIGHTLY_GRPO_MODEL }}
+          SFT_MODEL_PATH: ${{ vars.ASCEND_NIGHTLY_SFT_MODEL }}
+          DATASET_PATH: ${{ vars.ASCEND_NIGHTLY_GEOMETRY3K }}
+        run: bash scripts/ascend_nightly_train.sh ${{ matrix.suite }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ascend-nightly-${{ matrix.suite }}
+          path: nightly-output/metrics.json
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    needs: [prepare, train]
+    if: ${{ !cancelled() && needs.prepare.outputs.sha != '' && (needs.train.result == 'success' || needs.train.result == 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: ascend-nightly-{grpo,sft}
+          path: artifacts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install matplotlib
+      - name: Publish performance summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE: ${{ needs.prepare.outputs.baseline }}
+        run: |
+          gh auth setup-git
+          bash scripts/ascend_nightly_state.sh publish "$RUNNER_TEMP/results"
+      - name: Upload tables and charts
+        if: hashFiles('nightly-reports/*.md') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-e2e-reports
+          path: nightly-reports/
+          overwrite: true
