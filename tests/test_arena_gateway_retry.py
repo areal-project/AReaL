@@ -104,7 +104,10 @@ def test_gateway_redirect_exhausts_retry_budget(monkeypatch):
         "connect",
         "remote_protocol",
         429,
+        500,
         502,
+        503,
+        504,
         "apigwmoe_502",
         "arenaonlinegateway_504",
     ],
@@ -174,7 +177,7 @@ def test_existing_task_survives_exhausted_transient_result_reads(monkeypatch, fa
 
 
 @pytest.mark.parametrize(
-    "failure", [401, 403, 404, "non_json", "wrong_task", "local_protocol"]
+    "failure", [401, 403, 404, 501, 505, "non_json", "wrong_task", "local_protocol"]
 )
 def test_permanent_result_read_errors_still_fail(monkeypatch, failure):
     """Do not hide authentication failures, corrupt results, or local request bugs."""
@@ -213,11 +216,110 @@ def test_permanent_result_read_errors_still_fail(monkeypatch, failure):
                 client=client,
             )
 
-    with pytest.raises(ArenaAPIError):
-        asyncio.run(run())
+    with pytest.raises(
+        ArenaAPIError, match=f"HTTP {failure}" if isinstance(failure, int) else None
+    ):
+        asyncio.run(asyncio.wait_for(run(), timeout=1))
     assert requests == [
         ("POST", "/openapi/v1/streams/stream-1/launch_one_task"),
         ("GET", "/openapi/v1/tasks/task-1/result"),
+        ("POST", "/openapi/v1/jobs/job-1/cancel"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_known_job_cancel_retries_gateway_504_without_relaunch(monkeypatch):
+    """A safe cancellation can retry the redirect that a launch cannot replay."""
+    requests = []
+
+    async def no_sleep(_):
+        pass
+
+    monkeypatch.setattr("examples.swe.arena_client.asyncio.sleep", no_sleep)
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        if request.url.path.endswith("/launch_one_task"):
+            return httpx.Response(
+                202, json={"task_id": "task-1", "job_id": "job-1", "status": "RUNNING"}
+            )
+        if request.url.path.endswith("/result"):
+            raise TimeoutError("episode expired")
+        assert request.url.path == "/openapi/v1/jobs/job-1/cancel"
+        if sum(path.endswith("/cancel") for _, path in requests) == 1:
+            return httpx.Response(
+                302,
+                headers={
+                    "location": "https://gateway.example/wait?fromspanner=arenaonlinegateway_504"
+                },
+            )
+        return httpx.Response(200, json={})
+
+    api = ArenaOpenAPIClient(
+        base_url="https://arena.example", api_token="test-token", request_retries=0
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(TimeoutError, match="episode expired"):
+            await api.launch_one_task_result(
+                "stream-1",
+                "data-1",
+                "model-1",
+                "https://proxy.example",
+                "test-key",
+                client=client,
+            )
+    assert requests == [
+        ("POST", "/openapi/v1/streams/stream-1/launch_one_task"),
+        ("GET", "/openapi/v1/tasks/task-1/result"),
+        ("POST", "/openapi/v1/jobs/job-1/cancel"),
+        ("POST", "/openapi/v1/jobs/job-1/cancel"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_known_job_cancel_gateway_retry_obeys_cleanup_deadline(monkeypatch):
+    """Repeated redirects cannot extend the existing bounded cleanup window."""
+    requests = []
+
+    async def poll(*args):
+        raise TimeoutError("episode expired")
+
+    api = ArenaOpenAPIClient(
+        base_url="https://arena.example",
+        api_token="test-token",
+        request_retries=0,
+        timeout=0.02,
+    )
+    monkeypatch.setattr(api, "_poll_task_result", poll)
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        if request.url.path.endswith("/launch_one_task"):
+            return httpx.Response(
+                202, json={"task_id": "task-1", "job_id": "job-1", "status": "RUNNING"}
+            )
+        return httpx.Response(
+            302,
+            headers={
+                "location": "https://gateway.example/wait?fromspanner=arenaonlinegateway_504"
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(TimeoutError, match="episode expired"):
+            await asyncio.wait_for(
+                api.launch_one_task_result(
+                    "stream-1",
+                    "data-1",
+                    "model-1",
+                    "https://proxy.example",
+                    "test-key",
+                    client=client,
+                ),
+                timeout=0.5,
+            )
+    assert requests == [
+        ("POST", "/openapi/v1/streams/stream-1/launch_one_task"),
         ("POST", "/openapi/v1/jobs/job-1/cancel"),
     ]
 

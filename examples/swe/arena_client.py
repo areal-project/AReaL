@@ -85,7 +85,9 @@ def _is_retryable_status(status_code: int) -> bool:
     return status_code == 429 or status_code >= 500
 
 
-def _is_retryable_response(response: httpx.Response, method: str) -> bool:
+def _is_retryable_response(
+    response: httpx.Response, method: str, *, retry_gateway_timeout: bool = False
+) -> bool:
     if _is_retryable_status(response.status_code):
         return True
     if response.status_code == 302:
@@ -93,11 +95,19 @@ def _is_retryable_response(response: httpx.Response, method: str) -> bool:
         marker = parse_qs(urlsplit(location).query).get("fromspanner")
         # A gateway timeout may occur after a task launch was accepted.
         return marker == ["apigwmoe_502"] or (
-            marker == ["arenaonlinegateway_504"] and method in ("GET", "DELETE")
+            marker == ["arenaonlinegateway_504"]
+            and (method in ("GET", "DELETE") or retry_gateway_timeout)
         )
     if response.status_code != 403:
         return False
     return "spanner-http-ant-group-watch-all" in response.text[:1000]
+
+
+def _is_retryable_result_response(response: httpx.Response) -> bool:
+    """Only known transient failures may outlive the bounded request retries."""
+    if response.status_code >= 500:
+        return response.status_code in {500, 502, 503, 504}
+    return _is_retryable_response(response, "GET")
 
 
 def resolve_arena_credentials(
@@ -967,6 +977,7 @@ class ArenaOpenAPIClient:
         method: str,
         url: str,
         _retry_count: int | None = None,
+        _retry_gateway_timeout: bool = False,
         **kwargs: Any,
     ) -> httpx.Response:
         retries = self.request_retries if _retry_count is None else _retry_count
@@ -981,7 +992,9 @@ class ArenaOpenAPIClient:
                     ) from exc
                 await asyncio.sleep(min(2**attempt, 10))
                 continue
-            if not _is_retryable_response(response, method):
+            if not _is_retryable_response(
+                response, method, retry_gateway_timeout=_retry_gateway_timeout
+            ):
                 return response
             if attempt == retries:
                 return response
@@ -1207,6 +1220,9 @@ class ArenaOpenAPIClient:
                     "POST",
                     f"{self.base_url}/openapi/v1/jobs/{encoded_job_id}/cancel",
                     _retry_count=cleanup_retries,
+                    # Cancelling an exact known job is safe to replay. A launch
+                    # POST must never opt in to this ambiguous gateway retry.
+                    _retry_gateway_timeout=True,
                     headers=self._headers,
                 )
                 # A terminal job can race with cancellation. The cancel endpoint
@@ -1269,7 +1285,7 @@ class ArenaOpenAPIClient:
                 # the caller's episode timeout/cancellation still bounds this wait.
                 await asyncio.sleep(self.poll_interval)
                 continue
-            if _is_retryable_response(response, "GET"):
+            if _is_retryable_result_response(response):
                 failed_reads += 1
                 if failed_reads & (failed_reads - 1) == 0:
                     logger.warning(
