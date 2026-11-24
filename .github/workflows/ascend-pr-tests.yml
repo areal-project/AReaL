@@ -979,6 +979,7 @@ jobs:
 
   nightly-e2e-report:
     needs: nightly-e2e-train
+    if: ${{ !cancelled() && (needs.nightly-e2e-train.result == 'success' || needs.nightly-e2e-train.result == 'failure') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -991,12 +992,8 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v5
         with:
-          name: ascend-nightly-grpo
-          path: artifacts/grpo
-      - uses: actions/download-artifact@v5
-        with:
-          name: ascend-nightly-sft
-          path: artifacts/sft
+          pattern: ascend-nightly-{grpo,sft}
+          path: artifacts
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -1012,7 +1009,9 @@ jobs:
             baseline=$(git rev-parse FETCH_HEAD)
           fi
           for suite in grpo sft; do
-            args=(--suite "$suite" --snapshot "artifacts/$suite/metrics.json" --output "nightly-reports/$suite.md")
+            snapshot="artifacts/ascend-nightly-$suite/metrics.json"
+            [[ -f "$snapshot" ]] || continue
+            args=(--suite "$suite" --snapshot "$snapshot" --output "nightly-reports/$suite.md")
             if [[ -n "${baseline:-}" ]] && git cat-file -e "$baseline:$suite/metrics.json" 2>/dev/null; then
               git show "$baseline:$suite/metrics.json" > "$RUNNER_TEMP/$suite-baseline.json"
               args+=(--baseline-snapshot "$RUNNER_TEMP/$suite-baseline.json")
@@ -1021,6 +1020,7 @@ jobs:
           done
       - name: Upload tables and charts
         id: reports
+        if: hashFiles('nightly-reports/*.md') != ''
         uses: actions/upload-artifact@v7
         with:
           name: nightly-e2e-reports
@@ -1032,7 +1032,14 @@ jobs:
           REPORT_URL: ${{ steps.reports.outputs.artifact-url }}
         run: |
           for suite in grpo sft; do
+            if [[ ! -f "$RUNNER_TEMP/$suite-summary.md" ]]; then
+              echo "No verified metrics available for ${suite^^}." >> "$GITHUB_STEP_SUMMARY"
+              echo >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
             cat "$RUNNER_TEMP/$suite-summary.md" >> "$GITHUB_STEP_SUMMARY"
             echo >> "$GITHUB_STEP_SUMMARY"
           done
-          echo "[Download reports and charts]($REPORT_URL)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$REPORT_URL" ]]; then
+            echo "[Download reports and charts]($REPORT_URL)" >> "$GITHUB_STEP_SUMMARY"
+          fi

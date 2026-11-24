@@ -82,7 +82,7 @@ actor:
   gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 32768
+    max_tokens_per_mb: 16384
   optimizer:
     type: adam
     lr: 5e-7
