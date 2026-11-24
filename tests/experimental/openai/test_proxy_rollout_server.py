@@ -202,7 +202,9 @@ async def test_auxiliary_policy_checks_effective_session_tools(
     )
     if disable_default_tools:
         request["tools"] = []
-    await srv._call_client_create(create_fn, request, "task")
+    await srv._call_client_create(
+        create_fn, request, "task", responses_api=protocol == "responses"
+    )
     cache, effective_tools = observed[0]
     assert effective_tools == ([] if disable_default_tools else tools)
     assert (cache is session.completions) is not disable_default_tools
@@ -426,6 +428,113 @@ async def test_chat_auxiliary_policy_ignores_responses_only_session_instructions
         create, {"messages": [{"role": "user", "content": "Solve task"}]}, "task"
     )
     assert cache is session.completions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("default_prompt", ["Title", "Solve"])
+@pytest.mark.parametrize("request_prompt", ["Title", "Solve"])
+@pytest.mark.parametrize("use_input_system", [False, True])
+async def test_responses_http_ignores_chat_message_defaults(
+    monkeypatch, default_prompt, request_prompt, use_input_system
+):
+    """Only instructions consumed by Responses may select an auxiliary cache."""
+    from fastapi.responses import JSONResponse
+
+    session = SessionData(
+        session_id="task",
+        metadata={
+            "auxiliary_system_prompts": ["Title"],
+            "generation_args": {
+                "messages": [{"role": "system", "content": default_prompt}]
+            },
+        },
+    )
+    session.completions["previous"] = _prm_interaction("previous", [1], [2], [])
+    observed = []
+
+    async def create(input, areal_cache, instructions=None, temperature=1.0, top_p=1.0):
+        observed.append((input, instructions))
+        interaction = _prm_interaction("current", [3], [4], [])
+        interaction.reward = None
+        interaction.metadata["response_parse"] = {
+            "has_content": request_prompt != "Title",
+            "has_tool_calls": False,
+            "tool_call_parse_failed": False,
+        }
+        areal_cache["current"] = interaction
+        return JSONResponse({"id": "current"})
+
+    monkeypatch.setattr(
+        srv, "_openai_client", SimpleNamespace(responses=SimpleNamespace(create=create))
+    )
+    srv._session_cache["task"] = session
+    srv._api_key_to_session["task-key"] = "task"
+    headers = {"Authorization": "Bearer task-key"}
+    payload = (
+        {"input": [{"role": "system", "content": request_prompt}]}
+        if use_input_system
+        else {"instructions": request_prompt, "input": "task"}
+    )
+    async with _client() as client:
+        response = await client.post(
+            "/responses",
+            headers=headers,
+            json={"model": "test", **payload},
+        )
+        assert response.status_code == 200, response.text
+        rewarded = await client.post(
+            "/rl/set_reward", headers=headers, json={"reward": 1.0}
+        )
+    assert rewarded.status_code == 200
+    assert observed == [(payload["input"], payload.get("instructions"))]
+    exported = session.export_interactions(
+        discount=1.0, style="concat", episode_reward=1.0
+    )
+    auxiliary = request_prompt == "Title"
+    assert set(exported) == ({"previous"} if auxiliary else {"previous", "current"})
+    assert exported["previous" if auxiliary else "current"].reward == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowlist", [[], ["Title"]])
+async def test_responses_http_lazy_validation_records_system_error(
+    monkeypatch, allowlist
+):
+    """Validation before classification must preserve JSON errors and task flags."""
+    session = SessionData(
+        session_id="task", metadata={"auxiliary_system_prompts": allowlist}
+    )
+    calls = []
+
+    async def create(input, areal_cache, **kwargs):
+        calls.append(input)
+
+    monkeypatch.setattr(
+        srv, "_openai_client", SimpleNamespace(responses=SimpleNamespace(create=create))
+    )
+    srv._session_cache["task"] = session
+    srv._api_key_to_session["task-key"] = "task"
+    transport = httpx.ASGITransport(app=srv.app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/responses",
+            headers={"Authorization": "Bearer task-key"},
+            json={
+                "model": "test",
+                "instructions": "Title",
+                "input": "task",
+                "tools": [{"type": "function", "parameters": {"type": "object"}}],
+            },
+        )
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert "detail" in response.json()
+    assert session.system_error
+    assert "ValidationError" in session.system_error_message
+    assert calls == []
+    assert len(session.completions) == 0
 
 
 @pytest.mark.asyncio

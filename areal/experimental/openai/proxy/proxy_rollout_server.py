@@ -850,18 +850,18 @@ def _content_block_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def _auxiliary_system_prompt(kwargs: dict[str, Any]) -> str | None:
+def _auxiliary_system_prompt(
+    kwargs: dict[str, Any], *, responses_api: bool
+) -> str | None:
     """Recognize a sole leading instruction without hiding additional guidance."""
-    # Chat does not consume Responses-only session defaults, even when that
-    # unsupported field is still present before client-argument filtering.
-    instructions = (
-        kwargs.get("instructions") if kwargs.get("messages") is None else None
-    )
+    # Session defaults can include fields from the other API. Only inspect
+    # instructions consumed by the endpoint handling this request.
+    instructions = kwargs.get("instructions") if responses_api else None
     system_prompt = (
         instructions if isinstance(instructions, str) and instructions.strip() else None
     )
     prompts = [system_prompt] if system_prompt is not None else []
-    messages_key = "messages" if kwargs.get("messages") is not None else "input"
+    messages_key = "input" if responses_api else "messages"
     messages = kwargs.get(messages_key)
     if isinstance(messages, list):
         # Responses content can also be a lazily validated iterator. Retain its
@@ -999,6 +999,7 @@ async def _call_client_create(
     session_id: str,
     extra_ignored_args: list[str] | None = None,
     stream: bool = False,
+    responses_api: bool = False,
 ) -> ChatCompletion | Response | AsyncGenerator[ChatCompletionChunk, None]:
     """Common logic for chat completions and responses."""
     if _openai_client is None:
@@ -1051,21 +1052,29 @@ async def _call_client_create(
             kwargs.pop(key, None)
         kwargs.setdefault(key, value)
 
-    # FastAPI validates OpenAI Iterable fields lazily. An empty tools iterator
-    # is truthy; materialize it before classification and pass the same values
-    # to generation. Apply this after merging session defaults and overrides.
-    for key in ("tools", "messages", "input"):
-        value = kwargs.get(key)
-        if isinstance(value, Iterable) and not isinstance(value, (str, Mapping, list)):
-            kwargs[key] = list(value)
-    auxiliary_prompts = session_data.metadata.get("auxiliary_system_prompts", [])
-    system_prompt = _auxiliary_system_prompt(kwargs)
-    is_auxiliary = (
-        isinstance(auxiliary_prompts, list)
-        and isinstance(system_prompt, str)
-        and system_prompt in auxiliary_prompts
-        and not kwargs.get("tools")
-    )
+    try:
+        # FastAPI validates OpenAI Iterable fields lazily. An empty tools
+        # iterator is truthy; materialize it after merging defaults. Validation
+        # can fail here before a call can safely be classified as auxiliary.
+        for key in ("tools", "input" if responses_api else "messages"):
+            value = kwargs.get(key)
+            if isinstance(value, Iterable) and not isinstance(
+                value, (str, Mapping, list)
+            ):
+                kwargs[key] = list(value)
+        auxiliary_prompts = session_data.metadata.get("auxiliary_system_prompts", [])
+        system_prompt = _auxiliary_system_prompt(kwargs, responses_api=responses_api)
+        is_auxiliary = (
+            isinstance(auxiliary_prompts, list)
+            and isinstance(system_prompt, str)
+            and system_prompt in auxiliary_prompts
+            and not kwargs.get("tools")
+        )
+    except Exception as e:
+        message = f"{type(e).__name__}: {e}"
+        session_data.mark_system_error(message)
+        logger.exception("Failed to normalize proxy request for classification")
+        raise HTTPException(status_code=500, detail=message) from e
     if is_auxiliary:
         # Serve explicitly identified auxiliary calls without adding a reward
         # target or failure state to the task's training trajectory.
@@ -1454,6 +1463,7 @@ async def responses(
         create_fn=_openai_client.responses.create,
         request=request,
         session_id=session_id,
+        responses_api=True,
     )
 
 
