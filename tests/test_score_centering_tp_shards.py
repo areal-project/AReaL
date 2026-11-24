@@ -12,14 +12,14 @@ The cases run on CPU through gloo in two processes, no GPU and no Megatron
 import required.
 """
 
-import contextlib
-import socket
+from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from areal.utils.network import find_free_ports
 from areal.utils.score_centering import vocab_parallel_selected_logprobs
 
 pytestmark = pytest.mark.skipif(
@@ -30,10 +30,7 @@ pytestmark = pytest.mark.skipif(
 ROWS, VOCAB, K, CHUNK = 6, 32, 4, 4
 
 
-def _find_free_port() -> int:
-    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-        sock.bind(("localhost", 0))
-        return sock.getsockname()[1]
+_INIT_TIMEOUT = timedelta(seconds=60)
 
 
 def _dense_reference():
@@ -53,6 +50,7 @@ def _worker(rank: int, world_size: int, port: int, mode: str) -> None:
         init_method=f"tcp://localhost:{port}",
         rank=rank,
         world_size=world_size,
+        timeout=_INIT_TIMEOUT,
     )
     try:
         logits, ids, reference, entropy_reference = _dense_reference()
@@ -86,7 +84,7 @@ def _worker(rank: int, world_size: int, port: int, mode: str) -> None:
 
 
 def _run(mode: str) -> None:
-    port = _find_free_port()
+    port = find_free_ports(1)[0]
     mp.spawn(_worker, args=(2, port, mode), nprocs=2, join=True)
 
 
@@ -102,7 +100,7 @@ def test_vocab_parallel_gradient_is_not_scaled_by_tp_size_when_tp2():
 
 def test_vocab_parallel_rejects_ids_outside_the_shards_when_tp2():
     """Test that an id beyond the covered vocabulary is refused, not clamped."""
-    port = _find_free_port()
+    port = find_free_ports(1)[0]
     mp.spawn(_worker_reject, args=(2, port), nprocs=2, join=True)
 
 
@@ -112,6 +110,7 @@ def _worker_reject(rank: int, world_size: int, port: int) -> None:
         init_method=f"tcp://localhost:{port}",
         rank=rank,
         world_size=world_size,
+        timeout=_INIT_TIMEOUT,
     )
     try:
         logits, ids, _, _ = _dense_reference()
@@ -120,7 +119,7 @@ def _worker_reject(rank: int, world_size: int, port: int) -> None:
         bad_ids = ids.clone()
         bad_ids[0, 0] = VOCAB  # one past the last id
         # Every rank evaluates the same rows, so every rank must reject it.
-        with pytest.raises((RuntimeError, ValueError)):
+        with pytest.raises(RuntimeError, match="within the model vocabulary"):
             vocab_parallel_selected_logprobs(
                 local,
                 bad_ids,

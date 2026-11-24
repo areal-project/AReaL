@@ -103,6 +103,7 @@ class _StubEngine:
 
     _ensure_score_centering_supported = None  # filled in by the fixture
     _sc_diag_due = None
+    _compute_logprobs_and_loss = None
     _warn_sc_head_padding = None
     _warn_sc_head_mass = None
     _score_centering_logprobs = None
@@ -145,6 +146,7 @@ def engine_cls(monkeypatch):
         MegatronEngine._ensure_score_centering_supported
     )
     _StubEngine._sc_diag_due = MegatronEngine._sc_diag_due
+    _StubEngine._compute_logprobs_and_loss = MegatronEngine._compute_logprobs_and_loss
     _StubEngine._warn_sc_head_padding = MegatronEngine._warn_sc_head_padding
     _StubEngine._warn_sc_head_mass = MegatronEngine._warn_sc_head_mass
     _StubEngine._score_centering_logprobs = MegatronEngine._score_centering_logprobs
@@ -213,6 +215,66 @@ def test_engine_sc_prefers_context_parallel_local_heads(engine_cls, micro_batch)
     assert logprobs.shape == micro_batch["labels"].shape
 
 
+def test_engine_sc_cp_transforms_correction_and_metrics(engine_cls, monkeypatch):
+    """Test that the correction and its diagnostics share the CP row transform.
+
+    Both are per generated token and are logged against the global loss mask, so a
+    CP-local copy of either trips the stats-tracker shape check on the first step.
+    """
+    from areal.engine import megatron_engine as engine_module
+
+    transformed = []
+
+    def _record(value, *args, **kwargs):
+        transformed.append(value)
+        return value
+
+    monkeypatch.setattr(engine_module, "_cp_unpad_token_tensor", _record)
+    monkeypatch.setattr(
+        engine_module, "reassemble_cp_packed_logprobs", lambda value, cu: value
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "unpad_logits",
+        lambda value, padding_length, cu=None, old=None: value,
+    )
+
+    engine = engine_cls(vocab_size=8)
+    rows = 3
+    logits = torch.randn(rows, 8, dtype=torch.float64)
+    labels = torch.tensor([1, 2, 3])
+    heads = torch.tensor([[1, 2], [2, 3], [3, 4]])
+    sampler = torch.tensor([[0.5, 0.3], [0.4, 0.3], [0.45, 0.35]]).log()
+    captured = {}
+
+    def loss_fn(logprobs, entropy, inputs, **kwargs):
+        captured.update(kwargs)
+        return logprobs.sum() * 0.0
+
+    engine._compute_logprobs_and_loss(
+        logits,
+        {
+            "input_ids": torch.arange(rows)[None],
+            "loss_mask": torch.ones(rows),
+            "_cp_local_labels": labels,
+            "_cp_local_sampler_head_ids": heads,
+            "_cp_local_sampler_head_logprobs": sampler,
+            "_cp_padded_cu_seqlens": torch.tensor([0, rows], dtype=torch.int32),
+            "_cp_padding_length": 0,
+            "_cp_old_cu_seqlens": torch.tensor([0, rows], dtype=torch.int32),
+        },
+        loss_fn,
+        lambda inputs: torch.tensor(1.0),
+        torch.tensor(1.0),
+    )
+
+    correction = captured["sc_correction"]
+    metrics = captured["sc_metrics"]
+    assert any(value is correction for value in transformed)
+    for metric_value in metrics.values():
+        assert any(value is metric_value for value in transformed), metric_value.shape
+
+
 def test_engine_sc_missing_sampler_heads_rejected(engine_cls, micro_batch):
     """Test that a micro-batch without sampler heads raises a clear error."""
     engine = engine_cls()
@@ -252,27 +314,26 @@ def test_engine_sc_temperature_not_one_rejected(engine_cls, micro_batch):
         )
 
 
-@pytest.mark.parametrize("kw", [dict(mtp=True), dict(chunked=True), dict(tree=True)])
-def test_engine_sc_unsupported_modes_rejected(engine_cls, kw):
+@pytest.mark.parametrize(
+    "kw,message",
+    [
+        (dict(mtp=True), "MTP"),
+        (dict(chunked=True), "chunked_logits"),
+        (dict(tree=True), "tree training"),
+    ],
+)
+def test_engine_sc_unsupported_modes_rejected(engine_cls, kw, message):
     """Test that MTP, chunked logits and tree training are refused by the engine."""
     engine = engine_cls(**kw)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=message):
         engine._ensure_score_centering_supported()
 
 
-def test_engine_sc_accepts_every_parallel_axis(engine_cls, micro_batch, monkeypatch):
-    """Test that pp/tp/cp sizes are accepted by the engine guard."""
-    from megatron.core import parallel_state as mpu
+def test_engine_sc_guard_accepts_plain_actor_when_modes_supported(engine_cls):
+    """Test that the mode guard accepts an actor without the rejected modes."""
+    engine = engine_cls()
 
-    monkeypatch.setattr(mpu, "get_pipeline_model_parallel_world_size", lambda: 4)
-    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 2)
-    monkeypatch.setattr(mpu, "get_tensor_model_parallel_world_size", lambda: 8)
-    monkeypatch.setattr(mpu, "get_tensor_model_parallel_group", lambda: object())
-    engine = engine_cls(vocab_size=micro_batch["logits"].shape[-1] * 8)
-
-    # tp>1 needs a real process group for the shard reduction, so only the mode
-    # guard and the shard-coverage check are exercised here.
     engine._ensure_score_centering_supported()
 
     assert engine._sc_support_checked is True
@@ -311,14 +372,16 @@ def test_engine_sc_low_head_mass_warns_once(engine_cls):
 
 
 def test_engine_sc_diagnostics_sample_instead_of_syncing_every_step(engine_cls):
-    """Test that the sync-heavy head diagnostics run on a sampled schedule."""
+    """Test that the sync-heavy head diagnostics fire once per configured interval."""
+    from areal.engine.megatron_engine import _SC_DIAG_INTERVAL
+
     engine = engine_cls()
 
-    first = engine._sc_diag_due()
-    sampled = [engine._sc_diag_due() for _ in range(9)]
+    due = [engine._sc_diag_due() for _ in range(_SC_DIAG_INTERVAL + 1)]
 
-    assert first is True
-    assert not any(sampled)
+    assert due[0] is True
+    assert not any(due[1:_SC_DIAG_INTERVAL])
+    assert due[_SC_DIAG_INTERVAL] is True
 
 
 def test_engine_sc_full_head_mass_does_not_warn(engine_cls):
@@ -339,15 +402,11 @@ def test_engine_sc_guard_caches_success_only(engine_cls):
     second = ok._sc_support_checked is True
 
     bad = engine_cls(chunked=True)
-    raised = False
-    try:
+    with pytest.raises(ValueError, match="chunked_logits"):
         bad._ensure_score_centering_supported()
-    except ValueError:
-        raised = True
-    cached_after_failure = getattr(bad, "_sc_support_checked", False)
 
     assert first and second
-    assert raised and cached_after_failure is False
+    assert getattr(bad, "_sc_support_checked", False) is False
 
 
 def test_engine_sc_correction_matches_hand_computed_residual(engine_cls):

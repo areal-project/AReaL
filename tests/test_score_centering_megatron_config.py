@@ -67,25 +67,34 @@ def test_sc_rejects_chunked_logits_when_megatron_backend():
         )
 
 
+def test_sc_rejects_unsupported_backend_when_enabled():
+    """Test that a backend without sampler heads is rejected."""
+    with pytest.raises(ValueError, match="supports fsdp"):
+        _actor_config(backend="archon:d2p1t1", use_score_centering=True)
+
+
+def test_sc_rejects_tree_training_when_enabled():
+    """Test that tree training is rejected: its logits lack one row per token."""
+    with pytest.raises(ValueError, match="tree training"):
+        _actor_config(
+            backend="megatron:d2p1t1",
+            use_score_centering=True,
+            enable_tree_training=True,
+        )
+
+
 def test_sc_rejects_critic_when_enabled():
     """Test that a critic actor is rejected: SC scores sampler heads only."""
-    with pytest.raises(ValueError, match="actor"):
+    with pytest.raises(ValueError, match="requires an actor"):
         _actor_config(
             backend="megatron:d2p1t1", use_score_centering=True, is_critic=True
         )
 
 
-def test_sc_accepts_pipeline_parallel_when_disabled():
-    """Test that PP configs without SC are untouched by the new validation."""
-    config = _actor_config(backend="megatron:d2p2t2", use_score_centering=False)
-
-    assert config.use_score_centering is False
-
-
-def test_sc_guard_ignores_mtp_when_disabled():
-    """Test that MTP is only rejected while SC is enabled."""
+def test_sc_ignores_unsupported_modes_when_disabled():
+    """Test that MTP and PP configs without SC skip the new validation entirely."""
     config = _actor_config(
-        backend="megatron:d2p1t1",
+        backend="megatron:d2p2t2",
         use_score_centering=False,
         megatron=MegatronEngineConfig(
             bridge_type="megatron-bridge", enable_mtp_training=True
@@ -93,3 +102,4 @@ def test_sc_guard_ignores_mtp_when_disabled():
     )
 
     assert config.use_score_centering is False
+    assert config.megatron.enable_mtp_training is True

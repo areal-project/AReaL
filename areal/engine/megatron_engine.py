@@ -191,6 +191,25 @@ _SC_MIN_SAMPLER_HEAD_MASS = 0.9
 _SC_DIAG_INTERVAL = 100
 
 
+def _cp_unpad_token_tensor(
+    value: torch.Tensor,
+    padded_cu_seqlens: torch.Tensor,
+    padding_length: int,
+    old_cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    """Gather CP-local token rows and unpad them back to the global row order.
+
+    Per-token tensors consumed by the loss (log-probs, the SC correction and its
+    diagnostics) all live on the same row axis, so they must share one transform.
+    """
+    return unpad_logits(
+        reassemble_cp_packed_logprobs(value, padded_cu_seqlens),
+        padding_length,
+        padded_cu_seqlens,
+        old_cu_seqlens,
+    )
+
+
 def _normalize_glu_param_name(name: str) -> str:
     name = _LAYER_IDX_RE.sub(".layers.", name)
     name = _EXPERT_NUM_RE.sub(r".\1", name)
@@ -1659,8 +1678,6 @@ class MegatronEngine(TrainEngine):
                         "loss_mask",
                     ):
                         value = mb_input.padded_mb.get(key)
-                        if value is None:
-                            value = cp_inputs.get(key)
                         if value is not None:
                             cp_inputs[f"_cp_local_{key}"] = (
                                 split_packed_seqs_for_context_parallel(
@@ -3687,6 +3704,11 @@ class MegatronEngine(TrainEngine):
                 "Tree training with critic model is not supported yet."
             )
         if not self.config.is_critic:
+            if getattr(self.config, "use_score_centering", False):
+                # Check the modes here, not only inside the scoring helper: the
+                # tree and chunked-output branches never reach that helper, so the
+                # failure would surface later as a generic "no sc_correction".
+                self._ensure_score_centering_supported()
             # Score centering injects its correction into the loss callback.
             sc_kwargs: dict[str, Any] = {}
             if self.enable_tree_training:
@@ -3832,14 +3854,25 @@ class MegatronEngine(TrainEngine):
                     # otherwise it cannot broadcast against the unpadded rows
                     # ("size of tensor a (1930) must match ... (2048)").
                     if sc_kwargs.get("sc_correction") is not None:
-                        sc_kwargs["sc_correction"] = unpad_logits(
-                            reassemble_cp_packed_logprobs(
-                                sc_kwargs["sc_correction"], cp_padded_cu_seqlens
-                            ),
-                            cp_padding_length,
+                        sc_kwargs["sc_correction"] = _cp_unpad_token_tensor(
+                            sc_kwargs["sc_correction"],
                             cp_padded_cu_seqlens,
+                            cp_padding_length,
                             cp_old_cu_seqlens,
                         )
+                        # The diagnostics are per generated token as well and are
+                        # logged against the *global* loss mask, so they need the
+                        # identical transform; leaving them CP-local trips the
+                        # stats-tracker shape check on the first step.
+                        metrics = sc_kwargs.get("sc_metrics")
+                        if metrics:
+                            for metric_key, metric_value in metrics.items():
+                                metrics[metric_key] = _cp_unpad_token_tensor(
+                                    metric_value,
+                                    cp_padded_cu_seqlens,
+                                    cp_padding_length,
+                                    cp_old_cu_seqlens,
+                                )
                     inputs = {
                         k: v for k, v in inputs.items() if not k.startswith("_cp_")
                     }
@@ -3903,7 +3936,7 @@ class MegatronEngine(TrainEngine):
 
         Both diagnostics reduce a tensor to a Python scalar, which forces a
         device-to-host sync. Sampling them keeps the steady-state step free of
-        syncs while still inspecting the first step of a run.
+        syncs while still inspecting the first micro-batch of a run.
         """
         calls = getattr(self, "_sc_diag_calls", 0)
         self._sc_diag_calls = calls + 1
@@ -4029,8 +4062,18 @@ class MegatronEngine(TrainEngine):
         if diagnose:
             self._warn_sc_head_padding(q, loss_mask)
         tp_size = mpu.get_tensor_model_parallel_world_size()
-        vocab_size = int(getattr(self.hf_config, "vocab_size", 0)) or None
-        if tp_size > 1 and vocab_size is not None:
+        # VLMs nest the language attributes under ``text_config``; lang_config()
+        # unwraps that, so a Qwen3-VL actor reports the same vocabulary as a text
+        # model and does not silently fall back to a single shard.
+        vocab_size = int(getattr(lang_config(self.hf_config), "vocab_size", 0)) or None
+        if tp_size > 1:
+            if vocab_size is None:
+                raise ValueError(
+                    "Score centering cannot score the sampler heads: the model "
+                    "config exposes no vocab_size, so the tensor-parallel shards "
+                    "cannot be checked. Set actor.path to a config with vocab_size "
+                    "or disable use_score_centering."
+                )
             # Vocabulary shards must cover the sampler's id space; a narrower
             # shard means the local width and the head ids disagree (e.g. a
             # padded/trimmed embedding), which would silently mis-score heads.

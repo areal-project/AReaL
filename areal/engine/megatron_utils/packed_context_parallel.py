@@ -113,6 +113,13 @@ def split_packed_seqs_for_context_parallel(
     if cp_size <= 1:
         return tensor
 
+    if int(tensor.shape[0]) != int(cu_seqlens[-1].item()):
+        raise ValueError(
+            "Packed tensor rows do not match cu_seqlens: got "
+            f"{int(tensor.shape[0])} rows for {int(cu_seqlens[-1].item())} tokens. "
+            "This usually means an unpadded tensor was handed to the padded CP layout."
+        )
+
     input_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     batch_size = input_lens.shape[0]
     output_len = input_lens.sum().item() // cp_size
