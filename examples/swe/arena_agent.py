@@ -873,8 +873,10 @@ class ArenaStreamAgentWorkflow:
             and raw.get("failure") is None
         )
 
-    @staticmethod
-    def _core_terminal_failure_error(receipt: dict[str, Any]) -> dict[str, Any] | None:
+    @classmethod
+    def _core_terminal_failure_error(
+        cls, receipt: dict[str, Any]
+    ) -> dict[str, Any] | None:
         """Validate a completed prefix followed by one failed Core turn."""
         turns = receipt.get("turn_statuses")
         errors = receipt.get("error")
@@ -897,7 +899,15 @@ class ArenaStreamAgentWorkflow:
                 return None
         delivery = receipt.get("delivery")
         if not multiple_turns:
-            if delivery is not None:
+            # Observational runners can report their configured policy without
+            # performing a delivery. Do not accept execution results or failures.
+            if delivery is not None and (
+                not isinstance(delivery, dict)
+                or set(delivery) != {"policy", "independent_blender_reopen"}
+                or delivery["policy"] != "observation_only"
+                or delivery["independent_blender_reopen"] is not False
+                or cls._has_harness_receipt_system_failure(receipt)
+            ):
                 return None
         elif (
             "delivery" not in receipt

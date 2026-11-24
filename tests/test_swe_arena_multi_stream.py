@@ -1013,6 +1013,122 @@ def test_core_model_failure_with_matching_native_receipt_keeps_zero(
 
 
 @pytest.mark.parametrize(
+    "code,reason,message",
+    [
+        (
+            "LLM_RESPONSE_FAILED",
+            "empty_completion",
+            "model stopped without visible output or tool calls",
+        ),
+        (
+            "LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED",
+            "provider_length_stop",
+            "model stopped with reason: length",
+        ),
+    ],
+)
+def test_core_single_turn_observation_policy_preserves_model_zero(
+    code, reason, message
+):
+    """Policy metadata from an observational runner is not a delivery result."""
+    error = _core_model_failure_error(code, reason, message)
+    error.harness_result["continuations"] = 0
+    error.harness_result["delivery"] = {
+        "policy": "observation_only",
+        "independent_blender_reopen": False,
+    }
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=0
+        )
+        == "unknown_failure_reject"
+    )
+    if reason == "empty_completion":
+        assert (
+            ArenaStreamAgentWorkflow._harness_failure_reason(error)
+            == "empty_completion"
+        )
+
+
+@pytest.mark.parametrize(
+    "delivery",
+    [
+        {"policy": "observation_only", "independent_blender_reopen": True},
+        {"policy": "observation_only", "independent_blender_reopen": "false"},
+        {"policy": "observation_only", "independent_blender_reopen": 0},
+        {"policy": "observation_only"},
+        {"policy": "required", "independent_blender_reopen": False},
+        {
+            "policy": "observation_only",
+            "independent_blender_reopen": False,
+            "status": "incomplete",
+        },
+        {
+            "policy": "observation_only",
+            "independent_blender_reopen": False,
+            "status": "ERROR",
+        },
+    ],
+)
+def test_core_single_turn_policy_rejects_execution_results_and_unknown_shapes(
+    delivery,
+):
+    """A policy label cannot hide delivery work or loosely typed metadata."""
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "model stopped without visible output or tool calls",
+    )
+    error.harness_result["delivery"] = delivery
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure_field,value",
+    [
+        ("failure", {"code": "collection_failed"}),
+        ("observed_runner_timeout", True),
+        ("observed_external_interruption", True),
+        ("collection", {"status": "ERROR"}),
+    ],
+)
+def test_core_observation_policy_does_not_hide_runner_or_collection_failure(
+    failure_field, value
+):
+    """Even a matching model error is unscored when its runner is unhealthy."""
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "model stopped without visible output or tool calls",
+    )
+    error.harness_result["delivery"] = {
+        "policy": "observation_only",
+        "independent_blender_reopen": False,
+    }
+    error.harness_result[failure_field] = value
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
         "missing_receipt",
