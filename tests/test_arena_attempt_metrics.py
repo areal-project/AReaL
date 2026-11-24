@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from omegaconf import OmegaConf
 
 from examples.swe.arena_agent import ArenaStreamAgentWorkflow
 from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
+from examples.swe.utils import SWEPPOConfig
 from tests.test_swe_arena_abbreviated_receipt import _error as _runner_failure_error
 from tests.test_swe_arena_multi_stream import (
     _core_model_failure_error,
@@ -57,6 +59,35 @@ def test_auxiliary_request_policy_is_explicit_and_copied(workflow):
     assert metadata["auxiliary_system_prompts"] == prompts
     metadata["auxiliary_system_prompts"].clear()
     assert prompts == ["Generate a session title."]
+
+
+@pytest.mark.parametrize("prompts", [None, ["Title"]])
+def test_auxiliary_policy_loads_through_training_yaml(
+    tmp_path, monkeypatch, workflow, prompts
+):
+    from areal.api import cli_args
+    from areal.utils.stats_logger import StatsLogger
+
+    cfg = OmegaConf.structured(SWEPPOConfig)
+    for key in OmegaConf.missing_keys(cfg):
+        OmegaConf.update(cfg, key, "test")
+    data = OmegaConf.to_container(cfg, resolve=True)
+    data["econfig"].pop("arena_auxiliary_system_prompts", None)
+    if prompts is not None:
+        data["econfig"]["arena_auxiliary_system_prompts"] = prompts
+    path = tmp_path / "experiment.yaml"
+    OmegaConf.save(OmegaConf.create(data), path)
+    monkeypatch.setattr(cli_args.name_resolve, "reconfigure", lambda config: None)
+    monkeypatch.setattr(cli_args, "save_config", lambda config, path: None)
+    monkeypatch.setattr(
+        StatsLogger, "get_log_path", staticmethod(lambda config: str(tmp_path))
+    )
+
+    loaded, _ = cli_args.load_expr_config(["--config", str(path)], SWEPPOConfig)
+    assert loaded.econfig.arena_auxiliary_system_prompts == (prompts or [])
+    workflow.econfig = asdict(loaded.econfig)
+    metadata = workflow.get_session_metadata({})
+    assert metadata.get("auxiliary_system_prompts", []) == (prompts or [])
 
 
 @pytest.mark.parametrize("prompts", ["Title request", [""], [123]])

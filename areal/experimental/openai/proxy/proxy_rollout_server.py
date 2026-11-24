@@ -996,15 +996,39 @@ async def _call_client_create(
     )
 
     kwargs = request.model_dump() if isinstance(request, BaseModel) else dict(request)
+    token_limits = {"max_tokens", "max_completion_tokens"}
+    explicit_fields = (
+        request.model_fields_set if isinstance(request, BaseModel) else set(request)
+    )
+    for key, value in session_data.generation_args.items():
+        if key in token_limits:
+            if token_limits & explicit_fields:
+                continue
+            for limit in token_limits:
+                kwargs.pop(limit, None)
+        if isinstance(request, BaseModel) and key not in request.model_fields_set:
+            kwargs.pop(key, None)
+        kwargs.setdefault(key, value)
+
     auxiliary_prompts = session_data.metadata.get("auxiliary_system_prompts", [])
-    request_messages = kwargs.get("messages") or []
+    request_messages = kwargs.get("messages")
+    system_prompt = None
+    if request_messages is None:
+        # Responses uses instructions or a leading system message in input.
+        system_prompt = kwargs.get("instructions")
+        request_messages = kwargs.get("input")
+    if (
+        system_prompt is None
+        and isinstance(request_messages, list)
+        and request_messages
+    ):
+        first_message = request_messages[0]
+        if isinstance(first_message, Mapping) and first_message.get("role") == "system":
+            system_prompt = _content_block_text(first_message.get("content"))
     is_auxiliary = (
         isinstance(auxiliary_prompts, list)
-        and isinstance(request_messages, list)
-        and bool(request_messages)
-        and isinstance(request_messages[0], Mapping)
-        and request_messages[0].get("role") == "system"
-        and _content_block_text(request_messages[0].get("content")) in auxiliary_prompts
+        and isinstance(system_prompt, str)
+        and system_prompt in auxiliary_prompts
         and not kwargs.get("tools")
     )
     if is_auxiliary:
@@ -1021,19 +1045,6 @@ async def _call_client_create(
         logger.info(
             "Serving auxiliary request outside training cache: session=%s", session_id
         )
-    token_limits = {"max_tokens", "max_completion_tokens"}
-    explicit_fields = (
-        request.model_fields_set if isinstance(request, BaseModel) else set(request)
-    )
-    for key, value in session_data.generation_args.items():
-        if key in token_limits:
-            if token_limits & explicit_fields:
-                continue
-            for limit in token_limits:
-                kwargs.pop(limit, None)
-        if isinstance(request, BaseModel) and key not in request.model_fields_set:
-            kwargs.pop(key, None)
-        kwargs.setdefault(key, value)
 
     messages = kwargs.get("messages")
     if messages is not None:

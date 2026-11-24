@@ -121,6 +121,93 @@ async def test_auxiliary_failure_is_isolated_only_for_tool_free_matching_request
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exclude_auxiliary", [False, True])
+@pytest.mark.parametrize("title_shape", ["instructions", "input_system"])
+async def test_responses_auxiliary_title_preserves_task_reward(
+    monkeypatch, exclude_auxiliary, title_shape
+):
+    metadata = {"auxiliary_system_prompts": ["Title"]} if exclude_auxiliary else {}
+    session = SessionData(session_id="task", metadata=metadata)
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+
+    async def create_fn(input, areal_cache, instructions=None, **kwargs):
+        is_title = instructions == "Title" or isinstance(input, list)
+        key = "title" if is_title else "solve"
+        messages = [{"role": "user", "content": "request"}]
+        interaction = _prm_interaction(key, [1], [2], messages)
+        interaction.reward = None
+        interaction.metadata["response_parse"] = {
+            "tool_call_parse_failed": False,
+            "has_content": not is_title,
+            "has_tool_calls": False,
+        }
+        areal_cache[key] = interaction
+        return key
+
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(responses=SimpleNamespace(create=create_fn)),
+    )
+    assert await srv.responses({"input": "Write verifier.py"}, "task") == "solve"
+    title_request = (
+        {"instructions": "Title", "input": "Summarize"}
+        if title_shape == "instructions"
+        else {
+            "input": [
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "Title"}],
+                }
+            ]
+        }
+    )
+    assert await srv.responses(title_request, "task") == "title"
+    session.completions.set_reward("solve" if exclude_auxiliary else "title", 1.0)
+    exported = session.export_interactions(
+        discount=1.0, style="concat", episode_reward=1.0
+    )
+    assert set(exported) == ({"solve"} if exclude_auxiliary else {"solve", "title"})
+    assert exported["solve"].reward == (1.0 if exclude_auxiliary else 0.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["chat", "responses"])
+@pytest.mark.parametrize("disable_default_tools", [False, True])
+async def test_auxiliary_policy_checks_effective_session_tools(
+    monkeypatch, protocol, disable_default_tools
+):
+    tools = [{"type": "function", "function": {"name": "solve"}}]
+    session = SessionData(
+        session_id="task",
+        metadata={
+            "auxiliary_system_prompts": ["Title"],
+            "generation_args": {"tools": tools},
+        },
+    )
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+    observed = []
+
+    async def create_fn(
+        areal_cache, messages=None, instructions=None, tools=None, **kwargs
+    ):
+        observed.append((areal_cache, tools))
+
+    request = (
+        {"messages": [{"role": "system", "content": "Title"}]}
+        if protocol == "chat"
+        else {"instructions": "Title", "input": "Summarize"}
+    )
+    if disable_default_tools:
+        request["tools"] = []
+    await srv._call_client_create(create_fn, request, "task")
+    cache, effective_tools = observed[0]
+    assert effective_tools == ([] if disable_default_tools else tools)
+    assert (cache is session.completions) is not disable_default_tools
+
+
+@pytest.mark.asyncio
 async def test_auxiliary_invalid_tool_call_does_not_poison_task_session(monkeypatch):
     session = SessionData(
         session_id="task", metadata={"auxiliary_system_prompts": ["Title request"]}
