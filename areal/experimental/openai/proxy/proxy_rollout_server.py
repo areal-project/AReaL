@@ -6,19 +6,21 @@ import argparse
 import asyncio
 import hmac
 import inspect
+import json
 import os
 import secrets
 import threading
 import time
+import uuid
 from collections.abc import AsyncGenerator
-from functools import cache
+from functools import cache, partial
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from anthropic.types.message import Message
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses import Response
@@ -29,7 +31,7 @@ from areal.api.cli_args import NameResolveConfig
 from areal.experimental.openai.chat_template_patches import (
     apply_keep_all_reasoning_patches,
 )
-from areal.experimental.openai.client import ArealOpenAI
+from areal.experimental.openai.client import ArealOpenAI, ContextLengthExceededError
 from areal.infra.processor_cache import ProcessorCacheRegistry
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
@@ -102,6 +104,8 @@ def _warn_once(msg: str) -> None:
 # Engine and client (created via /create_engine and /call with method "initialize")
 _engine: InferenceEngine | None = None
 _openai_client: ArealOpenAI | None = None
+_resume_streams: asyncio.Event | None = None
+_STREAM_HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 # Session management
 _session_cache: dict[str, SessionData] = {}
@@ -233,6 +237,28 @@ def _remove_api_keys_for_session(session_id: str) -> None:
 # =============================================================================
 
 app = FastAPI()
+
+
+def _context_length_error_body(exc: ContextLengthExceededError) -> dict:
+    return {
+        "error": {
+            "message": str(exc),
+            "type": "invalid_request_error",
+            "param": "messages",
+            "code": "context_length_exceeded",
+            "prompt_tokens": exc.prompt_tokens,
+            "max_tokens": exc.max_tokens,
+        }
+    }
+
+
+@app.exception_handler(ContextLengthExceededError)
+async def context_length_error(
+    request: Request, exc: ContextLengthExceededError
+) -> JSONResponse:
+    """Expose context exhaustion as an OpenAI input error, without prompt content."""
+    logger.warning(str(exc))
+    return JSONResponse(status_code=400, content=_context_length_error_body(exc))
 
 
 @app.get("/health")
@@ -375,7 +401,7 @@ async def create_engine(raw_request: Request):
 
 @app.post("/call")
 async def call_engine_method(raw_request: Request):
-    global _engine, _openai_client
+    global _openai_client, _resume_streams
     if _engine is None:
         raise HTTPException(status_code=400, detail="Engine not initialized")
 
@@ -388,7 +414,6 @@ async def call_engine_method(raw_request: Request):
     result = method(*args, **kwargs)
 
     if method_name == "initialize":
-        global _openai_client
         # The processor only exists once the client is built, which is after
         # the engine reports healthy -- so this is the first point where the
         # contract can be checked. Publish the client only once the canary has
@@ -397,6 +422,11 @@ async def call_engine_method(raw_request: Request):
         client = _setup_openai_client()
         await _run_multimodal_canary(client)
         _openai_client = client
+    elif method_name == "pause" and _resume_streams is None:
+        _resume_streams = asyncio.Event()
+    elif method_name == "resume" and _resume_streams is not None:
+        _resume_streams.set()
+        _resume_streams = None
 
     return {"status": "success", "result": serialize_value(result)}
 
@@ -650,6 +680,7 @@ async def _call_client_create(
     session_id: str,
     extra_ignored_args: list[str] | None = None,
     stream: bool = False,
+    expected_session: SessionData | None = None,
 ) -> ChatCompletion | Response | AsyncGenerator[ChatCompletionChunk, None]:
     """Common logic for chat completions and responses."""
     if _openai_client is None:
@@ -659,11 +690,14 @@ async def _call_client_create(
         )
 
     with _lock:
-        if session_id not in _session_cache:
+        session_data = _session_cache.get(session_id)
+        if session_data is None or (
+            expected_session is not None
+            and (session_data is not expected_session or session_data.is_completed)
+        ):
             raise HTTPException(
                 status_code=410, detail=f"Session {session_id} already ended or expired"
             )
-        session_data = _session_cache[session_id]
 
     session_data.update_last_access()
 
@@ -673,7 +707,7 @@ async def _call_client_create(
         for parameter in sig.parameters.values()
     )
     areal_client_ignored_args = ["model"] + (extra_ignored_args or [])
-    areal_client_disallowed_args = ["areal_cache", "processor_cache"]
+    areal_client_disallowed_args = ["areal_cache", "processor_cache", "_completion_id"]
     areal_client_allowed_args = list(
         k
         for k in sig.parameters.keys()
@@ -731,10 +765,91 @@ async def _call_client_create(
         if supports_processor_cache:
             client_kwargs["processor_cache"] = session_data.processor_cache
         return await create_fn(**client_kwargs)
+    except ContextLengthExceededError:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+def _openai_streaming_response(stream: AsyncGenerator[str, None]) -> StreamingResponse:
+    return StreamingResponse(
+        _safe_stream_wrapper(stream),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _deferred_openai_sse_stream(
+    request: CompletionCreateParams, session: SessionData
+) -> AsyncGenerator[str, None]:
+    """Keep a paused request connected until generation can start."""
+    stream_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+    model = request.get("model") or ""
+    prelude = {
+        "id": stream_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None,
+            }
+        ],
+    }
+    yield f"data: {json.dumps(prelude)}\n\n"
+
+    async def create_when_resumed():
+        # A second pause can arrive before a woken request gets to run.
+        while _resume_streams is not None:
+            await _resume_streams.wait()
+        try:
+            return await _call_client_create(
+                partial(
+                    _openai_client.chat.completions.create, _completion_id=stream_id
+                ),
+                request,
+                session.session_id,
+                stream=True,
+                expected_session=session,
+            )
+        finally:
+            # create() caches the prompt before awaiting inference.
+            interaction = session.completions.get(stream_id)
+            if interaction is not None and interaction.completion is None:
+                session.completions.pop(stream_id)
+
+    create_task = asyncio.create_task(create_when_resumed())
+    try:
+        while not create_task.done():
+            done, _ = await asyncio.wait(
+                [create_task], timeout=_STREAM_HEARTBEAT_INTERVAL_SECONDS
+            )
+            if not done:
+                yield ": ping\n\n"
+
+        async for chunk in create_task.result():
+            chunk = chunk.model_copy(update={"model": model})
+            yield f"data: {chunk.model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+    except ContextLengthExceededError as exc:
+        yield f"data: {json.dumps(_context_length_error_body(exc))}\n\n"
+    except Exception:
+        logger.exception("Paused chat stream failed")
+        yield 'data: {"error":{"type":"server_error","message":"Stream generation failed"}}\n\n'
+    finally:
+        # A disconnect can race with create() returning its chunk generator.
+        create_task.cancel()
+        (stream,) = await asyncio.gather(create_task, return_exceptions=True)
+        if not isinstance(stream, BaseException):
+            await stream.aclose()
 
 
 @app.post(
@@ -761,6 +876,17 @@ async def chat_completions(
     is_streaming = request.get("stream") is True
 
     if is_streaming:
+        if _resume_streams is not None:
+            with _lock:
+                session = _session_cache.get(session_id)
+            if session is None:
+                raise HTTPException(
+                    status_code=410, detail="Session already ended or expired"
+                )
+            return _openai_streaming_response(
+                _deferred_openai_sse_stream(request, session)
+            )
+
         openai_stream = None
         try:
             openai_stream = await _call_client_create(
@@ -778,17 +904,9 @@ async def chat_completions(
                     yield f"data: {chunk.model_dump_json()}\n\n"
                 yield "data: [DONE]\n\n"
 
-            safe_stream = _safe_stream_wrapper(_openai_sse_generator(openai_stream))
-
-            return StreamingResponse(
-                safe_stream,
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
+            return _openai_streaming_response(_openai_sse_generator(openai_stream))
+        except ContextLengthExceededError:
+            raise
         except Exception as e:
             if openai_stream is not None and hasattr(openai_stream, "aclose"):
                 await openai_stream.aclose()
@@ -974,6 +1092,8 @@ async def anthropic_messages(
                     "X-Accel-Buffering": "no",
                 },
             )
+        except ContextLengthExceededError:
+            raise
         except Exception as e:
             # Clean up stream on error during setup
             if openai_stream is not None and hasattr(openai_stream, "aclose"):
