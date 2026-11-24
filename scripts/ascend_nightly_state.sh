@@ -48,17 +48,31 @@ case "$mode" in
                 args+=(--baseline-snapshot "$RUNNER_TEMP/$suite-baseline.json")
             fi
             python scripts/ascend_nightly_grpo_report.py --suite "$suite" --snapshot "$snapshot" \
-                --output "nightly-reports/$suite.md" --summary-output "$RUNNER_TEMP/$suite-summary.md" "${args[@]}"
-            cat "$RUNNER_TEMP/$suite-summary.md" >> "$GITHUB_STEP_SUMMARY"
-            echo >> "$GITHUB_STEP_SUMMARY"
-            mkdir -p "$state/$suite"
-            cp "$snapshot" "$state/$suite/metrics.json"
-            git -C "$state" add "$suite/metrics.json"
+                --output "nightly-reports/$suite.md" "${args[@]}"
+            mkdir -p "$state/charts/$suite"
+            cp nightly-reports/"$suite"/*.png "$state/charts/$suite/"
+            git -C "$state" add -f "charts/$suite"
+            if [[ $(cat "$state/last-attempt") == "$(git rev-parse HEAD)" ]]; then
+                mkdir -p "$state/$suite"
+                cp "$snapshot" "$state/$suite/metrics.json"
+                git -C "$state" add "$suite/metrics.json"
+            fi
         done
-        if [[ $(cat "$state/last-attempt") == "$(git rev-parse HEAD)" ]] && ! git -C "$state" diff --cached --quiet; then
+        if ! git -C "$state" diff --cached --quiet; then
             git -C "$state" commit -qm "Save nightly metrics for $(git rev-parse --short HEAD)"
             git -C "$state" push origin "HEAD:refs/heads/$branch"
         fi
+        # Pin images so future runs cannot change an earlier summary.
+        revision=$(git -C "$state" rev-parse HEAD)
+        for suite in grpo sft; do
+            report="nightly-reports/$suite.md"
+            [[ -f "$report" ]] || continue
+            prefix="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$revision/charts/$suite"
+            sed -E -e '/^!\[Other timings\]/i <details><summary>Other timing charts</summary>\n' \
+                -e '/^!\[Other timings\]/a \n</details>' \
+                -e "s|^!\[(.*)\]\($suite/([a-z-]+[.]png)\)$|<img src=\"$prefix/\2\" alt=\"\1\" width=\"780\">|" "$report" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+        done
         ;;
     *) exit 2 ;;
 esac

@@ -123,12 +123,11 @@ def plot(runs: dict[str, list[Step]], keys: list[str], path: Path) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
-    styles = {"Current": ("#006c79", "-"), "Baseline": ("#92591d", "--")}
+    styles = {"Current": ("#0057B8", "-"), "Baseline": ("#AD4600", "--")}
+    columns = 4 if len(keys) == 4 else min(3, len(keys))
+    rows = (len(keys) + columns - 1) // columns
     fig, axes = plt.subplots(
-        (len(keys) + 1) // 2,
-        2,
-        squeeze=False,
-        figsize=(11, 2.65 * ((len(keys) + 1) // 2) + 0.6),
+        rows, columns, squeeze=False, figsize=(10, 1.65 * rows + 0.5)
     )
     ends = [s.number for s in runs["Current"] if s.epoch_end]
     for ax, key in zip(axes.flat, keys):
@@ -146,13 +145,13 @@ def plot(runs: dict[str, list[Step]], keys: list[str], path: Path) -> None:
                 unit = "Tokens"
             color, style = styles[label]
             if len(x) >= 5:
-                ax.plot(x, y, color=color, alpha=0.28, lw=0.8)
+                ax.plot(x, y, color=color, ls=style, alpha=0.48, lw=1.0)
                 ax.plot(
                     x[4:],
                     [mean(y[i - 4 : i + 1]) for i in range(4, len(y))],
                     color=color,
                     ls=style,
-                    lw=1.6,
+                    lw=2.2,
                 )
             else:
                 ax.plot(x, y, color=color, ls=style, marker="o")
@@ -164,11 +163,12 @@ def plot(runs: dict[str, list[Step]], keys: list[str], path: Path) -> None:
             ax.set_yscale("log")
         ax.set(
             title=METRICS.get(key, key.removeprefix("timeperf/")),
-            xlabel="Training step",
             ylabel=unit,
             xticks=sorted({1, *ends}),
             xlim=(0, runs["Current"][-1].number + 1),
         )
+        ax.title.set_fontsize(10)
+        ax.tick_params(labelsize=8)
         ax.grid(axis="y", alpha=0.2)
     for ax in list(axes.flat)[len(keys) :]:
         ax.remove()
@@ -177,7 +177,11 @@ def plot(runs: dict[str, list[Step]], keys: list[str], path: Path) -> None:
         for label in runs
     ]
     fig.legend(handles=handles, loc="upper center", ncol=len(runs), frameon=False)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.supxlabel("Training step", fontsize=9, y=0.01)
+    fig.tight_layout(
+        rect=(0, 0.22 / fig.get_figheight(), 1, 1 - 0.32 / fig.get_figheight()),
+        pad=0.45,
+    )
     fig.savefig(path, dpi=140)
     plt.close(fig)
 
@@ -280,57 +284,6 @@ def report(
     return "\n\n".join(sections) + "\n"
 
 
-def inline_summary(markdown: str, runs: dict[str, list[Step]]) -> str:
-    """Embed chart data directly because job summaries cannot resolve artifact paths."""
-    keys = {key for steps in runs.values() for step in steps for key in step.metrics}
-    groups = {
-        "quality": [key for key in METRICS if key in keys],
-        "training-times": [f"timeperf/{name}" for name in MAIN_TIMERS],
-        "other-times": sorted(
-            key
-            for key in keys
-            if key.startswith("timeperf/")
-            and key.removeprefix("timeperf/") not in MAIN_TIMERS
-        ),
-    }
-
-    def charts(match: re.Match[str]) -> str:
-        blocks = []
-        for key in groups[match[1]]:
-            for label, steps in runs.items():
-                pairs = observations(steps, key)
-                if not pairs:
-                    continue
-                x, y = zip(*pairs, strict=True)
-                title = METRICS.get(key, key.removeprefix("timeperf/"))
-                if key.startswith("timeperf/"):
-                    title += " (s)"
-                if key.endswith("acceptance_rate"):
-                    title += " (%)"
-                    y = tuple(v * 100 for v in y)
-                axis = f"{x[0]} --> {x[-1]}"
-                if len(x) < 3 or x[-1] - x[0] + 1 != len(x):
-                    axis = "[" + ", ".join(str(step) for step in x) + "]"
-                values = ", ".join(f"{v:.10f}".rstrip("0").rstrip(".") for v in y)
-                series = "bar" if len(x) == 1 else "line"
-                blocks.append(
-                    f'```mermaid\nxychart-beta\n    title "{title} · {label}"\n'
-                    f'    x-axis "Training step" {axis}\n    {series} [{values}]\n```'
-                )
-        return "\n\n".join(blocks)
-
-    markdown = markdown.replace(
-        "Lines show individual steps and trailing five-step means. Dots mark sparse observations.",
-        "Charts show logged values by training step.",
-    )
-    return re.sub(
-        r"^!\[.*?\]\(.*/(quality|training-times|other-times)\.png\)$",
-        charts,
-        markdown,
-        flags=re.M,
-    )
-
-
 def read_snapshot(path: Path) -> list[Step]:
     return [Step(**row) for row in json.loads(path.read_text())]
 
@@ -348,9 +301,6 @@ def main() -> None:
     )
     parser.add_argument(
         "--image-prefix", help="Published chart URL prefix for the Actions summary"
-    )
-    parser.add_argument(
-        "--summary-output", type=Path, help="Write inline charts for Actions"
     )
     args = parser.parse_args()
     current = read_log(args.current) if args.current else read_snapshot(args.snapshot)
@@ -378,8 +328,6 @@ def main() -> None:
     charts = args.output.parent / args.output.stem
     markdown = report(runs, charts, args.image_prefix or charts.name, args.suite)
     args.output.write_text(markdown, encoding="utf-8")
-    if args.summary_output:
-        args.summary_output.write_text(inline_summary(markdown, runs), encoding="utf-8")
 
 
 if __name__ == "__main__":
