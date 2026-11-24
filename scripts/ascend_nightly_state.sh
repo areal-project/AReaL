@@ -68,9 +68,7 @@ case "$mode" in
             report="nightly-reports/$suite.md"
             [[ -f "$report" ]] || continue
             prefix="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$revision/charts/$suite"
-            sed -E -e '/^!\[Other timings\]/i <details><summary>Other timing charts</summary>\n' \
-                -e '/^!\[Other timings\]/a \n</details>' \
-                -e "s|^!\[(.*)\]\($suite/([a-z-]+[.]png)\)$|<img src=\"$prefix/\2\" alt=\"\1\" width=\"780\">|" "$report" >> "$GITHUB_STEP_SUMMARY"
+            sed -E "s|^!\[(.*)\]\($suite/([a-z-]+[.]png)\)$|<img src=\"$prefix/\2\" alt=\"\1\" width=\"780\">|" "$report" >> "$GITHUB_STEP_SUMMARY"
             echo >> "$GITHUB_STEP_SUMMARY"
         done
         ;;

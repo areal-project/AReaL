@@ -124,10 +124,11 @@ def plot(runs: dict[str, list[Step]], keys: list[str], path: Path) -> None:
     from matplotlib.lines import Line2D
 
     styles = {"Current": ("#0057B8", "-"), "Baseline": ("#AD4600", "--")}
-    columns = 4 if len(keys) == 4 else min(3, len(keys))
-    rows = (len(keys) + columns - 1) // columns
     fig, axes = plt.subplots(
-        rows, columns, squeeze=False, figsize=(10, 1.65 * rows + 0.5)
+        (len(keys) + 1) // 2,
+        2,
+        squeeze=False,
+        figsize=(9, 2.25 * ((len(keys) + 1) // 2) + 0.6),
     )
     ends = [s.number for s in runs["Current"] if s.epoch_end]
     for ax, key in zip(axes.flat, keys):
@@ -163,12 +164,11 @@ def plot(runs: dict[str, list[Step]], keys: list[str], path: Path) -> None:
             ax.set_yscale("log")
         ax.set(
             title=METRICS.get(key, key.removeprefix("timeperf/")),
+            xlabel="Training step",
             ylabel=unit,
             xticks=sorted({1, *ends}),
             xlim=(0, runs["Current"][-1].number + 1),
         )
-        ax.title.set_fontsize(10)
-        ax.tick_params(labelsize=8)
         ax.grid(axis="y", alpha=0.2)
     for ax in list(axes.flat)[len(keys) :]:
         ax.remove()
@@ -177,11 +177,7 @@ def plot(runs: dict[str, list[Step]], keys: list[str], path: Path) -> None:
         for label in runs
     ]
     fig.legend(handles=handles, loc="upper center", ncol=len(runs), frameon=False)
-    fig.supxlabel("Training step", fontsize=9, y=0.01)
-    fig.tight_layout(
-        rect=(0, 0.22 / fig.get_figheight(), 1, 1 - 0.32 / fig.get_figheight()),
-        pad=0.45,
-    )
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(path, dpi=140)
     plt.close(fig)
 
