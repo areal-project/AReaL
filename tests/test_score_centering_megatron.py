@@ -102,6 +102,7 @@ class _StubEngine:
     """Binds the real engine helpers onto a stub so they run without hardware."""
 
     _ensure_score_centering_supported = None  # filled in by the fixture
+    _sc_diag_due = None
     _warn_sc_head_padding = None
     _warn_sc_head_mass = None
     _score_centering_logprobs = None
@@ -143,6 +144,7 @@ def engine_cls(monkeypatch):
     _StubEngine._ensure_score_centering_supported = (
         MegatronEngine._ensure_score_centering_supported
     )
+    _StubEngine._sc_diag_due = MegatronEngine._sc_diag_due
     _StubEngine._warn_sc_head_padding = MegatronEngine._warn_sc_head_padding
     _StubEngine._warn_sc_head_mass = MegatronEngine._warn_sc_head_mass
     _StubEngine._score_centering_logprobs = MegatronEngine._score_centering_logprobs
@@ -306,6 +308,17 @@ def test_engine_sc_low_head_mass_warns_once(engine_cls):
 
     assert warned is True
     assert engine._sc_mass_warned is True
+
+
+def test_engine_sc_diagnostics_sample_instead_of_syncing_every_step(engine_cls):
+    """Test that the sync-heavy head diagnostics run on a sampled schedule."""
+    engine = engine_cls()
+
+    first = engine._sc_diag_due()
+    sampled = [engine._sc_diag_due() for _ in range(9)]
+
+    assert first is True
+    assert not any(sampled)
 
 
 def test_engine_sc_full_head_mass_does_not_warn(engine_cls):

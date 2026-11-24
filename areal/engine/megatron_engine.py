@@ -186,6 +186,10 @@ _EXPERT_NUM_RE = re.compile(r"\.(weight|bias)\d+$")
 # correction would be computed from a partial distribution.
 _SC_MIN_SAMPLER_HEAD_MASS = 0.9
 
+# The head diagnostics need a device sync, so they are sampled rather than
+# evaluated on every step. The first call is always inspected.
+_SC_DIAG_INTERVAL = 100
+
 
 def _normalize_glu_param_name(name: str) -> str:
     name = _LAYER_IDX_RE.sub(".layers.", name)
@@ -3894,7 +3898,20 @@ class MegatronEngine(TrainEngine):
             )
         self._sc_support_checked = True
 
-    def _warn_sc_head_padding(self, q, loss_mask) -> None:
+    def _sc_diag_due(self) -> bool:
+        """Return True when this step should pay the head-diagnostic sync.
+
+        Both diagnostics reduce a tensor to a Python scalar, which forces a
+        device-to-host sync. Sampling them keeps the steady-state step free of
+        syncs while still inspecting the first step of a run.
+        """
+        calls = getattr(self, "_sc_diag_calls", 0)
+        self._sc_diag_calls = calls + 1
+        return calls % _SC_DIAG_INTERVAL == 0
+
+    def _warn_sc_head_padding(
+        self, q: torch.Tensor, loss_mask: torch.Tensor | None
+    ) -> None:
         """Warn once if generated positions carry padded or zero-mass sampler heads."""
         if getattr(self, "_sc_pad_warned", False):
             return
@@ -3947,6 +3964,17 @@ class MegatronEngine(TrainEngine):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Sampled log-probs, entropy and SC kwargs for one Megatron micro-batch.
 
+        Args:
+            logits: ``[rows, vocab_local]`` logits of this micro-batch; under
+                tensor parallelism each rank holds one vocabulary shard.
+            inputs: Micro-batch tensors; the sampler heads and the loss mask are
+                read from the ``_cp_local_*`` copies when context parallelism is
+                active, otherwise from the packed originals.
+            labels: ``[rows]`` next-token labels.
+
+        Returns:
+            ``(logprobs, entropy, sc_kwargs)`` for the actor loss.
+
         Mirrors the FSDP path: the packed micro-batch already carries the
         sampler's top-k heads aligned to the logit rows. Under context parallelism
         the engine hands over CP-local copies of those rows (``_cp_local_*``), so
@@ -3997,7 +4025,9 @@ class MegatronEngine(TrainEngine):
                 "Score centering needs one label per logit row; got "
                 f"{labels.numel()} labels for {logits.shape[0]} rows."
             )
-        self._warn_sc_head_padding(q, loss_mask)
+        diagnose = self._sc_diag_due()
+        if diagnose:
+            self._warn_sc_head_padding(q, loss_mask)
         tp_size = mpu.get_tensor_model_parallel_world_size()
         vocab_size = int(getattr(self.hf_config, "vocab_size", 0)) or None
         if tp_size > 1 and vocab_size is not None:
@@ -4028,7 +4058,8 @@ class MegatronEngine(TrainEngine):
             ),
             metrics_out=sc_metrics,
         )
-        self._warn_sc_head_mass(sc_metrics)
+        if diagnose:
+            self._warn_sc_head_mass(sc_metrics)
         return (
             logprobs,
             entropy,
