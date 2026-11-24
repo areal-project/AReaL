@@ -132,6 +132,7 @@ from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.save_load import get_state_dict_from_repo_id_or_path
+from areal.utils.score_centering import HeadDiagnostics
 
 if TYPE_CHECKING:
     from areal.api import Scheduler
@@ -342,6 +343,7 @@ class FSDPEngine(TrainEngine):
                 parallel_strategy = ParallelStrategy()
 
         self.logger = logging.getLogger(f"[FSDPEngine Rank {dist.get_rank()}]")
+        self._sc_diagnostics = HeadDiagnostics(self.logger)
 
         parallel_strategy = self._make_parallel_strategy(parallel_strategy)
 
@@ -742,28 +744,6 @@ class FSDPEngine(TrainEngine):
     def lr_scheduler_step(self):
         assert self.lr_scheduler is not None
         self.lr_scheduler.step()
-
-    def _warn_sc_head_padding(self, q, loss_mask) -> None:
-        """Warn once if generated positions carry padded or zero-mass sampler heads."""
-        if getattr(self, "_sc_pad_warned", False):
-            return
-        rows = q.reshape(-1, q.shape[-1])
-        if loss_mask is not None:
-            keep = loss_mask.reshape(-1).bool()
-            if keep.numel() == rows.shape[0]:
-                rows = rows[keep]
-        if rows.numel() == 0:
-            return
-        pad_slots = int((rows <= -1e30).sum())
-        zero_rows = int((rows.exp().sum(-1) <= 0).sum())
-        if pad_slots or zero_rows:
-            self._sc_pad_warned = True
-            self.logger.warning(
-                "score centering: %d padded head slots and %d zero-mass rows in "
-                "generated positions; sampler top-k is incomplete",
-                pad_slots,
-                zero_rows,
-            )
 
     def forward_backward_batch(
         self,
@@ -2230,8 +2210,9 @@ class FSDPEngine(TrainEngine):
 
                 ids = ctx.mb_input.get("sampler_head_ids")
                 q = ctx.mb_input.get("sampler_head_logprobs")
-                if q is not None:
-                    self._warn_sc_head_padding(q, ctx.mb_input.get("loss_mask"))
+                diagnose = self._sc_diagnostics.due()
+                if diagnose and q is not None:
+                    self._sc_diagnostics.warn_padding(q, ctx.mb_input.get("loss_mask"))
                 if ids is None or q is None:
                     missing = (
                         "sampler_head_ids" if ids is None else "sampler_head_logprobs"
@@ -2273,6 +2254,8 @@ class FSDPEngine(TrainEngine):
                     )
                 )
                 sc_kwargs["sc_metrics"] = sc_metrics
+                if diagnose:
+                    self._sc_diagnostics.warn_mass(sc_metrics)
             loss = loss_fn(
                 logprobs,
                 entropy,

@@ -14,6 +14,7 @@ from areal.api.cli_args import (
 )
 from areal.api.io_struct import ModelResponse
 from areal.trainer.ppo.actor import grpo_loss_fn
+from areal.utils import logging
 from areal.utils.data import (
     concat_batch,
     pack_tensor_dict,
@@ -21,6 +22,7 @@ from areal.utils.data import (
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.score_centering import (
+    HeadDiagnostics,
     build_weight_fn,
     score_centering_correction,
     score_centering_logprobs,
@@ -362,6 +364,7 @@ def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width, tis_cap):
     engine.enable_tree_training = False
     engine.parallel_helper = SimpleNamespace(tp_size=1, sp_size=1)
     engine.model_config = SimpleNamespace(vocab_size=17)
+    engine._sc_diagnostics = HeadDiagnostics(logging.getLogger("FSDPEngineTest"))
     for item in mbs:
         inputs, ctx = engine._prepare_mb_inputs(item)
         assert "sampler_head_ids" not in inputs
@@ -471,6 +474,7 @@ def test_missing_heads_raise_value_error_not_keyerror():
     engine.enable_tree_training = False
     engine.parallel_helper = SimpleNamespace(tp_size=1, sp_size=1)
     engine.model_config = SimpleNamespace(vocab_size=17)
+    engine._sc_diagnostics = HeadDiagnostics(logging.getLogger("FSDPEngineTest"))
 
     mb = {
         "input_ids": torch.arange(4)[None],

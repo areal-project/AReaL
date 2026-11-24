@@ -26,7 +26,9 @@ from areal.engine.megatron_utils.packed_context_parallel import (  # noqa: E402
     _build_cp_reassemble_indices,
     split_packed_seqs_for_context_parallel,
 )
-from areal.utils.score_centering import (  # noqa: E402
+from areal.utils.score_centering import (
+    DIAG_INTERVAL,
+    HeadDiagnostics,  # noqa: E402
     build_weight_fn,
     score_centering_logprobs,
 )
@@ -102,10 +104,7 @@ class _StubEngine:
     """Binds the real engine helpers onto a stub so they run without hardware."""
 
     _ensure_score_centering_supported = None  # filled in by the fixture
-    _sc_diag_due = None
     _compute_logprobs_and_loss = None
-    _warn_sc_head_padding = None
-    _warn_sc_head_mass = None
     _score_centering_logprobs = None
 
     def __init__(
@@ -131,6 +130,7 @@ class _StubEngine:
         self.hf_config = types.SimpleNamespace(vocab_size=vocab_size)
         self.enable_tree_training = tree
         self.logger = logging.getLogger("TestScoreCentering")
+        self._sc_diagnostics = HeadDiagnostics(self.logger)
 
 
 @pytest.fixture
@@ -145,10 +145,7 @@ def engine_cls(monkeypatch):
     _StubEngine._ensure_score_centering_supported = (
         MegatronEngine._ensure_score_centering_supported
     )
-    _StubEngine._sc_diag_due = MegatronEngine._sc_diag_due
     _StubEngine._compute_logprobs_and_loss = MegatronEngine._compute_logprobs_and_loss
-    _StubEngine._warn_sc_head_padding = MegatronEngine._warn_sc_head_padding
-    _StubEngine._warn_sc_head_mass = MegatronEngine._warn_sc_head_mass
     _StubEngine._score_centering_logprobs = MegatronEngine._score_centering_logprobs
     return _StubEngine
 
@@ -363,34 +360,32 @@ def test_engine_sc_low_head_mass_warns_once(engine_cls):
     engine = engine_cls()
     weak_metrics = {"q_mass": torch.full((4,), 0.5)}
 
-    engine._warn_sc_head_mass(weak_metrics)
-    warned = engine._sc_mass_warned
-    engine._warn_sc_head_mass(weak_metrics)
+    engine._sc_diagnostics.warn_mass(weak_metrics)
+    warned = engine._sc_diagnostics._mass_warned
+    engine._sc_diagnostics.warn_mass(weak_metrics)
 
     assert warned is True
-    assert engine._sc_mass_warned is True
+    assert engine._sc_diagnostics._mass_warned is True
 
 
 def test_engine_sc_diagnostics_sample_instead_of_syncing_every_step(engine_cls):
     """Test that the sync-heavy head diagnostics fire once per configured interval."""
-    from areal.engine.megatron_engine import _SC_DIAG_INTERVAL
-
     engine = engine_cls()
 
-    due = [engine._sc_diag_due() for _ in range(_SC_DIAG_INTERVAL + 1)]
+    due = [engine._sc_diagnostics.due() for _ in range(DIAG_INTERVAL + 1)]
 
     assert due[0] is True
-    assert not any(due[1:_SC_DIAG_INTERVAL])
-    assert due[_SC_DIAG_INTERVAL] is True
+    assert not any(due[1:DIAG_INTERVAL])
+    assert due[DIAG_INTERVAL] is True
 
 
 def test_engine_sc_full_head_mass_does_not_warn(engine_cls):
     """Test that complete sampler heads stay quiet."""
     engine = engine_cls()
 
-    engine._warn_sc_head_mass({"q_mass": torch.full((4,), 0.999)})
+    engine._sc_diagnostics.warn_mass({"q_mass": torch.full((4,), 0.999)})
 
-    assert getattr(engine, "_sc_mass_warned", False) is False
+    assert engine._sc_diagnostics._mass_warned is False
 
 
 def test_engine_sc_guard_caches_success_only(engine_cls):

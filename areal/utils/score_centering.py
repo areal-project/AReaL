@@ -58,28 +58,6 @@ def validate_heads(ids, logprobs, count: int, width: int) -> None:
             raise ValueError("Sampler head probability mass exceeds one.")
 
 
-def parse_sampler_heads(meta: dict, output_tokens: list[int]):
-    """Read SGLang's standard [logprob, token_id, text] top-logprob rows."""
-    rows = meta.get("output_top_logprobs")
-    if not rows:
-        return None, None
-    try:
-        ids = [[entry[1] for entry in row] for row in rows]
-        logprobs = [[entry[0] for entry in row] for row in rows]
-        validate_heads(ids, logprobs, len(output_tokens), len(ids[0]))
-    except (IndexError, TypeError) as exc:
-        raise ValueError("Malformed SGLang sampler heads.") from exc
-    sampled = meta["output_token_logprobs"]
-    for row_ids, row_logprobs, sample in zip(ids, logprobs, sampled):
-        if sample[1] in row_ids:
-            head_logp = row_logprobs[row_ids.index(sample[1])]
-            if not math.isclose(head_logp, sample[0], rel_tol=1e-5, abs_tol=1e-5):
-                raise ValueError(
-                    "Sampled-token and head logprobs describe different distributions."
-                )
-    return ids, logprobs
-
-
 def trajectory_heads(response, width: int) -> dict[str, torch.Tensor]:
     """Pad prompt positions; keep sampler heads aligned to generated tokens."""
     validate_heads(
@@ -99,6 +77,79 @@ def trajectory_heads(response, width: int) -> dict[str, torch.Tensor]:
             response.sampler_head_logprobs, dtype=torch.float32
         )
     return {"sampler_head_ids": ids, "sampler_head_logprobs": logprobs}
+
+
+#: A complete sampler head covers ~1.0 of the probability mass; far below that
+#: means the head set is incomplete and the correction sees a partial distribution.
+MIN_SAMPLER_HEAD_MASS = 0.9
+
+#: The head diagnostics reduce tensors to Python scalars, which forces a
+#: device-to-host sync. Sample them instead of paying that on every step.
+DIAG_INTERVAL = 100
+
+
+class HeadDiagnostics:
+    """Warn-once checks for the sampler heads of a score-centering run.
+
+    Both checks are sampled through :meth:`due`: the first micro-batch is always
+    inspected, later ones every ``interval`` calls, so a healthy step performs no
+    device synchronization. A check that fires disables itself, which keeps a
+    broken head loud without flooding the log.
+    """
+
+    def __init__(self, logger, interval: int = DIAG_INTERVAL):
+        self._logger = logger
+        self._interval = max(1, interval)
+        self._calls = 0
+        self._padding_warned = False
+        self._mass_warned = False
+
+    def due(self) -> bool:
+        """Return True when this step should pay the diagnostic sync."""
+        calls = self._calls
+        self._calls = calls + 1
+        return calls % self._interval == 0
+
+    def warn_padding(
+        self, sampler_logps: torch.Tensor, loss_mask: torch.Tensor | None
+    ) -> None:
+        """Warn once if generated positions carry padded or zero-mass head rows."""
+        if self._padding_warned:
+            return
+        rows = sampler_logps.reshape(-1, sampler_logps.shape[-1])
+        if loss_mask is not None:
+            keep = loss_mask.reshape(-1).bool()
+            if keep.numel() == rows.shape[0]:
+                rows = rows[keep]
+        if rows.numel() == 0:
+            return
+        pad_slots = int((rows <= -1e30).sum())
+        zero_rows = int((rows.exp().sum(-1) <= 0).sum())
+        if pad_slots or zero_rows:
+            self._padding_warned = True
+            self._logger.warning(
+                "score centering: %d padded head slots and %d zero-mass rows in "
+                "generated positions; sampler top-k is incomplete",
+                pad_slots,
+                zero_rows,
+            )
+
+    def warn_mass(self, metrics: dict[str, torch.Tensor]) -> None:
+        """Warn once when the sampler heads cover too little probability mass."""
+        q_mass = metrics.get("q_mass")
+        if q_mass is None or self._mass_warned:
+            return
+        cover = float(q_mass.float().mean())
+        if cover >= MIN_SAMPLER_HEAD_MASS:
+            return
+        self._mass_warned = True
+        self._logger.warning(
+            "score centering: sampler top-k heads cover only %.3f of the sampler "
+            "probability mass (expected ~1.0); the correction is computed from an "
+            "incomplete head set. Check score_centering_top_k and that the sampler "
+            "and trainer share one vocabulary.",
+            cover,
+        )
 
 
 def selected_logprobs(
