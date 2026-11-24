@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import threading
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -49,6 +52,66 @@ def _client():
 
 def _admin_headers():
     return {"Authorization": f"Bearer {_ADMIN_KEY}"}
+
+
+def test_openai_proxy_without_litellm():
+    # Start with a fresh module cache so earlier tests cannot mask eager imports.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import asyncio, sys\n"
+            "sys.modules['litellm'] = None\n"
+            f"from {__name__} import _exercise_openai_routes\n"
+            "asyncio.run(_exercise_openai_routes())",
+        ],
+        check=True,
+        timeout=90,
+    )
+
+
+async def _exercise_openai_routes():
+    srv._openai_client = Mock()
+    srv._openai_client.chat.completions.create = AsyncMock(return_value={"id": "chat"})
+    srv._openai_client.responses.create = AsyncMock(
+        return_value={
+            "id": "resp",
+            "object": "response",
+            "created_at": 0,
+            "model": "test",
+            "output": [],
+            "parallel_tool_calls": False,
+            "tool_choice": "auto",
+            "tools": [],
+        }
+    )
+    srv._api_key_to_session["test-key"] = "session"
+    srv._session_cache["session"] = SessionData("session")
+    headers = {"Authorization": "Bearer test-key"}
+    async with _client() as client:
+        chat = await client.post(
+            "/chat/completions",
+            headers=headers,
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        response = await client.post(
+            "/responses", headers=headers, json={"model": "test", "input": "hi"}
+        )
+    assert chat.status_code == 200, chat.text
+    assert response.status_code == 200, response.text
+    assert chat.json()["id"] == "chat"
+    assert response.json()["id"] == "resp"
+
+
+def test_anthropic_request_loads_litellm_adapter():
+    request = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 8,
+    }
+    translated = srv._translate_anthropic_to_openai_request(request)
+    assert translated["messages"] == request["messages"]
+    assert translated["max_tokens"] == 8
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import secrets
 import threading
 import time
 from collections.abc import AsyncGenerator
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
@@ -18,10 +19,6 @@ from anthropic.types.message import Message
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
-from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
-    AnthropicAdapter,
-)
-from litellm.types.utils import ModelResponse as LitellmModelResponse
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses import Response
@@ -136,9 +133,6 @@ _trial_name: str | None = None
 _name_resolve_type: str = "nfs"
 _nfs_record_root: str = "/tmp/areal/name_resolve"
 _etcd3_addr: str = "localhost:2379"
-
-# Adapter to convert Anthropic request to OpenAI format
-_adapter = AnthropicAdapter()
 
 
 def _chat_template_supports_kwarg(tokenizer: Any, name: str) -> bool:
@@ -828,9 +822,25 @@ async def responses(
     )
 
 
+@cache
+def _get_anthropic_adapter() -> Any:
+    """Load the LiteLLM adapter on the first Anthropic request."""
+    try:
+        from litellm.llms.anthropic.messages.adapters.transformation import (
+            AnthropicAdapter,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name != "litellm.llms.anthropic.messages":
+            raise
+        from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+            AnthropicAdapter,
+        )
+    return AnthropicAdapter()
+
+
 def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) -> dict:
     """Translate an Anthropic Messages API request to OpenAI format."""
-    openai_request = _adapter.translate_completion_input_params(
+    openai_request = _get_anthropic_adapter().translate_completion_input_params(
         anthropic_request.copy()
     )
     if openai_request is None:
@@ -945,7 +955,7 @@ async def anthropic_messages(
 
             # Use LiteLLM's adapter to convert to Anthropic SSE format
             anthropic_sse_stream = (
-                _adapter.translate_completion_output_params_streaming(
+                _get_anthropic_adapter().translate_completion_output_params_streaming(
                     completion_stream=openai_stream,
                     model=anthropic_request.get("model", "default"),
                 )
@@ -981,10 +991,14 @@ async def anthropic_messages(
 
     # Convert OpenAI response to Anthropic format using LiteLLM's adapter
     try:
+        from litellm.types.utils import ModelResponse as LitellmModelResponse
+
         # Convert ChatCompletion to LitellmModelResponse
         openai_response_dict = openai_response.model_dump()
         model_response = LitellmModelResponse(**openai_response_dict)
-        anthropic_response = _adapter.translate_completion_output_params(model_response)
+        anthropic_response = (
+            _get_anthropic_adapter().translate_completion_output_params(model_response)
+        )
         if anthropic_response is None:
             raise ValueError("Failed to translate response")
 
