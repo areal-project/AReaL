@@ -596,6 +596,7 @@ class ArenaStreamAgentWorkflow:
         self.result_dump_dir = str(
             self.econfig.get("arena_result_dump_dir", "") or ""
         ).strip()
+        self.log_per_task_reward = self.econfig.get("arena_log_per_task_reward", False)
         self.response_validation_policy = self.econfig.get(
             "arena_response_validation_policy", "final_response"
         )
@@ -1706,14 +1707,16 @@ class ArenaStreamAgentWorkflow:
             )
         try:
             _record_arena_metrics(**metrics)
-            if result is not None and result.score is not None:
+            if (
+                self.log_per_task_reward
+                and result is not None
+                and result.score is not None
+            ):
                 data_id = str(data.get("data_id") or "").strip()
-            else:
-                data_id = ""
-            if data_id:
-                stats_tracker.get("debug").scalar(
-                    **{f"task/{data_id}/raw_reward": result.score}
-                )
+                if data_id:
+                    stats_tracker.get("debug").scalar(
+                        **{f"task/{data_id}/raw_reward": result.score}
+                    )
             _record_arena_domain_reward(reward, arena_task_type)
         finally:
             self._task_result.set(None)
