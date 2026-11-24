@@ -3,6 +3,10 @@ set -euo pipefail
 suite=$1
 work=$(mktemp -d "${RUNNER_TEMP:-/tmp}/ascend-nightly-XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
+# Keep model and dataset downloads shared while giving SwanLab a private cache.
+export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}"
+export XDG_CACHE_HOME="$work/cache"
+mkdir -m 700 "$XDG_CACHE_HOME"
 export AREAL_NIGHTLY_ADMIN_KEY
 AREAL_NIGHTLY_ADMIN_KEY=$(python -c 'import secrets; print(secrets.token_hex(32))')
 echo "::add-mask::$AREAL_NIGHTLY_ADMIN_KEY"
