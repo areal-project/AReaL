@@ -38,6 +38,109 @@ _ADMIN_KEY = "test-admin-key"
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exclude_auxiliary", [False, True])
+@pytest.mark.parametrize("content_blocks", [False, True])
+async def test_auxiliary_title_cannot_replace_successful_task_reward(
+    monkeypatch, exclude_auxiliary, content_blocks
+):
+    """A reasoning-only title after a valid solve must not zero its reward."""
+    title_prompt = "Generate a session title from the completed conversation."
+    metadata = {"auxiliary_system_prompts": [title_prompt]} if exclude_auxiliary else {}
+    session = SessionData(session_id="task", metadata=metadata)
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+
+    async def create_fn(messages, areal_cache, **kwargs):
+        is_title = messages[0]["content"] == title_prompt
+        key = "title" if is_title else "solve"
+        interaction = _prm_interaction(key, [1], [2], messages)
+        interaction.reward = None
+        interaction.metadata["response_parse"] = {
+            "tool_call_parse_failed": False,
+            "has_content": not is_title,
+            "has_tool_calls": False,
+        }
+        areal_cache[key] = interaction
+        return key
+
+    assert (
+        await srv._call_client_create(
+            create_fn,
+            {"messages": [{"role": "user", "content": "Write verifier.py"}]},
+            "task",
+        )
+        == "solve"
+    )
+    assert (
+        await srv._call_client_create(
+            create_fn,
+            {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": title_prompt}]
+                        if content_blocks
+                        else title_prompt,
+                    }
+                ]
+            },
+            "task",
+        )
+        == "title"
+    )
+    session.completions.set_reward("solve" if exclude_auxiliary else "title", 1.0)
+    exported = session.export_interactions(
+        discount=1.0, style="concat", episode_reward=1.0
+    )
+    assert set(exported) == ({"solve"} if exclude_auxiliary else {"solve", "title"})
+    assert exported["solve"].reward == (1.0 if exclude_auxiliary else 0.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tools", [False, True])
+async def test_auxiliary_failure_is_isolated_only_for_tool_free_matching_requests(
+    monkeypatch, with_tools
+):
+    from fastapi import HTTPException
+
+    session = SessionData(
+        session_id="task", metadata={"auxiliary_system_prompts": ["Title request"]}
+    )
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+
+    async def create_fn(messages, tools=None, **kwargs):
+        raise RuntimeError("generation failed")
+
+    request = {"messages": [{"role": "system", "content": "Title request"}]}
+    if with_tools:
+        request["tools"] = [{"type": "function", "function": {"name": "solve"}}]
+    with pytest.raises(HTTPException):
+        await srv._call_client_create(create_fn, request, "task")
+    assert session.system_error is with_tools
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_invalid_tool_call_does_not_poison_task_session(monkeypatch):
+    session = SessionData(
+        session_id="task", metadata={"auxiliary_system_prompts": ["Title request"]}
+    )
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+
+    async def create_fn(messages, **kwargs):
+        raise InvalidToolCallError("invalid title output")
+
+    with pytest.raises(InvalidToolCallError):
+        await srv._call_client_create(
+            create_fn,
+            {"messages": [{"role": "system", "content": "Title request"}]},
+            "task",
+        )
+    assert "task" not in srv._session_invalid_tool_errors
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("wire_form", ["flat", "nested", "both"])
 async def test_template_options_survive_proxy_filtering(monkeypatch, wire_form):
     options = {"enable_thinking": True, "reasoning_effort": "medium"}

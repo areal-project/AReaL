@@ -46,6 +46,26 @@ async def run_agent(workflow, data_id="data-1"):
         )
 
 
+def test_auxiliary_request_policy_is_explicit_and_copied(workflow):
+    workflow.gen_args = {"temperature": 0.7}
+    assert workflow.get_session_metadata({}) == {
+        "generation_args": {"temperature": 0.7}
+    }
+    prompts = ["Generate a session title."]
+    workflow.econfig["arena_auxiliary_system_prompts"] = prompts
+    metadata = workflow.get_session_metadata({})
+    assert metadata["auxiliary_system_prompts"] == prompts
+    metadata["auxiliary_system_prompts"].clear()
+    assert prompts == ["Generate a session title."]
+
+
+@pytest.mark.parametrize("prompts", ["Title request", [""], [123]])
+def test_invalid_auxiliary_request_policy_is_rejected(workflow, prompts):
+    workflow.econfig["arena_auxiliary_system_prompts"] = prompts
+    with pytest.raises(ValueError, match="nonempty strings"):
+        workflow.get_session_metadata({})
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["EVAL_FAILED", "HARNESS_FAILED", "SETUP_FAILED"])
 @pytest.mark.parametrize("with_result", [False, True])

@@ -996,6 +996,31 @@ async def _call_client_create(
     )
 
     kwargs = request.model_dump() if isinstance(request, BaseModel) else dict(request)
+    auxiliary_prompts = session_data.metadata.get("auxiliary_system_prompts", [])
+    request_messages = kwargs.get("messages") or []
+    is_auxiliary = (
+        isinstance(auxiliary_prompts, list)
+        and isinstance(request_messages, list)
+        and bool(request_messages)
+        and isinstance(request_messages[0], Mapping)
+        and request_messages[0].get("role") == "system"
+        and _content_block_text(request_messages[0].get("content")) in auxiliary_prompts
+        and not kwargs.get("tools")
+    )
+    if is_auxiliary:
+        # Serve explicitly identified auxiliary calls without adding a reward
+        # target or failure state to the task's training trajectory.
+        auxiliary_session = SessionData(
+            session_id=session_id,
+            sampling_seed_identity=session_data.sampling_seed_identity,
+            processor_cache=session_data.processor_cache,
+            metadata=session_data.metadata,
+        )
+        auxiliary_session.backend_session_id = session_data.backend_session_id
+        session_data = auxiliary_session
+        logger.info(
+            "Serving auxiliary request outside training cache: session=%s", session_id
+        )
     token_limits = {"max_tokens", "max_completion_tokens"}
     explicit_fields = (
         request.model_fields_set if isinstance(request, BaseModel) else set(request)
@@ -1149,8 +1174,9 @@ async def _call_client_create(
         # A streaming response has already sent HTTP 200 by the time the model
         # output can be validated. Poison the session so an SDK retry receives
         # a real HTTP 422 before it starts another model generation.
-        with _lock:
-            _session_invalid_tool_errors[session_id] = str(exc)
+        if not is_auxiliary:
+            with _lock:
+                _session_invalid_tool_errors[session_id] = str(exc)
         logger.warning("Session %s emitted invalid tool JSON", session_id)
         raise
     except ContextLengthExceededError as e:
