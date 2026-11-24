@@ -9,9 +9,10 @@ Ref: https://github.com/areal-project/AReaL/issues/1046
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
@@ -57,6 +58,7 @@ def _reset_server_globals(monkeypatch):
     monkeypatch.setattr(srv, "_admin_api_key", _ADMIN_KEY)
     monkeypatch.setattr(srv, "_lock", threading.Lock())
     monkeypatch.setattr(srv, "_last_cleanup_time", 0.0)
+    monkeypatch.setattr(srv, "_resume_streams", None)
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +73,7 @@ async def _fake_create(
     temperature=None,
     top_p=None,
     areal_cache=None,
+    _completion_id=None,
     **kwargs,
 ):
     """Minimal stand-in for ``AsyncCompletionsWithReward.create``.
@@ -86,7 +89,7 @@ async def _fake_create(
 
         async def _gen():
             yield ChatCompletionChunk(
-                id="chatcmpl-test",
+                id=_completion_id or "chatcmpl-test",
                 choices=[
                     ChunkChoice(
                         delta=ChoiceDelta(role="assistant", content="hello"),
@@ -131,6 +134,58 @@ def _mock_openai_client(monkeypatch):
 
 class TestChatCompletionsEndpoint:
     """Verify streaming and non-streaming responses from ``/chat/completions``."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("disconnect", [False, True])
+    async def test_paused_stream_waits_for_resume_or_disconnect(
+        self, monkeypatch, _mock_openai_client, disconnect
+    ):
+        monkeypatch.setattr(srv, "_engine", MagicMock())
+        monkeypatch.setattr(srv, "_STREAM_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+        monkeypatch.setattr(srv, "_capacity", 1)
+        create = create_autospec(_fake_create, side_effect=_fake_create)
+        monkeypatch.setattr(srv._openai_client.chat.completions, "create", create)
+
+        async with _client() as client, asyncio.timeout(5):
+            session = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={"task_id": "paused"},
+            )
+            session.raise_for_status()
+            (await client.post("/call", json={"method": "pause"})).raise_for_status()
+            response = await srv.chat_completions(
+                {
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "model": "test",
+                    "stream": True,
+                },
+                session_id=session.json()["session_id"],
+            )
+            events = response.body_iterator
+            first = json.loads((await anext(events)).removeprefix("data: "))
+            assert first["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+            assert await anext(events) == ": ping\n\n"
+            # A second pause must keep the waiter on the same resume signal.
+            (await client.post("/call", json={"method": "pause"})).raise_for_status()
+            assert await anext(events) == ": ping\n\n"
+            create.assert_not_awaited()
+            if disconnect:
+                await events.aclose()
+            (await client.post("/call", json={"method": "resume"})).raise_for_status()
+            if disconnect:
+                await asyncio.sleep(0)
+                create.assert_not_awaited()
+            else:
+                remaining = [
+                    event async for event in events if event.startswith("data: ")
+                ]
+                chunk, done = remaining
+                assert done == "data: [DONE]\n\n"
+                chunk = json.loads(chunk.removeprefix("data: "))
+                assert chunk["id"] == first["id"]
+                assert chunk["choices"][0]["delta"]["content"] == "hello"
+                create.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_streaming_returns_sse_response(

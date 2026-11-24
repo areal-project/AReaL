@@ -86,6 +86,18 @@ os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "none")
 logger = logging.getLogger("OpenAIClient")
 
 
+class ContextLengthExceededError(ValueError):
+    """The prompt leaves no room for generation within the context limit."""
+
+    def __init__(self, prompt_tokens: int, max_tokens: int) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.max_tokens = max_tokens
+        super().__init__(
+            f"Prompt has {prompt_tokens} tokens, reaching or exceeding the context "
+            f"length limit of {max_tokens} tokens; no room remains for generation."
+        )
+
+
 def _ensure_message_dict_list(
     name: str,
     value: list[Any],
@@ -960,6 +972,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
+        _completion_id: str | None = None,
         processor_cache: ProcessorCallCache | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[ChatCompletionChunk, None]: ...
@@ -984,6 +997,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
+        _completion_id: str | None = None,
         processor_cache: ProcessorCallCache | None = None,
         **kwargs: Any,
     ) -> ChatCompletion: ...
@@ -1007,6 +1021,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
+        _completion_id: str | None = None,
         processor_cache: ProcessorCallCache | None = None,
         **kwargs: Any,
     ) -> ChatCompletion | AsyncGenerator[ChatCompletionChunk, None]:
@@ -1016,7 +1031,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
 
         # Extract and validate supported parameters
         cache, interaction = None, None
-        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        completion_id = _completion_id or f"chatcmpl-{uuid.uuid4().hex[:29]}"
         if not isinstance(messages, Iterable):
             raise TypeError(
                 "messages must be provided as an iterable of dictionaries or BaseModel instances."
@@ -1189,8 +1204,9 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 ):
                     # Remove the interaction from cache on failure
                     del cache[completion_id]
-                raise ValueError(
-                    f"len of prompt tokens {len(prompt_token_ids)} exceeds max_total_tokens {max_total_tokens_final}"
+                raise ContextLengthExceededError(
+                    prompt_tokens=len(prompt_token_ids),
+                    max_tokens=max_total_tokens_final,
                 )
         if not is_omitted(max_completion_tokens):
             if max_new_tokens is None:
