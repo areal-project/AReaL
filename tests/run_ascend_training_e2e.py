@@ -4,6 +4,7 @@
 
 import faulthandler
 import json
+import secrets
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -20,6 +21,7 @@ from areal.utils.saver import Saver
 def main(args: list[str]) -> None:
     faulthandler.dump_traceback_later(600, repeat=True)
     config, _ = load_expr_config(args, GRPOConfig)
+    config.rollout.agent.admin_api_key = secrets.token_urlsafe(32)
     processor, tokenizer = load_hf_processor_and_tokenizer(config.tokenizer_path)
     train_dataset = get_custom_dataset(
         split="train[:2]",
@@ -35,14 +37,19 @@ def main(args: list[str]) -> None:
     )
     assert len(train_dataset) == 2
     assert len(valid_dataset) == 1
-    workflow_kwargs = dict(
-        reward_fn="examples.vlm.geometry3k_grpo.geometry3k_reward_fn",
-        gconfig=config.gconfig,
-        tokenizer=config.tokenizer_path,
-        processor=config.tokenizer_path,
-        enable_thinking=False,
-    )
-    eval_kwargs = {**workflow_kwargs, "gconfig": config.eval_gconfig}
+    workflow = "areal.workflow.openai.geometry3k_agent.Geometry3KAgent"
+    workflow_kwargs = {
+        "temperature": config.gconfig.temperature,
+        "top_p": config.gconfig.top_p,
+        "max_completion_tokens": config.gconfig.max_new_tokens,
+    }
+    eval_kwargs = {
+        "temperature": 0.0
+        if config.eval_gconfig.greedy
+        else config.eval_gconfig.temperature,
+        "top_p": config.eval_gconfig.top_p,
+        "max_completion_tokens": config.eval_gconfig.max_new_tokens,
+    }
     # Hardware telemetry is outside this training E2E and may block in DCMI init.
     with (
         patch(
@@ -63,9 +70,9 @@ def main(args: list[str]) -> None:
             ) as evaluations,
         ):
             trainer.train(
-                workflow="areal.workflow.vision_rlvr.VisionRLVRWorkflow",
+                workflow=workflow,
                 workflow_kwargs=workflow_kwargs,
-                eval_workflow="areal.workflow.vision_rlvr.VisionRLVRWorkflow",
+                eval_workflow=workflow,
                 eval_workflow_kwargs=eval_kwargs,
             )
             steps = [call.args[2] for call in commits.call_args_list]
