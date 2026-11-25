@@ -377,7 +377,7 @@ def test_chunk_store_reorder_release_and_capacity():
     assert versions.tolist() == [4] * 4
     store.delete([1, 3])
     assert store.locate(np.array([1, 7])).tolist()[0] == 0
-    store.discard_before(5)
+    store.delete([7, 9])
     assert store.nbytes == 0
     with pytest.raises(MemoryError):
         RowStore(100).add(
@@ -658,7 +658,6 @@ def test_scheduler_merge_preserves_explicit_seeds_and_row_alignment(seeded_first
         )
         value._areal_mask_versions = [version] * size
         value._areal_mask_leases = [(1, 2, version)] * size
-        value._areal_mask_request_ids = [f"{version}-{i}" for i in range(size)]
         return value
 
     left, right = batch(2, seeded_first, 5), batch(3, not seeded_first, 6)
@@ -671,7 +670,6 @@ def test_scheduler_merge_preserves_explicit_seeds_and_row_alignment(seeded_first
         atol=0,
         rtol=0,
     )
-    assert left._areal_mask_request_ids == ["5-0", "5-1", "6-0", "6-1", "6-2"]
     assert left._areal_mask_versions == [5, 5, 6, 6, 6]
     assert left._areal_mask_leases == [(1, 2, 5)] * 2 + [(1, 2, 6)] * 3
 
@@ -715,7 +713,7 @@ def test_metrics_count_tp_logical_rows_separately_from_transport_owners(logical_
         id_bytes=15,
         offset_bytes=32,
         control_bytes=91,
-        shared_descriptors=7,
+        shared_index_pages_read=17,
         _sessions={1: SimpleNamespace(payload_bytes=15)},
         _cache_bytes=256,
     )
@@ -736,31 +734,37 @@ def test_metrics_count_tp_logical_rows_separately_from_transport_owners(logical_
         assert metrics["sampling_mask/lifetime/candidate_mean"] == pytest.approx(5 / 3)
 
 
-def test_decode_block_compaction_preserves_reordered_rows_and_version_expiry():
-    """Coalescing decode allocations cannot change IDs, labels or row handles."""
+@pytest.mark.parametrize("count,width", [(30, 1), (256, 2), (65536, 4)])
+def test_gin_frame_preserves_exact_candidates_and_policy_versions(count, width):
+    from areal.infra.sampling_mask.protocol import pack_frame, unpack_frame
+
+    ids = pack_uint24(torch.arange(count + 1))
+    values = (
+        ids,
+        torch.tensor([0, count, count + 1]),
+        torch.tensor([count - 1, count]),
+        torch.tensor([7, 2**40]),
+    )
+    frame = pack_frame(*values)
+    assert frame.numel() == 8 + 2 * (width + 12) + ids.numel()
+    for actual, expected in zip(unpack_frame(frame), values, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_fetch_row_ranges_preserve_sparse_and_contiguous_handles():
     import numpy as np
 
-    from areal.infra.sampling_mask.store import RowStore
+    from areal.infra.sampling_mask.protocol import pack_row_ranges, unpack_row_ranges
 
-    store = RowStore(1 << 20)
-    for index in range(256):
-        store.add(
-            np.array([2 * index + 1, 2 * index + 2]),
-            pack_uint24(torch.tensor([1, 2, 3, 4], dtype=torch.int32)),
-            torch.tensor([0, 1, 4]),
-            torch.tensor([1, 3]),
-            torch.tensor([1, 2]),
-        )
-    rows = np.arange(512, 0, -1)
-    before = store.read(rows)
-    previous_bytes = store.nbytes
-    store.compact()
-    assert len(store._blocks) == 1
-    assert store.nbytes <= previous_bytes
-    for actual, expected in zip(store.read(rows), before, strict=True):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    store.discard_before(2)
-    assert not store.locate(np.arange(1, 513, 2)).any()
-    packed, offsets, tokens, versions = store.read(np.arange(512, 0, -2))
-    SamplingMask(packed, offsets, 5, 2).validate(tokens, weight_version=2)
-    assert torch.all(versions == 2)
+    rows = np.array([1, 2, 3, 9, 15, 16, 2**40], dtype=np.int64)
+    encoded = pack_row_ranges(rows)
+    assert encoded == [[1, 3], 9, [15, 16], 2**40]
+    np.testing.assert_array_equal(unpack_row_ranges(encoded), rows)
+
+
+@pytest.mark.parametrize("ranges", [[], [[1, 65537]]])
+def test_fetch_row_count_is_bounded_before_expansion(ranges):
+    from areal.infra.sampling_mask.protocol import unpack_row_ranges
+
+    with pytest.raises(ValueError, match="fetch row count"):
+        unpack_row_ranges(ranges)

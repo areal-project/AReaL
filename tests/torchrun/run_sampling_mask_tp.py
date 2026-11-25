@@ -97,6 +97,7 @@ def main():
     cpu_group = dist.new_group(list(range(world)), backend="gloo")
     counters = SimpleNamespace(
         _candidate_histogram=torch.bincount(offsets.diff(), minlength=13).numpy(),
+        shared_index_pages_read=2,
         id_bytes=30,
         offset_bytes=40,
         control_bytes=17 if rank == 1 else 0,
@@ -106,6 +107,7 @@ def main():
     metrics = aggregate_metrics(
         counters, vocab_size=12, logical_owner=rank == 0, cpu_group=cpu_group
     )
+    assert metrics["sampling_mask/lifetime/shared_index_pages_read"] == 4
     assert metrics["sampling_mask/lifetime/received_rows"] == 4
     assert metrics["sampling_mask/lifetime/id_payload_bytes"] == 30
     assert metrics["sampling_mask/lifetime/gin_payload_bytes"] == 30

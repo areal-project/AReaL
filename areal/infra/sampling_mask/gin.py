@@ -81,18 +81,18 @@ class GinEndpoint:
         self.chunks = 0
 
     def transfer(self, tensor: torch.Tensor) -> None:
-        """Transfer one bounded contiguous CUDA byte chunk and wait for completion.
+        """Transfer one bounded contiguous byte chunk and wait for completion.
 
         Explicit completion provides backpressure and permits immediate source
         reuse. A persistent session/window is reused for every chunk and batch.
         """
         if (
             tensor.dtype != torch.uint8
-            or tensor.device != self.device
+            or tensor.device not in (torch.device("cpu"), self.device)
             or not tensor.is_contiguous()
         ):
             raise ValueError(
-                "GIN transfer needs contiguous uint8 on the endpoint device"
+                "GIN transfer needs contiguous uint8 on CPU or the endpoint GPU"
             )
         if not 0 < tensor.numel() <= self.slot_bytes:
             raise ValueError("GIN chunk exceeds its registered slot capacity")
@@ -101,7 +101,8 @@ class GinEndpoint:
                 raise RuntimeError("Sampling-mask GIN endpoint is closed")
             # Producer completion is explicit: the native endpoint uses its own
             # stream and must never race a PyTorch pack/copy on another stream.
-            torch.cuda.current_stream(self.device).synchronize()
+            if tensor.is_cuda:
+                torch.cuda.current_stream(self.device).synchronize()
             slot = self._next_slot
             self._sequence[slot] += 1
             try:

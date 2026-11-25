@@ -3,12 +3,14 @@
 
 import hashlib
 import ipaddress
+from itertools import chain
 
 import numpy as np
 import torch
 
 from areal.utils.sampling_mask import PROTOCOL_VERSION
 
+MAX_FETCH_ROWS = 65536
 REFERENCE_KEYS = ("sampling_mask_source", "sampling_mask_nonce", "sampling_mask_row")
 
 
@@ -66,3 +68,59 @@ def trajectory_references(response) -> dict[str, torch.Tensor]:
     return {
         key: values[:, index].contiguous() for index, key in enumerate(REFERENCE_KEYS)
     }
+
+
+def pack_row_ranges(rows: np.ndarray) -> list:
+    """Sorted unique handles: one integer per singleton, [first,last] per run."""
+    bounds = np.r_[0, np.flatnonzero(np.diff(rows) != 1) + 1, len(rows)]
+    return [
+        int(rows[a]) if b == a + 1 else [int(rows[a]), int(rows[b - 1])]
+        for a, b in zip(bounds[:-1], bounds[1:], strict=True)
+        if b > a
+    ]
+
+
+def unpack_row_ranges(ranges: list) -> np.ndarray:
+    runs = [
+        range(span, span + 1) if isinstance(span, int) else range(span[0], span[1] + 1)
+        for span in ranges
+    ]
+    n = sum(map(len, runs))
+    if not 0 < n <= MAX_FETCH_ROWS:
+        raise ValueError("Sampling-mask fetch row count exceeds request bounds")
+    return np.fromiter(chain.from_iterable(runs), dtype=np.int64, count=n)
+
+
+def pack_frame(packed, offsets, tokens, versions) -> torch.Tensor:
+    counts = offsets.diff().numpy()
+    width = np.min_scalar_type(int(counts.max())).itemsize
+    # All fields are little-endian; rows follow the fetch request order.
+    return torch.cat(
+        [
+            torch.from_numpy(
+                np.array([len(counts), width], dtype="<u4").view(np.uint8)
+            ),
+            torch.from_numpy(counts.astype(f"<u{width}").view(np.uint8)),
+            torch.from_numpy(tokens.numpy().astype("<i4").view(np.uint8)),
+            torch.from_numpy(versions.numpy().astype("<i8", copy=False).view(np.uint8)),
+            packed.flatten(),
+        ]
+    )
+
+
+def unpack_frame(frame: torch.Tensor):
+    data = frame.numpy()
+    n, width = map(int, np.frombuffer(data, "<u4", 2))
+    counts = np.frombuffer(data, f"<u{width}", n, 8).astype(np.int64)
+    start = 8 + width * n
+    tokens = np.frombuffer(data, "<i4", n, start).astype(np.int64)
+    versions = np.frombuffer(data, "<i8", n, start + 4 * n).copy()
+    offsets = np.r_[np.int64(0), counts.cumsum()]
+    # Detach the compact IDs from the transient frame and its metadata.
+    packed = frame[start + 12 * n :].reshape(int(offsets[-1]), 3).clone()
+    return (
+        packed,
+        torch.from_numpy(offsets),
+        torch.from_numpy(tokens),
+        torch.from_numpy(versions),
+    )

@@ -12,6 +12,7 @@ from areal.infra.sampling_mask import consumer as consumer_module
 from areal.infra.sampling_mask import service as service_module
 from areal.infra.sampling_mask.consumer import SamplingMaskConsumer
 from areal.infra.sampling_mask.lifetime import LeaseRegistry
+from areal.infra.sampling_mask.pages import SharedPageReader
 from areal.infra.sampling_mask.protocol import REFERENCE_KEYS
 from areal.infra.sampling_mask.service import MaskProducer
 from areal.infra.sampling_mask.store import shared_namespace
@@ -20,12 +21,14 @@ from areal.utils.sampling_mask import restricted_logprobs
 
 
 def main():
-    # Exercise manifest slicing and slot wraparound with many bounded chunks.
+    # Exercise frame slicing and slot wraparound with many bounded chunks.
     consumer_module.SLOT_BYTES = service_module.SLOT_BYTES = 1024
     dist.init_process_group("gloo")
     rank = dist.get_rank()
     device = 0 if torch.cuda.device_count() == 1 else int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(device)
+    actors = [1] if dist.get_world_size() == 2 else [2, 3]
+    tp_group = dist.new_group(actors, backend="nccl") if len(actors) == 2 else None
     torch.manual_seed(124)
     logits = torch.randn(129, 257, device=device)
     metadata = [None]
@@ -44,8 +47,7 @@ def main():
         )
         column = torch.multinomial(logp.exp(), 1)
         tokens = ids.gather(1, column).flatten()
-        # Model 129 decode steps so the real source read path also exercises
-        # bounded coalescing of small immutable CSR blocks.
+        # Publish 129 separate decode steps, then fetch them in one microbatch.
         refs = []
         for step in range(129):
             refs.extend(
@@ -69,7 +71,7 @@ def main():
             shared_namespace(),
         )
     dist.broadcast_object_list(metadata, src=0)
-    if rank == 1:
+    if rank in actors:
         refs, tokens, old, namespace = metadata[0]
         data = {
             key: torch.tensor([ref[i] for ref in refs])
@@ -77,21 +79,28 @@ def main():
         }
         labels_cpu = torch.tensor(tokens)
         versions = torch.full_like(labels_cpu, 7)
-        consumer = SamplingMaskConsumer(torch.device("cuda", device), None, 257)
+        consumer = SamplingMaskConsumer(torch.device("cuda", device), tp_group, 257)
         support = consumer.load_async(data, labels_cpu, versions).result()
         assert support.slot is not None
         shared = namespace is not None and namespace == shared_namespace()
         if shared:
             assert not consumer._sessions
-            assert all(
-                block.name and block.packed is None
-                for store in consumer._stores.values()
-                for block in store._blocks.values()
+            assert consumer._stores and all(
+                isinstance(store, SharedPageReader)
+                for store, _ in consumer._stores.values()
             )
         else:
+            wire_bytes = sum(s.payload_bytes for s in consumer._sessions.values())
+            # 129 counts fit uint8; each row also carries int32 token + int64 version.
+            chunks = sum(s.chunks for s in consumer._sessions.values())
+            totals = torch.tensor([wire_bytes, chunks], device=device)
+            if tp_group is not None:
+                dist.all_reduce(totals, group=tp_group)
+            wire_total, chunk_total = totals.tolist()
+            assert chunk_total > 2
             assert (
-                sum(session.payload_bytes for session in consumer._sessions.values())
-                == support.packed_ids.numel()
+                wire_total
+                == support.packed_ids.numel() + 13 * len(tokens) + 8 * chunk_total
             )
         initial_control_bytes = consumer.control_bytes
         ids, offsets = support.chunk(0, 129, torch.device("cuda", device))
@@ -141,6 +150,10 @@ def main():
             torch.testing.assert_close(
                 reused.packed_ids, expected.packed_ids, atol=0, rtol=0
             )
+        if not shared:
+            assert (
+                sum(s.payload_bytes for s in consumer._sessions.values()) == wire_bytes
+            )
         assert consumer.id_bytes == support.packed_ids.numel()
         assert consumer.control_bytes == initial_control_bytes
         with pytest.raises(ValueError, match="not aligned"):
@@ -148,9 +161,28 @@ def main():
         # The failed task must not poison the next read or release the lease.
         recovered = consumer.load_async(data, labels_cpu, versions).result()
         torch.testing.assert_close(recovered.packed_ids, support.packed_ids)
+        if not shared:
+            invalid = {**data, "sampling_mask_row": data["sampling_mask_row"] + 10000}
+            with pytest.raises(RuntimeError, match="Unknown sampling-mask row"):
+                consumer.load(invalid, labels_cpu, versions)
+            # A source rejection before the first frame leaves the session usable.
+            consumer.release_batch()
+            torch.testing.assert_close(
+                consumer.load(data, labels_cpu, versions).packed_ids, support.packed_ids
+            )
+            if rank == actors[0]:
+                from areal.utils import logging
+
+                logging.getLogger("RemoteInfEngine").warning(
+                    "GIN cold read: %d ID bytes, %d GIN bytes, %d puts, %d control body bytes",
+                    support.packed_ids.numel(),
+                    wire_total,
+                    chunk_total,
+                    initial_control_bytes,
+                )
         consumer.close()
         # Another shard can legitimately reference the same parent prefix.
-        second = SamplingMaskConsumer(torch.device("cuda", device), None, 257)
+        second = SamplingMaskConsumer(torch.device("cuda", device), tp_group, 257)
         repeated = second.load(data, labels_cpu, versions)
         torch.testing.assert_close(
             repeated.packed_ids, support.packed_ids, atol=0, rtol=0
@@ -160,14 +192,13 @@ def main():
 
         logging.getLogger("RemoteInfEngine").warning(
             "Sampling mask pipeline passed: 129 tokens, 3 PPO epochs, %s logical ID bytes via %s",
-            consumer.id_bytes,
+            support.packed_ids.numel(),
             "shared memory" if shared else "GIN",
         )
     dist.barrier()
     # Processes exit only after the receiver consumed every source chunk.
     dist.destroy_process_group()
     if producer is not None:
-        assert len(producer._store._blocks) == 1
         owner.close()
         assert producer._store.nbytes == 0
         producer.close()

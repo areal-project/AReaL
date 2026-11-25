@@ -30,7 +30,8 @@ Megatron 普通输出头和分块输出头都支持受限归一化。分块反�
 CSR 是 Compressed Sparse Row（压缩稀疏行）：把各生成位置的候选 ID 连续拼接，用 offsets 指出第 t 个位置的区间
 `IDs[offsets[t]:offsets[t+1]]`。因此存储量随候选总数增长，不创建完整 `[batch, length, vocab]` mask。
 
-- 协议版本为 2。候选 ID 使用小端 uint24，每个候选严格占 3 字节；词表不能超过 2²⁴。CPU 缓存以 CSR 存储，offsets 为 int64。
+- 每次新启动 RL 实验时，rollout 和 actor 均使用协议 v3。候选 ID 使用小端 uint24，每个候选严格占 3 字节；词表不能超过 2²⁴。CPU
+  缓存以 CSR 存储，offsets 为 int64。
 - 每个生成位置携带 source、producer nonce、row ID、协议版本和权重版本。 进入训练张量后，前三项作为 int64 列随 token
   一起拼接、重排、padding 和分片； 权重版本沿用 rollout 的 versions。
 - 控制面只发送行引用和元数据；同机可共享的候选 ID 块通过只读映射访问，跨机通过 NCCL GIN GDAKI 传输。每个 GIN 连接使用两个 8 MiB 注册窗口和
@@ -45,9 +46,8 @@ CSR 是 Compressed Sparse Row（压缩稀疏行）：把各生成位置的候选
   lease。拒绝、异常、取消和 controller 超时关闭 lease；晚到登记或异步持久化不能复活已释放的行。重复释放安全，失败的释放保留待重试记录。
 - 训练 batch 的 lease 是独立控制元数据，进入 actor packing 前移除；正常完成后统一释放，异常退出由 controller 清理。评估无需
   PPO，收集完成后释放。在线外部代理会话暂不支持此生命周期，开启功能时明确报错。
-- 协议版本 2 要求推理和训练进程同时更新并重启，不能混用仍按版本回收的旧生产者。
-- 推理端的小 decode 块在首次读取时合并，保留原 row ID；每次合并暂存不超过 8 MiB ID 和 16k 行元数据。部分释放块在最后一行释放后回收。
-- 缺失集合、重复/越界候选、动作不属于集合、版本或校验和不一致明确报错。
+- 推理端按原 row ID 写入共享页。lease 释放对应的行，页内最后一行释放后回收整页。
+- 源端 top-k 生成互异候选。训练核对采样 token 和策略版本，受限概率计算检查动作和词表边界。
 
 ## 资源与指标
 
@@ -90,19 +90,23 @@ torchrun --standalone --nproc-per-node=2 tests/torchrun/run_sampling_mask_gin.py
 processor、speculative decoding、推理 PP/attention CP、蒸馏、 tree training 和 auxiliary
 token/top logprobs；这些路径报错，不静默采用另一种 概率定义。训练请求必须使用配置中的 temperature/top-p。
 
-当整个 actor TP 组与生产者位于同一 Linux 主机、使用相同用户且可见同一 `/dev/shm` 时，同卡和异卡都直接读源端共享块，支持 TP=1。 采样端在独立
-CUDA stream 上打包 uint24 ID 并异步复制到页锁定主存。CPU 写线程最多允许两个待处理的 decode 批次，消费速度不足时对采样端施加反压。
-写线程在最多 16,384 行或 8 MiB 候选 ID 的窗口内，按请求稳定排序并合并多个 decode 批次。单个超过窗口的原始批次独立保存。
-首次读取可以封存窗口剩余的行。每行引用、生成 token、权重版本和 workflow lease 在整理过程中保持对应。
+当整个 actor TP 组与采样端位于同一共享内存命名空间时，同卡和异卡都可按 rollout 已保存的行号直接读 mask，支持
+TP=1。每个训练分片在批内首次遇到一个来源时查询一次 `/info`，用 producer nonce 校验来源并取得页目录。每页覆盖连续 16,384 个行号，索引每行
+24 字节，记录起始候选位置、候选个数、采样 token 和策略版本。候选区只按实际个数追加 uint24 ID。页号和页内下标均从行号计算。
 
-首次本地读取将候选 ID 块迁移到共享内存，actor 的批内索引保存共享块名、偏移和行元数据。Megatron 在当前微批的模型前向前发起加载，
-在输出头使用候选前等待。TP=1 的读取由后台线程执行。TP>1 的控制广播和跨机 GIN 接收在原调度线程上顺序执行，CPU 校验、重排和上传可与模型前向重叠。 每个
-actor rank 复用一个 8 MiB 页锁定主存槽和一个同等大小的显存槽，使用 CUDA event 协调上传与计算。槽仍被反向传播引用或空间不足时按需分块上传。
-`sampling_mask/lifetime/shared_descriptors` 累计各消费 rank 实际处理的共享块描述数，可与有效生成位置数一起观察碎片开销。
+采样端沿用独立 CUDA stream 和深度为 2 的有界写队列。写线程先追加候选，再在页锁内发布索引。训练先取得索引和候选的快照，按微批顺序组装，核对 token
+与版本。若末尾 D2H 尚未完成，训练侧通过一次仅含最大行号的 `/ready` 等待，重读仍不存在的行会报错。索引项在 lease 释放时失效，最后一行释放时回收整页。
+训练侧只为累计去重统计保存每页 2,048 字节的位图。批次结束后释放该位图和来源信息。
 
-tmpfs 空间不足会报错。统计共享页的实际占用应使用 PSS 或同一 cgroup 的内存计数。逻辑 ID 字节包含共享读取，GIN 载荷仅计 GIN 传输。
-块中最后一条活跃行的 workflow lease 释放时删除共享对象。如果 TP 组跨主机或无法共享同一 tmpfs，整组沿用 GIN 传输和批内缓存，
-这条路径要求接收方与源 GPU 的 UUID 不同。
+Megatron 在当前微批前向前开始预取，在输出头使用候选前等待。TP>1 的控制广播和跨机 GIN 接收保留调度顺序。每个 actor rank 复用一对 8 MiB
+上传槽，槽被占用或容量不足时按需分块上传。跨机或 TP 组无法共同映射来源 tmpfs 时，使用 GIN，接收 GPU 与源 GPU 的 UUID
+必须不同。使用共享页的源端也从同一份数据服务 GIN。源端缺少共享命名空间时使用私有 RowStore；已使用 tmpfs 的源端在容量不足时显式报错。
+
+跨机 actor 对来源的缺失行去重，把连续行编码为闭区间，通过一次 `/fetch` 请求最多 65,536 行。响应流每帧只通告 GIN 字节数，末尾返回完成状态。 GIN
+帧按请求行序携带两项 uint32 头字段（行数和计数宽度）、每行候选数（1、2 或 4 字节）、int32 生成 token、int64 策略版本和连续 uint24 ID。
+GIN 注册槽通过 ready/credit 管理复用。接收端重建 CSR，在本训练分片复用。TP=1 从注册显存直接复制到 CPU，TP>1 先在组内广播有效数据。
+`gin_payload_bytes` 包含帧头和行元数据，`id_payload_bytes` 只统计 ID 净载荷。`shared_index_pages_read`
+统计读取的同机共享页数， `control_body_bytes` 统计 HTTP 请求与响应正文。
 
 SGLang sampler 通过 `register_sampler_backend()` 注册，sampling-mask 接入不再改写已安装的 SGLang
 源文件。未知版本会在启动前报错。

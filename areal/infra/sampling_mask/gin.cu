@@ -172,15 +172,15 @@ class Endpoint {
     const size_t offset = slot * slot_bytes_;
     if (rank_ == 0) {
       cuda_check(cudaMemcpyAsync(static_cast<char *>(buffer_) + offset,
-                                 reinterpret_cast<void *>(pointer), bytes, cudaMemcpyDeviceToDevice,
+                                 reinterpret_cast<void *>(pointer), bytes, cudaMemcpyDefault,
                                  stream_));
       send_chunk<<<1, 1, 0, stream_>>>(dev_, window_, offset, bytes, slot, slots_, sequence,
                                        timeout_, error_);
     } else {
       wait_chunk<<<1, 1, 0, stream_>>>(dev_, slot, sequence, timeout_, error_);
       cuda_check(cudaMemcpyAsync(reinterpret_cast<void *>(pointer),
-                                 static_cast<char *>(buffer_) + offset, bytes,
-                                 cudaMemcpyDeviceToDevice, stream_));
+                                 static_cast<char *>(buffer_) + offset, bytes, cudaMemcpyDefault,
+                                 stream_));
       ack_chunk<<<1, 1, 0, stream_>>>(dev_, slot, slots_, timeout_, error_);
     }
     cuda_check(cudaGetLastError());

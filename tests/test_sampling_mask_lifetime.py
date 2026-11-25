@@ -2,7 +2,6 @@
 """Delayed readers, cancellation and source admission without CUDA or WeftMoE."""
 
 import asyncio
-from pathlib import Path
 from threading import Condition
 from unittest.mock import MagicMock
 
@@ -66,14 +65,14 @@ def test_queued_old_version_survives_new_publish_until_all_consumers_finish(owne
     persist(producer, [2, 3], [170, 200], [new, new])
     owner.release(new[2])
     for _epoch_or_shard in range(4):
-        assert producer._lookup([1])[2].tolist() == [166]
+        assert producer._store.read([1])[3].tolist() == [166]
         assert producer._store.read([1, 1])[2].tolist() == [7, 7]
     owner.release(old[2])
     owner.release(old[2])  # duplicate acknowledgement
     assert producer._store.nbytes == 0
     assert not producer._leases
     with pytest.raises(ValueError, match="already released"):
-        producer._lookup([1])
+        producer._store.read([1])
 
 
 def test_cancel_before_response_discards_pending_and_future_writes(ownership):
@@ -86,65 +85,6 @@ def test_cancel_before_response_discards_pending_and_future_writes(ownership):
     assert producer._store.nbytes == 0
     assert not producer._leases
     assert not owner.register(lease[2], 99, 101)
-
-
-def test_local_readers_share_id_pages_until_last_workflow_releases(ownership):
-    owner, producer = ownership
-    old, new = owner.create(), owner.create()
-    persist(producer, [1, 2], [166, 170], [old, new])
-    original_bytes = producer._store.nbytes
-    first = producer._handle("/shared", {"rows": [2, 1]})
-    name, selected, starts = first["blocks"][0]
-    assert selected == [0, 1] and starts == [2, 0]
-    backing = Path("/dev/shm") / name
-    assert backing.stat().st_size == 12
-    assert producer._store.nbytes == original_bytes
-    assert producer._handle("/shared", {"rows": [1]})["blocks"][0][0] == name
-    shared = RowStore(1 << 20)
-    shared.index_shared(
-        np.array([2, 1]),
-        name,
-        np.array(starts),
-        torch.tensor([0, 2, 4]),
-        torch.tensor(first["tokens"]),
-        torch.tensor(first["versions"]),
-        10,
-        6,
-    )
-    assert all(block.packed is None for block in shared._blocks.values())
-    for store in (shared, producer._store):
-        packed, _, _, versions = store.read([1, 2, 1])
-        torch.testing.assert_close(packed, pack_uint24(torch.tensor([7, 9] * 3)))
-        assert versions.tolist() == [166, 170, 166]
-    owner.release(old[2])
-    with pytest.raises(ValueError, match="released"):
-        producer._handle("/shared", {"rows": [1]})
-    assert backing.exists()
-    owner.release(new[2])
-    assert not backing.exists()
-    assert producer._store.nbytes == 0
-    with pytest.raises(FileNotFoundError):
-        shared.read([2])
-
-
-def test_shared_reader_rejects_bad_bounds_and_token_before_caching(ownership):
-    owner, producer = ownership
-    persist(producer, [1], [7], [owner.create()])
-    name, _, _ = producer._handle("/shared", {"rows": [1]})["blocks"][0]
-    reader = RowStore(1 << 20)
-    for start, token, error in [(1, 7, "exceeds shared block"), (0, 5, "missing")]:
-        with pytest.raises(ValueError, match=error):
-            reader.index_shared(
-                np.array([1]),
-                name,
-                np.array([start]),
-                torch.tensor([0, 2]),
-                torch.tensor([token]),
-                torch.tensor([7]),
-                10,
-                6,
-            )
-        assert reader.nbytes == 0
 
 
 def test_release_between_registration_and_persistence_cannot_resurrect_rows(
@@ -171,9 +111,9 @@ def test_mixed_sampler_batch_releases_only_finished_workflow(ownership):
     first, second = owner.create(), owner.create()
     persist(producer, [1, 2, 3], [1, 1, 1], [first, second, first])
     owner.release(first[2])
-    assert producer._lookup([2])[0].tolist() == [2]
+    assert producer._store.counts([2]).tolist() == [2]
     with pytest.raises(ValueError, match="already released"):
-        producer._lookup([1])
+        producer._store.read([1])
     owner.release(second[2])
     assert producer._store.nbytes == 0
 
@@ -187,7 +127,7 @@ def test_failed_release_stays_fenced_and_retries(ownership, monkeypatch):
     with pytest.raises(TimeoutError):
         owner.release(lease[2])
     assert not owner.register(lease[2], 88, 99)
-    assert producer._lookup([1])[0].tolist() == [2]
+    assert producer._store.counts([1]).tolist() == [2]
     monkeypatch.setattr(lifetime, "call", original)
     owner.release(lease[2])
     assert not owner._leases
@@ -391,46 +331,6 @@ async def test_controller_owns_lease_before_rpc_and_fences_abandoned_task(
         controller._sampling_mask_owner.close()
 
 
-def test_decode_windows_seal_in_request_order_and_keep_old_row_handles(monkeypatch):
-    from areal.infra.sampling_mask import store as store_module
-
-    monkeypatch.setattr(store_module, "_SEGMENT_ROWS", 8)
-    store = RowStore(1 << 20)
-    try:
-        # Two interleaved requests, including cancelled rows in a partial block.
-        for step in range(9):
-            rows = np.array([2 * step + 1, 2 * step + 2])
-            labels = torch.from_numpy(rows)
-            packed = pack_uint24(torch.tensor([rows[0], rows[1], 99]))
-            store.add(
-                rows,
-                packed,
-                torch.tensor([0, 1, 3]),
-                labels,
-                labels + 10,
-                request_keys=np.array([0, 1]),
-            )
-            if step == 1:
-                store.delete(np.array([4]))
-        # Two full windows have already been sealed by the writer.
-        assert len(store._blocks) == 3
-        store.compact()
-        with pytest.raises(ValueError, match="released"):
-            store.read([4])
-        groups = store.share([1, 3, 5, 7])
-        assert len(groups) == 1
-        assert groups[0][2] == [0, 1, 2, 3]
-        rows = np.array([18, 1, 9, 18, 2, 7])
-        packed, offsets, labels, versions = store.read(rows)
-        expected = [v for r in rows for v in ([r, 99] if r % 2 == 0 else [r])]
-        torch.testing.assert_close(packed, pack_uint24(torch.tensor(expected)))
-        assert labels.tolist() == rows.tolist()
-        assert versions.tolist() == (rows + 10).tolist()
-        assert offsets.tolist() == [0, 2, 3, 4, 6, 8, 9]
-    finally:
-        store.close()
-
-
 def test_batch_release_drains_async_reader_before_clearing_store(monkeypatch):
     import weakref
     from concurrent.futures import Future, ThreadPoolExecutor, wait
@@ -442,6 +342,7 @@ def test_batch_release_drains_async_reader_before_clearing_store(monkeypatch):
     reader = object.__new__(reader_module.SamplingMaskConsumer)
     reader._pending_read = weakref.ref(result)
     reader._stores = {"current": object()}
+    reader._seen_pages = {}
     reader._cache_bytes = 123
     waiting = Event()
 
@@ -461,3 +362,229 @@ def test_batch_release_drains_async_reader_before_clearing_store(monkeypatch):
     with pytest.raises(ValueError, match="bad row"):
         result.result()
     assert not reader._stores and reader._cache_bytes == 0
+
+
+def test_published_pages_survive_reorder_and_release_only_live_rows(ownership):
+    from areal.infra.sampling_mask.pages import (
+        PAGE_ROWS,
+        SharedPageReader,
+        SharedPageWriter,
+        UnpublishedRow,
+    )
+
+    owner, producer = ownership
+    producer._store = writer = SharedPageWriter(1 << 20)
+    reader = SharedPageReader(writer.prefix, 10)
+    a, b = owner.create(), owner.create()
+    rows = [PAGE_ROWS - 1, PAGE_ROWS, PAGE_ROWS + 1, PAGE_ROWS + 3]
+    persist(producer, rows, [1, 2, 3, 4], [a, b, a, b])
+    packed, offsets, tokens, versions = reader.read(
+        [rows[3], rows[0], rows[1], rows[3]]
+    )
+    torch.testing.assert_close(
+        packed, pack_uint24(torch.tensor([7, 9] * 4)), rtol=0, atol=0
+    )
+    assert offsets.tolist() == [0, 2, 4, 6, 8]
+    assert tokens.tolist() == [7] * 4 and versions.tolist() == [4, 1, 2, 4]
+    owner.release(a[2])
+    with pytest.raises(UnpublishedRow, match="released"):
+        reader.read([rows[0]])
+    assert reader.read([rows[1]])[3].tolist() == [2]
+    owner.release(b[2])
+    assert writer.nbytes == 0
+    persist(producer, [PAGE_ROWS + 4], [8], [owner.create()])
+    with pytest.raises(UnpublishedRow, match="released"):
+        reader.read([rows[3]])
+
+
+def test_shared_directory_scalar_wait_and_epoch_reuse(ownership, monkeypatch):
+    from threading import Event, Thread
+
+    from areal.infra.sampling_mask.consumer import SamplingMaskConsumer
+    from areal.infra.sampling_mask.pages import SharedPageWriter
+    from areal.infra.sampling_mask.protocol import REFERENCE_KEYS
+    from areal.infra.sampling_mask.store import shared_namespace
+
+    owner, producer = ownership
+    producer._store = SharedPageWriter(1 << 20)
+    producer.uuid = "same-GPU"
+    producer._persisted_until = 1
+    reader = object.__new__(SamplingMaskConsumer)
+    reader.shared_namespace = shared_namespace()
+    reader.world, reader.rank, reader.uuids = 1, 0, [producer.uuid]
+    reader._pending_read = None
+    reader.shared_index_pages_read = 0
+    reader.vocab_size = 10
+    reader._candidate_histogram = np.zeros(11, dtype=np.int64)
+    reader._cache_bytes = reader.id_bytes = reader.offset_bytes = 0
+    reader._stores, reader._seen_pages = {}, {}
+    ready = Event()
+    calls = []
+
+    def control(source, nonce, path, **payload):
+        calls.append((path, payload))
+        if path == "/ready":
+            ready.set()
+        return producer._handle(path, payload)
+
+    monkeypatch.setattr(reader, "_control", control)
+    lease = owner.create()
+
+    def writer():
+        assert ready.wait(5)
+        persist(producer, [1, 2], [9, 8], [lease] * 2)
+        with producer._condition:
+            producer._persisted_until = 3
+            producer._condition.notify_all()
+
+    thread = Thread(target=writer)
+    thread.start()
+    refs = dict(
+        zip(
+            REFERENCE_KEYS,
+            (
+                torch.tensor(column)
+                for column in ([99, 99, 0, 99], [101, 101, 0, 101], [2, 1, 0, 2])
+            ),
+            strict=True,
+        )
+    )
+    labels, versions = torch.tensor([7, 7, 0, 7]), torch.tensor([8, 9, -1, 8])
+    for _ in range(3):
+        mask = reader.load(refs, labels, versions)
+        assert mask.offsets.tolist() == [0, 2, 4, 4, 6]
+    thread.join(5)
+    assert not thread.is_alive()
+    assert calls == [("/info", {}), ("/ready", {"through": 2})]
+    assert reader.id_bytes == 12 and reader._candidate_histogram[2] == 2
+    with pytest.raises(ValueError, match="not aligned"):
+        reader.load(refs, labels + 1, versions)
+    with pytest.raises(ValueError, match="version mismatch"):
+        reader.load(refs, labels, versions + 1)
+
+
+def test_shared_page_budget_and_bounds_fail_explicitly():
+    from areal.infra.sampling_mask.pages import (
+        SharedPageReader,
+        SharedPageWriter,
+        _index,
+    )
+
+    rows = np.array([1, 2])
+    args = (
+        rows,
+        pack_uint24(torch.tensor([1, 2, 3])),
+        torch.tensor([0, 1, 3]),
+        torch.tensor([1, 2]),
+        torch.tensor([7, 7]),
+    )
+    tiny = SharedPageWriter(1)
+    with pytest.raises(MemoryError, match="capacity"):
+        tiny.add(*args)
+    assert not tiny.pages and tiny.nbytes == 0
+    writer = SharedPageWriter(1 << 20)
+    try:
+        writer.add(*args)
+        reader = SharedPageReader(writer.prefix, 4)
+        with _index(writer.pages[0].index.name, write=True) as entries:
+            entries["start"][0] = 1 << 50
+        with pytest.raises(ValueError, match="exceeds candidate page"):
+            reader.read([1])
+    finally:
+        writer.close()
+
+
+def test_shared_page_failed_append_rolls_back_across_page_boundary(monkeypatch):
+    from areal.infra.sampling_mask import pages
+
+    writer = pages.SharedPageWriter(2 << 20)
+    real_write = pages.os.pwrite
+    lengths = []
+
+    def short_write(fd, data, offset):
+        lengths.append(len(data))
+        return real_write(fd, data[:1] if len(lengths) == 2 else data, offset)
+
+    monkeypatch.setattr(pages.os, "pwrite", short_write)
+    rows = np.array([pages.PAGE_ROWS, pages.PAGE_ROWS + 1])
+    args = (
+        rows,
+        pack_uint24(torch.tensor([1, 2])),
+        torch.tensor([0, 1, 2]),
+        torch.tensor([1, 2]),
+        torch.tensor([7, 8]),
+    )
+    try:
+        with pytest.raises(OSError, match="Short write"):
+            writer.add(*args)
+        assert not writer.pages and writer.nbytes == 0
+        writer.add(*args)
+        assert writer.read(rows)[3].tolist() == [7, 8]
+    finally:
+        writer.close()
+
+
+def test_inflight_page_read_pins_payload_across_unlink_and_recreation(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+    from threading import Event
+
+    from areal.infra.sampling_mask import pages
+
+    writer = pages.SharedPageWriter(1 << 20)
+    reader = pages.SharedPageReader(writer.prefix, 10)
+    mapped, resume = Event(), Event()
+    original = pages._index
+
+    @contextmanager
+    def pause_after_snapshot(name, write=False):
+        with original(name, write) as entries:
+            yield entries
+        if not write:
+            mapped.set()
+            assert resume.wait(5)
+
+    def publish(row, token):
+        writer.add(
+            np.array([row]),
+            pack_uint24(torch.tensor([token])),
+            torch.tensor([0, 1]),
+            torch.tensor([token]),
+            torch.tensor([7]),
+        )
+
+    try:
+        publish(1, 3)
+        monkeypatch.setattr(pages, "_index", pause_after_snapshot)
+        with ThreadPoolExecutor(1) as worker:
+            result = worker.submit(reader.read, [1])
+            try:
+                assert mapped.wait(5)
+                writer.delete([1])
+                publish(2, 9)
+            finally:
+                resume.set()
+            torch.testing.assert_close(
+                result.result(timeout=5)[0],
+                pack_uint24(torch.tensor([3])),
+                atol=0,
+                rtol=0,
+            )
+        with pytest.raises(pages.UnpublishedRow, match="released"):
+            reader.read([1])
+        assert reader.read([2])[2].tolist() == [9]
+    finally:
+        writer.close()
+
+
+def test_visible_shared_page_name_before_truncate_waits_for_publication(
+    tmp_path, monkeypatch
+):
+    from areal.infra.sampling_mask import pages
+
+    monkeypatch.setattr(pages, "_SHM", tmp_path)
+    reader = pages.SharedPageReader("a" * 32, 16)
+    name, _ = reader._names(0)
+    (tmp_path / name).touch()
+    with pytest.raises(pages.UnpublishedRow, match="being created"):
+        reader.read([1])

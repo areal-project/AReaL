@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-sampling-owner bounded CSR cache and metadata-only HTTP control plane."""
 
-import hashlib
 import json
 import secrets
 from array import array
@@ -14,7 +13,12 @@ import torch
 
 from areal.infra.sampling_mask.gin import GinEndpoint, load_extension
 from areal.infra.sampling_mask.lifetime import call, validate_lease
-from areal.infra.sampling_mask.protocol import encode_endpoint
+from areal.infra.sampling_mask.pages import PAGE_ROWS, SharedPageWriter
+from areal.infra.sampling_mask.protocol import (
+    encode_endpoint,
+    pack_frame,
+    unpack_row_ranges,
+)
 from areal.infra.sampling_mask.store import RowStore, shared_namespace
 from areal.utils.network import gethostip
 from areal.utils.sampling_mask import PROTOCOL_VERSION, pack_uint24
@@ -38,7 +42,11 @@ class MaskProducer:
         self.uuid = str(torch.cuda.get_device_properties(device).uuid)
         self._condition = Condition()
         self._next_row = 1
-        self._store = RowStore(CACHE_BYTES)
+        self._store = (
+            SharedPageWriter(CACHE_BYTES)
+            if shared_namespace()
+            else RowStore(CACHE_BYTES)
+        )
         self._fatal_error = None
         self._persisted_until = 1
         self._leases: dict[tuple[int, int, int], array] = {}
@@ -70,6 +78,20 @@ class MaskProducer:
                     request = json.loads(self.rfile.read(size))
                     if request.get("nonce") != producer.nonce:
                         raise ValueError("Sampling-mask producer generation mismatch")
+                    if self.path == "/fetch":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/x-ndjson")
+                        self.end_headers()
+
+                        def announce(value):
+                            self.wfile.write(json.dumps(value).encode() + b"\n")
+
+                        try:
+                            producer._fetch(request, announce)
+                            announce(0)
+                        except Exception as exc:
+                            announce(f"{type(exc).__name__}: {exc}")
+                        return
                     response = producer._handle(self.path, request)
                     encoded = json.dumps(response).encode()
                     self.send_response(200)
@@ -87,9 +109,7 @@ class MaskProducer:
         self.source = encode_endpoint(*self._server.server_address)
         Thread(target=self._server.serve_forever, daemon=True).start()
 
-    def publish(
-        self, ids, counts, tokens, versions, leases, request_ids=None
-    ) -> list[list[int]]:
+    def publish(self, ids, counts, tokens, versions, leases) -> list[list[int]]:
         """Enqueue bounded asynchronous D2H; return only CPU-generated row handles."""
         leases = [validate_lease(lease) for lease in leases]
         if len(leases) != ids.shape[0]:
@@ -144,7 +164,6 @@ class MaskProducer:
                     host_tokens.long(),
                     torch.tensor(versions, dtype=torch.int64),
                     leases,
-                    request_ids,
                 )
                 with self._condition:
                     self._persisted_until = start + batch_size
@@ -169,9 +188,7 @@ class MaskProducer:
             for i in range(batch_size)
         ]
 
-    def _persist_rows(
-        self, rows, packed, offsets, tokens, versions, leases, request_ids=None
-    ):
+    def _persist_rows(self, rows, packed, offsets, tokens, versions, leases):
         # Only the single writer registers sources. Install local admission
         # *before* the callback so a concurrent release can fence this writer.
         active = set()
@@ -196,26 +213,26 @@ class MaskProducer:
                     continue
             active.add(lease)
         with self._condition:
-            # Persist as one compact block, then remove cancelled rows. The
-            # lock makes publication atomic with the final release callback.
+            # Serialize admission and append with the final release callback.
             keep = np.array(
                 [lease in active and lease in self._leases for lease in leases]
             )
             if not keep.any():
                 return
-            # A hash only chooses physical order; identity and release always use
-            # the original row handle and lease, including on a hash collision.
-            keys = np.fromiter(
-                map(hash, request_ids if request_ids is not None else leases),
-                dtype=np.int64,
-                count=len(rows),
-            )
-            self._store.add(rows, packed, offsets, tokens, versions, request_keys=keys)
+            if keep.all():
+                self._store.add(rows, packed, offsets, tokens, versions)
+            else:
+                lengths = np.diff(offsets.numpy())
+                self._store.add(
+                    rows[keep],
+                    packed[np.repeat(keep, lengths)],
+                    torch.from_numpy(np.r_[np.int64(0), lengths[keep].cumsum()]),
+                    tokens[keep],
+                    versions[keep],
+                )
             for row, lease, live in zip(rows, leases, keep, strict=True):
                 if live:
                     self._leases[lease].append(int(row))
-            if not keep.all():
-                self._store.delete(rows[~keep])
 
     def _release_lease(self, lease):
         with self._condition:
@@ -223,35 +240,62 @@ class MaskProducer:
             if rows:
                 self._store.delete(np.frombuffer(rows, dtype=np.int64))
 
-    def _lookup(self, row_ids):
-        if len(row_ids) > 65536 or len(set(row_ids)) != len(row_ids):
-            raise ValueError("Invalid sampling-mask row request")
-        rows = np.asarray(row_ids, dtype=np.int64)
-        with self._condition:
-            if np.any(rows <= 0) or np.any(rows >= self._next_row):
-                raise ValueError("Unknown sampling-mask row")
-            ready = self._condition.wait_for(
-                lambda: self._fatal_error is not None
-                or np.all(rows < self._persisted_until),
-                timeout=60,
-            )
-            if self._fatal_error is not None:
-                raise RuntimeError(self._fatal_error)
-            if not ready:
-                raise TimeoutError("Sampling-mask source persistence timed out")
-            self._store.compact()
-            return self._store.describe(rows)
+    def _fetch(self, request, announce):
+        rows = unpack_row_ranges(request["rows"])
+        peer = request["peer"]
+        with self._transfer_locks[peer]:
+            with self._condition:
+                self._wait_for_row(int(rows[-1]))
+                counts = self._store.counts(rows)
+            # Bound host assembly as well as the GIN windows. A single row
+            # can fill a slot with IDs; its metadata then uses a second put.
+            width = np.min_scalar_type(int(counts.max())).itemsize
+            ends = np.r_[np.int64(0), (counts * 3 + width + 12).cumsum()]
+            start = 0
+            while start < len(rows):
+                end = max(
+                    start + 1,
+                    int(ends.searchsorted(ends[start] + SLOT_BYTES - 8, side="right"))
+                    - 1,
+                )
+                with self._condition:
+                    data = self._store.read(rows[start:end])
+                frame = pack_frame(*data)
+                announce(frame.numel())
+                for chunk in frame.split(SLOT_BYTES):
+                    self._sessions[peer].transfer(chunk)
+                start = end
+
+    def _wait_for_row(self, row):
+        if not 0 < row < self._next_row:
+            raise ValueError("Unknown sampling-mask row")
+        ready = self._condition.wait_for(
+            lambda: self._fatal_error is not None or row < self._persisted_until,
+            timeout=60,
+        )
+        if self._fatal_error is not None:
+            raise RuntimeError(self._fatal_error)
+        if not ready:
+            raise TimeoutError("Sampling-mask source persistence timed out")
 
     def _handle(self, path: str, request: dict) -> dict:
         if path == "/release_lease":
             self._release_lease(request["lease"])
             return {"released": True}
+        if path == "/ready":
+            with self._condition:
+                self._wait_for_row(request["through"])
+            return {}
         if path == "/info":
             return {
+                "page_directory": (
+                    {"layout": 1, "prefix": self._store.prefix, "rows": PAGE_ROWS}
+                    if isinstance(self._store, SharedPageWriter)
+                    else None
+                ),
                 "uuid": self.uuid,
                 "shared_namespace": shared_namespace(),
                 "protocol": PROTOCOL_VERSION,
-                "slot_bytes": SLOT_BYTES,
             }
         if path == "/connect":
             peer = request["peer"]
@@ -289,33 +333,6 @@ class MaskProducer:
                 self._reserved.append(self._session_buffers.pop(peer))
                 del self._transfer_locks[peer]
             return {"closed": True}
-        counts, tokens, versions = self._lookup(request["rows"])
-        if path in {"/describe", "/shared"}:
-            manifest = {
-                "counts": counts.tolist(),
-                "tokens": tokens.tolist(),
-                "versions": versions.tolist(),
-                "protocol": PROTOCOL_VERSION,
-            }
-            if path == "/shared":
-                with self._condition:
-                    manifest["blocks"] = self._store.share(request["rows"])
-            return manifest
-        if path == "/send":
-            total = int(counts.sum()) * 3
-            if total != request["bytes"] or total > SLOT_BYTES:
-                raise ValueError("Sampling-mask chunk descriptor size mismatch")
-            # Acquire before allocating staging tensors, so queued callers
-            # cannot multiply per-peer CPU/GPU scratch usage.
-            with self._transfer_locks[request["peer"]]:
-                with self._condition:
-                    payload = self._store.read(request["rows"])[0].reshape(-1)
-                checksum = hashlib.sha256(memoryview(payload.numpy())).hexdigest()
-                endpoint = self._sessions[request["peer"]]
-                with torch.cuda.device(self.device):
-                    device_payload = payload.to(device=self.device)
-                    endpoint.transfer(device_payload)
-            return {"bytes": total, "sha256": checksum}
         raise ValueError("Unknown sampling-mask control operation")
 
     def close(self):

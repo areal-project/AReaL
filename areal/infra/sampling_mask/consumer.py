@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Training-shard CPU cache; each support crosses the rollout boundary once."""
 
-import hashlib
+import json
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import closing
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -12,13 +13,19 @@ import torch
 import torch.distributed as dist
 
 from areal.infra.sampling_mask.gin import GinEndpoint, load_extension
-from areal.infra.sampling_mask.protocol import REFERENCE_KEYS, decode_endpoint
+from areal.infra.sampling_mask.pages import PAGE_ROWS, SharedPageReader, UnpublishedRow
+from areal.infra.sampling_mask.protocol import (
+    MAX_FETCH_ROWS,
+    REFERENCE_KEYS,
+    decode_endpoint,
+    pack_row_ranges,
+    unpack_frame,
+)
 from areal.infra.sampling_mask.service import CACHE_BYTES, SLOT_BYTES
 from areal.infra.sampling_mask.store import RowStore, shared_namespace
 from areal.utils.sampling_mask import (
     PROTOCOL_VERSION,
     UPLOAD_SLOT_BYTES,
-    SamplingMask,
     unpack_uint24,
 )
 
@@ -121,9 +128,10 @@ class SamplingMaskConsumer:
         )
         self._pending_read = None
         self._upload = _UploadSlot(self.device)
-        self.shared_descriptors = 0
+        self.shared_index_pages_read = 0
         self._sessions = {}
         self._stores = {}
+        self._seen_pages = {}
         self._cache_bytes = 0
         self.id_bytes = 0
         self.offset_bytes = 0
@@ -189,133 +197,98 @@ class SamplingMaskConsumer:
             raise RuntimeError(f"Sampling-mask owner failed: {envelope['error']}")
         return envelope["result"]
 
-    def _receive(self, source, nonce, rows, owner, manifest):
-        key = (source, nonce)
-        if manifest["protocol"] != PROTOCOL_VERSION:
-            raise ValueError("Sampling-mask manifest protocol version mismatch")
-        counts = manifest["counts"]
-        total_bytes = sum(counts) * 3
-        if total_bytes > SLOT_BYTES:
-            raise ValueError(
-                "Sampling-mask requested chunk exceeds registered capacity"
-            )
-        device_payload = torch.empty(total_bytes, dtype=torch.uint8, device=self.device)
+    def _connect(self, key):
+        if key in self._sessions:
+            return
+        source, nonce = key
+        unique_id = load_extension().bootstrap_id()
+        connecting = self._executor.submit(
+            self._control,
+            source,
+            nonce,
+            "/connect",
+            peer=self.uuid,
+            unique_id=unique_id.hex(),
+        )
+        try:
+            endpoint = GinEndpoint(unique_id, 1, self.device.index, SLOT_BYTES)
+        except Exception as local_error:
+            # Preserve the peer's actionable setup error, rather than
+            # reporting only a local missing-peer timeout.
+            try:
+                connecting.result()
+            except Exception as peer_error:
+                raise RuntimeError(
+                    f"Sampling-mask GIN local setup: {local_error}; "
+                    f"peer setup: {peer_error}"
+                ) from local_error
+            raise
+        connecting.result()
+        self._sessions[key] = endpoint
+
+    def _frame_sizes(self, key, rows):
+        source, nonce = key
+        self._connect(key)
+        request = {"nonce": nonce, "peer": self.uuid, "rows": pack_row_ranges(rows)}
+        with requests.post(
+            decode_endpoint(source) + "/fetch", json=request, stream=True, timeout=90
+        ) as response:
+            self.control_bytes += len(response.request.body)
+            response.raise_for_status()
+            while line := response.raw.readline():
+                self.control_bytes += len(line)
+                size = json.loads(line)
+                if isinstance(size, str):
+                    raise RuntimeError(f"Sampling-mask fetch: {size}")
+                if size == 0:
+                    return
+                yield size
+            raise EOFError("Sampling-mask fetch ended before completion")
+
+    def _receive(self, key, rows, owner, store):
+        # Only the owner opens the HTTP stream and receives GIN frames. TP
+        # peers learn the actual frame length before broadcasting the bytes.
+        wire = None
 
         def receive():
-            endpoint = self._sessions.get(key)
-            if endpoint is None:
-                unique_id = load_extension().bootstrap_id()
-                connecting = self._executor.submit(
-                    self._control,
-                    source,
-                    nonce,
-                    "/connect",
-                    peer=self.uuid,
-                    unique_id=unique_id.hex(),
+            nonlocal wire
+            size = next(sizes, 0)
+            if size:
+                wire = torch.empty(
+                    size,
+                    dtype=torch.uint8,
+                    device=self.device if self.world > 1 else "cpu",
                 )
-                try:
-                    endpoint = GinEndpoint(unique_id, 1, self.device.index, SLOT_BYTES)
-                except Exception as local_error:
-                    # Preserve the peer's actionable setup error, rather than
-                    # reporting only a local missing-peer timeout.
-                    try:
-                        connecting.result()
-                    except Exception as peer_error:
-                        raise RuntimeError(
-                            f"Sampling-mask GIN local setup: {local_error}; "
-                            f"peer setup: {peer_error}"
-                        ) from local_error
-                    raise
-                connecting.result()
-                self._sessions[key] = endpoint
-            sending = self._executor.submit(
-                self._control,
-                source,
-                nonce,
-                "/send",
-                peer=self.uuid,
-                rows=rows,
-                bytes=total_bytes,
-            )
-            endpoint.transfer(device_payload)
-            expected = sending.result()["sha256"]
-            actual = hashlib.sha256(
-                memoryview(device_payload.cpu().numpy())
-            ).hexdigest()
-            if actual != expected:
-                raise ValueError("Sampling-mask GIN payload checksum mismatch")
-            return True
+                endpoint = self._sessions[key]
+                for chunk in wire.split(SLOT_BYTES):
+                    endpoint.transfer(chunk)
+            return size
 
-        self._owner_call(owner, receive)
-        if self.world > 1:
-            dist.broadcast(
-                device_payload,
-                src=dist.get_global_rank(self.group, owner),
-                group=self.group,
-            )
-        packed = device_payload.cpu().reshape(-1, 3)
-        offsets = torch.tensor([0, *counts], dtype=torch.int64).cumsum(0)
-        tokens = torch.tensor(manifest["tokens"], dtype=torch.int64)
-        versions = torch.tensor(manifest["versions"], dtype=torch.int64)
-        # Protocol/weight identities are checked separately per token below;
-        # validate all CSR structure and membership in one vectorized operation.
-        SamplingMask(packed, offsets, self.vocab_size, 0).validate(
-            tokens, weight_version=0
-        )
-        store = self._stores.setdefault(key, RowStore(CACHE_BYTES))
-        store.capacity = CACHE_BYTES - self._cache_bytes + store.nbytes
-        previous = store.nbytes
-        store.add(rows, packed, offsets, tokens, versions)
-        self._cache_bytes += store.nbytes - previous
-        self.id_bytes += total_bytes
-        self.offset_bytes += offsets.numel() * 8
-        self._candidate_histogram += np.bincount(counts, minlength=self.vocab_size + 1)
-        # Only the workflow lease owner releases source rows after every
-        # training consumer has finished. A shard must not delete shared prefixes.
-
-    def _index_shared(self, store, rows, manifest):
-        if manifest["protocol"] != PROTOCOL_VERSION:
-            raise ValueError("Sampling-mask manifest protocol version mismatch")
-        counts = np.asarray(manifest["counts"], dtype=np.int64)
-        tokens, versions = (
-            torch.tensor(manifest[key], dtype=torch.int64)
-            for key in ("tokens", "versions")
-        )
-        positions = np.asarray(
-            [pos for _, group, _ in manifest["blocks"] for pos in group], dtype=np.int64
-        )
-        if (
-            counts.shape != (len(rows),)
-            or tokens.shape != counts.shape
-            or versions.shape != counts.shape
-            or np.any(counts <= 0)
-            or np.any(counts > min(SLOT_BYTES // 3, self.vocab_size))
-            or not np.array_equal(np.sort(positions), np.arange(len(rows)))
-        ):
-            raise ValueError("Invalid shared sampling-mask row descriptors")
-        self.shared_descriptors += len(manifest["blocks"])
-        for name, selected, starts in manifest["blocks"]:
-            selected = np.asarray(selected, dtype=np.int64)
-            starts = np.asarray(starts, dtype=np.int64)
-            if starts.shape != selected.shape or np.any(starts < 0):
-                raise ValueError("Invalid shared sampling-mask offsets")
-            offsets = torch.from_numpy(np.concatenate(([0], counts[selected].cumsum())))
-            store.capacity = CACHE_BYTES - self._cache_bytes + store.nbytes
-            previous = store.nbytes
-            store.index_shared(
-                rows[selected],
-                name,
-                starts,
-                offsets,
-                tokens[selected],
-                versions[selected],
-                self.vocab_size,
-                SLOT_BYTES,
-            )
-            self._cache_bytes += store.nbytes - previous
-        self.id_bytes += int(counts.sum()) * 3
-        self.offset_bytes += (len(rows) + 1) * 8
-        self._candidate_histogram += np.bincount(counts, minlength=self.vocab_size + 1)
+        offset = 0
+        with closing(self._frame_sizes(key, rows)) as sizes:
+            while size := self._owner_call(owner, receive):
+                if self.world > 1:
+                    if self.rank != owner:
+                        wire = torch.empty(size, dtype=torch.uint8, device=self.device)
+                    dist.broadcast(
+                        wire,
+                        src=dist.get_global_rank(self.group, owner),
+                        group=self.group,
+                    )
+                packed, offsets, tokens, versions = unpack_frame(wire.cpu())
+                end = offset + len(tokens)
+                previous = store.nbytes
+                store.capacity = CACHE_BYTES - self._cache_bytes + previous
+                store.add(rows[offset:end], packed, offsets, tokens, versions)
+                self._cache_bytes += store.nbytes - previous
+                self.id_bytes += packed.numel()
+                self.offset_bytes += offsets.numel() * 8
+                self._candidate_histogram += np.bincount(
+                    offsets.diff().numpy(), minlength=self.vocab_size + 1
+                )
+                offset = end
+        if offset != len(rows):
+            raise ValueError("Sampling-mask fetch returned an incomplete row set")
 
     def load(
         self, inputs: dict, labels: torch.Tensor, versions: torch.Tensor | None = None
@@ -351,6 +324,23 @@ class SamplingMaskConsumer:
         self._pending_read = weakref.ref(future)
         return future
 
+    def _open_source(self, key):
+        info = self._owner_call(0, self._control, *key, "/info")
+        if info["protocol"] != PROTOCOL_VERSION:
+            raise ValueError("Sampling-mask manifest protocol version mismatch")
+        if (
+            self.shared_namespace is not None
+            and info["shared_namespace"] == self.shared_namespace
+        ):
+            directory = info["page_directory"]
+            if directory["layout"] != 1 or directory["rows"] != PAGE_ROWS:
+                raise ValueError("Sampling-mask shared page layout version mismatch")
+            return SharedPageReader(directory["prefix"], self.vocab_size), None
+        for owner, uuid in enumerate(self.uuids):
+            if uuid != info["uuid"]:
+                return RowStore(CACHE_BYTES), owner
+        raise ValueError("GIN needs a distinct GPU in the actor TP group")
+
     def _resolve(self, inputs, labels, versions):
         """Resolve CPU token references after packing/CP/layout conversion."""
         if labels.device.type != "cpu":
@@ -363,72 +353,42 @@ class SamplingMaskConsumer:
         labels = labels.reshape(-1)
         versions = versions.reshape(-1) if versions is not None else None
         reads = []
-        shared_manifests = []
-        for source, nonce in np.unique(refs[:, :2], axis=0):
+        # Trajectory-packed runs usually contain thousands of consecutive rows
+        # from one producer. Sort only the run heads to find unique endpoints.
+        endpoints = refs[:, :2]
+        if len(endpoints):
+            changed = np.any(endpoints[1:] != endpoints[:-1], axis=1)
+            endpoints = endpoints[np.r_[True, changed]]
+        for source, nonce in np.unique(endpoints, axis=0):
             if source == 0:
                 continue
             source, nonce = int(source), int(nonce)
             selected = np.flatnonzero((refs[:, 0] == source) & (refs[:, 1] == nonce))
             row_ids = refs[selected, 2]
-            store = self._stores.setdefault((source, nonce), RowStore(CACHE_BYTES))
-            requested = np.unique(row_ids[store.locate(row_ids) == 0])
-            if requested.size:
-                info = self._owner_call(0, self._control, source, nonce, "/info")
-                shared = (
-                    self.shared_namespace is not None
-                    and info.get("shared_namespace") == self.shared_namespace
-                )
-                owner = next(
-                    (i for i, uuid in enumerate(self.uuids) if uuid != info["uuid"]),
-                    None,
-                )
-                if not shared and owner is None:
-                    raise ValueError(
-                        "sampling_mask_transfer needs a distinct GPU in the actor TP group for colocated GIN"
+            key = source, nonce
+            if key not in self._stores:
+                self._stores[key] = self._open_source(key)
+            store, owner = self._stores[key]
+            if owner is not None:
+                requested = np.unique(row_ids[store.locate(row_ids) == 0])
+                for start in range(0, len(requested), MAX_FETCH_ROWS):
+                    self._receive(
+                        key, requested[start : start + MAX_FETCH_ROWS], owner, store
                     )
-                # Bound both control messages and registered payload chunks.
-                for start in range(0, len(requested), 16384):
-                    rows = requested[start : start + 16384].tolist()
-                    if shared:
-                        manifest = self._owner_call(
-                            0, self._control, source, nonce, "/shared", rows=rows
-                        )
-                        shared_manifests.append((store, np.asarray(rows), manifest))
-                        continue
-                    description = self._owner_call(
-                        owner, self._control, source, nonce, "/describe", rows=rows
-                    )
-                    chunk, size, begin = [], 0, 0
+            reads.append((key, store, row_ids, torch.from_numpy(selected)))
+        return reads, labels, versions
 
-                    def receive_chunk(end):
-                        manifest = {
-                            key: description[key][begin:end]
-                            for key in ("counts", "tokens", "versions")
-                        }
-                        manifest["protocol"] = description["protocol"]
-                        self._receive(source, nonce, chunk, owner, manifest)
-
-                    for index, (row, count) in enumerate(
-                        zip(rows, description["counts"], strict=True)
-                    ):
-                        if chunk and size + 3 * count > SLOT_BYTES:
-                            receive_chunk(index)
-                            chunk, size = [], 0
-                            begin = index
-                        chunk.append(row)
-                        size += 3 * count
-                    if chunk:
-                        receive_chunk(len(rows))
-            reads.append((store, row_ids, torch.from_numpy(selected)))
-        return reads, shared_manifests, labels, versions
-
-    def _assemble(self, reads, shared_manifests, labels, versions):
-        for store, rows, manifest in shared_manifests:
-            self._index_shared(store, rows, manifest)
+    def _assemble(self, reads, labels, versions):
         counts = torch.zeros(len(labels), dtype=torch.int64)
         segments = []
-        for store, row_ids, positions in reads:
-            packed, local_offsets, tokens, model_versions = store.read(row_ids)
+        for key, store, row_ids, positions in reads:
+            try:
+                packed, local_offsets, tokens, model_versions = store.read(row_ids)
+            except UnpublishedRow:
+                # A rollout may have returned while its last D2H is in flight.
+                # Wait on a scalar watermark, then distinguish a released row.
+                self._control(*key, "/ready", through=int(row_ids.max()))
+                packed, local_offsets, tokens, model_versions = store.read(row_ids)
             if not torch.equal(tokens, labels[positions]):
                 raise ValueError(
                     "Sampling-mask row is not aligned with its generated token"
@@ -437,7 +397,10 @@ class SamplingMaskConsumer:
                 model_versions, versions[positions]
             ):
                 raise ValueError("Sampling-mask row model weight version mismatch")
-            counts[positions] = local_offsets.diff()
+            lengths = local_offsets.diff()
+            if isinstance(store, SharedPageReader):
+                self._count_shared_reads(key, row_ids, lengths.numpy())
+            counts[positions] = lengths
             segments.append((positions, packed, local_offsets))
         offsets = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
         # A single source was already read in final position order. Prompt and
@@ -452,9 +415,40 @@ class SamplingMaskConsumer:
             packed[indices] = source
         return LoadedSamplingMask(packed, offsets, self.vocab_size)
 
+    def _count_shared_reads(self, key, rows, counts):
+        # Track unique logical reads for metrics only. No offsets, candidates
+        # or policy data are copied into a second actor-side row index.
+        rows, first = np.unique(rows, return_index=True)
+        page_ids, slots = np.divmod(rows - 1, PAGE_ROWS)
+        boundaries = np.r_[0, np.flatnonzero(np.diff(page_ids)) + 1, len(rows)]
+        fresh = np.zeros(len(rows), dtype=bool)
+        self.shared_index_pages_read += len(boundaries) - 1
+        for start, end in zip(boundaries[:-1], boundaries[1:], strict=True):
+            page_key = (*key, int(page_ids[start]))
+            seen = self._seen_pages.get(page_key)
+            if seen is None:
+                if self._cache_bytes + PAGE_ROWS // 8 > CACHE_BYTES:
+                    raise MemoryError("Sampling-mask actor cache capacity exceeded")
+                seen = self._seen_pages[page_key] = np.zeros(
+                    PAGE_ROWS // 8, dtype=np.uint8
+                )
+                self._cache_bytes += seen.nbytes
+            byte, bit = np.divmod(slots[start:end], 8)
+            bits = np.left_shift(np.uint8(1), bit.astype(np.uint8))
+            fresh[start:end] = (seen[byte] & bits) == 0
+            np.bitwise_or.at(seen, byte, bits)
+        new_counts = counts[first[fresh]]
+        if len(new_counts):
+            self.id_bytes += int(new_counts.sum()) * 3
+            self.offset_bytes += (len(new_counts) + 1) * 8
+            self._candidate_histogram += np.bincount(
+                new_counts, minlength=self.vocab_size + 1
+            )
+
     def release_batch(self):
         self._drain_reader()
         self._stores.clear()
+        self._seen_pages.clear()
         self._cache_bytes = 0
 
     def close(self):
@@ -503,7 +497,7 @@ def aggregate_metrics(
         counters[2:] = (
             consumer.control_bytes,
             sum(endpoint.payload_bytes for endpoint in consumer._sessions.values()),
-            consumer.shared_descriptors,
+            consumer.shared_index_pages_read,
             consumer._cache_bytes,
         )
     values = torch.from_numpy(np.concatenate((histogram, counters)))
@@ -531,7 +525,7 @@ def aggregate_metrics(
         "reference_tensor_bytes": total * len(REFERENCE_KEYS) * 8,
         "control_body_bytes": counters[2],
         "gin_payload_bytes": counters[3],
-        "shared_descriptors": counters[4],
+        "shared_index_pages_read": counters[4],
     }
     result = {
         f"sampling_mask/lifetime/{key}": float(value)
