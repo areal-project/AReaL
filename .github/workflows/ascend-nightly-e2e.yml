@@ -81,8 +81,12 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v5
         with:
-          pattern: ascend-nightly-{grpo,sft}
-          path: artifacts
+          pattern: ascend-nightly-grpo
+          path: artifacts/ascend-nightly-grpo
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: ascend-nightly-sft
+          path: artifacts/ascend-nightly-sft
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
