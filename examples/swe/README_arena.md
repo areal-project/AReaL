@@ -568,6 +568,27 @@ preserves the external episode reward only for successful concat exports with PR
 disabled. Malformed tool calls remain invalid. The default `final_response` policy still
 requires usable final text or a tool call.
 
+### Auxiliary model requests
+
+Harnesses can issue model calls such as session-title generation after solving a task.
+To keep these calls out of training trajectories, explicitly allowlist their complete
+system prompts in the normal training YAML:
+
+```yaml
+econfig:
+  arena_auxiliary_system_prompts:
+    - "Generate a session title."
+```
+
+Replace the example with the exact prompt emitted by the Harness. The default empty list
+disables exclusion. Chat Completions matches the leading system message; Responses
+matches non-empty `instructions` or a leading system message in `input`. Empty
+instructions are ignored, and additional non-empty system or developer instructions keep
+the request in training. Matching uses the effective request after session defaults are
+merged. Calls with tools, including inherited tools, remain in training; an explicit
+empty tools list can disable inherited tools. Matched tool-free calls use isolated
+interaction and failure state so they cannot replace the task's reward target.
+
 ### Multiple Harnesses for one Stream
 
 Multiple `arena_streams` entries may share a `stream_id` to run the same dataset through

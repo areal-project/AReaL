@@ -857,6 +857,47 @@ def _content_block_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def _auxiliary_system_prompt(
+    kwargs: dict[str, Any], *, responses_api: bool
+) -> str | None:
+    """Recognize a sole leading instruction without hiding additional guidance."""
+    # Session defaults can include fields from the other API. Only inspect
+    # instructions consumed by the endpoint handling this request.
+    instructions = kwargs.get("instructions") if responses_api else None
+    system_prompt = (
+        instructions if isinstance(instructions, str) and instructions.strip() else None
+    )
+    prompts = [system_prompt] if system_prompt is not None else []
+    messages_key = "input" if responses_api else "messages"
+    messages = kwargs.get(messages_key)
+    if isinstance(messages, list):
+        # Responses content can also be a lazily validated iterator. Retain its
+        # materialized value for generation rather than consuming it only here.
+        messages = list(messages)
+        kwargs[messages_key] = messages
+        for index, message in enumerate(messages):
+            if not isinstance(message, Mapping) or message.get("role") not in {
+                "system",
+                "developer",
+            }:
+                continue
+            content = message.get("content")
+            if content is None:
+                continue
+            if isinstance(content, Iterable) and not isinstance(
+                content, (str, Mapping)
+            ):
+                content = list(content)
+                messages[index] = {**message, "content": content}
+            text = _content_block_text(content)
+            if not text.strip():
+                continue
+            prompts.append(text)
+            if index == 0 and message.get("role") == "system" and system_prompt is None:
+                system_prompt = text
+    return system_prompt if len(prompts) == 1 else None
+
+
 def _flatten_text_content_lists(messages: list[dict]) -> None:
     """Flatten text-only content block lists to strings in-place.
 
@@ -965,6 +1006,7 @@ async def _call_client_create(
     session_id: str,
     extra_ignored_args: list[str] | None = None,
     stream: bool = False,
+    responses_api: bool = False,
 ) -> ChatCompletion | Response | AsyncGenerator[ChatCompletionChunk, None]:
     """Common logic for chat completions and responses."""
     if _openai_client is None:
@@ -1016,6 +1058,44 @@ async def _call_client_create(
         if isinstance(request, BaseModel) and key not in request.model_fields_set:
             kwargs.pop(key, None)
         kwargs.setdefault(key, value)
+
+    try:
+        # FastAPI validates OpenAI Iterable fields lazily. An empty tools
+        # iterator is truthy; materialize it after merging defaults. Validation
+        # can fail here before a call can safely be classified as auxiliary.
+        for key in ("tools", "input" if responses_api else "messages"):
+            value = kwargs.get(key)
+            if isinstance(value, Iterable) and not isinstance(
+                value, (str, Mapping, list)
+            ):
+                kwargs[key] = list(value)
+        auxiliary_prompts = session_data.metadata.get("auxiliary_system_prompts", [])
+        system_prompt = _auxiliary_system_prompt(kwargs, responses_api=responses_api)
+        is_auxiliary = (
+            isinstance(auxiliary_prompts, list)
+            and isinstance(system_prompt, str)
+            and system_prompt in auxiliary_prompts
+            and not kwargs.get("tools")
+        )
+    except Exception as e:
+        message = f"{type(e).__name__}: {e}"
+        session_data.mark_system_error(message)
+        logger.exception("Failed to normalize proxy request for classification")
+        raise HTTPException(status_code=500, detail=message) from e
+    if is_auxiliary:
+        # Serve explicitly identified auxiliary calls without adding a reward
+        # target or failure state to the task's training trajectory.
+        auxiliary_session = SessionData(
+            session_id=session_id,
+            sampling_seed_identity=session_data.sampling_seed_identity,
+            processor_cache=session_data.processor_cache,
+            metadata=session_data.metadata,
+        )
+        auxiliary_session.backend_session_id = session_data.backend_session_id
+        session_data = auxiliary_session
+        logger.info(
+            "Serving auxiliary request outside training cache: session=%s", session_id
+        )
 
     messages = kwargs.get("messages")
     if messages is not None:
@@ -1156,8 +1236,9 @@ async def _call_client_create(
         # A streaming response has already sent HTTP 200 by the time the model
         # output can be validated. Poison the session so an SDK retry receives
         # a real HTTP 422 before it starts another model generation.
-        with _lock:
-            _session_invalid_tool_errors[session_id] = str(exc)
+        if not is_auxiliary:
+            with _lock:
+                _session_invalid_tool_errors[session_id] = str(exc)
         logger.warning("Session %s emitted invalid tool JSON", session_id)
         raise
     except ContextLengthExceededError as e:
@@ -1312,7 +1393,10 @@ async def _deferred_openai_sse_stream(
                 if real_completion_id != stream_id:
                     with _lock:
                         session = _session_cache.get(session_id)
-                        if session is not None:
+                        if (
+                            session is not None
+                            and real_completion_id in session.completions
+                        ):
                             session.stream_completion_aliases[stream_id] = (
                                 real_completion_id
                             )
@@ -1390,6 +1474,7 @@ async def responses(
         create_fn=_openai_client.responses.create,
         request=request,
         session_id=session_id,
+        responses_api=True,
     )
 
 

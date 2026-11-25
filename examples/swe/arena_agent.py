@@ -1779,7 +1779,18 @@ class ArenaStreamAgentWorkflow:
     def get_session_metadata(self, data: dict[str, Any]) -> dict[str, Any]:
         """Supply generation defaults for requests that omit these fields."""
         del data
-        return {"generation_args": dict(self.gen_args)} if self.gen_args else {}
+        metadata = {"generation_args": dict(self.gen_args)} if self.gen_args else {}
+        auxiliary_prompts = self.econfig.get("arena_auxiliary_system_prompts", [])
+        if auxiliary_prompts:
+            if not isinstance(auxiliary_prompts, list) or any(
+                not isinstance(prompt, str) or not prompt
+                for prompt in auxiliary_prompts
+            ):
+                raise ValueError(
+                    "Arena auxiliary system prompts must be nonempty strings"
+                )
+            metadata["auxiliary_system_prompts"] = list(auxiliary_prompts)
+        return metadata
 
     async def record_failure_disposition(
         self,
