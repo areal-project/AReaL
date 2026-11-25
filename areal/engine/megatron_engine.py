@@ -11,7 +11,7 @@ import os
 import re
 import struct
 from collections.abc import Callable, Iterator
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -2105,18 +2105,6 @@ class MegatronEngine(TrainEngine):
                     "also supports padded BSHD"
                 )
 
-            sampling_mask = None
-            if (
-                getattr(self.config, "_sampling_mask_transfer", False)
-                and is_pipeline_last_stage
-            ):
-                sampling_mask = self._load_sampling_mask_microbatch(
-                    source_mb,
-                    chunked=use_chunked_lm_head,
-                    cp_local=cp_local,
-                )
-                mb_input.orig_mb["_sampling_mask"] = sampling_mask
-
             # MTP training: pass the token loss mask through the model's actual
             # THD or BSHD layout. MCore 0.19 derives MTP labels directly from
             # input_ids when the main forward keeps labels=None, so AReaL only
@@ -2159,27 +2147,49 @@ class MegatronEngine(TrainEngine):
                 # but it only applies to an active MTP training objective.
                 mb_input.padded_mb.pop("mtp_version_mask", None)
 
-            output = packed_context_parallel_forward(
-                model,
-                mb_input.padded_mb,
-                gather_cp_output=not cp_local,
-                is_vision_model=self.is_vision_model,
-                use_padded_seq=self.use_padded_seq,
-                use_model_packed_seq=self.use_model_packed_seq,
-                fp32_output=_float16_wrapper_fp32_output(
-                    self.mcore_config.enable_chunked_logits,
-                    self.dtype,
-                ),
-                return_hidden_states=use_chunked_lm_head,
-                use_wrapper_packed_seq=(
-                    self.bridge_cls == "mcore-bridge"
-                    and self.sequence_packing_mode == SequencePackingMode.WRAPPER_THD
-                ),
-                language_model_only=(
-                    self.bridge_cls == "mcore-bridge"
-                    and self.mcore_config.language_model_only
-                ),
-            )
+            mask_future = None
+            if (
+                getattr(self.config, "_sampling_mask_transfer", False)
+                and is_pipeline_last_stage
+            ):
+                mask_future = self._prefetch_sampling_mask_microbatch(
+                    source_mb,
+                    chunked=use_chunked_lm_head,
+                    cp_local=cp_local,
+                )
+
+            try:
+                output = packed_context_parallel_forward(
+                    model,
+                    mb_input.padded_mb,
+                    gather_cp_output=not cp_local,
+                    is_vision_model=self.is_vision_model,
+                    use_padded_seq=self.use_padded_seq,
+                    use_model_packed_seq=self.use_model_packed_seq,
+                    fp32_output=_float16_wrapper_fp32_output(
+                        self.mcore_config.enable_chunked_logits,
+                        self.dtype,
+                    ),
+                    return_hidden_states=use_chunked_lm_head,
+                    use_wrapper_packed_seq=(
+                        self.bridge_cls == "mcore-bridge"
+                        and self.sequence_packing_mode
+                        == SequencePackingMode.WRAPPER_THD
+                    ),
+                    language_model_only=(
+                        self.bridge_cls == "mcore-bridge"
+                        and self.mcore_config.language_model_only
+                    ),
+                )
+            except BaseException:
+                if mask_future is not None:
+                    mask_future.cancel()
+                    wait([mask_future])
+                raise
+            sampling_mask = None
+            if mask_future is not None:
+                sampling_mask = mask_future.result()
+                mb_input.orig_mb["_sampling_mask"] = sampling_mask
             if r3_replay is not None:
                 self._finish_r3_microbatch_replay(
                     r3_replay[0],
@@ -4206,7 +4216,7 @@ class MegatronEngine(TrainEngine):
                 consumer.release_batch()
             self._sampling_mask_batch_identity = identity
 
-    def _load_sampling_mask_microbatch(
+    def _prefetch_sampling_mask_microbatch(
         self, source_mb, *, chunked: bool, cp_local: bool
     ):
         from areal.infra.sampling_mask.consumer import SamplingMaskConsumer
@@ -4267,7 +4277,7 @@ class MegatronEngine(TrainEngine):
             versions = (
                 versions.transpose(0, 1).contiguous() if versions is not None else None
             )
-        return self._sampling_mask_consumer.load(refs, labels, versions)
+        return self._sampling_mask_consumer.load_async(refs, labels, versions)
 
     def _compute_logprobs_and_loss(
         self,

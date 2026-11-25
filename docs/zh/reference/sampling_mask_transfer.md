@@ -33,7 +33,7 @@ CSR 是 Compressed Sparse Row（压缩稀疏行）：把各生成位置的候选
 - 协议版本为 2。候选 ID 使用小端 uint24，每个候选严格占 3 字节；词表不能超过 2²⁴。CPU 缓存以 CSR 存储，offsets 为 int64。
 - 每个生成位置携带 source、producer nonce、row ID、协议版本和权重版本。 进入训练张量后，前三项作为 int64 列随 token
   一起拼接、重排、padding 和分片； 权重版本沿用 rollout 的 versions。
-- 控制面只发送行引用、计数、生成 token、版本和校验信息；候选 ID 通过 NCCL GIN GDAKI 传输。每个连接使用两个 8 MiB 注册窗口和
+- 控制面只发送行引用和元数据；同机可共享的候选 ID 块通过只读映射访问，跨机通过 NCCL GIN GDAKI 传输。每个 GIN 连接使用两个 8 MiB 注册窗口和
   credit/ready 信号。
 - 推理端在模型/KV cache 规划前预留窗口，训练 peer 就绪后注册；同一连接跨批复用。 开关自动在进程启动前设置 `NCCL_CUMEM_ENABLE=1`。
 - 开关为训练和推理进程选择已安装 NCCL 包的共享库；GIN 启动时查询实际加载的 NCCL runtime，要求至少 2.31，避免 PyTorch wheel
@@ -90,8 +90,19 @@ torchrun --standalone --nproc-per-node=2 tests/torchrun/run_sampling_mask_gin.py
 processor、speculative decoding、推理 PP/attention CP、蒸馏、 tree training 和 auxiliary
 token/top logprobs；这些路径报错，不静默采用另一种 概率定义。训练请求必须使用配置中的 temperature/top-p。
 
-GIN peer 必须位于不同物理 GPU。同机同 GPU 的 rollout 与 actor 需要 actor TP 组内另一张 GPU 接收后广播；TP=1
-且双方只有同一张 GPU 时明确拒绝。
+当整个 actor TP 组与生产者位于同一 Linux 主机、使用相同用户且可见同一 `/dev/shm` 时，同卡和异卡都直接读源端共享块，支持 TP=1。 采样端在独立
+CUDA stream 上打包 uint24 ID 并异步复制到页锁定主存。CPU 写线程最多允许两个待处理的 decode 批次，消费速度不足时对采样端施加反压。
+写线程在最多 16,384 行或 8 MiB 候选 ID 的窗口内，按请求稳定排序并合并多个 decode 批次。单个超过窗口的原始批次独立保存。
+首次读取可以封存窗口剩余的行。每行引用、生成 token、权重版本和 workflow lease 在整理过程中保持对应。
+
+首次本地读取将候选 ID 块迁移到共享内存，actor 的批内索引保存共享块名、偏移和行元数据。Megatron 在当前微批的模型前向前发起加载，
+在输出头使用候选前等待。TP=1 的读取由后台线程执行。TP>1 的控制广播和跨机 GIN 接收在原调度线程上顺序执行，CPU 校验、重排和上传可与模型前向重叠。 每个
+actor rank 复用一个 8 MiB 页锁定主存槽和一个同等大小的显存槽，使用 CUDA event 协调上传与计算。槽仍被反向传播引用或空间不足时按需分块上传。
+`sampling_mask/lifetime/shared_descriptors` 累计各消费 rank 实际处理的共享块描述数，可与有效生成位置数一起观察碎片开销。
+
+tmpfs 空间不足会报错。统计共享页的实际占用应使用 PSS 或同一 cgroup 的内存计数。逻辑 ID 字节包含共享读取，GIN 载荷仅计 GIN 传输。
+块中最后一条活跃行的 workflow lease 释放时删除共享对象。如果 TP 组跨主机或无法共享同一 tmpfs，整组沿用 GIN 传输和批内缓存，
+这条路径要求接收方与源 GPU 的 UUID 不同。
 
 SGLang sampler 通过 `register_sampler_backend()` 注册，sampling-mask 接入不再改写已安装的 SGLang
 源文件。未知版本会在启动前报错。

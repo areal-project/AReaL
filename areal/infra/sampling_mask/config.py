@@ -101,7 +101,7 @@ def configure(config) -> None:
 
 def preflight(config, vocab_size: int) -> dict:
     from areal.api.alloc_mode import ModelAllocation
-    from areal.utils.sampling_mask import estimate_mask_memory
+    from areal.utils.sampling_mask import UPLOAD_SLOT_BYTES, estimate_mask_memory
 
     allocation = ModelAllocation.from_str(config.actor.backend, name="actor")
     max_tokens = (
@@ -125,6 +125,8 @@ def preflight(config, vocab_size: int) -> dict:
     return {
         "rollout_owner": estimate_mask_memory(data_parallel_size=1, **source),
         "actor_rank": estimate_mask_memory(
-            data_parallel_size=allocation.parallel.data_parallel_size, **common
+            data_parallel_size=allocation.parallel.data_parallel_size,
+            upload_slot_bytes=UPLOAD_SLOT_BYTES,
+            **common,
         ),
     }

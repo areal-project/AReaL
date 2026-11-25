@@ -15,7 +15,7 @@ import torch
 from areal.infra.sampling_mask.gin import GinEndpoint, load_extension
 from areal.infra.sampling_mask.lifetime import call, validate_lease
 from areal.infra.sampling_mask.protocol import encode_endpoint
-from areal.infra.sampling_mask.store import RowStore
+from areal.infra.sampling_mask.store import RowStore, shared_namespace
 from areal.utils.network import gethostip
 from areal.utils.sampling_mask import PROTOCOL_VERSION, pack_uint24
 
@@ -43,6 +43,7 @@ class MaskProducer:
         self._persisted_until = 1
         self._leases: dict[tuple[int, int, int], array] = {}
         self._pending = Semaphore(2)
+        self._copy_stream = torch.cuda.Stream(device=device)
         self._writer = ThreadPoolExecutor(max_workers=1)
         self._sessions = {}
         self._session_buffers = {}
@@ -86,7 +87,9 @@ class MaskProducer:
         self.source = encode_endpoint(*self._server.server_address)
         Thread(target=self._server.serve_forever, daemon=True).start()
 
-    def publish(self, ids, counts, tokens, versions, leases) -> list[list[int]]:
+    def publish(
+        self, ids, counts, tokens, versions, leases, request_ids=None
+    ) -> list[list[int]]:
         """Enqueue bounded asynchronous D2H; return only CPU-generated row handles."""
         leases = [validate_lease(lease) for lease in leases]
         if len(leases) != ids.shape[0]:
@@ -106,15 +109,20 @@ class MaskProducer:
             start = self._next_row
             self._next_row += batch_size
         try:
-            packed = pack_uint24(ids)
-            host_ids = torch.empty_like(packed, device="cpu", pin_memory=True)
-            host_counts = torch.empty_like(counts, device="cpu", pin_memory=True)
-            host_tokens = torch.empty_like(tokens, device="cpu", pin_memory=True)
-            host_ids.copy_(packed, non_blocking=True)
-            host_counts.copy_(counts, non_blocking=True)
-            host_tokens.copy_(tokens, non_blocking=True)
-            done = torch.cuda.Event()
-            done.record()
+            stream = self._copy_stream
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+            # Scheduler-owned outputs may be freed as soon as publish returns.
+            for tensor in (ids, counts, tokens):
+                tensor.record_stream(stream)
+            with torch.cuda.stream(stream):
+                packed = pack_uint24(ids)
+                host_ids = torch.empty_like(packed, device="cpu", pin_memory=True)
+                host_counts = torch.empty_like(counts, device="cpu", pin_memory=True)
+                host_tokens = torch.empty_like(tokens, device="cpu", pin_memory=True)
+                host_ids.copy_(packed, non_blocking=True)
+                host_counts.copy_(counts, non_blocking=True)
+                host_tokens.copy_(tokens, non_blocking=True)
+                done = stream.record_event()
         except Exception as exc:
             with self._condition:
                 self._fatal_error = str(exc)
@@ -136,6 +144,7 @@ class MaskProducer:
                     host_tokens.long(),
                     torch.tensor(versions, dtype=torch.int64),
                     leases,
+                    request_ids,
                 )
                 with self._condition:
                     self._persisted_until = start + batch_size
@@ -160,7 +169,9 @@ class MaskProducer:
             for i in range(batch_size)
         ]
 
-    def _persist_rows(self, rows, packed, offsets, tokens, versions, leases):
+    def _persist_rows(
+        self, rows, packed, offsets, tokens, versions, leases, request_ids=None
+    ):
         # Only the single writer registers sources. Install local admission
         # *before* the callback so a concurrent release can fence this writer.
         active = set()
@@ -192,7 +203,14 @@ class MaskProducer:
             )
             if not keep.any():
                 return
-            self._store.add(rows, packed, offsets, tokens, versions)
+            # A hash only chooses physical order; identity and release always use
+            # the original row handle and lease, including on a hash collision.
+            keys = np.fromiter(
+                map(hash, request_ids if request_ids is not None else leases),
+                dtype=np.int64,
+                count=len(rows),
+            )
+            self._store.add(rows, packed, offsets, tokens, versions, request_keys=keys)
             for row, lease, live in zip(rows, leases, keep, strict=True):
                 if live:
                     self._leases[lease].append(int(row))
@@ -231,6 +249,7 @@ class MaskProducer:
         if path == "/info":
             return {
                 "uuid": self.uuid,
+                "shared_namespace": shared_namespace(),
                 "protocol": PROTOCOL_VERSION,
                 "slot_bytes": SLOT_BYTES,
             }
@@ -271,13 +290,17 @@ class MaskProducer:
                 del self._transfer_locks[peer]
             return {"closed": True}
         counts, tokens, versions = self._lookup(request["rows"])
-        if path == "/describe":
-            return {
+        if path in {"/describe", "/shared"}:
+            manifest = {
                 "counts": counts.tolist(),
                 "tokens": tokens.tolist(),
                 "versions": versions.tolist(),
                 "protocol": PROTOCOL_VERSION,
             }
+            if path == "/shared":
+                with self._condition:
+                    manifest["blocks"] = self._store.share(request["rows"])
+            return manifest
         if path == "/send":
             total = int(counts.sum()) * 3
             if total != request["bytes"] or total > SLOT_BYTES:
@@ -303,6 +326,8 @@ class MaskProducer:
         self._writer.shutdown(wait=True)
         self._server.shutdown()
         self._server.server_close()
+        with self._condition:
+            self._store.close()
         for pointer in self._reserved:
             load_extension().free_reserved(pointer, self.device)
         self._reserved.clear()

@@ -2,8 +2,9 @@
 """Training-shard CPU cache; each support crosses the rollout boundary once."""
 
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+import weakref
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, replace
 
 import numpy as np
 import requests
@@ -13,8 +14,13 @@ import torch.distributed as dist
 from areal.infra.sampling_mask.gin import GinEndpoint, load_extension
 from areal.infra.sampling_mask.protocol import REFERENCE_KEYS, decode_endpoint
 from areal.infra.sampling_mask.service import CACHE_BYTES, SLOT_BYTES
-from areal.infra.sampling_mask.store import RowStore
-from areal.utils.sampling_mask import PROTOCOL_VERSION, SamplingMask, unpack_uint24
+from areal.infra.sampling_mask.store import RowStore, shared_namespace
+from areal.utils.sampling_mask import (
+    PROTOCOL_VERSION,
+    UPLOAD_SLOT_BYTES,
+    SamplingMask,
+    unpack_uint24,
+)
 
 
 def control(source: int, nonce: int, path: str, **payload) -> dict:
@@ -33,16 +39,60 @@ def control(source: int, nonce: int, path: str, **payload) -> dict:
     return result
 
 
+class _UploadSlot:
+    """A bounded packed H2D transfer, reusable once both Python and CUDA are done."""
+
+    def __init__(self, device):
+        self.host = torch.empty(UPLOAD_SLOT_BYTES, dtype=torch.uint8, pin_memory=True)
+        self.stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(self.stream):
+            self.device = torch.empty_like(self.host, device=device)
+        self.done = torch.cuda.Event()
+        self.owner = None
+
+    def stage(self, mask):
+        # Pipeline schedules can retain masks through backward. A busy slot
+        # leaves the caller on the existing on-demand chunk upload path.
+        if self.owner is not None and (
+            self.owner() is not None or not self.done.query()
+        ):
+            return mask
+        offsets = mask.offsets.view(torch.uint8)
+        n = offsets.numel()
+        end = n + mask.packed_ids.numel()
+        if end > self.host.numel():
+            return mask
+        self.host[:n].copy_(offsets)
+        self.host[n:end].copy_(mask.packed_ids.reshape(-1))
+        with torch.cuda.stream(self.stream):
+            self.device[:end].copy_(self.host[:end], non_blocking=True)
+            self.done.record(self.stream)
+        staged = replace(mask, slot=self)
+        self.owner = weakref.ref(staged)
+        return staged
+
+
 @dataclass(frozen=True)
 class LoadedSamplingMask:
     packed_ids: torch.Tensor
     offsets: torch.Tensor
     vocab_size: int
+    slot: _UploadSlot | None = None
 
     def chunk(
         self, start: int, end: int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor]:
         begin, finish = int(self.offsets[start]), int(self.offsets[end])
+        if self.slot is not None and device == self.slot.device.device:
+            slot = self.slot
+            stream = torch.cuda.current_stream(device)
+            stream.wait_event(slot.done)
+            slot.device.record_stream(stream)
+            n = self.offsets.numel() * self.offsets.element_size()
+            ids = unpack_uint24(slot.device[n + 3 * begin : n + 3 * finish].view(-1, 3))
+            offsets = slot.device[:n].view(torch.int64)[start : end + 1] - begin
+            slot.done.record(stream)
+            return ids, offsets
         ids = unpack_uint24(
             self.packed_ids[begin:finish].to(device=device, non_blocking=True)
         )
@@ -60,12 +110,18 @@ class SamplingMaskConsumer:
         self.rank = dist.get_rank(tp_group) if tp_group is not None else 0
         self.vocab_size = vocab_size
         self.uuid = str(torch.cuda.get_device_properties(device).uuid)
-        self.uuids = [None] * self.world
+        peers = [(self.uuid, shared_namespace())] * self.world
         if self.world > 1:
-            dist.all_gather_object(self.uuids, self.uuid, group=tp_group)
-        else:
-            self.uuids[0] = self.uuid
+            dist.all_gather_object(peers, peers[0], group=tp_group)
+        self.uuids, namespaces = zip(*peers, strict=True)
+        self.shared_namespace = namespaces[0] if len(set(namespaces)) == 1 else None
         self._executor = ThreadPoolExecutor(max_workers=1)
+        self._reader = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mask-reader"
+        )
+        self._pending_read = None
+        self._upload = _UploadSlot(self.device)
+        self.shared_descriptors = 0
         self._sessions = {}
         self._stores = {}
         self._cache_bytes = 0
@@ -217,9 +273,85 @@ class SamplingMaskConsumer:
         # Only the workflow lease owner releases source rows after every
         # training consumer has finished. A shard must not delete shared prefixes.
 
+    def _index_shared(self, store, rows, manifest):
+        if manifest["protocol"] != PROTOCOL_VERSION:
+            raise ValueError("Sampling-mask manifest protocol version mismatch")
+        counts = np.asarray(manifest["counts"], dtype=np.int64)
+        tokens, versions = (
+            torch.tensor(manifest[key], dtype=torch.int64)
+            for key in ("tokens", "versions")
+        )
+        positions = np.asarray(
+            [pos for _, group, _ in manifest["blocks"] for pos in group], dtype=np.int64
+        )
+        if (
+            counts.shape != (len(rows),)
+            or tokens.shape != counts.shape
+            or versions.shape != counts.shape
+            or np.any(counts <= 0)
+            or np.any(counts > min(SLOT_BYTES // 3, self.vocab_size))
+            or not np.array_equal(np.sort(positions), np.arange(len(rows)))
+        ):
+            raise ValueError("Invalid shared sampling-mask row descriptors")
+        self.shared_descriptors += len(manifest["blocks"])
+        for name, selected, starts in manifest["blocks"]:
+            selected = np.asarray(selected, dtype=np.int64)
+            starts = np.asarray(starts, dtype=np.int64)
+            if starts.shape != selected.shape or np.any(starts < 0):
+                raise ValueError("Invalid shared sampling-mask offsets")
+            offsets = torch.from_numpy(np.concatenate(([0], counts[selected].cumsum())))
+            store.capacity = CACHE_BYTES - self._cache_bytes + store.nbytes
+            previous = store.nbytes
+            store.index_shared(
+                rows[selected],
+                name,
+                starts,
+                offsets,
+                tokens[selected],
+                versions[selected],
+                self.vocab_size,
+                SLOT_BYTES,
+            )
+            self._cache_bytes += store.nbytes - previous
+        self.id_bytes += int(counts.sum()) * 3
+        self.offset_bytes += (len(rows) + 1) * 8
+        self._candidate_histogram += np.bincount(counts, minlength=self.vocab_size + 1)
+
     def load(
         self, inputs: dict, labels: torch.Tensor, versions: torch.Tensor | None = None
     ) -> LoadedSamplingMask:
+        self._drain_reader()
+        return self._assemble(*self._resolve(inputs, labels, versions))
+
+    def _drain_reader(self):
+        # Only the scheduling thread changes batches. The caller owns the result
+        # (and its exception); do not keep a completed mask alive through backward.
+        future = self._pending_read() if self._pending_read is not None else None
+        if future is not None and not future.done():
+            wait([future])
+        self._pending_read = None
+
+    def load_async(self, inputs, labels, versions) -> Future[LoadedSamplingMask]:
+        """One in-flight microbatch. Keep model TP collectives on the schedule thread."""
+        self._drain_reader()
+        resolved = self._resolve(inputs, labels, versions) if self.world > 1 else None
+
+        def assemble_and_upload():
+            # GIN at TP=1 may also stage CUDA tensors. Ordering its work on the
+            # private stream keeps its synchronizations off the compute stream.
+            with torch.cuda.device(self.device), torch.cuda.stream(self._upload.stream):
+                parts = (
+                    resolved
+                    if resolved is not None
+                    else self._resolve(inputs, labels, versions)
+                )
+                return self._upload.stage(self._assemble(*parts))
+
+        future = self._reader.submit(assemble_and_upload)
+        self._pending_read = weakref.ref(future)
+        return future
+
+    def _resolve(self, inputs, labels, versions):
         """Resolve CPU token references after packing/CP/layout conversion."""
         if labels.device.type != "cpu":
             raise ValueError(
@@ -230,8 +362,8 @@ class SamplingMaskConsumer:
         )
         labels = labels.reshape(-1)
         versions = versions.reshape(-1) if versions is not None else None
-        counts = torch.zeros(len(refs), dtype=torch.int64)
-        segments = []
+        reads = []
+        shared_manifests = []
         for source, nonce in np.unique(refs[:, :2], axis=0):
             if source == 0:
                 continue
@@ -242,17 +374,27 @@ class SamplingMaskConsumer:
             requested = np.unique(row_ids[store.locate(row_ids) == 0])
             if requested.size:
                 info = self._owner_call(0, self._control, source, nonce, "/info")
+                shared = (
+                    self.shared_namespace is not None
+                    and info.get("shared_namespace") == self.shared_namespace
+                )
                 owner = next(
                     (i for i, uuid in enumerate(self.uuids) if uuid != info["uuid"]),
                     None,
                 )
-                if owner is None:
+                if not shared and owner is None:
                     raise ValueError(
                         "sampling_mask_transfer needs a distinct GPU in the actor TP group for colocated GIN"
                     )
                 # Bound both control messages and registered payload chunks.
                 for start in range(0, len(requested), 16384):
                     rows = requested[start : start + 16384].tolist()
+                    if shared:
+                        manifest = self._owner_call(
+                            0, self._control, source, nonce, "/shared", rows=rows
+                        )
+                        shared_manifests.append((store, np.asarray(rows), manifest))
+                        continue
                     description = self._owner_call(
                         owner, self._control, source, nonce, "/describe", rows=rows
                     )
@@ -277,8 +419,16 @@ class SamplingMaskConsumer:
                         size += 3 * count
                     if chunk:
                         receive_chunk(len(rows))
+            reads.append((store, row_ids, torch.from_numpy(selected)))
+        return reads, shared_manifests, labels, versions
+
+    def _assemble(self, reads, shared_manifests, labels, versions):
+        for store, rows, manifest in shared_manifests:
+            self._index_shared(store, rows, manifest)
+        counts = torch.zeros(len(labels), dtype=torch.int64)
+        segments = []
+        for store, row_ids, positions in reads:
             packed, local_offsets, tokens, model_versions = store.read(row_ids)
-            positions = torch.from_numpy(selected)
             if not torch.equal(tokens, labels[positions]):
                 raise ValueError(
                     "Sampling-mask row is not aligned with its generated token"
@@ -290,6 +440,10 @@ class SamplingMaskConsumer:
             counts[positions] = local_offsets.diff()
             segments.append((positions, packed, local_offsets))
         offsets = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+        # A single source was already read in final position order. Prompt and
+        # padding positions have zero counts and introduce no ID gaps.
+        if len(segments) == 1:
+            return LoadedSamplingMask(segments[0][1], offsets, self.vocab_size)
         packed = torch.empty((int(offsets[-1]), 3), dtype=torch.uint8)
         for positions, source, local_offsets in segments:
             indices = torch.repeat_interleave(
@@ -299,11 +453,13 @@ class SamplingMaskConsumer:
         return LoadedSamplingMask(packed, offsets, self.vocab_size)
 
     def release_batch(self):
+        self._drain_reader()
         self._stores.clear()
         self._cache_bytes = 0
 
     def close(self):
         """Both GIN peers drain credits before deregistering their windows."""
+        self._reader.shutdown(wait=True)
         errors = []
         try:
             for (source, nonce), endpoint in self._sessions.items():
@@ -339,7 +495,7 @@ def aggregate_metrics(
     Shared rows fetched by different DP/CP shards count as separate transfers.
     """
     histogram = np.zeros(vocab_size + 1, dtype=np.int64)
-    counters = np.zeros(5, dtype=np.int64)
+    counters = np.zeros(6, dtype=np.int64)
     if consumer is not None:
         if logical_owner:
             histogram[:] = consumer._candidate_histogram
@@ -347,6 +503,7 @@ def aggregate_metrics(
         counters[2:] = (
             consumer.control_bytes,
             sum(endpoint.payload_bytes for endpoint in consumer._sessions.values()),
+            consumer.shared_descriptors,
             consumer._cache_bytes,
         )
     values = torch.from_numpy(np.concatenate((histogram, counters)))
@@ -374,11 +531,12 @@ def aggregate_metrics(
         "reference_tensor_bytes": total * len(REFERENCE_KEYS) * 8,
         "control_body_bytes": counters[2],
         "gin_payload_bytes": counters[3],
+        "shared_descriptors": counters[4],
     }
     result = {
         f"sampling_mask/lifetime/{key}": float(value)
         for key, value in statistics.items()
     }
-    result["sampling_mask/cpu_cache_bytes_sum"] = float(counters[4])
+    result["sampling_mask/cpu_cache_bytes_sum"] = float(counters[5])
     result["sampling_mask/cpu_cache_bytes_max_rank"] = float(peak[0])
     return result

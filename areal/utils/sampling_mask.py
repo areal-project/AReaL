@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+UPLOAD_SLOT_BYTES = 8 << 20
 PROTOCOL_VERSION = 2
 UINT24_LIMIT = 1 << 24
 
@@ -283,6 +284,7 @@ def estimate_mask_memory(
     chunk_tokens: int,
     buffer_bytes: int,
     budget_bytes: int = 30_000_000_000,
+    upload_slot_bytes: int = 0,
 ) -> dict[str, int]:
     """Conservative preflight bound, including packed host and unpacked GPU data.
 
@@ -314,6 +316,9 @@ def estimate_mask_memory(
     host_bytes += min(tokens, chunk_tokens) * candidates * 48
     # Double-buffered registered wire buffers + int32 candidates and row IDs.
     device_bytes = 2 * buffer_bytes + min(tokens, chunk_tokens) * candidates * 80
+    # One pinned and one device slot, shared by in-flight pipeline microbatches.
+    host_bytes += upload_slot_bytes
+    device_bytes += upload_slot_bytes
     result = {
         "candidates_bound": candidates,
         "tokens_per_rank": tokens,

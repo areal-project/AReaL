@@ -2,6 +2,7 @@
 """Delayed readers, cancellation and source admission without CUDA or WeftMoE."""
 
 import asyncio
+from pathlib import Path
 from threading import Condition
 from unittest.mock import MagicMock
 
@@ -85,6 +86,65 @@ def test_cancel_before_response_discards_pending_and_future_writes(ownership):
     assert producer._store.nbytes == 0
     assert not producer._leases
     assert not owner.register(lease[2], 99, 101)
+
+
+def test_local_readers_share_id_pages_until_last_workflow_releases(ownership):
+    owner, producer = ownership
+    old, new = owner.create(), owner.create()
+    persist(producer, [1, 2], [166, 170], [old, new])
+    original_bytes = producer._store.nbytes
+    first = producer._handle("/shared", {"rows": [2, 1]})
+    name, selected, starts = first["blocks"][0]
+    assert selected == [0, 1] and starts == [2, 0]
+    backing = Path("/dev/shm") / name
+    assert backing.stat().st_size == 12
+    assert producer._store.nbytes == original_bytes
+    assert producer._handle("/shared", {"rows": [1]})["blocks"][0][0] == name
+    shared = RowStore(1 << 20)
+    shared.index_shared(
+        np.array([2, 1]),
+        name,
+        np.array(starts),
+        torch.tensor([0, 2, 4]),
+        torch.tensor(first["tokens"]),
+        torch.tensor(first["versions"]),
+        10,
+        6,
+    )
+    assert all(block.packed is None for block in shared._blocks.values())
+    for store in (shared, producer._store):
+        packed, _, _, versions = store.read([1, 2, 1])
+        torch.testing.assert_close(packed, pack_uint24(torch.tensor([7, 9] * 3)))
+        assert versions.tolist() == [166, 170, 166]
+    owner.release(old[2])
+    with pytest.raises(ValueError, match="released"):
+        producer._handle("/shared", {"rows": [1]})
+    assert backing.exists()
+    owner.release(new[2])
+    assert not backing.exists()
+    assert producer._store.nbytes == 0
+    with pytest.raises(FileNotFoundError):
+        shared.read([2])
+
+
+def test_shared_reader_rejects_bad_bounds_and_token_before_caching(ownership):
+    owner, producer = ownership
+    persist(producer, [1], [7], [owner.create()])
+    name, _, _ = producer._handle("/shared", {"rows": [1]})["blocks"][0]
+    reader = RowStore(1 << 20)
+    for start, token, error in [(1, 7, "exceeds shared block"), (0, 5, "missing")]:
+        with pytest.raises(ValueError, match=error):
+            reader.index_shared(
+                np.array([1]),
+                name,
+                np.array([start]),
+                torch.tensor([0, 2]),
+                torch.tensor([token]),
+                torch.tensor([7]),
+                10,
+                6,
+            )
+        assert reader.nbytes == 0
 
 
 def test_release_between_registration_and_persistence_cannot_resurrect_rows(
@@ -329,3 +389,75 @@ async def test_controller_owns_lease_before_rpc_and_fences_abandoned_task(
         assert not controller._sampling_mask_owner._leases
     finally:
         controller._sampling_mask_owner.close()
+
+
+def test_decode_windows_seal_in_request_order_and_keep_old_row_handles(monkeypatch):
+    from areal.infra.sampling_mask import store as store_module
+
+    monkeypatch.setattr(store_module, "_SEGMENT_ROWS", 8)
+    store = RowStore(1 << 20)
+    try:
+        # Two interleaved requests, including cancelled rows in a partial block.
+        for step in range(9):
+            rows = np.array([2 * step + 1, 2 * step + 2])
+            labels = torch.from_numpy(rows)
+            packed = pack_uint24(torch.tensor([rows[0], rows[1], 99]))
+            store.add(
+                rows,
+                packed,
+                torch.tensor([0, 1, 3]),
+                labels,
+                labels + 10,
+                request_keys=np.array([0, 1]),
+            )
+            if step == 1:
+                store.delete(np.array([4]))
+        # Two full windows have already been sealed by the writer.
+        assert len(store._blocks) == 3
+        store.compact()
+        with pytest.raises(ValueError, match="released"):
+            store.read([4])
+        groups = store.share([1, 3, 5, 7])
+        assert len(groups) == 1
+        assert groups[0][2] == [0, 1, 2, 3]
+        rows = np.array([18, 1, 9, 18, 2, 7])
+        packed, offsets, labels, versions = store.read(rows)
+        expected = [v for r in rows for v in ([r, 99] if r % 2 == 0 else [r])]
+        torch.testing.assert_close(packed, pack_uint24(torch.tensor(expected)))
+        assert labels.tolist() == rows.tolist()
+        assert versions.tolist() == (rows + 10).tolist()
+        assert offsets.tolist() == [0, 2, 3, 4, 6, 8, 9]
+    finally:
+        store.close()
+
+
+def test_batch_release_drains_async_reader_before_clearing_store(monkeypatch):
+    import weakref
+    from concurrent.futures import Future, ThreadPoolExecutor, wait
+    from threading import Event
+
+    from areal.infra.sampling_mask import consumer as reader_module
+
+    result = Future()
+    reader = object.__new__(reader_module.SamplingMaskConsumer)
+    reader._pending_read = weakref.ref(result)
+    reader._stores = {"current": object()}
+    reader._cache_bytes = 123
+    waiting = Event()
+
+    def observe_wait(futures):
+        waiting.set()
+        return wait(futures)
+
+    monkeypatch.setattr(reader_module, "wait", observe_wait)
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        cleanup = worker.submit(reader.release_batch)
+        try:
+            assert waiting.wait(2)
+            assert "current" in reader._stores
+        finally:
+            result.set_exception(ValueError("bad row"))
+        cleanup.result(timeout=2)
+    with pytest.raises(ValueError, match="bad row"):
+        result.result()
+    assert not reader._stores and reader._cache_bytes == 0

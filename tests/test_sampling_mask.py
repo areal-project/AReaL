@@ -658,6 +658,7 @@ def test_scheduler_merge_preserves_explicit_seeds_and_row_alignment(seeded_first
         )
         value._areal_mask_versions = [version] * size
         value._areal_mask_leases = [(1, 2, version)] * size
+        value._areal_mask_request_ids = [f"{version}-{i}" for i in range(size)]
         return value
 
     left, right = batch(2, seeded_first, 5), batch(3, not seeded_first, 6)
@@ -670,6 +671,7 @@ def test_scheduler_merge_preserves_explicit_seeds_and_row_alignment(seeded_first
         atol=0,
         rtol=0,
     )
+    assert left._areal_mask_request_ids == ["5-0", "5-1", "6-0", "6-1", "6-2"]
     assert left._areal_mask_versions == [5, 5, 6, 6, 6]
     assert left._areal_mask_leases == [(1, 2, 5)] * 2 + [(1, 2, 6)] * 3
 
@@ -713,6 +715,7 @@ def test_metrics_count_tp_logical_rows_separately_from_transport_owners(logical_
         id_bytes=15,
         offset_bytes=32,
         control_bytes=91,
+        shared_descriptors=7,
         _sessions={1: SimpleNamespace(payload_bytes=15)},
         _cache_bytes=256,
     )

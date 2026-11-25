@@ -386,8 +386,8 @@ def test_upstream_factory_instantiates_and_samples_restricted_policy(
         def __init__(self, *args, **kwargs):
             pass
 
-        def publish(self, ids, counts, tokens, versions, leases):
-            rows.append((ids, counts, tokens, versions, leases))
+        def publish(self, ids, counts, tokens, versions, leases, request_ids):
+            rows.append((ids, counts, tokens, versions, leases, request_ids))
             return [[1, 2, 3, 4, 5]]
 
     monkeypatch.setattr(service, "MaskProducer", Producer)
@@ -406,13 +406,14 @@ def test_upstream_factory_instantiates_and_samples_restricted_policy(
         sampling_seed=None,
         _areal_mask_versions=[7],
         _areal_mask_leases=[[1, 2, 3]],
+        _areal_mask_request_ids=["rollout_a"],
     )
     token = sampler(output, info, True, [], [], torch.tensor([0]))
     expected = torch.log_softmax(torch.tensor([3.0, 2.0, 1.0]), dim=0)[token.long()]
     torch.testing.assert_close(output.next_token_logprobs, expected, atol=1e-6, rtol=0)
     assert rows[0][1].tolist() == [3]
     assert rows[0][3] == [7]
-    assert rows[0][4] == [[1, 2, 3]]
+    assert rows[0][4:] == ([[1, 2, 3]], ["rollout_a"])
     assert output.customized_info["sampling_mask_refs"] == [[1, 2, 3, 4, 5]]
     assert plugin.BACKEND in runtime.sampler._CUSTOM_SAMPLER_FACTORIES
 
@@ -469,7 +470,10 @@ def test_upstream_dataclass_copy_retains_mask_versions(upstream_runtime):
     original = upstream_runtime.batch_cls([])
     original._areal_mask_versions = [2, 3]
     original._areal_mask_leases = [(1, 2, 2), (1, 2, 3)]
+    original._areal_mask_request_ids = ["a", "b"]
     copied = original.copy_for_forward()
+    assert copied._areal_mask_request_ids == ["a", "b"]
+    assert copied._areal_mask_request_ids is not original._areal_mask_request_ids
     assert copied._areal_mask_versions == [2, 3]
     assert copied._areal_mask_versions is not original._areal_mask_versions
     assert copied._areal_mask_leases == original._areal_mask_leases
@@ -534,6 +538,7 @@ def test_workflow_leases_survive_schedule_filter_and_forward(upstream_runtime):
     assert batch._areal_mask_leases == [(1, 2, 3), (1, 2, 4), None]
     batch.filter_batch([2, 0], None)
     copied = batch.copy_for_forward()
+    assert copied._areal_mask_request_ids == ["health_probe", "rollout_a"]
     assert copied._areal_mask_versions == [-1, 166]
     assert copied._areal_mask_leases == [None, (1, 2, 3)]
     with pytest.raises(ValueError, match="workflow lease"):
@@ -557,12 +562,19 @@ def test_readiness_rows_never_acquire_mask_storage():
     ids = torch.tensor([[2, 3], [4, 5]], dtype=torch.int32)
     counts, tokens = torch.tensor([2, 2]), torch.tensor([2, 4])
     refs = publish_sampling_masks(
-        producer, ids, counts, tokens, [-1, 166], [None, [1, 2, 3]]
+        producer,
+        ids,
+        counts,
+        tokens,
+        [-1, 166],
+        [None, [1, 2, 3]],
+        ["health_probe", "rollout_a"],
     )
     assert refs == [[0] * 5, [1, 2, 3, 2, 166]]
     torch.testing.assert_close(
         producer.publish.call_args.args[0], ids[1:], rtol=0, atol=0
     )
+    assert producer.publish.call_args.args[-1] == ["rollout_a"]
     producer.reset_mock()
     assert publish_sampling_masks(
         producer, ids, counts, tokens, [-1, -1], [None, None]

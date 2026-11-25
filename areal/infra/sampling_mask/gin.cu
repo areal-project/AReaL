@@ -101,9 +101,9 @@ class Endpoint {
         || slots == 0 || timeout_seconds <= 0)
       throw std::invalid_argument("Invalid sampling-mask GIN endpoint parameters");
     cuda_check(cudaSetDevice(device));
-    cudaDeviceProp device_props;
-    cuda_check(cudaGetDeviceProperties(&device_props, device));
-    timeout_ = uint64_t(timeout_seconds * device_props.clockRate * 1000.0);
+    int clock_rate_khz;
+    cuda_check(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, device));
+    timeout_ = uint64_t(timeout_seconds * clock_rate_khz * 1000.0);
     ncclUniqueId unique_id;
     std::memcpy(&unique_id, id.data(), sizeof(unique_id));
     const char *stage = "communicator initialization";

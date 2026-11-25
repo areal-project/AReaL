@@ -90,6 +90,7 @@ def merge_sampling_batches(left, right, original_merge) -> None:
     """Preserve seeded requests when SGLang merges independently built batches."""
     versions = left._areal_mask_versions + right._areal_mask_versions
     leases = left._areal_mask_leases + right._areal_mask_leases
+    request_ids = left._areal_mask_request_ids + right._areal_mask_request_ids
     if left.sampling_seed is not None or right.sampling_seed is not None:
         for batch in (left, right):
             if batch.sampling_seed is None:
@@ -99,19 +100,24 @@ def merge_sampling_batches(left, right, original_merge) -> None:
     original_merge(left, right)
     left._areal_mask_versions = versions
     left._areal_mask_leases = leases
+    left._areal_mask_request_ids = request_ids
 
 
-def publish_sampling_masks(producer, ids, counts, tokens, versions, leases):
+def publish_sampling_masks(
+    producer, ids, counts, tokens, versions, leases, request_ids=None
+):
     """Readiness probes never own training data or acquire a workflow lease."""
     if len(leases) != len(versions) or len(leases) != ids.shape[0]:
         raise ValueError("Sampling-mask lease metadata is misaligned")
+    if request_ids is not None and len(request_ids) != len(leases):
+        raise ValueError("Sampling-mask request IDs are misaligned")
     if any(
         lease is None and version != -1
         for lease, version in zip(leases, versions, strict=True)
     ):
         raise ValueError("Training request is missing sampling-mask workflow lease")
     if all(lease is not None for lease in leases):
-        return producer.publish(ids, counts, tokens, versions, leases)
+        return producer.publish(ids, counts, tokens, versions, leases, request_ids)
     live = [i for i, lease in enumerate(leases) if lease is not None]
     refs = [[0] * 5 for _ in leases]
     if live:
@@ -122,6 +128,7 @@ def publish_sampling_masks(producer, ids, counts, tokens, versions, leases):
             tokens[indices],
             [versions[i] for i in live],
             [leases[i] for i in live],
+            [request_ids[i] for i in live] if request_ids is not None else None,
         )
         for index, reference in zip(live, published, strict=True):
             refs[index] = reference
@@ -197,14 +204,17 @@ def register_backend() -> None:
             )
         result._areal_mask_versions = versions
         result._areal_mask_leases = leases
+        result._areal_mask_request_ids = [request.rid for request in batch.reqs]
         return result
 
     def filter_batch(self, indices, indices_device):
         versions = [self._areal_mask_versions[i] for i in indices]
         leases = [self._areal_mask_leases[i] for i in indices]
+        request_ids = [self._areal_mask_request_ids[i] for i in indices]
         original_filter(self, indices, indices_device)
         self._areal_mask_versions = versions
         self._areal_mask_leases = leases
+        self._areal_mask_request_ids = request_ids
 
     def merge_batch(self, other):
         merge_sampling_batches(self, other, original_merge)
@@ -213,6 +223,7 @@ def register_backend() -> None:
         result = original_copy(self)
         result._areal_mask_versions = self._areal_mask_versions.copy()
         result._areal_mask_leases = self._areal_mask_leases.copy()
+        result._areal_mask_request_ids = self._areal_mask_request_ids.copy()
         return result
 
     SamplingBatchInfo.copy_for_forward = copy_for_forward
@@ -298,6 +309,7 @@ def register_backend() -> None:
                     tokens,
                     sampling_info._areal_mask_versions,
                     sampling_info._areal_mask_leases,
+                    sampling_info._areal_mask_request_ids,
                 )
                 if self.producer is not None
                 else [[0] * 5 for _ in range(ids.shape[0])]

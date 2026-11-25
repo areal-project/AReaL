@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Two GPU integration: actual sampling, uint24 GIN, cached multi-epoch PPO."""
+"""Two processes: real sampling and multi-epoch PPO on shared memory or GIN."""
 
 import os
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -13,6 +14,7 @@ from areal.infra.sampling_mask.consumer import SamplingMaskConsumer
 from areal.infra.sampling_mask.lifetime import LeaseRegistry
 from areal.infra.sampling_mask.protocol import REFERENCE_KEYS
 from areal.infra.sampling_mask.service import MaskProducer
+from areal.infra.sampling_mask.store import shared_namespace
 from areal.utils.functional import ppo_actor_loss_fn
 from areal.utils.sampling_mask import restricted_logprobs
 
@@ -22,7 +24,7 @@ def main():
     consumer_module.SLOT_BYTES = service_module.SLOT_BYTES = 1024
     dist.init_process_group("gloo")
     rank = dist.get_rank()
-    device = int(os.environ["LOCAL_RANK"])
+    device = 0 if torch.cuda.device_count() == 1 else int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(device)
     torch.manual_seed(124)
     logits = torch.randn(129, 257, device=device)
@@ -64,10 +66,11 @@ def main():
             refs,
             tokens.cpu().tolist(),
             logp.gather(1, column).flatten().cpu().tolist(),
+            shared_namespace(),
         )
     dist.broadcast_object_list(metadata, src=0)
     if rank == 1:
-        refs, tokens, old = metadata[0]
+        refs, tokens, old, namespace = metadata[0]
         data = {
             key: torch.tensor([ref[i] for ref in refs])
             for i, key in enumerate(REFERENCE_KEYS)
@@ -75,7 +78,22 @@ def main():
         labels_cpu = torch.tensor(tokens)
         versions = torch.full_like(labels_cpu, 7)
         consumer = SamplingMaskConsumer(torch.device("cuda", device), None, 257)
-        support = consumer.load(data, labels_cpu, versions)
+        support = consumer.load_async(data, labels_cpu, versions).result()
+        assert support.slot is not None
+        shared = namespace is not None and namespace == shared_namespace()
+        if shared:
+            assert not consumer._sessions
+            assert all(
+                block.name and block.packed is None
+                for store in consumer._stores.values()
+                for block in store._blocks.values()
+            )
+        else:
+            assert (
+                sum(session.payload_bytes for session in consumer._sessions.values())
+                == support.packed_ids.numel()
+            )
+        initial_control_bytes = consumer.control_bytes
         ids, offsets = support.chunk(0, 129, torch.device("cuda", device))
         parameter = torch.nn.Parameter(logits.clone())
         optimizer = torch.optim.SGD([parameter], lr=0.05)
@@ -111,9 +129,10 @@ def main():
             optimizer.step()
             permutation = torch.arange(128, -1, -1)
             reordered = {key: value[permutation] for key, value in data.items()}
-            reused = consumer.load(
+            reused = consumer.load_async(
                 reordered, labels_cpu[permutation], versions[permutation]
-            )
+            ).result()
+            assert reused.slot is None  # backward can still reference the first mask
             from areal.utils.sampling_mask import SamplingMask
 
             expected = SamplingMask(
@@ -123,6 +142,12 @@ def main():
                 reused.packed_ids, expected.packed_ids, atol=0, rtol=0
             )
         assert consumer.id_bytes == support.packed_ids.numel()
+        assert consumer.control_bytes == initial_control_bytes
+        with pytest.raises(ValueError, match="not aligned"):
+            consumer.load_async(data, labels_cpu + 1, versions).result()
+        # The failed task must not poison the next read or release the lease.
+        recovered = consumer.load_async(data, labels_cpu, versions).result()
+        torch.testing.assert_close(recovered.packed_ids, support.packed_ids)
         consumer.close()
         # Another shard can legitimately reference the same parent prefix.
         second = SamplingMaskConsumer(torch.device("cuda", device), None, 257)
@@ -134,8 +159,9 @@ def main():
         from areal.utils import logging
 
         logging.getLogger("RemoteInfEngine").warning(
-            "Sampling mask pipeline passed: 129 tokens, 3 PPO epochs, %s ID bytes transferred once",
+            "Sampling mask pipeline passed: 129 tokens, 3 PPO epochs, %s logical ID bytes via %s",
             consumer.id_bytes,
+            "shared memory" if shared else "GIN",
         )
     dist.barrier()
     # Processes exit only after the receiver consumed every source chunk.
