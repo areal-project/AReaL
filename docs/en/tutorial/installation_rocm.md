@@ -41,6 +41,7 @@ PyTorch.
 | Megatron-Core      | core_v0.19.0                                                   |
 | Transformers       | 5.3.0                                                          |
 | Ray                | 2.59.0                                                         |
+| aiter              | 0.1.14.post1 (from the base image)                             |
 
 **Note**: This tutorial does not cover the installation of the AMD GPU driver or of
 shared storage. See the
@@ -146,6 +147,11 @@ We recommend the image. To install AReaL into your own ROCm environment instead:
     exit with `Option spirv-expand-step registered more than once`.
   - With Megatron, set `NVTE_FLASH_ATTN=1` and `NVTE_FUSED_ATTN=1`. If either is `0`,
     Megatron's `attention_backend=auto` fails an assertion at startup.
+  - With aiter, set `OPUS_FP32_to_BF16_DEFAULT=0` and
+    `CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0`. On gfx942, aiter 0.1.14 truncates fp32 to
+    bf16 by default, which roughly doubles the train-vs-rollout logprob difference; `0`
+    rounds to nearest even instead. They only affect kernels compiled after they are
+    set, so delete any existing builds under `~/.aiter/build/` and run again.
 
 - If you install SGLang yourself and plan to set `SGLANG_USE_AITER=1`, run the command
   below once after installing it and before training. It patches SGLang 0.5.10.post1,
@@ -181,12 +187,39 @@ We recommend the image. To install AReaL into your own ROCm environment instead:
    `triton`. Any other backend you set explicitly is passed to SGLang unchanged, for
    example `+sglang.attention_backend=triton`.
 
+## Accelerate Rollout with aiter
+
+[aiter](https://github.com/ROCm/aiter) is AMD's high-performance kernel library. We
+recommend enabling it for rollout for better performance. For example, training
+Qwen3-30B-A3B with SGLang on 8 × MI308X, **rollout is about 3× faster with aiter**, and
+train-vs-rollout consistency is not affected.
+
+Images built from `Dockerfile.rocm` already include the MoE layout patch and the
+rounding variables. Before training, export `SGLANG_USE_AITER=1` or
+`VLLM_ROCM_USE_AITER=1` for your inference backend. With vLLM, also add
+`+rollout.setup_timeout=1200`, because compiling the aiter kernels on the first start
+can exceed the default 300 s setup timeout.
+
+If you install the environment yourself instead of using the image, check the following
+before training:
+
+- **MoE layout patch (SGLang with MoE models).** Run the `sglang_aiter_moe_layout` patch
+  above first, or MoE layers produce wrong outputs after the first weight sync.
+- **Rounding variables.** Set `OPUS_FP32_to_BF16_DEFAULT=0` and
+  `CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0`. Without them, train-vs-rollout consistency is
+  worse on gfx942 (MI300X/MI308X); gfx950 (MI350X/MI355X) is not affected and gives the
+  same results either way.
+
+**Note**: From aiter v0.1.28 the defaults no longer truncate, so the rounding variables
+are not needed. If the image environment already sets
+`CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=2` explicitly, still change it to `0`.
+
 ## Environment Variables
 
 | Variable                          | Purpose                                                                                                                                                                                                 |
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SGLANG_USE_AITER=1`              | Optional, off by default. Uses aiter kernels for SGLang's MoE, LayerNorm and other operators; attention is not affected. You may enable it for MoE models, which then need the MoE layout patch above.  |
-| `VLLM_ROCM_USE_AITER=1`           | Optional, off by default. Uses aiter kernels in vLLM. The first start compiles aiter kernels and can exceed the default 300 s setup timeout; add `+rollout.setup_timeout=1200`.                         |
+| `SGLANG_USE_AITER=1`              | Recommended, off by default. Uses aiter kernels for SGLang's MoE, LayerNorm and other operators. See [Accelerate Rollout with aiter](#accelerate-rollout-with-aiter).                                   |
+| `VLLM_ROCM_USE_AITER=1`           | Recommended, off by default. Uses aiter kernels in vLLM. See [Accelerate Rollout with aiter](#accelerate-rollout-with-aiter).                                                                           |
 | `AREAL_ALLOW_DEFAULT_ADMIN_KEY=1` | Required when a service starts on a non-loopback address without a custom `admin_api_key`; otherwise AReaL refuses to start. Use it only on a trusted network.                                          |
 | `VLLM_SERVER_DEV_MODE=1`          | Optional, needed only for vLLM colocation; export it before training. vLLM 0.19.1 serves the `/sleep` and `/wake_up` endpoints colocation needs only in dev mode. Separated deployments do not need it. |
 
