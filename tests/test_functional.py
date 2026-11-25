@@ -26,6 +26,38 @@ def test_ppo_token_ratio_masks_overflow_before_backward():
     torch.testing.assert_close(stats["importance_weight"], torch.tensor([[1.0, 0.0]]))
 
 
+@pytest.mark.parametrize("importance_sampling_level", ["token", "sequence"])
+def test_sapo_ratio_masked_overflow_gives_finite_grad(importance_sampling_level):
+    """Test that sapo_loss_fn keeps grads finite when a masked token's ratio overflows."""
+    # Arrange
+    logprobs = torch.tensor([[-1.0, -2.0, -0.5, -1.5]], requires_grad=True)
+    advantages = torch.tensor([[1.0, -1.0, 1.0, 1.0]])
+    loss_mask = torch.tensor([[True, True, False, True]])
+    old_overflow = torch.tensor([[-1.0, -2.1, -100.5, -1.5]])
+    old_reference = torch.tensor([[-1.0, -2.1, -0.5, -1.5]])
+
+    # Act
+    results = []
+    for old_logprobs in (old_overflow, old_reference):
+        loss, _ = sapo_loss_fn(
+            logprobs=logprobs,
+            old_logprobs=old_logprobs,
+            advantages=advantages,
+            tau_pos=1.0,
+            tau_neg=1.05,
+            loss_mask=loss_mask,
+            importance_sampling_level=importance_sampling_level,
+        )
+        (grad,) = torch.autograd.grad(loss, logprobs)
+        results.append((loss.detach(), grad))
+    (loss_overflow, grad_overflow), (loss_reference, grad_reference) = results
+
+    # Assert
+    assert torch.isfinite(grad_overflow).all()
+    torch.testing.assert_close(grad_overflow, grad_reference, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(loss_overflow, loss_reference, rtol=1e-6, atol=1e-6)
+
+
 class TestPPOActorLossFnSequenceLevel:
     """Test cases for ppo_actor_loss_fn with importance_sampling_level='sequence'."""
 
