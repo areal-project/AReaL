@@ -122,6 +122,7 @@ LOGGER_COLORS_EXACT = {
     "ProxyUtils": "light_purple",
     "AReaL-SWEAgent": "light_purple",
     "ArenaStreamAgent": "light_purple",
+    "ArenaOpenAPIClient": "light_purple",
     "SWETrain": "light_green",
     "SWEPrefixMatcher": "light_yellow",
     # Agent Service - purple
@@ -144,6 +145,7 @@ LOGGER_COLORS_EXACT = {
     # AWEX weight exchange - cyan (compute backend)
     "AwexMegatronAdapter": "light_cyan",
     "AwexSGLangAdapter": "light_cyan",
+    "Qwen35FP8Checkpoint": "light_cyan",
     "AwexFSDPAdapter": "light_cyan",
     "MegatronResidency": "light_cyan",
     "MOPDTeacherPhase": "light_cyan",

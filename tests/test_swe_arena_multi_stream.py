@@ -230,17 +230,18 @@ def test_parse_arena_stream_config_rejects_metric_unsafe_name():
         parse_arena_stream_config({"name": "bad/name", "stream_id": "stream-a"})
 
 
-def test_load_arena_stream_configs_rejects_duplicate_stream_ids():
-    """A copied Stream id must not silently receive multiple mixture weights."""
-    with pytest.raises(ValueError, match="ids must be unique"):
-        load_arena_stream_configs(
-            {
-                "arena_streams": [
-                    {"name": "a", "stream_id": "stream-a"},
-                    {"name": "b", "stream_id": "stream-a"},
-                ]
-            }
-        )
+def test_load_arena_stream_configs_allows_duplicate_ids_for_logical_harnesses():
+    """One real Stream can have separate logical Harness metric namespaces."""
+    streams = load_arena_stream_configs(
+        {
+            "arena_streams": [
+                {"name": "a", "stream_id": "stream-a"},
+                {"name": "b", "stream_id": "stream-a"},
+            ]
+        }
+    )
+    assert [stream.name for stream in streams] == ["a", "b"]
+    assert [stream.stream_id for stream in streams] == ["stream-a", "stream-a"]
 
 
 def test_build_weighted_arena_rows_uses_attempted_group_weights():
@@ -576,11 +577,13 @@ def test_preflight_health_ignores_tasks_without_exact_provenance():
     assert (terminal, failures) == (1, 1)
 
 
+@pytest.mark.parametrize("shared_stream", [False, True])
 @pytest.mark.parametrize("with_observation", [False, True])
 def test_workflow_routes_harness_transform_and_raw_metrics(
-    monkeypatch, tmp_path, with_observation
+    monkeypatch, tmp_path, with_observation, shared_stream
 ):
     """A row should select all rollout and reward settings from its Stream."""
+    second_stream_id = "stream-a" if shared_stream else "stream-b"
     stats_tracker.export_all(reset=True)
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
@@ -604,7 +607,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(
                 },
                 {
                     "name": "b",
-                    "stream_id": "stream-b",
+                    "stream_id": second_stream_id,
                     "harness": "codex@2",
                     "task_envs": {"MODE": "b"},
                     "expected_reward_ref": {"key": "reward-b", "version": "2"},
@@ -672,7 +675,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(
     monkeypatch.setattr(workflow.client, "delete_llm_proxy_async", delete)
     data = {
         "arena_stream_name": "b",
-        "stream_id": "stream-b",
+        "stream_id": second_stream_id,
         "data_id": "data-b",
         "reward_ref_key": "reward-b",
         "reward_ref_version": "2",
@@ -694,7 +697,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(
     reward = asyncio.run(run_workflow())
 
     assert reward == pytest.approx(0.75)
-    assert launched["stream_id"] == "stream-b"
+    assert launched["stream_id"] == second_stream_id
     assert launched["harness"] == "codex@2"
     assert launched["task_envs"] == {"MODE": "b"}
     stats = stats_tracker.export_all(reset=True)
@@ -1004,6 +1007,122 @@ def test_core_model_failure_with_matching_native_receipt_keeps_zero(
     assert (
         ArenaStreamAgentWorkflow.classify_proxy_failure(
             error, context_overflow=False, interaction_count=0
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "code,reason,message",
+    [
+        (
+            "LLM_RESPONSE_FAILED",
+            "empty_completion",
+            "model stopped without visible output or tool calls",
+        ),
+        (
+            "LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED",
+            "provider_length_stop",
+            "model stopped with reason: length",
+        ),
+    ],
+)
+def test_core_single_turn_observation_policy_preserves_model_zero(
+    code, reason, message
+):
+    """Policy metadata from an observational runner is not a delivery result."""
+    error = _core_model_failure_error(code, reason, message)
+    error.harness_result["continuations"] = 0
+    error.harness_result["delivery"] = {
+        "policy": "observation_only",
+        "independent_blender_reopen": False,
+    }
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=0
+        )
+        == "unknown_failure_reject"
+    )
+    if reason == "empty_completion":
+        assert (
+            ArenaStreamAgentWorkflow._harness_failure_reason(error)
+            == "empty_completion"
+        )
+
+
+@pytest.mark.parametrize(
+    "delivery",
+    [
+        {"policy": "observation_only", "independent_blender_reopen": True},
+        {"policy": "observation_only", "independent_blender_reopen": "false"},
+        {"policy": "observation_only", "independent_blender_reopen": 0},
+        {"policy": "observation_only"},
+        {"policy": "required", "independent_blender_reopen": False},
+        {
+            "policy": "observation_only",
+            "independent_blender_reopen": False,
+            "status": "incomplete",
+        },
+        {
+            "policy": "observation_only",
+            "independent_blender_reopen": False,
+            "status": "ERROR",
+        },
+    ],
+)
+def test_core_single_turn_policy_rejects_execution_results_and_unknown_shapes(
+    delivery,
+):
+    """A policy label cannot hide delivery work or loosely typed metadata."""
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "model stopped without visible output or tool calls",
+    )
+    error.harness_result["delivery"] = delivery
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure_field,value",
+    [
+        ("failure", {"code": "collection_failed"}),
+        ("observed_runner_timeout", True),
+        ("observed_external_interruption", True),
+        ("collection", {"status": "ERROR"}),
+    ],
+)
+def test_core_observation_policy_does_not_hide_runner_or_collection_failure(
+    failure_field, value
+):
+    """Even a matching model error is unscored when its runner is unhealthy."""
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "model stopped without visible output or tool calls",
+    )
+    error.harness_result["delivery"] = {
+        "policy": "observation_only",
+        "independent_blender_reopen": False,
+    }
+    error.harness_result[failure_field] = value
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
         )
         == "unknown_failure_reject"
     )

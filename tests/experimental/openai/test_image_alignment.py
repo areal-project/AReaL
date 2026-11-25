@@ -59,10 +59,12 @@ def processor(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("chat_template_type", ["hf", "concat"])
+@pytest.mark.parametrize("compression", [None, "true"])
 async def test_cached_prompt_keeps_wire_images_with_training_tensors(
-    monkeypatch, chat_template_type, processor
+    monkeypatch, chat_template_type, compression, processor
 ):
-    monkeypatch.delenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", raising=False)
+    if compression is not None:
+        monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", compression)
     buffer = BytesIO()
     Image.new("RGB", (1600, 1200), "red").save(buffer, format="JPEG")
     original_images = [base64.b64encode(buffer.getvalue()).decode()]
@@ -109,11 +111,16 @@ async def test_cached_prompt_keeps_wire_images_with_training_tensors(
     assert original_images == first.image_data
     assert processor.image_kwargs[0] == {
         "device": "cpu",
-        "size": {"shortest_edge": 65536, "longest_edge": 1048576},
+        "size": {
+            "shortest_edge": 65536,
+            "longest_edge": 1048576 if compression == "true" else 16777216,
+        },
     }
     with Image.open(BytesIO(base64.b64decode(first.image_data[0]))) as wire:
         assert wire.size == (1600, 1200)
-        expected = wire.convert("RGB").resize((1152, 864), resample=None)
+        expected = wire.convert("RGB")
+        if compression == "true":
+            expected = expected.resize((1152, 864), resample=None)
         torch.testing.assert_close(
             torch.from_numpy(np.asarray(expected).copy()),
             first.multi_modal_input["pixel_values"],
@@ -209,8 +216,8 @@ async def test_create_forwards_images_for_backend(
             assert wire["mm_sampling_kwargs"][IMAGE_SPANS_KEY] == [[2, 2]]
         if backend == "sglang" and alignment != "false":
             assert request.image_data == [original]
-            expected_size = (1152, 864)
-            assert processor.image_kwargs[0]["size"]["longest_edge"] == 1048576
+            expected_size = (1600, 1200)
+            assert processor.image_kwargs[0]["size"]["longest_edge"] == 16777216
         else:
             assert request.image_data == [original]
             expected_size = (1600, 1200)
@@ -260,17 +267,26 @@ async def test_cached_prompt_respects_sglang_pixel_and_resampling_settings(
             "areal.experimental.openai.client.apply_chat_template",
             return_value="prompt",
         ):
-            first = await _prepare_prompt(**kwargs)
-            monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", "false")
             full_budget = await _prepare_prompt(**kwargs)
+            monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", "true")
+            first = await _prepare_prompt(**kwargs)
             monkeypatch.delenv("SGLANG_VLM_QWEN_LIMIT_PIXEL")
+            restored_default = await _prepare_prompt(**kwargs)
+            monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", "false")
+            explicit_false = await _prepare_prompt(**kwargs)
+            monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", "true")
             monkeypatch.setenv("SGLANG_RESIZE_RESAMPLE", "NEAREST")
             nearest = await _prepare_prompt(**kwargs)
             repeated = await _prepare_prompt(**kwargs)
 
         assert processor.calls == 3
         assert first.multi_modal_input["pixel_values"].shape == (864, 1152, 3)
-        assert full_budget.multi_modal_input["pixel_values"].shape == (1216, 1600, 3)
+        assert full_budget.multi_modal_input["pixel_values"].shape == (1200, 1600, 3)
+        assert (
+            restored_default.multi_modal_input["pixel_values"]
+            is explicit_false.multi_modal_input["pixel_values"]
+            is full_budget.multi_modal_input["pixel_values"]
+        )
         assert nearest.multi_modal_input["pixel_values"].shape == (864, 1152, 3)
         assert not torch.equal(
             first.multi_modal_input["pixel_values"],
@@ -309,7 +325,7 @@ async def test_sglang_decode_keeps_raw_exif_orientation(processor):
             align_sglang_images=True,
         )
     assert result.image_data == [original]
-    assert result.multi_modal_input["pixel_values"].shape == (384, 192, 3)
+    assert result.multi_modal_input["pixel_values"].shape == (80, 40, 3)
 
 
 @pytest.mark.parametrize(
@@ -330,3 +346,48 @@ def test_alignment_selects_sglang_backends(
     engine.config = SimpleNamespace(backend=config_backend)
     engine.backend = type(backend_type, (), {})()
     assert _is_sglang_backend(engine) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compression", [None, "true"])
+async def test_changed_text_prompt_reuses_decoded_history(
+    processor, monkeypatch, compression
+):
+    """A new prompt key must not decode cached source images again."""
+    if compression is not None:
+        monkeypatch.setenv("SGLANG_VLM_QWEN_LIMIT_PIXEL", compression)
+    buffer = BytesIO()
+    Image.new("RGB", (1600, 1200), "red").save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode()
+    kwargs = dict(
+        processor=processor,
+        tokenizer=SimpleNamespace(eos_token_id=2),
+        tokenizer_messages=[],
+        concat_messages=[],
+        image_data=[encoded],
+        parent=None,
+        chat_template_type="hf",
+        tools=None,
+        extra_body={},
+        processor_cache=ProcessorCallCache(),
+        align_sglang_images=True,
+    )
+    with (
+        patch(
+            "areal.experimental.openai.client.apply_chat_template",
+            return_value="prompt",
+        ),
+        patch("base64.b64decode", wraps=base64.b64decode) as decode,
+    ):
+        first = await _prepare_prompt(**kwargs)
+        kwargs["tokenizer_messages"] = [{"role": "user", "content": "changed text"}]
+        second = await _prepare_prompt(**kwargs)
+        assert decode.call_count == 1
+    assert processor.calls == 2
+    assert second.image_data == first.image_data == [encoded]
+    torch.testing.assert_close(
+        first.multi_modal_input["pixel_values"],
+        second.multi_modal_input["pixel_values"],
+        rtol=0,
+        atol=0,
+    )

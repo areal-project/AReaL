@@ -650,16 +650,20 @@ class RolloutController:
         errors: list[str] = []
 
         # Stop externally reachable/background work before deleting any role.
-        self._stop_proxy_gateway()
+        cleanup_steps = [("proxy gateway stop", self._stop_proxy_gateway)]
         if self._dispatcher is not None:
-            self._dispatcher.destroy()
-        self._stop_callback_server()
+            cleanup_steps.append(("dispatcher destroy", self._dispatcher.destroy))
+        cleanup_steps.append(("callback server stop", self._stop_callback_server))
         owner = getattr(self, "_sampling_mask_owner", None)
         if owner is not None:
+            cleanup_steps.append(("sampling-mask lease shutdown", owner.close))
+        for name, cleanup in cleanup_steps:
             try:
-                owner.close()
+                cleanup()
             except Exception as exc:
-                errors.append(f"sampling-mask lease shutdown: {exc}")
+                # In particular, an OOM here must not skip destroy RPCs: those
+                # cancel pending workflows and their external Arena jobs.
+                errors.append(f"{name}: {exc}")
 
         # Proxy is a logical leaf of rollout. Destroy its engines and workers
         # while the rollout alias still resolves to the actual process owner.

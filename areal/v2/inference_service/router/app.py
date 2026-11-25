@@ -379,6 +379,22 @@ def create_app(config: RouterConfig) -> FastAPI:
     # Routing (admin key required)
     # =========================================================================
 
+    async def _pick_new_worker_addr(model_addrs: list[str] | None) -> str:
+        candidates = await worker_registry.get_all_workers()
+        if model_addrs is not None:
+            workers_by_addr = {worker.worker_addr: worker for worker in candidates}
+            candidates = [
+                workers_by_addr[addr]
+                for addr in dict.fromkeys(model_addrs)
+                if addr in workers_by_addr
+            ]
+        if not candidates:
+            raise HTTPException(status_code=503, detail="No registered workers")
+        worker = strategy.pick([worker for worker in candidates if worker.is_healthy])
+        if worker is None:
+            raise HTTPException(status_code=503, detail="No healthy workers")
+        return worker.worker_addr
+
     @app.post("/route", response_model=RouteResponse | LeaseResponse)
     async def route(body: RouteRequest, request: Request):
         _require_admin_key(request, config.admin_api_key)
@@ -412,16 +428,6 @@ def create_app(config: RouterConfig) -> FastAPI:
             if first is not None:
                 model_addrs = first.data_proxy_addrs
 
-        def _filter_by_model(workers: list, addrs: list[str] | None) -> list:
-            if addrs is None:
-                return workers
-            workers_by_addr = {w.worker_addr: w for w in workers}
-            return [
-                workers_by_addr[addr]
-                for addr in dict.fromkeys(addrs)
-                if addr in workers_by_addr
-            ]
-
         # Step B: session_id lookup
         if body.session_id is not None:
             worker = await session_registry.lookup_by_id(body.session_id)
@@ -432,20 +438,14 @@ def create_app(config: RouterConfig) -> FastAPI:
 
         # Step C: model-only routing (no api_key/session_id)
         if body.api_key is None and model_addrs is not None:
-            all_workers = await worker_registry.get_all_workers()
-            candidates = _filter_by_model(all_workers, model_addrs)
-            if not candidates:
-                raise HTTPException(status_code=503, detail="No registered workers")
-            worker = strategy.pick(candidates)
-            if worker is None:
-                raise HTTPException(status_code=503, detail="No registered workers")
+            worker_addr = await _pick_new_worker_addr(model_addrs)
             info = (
                 await model_registry.get(body.model)
                 if body.model
                 else await model_registry.first()
             )
             return RouteResponse(
-                worker_addr=worker.worker_addr,
+                worker_addr=worker_addr,
                 url=info.url if info else None,
                 api_key=info.api_key if info else None,
             )
@@ -468,19 +468,13 @@ def create_app(config: RouterConfig) -> FastAPI:
 
         # Step D: Admin key → pick from model addrs
         if hmac.compare_digest(body.api_key, config.admin_api_key):
-            all_workers = await worker_registry.get_all_workers()
-            candidates = _filter_by_model(all_workers, model_addrs)
-            if not candidates:
-                raise HTTPException(status_code=503, detail="No registered workers")
-            worker = strategy.pick(candidates)
-            if worker is None:
-                raise HTTPException(status_code=503, detail="No registered workers")
+            worker_addr = await _pick_new_worker_addr(model_addrs)
             await session_registry.register_session(
                 body.api_key,
                 "__hitl__",
-                worker.worker_addr,
+                worker_addr,
             )
-            return RouteResponse(worker_addr=worker.worker_addr)
+            return RouteResponse(worker_addr=worker_addr)
 
         # Step E: Unknown key
         raise HTTPException(status_code=404, detail="Unknown API key")

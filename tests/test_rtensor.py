@@ -947,6 +947,40 @@ class TestRemotize:
 
 
 class TestRTensorAliasPreservation:
+    def test_compaction_preserves_images_shared_across_trajectories(self, monkeypatch):
+        """Token trimming must not clone a shared image once per trajectory."""
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        monkeypatch.setattr("areal.infra.rpc.rtensor._fetch_buffer", {})
+        image = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        trajectories = [
+            {
+                "attention_mask": torch.tensor([[1, 1, 0]]),
+                "input_ids": torch.tensor([[index, index + 1, 0]]),
+                "multi_modal_input": [{"pixel_values": image}],
+            }
+            for index in range(12)
+        ]
+
+        remote = RTensor.remotize(
+            trajectories, node_addr="node-a", preserve_tensor_aliases=True
+        )
+        shards = [item["multi_modal_input"][0]["pixel_values"].shard for item in remote]
+        assert all(shard == shards[0] for shard in shards)
+        assert len(backend.store_calls) == 25  # Two token fields per row, one image.
+        local = RTensor.localize(
+            deserialize_value(serialize_value(remote)), preserve_tensor_aliases=True
+        )
+        first_image = local[0]["multi_modal_input"][0]["pixel_values"]
+        for original, restored in zip(trajectories, local, strict=True):
+            assert original["multi_modal_input"][0]["pixel_values"] is image
+            assert original["input_ids"].shape == (1, 3)
+            assert restored["multi_modal_input"][0]["pixel_values"] is first_image
+            torch.testing.assert_close(first_image, image, rtol=0, atol=0)
+            torch.testing.assert_close(
+                restored["input_ids"], original["input_ids"][:, :2], rtol=0, atol=0
+            )
+
     def test_remotize_nested_trajectories_retains_temporary_sources(self, monkeypatch):
         """Compacted sources stay alive across siblings, only until remotize ends."""
         from areal.utils import data as data_utils

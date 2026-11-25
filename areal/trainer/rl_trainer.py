@@ -212,7 +212,12 @@ class PPOTrainer:
                 "created workers",
                 exc_info=True,
             )
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                logger.warning(
+                    "Cleanup failed after trainer construction error", exc_info=True
+                )
             raise
 
     def _init_impl(
@@ -1478,7 +1483,10 @@ class PPOTrainer:
                     logger.warning(
                         f"{attr}.destroy() failed during close", exc_info=True
                     )
-        perf_tracer.save(force=True)
+        try:
+            perf_tracer.save(force=True)
+        except Exception:
+            logger.warning("perf_tracer.save() failed during close", exc_info=True)
 
     def _config_perf_tracer(self):
         rank = int(os.getenv("RANK", "0"))
@@ -2346,5 +2354,10 @@ class PPOTrainer:
     def __exit__(self, exc_type, exc_value, traceback):
         if exc_type is not None:
             logger.error(f"Training failed with exception: {exc_value}", exc_info=True)
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            if exc_type is None:
+                raise
+            logger.warning("Cleanup failed after training error", exc_info=True)
         return False

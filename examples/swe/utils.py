@@ -25,6 +25,8 @@ class SWEEnvConfig:
         llm_model: Optional LLM model override for OH/OpenCode/Codex agents.
         opencode_provider: Optional OpenCode provider override.
         codex_provider: Optional Codex provider override.
+        arena_auxiliary_system_prompts: Exact system prompts identifying tool-free
+            model calls to exclude from training trajectories. Empty disables exclusion.
         step_limit: Maximum number of agent interaction steps per episode.
         max_completion_tokens: Maximum completion tokens for the agent LLM.
         timeout: Maximum time allowed for a single episode in seconds.
@@ -104,6 +106,12 @@ class SWEEnvConfig:
             "help": "Maximum serialized Arena raw payload bytes per audit record."
         },
     )
+    arena_log_per_task_reward: bool = field(
+        default=False,
+        metadata={
+            "help": "Emit a separate raw reward metric for each Arena dataset task."
+        },
+    )
     arena_base_url: str = field(
         default="",
         metadata={
@@ -161,6 +169,16 @@ class SWEEnvConfig:
                 "an OpenAI Chat Completions upstream."
             ),
             "choices": ["", "anthropic", "responses", "chat_completions"],
+        },
+    )
+    arena_auxiliary_system_prompts: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Exact system prompts identifying tool-free auxiliary model calls "
+                "to exclude from training trajectories. Supports Chat Completions "
+                "system messages and Responses instructions. Empty disables exclusion."
+            )
         },
     )
     arena_harness: str = field(

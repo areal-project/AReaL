@@ -30,6 +30,7 @@ The following hardware configuration has been extensively tested:
 | Docker           |                                                                                                 27.2.0                                                                                                 |
 | AReaL Image (A2) |                                                                       `ghcr.io/hwvanici/areal_npu:v1.0.5-a2` (see details below)                                                                       |
 | AReaL Image (A3) |                                                                       `ghcr.io/hwvanici/areal_npu:v1.0.5-a3` (see details below)                                                                       |
+| AReaL Image (A5) |                                                                       `ghcr.io/hwvanici/areal_npu:v1.0.5-a5` (see details below)                                                                       |
 
 **Note**: This tutorial does not cover the installation of CANN, or shared storage
 mounting, as these depend on your specific node configuration and system version. Please
@@ -44,15 +45,17 @@ and the A3 image targets Atlas A3; both are built from the same recipe (see
 [`Dockerfile.a2`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.5/Dockerfile.a2)
 /
 [`Dockerfile.a3`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.5/Dockerfile.a3)
-on the `ascend-v1.0.5` branch) and ship the following pre-built stack. The versions
-below match the published `v1.0.5` image:
+on the `ascend-v1.0.5` branch). The A5 image targets Ascend 950 and uses
+[`Dockerfile.a5`](https://github.com/HwVanICI/AReaL/blob/33d8d7b14be86bbc559364927abee8ffaea62ffa/Dockerfile.a5).
+The table lists the runtime versions in the published images.
 
 | Component       |                       Version                       |
 | --------------- | :-------------------------------------------------: |
 | Base image (A2) | `quay.io/ascend/cann:9.0.1-910b-ubuntu22.04-py3.11` |
 | Base image (A3) |  `quay.io/ascend/cann:9.0.1-a3-ubuntu22.04-py3.11`  |
-| Runtime OS      |                 Ubuntu 22.04.5 LTS                  |
-| Python          |                       3.11.15                       |
+| Base image (A5) | `quay.io/ascend/cann:9.0.1-950-ubuntu22.04-py3.12`  |
+| Runtime OS      |    Ubuntu 22.04.5 LTS (A2/A3), Ubuntu 22.04 (A5)    |
+| Python          |            3.11.15 (A2/A3), 3.12.13 (A5)            |
 | CANN            |                        9.0.1                        |
 | PyTorch         |                       2.10.0                        |
 | torch_npu       |                    2.10.0.post2                     |
@@ -73,9 +76,10 @@ are made importable via `PYTHONPATH`.
 WORK_DIR=<your_workspace>
 CONTAINER_WORK_DIR=<your_container_workspace>
 
-# Use A2/A3 image depending on your hardware type
+# Use A2/A3/A5 image depending on your hardware type
 # IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.5-a2
 IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.5-a3
+# IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.5-a5
 CONTAINER_NAME=areal_npu
 
 cd ${WORK_DIR}
@@ -130,11 +134,11 @@ Megatron-Bridge under `/areal-workspace`) stay untouched.
 ```bash
 rm -rf /AReaL
 
-git clone https://github.com/areal-project/AReaL
+# A2/A3
+git clone -b ascend-v1.0.5 https://github.com/areal-project/AReaL
+# For A5, use the following clone command instead:
+# git clone -b ascend-950-dev https://github.com/HwVanICI/AReaL
 cd AReaL
-
-# Checkout to ascend branch
-git checkout ascend-v1.0.5
 
 # Install AReaL. All Python dependencies (from pyproject.npu.toml) are already
 # installed in the image, so only the AReaL package itself needs to be installed.

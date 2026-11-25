@@ -35,6 +35,10 @@ from examples.swe.arena_reward_breakdown import arena_reward_metrics
 from examples.swe.arena_reward_mapping import load_harness_mapping, load_reward_mapping
 from examples.swe.arena_types import ArenaRewardRefConfig, ArenaStreamConfig
 
+from areal.experimental.openai.finalization import (
+    ResponseValidationPolicy,
+    response_validator_for_policy,
+)
 from areal.experimental.openai.proxy.workflow import HARNESS_OUTCOME_METRIC_CODES
 from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.infra import workflow_context
@@ -592,6 +596,11 @@ class ArenaStreamAgentWorkflow:
         self.result_dump_dir = str(
             self.econfig.get("arena_result_dump_dir", "") or ""
         ).strip()
+        self.log_per_task_reward = self.econfig.get("arena_log_per_task_reward", False)
+        self.response_validation_policy = self.econfig.get(
+            "arena_response_validation_policy", "final_response"
+        )
+        response_validator_for_policy(self.response_validation_policy)
         self.result_dump_max_bytes = int(
             self.econfig.get("arena_result_dump_max_bytes", 1_000_000)
         )
@@ -864,8 +873,10 @@ class ArenaStreamAgentWorkflow:
             and raw.get("failure") is None
         )
 
-    @staticmethod
-    def _core_terminal_failure_error(receipt: dict[str, Any]) -> dict[str, Any] | None:
+    @classmethod
+    def _core_terminal_failure_error(
+        cls, receipt: dict[str, Any]
+    ) -> dict[str, Any] | None:
         """Validate a completed prefix followed by one failed Core turn."""
         turns = receipt.get("turn_statuses")
         errors = receipt.get("error")
@@ -888,7 +899,15 @@ class ArenaStreamAgentWorkflow:
                 return None
         delivery = receipt.get("delivery")
         if not multiple_turns:
-            if delivery is not None:
+            # Observational runners can report their configured policy without
+            # performing a delivery. Do not accept execution results or failures.
+            if delivery is not None and (
+                not isinstance(delivery, dict)
+                or set(delivery) != {"policy", "independent_blender_reopen"}
+                or delivery["policy"] != "observation_only"
+                or delivery["independent_blender_reopen"] is not False
+                or cls._has_harness_receipt_system_failure(receipt)
+            ):
                 return None
         elif (
             "delivery" not in receipt
@@ -1631,6 +1650,21 @@ class ArenaStreamAgentWorkflow:
             return reward
         return None
 
+    def get_response_validation_policy_for_export(
+        self,
+        data: dict[str, Any],
+        reward: float,
+        *,
+        export_style: str,
+    ) -> ResponseValidationPolicy:
+        """Opt successful artifact episodes into external-score validation only."""
+        if (
+            self.get_episode_reward_for_export(data, reward, export_style=export_style)
+            is None
+        ):
+            return "final_response"
+        return self.response_validation_policy
+
     def get_failure_reward_for_export(
         self, data: dict[str, Any], *, export_style: str
     ) -> float | None:
@@ -1683,14 +1717,16 @@ class ArenaStreamAgentWorkflow:
             )
         try:
             _record_arena_metrics(**metrics)
-            if result is not None and result.score is not None:
+            if (
+                self.log_per_task_reward
+                and result is not None
+                and result.score is not None
+            ):
                 data_id = str(data.get("data_id") or "").strip()
-            else:
-                data_id = ""
-            if data_id:
-                stats_tracker.get("debug").scalar(
-                    **{f"task/{data_id}/raw_reward": result.score}
-                )
+                if data_id:
+                    stats_tracker.get("debug").scalar(
+                        **{f"task/{data_id}/raw_reward": result.score}
+                    )
             _record_arena_domain_reward(reward, arena_task_type)
         finally:
             self._task_result.set(None)
@@ -1743,7 +1779,18 @@ class ArenaStreamAgentWorkflow:
     def get_session_metadata(self, data: dict[str, Any]) -> dict[str, Any]:
         """Supply generation defaults for requests that omit these fields."""
         del data
-        return {"generation_args": dict(self.gen_args)} if self.gen_args else {}
+        metadata = {"generation_args": dict(self.gen_args)} if self.gen_args else {}
+        auxiliary_prompts = self.econfig.get("arena_auxiliary_system_prompts", [])
+        if auxiliary_prompts:
+            if not isinstance(auxiliary_prompts, list) or any(
+                not isinstance(prompt, str) or not prompt
+                for prompt in auxiliary_prompts
+            ):
+                raise ValueError(
+                    "Arena auxiliary system prompts must be nonempty strings"
+                )
+            metadata["auxiliary_system_prompts"] = list(auxiliary_prompts)
+        return metadata
 
     async def record_failure_disposition(
         self,
@@ -1979,8 +2026,8 @@ class ArenaStreamAgentWorkflow:
         async def audit_incomplete_task(status: str) -> None:
             if not launched_task_id:
                 return
-            # TODO(agent): call Arena task cancellation here once a supported
-            # endpoint is present in the published OpenAPI schema.
+            # The client cancels the launched job before propagating a local
+            # cancellation/timeout. Keep the local failure receipt unscored.
             incomplete_result = ArenaTaskResult(
                 task_id=launched_task_id,
                 status=status,

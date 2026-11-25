@@ -32,6 +32,7 @@ from pydantic import BaseModel, StringConstraints, ValidationError
 from areal.api import InferenceEngine, TrainEngine
 from areal.infra.platforms import current_platform
 from areal.infra.rpc.guard.app import GuardState, get_state
+from areal.infra.rpc.node_shared_vision import NodeSharedVisionTransport
 from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.utils import logging, perf_tracer, seeding
@@ -39,6 +40,9 @@ from areal.utils.data import broadcast_tensor_container, tensor_container_to
 from areal.utils.dynamic_import import import_from_string
 
 logger = logging.getLogger("EngineBP")
+
+# No process groups are created until the first eligible collective.
+_node_shared_vision = NodeSharedVisionTransport(broadcast_tensor_container)
 
 
 # ======================================================================================
@@ -532,15 +536,20 @@ def call_engine_method():
                         preserve_input_tensor_aliases
                         and getattr(engine, "is_vision_model", False)
                     )
+                    broadcast_payload = (
+                        _node_shared_vision
+                        if os.environ.get("AREAL_NODE_SHARED_VISION", "0") == "1"
+                        else broadcast_tensor_container
+                    )
                     args_bcast = tensor_container_to(args, bcast_device)
-                    args_bcast = broadcast_tensor_container(
+                    args_bcast = broadcast_payload(
                         args_bcast,
                         src_rank=engine.current_data_parallel_head(),
                         group=bcast_group,
                         preserve_tensor_aliases=preserve_broadcast_aliases,
                     )
                     kwargs_bcast = tensor_container_to(kwargs, bcast_device)
-                    kwargs_bcast = broadcast_tensor_container(
+                    kwargs_bcast = broadcast_payload(
                         kwargs_bcast,
                         src_rank=engine.current_data_parallel_head(),
                         group=bcast_group,

@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Follow SGLang's CPU/PIL Qwen image pipeline without changing wire images.
+"""Select native or legacy Qwen image preprocessing without changing wire images.
 
 ``AREAL_VLM_ALIGN_SGLANG`` defaults to true. Set it to false to use the
-original HF image preprocessing in the OpenAI proxy. This does not change
-SGLang's image settings or disable the HF processor's own resizing.
+original HF image preprocessing in the OpenAI proxy. With alignment enabled,
+``SGLANG_VLM_QWEN_LIMIT_PIXEL`` defaults to false, preserving native image bounds.
+Set it to true to restore the legacy preliminary PIL resize and 16-fold
+pixel-budget reduction. The HF processor still handles model sizing, and
+original wire bytes are retained in both modes.
 """
 
 from __future__ import annotations
 
 import math
 import os
+from collections.abc import Callable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -68,6 +72,7 @@ class _ImagePolicy(NamedTuple):
     factor: int
     min_pixels: int
     max_pixels: int
+    compress_images: bool
     resample: Any
 
 
@@ -85,33 +90,36 @@ def _image_policy(processor: Any) -> _ImagePolicy | None:
     ):
         return None
 
-    from PIL import Image as PILImage
-
     image_processor = processor.image_processor
     factor = int(image_processor.patch_size) * int(image_processor.merge_size)
     min_pixels = int(image_processor.size["shortest_edge"])
     max_pixels = int(image_processor.size["longest_edge"])
-    limit_pixels = os.environ.get("SGLANG_VLM_QWEN_LIMIT_PIXEL", "true").lower()
+    limit_pixels = (
+        os.environ.get("SGLANG_VLM_QWEN_LIMIT_PIXEL", "false").strip().lower()
+    )
     if limit_pixels not in ("true", "false", "1", "0", "yes", "no", "y", "n"):
         raise ValueError("Invalid SGLANG_VLM_QWEN_LIMIT_PIXEL boolean value")
-    if limit_pixels in ("true", "1", "yes", "y") and max_pixels >= (32 * factor) ** 2:
-        max_pixels //= 16
+    compress_images = limit_pixels in ("true", "1", "yes", "y")
+    resample = None
+    if compress_images:
+        from PIL import Image as PILImage
+
+        if max_pixels >= (32 * factor) ** 2:
+            max_pixels //= 16
+        resample = getattr(PILImage, os.environ.get("SGLANG_RESIZE_RESAMPLE", ""), None)
     if factor <= 0 or not 0 < min_pixels <= max_pixels:
         raise ValueError("Invalid Qwen-VL image factor or pixel bounds")
 
-    # Match the resampling filter used by SGLang's preliminary PIL resize.
-    resample = getattr(PILImage, os.environ.get("SGLANG_RESIZE_RESAMPLE", ""), None)
-    return _ImagePolicy(factor, min_pixels, max_pixels, resample)
+    return _ImagePolicy(factor, min_pixels, max_pixels, compress_images, resample)
 
 
 def sglang_qwen_image_kwargs(processor: Any) -> dict[str, Any] | None:
-    """Use proxy CPU HF processing with SGLang's effective size, without mutation.
+    """Use proxy CPU HF processing with the selected image pixel bounds.
 
-    SGLang reduces its own processor's maximum once at startup. The proxy keeps
-    its shared processor unchanged and passes the effective bounds per call,
-    so repeated requests cannot apply the pixel reduction more than once.
-    This describes SGLang's policy independently of AREAL_VLM_ALIGN_SGLANG:
-    callers also use it to recognize models requiring real-image metadata.
+    Enabling the legacy switch restores the training-side reduction without
+    mutating the shared processor or changing the inference server. Select
+    the policy to match the server. Callers also use this independently of
+    AREAL_VLM_ALIGN_SGLANG to recognize models requiring real-image metadata.
     """
     policy = _image_policy(processor)
     if policy is None:
@@ -127,56 +135,66 @@ def sglang_qwen_image_kwargs(processor: Any) -> dict[str, Any] | None:
 
 def prepare_sglang_qwen_images(
     processor: Any,
-    images: list[Image],
+    images: list[Image | Callable[[], Image]],
     *,
     cache: ProcessorCallCache | None = None,
     image_keys: list[str] | None = None,
 ) -> tuple[list[Image], list[str]] | None:
-    """Reproduce native SGLang PIL resize, retaining original request bytes.
+    """Prepare native or legacy-resized images while retaining wire bytes.
 
-    The SGLang model startup patch selects CPU/PIL decoding while retaining
-    native pixel bounds, preliminary resize, and HF device dispatch. The proxy
-    uses CPU HF processing after the same preliminary PIL resize.
-    Both processes must use the same SGLANG_VLM_QWEN_LIMIT_PIXEL and
-    SGLANG_RESIZE_RESAMPLE settings, without server-side image-size overrides.
+    By default image dimensions are retained until HF preprocessing.
+    SGLANG_VLM_QWEN_LIMIT_PIXEL=true restores the old training-side PIL resize
+    and pixel-budget reduction; SGLANG_RESIZE_RESAMPLE selects its PIL filter.
 
-    Return resized training images and an unchanged copy of image_keys for
+    Return RGB training images and an unchanged copy of image_keys for
     inference transport. No image is encoded again. With no image_keys the
     second return value is empty, since the original wire bytes are unavailable.
+    Callable inputs are decoded only on cache misses and closed after preprocessing.
     Qwen4-Exp and unknown processor/model families keep their own policy.
     """
     policy = _image_policy(processor)
     if policy is None:
         return None
-    factor, min_pixels, max_pixels, resample = policy
+    factor, min_pixels, max_pixels, compress_images, resample = policy
     if image_keys is not None and len(image_keys) != len(images):
         raise ValueError("Image cache keys must match the input images")
     prepared = []
     for index, image in enumerate(images):
 
         def prepare(image=image):
-            height, width = _sglang_image_size(
-                image.height, image.width, factor, min_pixels, max_pixels
-            )
-            resized = image.convert("RGB").resize((width, height), resample=resample)
-            return resized
+            owned = callable(image)
+            decoded = image() if owned else image
+            try:
+                prepared_image = decoded.convert("RGB")
+                if compress_images:
+                    height, width = _sglang_image_size(
+                        decoded.height, decoded.width, factor, min_pixels, max_pixels
+                    )
+                    prepared_image = prepared_image.resize(
+                        (width, height), resample=resample
+                    )
+                return prepared_image
+            finally:
+                if owned:
+                    decoded.close()
 
         if cache is not None and image_keys is not None:
-            # Reuse resized historical images when text or appended images
+            # Reuse decoded historical images when text or appended images
             # change. The original JPEG/PNG transport remains unchanged.
             key = cache.make_key(
-                "sglang_qwen_image",
+                "sglang_qwen_image_compression",
                 id(processor),
                 factor,
                 min_pixels,
                 max_pixels,
+                compress_images,
                 resample,
                 image_keys[index],
             )
-            resized = cache.get_or_compute(key, prepare)
+            prepared_image = cache.get_or_compute(key, prepare)
             # Processors may mutate PIL inputs. Never expose the cached image.
-            resized = resized.copy()
+            prepared_image = prepared_image.copy()
         else:
-            resized = prepare()
-        prepared.append(resized)
+            prepared_image = prepare()
+        prepared.append(prepared_image)
     return prepared, list(image_keys) if image_keys is not None else []

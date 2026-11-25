@@ -728,6 +728,14 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             )
             if episode_reward is not None:
                 export_kwargs["episode_reward"] = episode_reward
+                policy = await self._call_agent_hook(
+                    "get_response_validation_policy_for_export",
+                    data,
+                    rewards,
+                    export_style=self.export_style,
+                )
+                if policy is not None and policy != "final_response":
+                    export_kwargs["response_validation_policy"] = policy
 
         # Apply turn-level discount and export interactions
         interactions = await proxy_client.export_interactions(

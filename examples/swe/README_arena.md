@@ -162,6 +162,43 @@ are retained for audit, not parsed for training rewards. Model-attributed failur
 retain interactions with zero reward; system and ambiguous failures are rejected. Result
 shards are written under `arena_result_dump_dir` when configured.
 
+### Pending jobs during shutdown
+
+An accepted Arena launch remains owned by its waiting workflow. If that wait is
+cancelled, times out, or raises an error, the client attempts to cancel the exact
+launched Job before releasing the workflow's proxy registration. This also runs when
+normal trainer shutdown destroys pending workflows, including while unwinding Python
+`MemoryError` or CUDA allocator OOM exceptions. Completed Arena results and their reward
+receipts are preserved. No additional cleanup job is launched.
+
+Cleanup uses the returned `job_id`, or resolves it from the exact `task_id` for older
+launch responses. It never scans or cancels by shared model name. Lookup and
+cancellation share a ten-second budget, capped by the client timeout; failures are
+logged without replacing the original workflow or training exception. Transient lookup
+and cancellation failures retry within that same budget, independently of the
+task-creation retry setting.
+
+This is in-process, best-effort cleanup. A lost launch response can leave an unknown
+Job. `ray.kill`, SIGKILL, host OOM killing, and node loss cannot execute Python cleanup.
+The RPC guard attempts cleanup on SIGTERM, but a platform kill deadline can interrupt
+it. Ray worker-death and OOM errors enter the launcher's failure/post-exit path; that
+does not prove that a dead worker's Arena jobs have been reclaimed. Guaranteed recovery
+of these cases requires service-side expiry or reconciliation.
+
+### Per-task reward metrics
+
+Arena logs aggregate and per-Stream rewards by default. To also log
+`debug/task/<data_id>/raw_reward`, add this to the training YAML.
+
+```yaml
+econfig:
+  arena_log_per_task_reward: true
+```
+
+If the field is absent from the YAML, the equivalent CLI override is
+`+econfig.arena_log_per_task_reward=true`. Each distinct dataset task adds a separate
+metric series in W&B.
+
 ### Multimodal request limits
 
 Configure SGLang's item-count limits through the training YAML:
@@ -522,3 +559,39 @@ or adaptive thinking controls. Chat rendering uses the checkpoint's template def
 and any Harness request overrides. These differences affect training semantics; the
 profile is intended for Arena integration validation, not a claim of full recipe
 equivalence.
+
+### Externally scored artifacts
+
+For Harnesses that score an artifact and finish with an empty auxiliary response, set
+`econfig.arena_response_validation_policy: artifact_reward` explicitly. This policy
+preserves the external episode reward only for successful concat exports with PRM
+disabled. Malformed tool calls remain invalid. The default `final_response` policy still
+requires usable final text or a tool call.
+
+### Auxiliary model requests
+
+Harnesses can issue model calls such as session-title generation after solving a task.
+To keep these calls out of training trajectories, explicitly allowlist their complete
+system prompts in the normal training YAML:
+
+```yaml
+econfig:
+  arena_auxiliary_system_prompts:
+    - "Generate a session title."
+```
+
+Replace the example with the exact prompt emitted by the Harness. The default empty list
+disables exclusion. Chat Completions matches the leading system message; Responses
+matches non-empty `instructions` or a leading system message in `input`. Empty
+instructions are ignored, and additional non-empty system or developer instructions keep
+the request in training. Matching uses the effective request after session defaults are
+merged. Calls with tools, including inherited tools, remain in training; an explicit
+empty tools list can disable inherited tools. Matched tool-free calls use isolated
+interaction and failure state so they cannot replace the task's reward target.
+
+### Multiple Harnesses for one Stream
+
+Multiple `arena_streams` entries may share a `stream_id` to run the same dataset through
+different Harnesses. Give every entry a unique `name`; sampling weights, Harness
+selection, reward settings, and per-stream metrics use that logical name. Each entry
+contributes its own sampling weight even when its Stream ID is shared.
