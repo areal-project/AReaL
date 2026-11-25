@@ -1,0 +1,6 @@
+name: Ascend nightly suite
+on: workflow_call
+
+jobs:
+  e2e:
+    uses: ./.github/workflows/ascend-nightly-e2e.yml
