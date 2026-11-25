@@ -15,6 +15,10 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
+from areal.utils import logging
+
+logger = logging.getLogger("ArenaOpenAPIClient")
+
 LLMProtocol = Literal["anthropic", "responses", "chat_completions"]
 
 
@@ -81,17 +85,29 @@ def _is_retryable_status(status_code: int) -> bool:
     return status_code == 429 or status_code >= 500
 
 
-def _is_retryable_response(response: httpx.Response) -> bool:
+def _is_retryable_response(
+    response: httpx.Response, method: str, *, retry_gateway_timeout: bool = False
+) -> bool:
     if _is_retryable_status(response.status_code):
         return True
     if response.status_code == 302:
-        # Spanner renders an upstream 502 as a redirect to an HTML waiting page.
-        # Retry the original request within its existing budget, never the redirect.
         location = response.headers.get("location", "")
-        return parse_qs(urlsplit(location).query).get("fromspanner") == ["apigwmoe_502"]
+        marker = parse_qs(urlsplit(location).query).get("fromspanner")
+        # A gateway timeout may occur after a task launch was accepted.
+        return marker == ["apigwmoe_502"] or (
+            marker == ["arenaonlinegateway_504"]
+            and (method in ("GET", "DELETE") or retry_gateway_timeout)
+        )
     if response.status_code != 403:
         return False
     return "spanner-http-ant-group-watch-all" in response.text[:1000]
+
+
+def _is_retryable_result_response(response: httpx.Response) -> bool:
+    """Only known transient failures may outlive the bounded request retries."""
+    if response.status_code >= 500:
+        return response.status_code in {500, 502, 503, 504}
+    return _is_retryable_response(response, "GET")
 
 
 def resolve_arena_credentials(
@@ -944,7 +960,7 @@ class ArenaOpenAPIClient:
                         ) from exc
                     time.sleep(min(2**attempt, 10))
                     continue
-                if not _is_retryable_response(response):
+                if not _is_retryable_response(response, method):
                     return response
                 if attempt == self.request_retries:
                     return response
@@ -961,6 +977,7 @@ class ArenaOpenAPIClient:
         method: str,
         url: str,
         _retry_count: int | None = None,
+        _retry_gateway_timeout: bool = False,
         **kwargs: Any,
     ) -> httpx.Response:
         retries = self.request_retries if _retry_count is None else _retry_count
@@ -975,7 +992,9 @@ class ArenaOpenAPIClient:
                     ) from exc
                 await asyncio.sleep(min(2**attempt, 10))
                 continue
-            if not _is_retryable_response(response):
+            if not _is_retryable_response(
+                response, method, retry_gateway_timeout=_retry_gateway_timeout
+            ):
                 return response
             if attempt == retries:
                 return response
@@ -1201,6 +1220,9 @@ class ArenaOpenAPIClient:
                     "POST",
                     f"{self.base_url}/openapi/v1/jobs/{encoded_job_id}/cancel",
                     _retry_count=cleanup_retries,
+                    # Cancelling an exact known job is safe to replay. A launch
+                    # POST must never opt in to this ambiguous gateway retry.
+                    _retry_gateway_timeout=True,
                     headers=self._headers,
                 )
                 # A terminal job can race with cancellation. The cancel endpoint
@@ -1230,13 +1252,59 @@ class ArenaOpenAPIClient:
     ) -> ArenaTaskResult:
         encoded_task_id = quote(task_id, safe="")
         url = f"{self.base_url}/openapi/v1/tasks/{encoded_task_id}/result"
+        failed_reads = 0
         while True:
-            response = await self._async_request(
-                client,
-                "GET",
-                url,
-                headers=self._headers,
-            )
+            try:
+                response = await self._async_request(
+                    client,
+                    "GET",
+                    url,
+                    headers=self._headers,
+                )
+            except ArenaAPIError as exc:
+                cause = exc.__cause__
+                if not isinstance(
+                    cause,
+                    (
+                        httpx.TimeoutException,
+                        httpx.NetworkError,
+                        httpx.RemoteProtocolError,
+                    ),
+                ):
+                    raise
+                failed_reads += 1
+                if failed_reads & (failed_reads - 1) == 0:
+                    logger.warning(
+                        "Transient result read failed for task %s (%s, %d failed reads); "
+                        "continuing to poll the same task",
+                        task_id,
+                        type(cause).__name__,
+                        failed_reads,
+                    )
+                # The Task already exists. Keep its route and siblings alive;
+                # the caller's episode timeout/cancellation still bounds this wait.
+                await asyncio.sleep(self.poll_interval)
+                continue
+            if _is_retryable_result_response(response):
+                failed_reads += 1
+                if failed_reads & (failed_reads - 1) == 0:
+                    logger.warning(
+                        "Transient result response for task %s (HTTP %d, %d failed reads); "
+                        "continuing to poll the same task",
+                        task_id,
+                        response.status_code,
+                        failed_reads,
+                    )
+                await response.aclose()
+                await asyncio.sleep(self.poll_interval)
+                continue
+            if failed_reads:
+                logger.info(
+                    "Result reads recovered for task %s after %d failed reads",
+                    task_id,
+                    failed_reads,
+                )
+                failed_reads = 0
             payload = _response_json(response)
             result = _parse_task_result(payload, fallback_task_id=task_id)
             if result.task_id != task_id:
