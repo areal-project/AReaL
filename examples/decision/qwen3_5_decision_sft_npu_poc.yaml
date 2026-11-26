@@ -1,0 +1,152 @@
+# Single-NPU PointerHead decision SFT PoC.
+#
+# Recipe knobs: LoRA 16, lr 5e-5, head_dim 256, max_state 384, and the
+# default none/distractor probabilities. Override actor.path and the
+# dataset paths for your machine:
+#
+#   bash examples/decision/run_npu_poc.sh
+#   python3 examples/decision/train_decision.py \
+#       --config examples/decision/qwen3_5_decision_sft_npu_poc.yaml \
+#       actor.path=/path/to/Qwen3.5-4B-Base \
+#       train_dataset.path=/path/to/train.jsonl \
+#       valid_dataset.path=/path/to/development.jsonl
+experiment_name: qwen35-decision-sft-npu-poc
+trial_name: poc0
+
+seed: 0
+enable_offload: false
+total_train_epochs: 2
+total_train_steps: null
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 1
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+scheduler:
+  type: local
+
+actor:
+  backend: "megatron:d1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3.5-4B-Base
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  is_decision_model: true
+  decision_head_dim: 256
+  ord_w: 0.0
+  label_smoothing: 0.0
+  brier_w: 0.0
+  focal_gamma: 0.0
+  use_lora: true
+  lora_rank: 16
+  lora_alpha: 16
+  lora_dropout: 0.0
+  lora_targets_preset: all
+  mb_spec:
+    max_tokens_per_mb: 4096
+  optimizer:
+    type: adam
+    lr: 5.0e-5
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1e-5
+    lr_scheduler_type: cosine
+    gradient_clipping: 1.0
+  mindspeed:
+    swap_optimizer: true
+    use_fused_swiglu: true
+    position_embedding_type: "rope"
+  megatron:
+    bridge_type: megatron-bridge
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        TASK_QUEUE_ENABLE: "2"
+        HCCL_EXEC_TIMEOUT: "14400"
+        ACL_DEVICE_SYNC_TIMEOUT: "14400"
+        HCCL_EVENT_TIMEOUT: "14500"
+        HCCL_ASYNC_ERROR_HANDLING: "0"
+        ACL_STREAM_TIMEOUT: "14500000"
+        HCCL_CONNECT_TIMEOUT: "7200"
+        PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+        TORCH_COMPILE_DISABLE: "1"
+
+train_dataset:
+  batch_size: 4
+  shuffle: true
+  pin_memory: false
+  num_workers: 0
+  drop_last: false
+  scheduling_spec: null
+  path: /data/decision/train.jsonl
+  type: decision
+  split: train
+  dataset_kwargs:
+    seed: 0
+    max_state: 384
+    max_branch: 1024
+    p_none: 0.1
+    p_none_distract: 0.12
+    p_distract: 0.15
+    p_none_pair: 0.25
+
+valid_dataset:
+  split: development
+  batch_size: 4
+  shuffle: false
+  pin_memory: false
+  num_workers: 0
+  drop_last: false
+  scheduling_spec: null
+  path: /data/decision/development.jsonl
+  type: decision
+  dataset_kwargs:
+    seed: 0
+    max_state: 384
+    max_branch: 1024
+    augment: false
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
