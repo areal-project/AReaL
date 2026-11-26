@@ -2,14 +2,27 @@
 
 """Saturated Actor throughput for the predicted rollout mix."""
 
+from dataclasses import replace
+from math import isfinite
 
-def actor_capacity(templates, batch_size, batch_seconds, publication_seconds):
-    """Estimate episodes per second, including one publication per PPO update."""
-    if not templates:
+from .cost_model import actor_config
+
+
+def estimate_actor_capacity(models, template, role, pattern, publication):
+    """Return the capacity of a legal representative Actor batch in episodes/s."""
+    execution = replace(template, actor_backend=role.backend)
+    config = actor_config(models.actor_template, execution)
+    model = models.actor_model
+    batch = tuple(episode.completed_turns for episode in pattern.templates)
+    try:
+        estimate = model.estimate_batch(config, batch)
+        duration = estimate.duration_seconds()
+        if (
+            not isfinite(duration)
+            or duration <= 0
+            or estimate.peak_gib > model.hardware.memory_gb * 1e9 / 2**30
+        ):
+            return None
+        return len(batch) / (duration + publication)
+    except ValueError:
         return None
-    count = len(templates)
-    weighted = 0.0
-    for offset in range(0, count, batch_size):
-        batch = tuple(templates[(offset + i) % count] for i in range(batch_size))
-        weighted += min(batch_size, count - offset) * batch_seconds(batch)
-    return batch_size / (weighted / count + publication_seconds)

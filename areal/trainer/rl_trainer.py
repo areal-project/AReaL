@@ -721,16 +721,12 @@ class PPOTrainer:
         self, meta: WeightUpdateMeta, new_version: int
     ) -> None:
         """Update weights, publish their version, and discard stale AWEX requests."""
-        if self._elastic_controller is not None:
-            self._elastic_controller.record("publish")
         self.actor.update_weights(meta)
 
         self.actor.set_version(new_version)
         if self.critic is not None:
             self.critic.set_version(new_version)
         self.rollout.set_version(new_version)
-        if self._elastic_controller is not None:
-            self._elastic_controller.record("done")
         if self.eval_rollout is not None:
             self.eval_rollout.set_version(new_version)
 

@@ -7,9 +7,8 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import cached_property
-from typing import Literal, NamedTuple
 
 
 def nonnegative(name: str, value: float, *, positive: bool = False) -> None:
@@ -439,36 +438,6 @@ class EpisodeView:
     initial_input_tokens: int | None = None
 
 
-class InflightCall(NamedTuple):
-    episode_id: str
-    turn: int
-    ready_at: float
-    first_token_at: float | None = None
-    prefilled: int = 0
-    generated: int = 0
-    retained: int = 0
-    replica: int | None = None
-
-
-@dataclass(frozen=True)
-class Backlog:
-    """Outstanding work at one observation time, with measured or estimated shapes.
-
-    Timestamps share the arrival clock. A tool entry identifies the next turn
-    and its expected start. An Actor event gives its next phase and time left.
-    """
-
-    shapes: dict[str, tuple[Turn, ...]]
-    queued: tuple[tuple[str, float], ...] = ()
-    running: tuple[InflightCall, ...] = ()
-    tools: tuple[tuple[str, int, float], ...] = ()
-    ready: tuple[str, ...] = ()
-    actor_event: tuple[Literal["actor", "published"], float] | None = None
-    passed_calls: int = 0
-    completed_calls: int = 0
-    unknown_timing: bool = False
-
-
 @dataclass(frozen=True)
 class OnlineObservation:
     now: float
@@ -559,86 +528,3 @@ class Request:
             raise ValueError(
                 "Request needs a name and at least one uncached input token"
             )
-
-
-@dataclass(frozen=True)
-class HistoryReplayConfig:
-    history_seconds: float = 120.0
-
-    def __post_init__(self):
-        nonnegative("history_seconds", self.history_seconds, positive=True)
-
-
-def _with_initial_input(turns: tuple[Turn, ...], input_tokens: int) -> tuple[Turn, ...]:
-    result = [replace(turns[0], input_tokens=input_tokens)]
-    for turn in turns[1:]:
-        previous = result[-1]
-        result.append(
-            replace(
-                turn,
-                input_tokens=previous.input_tokens
-                + previous.output_tokens
-                + previous.tool_output_tokens
-                + previous.next_input_overhead,
-            )
-        )
-    return tuple(result)
-
-
-@dataclass(frozen=True)
-class HistoricalReplay:
-    """Replay recent arrival slots using the latest compatible completed trajectories."""
-
-    config: HistoryReplayConfig
-
-    @property
-    def horizon_seconds(self) -> float:
-        return self.config.history_seconds
-
-    def predict(self, view: OnlineObservation, decision: int) -> tuple[Forecast, ...]:
-        history = sorted(
-            (
-                e
-                for e in view.episodes
-                if e.completed_at is not None and e.completed_at <= view.now
-            ),
-            key=lambda e: (e.completed_at, e.available_at, e.episode_id),
-        )
-        if not history:
-            return ()
-
-        start = max(0.0, view.now - self.config.history_seconds)
-        span = view.now - start
-        end = view.now + self.config.history_seconds
-        latest = {episode.family: episode for episode in history}
-
-        episodes = []
-        recent = []
-        for episode in view.episodes:
-            if view.input_closed or not start <= episode.available_at < view.now:
-                continue
-            if episode.completed_at is not None and episode.completed_at <= view.now:
-                turns = episode.completed_turns
-            else:
-                turns = latest.get(episode.family, history[-1]).completed_turns
-                if episode.initial_input_tokens is not None:
-                    turns = _with_initial_input(turns, episode.initial_input_tokens)
-            recent.append((episode.available_at, episode.family, turns))
-
-        recent.sort(key=lambda slot: slot[0])
-        cycle = 0
-        while recent and cycle * span < self.config.history_seconds:
-            for index, (available_at, family, turns) in enumerate(recent):
-                when = view.now + cycle * span + available_at - start
-                if when >= end:
-                    break
-                episodes.append(
-                    EpisodeSample(
-                        f"history-replay-{decision}-{cycle}-{index}",
-                        family,
-                        when,
-                        turns,
-                    )
-                )
-            cycle += 1
-        return (Forecast(tuple(episodes), end),)

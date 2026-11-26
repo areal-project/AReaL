@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run the Reference policy beside online PPO and submit at publication boundaries."""
+"""Run capacity search beside online PPO and apply at publication boundaries."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from functools import cache
 from itertools import combinations
 from pathlib import Path
@@ -25,21 +25,9 @@ from areal.v2.reconfiguration import (
     sglang_gpus_per_node,
 )
 
-from .evaluator import Catalog, Observation, ReplayEvaluator, load_profiles
-from .evaluator.actor.cost_model import actor_config
-from .evaluator.areal.cost_model import (
-    ActorStages,
-    IOBandwidth,
-    ReconfigurationModel,
-    RolloutStages,
-)
+from .evaluator import CapacityEvaluator, Catalog, load_profiles
 from .evaluator.contracts import ActorConfig
-from .evaluator.workload import (
-    ExecutionConfig,
-    HistoricalReplay,
-    HistoryReplayConfig,
-    ServingSLO,
-)
+from .evaluator.workload import ExecutionConfig, ServingSLO
 from .observation import LiveObservation
 from .optimizer import Layout, Optimizer, RoleLayout
 from .trigger import StableWorkloadTrigger
@@ -67,11 +55,6 @@ def configure_devices(config, supplied):
         for x in (settings.poll_seconds, settings.forecast_seconds)
     ):
         raise ValueError("Polling and forecasting periods must be positive")
-    if (
-        not math.isfinite(settings.estimated_search_seconds)
-        or settings.estimated_search_seconds < 0
-    ):
-        raise ValueError("Expected a nonnegative search duration estimate")
     directory = Path(settings.run_dir).resolve()
     config.rollout.scheduling_spec[0].env_vars["AREAL_ELASTIC_EVENT_DIR"] = str(
         directory
@@ -186,30 +169,8 @@ def _placement(
     return place
 
 
-def _policy(trainer, binding, warm_actor, warm_rollout, parameters, models):
+def _policy(trainer, binding, parameters, models):
     cfg = trainer.config
-    settings = cfg.elastic
-    stages = parameters["cutover_parameters"]
-    if any(stages[k] != parameters["profiles"][k] for k in ("hardware", "model")):
-        raise ValueError(
-            "Cutover parameters must match the hardware and model profiles"
-        )
-    shape = models.actor_model.model
-    weight = shape.total_parameters * 2 / 1e9
-    actor = ActorStages(
-        weight,
-        6 * weight,
-        IOBandwidth(**stages["write_GBps"]),
-        IOBandwidth(**stages["read_GBps"]),
-        warm_nodes=frozenset(warm_actor),
-        expert_fraction=shape.layers
-        * shape.expert_parameters_per_layer
-        / shape.total_parameters
-        if shape.mlp_type == "moe"
-        else 0.0,
-        **stages["actor"],
-    )
-    rollout = RolloutStages(warm_nodes=frozenset(warm_rollout), **stages["rollout"])
     actor_layout, rollout_layout, dp = binding
     template = ExecutionConfig(
         actor_layout.backend,
@@ -231,32 +192,18 @@ def _policy(trainer, binding, warm_actor, warm_rollout, parameters, models):
     pool = tuple(trainer._reconfiguration_devices)
     place = _placement(pool, current, actor_layout, rollout_layout)
 
-    cut = ReconfigurationModel(
-        actor.predict,
-        rollout.predict,
-        place,
-        stages["pause_disconnect"],
-        stages["reconnect_resume"],
-    )
     window = parameters["window"]
     slo = ServingSLO(
         window["ttft_seconds"], window["tpot_seconds"], window["pressure_fraction"]
     )
-    evaluator = ReplayEvaluator(
+    evaluator = CapacityEvaluator(
         models,
-        HistoricalReplay(HistoryReplayConfig(settings.forecast_seconds)),
         template,
         slo,
         batch_size=cfg.train_dataset.batch_size,
         concurrency=cfg.rollout.max_concurrent_rollouts,
-        staleness=cfg.rollout.max_head_offpolicyness,
-        reconfiguration=cut,
     )
-    search = Optimizer(
-        evaluator=evaluator,
-        gpu_capacity=len(pool),
-        minimum_request_fraction=slo.minimum_request_fraction,
-    )
+    search = Optimizer(evaluator, len(pool), place)
     return search, current, place
 
 
@@ -281,15 +228,11 @@ class ElasticController:
         self.lock = Lock()
         self.stop = Event()
         self.wake = Event()
-        self.warm_actor = set()
-        self.warm_rollout = set()
         self.binding = self._binding()
         self.policy = self._bind(self.binding)
         self.version = trainer.actor.get_version()
-        self.actor_events = []
         self.latest_batch: tuple[str, ...] = ()
         self.switching = False
-        self.consumed_sessions = set()
         self.generation = 0
         self.running = None
         self.ready = None
@@ -312,28 +255,12 @@ class ElasticController:
         )
 
     def _bind(self, binding):
-        self.warm_actor.update(d.node for d in binding[0].devices)
-        self.warm_rollout.update(d.node for d in binding[1].devices)
-        return _policy(
-            self.trainer,
-            binding,
-            self.warm_actor,
-            self.warm_rollout,
-            self.parameters,
-            self.models,
-        )
-
-    def record(self, kind, count=0):
-        with self.lock:
-            self.actor_events.append((kind, time.time(), count))
+        return _policy(self.trainer, binding, self.parameters, self.models)
 
     def on_actor_batch(self, batch):
-        at = time.time()
         session_ids = tuple(traj.pop("_elastic_session_id", "") for traj in batch)
         with self.lock:
-            self.actor_events.append(("take", at, len(batch)))
             self.latest_batch = session_ids
-            self.consumed_sessions.update(sid for sid in session_ids if sid)
         self.wake.set()
 
     def _run(self):
@@ -366,9 +293,7 @@ class ElasticController:
                 return
             at = time.time()
             version, policy = self.version, self.policy
-            events = tuple(self.actor_events)
             sessions = self.latest_batch
-            consumed = tuple(self.consumed_sessions)
         if not sessions:
             return
         view = self.reader.snapshot(version, at=at)
@@ -379,51 +304,10 @@ class ElasticController:
             if self.switching or policy is not self.policy:
                 return
             change = self.trigger.observe(view, batch)
-        if change is None:
-            return
-
-        backlog = self.reader.backlog(
-            view,
-            change.pattern,
-            events,
-            consumed=set(self.reader.episode_ids(consumed)),
-        )
-        optimizer, layout, _ = policy
-        if (
-            backlog is not None
-            and backlog.actor_event is not None
-            and backlog.actor_event[0] == "actor"
-        ):
-            shapes = tuple(ep.completed_turns for ep in change.pattern.templates)
-            try:
-                execution = actor_config(
-                    self.models.actor_template, optimizer.evaluator.template
-                )
-                duration = self.models.actor_model.estimate_batch(
-                    execution, shapes
-                ).duration_seconds()
-            except ValueError as exc:
-                logger.warning("Cannot estimate the active Actor batch: %s", exc)
-            else:
-                started = next(
-                    stamp for kind, stamp, _ in reversed(events) if kind == "take"
-                )
-                backlog = replace(
-                    backlog, actor_event=("actor", max(0.0, duration - (at - started)))
-                )
-
-        with self.lock:
-            if self.switching or policy is not self.policy:
+            if change is None:
                 return
-            ready_at = (
-                view.now
-                + max(0.0, time.time() - at)
-                + self.settings.estimated_search_seconds
-            )
-            observation = Observation(view, layout, backlog, ready_at)
-            future = worker.submit(
-                optimizer.decide, observation, layout, confirmed=change
-            )
+            optimizer, layout, _ = policy
+            future = worker.submit(optimizer.decide, layout, change)
             self.running = (future, self.generation, policy, at, change)
             future.add_done_callback(lambda _: self.wake.set())
         logger.info(
@@ -442,12 +326,14 @@ class ElasticController:
         self.running = None
         decision = future.result()
         logger.info(
-            "Elastic decision %s: %s -> %s (%s, %d candidates)",
+            "Elastic decision %s: %s -> %s (split %s, %d Actor estimates, %d Rollout probes, %s)",
             epoch,
             decision.source,
             decision.target,
+            decision.split,
+            decision.actor_evaluations,
+            decision.rollout_evaluations,
             decision.reason,
-            len(decision.predictions),
         )
         if epoch == self.generation and source is self.policy:
             self.ready = (source, decision, at, change)
@@ -478,15 +364,7 @@ class ElasticController:
             _, layout, place = source
             if decision.source != layout:
                 return
-            selected = next(
-                (p for p in decision.predictions if p.layout == decision.target), None
-            )
-            if (
-                selected is None
-                or not selected.supported
-                or selected.request_fraction is None
-                or selected.gpu_seconds is None
-            ):
+            if decision.target is None:
                 return
             if decision.target == layout:
                 self.trigger.bind(change)
