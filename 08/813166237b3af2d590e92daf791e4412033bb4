@@ -1,0 +1,28 @@
+tests/test_sglang_mm_limits_config.py
+  s_a9fdf80967fb72::t_18df8f471b149f 52-56,62-75
+  s_a9fdf80967fb72::t_5f10f0f50a6203 57-61
+docs/zh/cli_reference.md
+  s_a9fdf80967fb72::t_6551a0077012a0 662
+areal/api/cli_args.py
+  s_a9fdf80967fb72::t_6d52d39307c713 2731-2732,2903-2904,2906
+  s_a9fdf80967fb72::t_18df8f471b149f 2726-2730,2733-2734,2905
+  s_a9fdf80967fb72::t_71919773b9ca93 2907
+docs/en/cli_reference.md
+  s_a9fdf80967fb72::t_6551a0077012a0 664
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "08813166237b3af2d590e92daf791e4412033bb4",
+  "prompts": {},
+  "sessions": {
+    "s_a9fdf80967fb72": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a210d4-565c-7d53-bc6c-852373035626",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
