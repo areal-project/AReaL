@@ -33,6 +33,10 @@ class VLLMBridgeBackend:
     ) -> HttpRequest:
         """Build a ``/v1/completions`` or ``/v1/chat/completions`` request."""
         gconfig = req.gconfig
+        if gconfig.score_centering_top_k:
+            raise ValueError(
+                "vLLM score centering currently requires rollout._version=v1."
+            )
 
         # Compute effective max_new_tokens (cap by remaining context window)
         max_new_tokens = min(

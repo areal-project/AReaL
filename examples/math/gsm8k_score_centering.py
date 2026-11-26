@@ -25,8 +25,8 @@ def main(args):
         raise ValueError(
             "Enable actor.use_score_centering and gconfig.score_centering_top_k."
         )
-    if not config.rollout.backend.startswith("sglang:"):
-        raise ValueError("This example requires SGLang rollout.")
+    if not config.rollout.backend.startswith(("sglang:", "vllm:")):
+        raise ValueError("This example requires native SGLang or vLLM rollout.")
     workflow_kwargs = dict(
         reward_fn="areal.reward.gsm8k.gsm8k_reward_fn",
         gconfig=config.gconfig,
