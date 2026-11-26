@@ -1234,6 +1234,12 @@ async def _call_client_create(
             _engine, session_data.backend_session_id, close=False
         ):
             return await create_fn(**client_kwargs)
+    except asyncio.CancelledError:
+        # RouteClient shields dispatched generation and retains its lease after
+        # the caller leaves. Ending this proxy request cannot establish that the
+        # backend stopped, even if a later request confirms a running timeout.
+        session_data.mark_model_request_cancelled()
+        raise
     except ModelExecutionTimeoutError:
         session_data.mark_model_execution_timeout()
         logger.warning("Session %s exceeded the model running timeout", session_id)

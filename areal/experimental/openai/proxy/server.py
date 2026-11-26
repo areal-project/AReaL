@@ -169,6 +169,7 @@ class SessionData:
         self.model_execution_timeout = False
         self._active_model_requests = 0
         self._concurrent_model_requests = False
+        self._cancelled_model_request = False
         self._next_sampling_request_index = 0
         self._processor_cache_released = False
 
@@ -239,13 +240,19 @@ class SessionData:
         with self._lock:
             self.model_execution_timeout = True
 
+    def mark_model_request_cancelled(self) -> None:
+        """Cancellation does not prove a dispatched backend request terminated."""
+        with self._lock:
+            self._cancelled_model_request = True
+
     @property
     def recoverable_model_execution_timeout(self) -> bool:
-        """Concurrent requests cannot establish a unique terminal model cause."""
+        """Concurrent or cancelled requests leave the terminal cause ambiguous."""
         with self._lock:
             return (
                 self.model_execution_timeout
                 and not self._concurrent_model_requests
+                and not self._cancelled_model_request
                 and self._active_model_requests == 0
             )
 

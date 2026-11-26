@@ -2,6 +2,7 @@
 
 """Only backend-confirmed running deadlines may supply model-timeout evidence."""
 
+import asyncio
 import hashlib
 import json
 import pickle
@@ -16,11 +17,16 @@ from aiohttp import web
 from examples.swe.arena_agent import ArenaStreamAgentWorkflow
 from tests.experimental.openai.test_context_overflow_recovery import _FakeProxyClient
 from tests.test_http_error_diagnostics import http_server
-from tests.test_remote_inf_engine_r3 import _make_engine, _make_request
+from tests.test_remote_inf_engine_r3 import (
+    _make_engine,
+    _make_request,
+    _make_sglang_response,
+)
 from tests.test_swe_arena_multi_stream import (
     _core_tool_json_failure_error,
     _set_core_failure_outcome,
 )
+from tests.v2.inference_service import test_backend_router
 
 from areal.engine.sglang_remote import SGLangBackend
 from areal.experimental.openai.proxy import client_session as client_module
@@ -32,6 +38,14 @@ from areal.infra import remote_inf_engine, workflow_context
 from areal.infra.utils.http import arequest_with_retry
 from areal.utils import stats_tracker
 from areal.utils.errors import ModelExecutionTimeoutError
+from areal.v2.inference_service.router.backend import (
+    BackendSpec,
+    RegisterBackends,
+    SetPoolState,
+)
+from areal.v2.inference_service.router.client import RouteClient
+
+live_client = test_backend_router.live_client
 
 
 def _timeout_http_body(message="Request running timeout reached."):
@@ -238,6 +252,180 @@ async def test_timeout_stream_and_end_session_preserve_typed_evidence(monkeypatc
     )
     assert response.status_code == 422
     assert response.headers["x-should-retry"] == "false"
+
+
+@pytest.mark.asyncio
+async def test_disconnected_stream_with_outstanding_lease_vetoes_later_timeout(
+    monkeypatch, live_client
+):
+    """An SSE disconnect does not terminate the shielded backend generation."""
+    state, _, http_session, controls = live_client
+    identity = {"pool_id": "timeout-pool", "run_id": "run"}
+    await state.register(
+        RegisterBackends(
+            **identity,
+            weight_version=0,
+            backends=[
+                BackendSpec(
+                    backend_id="backend", backend_addr=controls["address"], capacity=2
+                )
+            ],
+        )
+    )
+    await state.set_state(
+        identity["pool_id"],
+        SetPoolState(run_id="run", control_seq=0, state="READY", weight_version=0),
+    )
+    route = RouteClient(controls["address"], **identity, admin_api_key="test")
+    route.set_sender_state(False, 0)
+    engine = _make_engine(return_routed_experts=False)
+    engine.route_client = route
+    session = SessionData(session_id="task")
+    started, finish = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def generate(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await finish.wait()
+            return web.json_response(_make_sglang_response([(-0.1, 7)]))
+        return web.json_response(_timeout_http_body(), status=503)
+
+    async def create_fn(messages, **kwargs):
+        await engine._agenerate(_make_request())
+
+        async def chunks():
+            for chunk in ():
+                yield chunk
+
+        return chunks()
+
+    async def consume():
+        return [
+            chunk
+            async for chunk in srv._deferred_openai_sse_stream(
+                {"messages": [{"role": "user", "content": "solve"}]}, "task"
+            )
+        ]
+
+    controls["generate"] = generate
+    monkeypatch.setattr(
+        workflow_context, "get_aiohttp_session", AsyncMock(return_value=http_session)
+    )
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+    monkeypatch.setattr(srv, "_engine", engine)
+    monkeypatch.setattr(srv, "_resume_streams", None)
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_fn))
+        ),
+    )
+    first = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        first.cancel()  # Same cancellation path as a disconnected StreamingResponse.
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert (await state.snapshot(**identity))["outstanding"] == 1
+
+        chunks = await asyncio.wait_for(consume(), 2)
+        assert ModelExecutionTimeoutError.code in chunks[-1]
+        assert (await state.snapshot(**identity))["outstanding"] == 1
+        ended = await srv.end_session("task")
+        assert ended["system_error"] is False
+        assert ended["model_execution_timeout"] is False
+        assert (
+            ArenaStreamAgentWorkflow.classify_proxy_failure(
+                _model_timeout_error(),
+                context_overflow=False,
+                interaction_count=2,
+                model_execution_timeout=ended["model_execution_timeout"],
+            )
+            == "unknown_failure_reject"
+        )
+    finally:
+        finish.set()
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(*list(route._tasks)), 3)
+    assert (await state.snapshot(**identity))["outstanding"] == 0
+    assert session.recoverable_model_execution_timeout is False
+
+
+@pytest.mark.parametrize("auxiliary", [False, True])
+@pytest.mark.asyncio
+async def test_cancelled_request_veto_is_isolated_from_auxiliary_calls(
+    monkeypatch, auxiliary
+):
+    """Cancelled auxiliary generation must not poison the training session."""
+    session = SessionData(
+        session_id="task", metadata={"auxiliary_system_prompts": ["Title"]}
+    )
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+
+    async def create_fn(messages, **kwargs):
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await srv._call_client_create(
+            create_fn,
+            {
+                "messages": [
+                    {
+                        "role": "system" if auxiliary else "user",
+                        "content": "Title" if auxiliary else "Solve",
+                    }
+                ]
+            },
+            "task",
+        )
+    session.mark_model_execution_timeout()
+    assert session.recoverable_model_execution_timeout is auxiliary
+
+
+@pytest.mark.parametrize(
+    "terminal_message,accepted",
+    [
+        ("model HTTP status 422", True),
+        ("model HTTP status 422 Unprocessable Entity", True),
+        ("model HTTP status 422 Unprocessable Entity: upstream timeout", False),
+        ("model HTTP status 503 Service Unavailable", False),
+    ],
+)
+@pytest.mark.parametrize(
+    "fault", [None, "no_local_proof", "wrong_digest", "wrong_status"]
+)
+def test_core_http_timeout_status_text_requires_matching_proof(
+    terminal_message, accepted, fault
+):
+    """Source-derived Core HttpFailure fixture; no deployed-image provenance.
+
+    AReaL-Harness 9a586229 core/engine/src/model.rs formats reqwest::StatusCode
+    with its reason phrase. Keep legacy bare-status receipts supported too.
+    """
+    error = _model_timeout_error()
+    outcome = deepcopy(error.result.raw["outcome"])
+    outcome["source"] = "provider_http"
+    outcome["details"].update(eventType="http_error", httpStatus=422)
+    if fault == "wrong_digest":
+        outcome["details"]["diagnosticSignals"]["messageSha256"] = "0" * 64
+    elif fault == "wrong_status":
+        outcome["details"]["httpStatus"] = 503
+    _set_core_failure_outcome(error, outcome)
+    error.harness_result["error"][-1]["message"] = terminal_message
+    assert ArenaStreamAgentWorkflow.classify_proxy_failure(
+        error,
+        context_overflow=False,
+        interaction_count=2,
+        model_execution_timeout=fault != "no_local_proof",
+    ) == (
+        "model_failure_zero" if accepted and fault is None else "unknown_failure_reject"
+    )
 
 
 @pytest.mark.asyncio

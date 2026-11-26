@@ -1130,7 +1130,12 @@ class ArenaStreamAgentWorkflow:
             )
             allowed_messages = {expected_message}
             if details["eventType"] == "http_error":
-                allowed_messages.add("model HTTP status 422")
+                allowed_messages.update(
+                    {
+                        "model HTTP status 422",
+                        "model HTTP status 422 Unprocessable Entity",
+                    }
+                )
             if terminal_error["message"] not in allowed_messages:
                 return False
         if (
