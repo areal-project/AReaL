@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+from importlib.metadata import version
 
 
 # ---- BEGIN AREAL ----
@@ -70,6 +71,7 @@ def areal_launch_server(server_args) -> None:
     from areal.v2.inference_service.sglang.rpc_proxy import RpcProxy
     from areal.v2.inference_service.sglang.scheduler import (
         areal_run_scheduler_process,
+        areal_run_scheduler_process_0520,
         create_result_ipc,
     )
     # ---- END AREAL ----
@@ -78,20 +80,27 @@ def areal_launch_server(server_args) -> None:
     result_ipc = create_result_ipc()
     # ---- END AREAL ----
 
+    sglang_0520 = version("sglang") == "0.5.20"
+    launched = Engine._launch_subprocesses(
+        server_args=server_args,
+        init_tokenizer_manager_func=init_tokenizer_manager,
+        run_scheduler_process_func=(
+            areal_run_scheduler_process_0520
+            if sglang_0520
+            else areal_run_scheduler_process
+        ),
+        run_detokenizer_process_func=run_detokenizer_process,
+    )
+    if sglang_0520:
+        # The newer engine also returns handles for weight-cache daemons.
+        *launched, _weight_cache_daemons = launched
     (
         tokenizer_manager,
         template_manager,
         port_args,
         scheduler_init_result,
         subprocess_watchdog,
-    ) = Engine._launch_subprocesses(
-        server_args=server_args,
-        init_tokenizer_manager_func=init_tokenizer_manager,
-        # ---- BEGIN AREAL ----
-        run_scheduler_process_func=areal_run_scheduler_process,
-        # ---- END AREAL ----
-        run_detokenizer_process_func=run_detokenizer_process,
-    )
+    ) = launched
 
     # ---- BEGIN AREAL ----
     if tokenizer_manager is None:

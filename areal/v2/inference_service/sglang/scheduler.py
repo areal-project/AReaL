@@ -18,17 +18,14 @@ RESULT_IPC_ENV = "AREAL_AWEX_RESULT_IPC"
 
 
 class AwexSchedulerBridge:
-    """Compose awex weight-update capabilities onto a plain Scheduler instance.
+    """Compose AWEX weight-update capabilities onto a Scheduler instance.
 
     Lifecycle:
-      1. Created after ``Scheduler.__init__()`` in :func:`areal_run_scheduler_process`
+      1. Created after ``Scheduler.__init__()`` in the worker startup path
       2. :meth:`bind` attaches ``awex_*`` methods to the scheduler via ``setattr``
       3. ``handle_rpc_request`` dispatches via ``getattr(self, method)`` and finds them
       4. Methods delegate to :class:`AwexSGLangAdapter` for actual work
       5. Data-returning methods push results via ZMQ PUSH (tp_rank 0, dp_rank 0 only)
-
-    No inheritance.  No monkey-patch.  The scheduler instance remains a plain
-    ``sglang.srt.managers.scheduler.Scheduler``.
     """
 
     def __init__(self, scheduler: Any) -> None:
@@ -185,6 +182,42 @@ class AwexSchedulerBridge:
 #   2. MTPDistributedWeightUpdateBridge(...).bind() -- NEXTN draft weight routing
 #   3. PPSchedulerBridge(scheduler, server_args).bind()  -- per-PP-rank NCCL groups
 # ---------------------------------------------------------------------------
+
+
+def areal_run_scheduler_process_0520(server_args, *args, **kwargs):
+    """Attach AReaL's RPCs after SGLang 0.5.20 creates the scheduler."""
+    from sglang.srt.managers import scheduler as upstream
+
+    from areal.v2.inference_service.sglang.flashinfer_cache import enable_staged_aot
+    from areal.v2.inference_service.sglang.mtp_weight_update_bridge import (
+        MTPDistributedWeightUpdateBridge,
+    )
+    from areal.v2.inference_service.sglang.pp_bridge import PPSchedulerBridge
+    from areal.v2.inference_service.sglang.routed_experts_compat import (
+        apply_sglang_routed_experts_token_cache_patch,
+    )
+
+    if server_args.enable_return_routed_experts:
+        apply_sglang_routed_experts_token_cache_patch()
+    enable_staged_aot()
+    upstream.load_plugins()
+    original = upstream.Scheduler
+
+    class SchedulerWithAReaLRPCs(original):
+        def __init__(self, *init_args, **init_kwargs):
+            super().__init__(*init_args, **init_kwargs)
+            for name in ("pp_rank", "pp_size", "tp_rank", "tp_size", "dp_rank"):
+                if not hasattr(self, name):
+                    setattr(self, name, getattr(self.ps, name))
+            AwexSchedulerBridge(self).bind()
+            MTPDistributedWeightUpdateBridge(self, server_args).bind()
+            PPSchedulerBridge(self, server_args).bind()
+
+    upstream.Scheduler = SchedulerWithAReaLRPCs
+    try:
+        return upstream.run_scheduler_process(server_args, *args, **kwargs)
+    finally:
+        upstream.Scheduler = original
 
 
 def areal_run_scheduler_process(

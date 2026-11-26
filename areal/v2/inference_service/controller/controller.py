@@ -24,6 +24,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, Callable
 from copy import deepcopy
 from dataclasses import dataclass
+from itertools import accumulate
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
@@ -227,6 +228,7 @@ class RolloutControllerV2:
         self._init_lock = threading.Lock()
         self._workers_ready = threading.Event()
         self._shutdown_requested = threading.Event()
+        self._stages_flashinfer_cache = False
 
     # -- Initialize --------------------------------------------------------
 
@@ -364,7 +366,11 @@ class RolloutControllerV2:
             future = self._init_future
             if future is None:
                 return
-            future.result(timeout=self.config.setup_timeout)
+            timeout = self.config.setup_timeout
+            if self._stages_flashinfer_cache:
+                # Sampling JIT warmup is bounded separately from server startup.
+                timeout += self.config.setup_timeout
+            future.result(timeout=timeout)
             self._init_future = None
 
     async def _async_initialize(
@@ -386,6 +392,7 @@ class RolloutControllerV2:
         admin_api_key = self.config.admin_api_key
         agent_cfg = self._agent_config
         fixed_guard_pool = False
+        worker_groups = None
         guard_pool = kwargs.pop("guard_gpu_devices", None)
         if guard_pool is not None and (
             (not isinstance(self.scheduler, LocalScheduler) and self._ray_pool is None)
@@ -455,6 +462,26 @@ class RolloutControllerV2:
 
             inf_spec.cmd = "python -m areal.v2.inference_service.guard"
 
+        if (
+            guard_pool is not None
+            and self._ray_pool is not None
+            and inf_backend == "sglang"
+        ):
+            from areal.v2.inference_service.sglang.flashinfer_cache import (
+                supports_cache_staging,
+            )
+
+            self._stages_flashinfer_cache = supports_cache_staging()
+            if self._stages_flashinfer_cache:
+                workspace = Path.home() / ".cache/sglang"
+                for name, default in (
+                    ("FLASHINFER_WORKSPACE_BASE", workspace),
+                    ("CUDA_CACHE_PATH", workspace / "nv"),
+                ):
+                    inf_spec.env_vars.setdefault(
+                        name, os.environ.get(name, str(default))
+                    )
+
         inf_role = f"{self._worker_role}{self._INF_SUFFIX}"
         inf_job = Job(
             replicas=total_workers,
@@ -493,21 +520,12 @@ class RolloutControllerV2:
                     for device in devices
                 ]
             )
-            owners = {
-                device: worker
-                for worker in inf_workers
-                for device in self._guard_gpu_devices[worker.id]
-            }
+            worker_groups, self._inference_gpu_devices = self._guard_layout(
+                alloc, active
+            )
             self._inference_workers = [
-                owners[active[index]]
-                for index in range(0, len(active), gpus_per_worker)
+                worker for group in worker_groups for worker in group
             ]
-            self._inference_gpu_devices = {
-                worker.id: active[
-                    index * gpus_per_worker : (index + 1) * gpus_per_worker
-                ]
-                for index, worker in enumerate(self._inference_workers)
-            }
         logger.info("RPCGuard workers ready: %s", [w.id for w in inf_workers])
 
         self._workers_ready.set()
@@ -566,9 +584,10 @@ class RolloutControllerV2:
                 nnodes_per_instance,
                 dict(inf_spec.env_vars),
                 server_args,
+                worker_groups=worker_groups,
             )
             if self._ray_pool is not None and inf_backend == "sglang":
-                await self._async_stage_sglang_jit_cache()
+                await self._async_stage_sglang_jit_cache(server_args)
         logger.info("Inference servers: %s", self._inf_addrs)
 
         router_host, router_port = await router_task
@@ -707,14 +726,48 @@ class RolloutControllerV2:
         self._gateway_addr = f"http://{format_hostport(gw_host, gw_port)}"
         logger.info("Gateway: %s", self._gateway_addr)
 
-    async def _async_stage_sglang_jit_cache(self) -> None:
-        # Guard and SGLang share the node-local TVM cache. One RPC per host.
+    async def _async_stage_sglang_jit_cache(
+        self, server_args: dict[str, Any] | None = None
+    ) -> None:
+        # Inference processes and Guards share the node-local caches.
         pool = {w.ip: w for w in self.workers}
         sources = {w.ip: w for w in self._inference_workers}
         targets = [pool[ip] for ip in sorted(pool.keys() - sources.keys())]
         if not targets or not self.scheduler.fileroot:
             return
         client = await self._get_async_client()
+
+        async def warm(addr: str) -> None:
+            context_length = (server_args or {}).get("context_length") or 4360
+            max_new_tokens = min(8, max(1, context_length - 1))
+            input_length = min(4352, max(1, context_length - max_new_tokens))
+            response = await client.post(
+                f"{addr}/generate",
+                json={
+                    "input_ids": ([123, 500, 808, 1152] * 1088)[:input_length],
+                    "sampling_params": {
+                        "temperature": 1.0,
+                        "top_p": 0.95,
+                        "top_k": 50,
+                        "max_new_tokens": max_new_tokens,
+                        "ignore_eos": True,
+                    },
+                    "return_logprob": True,
+                },
+                timeout=self.config.setup_timeout,
+            )
+            response.raise_for_status()
+            if response.json()["meta_info"]["completion_tokens"] != max_new_tokens:
+                raise RuntimeError("SGLang sampling warmup did not finish")
+            logger.info("FlashInfer prefill and sampling warmup complete on %s", addr)
+
+        if self._stages_flashinfer_cache:
+            results = await asyncio.gather(
+                *(warm(addr) for addr in self._inf_addrs), return_exceptions=True
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("FlashInfer sampling warmup failed: %s", result)
 
         async def configure(worker: Worker, action: str, directory: str) -> None:
             addr = format_hostport(worker.ip, int(worker.worker_ports[0]))
@@ -757,6 +810,9 @@ class RolloutControllerV2:
         nnodes_per_instance: int,
         worker_env: dict[str, str],
         server_args: dict[str, Any] | None,
+        *,
+        worker_groups: list[list[Worker]] | None = None,
+        guard_devices: dict[str, list[int]] | None = None,
     ) -> None:
         if inf_backend == "sglang":
             from areal.api.cli_args import SGLangConfig
@@ -791,18 +847,30 @@ class RolloutControllerV2:
                 *[_cleanup_owner(guard, index) for guard, index in owners]
             )
 
-        async def _fork_group(
-            group_idx: int,
-        ) -> tuple[str, int, list[tuple[str, str, int]]]:
-            group_workers = inf_workers[
-                group_idx * nnodes_per_instance : (group_idx + 1) * nnodes_per_instance
+        if worker_groups is None:
+            worker_groups = [
+                inf_workers[i * nnodes_per_instance : (i + 1) * nnodes_per_instance]
+                for i in range(dp_size)
             ]
+        if len(worker_groups) != dp_size or not all(worker_groups):
+            raise ValueError(
+                "Expected a nonempty Guard group for each inference DP rank"
+            )
+        offsets = accumulate(map(len, worker_groups), initial=0)
+        if guard_devices is None:
+            guard_devices = self._inference_gpu_devices
+
+        async def _fork_group(
+            group_workers: list[Worker],
+            start: int,
+        ) -> tuple[str, int, list[tuple[str, str, int]]]:
+            nnodes = len(group_workers)
             client = await self._get_async_client()
 
             owners = [
                 (
                     f"http://{format_hostport(worker.ip, int(worker.worker_ports[0]))}",
-                    group_idx * nnodes_per_instance + node_rank,
+                    start + node_rank,
                 )
                 for node_rank, worker in enumerate(group_workers)
             ]
@@ -812,7 +880,7 @@ class RolloutControllerV2:
             ) -> dict[str, Any]:
                 # The group head owns both its inference port and the distributed
                 # rendezvous port. Guard permits one reservation per owner.
-                count = 2 if node_rank == 0 and nnodes_per_instance > 1 else 1
+                count = 2 if node_rank == 0 and nnodes > 1 else 1
                 resp = await client.post(
                     f"{guard_addr}/alloc_ports",
                     json={
@@ -846,7 +914,7 @@ class RolloutControllerV2:
 
             port_data_by_node = cast(list[dict[str, Any]], allocation_results)
             dist_init_addr = None
-            if nnodes_per_instance > 1:
+            if nnodes > 1:
                 rendezvous_host = port_data_by_node[0]["host"]
                 rendezvous_port = port_data_by_node[0]["ports"][1]
                 dist_init_addr = format_hostport(rendezvous_host, rendezvous_port)
@@ -864,7 +932,7 @@ class RolloutControllerV2:
                     **(server_args or {}),
                     "host": inf_host,
                     "port": inf_port,
-                    "nnodes": nnodes_per_instance,
+                    "nnodes": nnodes,
                     "node_rank": node_rank,
                     "dist_init_addr": dist_init_addr,
                 }
@@ -919,7 +987,7 @@ class RolloutControllerV2:
                         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
                     }
 
-                devices = self._inference_gpu_devices.get(group_workers[node_rank].id)
+                devices = guard_devices.get(group_workers[node_rank].id)
                 if devices is not None:
                     from areal.infra.platforms import current_platform
 
@@ -962,13 +1030,17 @@ class RolloutControllerV2:
             successful_nodes = cast(list[tuple[str, int, str]], node_results)
             head_inf_host, head_inf_port, _ = successful_nodes[0]
             forked: list[tuple[str, str, int]] = [
-                (guard_addr, "inf-server", group_idx * nnodes_per_instance + rank)
+                (guard_addr, "inf-server", start + rank)
                 for rank, (_, _, guard_addr) in enumerate(successful_nodes)
             ]
             return (head_inf_host, head_inf_port, forked)
 
         raw_group_results = await asyncio.gather(
-            *[_fork_group(i) for i in range(dp_size)], return_exceptions=True
+            *[
+                _fork_group(group, start)
+                for group, start in zip(worker_groups, offsets)
+            ],
+            return_exceptions=True,
         )
         group_error = next(
             (
@@ -1838,10 +1910,36 @@ class RolloutControllerV2:
                 "Target GPUs must match the layout and original Guard pool"
             )
         if self._ray_pool is not None:
-            self._ray_pool.validate_replicas(
-                gpu_devices, alloc.parallel.tp_size * alloc.parallel.pp_size
+            self._ray_pool.rollout_groups(
+                gpu_devices, alloc.parallel.tp_size, alloc.parallel.pp_size
             )
         return alloc
+
+    def _guard_layout(
+        self, alloc: ModelAllocation, gpu_devices: list[int]
+    ) -> tuple[list[list[Worker]], dict[str, list[int]]]:
+        parallel = alloc.parallel
+        width = parallel.tp_size * parallel.pp_size
+        if self._ray_pool is not None and alloc.backend == "sglang":
+            slots = self._ray_pool.rollout_groups(
+                gpu_devices, parallel.tp_size, parallel.pp_size
+            )
+        else:
+            slots = [
+                [gpu_devices[i : i + width]] for i in range(0, len(gpu_devices), width)
+            ]
+        owners = {
+            device: worker
+            for worker in self.workers
+            for device in self._guard_gpu_devices[worker.id]
+        }
+        groups = [[owners[node[0]] for node in replica] for replica in slots]
+        assigned = {
+            worker.id: node
+            for workers, replica in zip(groups, slots, strict=True)
+            for worker, node in zip(workers, replica, strict=True)
+        }
+        return groups, assigned
 
     def rebuild_model_servers(self, backend: str, gpu_devices: list[int]) -> None:
         """Rebuild held model servers while preserving Guards, proxies and sessions.
@@ -1883,19 +1981,8 @@ class RolloutControllerV2:
         attention_dp_size: int | None = None,
     ) -> None:
         client = await self._get_async_client()
-        owners = {
-            device: worker
-            for worker in self.workers
-            for device in self._guard_gpu_devices[worker.id]
-        }
-        size = alloc.parallel.tp_size * alloc.parallel.pp_size
-        self._inference_workers = [
-            owners[gpu_devices[index]] for index in range(0, len(gpu_devices), size)
-        ]
-        self._inference_gpu_devices = {
-            worker.id: gpu_devices[index * size : (index + 1) * size]
-            for index, worker in enumerate(self._inference_workers)
-        }
+        groups, assigned = self._guard_layout(alloc, gpu_devices)
+        workers = [worker for group in groups for worker in group]
         self._inf_addrs.clear()
         self._server_infos.clear()
         args = deepcopy(self._model_server_args)
@@ -1914,12 +2001,16 @@ class RolloutControllerV2:
             self.config,
             alloc,
             "sglang",
-            self._inference_workers,
+            workers,
             alloc.parallel.dp_size,
             1,
             dict(self.config.scheduling_spec[0].env_vars),
             args,
+            worker_groups=groups,
+            guard_devices=assigned,
         )
+        self._inference_workers = workers
+        self._inference_gpu_devices = assigned
         responses = await asyncio.gather(
             *(
                 client.post(f"{addr}/pause_generation", json={})
@@ -1939,7 +2030,6 @@ class RolloutControllerV2:
         )
         self.rollout_alloc = alloc
         self._model_server_args = args
-        self._nnodes_per_instance = 1
         self.config.backend = str(alloc)
         self.config.gpu_devices = gpu_devices
         logger.info(
@@ -2274,6 +2364,12 @@ class RolloutControllerV2:
 
             online_kwargs = dict(workflow_kwargs or {})
             online_kwargs.pop("controller", None)
+            if self.config.scheduling_spec:
+                directory = self.config.scheduling_spec[0].env_vars.get(
+                    "AREAL_ELASTIC_EVENT_DIR"
+                )
+                if directory:
+                    online_kwargs["elastic_event_dir"] = directory
             online_kwargs.setdefault(
                 "drop_retry_orphans", self._agent_config.drop_retry_orphans
             )

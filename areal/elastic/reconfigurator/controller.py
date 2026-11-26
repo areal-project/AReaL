@@ -7,25 +7,33 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections import defaultdict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from functools import cache
+from itertools import combinations
 from pathlib import Path
 from threading import Event, Lock, Thread
 from uuid import uuid4
 
 from areal.utils import logging
-from areal.v2.reconfiguration import Device, ExecutionLayout, RayDevicePool
+from areal.v2.reconfiguration import (
+    Device,
+    ExecutionLayout,
+    RayDevicePool,
+    sglang_gpus_per_node,
+)
 
-from .evaluator import Observation, ReplayEvaluator
-from .evaluator.cost_model.contracts import ActorConfig
-from .evaluator.cost_model.loader import Catalog
-from .evaluator.cost_model.models import AnalyticalCostModels
-from .evaluator.cost_model.reconfiguration.model import (
+from .evaluator import Catalog, Observation, ReplayEvaluator, load_profiles
+from .evaluator.actor.cost_model import actor_config
+from .evaluator.areal.cost_model import (
     ActorStages,
     IOBandwidth,
     ReconfigurationModel,
     RolloutStages,
 )
+from .evaluator.contracts import ActorConfig
 from .evaluator.workload import (
     ExecutionConfig,
     HistoricalReplay,
@@ -34,7 +42,7 @@ from .evaluator.workload import (
 )
 from .observation import LiveObservation
 from .optimizer import Layout, Optimizer, RoleLayout
-from .trigger import WorkloadTrigger
+from .trigger import StableWorkloadTrigger
 
 logger = logging.getLogger("ElasticController")
 
@@ -71,6 +79,113 @@ def configure_devices(config, supplied):
     return devices
 
 
+def _pack_rollout(
+    devices: tuple[Device, ...], tp_size: int, pp_size: int, replicas: int
+) -> tuple[Device, ...] | None:
+    by_node: dict[str, list[Device]] = defaultdict(list)
+    for device in devices:
+        by_node[device.node].append(device)
+    replica_size = tp_size * pp_size
+    slots = tuple(
+        device
+        for node_devices in by_node.values()
+        for start in range(0, len(node_devices) - replica_size + 1, replica_size)
+        for device in node_devices[start : start + replica_size]
+    )
+    required = replicas * replica_size
+    if len(slots) >= required:
+        return slots[:required]
+
+    devices_by_node = tuple(by_node.values())
+    capacities = tuple(map(len, devices_by_node))
+    widths = []
+    for nnodes in range(1, min(len(by_node), replica_size) + 1):
+        try:
+            local = sglang_gpus_per_node(tp_size, pp_size, nnodes)
+        except ValueError:
+            continue
+        widths.append((nnodes, local))
+
+    @cache
+    def pack(available: tuple[int, ...], count: int) -> tuple[Device, ...] | None:
+        if not count:
+            return ()
+        if sum(available) < count * replica_size:
+            return None
+        examined = set()
+        for nnodes, local in widths:
+            eligible = [i for i, capacity in enumerate(available) if capacity >= local]
+            for nodes in combinations(eligible, nnodes):
+                remainder = list(available)
+                for node in nodes:
+                    remainder[node] -= local
+                # Node identity does not affect feasibility for node-local ranks.
+                shape = tuple(sorted(remainder))
+                if shape in examined:
+                    continue
+                examined.add(shape)
+                placement = pack(tuple(remainder), count - 1)
+                if placement is not None:
+                    return (
+                        tuple(
+                            device
+                            for node in nodes
+                            for device in devices_by_node[node][
+                                capacities[node] - available[node] : capacities[node]
+                                - remainder[node]
+                            ]
+                        )
+                        + placement
+                    )
+        return None
+
+    return pack(capacities, replicas)
+
+
+def _placement(
+    pool: tuple[Device, ...],
+    current: Layout,
+    actor_layout: ExecutionLayout,
+    rollout_layout: ExecutionLayout,
+) -> Callable[[Layout], tuple[tuple[Device, ...], tuple[Device, ...]]]:
+    actor_devices, rollout_devices = actor_layout.devices, rollout_layout.devices
+    active = set(actor_devices + rollout_devices)
+    ordered = (
+        rollout_devices
+        + tuple(device for device in pool if device not in active)
+        + actor_devices
+    )
+    active_actor = set(actor_devices)
+    without_actor = tuple(device for device in ordered if device not in active_actor)
+
+    def place(layout: Layout) -> tuple[tuple[Device, ...], tuple[Device, ...]]:
+        if layout.gpus > len(pool):
+            raise ValueError("Layout exceeds the GPU pool")
+        keep_actor = layout.actor == current.actor
+        if layout.rollout == current.rollout:
+            rollouts = rollout_devices
+        else:
+            replicas, tp_size, pp_size = ExecutionConfig(
+                layout.actor.backend, layout.rollout.backend
+            ).rollout_parallel
+            rollouts = (
+                _pack_rollout(without_actor, tp_size, pp_size, replicas)
+                if keep_actor
+                else None
+            )
+            if rollouts is None:
+                rollouts = _pack_rollout(ordered, tp_size, pp_size, replicas)
+            if rollouts is None:
+                raise ValueError("The SGLang replicas do not fit in the GPU pool")
+        occupied = set(rollouts)
+        if keep_actor and active_actor.isdisjoint(occupied):
+            return actor_devices, rollouts
+        available = tuple(device for device in ordered if device not in occupied)
+        return available[-layout.actor.gpus :], rollouts
+
+    return place
+
+
 def _policy(trainer, binding, warm_actor, warm_rollout, parameters, models):
     cfg = trainer.config
     settings = cfg.elastic
@@ -80,7 +195,7 @@ def _policy(trainer, binding, warm_actor, warm_rollout, parameters, models):
             "Cutover parameters must match the hardware and model profiles"
         )
     shape = models.actor_model.model
-    weight = models.weight_bytes / 1e9
+    weight = shape.total_parameters * 2 / 1e9
     actor = ActorStages(
         weight,
         6 * weight,
@@ -114,25 +229,7 @@ def _policy(trainer, binding, warm_actor, warm_rollout, parameters, models):
         RoleLayout(template.rollout_backend, template.rollout_gpus),
     )
     pool = tuple(trainer._reconfiguration_devices)
-    active = set(actor_layout.devices + rollout_layout.devices)
-    ordered = (
-        rollout_layout.devices
-        + tuple(device for device in pool if device not in active)
-        + actor_layout.devices
-    )
-
-    def place(layout):
-        actors, rollouts = ordered[-layout.actor.gpus :], ordered[: layout.rollout.gpus]
-        replica_size = (
-            len(rollouts)
-            // ExecutionConfig(
-                template.actor_backend, layout.rollout.backend
-            ).rollout_replicas
-        )
-        for start in range(0, len(rollouts), replica_size):
-            if len({d.node for d in rollouts[start : start + replica_size]}) != 1:
-                raise ValueError("An SGLang instance must fit on one node")
-        return actors, rollouts
+    place = _placement(pool, current, actor_layout, rollout_layout)
 
     cut = ReconfigurationModel(
         actor.predict,
@@ -174,22 +271,27 @@ class ElasticController:
         (self.directory / "trainer-run").mkdir()
         self.reader = LiveObservation(self.directory)
         self.parameters = json.loads(Path(self.settings.settings).read_text())
-        self.models = AnalyticalCostModels.from_profiles(
+        self.models = load_profiles(
             **self.parameters["profiles"],
             catalog=Catalog(Path(self.settings.catalog)),
             bandwidth_GBps=self.parameters["publication_GBps"],
             actor_runtime=ActorConfig.from_areal(asdict(trainer.config.actor)),
         )
-        self.trigger = WorkloadTrigger()
+        self.trigger = StableWorkloadTrigger()
         self.lock = Lock()
         self.stop = Event()
+        self.wake = Event()
         self.warm_actor = set()
         self.warm_rollout = set()
         self.binding = self._binding()
         self.policy = self._bind(self.binding)
         self.version = trainer.actor.get_version()
         self.actor_events = []
+        self.latest_batch: tuple[str, ...] = ()
+        self.switching = False
+        self.consumed_sessions = set()
         self.generation = 0
+        self.running = None
         self.ready = None
         self.error = None
         self.thread = Thread(target=self._run, name="elastic-observe", daemon=True)
@@ -225,6 +327,15 @@ class ElasticController:
         with self.lock:
             self.actor_events.append((kind, time.time(), count))
 
+    def on_actor_batch(self, batch):
+        at = time.time()
+        session_ids = tuple(traj.pop("_elastic_session_id", "") for traj in batch)
+        with self.lock:
+            self.actor_events.append(("take", at, len(batch)))
+            self.latest_batch = session_ids
+            self.consumed_sessions.update(sid for sid in session_ids if sid)
+        self.wake.set()
+
     def _run(self):
         try:
             with ThreadPoolExecutor(
@@ -237,59 +348,109 @@ class ElasticController:
             logger.exception("Automatic elastic search failed")
 
     def _observe(self, worker):
-        running = queued = None
+        next_poll = time.monotonic()
         while not self.stop.is_set():
+            self.wake.clear()
             with self.lock:
-                version, policy = self.version, self.policy
-            view = self.reader.snapshot(version)
-            change = self.trigger.observe(view) if view is not None else None
-            if change is not None and (
-                change.pattern.templates or not change.pattern.arrivals
-            ):
-                with self.lock:
-                    if policy is not self.policy:
-                        continue
-                    events = tuple(self.actor_events)
-                    self.generation += 1
-                    self.ready = None
-                    generation = self.generation
-                self.trigger.searched(change)
-                backlog = self.reader.backlog(view, change.pattern, events)
-                queued = (generation, policy, view, change, backlog)
-            if running is not None and running[0].done():
-                future, epoch, source, started = running
-                decision = future.result()
-                logger.info(
-                    "Elastic decision %s: %s -> %s (%s, %d candidates)",
-                    epoch,
-                    decision.source,
-                    decision.target,
-                    decision.reason,
-                    len(decision.predictions),
+                self._collect_search()
+            if time.monotonic() >= next_poll:
+                next_poll = time.monotonic() + self.trigger.window_seconds
+                self._poll_trigger(worker)
+            self.wake.wait(
+                min(self.settings.poll_seconds, max(0, next_poll - time.monotonic()))
+            )
+
+    def _poll_trigger(self, worker):
+        with self.lock:
+            if self.switching or self.running is not None or self.ready is not None:
+                return
+            at = time.time()
+            version, policy = self.version, self.policy
+            events = tuple(self.actor_events)
+            sessions = self.latest_batch
+            consumed = tuple(self.consumed_sessions)
+        if not sessions:
+            return
+        view = self.reader.snapshot(version, at=at)
+        if view is None:
+            return
+        batch = self.reader.episode_ids(sessions)
+        with self.lock:
+            if self.switching or policy is not self.policy:
+                return
+            change = self.trigger.observe(view, batch)
+        if change is None:
+            return
+
+        backlog = self.reader.backlog(
+            view,
+            change.pattern,
+            events,
+            consumed=set(self.reader.episode_ids(consumed)),
+        )
+        optimizer, layout, _ = policy
+        if (
+            backlog is not None
+            and backlog.actor_event is not None
+            and backlog.actor_event[0] == "actor"
+        ):
+            shapes = tuple(ep.completed_turns for ep in change.pattern.templates)
+            try:
+                execution = actor_config(
+                    self.models.actor_template, optimizer.evaluator.template
                 )
-                with self.lock:
-                    if epoch == self.generation and source is self.policy:
-                        self.ready = (source, decision, started)
-                running = None
-            if running is None and queued is not None:
-                epoch, source, snapshot, change, backlog = queued
-                queued = None
-                with self.lock:
-                    if source is not self.policy:
-                        continue
-                optimizer, layout, _ = source
-                started = time.monotonic()
-                ready_at = (
-                    time.time()
-                    - self.reader.origin
-                    + self.settings.estimated_search_seconds
+                duration = self.models.actor_model.estimate_batch(
+                    execution, shapes
+                ).duration_seconds()
+            except ValueError as exc:
+                logger.warning("Cannot estimate the active Actor batch: %s", exc)
+            else:
+                started = next(
+                    stamp for kind, stamp, _ in reversed(events) if kind == "take"
                 )
-                observation = Observation(snapshot, layout, backlog, ready_at)
-                future = worker.submit(
-                    optimizer.decide, observation, layout, confirmed=change
+                backlog = replace(
+                    backlog, actor_event=("actor", max(0.0, duration - (at - started)))
                 )
-                running = (future, epoch, source, started)
-            self.stop.wait(self.settings.poll_seconds)
+
+        with self.lock:
+            if self.switching or policy is not self.policy:
+                return
+            ready_at = (
+                view.now
+                + max(0.0, time.time() - at)
+                + self.settings.estimated_search_seconds
+            )
+            observation = Observation(view, layout, backlog, ready_at)
+            future = worker.submit(
+                optimizer.decide, observation, layout, confirmed=change
+            )
+            self.running = (future, self.generation, policy, at, change)
+            future.add_done_callback(lambda _: self.wake.set())
+        logger.info(
+            "Elastic trigger at version %s: %s (%.3f arrivals/s, score=%s)",
+            version,
+            ", ".join(change.reasons),
+            change.rate,
+            "initial" if change.score is None else f"{change.score:.1%}",
+        )
+
+    def _collect_search(self):
+        """Collect under the controller lock, including at the publication boundary."""
+        if self.running is None or not self.running[0].done():
+            return
+        future, epoch, source, at, change = self.running
+        self.running = None
+        decision = future.result()
+        logger.info(
+            "Elastic decision %s: %s -> %s (%s, %d candidates)",
+            epoch,
+            decision.source,
+            decision.target,
+            decision.reason,
+            len(decision.predictions),
+        )
+        if epoch == self.generation and source is self.policy:
+            self.ready = (source, decision, at, change)
 
     def at_boundary(self):
         """Apply a ready decision synchronously at a PPO publication boundary."""
@@ -303,30 +464,46 @@ class ElasticController:
                 self.policy = self._bind(binding)
                 self.generation += 1
                 self.ready = None
+                self.trigger.bind(None)
+            self._collect_search()
             if self.ready is None:
                 return
-            source, decision, started = self.ready
+            source, decision, started, change = self.ready
             self.ready = None
             if (
                 source is not self.policy
-                or time.monotonic() - started >= self.settings.forecast_seconds
+                or time.time() - started >= self.settings.forecast_seconds
             ):
                 return
             _, layout, place = source
-            if decision.source != layout or decision.target == layout:
+            if decision.source != layout:
                 return
+            selected = next(
+                (p for p in decision.predictions if p.layout == decision.target), None
+            )
+            if (
+                selected is None
+                or not selected.supported
+                or selected.request_fraction is None
+                or selected.gpu_seconds is None
+            ):
+                return
+            if decision.target == layout:
+                self.trigger.bind(change)
+                return
+            self.switching = True
 
         target = decision.target
         actors, rollouts = place(target)
         actor_layout = None
         rollout_layout = None
         state_path = None
-        if target.actor != layout.actor:
+        if target.actor != layout.actor or actors != binding[0].devices:
             actor_layout = ExecutionLayout(target.actor.backend, actors)
             state_path = str(
                 self.directory / f"actor-state-{self.version}-{uuid4().hex}"
             )
-        if target.rollout != layout.rollout:
+        if target.rollout != layout.rollout or rollouts != binding[1].devices:
             dp = dict(target.rollout.options).get("sglang_dp_size")
             rollout_layout = ExecutionLayout(
                 target.rollout.backend, rollouts, attention_dp_size=dp
@@ -342,6 +519,8 @@ class ElasticController:
             self.policy = self._bind(binding)
             self.generation += 1
             self.ready = None
+            self.trigger.bind(change)
+            self.switching = False
         logger.info(
             "Automatic elastic published layout at version %s: %s",
             self.version,
@@ -350,4 +529,5 @@ class ElasticController:
 
     def close(self):
         self.stop.set()
+        self.wake.set()
         self.thread.join()

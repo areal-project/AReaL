@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Component configuration, workload shapes, estimates and calibration records."""
+"""Evaluation contracts, configuration, calibration and estimates."""
 
 from __future__ import annotations
 
@@ -11,7 +11,11 @@ from typing import Any, Literal
 from areal.elastic.reconfigurator.evaluator.workload import parse_actor_parallel
 
 Evidence = Literal["measured", "calibrated", "assumed", "unsupported"]
+
+
 Feasibility = Literal["feasible", "infeasible", "unknown"]
+
+
 Features = tuple[tuple[str, float], ...]
 
 
@@ -189,81 +193,6 @@ class Hardware:
                 positive(field.name, getattr(self, field.name))
         if type(self.gpus_per_node) is not int:
             raise ValueError("gpus_per_node must be an integer")
-
-
-@dataclass(frozen=True)
-class ModelShape:
-    """Explicit dense-attention/MoE dimensions, supplied from the target model config."""
-
-    hidden_size: int
-    intermediate_size: int
-    layers: int
-    attention_heads: int
-    kv_heads: int
-    head_dim: int
-    experts: int
-    top_k: int
-    vocab_size: int
-    tied_embeddings: bool = False
-    mlp_type: str = "moe"
-
-    def __post_init__(self) -> None:
-        for field in fields(self):
-            if field.name not in {"tied_embeddings", "mlp_type"}:
-                value = getattr(self, field.name)
-                if type(value) is not int or value < 1:
-                    raise ValueError(f"{field.name} must be a positive integer")
-        if self.top_k > self.experts or self.attention_heads % self.kv_heads:
-            raise ValueError("Invalid top_k or grouped-query attention dimensions")
-        if self.mlp_type not in {"dense", "moe"} or (
-            self.mlp_type == "dense" and (self.experts, self.top_k) != (1, 1)
-        ):
-            raise ValueError("Dense MLP requires experts=top_k=1 and no router")
-
-    @property
-    def attention_parameters_per_layer(self) -> int:
-        return (
-            2
-            * self.hidden_size
-            * self.head_dim
-            * (self.attention_heads + self.kv_heads)
-        )
-
-    def attention_parameters_per_rank(self, tp: int) -> float:
-        # GQA repeats a KV head when TP is larger than the number of KV heads.
-        return (
-            2
-            * self.hidden_size
-            * self.head_dim
-            * (self.attention_heads / tp + max(1, self.kv_heads / tp))
-        )
-
-    @property
-    def expert_parameters_per_layer(self) -> int:
-        return 3 * self.hidden_size * self.intermediate_size * self.experts
-
-    @property
-    def router_parameters_per_layer(self) -> int:
-        return self.hidden_size * self.experts if self.mlp_type == "moe" else 0
-
-    @property
-    def head_parameters(self) -> int:
-        return self.hidden_size * self.vocab_size
-
-    @property
-    def total_parameters(self) -> int:
-        norms = 2 * self.hidden_size + 2 * self.head_dim
-        return (
-            self.layers
-            * (
-                self.attention_parameters_per_layer
-                + self.expert_parameters_per_layer
-                + self.router_parameters_per_layer
-                + norms
-            )
-            + (1 if self.tied_embeddings else 2) * self.head_parameters
-            + self.hidden_size
-        )
 
 
 @dataclass(frozen=True)
@@ -509,6 +438,12 @@ class ServiceSlice:
         if type(self.emit_token) is not bool:
             raise ValueError("emit_token must be boolean")
 
+    @property
+    def attention_pairs(self) -> float:
+        """Count causal query-key pairs for the cached context and new queries."""
+        queries = self.query_tokens
+        return queries * self.context_tokens + queries * (queries + 1) / 2
+
 
 @dataclass(frozen=True)
 class ServiceState:
@@ -612,3 +547,86 @@ class ServiceEstimate:
     duration: Estimate
     features: Features
     kv_tokens_after: int
+
+
+@dataclass(frozen=True)
+class ModelShape:
+    """Explicit dense-attention/MoE dimensions, supplied from the target model config."""
+
+    hidden_size: int
+    intermediate_size: int
+    layers: int
+    attention_heads: int
+    kv_heads: int
+    head_dim: int
+    experts: int
+    top_k: int
+    vocab_size: int
+    tied_embeddings: bool = False
+    mlp_type: str = "moe"
+
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            if field.name not in {"tied_embeddings", "mlp_type"}:
+                value = getattr(self, field.name)
+                if type(value) is not int or value < 1:
+                    raise ValueError(f"{field.name} must be a positive integer")
+        if self.top_k > self.experts or self.attention_heads % self.kv_heads:
+            raise ValueError("Invalid top_k or grouped-query attention dimensions")
+        if self.mlp_type not in {"dense", "moe"} or (
+            self.mlp_type == "dense" and (self.experts, self.top_k) != (1, 1)
+        ):
+            raise ValueError("Dense MLP requires experts=top_k=1 and no router")
+
+    @property
+    def attention_parameters_per_layer(self) -> int:
+        return (
+            2
+            * self.hidden_size
+            * self.head_dim
+            * (self.attention_heads + self.kv_heads)
+        )
+
+    def attention_parameters_per_rank(self, tp: int) -> float:
+        # GQA repeats a KV head when TP is larger than the number of KV heads.
+        return (
+            2
+            * self.hidden_size
+            * self.head_dim
+            * (self.attention_heads / tp + max(1, self.kv_heads / tp))
+        )
+
+    def attention_flops_per_pair(self, layers: int) -> int:
+        """Count FLOPs for QK and applying the weight to V across all query heads."""
+        return 4 * layers * self.attention_heads * self.head_dim
+
+    @property
+    def expert_parameters_per_layer(self) -> int:
+        return 3 * self.hidden_size * self.intermediate_size * self.experts
+
+    @property
+    def router_parameters_per_layer(self) -> int:
+        return self.hidden_size * self.experts if self.mlp_type == "moe" else 0
+
+    @property
+    def active_expert_parameters_per_layer(self) -> float:
+        return self.expert_parameters_per_layer * self.top_k / self.experts
+
+    @property
+    def head_parameters(self) -> int:
+        return self.hidden_size * self.vocab_size
+
+    @property
+    def total_parameters(self) -> int:
+        norms = 2 * self.hidden_size + 2 * self.head_dim
+        return (
+            self.layers
+            * (
+                self.attention_parameters_per_layer
+                + self.expert_parameters_per_layer
+                + self.router_parameters_per_layer
+                + norms
+            )
+            + (1 if self.tied_embeddings else 2) * self.head_parameters
+            + self.hidden_size
+        )

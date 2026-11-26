@@ -1,37 +1,69 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU prediction at a published update boundary, using frozen Reference components."""
+"""Load evaluation profiles, prepare common boundaries and evaluate candidate layouts."""
 
 from __future__ import annotations
 
-from collections import deque
+import gzip
+import hashlib
+import json
+import re
 from concurrent.futures import Executor
-from dataclasses import dataclass, field, replace
-from functools import cache, lru_cache
-from heapq import heapify, heappop, heappush
-from itertools import count
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from math import isfinite
 from pathlib import Path
 
-from ..optimizer import Layout, Prediction
-from .cost_model.reconfiguration.model import Cutover, ReconfigurationModel
-from .workload import (
-    Backlog,
-    ExecutionConfig,
+import numpy as np
+
+from areal.elastic.reconfigurator.evaluator import fingerprint
+from areal.elastic.reconfigurator.evaluator.actor.cost_model import (
+    Advantages,
+    Efficiency,
+    ExpertActorModel,
+)
+from areal.elastic.reconfigurator.evaluator.areal.controller import (
+    DispatchConfig,
+    Observation,
+    simulate,
+)
+from areal.elastic.reconfigurator.evaluator.areal.cost_model import (
+    Cutover,
+    ReconfigurationModel,
+)
+from areal.elastic.reconfigurator.evaluator.contracts import (
+    ActorConfig,
+    Hardware,
+    InferenceRates,
+    ModelShape,
+    ParallelLayout,
+    ParameterCalibration,
+    RolloutConfig,
+    nonnegative,
+)
+from areal.elastic.reconfigurator.evaluator.rollout.cost_model import (
+    ExpertRolloutModel,
+)
+from areal.elastic.reconfigurator.evaluator.workload import (
     Forecast,
-    InflightCall,
-    OnlineObservation,
     ServingSLO,
     WorkloadPattern,
 )
+from areal.elastic.reconfigurator.optimizer import Layout, Prediction
+
+from .actor.capacity import actor_capacity
+from .actor.cost_model import actor_config
+from .areal.cost_model import publication_seconds
+from .rollout.capacity import probe_capacity
+from .rollout.cost_model import rollout_config
+from .rollout.sglang import scheduler_for
 
 
 @dataclass(frozen=True)
-class Observation:
-    view: OnlineObservation
-    current: Layout
-    backlog: Backlog | None = None
-    search_ready_at: float | None = None  # earliest time a decision can be applied
+class CandidateExecution:
+    actor: ActorConfig
+    rollout: RolloutConfig
+    rollout_concurrency: int | None
 
 
 @dataclass(frozen=True)
@@ -40,7 +72,7 @@ class _CandidateJob:
     model_spec: tuple
     source_ids: tuple[str, ...]
     context: tuple[Observation, Forecast]
-    config: ExecutionConfig
+    config: CandidateExecution
     layout: Layout
     cut: Cutover
     publication: float
@@ -50,9 +82,6 @@ class _CandidateJob:
 
 @lru_cache(maxsize=1)
 def _worker_models(spec, expected_ids):
-    from .cost_model.loader import Catalog
-    from .cost_model.models import AnalyticalCostModels
-
     (
         kind,
         hardware,
@@ -70,7 +99,7 @@ def _worker_models(spec, expected_ids):
         raise ValueError(
             "Parallel evaluation requires an analytical model specification"
         )
-    models = AnalyticalCostModels.from_profiles(
+    models = load_profiles(
         hardware=hardware,
         topology=topology,
         model=model,
@@ -89,7 +118,7 @@ def _worker_models(spec, expected_ids):
 
 def _evaluate_candidate(job: _CandidateJob) -> tuple[int, Prediction]:
     models = _worker_models(job.model_spec, job.source_ids)
-    evaluator = ReplayEvaluator(models, None, job.config, job.slo, **job.settings)
+    evaluator = ReplayEvaluator(models, None, None, job.slo, **job.settings)
     try:
         prediction = evaluator._predict(
             *job.context, job.config, job.layout, job.cut, job.publication, None
@@ -99,79 +128,6 @@ def _evaluate_candidate(job: _CandidateJob) -> tuple[int, Prediction]:
             job.layout, None, None, None, supported=False, reason=str(exc)
         )
     return job.index, prediction
-
-
-@dataclass
-class Call:
-    group_id: str
-    index: int
-    order: int
-    ready_at: float
-    request: object
-    prefilled: int = 0
-    generated: int = 0
-    retained: int = 0
-    first: float | None = None
-
-    @property
-    def kv_tokens(self):
-        return self.prefilled + max(0, self.generated - 1)
-
-    def resume(self):
-        """Re-prefill acknowledged output as context on a fresh backend."""
-        self.retained += self.generated
-        self.request = replace(
-            self.request,
-            input_tokens=self.request.input_tokens + self.generated,
-            output_tokens=self.request.output_tokens - self.generated,
-        )
-        self.prefilled = self.generated = 0
-
-
-@dataclass
-class DecodeSpan:
-    first_end: float
-    first_seconds: float
-    increment: float
-    limit: int
-    # Routing can add residents while the current decode batch is in flight.
-    resident_count: int = 0
-
-    def end(self, steps):
-        return (
-            self.first_end
-            + (steps - 1) * self.first_seconds
-            + self.increment * steps * (steps - 1) / 2
-        )
-
-    def steps_before(self, boundary):
-        # Leave an ordinary iteration in flight and handle ties on the event heap.
-        low, high = 0, self.limit - 1
-        while low < high:
-            middle = (low + high + 1) // 2
-            if self.end(middle) < boundary - 1e-9:
-                low = middle
-            else:
-                high = middle - 1
-        return low
-
-
-@dataclass
-class Replica:
-    rows: dict = field(default_factory=dict)
-    busy: bool = False
-    decode_span: DecodeSpan | None = None
-
-    @property
-    def kv_tokens(self):
-        return sum(r.kv_tokens for r in self.rows.values())
-
-    @property
-    def reserved_tokens(self):
-        return sum(
-            r.request.input_tokens + r.request.output_tokens - 1
-            for r in self.rows.values()
-        )
 
 
 class ReplayEvaluator:
@@ -192,8 +148,7 @@ class ReplayEvaluator:
         memory_reserve_fraction=0.0,
         executor: Executor | None = None,
     ):
-        from .cost_model.rollout.sglang import scheduler_for
-        from .workload import Request
+        from areal.elastic.reconfigurator.evaluator.workload import Request
 
         self.models, self.forecaster, self.template, self.slo = (
             models,
@@ -249,6 +204,89 @@ class ReplayEvaluator:
             return Prediction(
                 layout, None, None, None, supported=False, reason=str(exc)
             )
+
+    def estimate_rollout_capacity(self, context, layout, pattern, rate, target):
+        obs, forecast = context
+        execution = replace(
+            self.template,
+            rollout_backend=layout.rollout.backend,
+            **dict(layout.rollout.options),
+        )
+        rollout = rollout_config(
+            self.models.rollout_template, self.models.rollout_model, execution
+        )
+        cfg = CandidateExecution(
+            self.models.actor_template,
+            rollout,
+            execution.rollout_max_concurrent_rollouts,
+        )
+        start = obs.view.now
+        sample_seconds = min(60.0, forecast.input_closes_at - start)
+        clean = replace(obs, backlog=None)
+
+        def check(probe_rate):
+            period = len(pattern.arrivals) / probe_rate
+            scaled = replace(
+                pattern,
+                period_seconds=period,
+                arrivals=tuple(
+                    (at * period / pattern.period_seconds, family)
+                    for at, family in pattern.arrivals
+                ),
+            )
+            sample = scaled.forecast(start, sample_seconds)
+            if sample is None or not sample.episodes:
+                return None
+            # Drain the finite offer window so the last calls can report TPOT.
+            probe = replace(sample, input_closes_at=sample.input_closes_at + 75.0)
+            row = simulate(
+                clean,
+                probe,
+                cfg,
+                layout,
+                Cutover(0, 0),
+                0.0,
+                None,
+                batch_size=self.batch_size,
+                concurrency=self.concurrency,
+                actor_model=self.models.actor_model,
+                rollout_model=self.models.rollout_model,
+                request_type=self.request_type,
+                reserve=self.reserve,
+                scheduler=self.scheduler,
+                slo=self.slo,
+                staleness=self.staleness,
+                rollout_only=True,
+            )
+            if row.unfinished_episodes:
+                return min(
+                    row.request_fraction or 0.0,
+                    1 - row.unfinished_episodes / len(probe.episodes),
+                )
+            return row.request_fraction
+
+        return probe_capacity(check, rate, target)
+
+    def estimate_actor_capacity(self, context, layout):
+        # A representative batch suffices to rank parallel alternatives in one split.
+        try:
+            cfg, _, pub = self._prepare_candidate(context, layout)
+            templates = [episode.turns for episode in context[1].episodes][
+                : self.batch_size
+            ]
+            model = self.models.actor_model
+
+            def duration(batch):
+                estimate = model.estimate_batch(cfg.actor, batch)
+                if estimate.peak_gib > model.hardware.memory_gb * 1e9 / 2**30 * (
+                    1 - self.reserve
+                ):
+                    raise ValueError("Actor batch exceeds available GPU memory")
+                return estimate.duration_seconds()
+
+            return actor_capacity(templates, self.batch_size, duration, pub)
+        except ValueError:
+            return None
 
     def evaluate_many(self, context, layouts):
         """Prepare cuts in the parent and return predictions in submitted order."""
@@ -307,7 +345,23 @@ class ReplayEvaluator:
             cfg.rollout_gpus,
         ):
             raise ValueError("Backend dimensions disagree with allocated GPU counts")
-        pub = self.models.publication(cfg, (cfg,))
+        actor = actor_config(self.models.actor_template, cfg)
+        rollout = rollout_config(
+            self.models.rollout_template, self.models.rollout_model, cfg
+        )
+        execution = CandidateExecution(
+            actor, rollout, cfg.rollout_max_concurrent_rollouts
+        )
+        model = self.models.actor_model
+        pub = publication_seconds(
+            model.model,
+            model.hardware,
+            actor.parallel,
+            (rollout,),
+            weight_bytes=model.model.total_parameters * 2,
+            hbm_efficiency=model.efficiency.hbm,
+            bandwidth=self.models.publication_GBps,
+        )
         if not isfinite(pub) or pub < 0:
             raise ValueError("Unknown publication duration")
         cut = (
@@ -323,7 +377,7 @@ class ReplayEvaluator:
             raise ValueError(
                 "Cutover extends beyond the forecast; partial residency unknown"
             )
-        return cfg, cut, pub
+        return execution, cut, pub
 
     def _predict(
         self,
@@ -337,381 +391,378 @@ class ReplayEvaluator:
         *,
         stop_at_publication=None,
     ):
-        view, size = obs.view, self.batch_size
-        if view.busy or view.provider_version != view.training_version:
-            raise ValueError("Expected an idle Actor at the published update boundary")
-        end, start = forecast.input_closes_at, view.now
-        rc = self.models.rollout_config(cfg)
-        shapes = {e.episode_id: e.turns for e in forecast.episodes}
-
-        @cache
-        def actor_time(batch):
-            peak, cap, oom = self.models.actor_memory(cfg, batch)
-            if oom or peak > cap * (1 - self.reserve):
-                raise ValueError(
-                    f"Batch exceeds Actor memory allowance (peak={peak:.2f} GiB, "
-                    f"allowance={cap * (1 - self.reserve):.2f} GiB, oom={oom})"
-                )
-            stages = self.models.actor(cfg, batch)
-            duration = sum(t for _, t in stages)
-            if not stages or not isfinite(duration) or duration <= 0:
-                raise ValueError("Unknown Actor duration")
-            return duration
-
-        templates = [episode.turns for episode in forecast.episodes]
-        deficit = 0.0
-        if templates:
-            rate = len(templates) / (end - start)
-            weighted = 0.0
-            for offset in range(0, len(templates), size):
-                batch = tuple(
-                    templates[(offset + i) % len(templates)] for i in range(size)
-                )
-                weighted += min(size, len(templates) - offset) * actor_time(batch)
-            deficit = rate - size / (weighted / len(templates) + pub)
-
-        # All state below belongs to this candidate. Simultaneous completions are
-        # applied before the next batch is chosen or new inference work is scheduled.
-        ready = deque()
-        arrivals, waiting = deque(), {}
-        replicas = {i: Replica() for i in range(rc.replicas)}
-        events, serial = [], count()
-        active = set()
-        accepted = 0
-        passed = completed = updates = 0
-        unknown_timing = actor_busy = False
-        paused = cut.seconds > 0
-        generation = 0
-        now = start
-        interval = getattr(self.models, "decode_interval", None)
-        # Full-output reservations stay fixed until admission, completion or pause.
-        routing_dirty = True
-
-        def push(at, kind, payload=None):
-            heappush(events, (at, next(serial), kind, payload))
-
-        def add_call(key, i, at):
-            nonlocal routing_dirty
-            routing_dirty = True
-            t = shapes[key][i]
-            req = self.request_type(f"turn-{i}", t.input_tokens, t.output_tokens)
-            call = Call(key, i, next(serial), at, req)
-            waiting[key] = call
-            return call
-
-        # Only the next arrival bounds an interval. Preserve the original event
-        # serials for equal timestamps even when input is supplied out of order.
-        offers = iter(
-            sorted(
-                (
-                    e.available_at,
-                    next(serial),
-                    "arrival",
-                    (e.episode_id, e.available_at),
-                )
-                for e in forecast.episodes
-            )
-        )
-
-        def enqueue_offer():
-            event = next(offers, None)
-            if event is not None:
-                heappush(events, event)
-
-        backlog = obs.backlog
-        if backlog is not None:
-            shapes.update(backlog.shapes)
-            arrivals.extend(backlog.queued)
-            ready.extend(backlog.ready)
-            accepted = len(ready)
-            passed, completed = backlog.passed_calls, backlog.completed_calls
-            unknown_timing = backlog.unknown_timing
-            for progress in backlog.running:
-                key = progress.episode_id
-                call = add_call(key, progress.turn, progress.ready_at)
-                call.first = progress.first_token_at
-                call.prefilled, call.generated = progress.prefilled, progress.generated
-                call.retained = progress.retained
-                call.request = replace(
-                    call.request,
-                    input_tokens=call.request.input_tokens + call.retained,
-                    output_tokens=call.request.output_tokens - call.retained,
-                )
-                active.add(key)
-                if cut.seconds:
-                    call.resume()
-                elif progress.replica is not None:
-                    replicas[progress.replica].rows[key] = waiting.pop(key)
-            for key, turn, at in backlog.tools:
-                active.add(key)
-                push(at, "tool", (key, turn))
-            if backlog.actor_event is not None:
-                kind, remaining = backlog.actor_event
-                accepted += size
-                actor_busy = True
-                paused = paused or kind == "published"
-                push(start + cut.seconds + remaining, kind)
-
-        enqueue_offer()
-        if paused:
-            push(start + cut.seconds, "resume")
-        push(end, "end")
-
-        def simulate_step():
-            nonlocal routing_dirty
-            limit = min(
-                self.concurrency,
-                cfg.rollout_max_concurrent_rollouts or size,
-            )
-            while (
-                arrivals
-                and len(active) < limit
-                and accepted + len(active) < (updates + 1 + self.staleness) * size
-            ):
-                key, at = arrivals.popleft()
-                active.add(key)
-                add_call(key, 0, at)
-            if routing_dirty:
-                for key, call in tuple(waiting.items()):
-                    rid = self.scheduler.choose_replica(rc, call, replicas)
-                    if rid is not None:
-                        replicas[rid].rows[key] = waiting.pop(key)
-                routing_dirty = False
-            for rid, replica in replicas.items():
-                if replica.rows and not replica.busy:
-                    slices, keys = self.scheduler.batch(rc, list(replica.rows.values()))
-                    if not slices:
-                        raise ValueError(
-                            "Serving profile cannot schedule the pending tokens"
-                        )
-                    replica.decode_span = None
-                    if interval is not None and all(s.kind == "decode" for s in slices):
-                        remaining = min(
-                            replica.rows[key].request.output_tokens
-                            - replica.rows[key].generated
-                            for key, _ in keys
-                        )
-                        duration, slope, steps = interval(
-                            cfg, replica.kv_tokens, slices, remaining
-                        )
-                        if (
-                            steps > 1
-                            and isfinite(slope)
-                            and duration + (steps - 1) * slope > 0
-                        ):
-                            replica.decode_span = DecodeSpan(
-                                now + duration,
-                                duration,
-                                slope,
-                                steps,
-                                resident_count=len(replica.rows),
-                            )
-                    else:
-                        duration = self.models.service(cfg, replica.kv_tokens, slices)
-                    if not isfinite(duration) or duration <= 0:
-                        raise ValueError("Unknown inference duration")
-                    replica.busy = True
-                    push(
-                        now + duration,
-                        "tokens",
-                        (generation, rid, tuple(zip(keys, slices))),
-                    )
-
-        def advance_decode():
-            # Stop at the earliest event that could change routing, batch membership,
-            # policy version, or the cost model's segment on any replica.
-            boundary = end
-            spans = []
-            for index, (when, _, kind, payload) in enumerate(events):
-                if kind == "tokens":
-                    gen, rid, items = payload
-                    replica = replicas.get(rid)
-                    span = (
-                        replica.decode_span if gen == generation and replica else None
-                    )
-                    if span is not None and span.resident_count == len(replica.rows):
-                        spans.append((index, rid, span, items))
-                        boundary = min(boundary, span.end(span.limit))
-                        continue
-                boundary = min(boundary, when)
-
-            moved = []
-            for index, rid, span, items in spans:
-                steps = span.steps_before(boundary)
-                if steps:
-                    for (key, _), _ in items:
-                        replicas[rid].rows[key].generated += steps
-                    moved.append((span.end(steps), rid, index))
-                    span.first_end = span.end(steps + 1)
-                    span.first_seconds += steps * span.increment
-                    span.limit -= steps
-            if moved:
-                # The next token would have been scheduled after the last skipped
-                # completion. Replica order breaks ties as in simulate_step().
-                for _, rid, index in sorted(moved):
-                    payload = events[index][3]
-                    events[index] = (
-                        replicas[rid].decode_span.first_end,
-                        next(serial),
-                        "tokens",
-                        payload,
-                    )
-                heapify(events)
-
-        while True:
-            # Process all events at now, including newly scheduled zero-length tools.
-            while events and events[0][0] <= now:
-                _, _, kind, payload = heappop(events)
-                if kind == "arrival":
-                    arrivals.append(payload)
-                    enqueue_offer()
-                elif kind == "tool":
-                    add_call(*payload, now)
-                elif kind == "actor":
-                    routing_dirty = True
-                    paused = True
-                    generation += 1
-                    for replica in replicas.values():
-                        for key, call in replica.rows.items():
-                            call.resume()
-                            waiting[key] = call
-                        replica.rows.clear()
-                        replica.busy = False
-                    push(now + pub, "published")
-                elif kind == "published":
-                    paused = actor_busy = False
-                    updates += 1
-                    if stop_at_publication is not None and now >= stop_at_publication:
-                        if now >= end:
-                            return obs, None
-                        # Publishing flushed replica KV. Calls waiting for the
-                        # new weights still own their acknowledged output.
-                        running = tuple(
-                            InflightCall(
-                                c.group_id,
-                                c.index,
-                                c.ready_at,
-                                c.first,
-                                c.prefilled,
-                                c.generated,
-                                c.retained,
-                            )
-                            for c in waiting.values()
-                        )
-                        tools = tuple(
-                            (*item, at)
-                            for at, _, event, item in events
-                            if event == "tool"
-                        )
-                        keys = set(active) | set(ready) | {k for k, _ in arrivals}
-                        carry = Backlog(
-                            {k: shapes[k] for k in keys},
-                            tuple(arrivals),
-                            running,
-                            tools,
-                            tuple(ready),
-                            passed_calls=passed,
-                            completed_calls=completed,
-                            unknown_timing=unknown_timing,
-                        )
-                        unseen = {
-                            item[0]
-                            for _, _, event, item in events
-                            if event == "arrival"
-                        }
-                        unseen.update(item[0] for _, _, _, item in offers)
-                        rest = tuple(
-                            e for e in forecast.episodes if e.episode_id in unseen
-                        )
-                        version = view.training_version + updates
-                        next_view = replace(
-                            view,
-                            now=now,
-                            training_version=version,
-                            provider_version=version,
-                        )
-                        return (
-                            Observation(next_view, layout, carry),
-                            replace(forecast, episodes=rest),
-                        )
-                elif kind == "resume":
-                    paused = any(event[2] == "published" for event in events)
-                elif kind == "tokens":
-                    gen, rid, items = payload
-                    if gen != generation:
-                        continue
-                    replica = replicas[rid]
-                    replica.busy = False
-                    for (key, _), item in items:
-                        call = replica.rows[key]
-                        if item.kind == "prefill":
-                            call.prefilled += item.query_tokens
-                        if not item.emit_token:
-                            continue
-                        if call.generated + call.retained == 0:
-                            call.first = now
-                        call.generated += 1
-                        if call.generated != call.request.output_tokens:
-                            continue
-                        del replica.rows[key]
-                        routing_dirty = True
-                        completed += 1
-                        total = call.generated + call.retained
-                        if call.first is None:
-                            unknown_timing = True
-                        else:
-                            passed += (
-                                call.first - call.ready_at <= self.slo.ttft_seconds
-                                and (
-                                    total == 1
-                                    or (now - call.first) / (total - 1)
-                                    <= self.slo.tpot_seconds
-                                )
-                            )
-                        t = shapes[key][call.index]
-                        if t.tool_seconds is None:
-                            ready.append(key)
-                            active.remove(key)
-                            accepted += 1
-                        else:
-                            push(now + t.tool_seconds, "tool", (key, call.index + 1))
-            if now >= end:
-                break
-            if not paused:
-                if len(ready) >= size and not actor_busy:
-                    ids = tuple(ready.popleft() for _ in range(size))
-                    duration = actor_time(tuple(shapes[key] for key in ids))
-                    if on_batch is not None:
-                        on_batch(now, ids)
-                    push(now + duration, "actor")
-                    actor_busy = True
-                simulate_step()
-                if interval is not None:
-                    advance_decode()
-            now = events[0][0]
-
-        pending_calls = [
-            *waiting.values(),
-            *(c for r in replicas.values() for c in r.rows.values()),
-        ]
-        # Offered first calls held by permits still contribute to prospective TTFT.
-        failures = sum(end - at > self.slo.ttft_seconds for _, at in arrivals)
-        failures += sum(
-            (end if c.first is None else c.first) - c.ready_at > self.slo.ttft_seconds
-            for c in pending_calls
-            if c.first is not None or not (c.generated + c.retained)
-        )
-        decided = completed + failures
-        return Prediction(
+        return simulate(
+            obs,
+            forecast,
+            cfg,
             layout,
-            passed / decided if decided and not unknown_timing else None,
-            max(
-                (end - start) * layout.gpus,
-                cut.gpu_seconds + (end - start - cut.seconds) * layout.gpus,
-            ),
-            deficit <= 1e-12,
-            max(0.0, deficit),
-            completed_updates=updates,
-            pending_requests=len(pending_calls) + len(arrivals),
-            completed_requests=completed,
+            cut,
+            pub,
+            on_batch,
+            stop_at_publication=stop_at_publication,
+            batch_size=self.batch_size,
+            concurrency=self.concurrency,
+            actor_model=self.models.actor_model,
+            rollout_model=self.models.rollout_model,
+            request_type=self.request_type,
+            reserve=self.reserve,
+            scheduler=self.scheduler,
+            slo=self.slo,
+            staleness=self.staleness,
         )
+
+
+_KINDS = {"hardware", "topology", "models", "execution/actor", "execution/rollout"}
+
+
+def numerical_environment() -> dict[str, str]:
+    """FFD ties depend on NumPy argsort; migration must preserve this binding."""
+    return {"numpy": np.__version__}
+
+
+def _hardware(gpu: dict, topology: dict, hardware_name: str) -> Hardware:
+    if topology["hardware_profile"] != hardware_name:
+        raise ValueError("Topology belongs to another GPU profile")
+    if gpu.keys() & topology["hardware"].keys():
+        raise ValueError("GPU and topology hardware fields must be disjoint")
+    return Hardware(**gpu, **topology["hardware"])
+
+
+def _model(value: dict) -> ModelShape:
+    config = value["hf_config"]
+    architecture = value["architecture"]
+    if (
+        architecture not in {"qwen3_moe", "qwen3"}
+        or config["model_type"] != architecture
+    ):
+        raise ValueError("This model adapter covers Qwen3 dense and MoE")
+    dense = architecture == "qwen3"
+    if (
+        config.get("decoder_sparse_step", 1) != 1
+        or config.get("mlp_only_layers")
+        or config.get("use_sliding_window")
+        or config.get("attention_bias")
+        or (config.get("hidden_act", "silu") != "silu")
+    ):
+        raise ValueError(
+            "Mixed dense/MoE layers or alternate attention/MLP rules require another model adapter"
+        )
+    shape = ModelShape(
+        config["hidden_size"],
+        config["intermediate_size"] if dense else config["moe_intermediate_size"],
+        config["num_hidden_layers"],
+        config["num_attention_heads"],
+        config["num_key_value_heads"],
+        config["head_dim"],
+        1 if dense else config["num_experts"],
+        1 if dense else config["num_experts_per_tok"],
+        config["vocab_size"],
+        config["tie_word_embeddings"],
+        "dense" if dense else "moe",
+    )
+    if shape != ModelShape(**value["shape"]):
+        raise ValueError("Model dimensions disagree with the archived HF configuration")
+    return shape
+
+
+def _actor(value: dict, parallel: ParallelLayout) -> ActorConfig:
+    config = value["config"].copy()
+    config["parallel"] = parallel
+    return ActorConfig(**config)
+
+
+def _rollout(
+    value: dict, *, tp: int, replicas: int, kv_capacity_tokens: int
+) -> RolloutConfig:
+    config = RolloutConfig(
+        **value["config"],
+        tp=tp,
+        replicas=replicas,
+        kv_capacity_tokens=kv_capacity_tokens,
+    )
+    if scheduler_for(config.backend).version != value["policy"]:
+        raise ValueError("Unknown rollout scheduler")
+    return config
+
+
+def _name(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(
+        "[a-zA-Z0-9][a-zA-Z0-9_.-]*", value
+    ):
+        raise ValueError("Catalog names must be simple identifiers")
+    return value
+
+
+def _finite(value: str):
+    raise ValueError(f"Nonfinite archive number: {value}")
+
+
+def _read(path: Path, *, expected_sha256: str | None = None):
+    payload = path.read_bytes()
+    if (
+        expected_sha256 is not None
+        and hashlib.sha256(payload).hexdigest() != expected_sha256
+    ):
+        raise ValueError(f"Archive content hash mismatch: {path.name}")
+    if path.suffix == ".gz":
+        payload = gzip.decompress(payload)
+    text = payload.decode("utf-8")
+    if ".jsonl" in path.suffixes:
+        return [
+            json.loads(line, parse_constant=_finite)
+            for line in text.splitlines()
+            if line.strip()
+        ]
+    return json.loads(text, parse_constant=_finite)
+
+
+def _inside(root: Path, relative: str) -> Path:
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root.resolve()) or path == root.resolve():
+        raise ValueError("Archive reference must remain inside its catalog/trial")
+    return path
+
+
+def _components(
+    profiles: dict, hardware_name: str
+) -> tuple[ExpertActorModel, ExpertRolloutModel]:
+    hardware = _hardware(profiles["hardware"], profiles["topology"], hardware_name)
+    model = _model(profiles["model"])
+    actor, rollout = (profiles["actor"], profiles["rollout"])
+    if actor.get("advantage"):
+        raise ValueError("Legacy aggregate advantage fits require the archived model")
+    if actor["dispatch"]["mode"] != "controller":
+        raise ValueError("Reference requires a single-controller Actor profile")
+    raw = ExpertActorModel(
+        model,
+        hardware,
+        actor["runtime_revision"],
+        efficiency=Efficiency(
+            **{k: v for k, v in actor["efficiency"].items() if k != "fsdp_overlap"}
+        ),
+        group_gbps=tuple(profiles["topology"]["group_gbps"]),
+        dispatch=DispatchConfig(group_size=actor["dispatch"]["group_size"]),
+        execution_identity=fingerprint(profiles["model"], actor["execution"])
+        if actor.get("execution")
+        else "",
+    )
+    service = ExpertRolloutModel(
+        model,
+        hardware,
+        InferenceRates(**rollout["rates"]),
+        rollout["runtime_revision"],
+        execution_identity=fingerprint(profiles["model"], rollout["execution"])
+        if rollout.get("execution")
+        else "",
+        **rollout.get("model_options", {}),
+    )
+    return (raw, service)
+
+
+@dataclass(frozen=True)
+class Catalog:
+    """Explicit external catalog root containing profiles/<kind>/<id>.json."""
+
+    root: Path
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "root", Path(self.root).resolve())
+
+    def names(self, kind: str) -> tuple[str, ...]:
+        if kind not in _KINDS:
+            raise ValueError("Unknown catalog kind")
+        directory = self.root / f"profiles/{kind}"
+        return tuple(sorted(p.stem for p in directory.glob("*.json")))
+
+    def profile(self, kind: str, name: str, *, sha256: str | None = None) -> dict:
+        if kind not in _KINDS:
+            raise ValueError("Unknown profile kind")
+        path = _inside(self.root, f"profiles/{kind}/{_name(name)}.json")
+        value = _read(path, expected_sha256=sha256)
+        if (value.get("schema_version"), value.get("kind"), value.get("id")) != (
+            1,
+            kind,
+            name,
+        ):
+            raise ValueError("Profile schema, kind or identity mismatch")
+        if (
+            not value.get("version")
+            or not isinstance(value.get("values"), dict)
+            or (not value.get("provenance"))
+        ):
+            raise ValueError("Profiles require versioned values and provenance")
+        return value
+
+    def hardware(self, hardware: str, topology: str) -> Hardware:
+        gpu = self.profile("hardware", hardware)["values"]
+        host = self.profile("topology", topology)["values"]
+        return _hardware(gpu, host, hardware)
+
+    def model(self, name: str) -> ModelShape:
+        return _model(self.profile("models", name)["values"])
+
+    def actor(self, name: str, *, parallel: ParallelLayout) -> ActorConfig:
+        return _actor(self.profile("execution/actor", name)["values"], parallel)
+
+    def rollout(
+        self, name: str, *, tp: int, replicas: int, kv_capacity_tokens: int
+    ) -> RolloutConfig:
+        return _rollout(
+            self.profile("execution/rollout", name)["values"],
+            tp=tp,
+            replicas=replicas,
+            kv_capacity_tokens=kv_capacity_tokens,
+        )
+
+
+def _load_profile_components(
+    catalog,
+    hardware,
+    topology,
+    model,
+    actor,
+    rollout,
+    inter_node_GBps,
+    calibration=None,
+):
+    profiles = {
+        role: catalog.profile(kind, name)["values"]
+        for role, kind, name in (
+            ("hardware", "hardware", hardware),
+            ("topology", "topology", topology),
+            ("model", "models", model),
+            ("actor", "execution/actor", actor),
+            ("rollout", "execution/rollout", rollout),
+        )
+    }
+    for role in ("actor", "rollout"):
+        if profiles[role].get("model_profile", model) != model:
+            raise ValueError(f"{role} profile belongs to another model")
+    a, r = _components(profiles, hardware)
+    if calibration is not None:
+        data = _read(Path(calibration))
+        fit_id = fingerprint(data)
+        if data.pop("hardware", None) != hardware or data.pop("model", None) != model:
+            raise ValueError(
+                "Calibration hardware or model differs from the selected profiles"
+            )
+        fit_topology = data.pop("topology", None)
+        if fit_topology is not None and fit_topology != topology:
+            raise ValueError("Calibration belongs to another topology")
+        if not data or not data.keys() <= {"actor", "rollout"}:
+            raise ValueError("Calibration requires actor or rollout parameters")
+        if fit_topology is None and any(
+            "network" in fit["parameters"] for fit in data.values()
+        ):
+            raise ValueError("Calibrated communication efficiency requires a topology")
+        if "actor" in data:
+            fit = ParameterCalibration(**data["actor"])
+            a = replace(
+                a,
+                efficiency=fit.apply(a.efficiency, a.runtime_revision),
+                parameter_sources=(fit_id, *fit.source_ids),
+            )
+        if "rollout" in data:
+            fit = ParameterCalibration(**data["rollout"])
+            r = replace(
+                r,
+                rates=fit.apply(r.rates, r.runtime_revision),
+                parameter_sources=(fit_id, *fit.source_ids),
+            )
+    if inter_node_GBps is not None:
+        nonnegative("inter_node_GBps", inter_node_GBps, positive=True)
+        a = replace(a, hardware=replace(a.hardware, inter_node_gbps=inter_node_GBps))
+        r = replace(r, hardware=replace(r.hardware, inter_node_gbps=inter_node_GBps))
+    actor_template = _actor(profiles["actor"], ParallelLayout())
+    rollout_template = _rollout(
+        profiles["rollout"], tp=1, replicas=1, kv_capacity_tokens=1
+    )
+    rollout_template = replace(
+        rollout_template,
+        mem_fraction_static=profiles["rollout"]["config"].get(
+            "mem_fraction_static", 0.9
+        ),
+    )
+    return a, actor_template, r, rollout_template
+
+
+@dataclass(frozen=True)
+class LoadedProfiles:
+    actor_model: ExpertActorModel
+    actor_template: ActorConfig
+    rollout_model: ExpertRolloutModel
+    rollout_template: RolloutConfig
+    publication_GBps: float
+    source_ids: tuple
+    worker_spec: tuple
+
+
+def load_profiles(
+    *,
+    hardware,
+    topology,
+    model,
+    actor,
+    rollout,
+    bandwidth_GBps,
+    inter_node_GBps=None,
+    catalog: Catalog,
+    calibration: Path | None = None,
+    actor_runtime: ActorConfig | None = None,
+):
+    """Load profiles and optional fitted coefficients from JSON.
+
+    A calibration names its hardware and model profiles. Each fitted role
+    (actor, rollout) supplies runtime_revision, source_ids and a sparse
+    parameters object (e.g. rollout's hbm efficiency). Include the
+    topology profile when fitting network efficiency. For a live Actor pass
+    ActorConfig.from_areal(resolved_actor) to use its execution settings.
+    """
+    actor_model, actor_template, rollout_model, rollout_template = (
+        _load_profile_components(
+            catalog,
+            hardware,
+            topology,
+            model,
+            actor,
+            rollout,
+            inter_node_GBps,
+            calibration,
+        )
+    )
+    worker_spec = (
+        "analytical",
+        hardware,
+        topology,
+        model,
+        actor,
+        rollout,
+        bandwidth_GBps,
+        inter_node_GBps,
+        str(catalog.root),
+        str(Path(calibration).resolve()) if calibration is not None else None,
+        actor_runtime,
+    )
+    nonnegative("bandwidth_GBps", bandwidth_GBps, positive=True)
+    actor_template = actor_runtime if actor_runtime is not None else actor_template
+    source_ids = (
+        fingerprint(
+            "megatron-sglang-analytical-v1",
+            actor_model.profile_key(actor_template),
+            rollout_model.profile_key(rollout_template),
+            bandwidth_GBps,
+        ),
+    ) + tuple(
+        dict.fromkeys(actor_model.parameter_sources + rollout_model.parameter_sources)
+    )
+    return LoadedProfiles(
+        replace(
+            actor_model, advantage_model=actor_model.advantage_model or Advantages()
+        ),
+        actor_template,
+        rollout_model,
+        rollout_template,
+        bandwidth_GBps,
+        source_ids,
+        worker_spec,
+    )

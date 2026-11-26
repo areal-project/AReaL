@@ -30,6 +30,11 @@ app = create_app(_state)
 def _configure_jit_cache(data: dict) -> dict:
     if "sglang_jit_cache" not in data:
         return {}
+    from areal.v2.inference_service.sglang.flashinfer_cache import (
+        stage_driver_cache,
+        stage_flashinfer_cache,
+        supports_cache_staging,
+    )
     from areal.v2.inference_service.sglang.jit_cache import stage_cache
 
     options = data["sglang_jit_cache"]
@@ -47,7 +52,19 @@ def _configure_jit_cache(data: dict) -> dict:
             for (role, _), p in _state.forked_children_map.items()
             if role == "inf-server" and p.poll() is None
         ]
-    return stage_cache(options["action"], Path(root) / directory, pids)
+    action = options["action"]
+    shared = Path(root) / directory
+    result = stage_cache(action, shared, pids)
+    if supports_cache_staging():
+        for name, stage in (
+            ("flashinfer", stage_flashinfer_cache),
+            ("cuda_driver", stage_driver_cache),
+        ):
+            try:
+                result[name] = stage(action, shared)
+            except (OSError, ValueError) as error:
+                result[name] = {"skipped": str(error)}
+    return result
 
 
 _state.register_configure_hook(_configure_jit_cache)

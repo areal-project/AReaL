@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
@@ -15,15 +16,33 @@ from math import inf, isfinite
 from time import monotonic
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
-from .trigger import WorkloadChange, WorkloadTrigger
+from .trigger import StableWorkloadTrigger, WorkloadChange
 
 if TYPE_CHECKING:
     from .evaluator import Observation, ReplayEvaluator
+    from .evaluator.rollout.capacity import RolloutCapacity
     from .evaluator.workload import ExecutionConfig, WorkloadPattern
 
 
 Value = bool | int | float | str | None
 ATTENTION_DP_OPTIONS = frozenset(("sglang_dp_size", "sglang_enable_dp_attention"))
+DEFAULT_EVALUATION_BUDGET = 32
+
+
+def _rank_products(
+    axes: tuple[Sequence[int], ...], limit: int
+) -> Iterator[tuple[tuple[int, ...], int]]:
+    """Enumerate physical meshes without expanding over-capacity prefixes."""
+    if not axes:
+        yield (), 1
+        return
+    degrees = axes[0]
+    if isinstance(degrees, range) and degrees.step > 0:
+        degrees = degrees[: bisect_right(degrees, limit)]
+    for degree in degrees:
+        if degree <= limit:
+            for suffix, size in _rank_products(axes[1:], limit // degree):
+                yield (degree, *suffix), degree * size
 
 
 @dataclass(frozen=True)
@@ -82,10 +101,16 @@ class SearchSpace:
                 if k.startswith("actor_") == (role == "actor")
             }
             rows = []
-            for values in product(*(axes.get(name, (1,)) for name in names)):
+            physical = tuple(axes.get(name, (1,)) for name in names[:4])
+            experts = tuple(product(*(axes.get(name, (1,)) for name in names[4:])))
+            meshes = (
+                (ranks + expert, gpus)
+                for ranks, gpus in _rank_products(physical, self.gpu_capacity - 1)
+                for expert in experts
+            )
+            for values, gpus in meshes:
                 if role == "actor":
                     dp, tp, pp, cp, ep, etp = values
-                    gpus = dp * tp * pp * cp
                     if (
                         self.batch_size % dp
                         or dp * tp * cp % (ep * etp)
@@ -98,10 +123,7 @@ class SearchSpace:
                     backend = "megatron:" + parallel
                 else:
                     replicas, tp, pp = values
-                    gpus = replicas * tp * pp
                     backend = f"sglang:d{replicas}t{tp}p{pp}"
-                if gpus >= self.gpu_capacity:
-                    continue
                 for settings in product(*options.values()):
                     rows.append(
                         RoleLayout(backend, gpus, tuple(sorted(zip(options, settings))))
@@ -111,15 +133,18 @@ class SearchSpace:
 
     @classmethod
     def for_pool(cls, gpu_capacity: int, batch_size: int):
-        """Default physical axes for a Megatron Actor and homogeneous SGLang replicas."""
+        """Enumerate integer degrees within the pool for Megatron and SGLang."""
         counts = range(1, gpu_capacity)
-        tp = (1, 2, 4, 8)
-        stages = (*tp, 16)
         return cls(
             gpu_capacity,
             batch_size,
-            dict(dp=counts, tp=tp, pp=stages, cp=stages),
-            dict(replicas=counts, tp=tp, pp=stages),
+            dict(
+                dp=tuple(n for n in counts if batch_size % n == 0),
+                tp=counts,
+                pp=counts,
+                cp=counts,
+            ),
+            dict(replicas=counts, tp=counts, pp=counts),
         )
 
     @classmethod
@@ -176,7 +201,8 @@ def coordinates(role, inherited_dp=1):
 
 
 def supported_space(grid, evaluator, attention_dp_sizes):
-    from .evaluator.cost_model.actor.megatron import MegatronCosts
+    from .evaluator.actor.cost_model import MegatronCosts, actor_config
+    from .evaluator.rollout.cost_model import rollout_config
     from .evaluator.workload import ExecutionConfig
 
     template = getattr(evaluator, "template", None)
@@ -190,14 +216,16 @@ def supported_space(grid, evaluator, attention_dp_sizes):
     for role in space.actors:
         config = replace(template, actor_backend=role.backend)
         if MegatronCosts.mesh_is_valid(
-            models.actor_config(config), models.actor_model.model
+            actor_config(models.actor_template, config), models.actor_model.model
         ):
             actors.append(role)
     rollouts = []
     for role in space.rollouts:
         config = replace(template, rollout_backend=role.backend, **dict(role.options))
         try:
-            models.rollout_config(config)  # model shape and weight/KV capacity
+            rollout_config(
+                models.rollout_template, models.rollout_model, config
+            )  # model shape and weight/KV capacity
         except ValueError:
             continue
         rollouts.append(role)
@@ -216,12 +244,28 @@ class Prediction:
     completed_updates: int | None = None
     pending_requests: int | None = None
     completed_requests: int | None = None
+    actor_capacity: float | None = None
+    admission_failures: int = 0
+    rollout_queue_failures: int = 0
+    rollout_decode_failures: int = 0
+    unfinished_episodes: int = 0
 
 
 class Evaluator(Protocol):
     def prepare(self, observation: Any, *, pattern: WorkloadPattern) -> Any: ...
 
     def evaluate(self, context: Any, layout: Layout) -> Prediction: ...
+
+    def estimate_rollout_capacity(
+        self,
+        context: Any,
+        layout: Layout,
+        pattern: WorkloadPattern,
+        rate: float,
+        target: float,
+    ) -> RolloutCapacity: ...
+
+    def estimate_actor_capacity(self, context: Any, layout: Layout) -> float | None: ...
 
 
 @dataclass(frozen=True)
@@ -231,6 +275,8 @@ class Decision:
     predictions: tuple[Prediction, ...]
     reason: str
     workload_change: tuple[str, ...] = ()
+    rollout_capacity_probe: RolloutCapacity | None = None
+    within_split_evaluations: int = 0
 
 
 @dataclass(frozen=True)
@@ -246,13 +292,13 @@ def _usable(p: Prediction) -> bool:
 
 
 def _meets(p: Prediction, target: float) -> bool:
-    return p.actor_sustainable is True and p.request_fraction + 1e-12 >= target
+    return p.request_fraction + 1e-12 >= target
 
 
 def select(
     predictions: Sequence[Prediction], current: Layout, target: float
 ) -> Prediction | None:
-    """Minimize GPU seconds subject to serving SLO and sustainable training."""
+    """Minimize GPU seconds among supported layouts that meet the serving SLO."""
     return min(
         (p for p in predictions if _usable(p) and _meets(p, target)),
         key=lambda p: (p.gpu_seconds, p.layout != current, p.layout.key),
@@ -269,7 +315,7 @@ class BaseOptimizer:
         evaluator,
         *,
         minimum_request_fraction,
-        max_evaluations=64,
+        max_evaluations=DEFAULT_EVALUATION_BUDGET,
         clock=monotonic,
     ):
         if (
@@ -367,6 +413,8 @@ class _Split:
     layouts: Iterator[Layout]
     count: int
     queried: int
+    actors: tuple[RoleLayout, ...]
+    rollouts: tuple[RoleLayout, ...]
 
     @property
     def gpus(self):
@@ -383,7 +431,7 @@ class Optimizer(BaseOptimizer):
         *,
         gpu_capacity: int | None = None,
         minimum_request_fraction: float,
-        max_evaluations: int = 64,
+        max_evaluations: int = DEFAULT_EVALUATION_BUDGET,
         clock: Callable[[], float] = monotonic,
         attention_dp_sizes: Sequence[int] = (1,),
     ):
@@ -426,7 +474,11 @@ class Optimizer(BaseOptimizer):
             max_evaluations=max_evaluations,
             clock=clock,
         )
-        self.workload_trigger = WorkloadTrigger()
+        self.workload_trigger = StableWorkloadTrigger(
+            getattr(evaluator, "batch_size", 128)
+        )
+        self._observed_layout: Layout | None = None
+        self._proposed_pattern: tuple[Layout, WorkloadChange] | None = None
         self.inherited_dp = space.inherited_attention_dp
 
     @classmethod
@@ -436,7 +488,7 @@ class Optimizer(BaseOptimizer):
         evaluator: ReplayEvaluator,
         *,
         attention_dp_sizes=(1,),
-        max_evaluations=64,
+        max_evaluations=DEFAULT_EVALUATION_BUDGET,
     ):
         """Normal entry point. Build a physical catalogue from the native profiles once."""
         return cls(
@@ -448,12 +500,12 @@ class Optimizer(BaseOptimizer):
         )
 
     def _actors_for_forecast(self, forecast):
-        from .evaluator import ReplayEvaluator
-        from .evaluator.cost_model.models import AnalyticalCostModels
+        from .evaluator import LoadedProfiles, ReplayEvaluator
+        from .evaluator.actor.cost_model import actor_config
 
         evaluator = self.evaluator
         if not isinstance(evaluator, ReplayEvaluator) or not isinstance(
-            evaluator.models, AnalyticalCostModels
+            evaluator.models, LoadedProfiles
         ):
             return self.actors
         # Replay checks this first batch for every layout, before scheduling any
@@ -470,10 +522,13 @@ class Optimizer(BaseOptimizer):
                 evaluator.template, actor_backend=role.backend, **dict(role.options)
             )
             try:
-                peak, capacity, oom = evaluator.models.actor_memory(config, batch)
+                model = evaluator.models.actor_model
+                execution = actor_config(evaluator.models.actor_template, config)
+                peak = model.estimate_batch(execution, batch).peak_gib
+                capacity = model.hardware.memory_gb * 1e9 / 2**30
             except ValueError:
                 continue  # Replay also marks this mandatory batch unsupported.
-            if not (oom or peak > capacity * (1 - evaluator.reserve)):
+            if peak <= capacity * (1 - evaluator.reserve):
                 actors.append(role)
         return actors
 
@@ -500,6 +555,8 @@ class Optimizer(BaseOptimizer):
                         _joint_layouts(actors[a], rollouts[r], current),
                         count,
                         queried,
+                        tuple(item.role for item in actors[a]),
+                        tuple(item.role for item in rollouts[r]),
                     )
                 )
         return splits
@@ -528,6 +585,12 @@ class Optimizer(BaseOptimizer):
             return Decision(
                 current, current, (), "Waiting for a published update boundary"
             )
+        if confirmed is None and current != self._observed_layout:
+            proposal = self._proposed_pattern
+            self.workload_trigger.bind(
+                proposal[1] if proposal and proposal[0] == current else None
+            )
+            self._observed_layout, self._proposed_pattern = current, None
         change = (
             confirmed if confirmed is not None else self.workload_trigger.observe(view)
         )
@@ -550,10 +613,10 @@ class Optimizer(BaseOptimizer):
             raise ValueError("Expected a positive, finite forecast horizon")
 
         predictions = []
-        best_cost = inf
+        best_feasible: Prediction | None = None
 
         def query(layout):
-            nonlocal best_cost
+            nonlocal best_feasible
             row = self.evaluator.evaluate(context, layout)
             if row.layout != layout:
                 raise ValueError("Evaluator returned a different layout")
@@ -563,59 +626,175 @@ class Optimizer(BaseOptimizer):
                 raise ValueError(
                     "Prediction violates the native replay GPU-time lower bound"
                 )
-            if _usable(row) and _meets(row, self.target):
-                best_cost = min(best_cost, row.gpu_seconds)
+            if (
+                _usable(row)
+                and _meets(row, self.target)
+                and (
+                    best_feasible is None or row.gpu_seconds < best_feasible.gpu_seconds
+                )
+            ):
+                best_feasible = row
             predictions.append(row)
             return row
 
         source = query(current)
         splits = self._splits(current, self._actors_for_forecast(forecast))
 
-        def discovery_order(split):
-            preferred = True
-            if source.supported and source.actor_sustainable is False:
-                preferred = split.actor_gpus > current.actor.gpus
-            elif (
-                source.supported
-                and source.actor_sustainable is True
-                and source.request_fraction is not None
-                and source.request_fraction < self.target
-            ):
-                preferred = split.rollout_gpus > current.rollout.gpus
-            distance = abs(split.actor_gpus - current.actor.gpus) + abs(
-                split.rollout_gpus - current.rollout.gpus
+        probe = None
+        rate = change.rate
+        if best_feasible is None and splits and self.limit > 1 and rate > 0:
+            probe = self.evaluator.estimate_rollout_capacity(
+                context, current, change.pattern, rate, self.target
             )
+        rollout_rate = probe.rate if probe is not None else None
+        feedback = source
+        tested = {current}
+        refined = set()
+        within_split_evaluations = 0
+
+        def pressure(row):
+            actor = (
+                row.actor_capacity is not None
+                and row.actor_capacity < rate
+                and (row.admission_failures > 0 or row.actor_sustainable is False)
+            )
+            queue = row.rollout_queue_failures
+            decode = row.rollout_decode_failures
+            return actor, queue, decode
+
+        def capacity_order(split):
+            anchor = feedback.layout
+            if rate and feedback.actor_capacity:
+                need_actor = anchor.actor.gpus * rate / feedback.actor_capacity
+            elif rate and source.actor_capacity:
+                need_actor = current.actor.gpus * rate / source.actor_capacity
+            else:
+                need_actor = current.actor.gpus
+            need_rollout = (
+                current.rollout.gpus * rate / rollout_rate
+                if rollout_rate is not None
+                else current.rollout.gpus
+            )
+            a, r = split.actor_gpus, split.rollout_gpus
+            actor_gap = max(0.0, 1 - a / need_actor)
+            rollout_gap = max(0.0, 1 - r / need_rollout)
+            actor, queue, decode = pressure(feedback)
+            rollout = queue + decode > 0
+            if actor and not rollout:
+                counterproductive = (a <= anchor.actor.gpus, r < anchor.rollout.gpus)
+            elif rollout and not actor:
+                counterproductive = (r <= anchor.rollout.gpus, a < anchor.actor.gpus)
+            else:
+                counterproductive = (False, False)
+            distance = abs(a - need_actor) + abs(r - need_rollout)
             return (
-                split.queried,
-                not preferred,
+                split.queried > 0,
+                max(actor_gap, rollout_gap) > 0,
+                *counterproductive,
+                max(actor_gap, rollout_gap),
+                actor_gap + rollout_gap,
                 distance,
-                split.actor_gpus,
-                split.rollout_gpus,
+                split.queried,
+                a,
+                r,
             )
 
-        while splits:
-            if best_cost < inf:
-                split = min(
-                    splits,
-                    key=lambda s: (s.gpus, s.queried, s.actor_gpus, s.rollout_gpus),
+        def parallel_alternative(split, row):
+            actor, queue, decode = pressure(row)
+            source_layout = row.layout
+            if actor and not (queue or decode):
+                candidates = [
+                    Layout(role, source_layout.rollout)
+                    for role in split.actors
+                    if Layout(role, source_layout.rollout) not in tested
+                ]
+                estimates = [
+                    (
+                        self.evaluator.estimate_actor_capacity(context, candidate),
+                        candidate,
+                    )
+                    for candidate in candidates[:4]
+                ]
+                return max(
+                    (
+                        item
+                        for item in estimates
+                        if item[0] and item[0] > row.actor_capacity
+                    ),
+                    key=lambda item: item[0],
+                    default=(None, None),
+                )[1]
+            if not actor and (queue or decode):
+                axis = 1 if decode > queue else 0  # TP for decode; replicas for queue.
+                parallelism = coordinates(source_layout.rollout, self.inherited_dp)[
+                    axis
+                ]
+                return next(
+                    (
+                        candidate
+                        for role in split.rollouts
+                        if coordinates(role, self.inherited_dp)[axis] > parallelism
+                        and (candidate := Layout(source_layout.actor, role))
+                        not in tested
+                    ),
+                    None,
                 )
-                if horizon * split.gpus >= best_cost:
+            return None
+
+        while splits:
+            alternative = None
+            if best_feasible is not None:
+                incumbent = best_feasible.layout
+                # Try the closest smaller GPU count first. Same-size or larger
+                # layouts can still win if they avoid enough switching cost.
+                split = min(
+                    (s for s in splits if horizon * s.gpus < best_feasible.gpu_seconds),
+                    key=lambda s: (
+                        s.gpus >= incumbent.gpus,
+                        abs(s.gpus - incumbent.gpus),
+                        s.queried,
+                        abs(s.actor_gpus - incumbent.actor.gpus)
+                        + abs(s.rollout_gpus - incumbent.rollout.gpus),
+                        s.actor_gpus,
+                        s.rollout_gpus,
+                    ),
+                    default=None,
+                )
+                if split is None:
                     reason = "Minimum cost certified by GPU-time bound"
                     break
             else:
-                split = min(splits, key=discovery_order)
+                split = min(splits, key=capacity_order)
             if len(predictions) == self.limit:
                 reason = "Query budget exhausted"
                 break
-            query(next(split.layouts))
+            if best_feasible is None and feedback is not source:
+                key = (feedback.layout.actor.gpus, feedback.layout.rollout.gpus)
+                if key not in refined:
+                    peer = next(
+                        (s for s in splits if (s.actor_gpus, s.rollout_gpus) == key),
+                        None,
+                    )
+                    if peer is not None:
+                        alternative = parallel_alternative(peer, feedback)
+                        if alternative is not None:
+                            refined.add(key)
+                            within_split_evaluations += 1
+                            split = peer
+            if alternative is None:
+                alternative = next(
+                    candidate for candidate in split.layouts if candidate not in tested
+                )
+            row = query(alternative)
+            tested.add(alternative)
+            if _usable(row):
+                feedback = row
             split.queried += 1
             if split.queried == split.count:
                 splits.remove(split)
         else:
             reason = "Catalogue exhausted"
         winner = select(predictions, current, self.target)
-        if confirmed is None:
-            self.workload_trigger.searched(change)
         if winner is None:
             reason = (
                 f"No feasible candidate among {len(predictions)} evaluated ({reason})"
@@ -640,10 +819,18 @@ class Optimizer(BaseOptimizer):
             )
             if winner is not None:
                 reason += "; selected best available"
+        if confirmed is None and winner is not None:
+            if winner.layout == current:
+                self.workload_trigger.bind(change)
+                self._proposed_pattern = None
+            else:
+                self._proposed_pattern = (winner.layout, change)
         return Decision(
             current,
             winner.layout if winner else current,
             tuple(predictions),
             reason,
             change.reasons,
+            probe,
+            within_split_evaluations,
         )

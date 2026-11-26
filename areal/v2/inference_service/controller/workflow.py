@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -58,6 +59,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        elastic_event_dir: str | None = None,
     ):
         self.controller = controller
         self.agent = agent
@@ -72,6 +74,11 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.reward_normalization = reward_normalization
         self.drop_incomplete_group = drop_incomplete_group
         self.min_usable_group_size = min_usable_group_size
+        self._elastic_events = None
+        if elastic_event_dir is not None:
+            from areal.elastic.reconfigurator.observation import EventWriter
+
+            self._elastic_events = EventWriter(elastic_event_dir)
 
     @async_http_retry
     async def _start_session(
@@ -397,4 +404,13 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             return None
 
         stats_tracker.get(workflow_context.stat_scope()).scalar(reward=last_reward)
+        if self._elastic_events is not None and session_id != "__hitl__":
+            await asyncio.to_thread(
+                self._elastic_events.write,
+                "ready",
+                request_id=session_id,
+                session_id=session_id,
+                at=time.time(),
+            )
+            traj["_elastic_session_id"] = session_id
         return traj

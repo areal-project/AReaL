@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Model SGLang replica selection and prefill/decode batch scheduling."""
+"""SGLang request routing and iteration scheduling."""
 
 from __future__ import annotations
 
@@ -8,8 +8,11 @@ from dataclasses import dataclass
 from typing import ClassVar, Protocol
 from zlib import crc32
 
-from ...workload import Request
-from ..contracts import RolloutConfig, ServiceSlice
+from areal.elastic.reconfigurator.evaluator.contracts import (
+    RolloutConfig,
+    ServiceSlice,
+)
+from areal.elastic.reconfigurator.evaluator.workload import Request
 
 
 class RequestState(Protocol):

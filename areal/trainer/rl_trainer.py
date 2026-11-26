@@ -1017,7 +1017,7 @@ class PPOTrainer:
                     min_batch_size=min_consumer_batch_size,
                 )
                 if self._elastic_controller is not None:
-                    self._elastic_controller.record("take", len(rollout_batch))
+                    self._elastic_controller.on_actor_batch(rollout_batch)
             if self._should_offload_rollout:
                 self._offload_rollout()
             elif self._is_v1_awex_colocate(self.config):
@@ -1503,8 +1503,8 @@ class PPOTrainer:
             raise ValueError("Initial Actor and rollout devices must be disjoint")
         if ray_pool is not None:
             parallel = self.rollout_alloc.parallel
-            ray_pool.validate_replicas(
-                config.rollout.gpu_devices, parallel.tp_size * parallel.pp_size
+            ray_pool.rollout_groups(
+                config.rollout.gpu_devices, parallel.tp_size, parallel.pp_size
             )
         return pool
 

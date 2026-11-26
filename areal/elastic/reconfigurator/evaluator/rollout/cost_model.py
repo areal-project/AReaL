@@ -1,31 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Replica-level prefill/decode costs for a selected inference batch."""
+"""Transformer inference work, iteration latency, KV memory and communications."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
-from areal.elastic.reconfigurator.evaluator.cost_model import code_revision, fingerprint
-from areal.elastic.reconfigurator.evaluator.cost_model.contracts import (
+from areal.elastic.reconfigurator.evaluator import (
+    code_revision,
+    fingerprint,
+)
+from areal.elastic.reconfigurator.evaluator.contracts import (
     Estimate,
     Hardware,
+    InferenceRates,
     ModelShape,
+    RolloutConfig,
+    ServiceEstimate,
     ServiceSlice,
     ServiceState,
 )
 
-from ..contracts import ServiceEstimate
+from ..workload import ExecutionConfig as CandidateConfig
 from .sglang import SGLangScheduler
 
-if TYPE_CHECKING:
-    from areal.elastic.reconfigurator.evaluator.cost_model.contracts import (
-        InferenceRates,
-        RolloutConfig,
-    )
+
+def compute_seconds(hardware, flops, efficiency):
+    return flops / (hardware.bf16_tflops * 1e12 * efficiency)
+
+
+def memory_seconds(hardware, moved_bytes, efficiency):
+    return moved_bytes / (hardware.hbm_gbps * 1e9 * efficiency)
+
+
+def inference_linear_flops(model, tokens, emitted, tp):
+    dense = model.attention_parameters_per_layer + model.router_parameters_per_layer
+    return (
+        2 * tokens * model.layers * (dense + model.active_expert_parameters_per_layer)
+        + 2 * emitted * model.head_parameters
+    ) / tp
+
+
+def kv_cache_bytes_per_token(
+    model, layers: int, local_kv_heads: float, element_bytes: int
+) -> float:
+    """Count logical bytes for both key and value vectors of one token."""
+    return 2 * layers * local_kv_heads * model.head_dim * element_bytes
 
 
 def iteration_cost(
@@ -49,21 +72,15 @@ def iteration_cost(
         )
     m, h, r, tp = (model, hardware, rates, config.tp)
     tokens = sum(s.query_tokens for s in slices)
-    pairs = sum(
-        s.query_tokens * s.context_tokens + s.query_tokens * (s.query_tokens + 1) / 2
-        for s in slices
-    )
-    active_expert = m.expert_parameters_per_layer * m.top_k / m.experts
+    pairs = sum(s.attention_pairs for s in slices)
+    pair_flops = m.attention_flops_per_pair(m.layers)
     dense = m.attention_parameters_per_layer + m.router_parameters_per_layer
     emitted = sum(s.emit_token for s in slices)
-    linear_flops = (
-        2 * tokens * m.layers * (dense + active_expert)
-        + 2 * emitted * m.head_parameters
-    ) / tp
-    attention_flops = 4 * m.layers * m.attention_heads * m.head_dim * pairs / tp
-    compute = linear_flops / (
-        h.bf16_tflops * 1000000000000.0 * r.dense
-    ) + attention_flops / (h.bf16_tflops * 1000000000000.0 * r.attention)
+    linear_flops = inference_linear_flops(m, tokens, emitted, tp)
+    attention_flops = pair_flops * pairs / tp
+    compute = compute_seconds(h, linear_flops, r.dense) + compute_seconds(
+        h, attention_flops, r.attention
+    )
     touched = 1 - (1 - m.top_k / m.experts) ** tokens
     weights = (
         (
@@ -74,10 +91,10 @@ def iteration_cost(
         / tp
     )
     local_kv_heads = max(1.0, m.kv_heads / tp)
-    kv_width = 2 * m.layers * local_kv_heads * m.head_dim * config.kv_bytes
+    kv_width = kv_cache_bytes_per_token(m, m.layers, local_kv_heads, config.kv_bytes)
     kv_traffic = (sum(s.context_tokens for s in slices) + tokens) * kv_width
     activations = tokens * m.layers * m.hidden_size * config.weight_bytes * 24 / tp
-    memory = (weights + kv_traffic + activations) / (h.hbm_gbps * 1000000000.0 * r.hbm)
+    memory = memory_seconds(h, weights + kv_traffic + activations, r.hbm)
     network = 0.0
     if tp > 1:
         remote = tp > h.gpus_per_node
@@ -100,10 +117,7 @@ def iteration_cost(
             (
                 (
                     compute + fixed,
-                    4
-                    * m.layers
-                    * m.attention_heads
-                    * m.head_dim
+                    pair_flops
                     * len(slices)
                     / tp
                     / (h.bf16_tflops * 1e12 * r.attention),
@@ -143,12 +157,11 @@ def memory_per_rank(model, config):
         layers * (attention + expert + replicated)
         + heads * model.head_parameters / config.tp
     ) * config.weight_bytes
-    kv = (
-        2
-        * layers
-        * max(1, model.kv_heads / config.attention_tp)
-        * model.head_dim
-        * config.kv_bytes
+    kv = kv_cache_bytes_per_token(
+        model,
+        layers,
+        max(1, model.kv_heads / config.attention_tp),
+        config.kv_bytes,
     )
     return weights, kv
 
@@ -171,16 +184,9 @@ def _distributed_iteration_cost(
         if any(s.kind == "prefill" for s in slices)
         else max(group_tokens) * c.dp_size
     )
-    pairs = max(
-        sum(
-            s.query_tokens * s.context_tokens
-            + s.query_tokens * (s.query_tokens + 1) / 2
-            for s in row
-        )
-        for row in groups
-    )
+    pairs = max(sum(s.attention_pairs for s in row) for row in groups)
     emitted = sum(s.emit_token for s in slices)
-    active = m.expert_parameters_per_layer * m.top_k / m.experts
+    active = m.active_expert_parameters_per_layer
     linear = (
         2
         * m.layers
@@ -190,9 +196,10 @@ def _distributed_iteration_cost(
         )
         + 2 * emitted * m.head_parameters / c.tp
     )
-    attention = 4 * m.layers * m.attention_heads * m.head_dim * pairs / c.attention_tp
-    compute = linear / (h.bf16_tflops * 1e12 * r.dense) + attention / (
-        h.bf16_tflops * 1e12 * r.attention
+    pair_flops = m.attention_flops_per_pair(m.layers)
+    attention = pair_flops * pairs / c.attention_tp
+    compute = compute_seconds(h, linear, r.dense) + compute_seconds(
+        h, attention, r.attention
     )
     weights, kv_width = memory_per_rank(m, c)
     microbatches = min(
@@ -210,7 +217,7 @@ def _distributed_iteration_cost(
         / c.dp_size
         + tokens * m.layers * m.hidden_size * c.weight_bytes * 24 / c.tp
     )
-    memory /= h.hbm_gbps * 1e9 * r.hbm
+    memory = memory_seconds(h, memory, r.hbm)
 
     def collective(payload, size, span, *, allreduce=True):
         if size == 1:
@@ -259,24 +266,14 @@ def _distributed_iteration_cost(
         ) * bubble + pipeline
         for row in groups:
             group_pairs = sum(s.context_tokens + 1 for s in row)
-            group_attention = (
-                4
-                * m.layers
-                * m.attention_heads
-                * m.head_dim
-                * group_pairs
-                / c.attention_tp
+            group_attention = pair_flops * group_pairs / c.attention_tp
+            group_compute = compute_seconds(h, linear, r.dense) + compute_seconds(
+                h, group_attention, r.attention
             )
-            group_compute = linear / (
-                h.bf16_tflops * 1e12 * r.dense
-            ) + group_attention / (h.bf16_tflops * 1e12 * r.attention)
             decode_lines.append(
                 (
                     group_compute * bubble + fixed,
-                    4
-                    * m.layers
-                    * m.attention_heads
-                    * m.head_dim
+                    pair_flops
                     * len(row)
                     / c.attention_tp
                     / (h.bf16_tflops * 1e12 * r.attention)
@@ -383,11 +380,7 @@ class ExpertRolloutModel:
         tokens = sum(s.query_tokens for s in slices)
         prefill = sum(s.query_tokens for s in slices if s.kind == "prefill")
         decode = sum(s.kind == "decode" for s in slices)
-        pairs = sum(
-            s.query_tokens * s.context_tokens
-            + s.query_tokens * (s.query_tokens + 1) / 2
-            for s in slices
-        )
+        pairs = sum(s.attention_pairs for s in slices)
         kv_after = state.kv_tokens + tokens
         features = (
             ("prefill_tokens", float(prefill)),
@@ -404,11 +397,12 @@ class ExpertRolloutModel:
                 (
                     "kv_bytes_per_token_per_rank",
                     float(
-                        2
-                        * self.model.layers
-                        * max(1, self.model.kv_heads // config.tp)
-                        * self.model.head_dim
-                        * config.kv_bytes
+                        kv_cache_bytes_per_token(
+                            self.model,
+                            self.model.layers,
+                            max(1, self.model.kv_heads // config.tp),
+                            config.kv_bytes,
+                        )
                     ),
                 ),
             )
@@ -472,3 +466,29 @@ class ExpertRolloutModel:
             ),
         )
         return ServiceEstimate(profile, estimate, features, kv_after)
+
+
+def rollout_config(template, rollout_model, candidate):
+    values = dict(replicas=candidate.rollout_replicas, tp=candidate.rollout_tp)
+    if isinstance(candidate, CandidateConfig):
+        values.update(
+            pp=candidate.rollout_pp,
+            dp_size=candidate.sglang_dp_size,
+            ep_size=1,  # Expert-parallel search awaits reconfiguration validation.
+            max_batch_sequences=candidate.sglang_max_running_requests
+            or template.max_batch_sequences,
+            max_batch_tokens=candidate.sglang_max_prefill_tokens,
+            mem_fraction_static=candidate.sglang_mem_fraction_static
+            if candidate.sglang_mem_fraction_static is not None
+            else template.mem_fraction_static,
+        )
+    config = replace(template, **values)
+    model, hardware = rollout_model.model, rollout_model.hardware
+    if not supports_layout(model, config):
+        raise ValueError("Model dimensions do not divide the SGLang layout")
+    weights, kv_bytes = memory_per_rank(model, config)
+    available = hardware.memory_gb * 1e9 * config.mem_fraction_static - weights
+    capacity = math.floor(available / kv_bytes) * config.dp_size
+    if capacity <= 0:
+        raise ValueError("SGLang weights exhaust the configured static memory budget")
+    return replace(config, kv_capacity_tokens=capacity)

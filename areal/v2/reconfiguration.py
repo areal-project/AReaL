@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from itertools import groupby
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,21 @@ class Device:
             raise ValueError("Device.node must be a nonempty worker node IP")
         if type(self.gpu) is not int or self.gpu < 0:
             raise ValueError("Device.gpu must be a nonnegative integer")
+
+
+def sglang_gpus_per_node(tp_size: int, pp_size: int, nnodes: int) -> int:
+    """Number of local ranks in SGLang's node partition of a TP/PP mesh."""
+    if min(tp_size, pp_size, nnodes) < 1:
+        raise ValueError("SGLang TP, PP and node count must be positive")
+    # SGLang first groups complete PP stages on a node. If there are more
+    # nodes than stages, it splits the TP ranks of each stage across nodes.
+    if nnodes <= pp_size:
+        valid = pp_size % nnodes == 0
+    else:
+        valid = nnodes % pp_size == 0 and tp_size % (nnodes // pp_size) == 0
+    if not valid:
+        raise ValueError("SGLang TP/PP ranks cannot be evenly partitioned across nodes")
+    return tp_size * pp_size // nnodes
 
 
 class RayDevicePool:
@@ -49,7 +65,7 @@ class RayDevicePool:
     def local_gpu_ids(self, node: str, slots: list[int]) -> list[int]:
         devices = [self.devices[slot] for slot in slots]
         if any(device.node != node for device in devices):
-            raise ValueError("All GPUs of one SGLang replica must be on its Guard node")
+            raise ValueError("GPU slots assigned to a Guard must be on its node")
         return [device.gpu for device in devices]
 
     def validate_replicas(self, slots: list[int], replica_size: int) -> None:
@@ -57,6 +73,42 @@ class RayDevicePool:
             self.local_gpu_ids(
                 self.devices[slots[start]].node, slots[start : start + replica_size]
             )
+
+    def rollout_groups(
+        self, slots: list[int], tp_size: int, pp_size: int
+    ) -> list[list[list[int]]]:
+        """Return DP groups of ordered node-local GPU slots."""
+        width = tp_size * pp_size
+        if (
+            min(tp_size, pp_size) < 1
+            or not slots
+            or len(slots) % width
+            or len(set(slots)) != len(slots)
+            or any(
+                type(slot) is not int or not 0 <= slot < len(self.devices)
+                for slot in slots
+            )
+        ):
+            raise ValueError(
+                "SGLang layouts require complete groups of unique pool slots"
+            )
+        replicas = []
+        for start in range(0, len(slots), width):
+            chunk = slots[start : start + width]
+            node_chunks = [
+                list(group)
+                for _, group in groupby(chunk, key=lambda slot: self.devices[slot].node)
+            ]
+            nodes = {self.devices[group[0]].node for group in node_chunks}
+            ranks = sglang_gpus_per_node(tp_size, pp_size, len(nodes))
+            if len(nodes) != len(node_chunks) or any(
+                len(group) != ranks for group in node_chunks
+            ):
+                raise ValueError(
+                    "SGLang requires one ordered GPU block of equal size per node"
+                )
+            replicas.append(node_chunks)
+        return replicas
 
 
 @dataclass(frozen=True)
