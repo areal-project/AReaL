@@ -144,3 +144,60 @@ def get_gsm8k_rl_dataset(
 
     return dataset
 ```
+
+## 离线准备并校验本地数据集
+
+在准备好的 Python 3.12+ CPU 环境中运行以下示例。临时目录名避开了内置适配器的匹配规则。通用 loader
+按保存时的内容读回记录，需要分词或按长度过滤时，请在保存前完成。文本 RL 工作流使用 `messages` 构造提示词，并将整行字段传给奖励函数，其中 `answer` 是
+GSM8K 奖励函数使用的参考答案。
+
+```python
+from pathlib import Path
+from subprocess import run
+from sys import executable
+from tempfile import TemporaryDirectory
+
+from datasets import Dataset, DatasetDict
+
+from areal.dataset import get_custom_dataset
+
+rows = [
+    {"messages": [{"role": "user", "content": question}], "answer": answer}
+    for question, answer in [("8 + 3 = ?", "11"), ("14 - 6 = ?", "8"), ("4 * 7 = ?", "28")]
+]
+with TemporaryDirectory(prefix="local-math-") as root:
+    data = Dataset.from_list(rows)
+    single = str(Path(root) / "examples")
+    data.save_to_disk(single)
+    loaded = get_custom_dataset(path=single, type="rl")
+    assert len(loaded) == 3
+    assert list(loaded) == rows
+
+    splits = str(Path(root) / "splits")
+    DatasetDict(train=data.select([0, 1]), validation=data.select([2])).save_to_disk(splits)
+    for name, count in [("train", 2), ("validation", 1)]:
+        assert len(get_custom_dataset(path=splits, type="rl", split=name)) == count
+    try:
+        get_custom_dataset(path=splits, type="rl", split="holdout")
+    except ValueError as error:
+        assert all(name in str(error) for name in ("holdout", "train", "validation"))
+    else:
+        raise AssertionError("Expected ValueError for missing holdout split")
+
+    run(
+        [executable, "-m", "areal.dataset.validate", single,
+         "--profile", "text-rl", "--require-field", "answer"],
+        check=True,
+    )
+```
+
+最后一条命令输出 `checked=3 valid=3 invalid=0`。校验落盘的 DatasetDict 时，通过 `--split train` 等参数选择已有的
+split。也可以直接传入 JSONL 文件。支持的文本数据子集如下。
+
+- `text-rl` 检查消息对象的角色（system、user、assistant）和字符串内容。可重复使用 `--require-field` 要求额外字段存在。
+- `tokenized-sft` 检查等长且非空的 token ID 和 loss mask 列表。ID 为非负整数且排除布尔值，mask
+  接受二值及布尔值，至少有一个位置参与监督。可用 `--max-length N` 限制序列长度。
+
+使用 `--report PATH` 保存 JSON 计数和有序诊断。每条诊断包括字段、错误码及位置。文件行号从 1 开始，落盘数据集行号从 0 开始。程序逐行读取
+JSONL。`--max-errors N` 限制保留的诊断数（默认 20），程序继续扫描，`truncated` 标明有无省略的明细。退出码 0 表示数据有效，1
+表示数据无效或为空，2 表示用法或读写错误。
