@@ -194,8 +194,8 @@ def coordinates(role, inherited_dp=1):
 
 
 def supported_space(grid, evaluator, attention_dp_sizes):
-    from .evaluator.actor.cost_model import MegatronCosts, actor_config
-    from .evaluator.rollout.cost_model import rollout_config
+    from .evaluator.actor import MegatronCosts, actor_config
+    from .evaluator.rollout import rollout_config
     from .evaluator.workload import ExecutionConfig
 
     template = getattr(evaluator, "template", None)
@@ -288,7 +288,7 @@ class Optimizer:
         )
 
     def decide(self, current: Layout, change: WorkloadChange) -> Decision:
-        from .evaluator.rollout.capacity import probe_capacity
+        from .evaluator.rollout import probe_capacity
 
         rate, pattern = change.rate, change.pattern
         target = self.evaluator.slo.minimum_request_fraction

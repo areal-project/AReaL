@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Evaluation contracts, configuration, calibration and estimates."""
+"""Evaluation configuration, hardware/model shapes and calibration contracts."""
 
 from __future__ import annotations
 
@@ -8,99 +8,28 @@ import math
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
-from areal.elastic.reconfigurator.evaluator.workload import parse_actor_parallel
-
-Evidence = Literal["measured", "calibrated", "assumed", "unsupported"]
-
-
-Feasibility = Literal["feasible", "infeasible", "unknown"]
-
-
-Features = tuple[tuple[str, float], ...]
+from .workload import parse_actor_parallel
 
 
 def nonnegative(name: str, value: float, *, positive: bool = False) -> None:
-    if isinstance(value, bool) or not math.isfinite(value) or value < 0:
-        raise ValueError(f"{name} must be finite and nonnegative")
-    if positive and value == 0:
-        raise ValueError(f"{name} must be positive")
+    if (
+        isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+        or (positive and value == 0)
+    ):
+        raise ValueError(
+            f"{name} must be finite and {'positive' if positive else 'nonnegative'}"
+        )
+
+
+def positive(name: str, value: float) -> None:
+    nonnegative(name, value, positive=True)
 
 
 def integer(name: str, value: int, *, minimum: int = 0) -> None:
     if type(value) is not int or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")
-
-
-def evidence_of(values: tuple[Evidence, ...]) -> Evidence:
-    order = ("measured", "calibrated", "assumed", "unsupported")
-    return max(values, key=order.index, default="measured")
-
-
-@dataclass(frozen=True)
-class Estimate:
-    seconds: float | None
-    evidence: Evidence
-    feasibility: Feasibility = "unknown"
-    notes: tuple[str, ...] = ()
-    source_ids: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.evidence not in {"measured", "calibrated", "assumed", "unsupported"}:
-            raise ValueError("Unknown estimate evidence")
-        if self.feasibility not in {"feasible", "infeasible", "unknown"}:
-            raise ValueError("Unknown feasibility")
-        if (self.seconds is None) != (self.evidence == "unsupported"):
-            raise ValueError("Unsupported estimates must have unknown duration")
-        if self.seconds is not None:
-            nonnegative("seconds", self.seconds)
-        object.__setattr__(self, "notes", tuple(self.notes))
-        object.__setattr__(self, "source_ids", tuple(self.source_ids))
-
-    def require_seconds(self) -> float:
-        if self.seconds is None or self.feasibility == "infeasible":
-            raise UnsupportedEstimate("; ".join(self.notes) or "Unavailable estimate")
-        return self.seconds
-
-
-class UnsupportedEstimate(ValueError):
-    """A missing model or known infeasibility, never an implicit zero duration."""
-
-
-@dataclass(frozen=True)
-class TimedTask:
-    name: str
-    estimate: Estimate
-    predecessors: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("Task name is required")
-        object.__setattr__(self, "predecessors", tuple(self.predecessors))
-
-
-def critical_path(tasks: tuple[TimedTask, ...]) -> tuple[tuple[str, float, float], ...]:
-    """Schedule a dependency DAG; resource serialization must be explicit edges."""
-    pending = {task.name: task for task in tasks}
-    if len(pending) != len(tasks):
-        raise ValueError("Duplicate task name")
-    if any(parent not in pending for t in tasks for parent in t.predecessors):
-        raise ValueError("Unknown task dependency")
-    end: dict[str, float] = {}
-    spans = []
-    while pending:
-        ready = [
-            task
-            for task in pending.values()
-            if all(p in end for p in task.predecessors)
-        ]
-        if not ready:
-            raise ValueError("Cyclic task dependencies")
-        for task in ready:
-            start = max((end[p] for p in task.predecessors), default=0.0)
-            end[task.name] = start + task.estimate.require_seconds()
-            spans.append((task.name, start, end[task.name]))
-            del pending[task.name]
-    return tuple(spans)
 
 
 @dataclass(frozen=True)
@@ -116,24 +45,14 @@ class ParameterCalibration:
             raise ValueError(
                 f"Calibration requires backend revision {self.runtime_revision!r}"
             )
-        if (
-            not isinstance(self.source_ids, (list, tuple))
-            or not self.source_ids
-            or not all(
-                isinstance(source, str) and source.strip() for source in self.source_ids
-            )
+        if not self.source_ids or not all(
+            isinstance(s, str) and s.strip() for s in self.source_ids
         ):
             raise ValueError("Calibration requires measurement source IDs")
-        # Collective count describes the algorithm; it is not an efficiency parameter.
         allowed = {item.name for item in fields(defaults)} - {"collectives_per_layer"}
         if not self.parameters or not self.parameters.keys() <= allowed:
             raise ValueError(f"Expected fitted coefficients from {sorted(allowed)}")
         return replace(defaults, **self.parameters)
-
-
-def positive(name: str, value: float) -> None:
-    if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
-        raise ValueError(f"{name} must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -146,10 +65,8 @@ class ParallelLayout:
     etp: int = 1
 
     def __post_init__(self) -> None:
-        for field in fields(self):
-            value = getattr(self, field.name)
-            if type(value) is not int or value < 1:
-                raise ValueError(f"{field.name} must be a positive integer")
+        for item in fields(self):
+            integer(item.name, getattr(self, item.name), minimum=1)
         if self.world_size % (self.pp * self.ep * self.etp):
             raise ValueError("Expert layout does not divide attention world size")
 
@@ -163,17 +80,12 @@ class ParallelLayout:
 
     @classmethod
     def from_allocation(cls, allocation: str) -> tuple[str, ParallelLayout]:
-        """Read AReaL's canonical hybrid MoE notation without importing engines."""
         return "megatron", cls(*parse_actor_parallel(allocation))
 
 
 @dataclass(frozen=True)
 class Hardware:
-    """Per-GPU rates. Bandwidths are GB/s, one direction, not bidirectional sums.
-
-    Inter-node bandwidth is an explicit scenario input, not inferred from GPU type.
-    Named bundled presets are reference systems, not an assertion about a trial.
-    """
+    """Per-GPU rates. Bandwidths are GB/s, one direction."""
 
     name: str
     bf16_tflops: float
@@ -188,11 +100,10 @@ class Hardware:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("Hardware name cannot be empty")
-        for field in fields(self):
-            if field.name != "name":
-                positive(field.name, getattr(self, field.name))
-        if type(self.gpus_per_node) is not int:
-            raise ValueError("gpus_per_node must be an integer")
+        for item in fields(self):
+            if item.name != "name":
+                positive(item.name, getattr(self, item.name))
+        integer("gpus_per_node", self.gpus_per_node, minimum=1)
 
 
 @dataclass(frozen=True)
@@ -238,53 +149,23 @@ class ActorConfig:
             object.__setattr__(self, "pipeline_layers", tuple(self.pipeline_layers))
         if self.backend != "megatron":
             raise ValueError("Actor cost model supports Megatron")
-        if self.precision_aware_optimizer and self.backend != "megatron":
-            raise ValueError("Precision-aware Adam component requires Megatron")
-        if (
-            type(self.lm_head_loss_chunk_size) is not int
-            or self.lm_head_loss_chunk_size < 0
-        ):
-            raise ValueError("LM-head loss chunk size must be a nonnegative integer")
-        if self.lm_head_loss_chunk_size > 0 and (
-            not self.enable_chunked_logits or self.entropy_requires_grad
-        ):
+        if self.packing_algorithm != "ffd" or self.enable_tree_training:
             raise ValueError(
-                "LM-head chunking requires chunked logits without entropy gradients"
+                "Actor cost model supports FFD packing without tree training"
             )
-        if self.main_grad_bytes not in {
-            2,
-            4,
-        } or self.optimizer_master_storage_bytes not in {None, 2, 4}:
-            raise ValueError("Unknown main-gradient or master/remainder storage width")
         if self.optimizer_type != "adam" or self.optimizer_dtype != "float32":
             raise ValueError("Megatron component requires FP32 Adam states")
-        for name in (
-            "pad_to_maximum",
-            "gradient_checkpointing",
-            "reshard_after_forward",
-            "reshard_head_after_forward",
-            "recompute_logprob",
-            "use_decoupled_loss",
-            "distributed_optimizer",
-            "overlap_grad_reduce",
-            "compile",
-            "enable_tree_training",
-            "optimizer_weight_decay",
-            "precision_aware_optimizer",
-            "enable_chunked_logits",
-            "entropy_requires_grad",
-        ):
-            if type(getattr(self, name)) is not bool:
-                raise ValueError(f"{name} must be boolean")
+        if self.dtype not in {"bfloat16", "bf16", "float16", "fp16"}:
+            raise ValueError("Actor cost model supports BF16/FP16 training")
         if self.expert_dispatcher not in {"alltoall", "hierarchical"}:
             raise ValueError("Supported expert_dispatcher: alltoall or hierarchical")
-        if (
-            not math.isfinite(self.checkpoint_recompute_fraction)
-            or not 0 <= self.checkpoint_recompute_fraction <= 1
-        ):
-            raise ValueError(
-                "checkpoint_recompute_fraction must be between zero and one"
-            )
+        if self.prox_logp_method not in {
+            "recompute",
+            "metrics",
+            "loglinear",
+            "reuse_train_logp",
+        }:
+            raise ValueError("Unknown AReaL proximal logprob method")
         for name in (
             "max_tokens_per_mb",
             "n_mbs",
@@ -294,32 +175,8 @@ class ActorConfig:
             "grad_bytes",
             "logprobs_chunk_size",
         ):
-            value = getattr(self, name)
-            if type(value) is not int or value < 1:
-                raise ValueError(f"{name} must be a positive integer")
-        if self.dtype not in {"bfloat16", "bf16", "float16", "fp16"}:
-            raise ValueError(
-                "The Actor cost model supports BF16/FP16 full-parameter training"
-            )
-        if self.packing_algorithm != "ffd" or self.enable_tree_training:
-            raise ValueError(
-                "FFD packed sequences are supported; tree/KK require another packing component"
-            )
-        if self.prox_logp_method not in {
-            "recompute",
-            "metrics",
-            "loglinear",
-            "reuse_train_logp",
-        }:
-            raise ValueError("Unknown AReaL proximal logprob method")
-        if self.prox_logp_method == "reuse_train_logp" and self.ppo_n_minibatches != 1:
-            raise ValueError("reuse_train_logp requires ppo_n_minibatches=1")
-        if self.pipeline_layers is not None and (
-            len(self.pipeline_layers) != self.parallel.pp
-            or any(type(n) is not int or n < 0 for n in self.pipeline_layers)
-            or any(n == 0 for n in self.pipeline_layers[1:-1])
-        ):
-            raise ValueError("Only first/last PP stages may have no decoder layers")
+            integer(name, getattr(self, name), minimum=1)
+        integer("lm_head_loss_chunk_size", self.lm_head_loss_chunk_size)
 
     @property
     def compute_prox_logp(self) -> bool:
@@ -331,25 +188,18 @@ class ActorConfig:
 
     @property
     def minimum_microbatches(self) -> int:
-        pipeline_min = (
-            2 * self.parallel.pp if self.backend == "megatron" else self.parallel.pp
-        )
-        return max(self.n_mbs, pipeline_min if self.parallel.pp > 1 else 1)
+        return max(self.n_mbs, 2 * self.parallel.pp if self.parallel.pp > 1 else 1)
 
     @classmethod
     def from_areal(cls, data: dict[str, Any]) -> ActorConfig:
-        """Accept the resolved experiment config or just its actor section.
-
-        Interpolations must be resolved by AReaL/OmegaConf before passing a config.
-        train_dataset.batch_size is deliberately NOT interpreted as actor n_seqs.
-        """
+        """Accept a resolved experiment config or its actor section."""
         actor = data.get("actor", data)
         backend, parallel = ParallelLayout.from_allocation(actor["backend"])
         mb = actor.get("mb_spec", {})
         megatron = actor.get("megatron", {})
+        ddp = megatron.get("ddp", {})
         if parallel.pp > 1 and megatron.get("virtual_pipeline_parallel_size", 1) != 1:
             raise ValueError("Evaluator supports non-interleaved 1F1B, without VPP")
-        ddp = megatron.get("ddp", {})
         precision_aware = megatron.get("use_precision_aware_optimizer", False)
         if precision_aware and (
             megatron.get("main_grads_dtype", "float32") not in {"bfloat16", "float32"}
@@ -413,9 +263,6 @@ class ActorConfig:
             if megatron.get("moe_enable_deepep", False)
             else "alltoall",
             checkpoint_recompute_fraction=0.25 if selective else 1.0,
-            checkpoint_note="Selective recompute uses a 0.25 analytical prior"
-            if selective
-            else "Full layer recomputation when enabled",
             compile=bool(megatron.get("cuda_graph_impl")),
         )
 
@@ -428,31 +275,10 @@ class ServiceSlice:
     kind: Literal["prefill", "decode"]
     emit_token: bool
 
-    def __post_init__(self) -> None:
-        if not self.request_id or self.kind not in {"prefill", "decode"}:
-            raise ValueError("Request identity and service kind are required")
-        integer("context_tokens", self.context_tokens)
-        integer("query_tokens", self.query_tokens, minimum=1)
-        if self.kind == "decode" and (self.query_tokens != 1 or not self.emit_token):
-            raise ValueError("A decode slice emits exactly one token")
-        if type(self.emit_token) is not bool:
-            raise ValueError("emit_token must be boolean")
-
     @property
     def attention_pairs(self) -> float:
-        """Count causal query-key pairs for the cached context and new queries."""
         queries = self.query_tokens
         return queries * self.context_tokens + queries * (queries + 1) / 2
-
-
-@dataclass(frozen=True)
-class ServiceState:
-    """Occupied token slots, including explicitly retained prefix-cache entries."""
-
-    kv_tokens: int
-
-    def __post_init__(self) -> None:
-        integer("kv_tokens", self.kv_tokens)
 
 
 @dataclass(frozen=True)
@@ -460,7 +286,6 @@ class RolloutConfig:
     replicas: int
     tp: int
     max_batch_sequences: int
-    # Prefill cap per DP group; legacy mode caps total iteration queries instead.
     max_batch_tokens: int
     kv_capacity_tokens: int
     backend: str = "sglang"
@@ -468,11 +293,9 @@ class RolloutConfig:
     kv_bytes: int = 2
     cache_mode: Literal["none", "prefix"] = "none"
     pp: int = 1
-    # Attention DP groups inside one TP×PP instance, not external replicas.
     dp_size: int = 1
     ep_size: int = 1
     mem_fraction_static: float = 1.0
-    # Fixed backend chunk size before internal DP division; None keeps legacy batching.
     prefill_chunk_tokens: int | None = None
 
     def __post_init__(self) -> None:
@@ -490,17 +313,13 @@ class RolloutConfig:
         ):
             integer(name, getattr(self, name), minimum=1)
         if self.backend != "sglang" or self.cache_mode not in {"none", "prefix"}:
-            raise ValueError(
-                "This service model covers SGLang with explicit cache mode"
-            )
+            raise ValueError("Rollout model covers SGLang with explicit cache mode")
         if self.weight_bytes != 2 or self.kv_bytes != 2:
             raise ValueError("Quantized weights/KV require a separate operator profile")
         if self.tp % self.dp_size or self.tp % self.ep_size:
             raise ValueError("SGLang attention DP and EP must divide TP")
         if self.max_batch_sequences < self.dp_size:
-            raise ValueError(
-                "SGLang needs at least one running slot per attention DP group"
-            )
+            raise ValueError("SGLang needs at least one slot per attention DP group")
         if self.prefill_chunk_tokens is not None:
             integer(
                 "prefill_chunk_tokens", self.prefill_chunk_tokens, minimum=self.dp_size
@@ -516,14 +335,12 @@ class RolloutConfig:
         return self.replicas * self.tp * self.pp
 
     @property
-    def attention_tp(self):
+    def attention_tp(self) -> int:
         return self.tp // self.dp_size
 
 
 @dataclass(frozen=True)
 class InferenceRates:
-    """Explicit effective/peak fractions; no company hardware calibration implied."""
-
     dense: float
     attention: float
     hbm: float
@@ -534,7 +351,7 @@ class InferenceRates:
     def __post_init__(self) -> None:
         for name in ("dense", "attention", "hbm", "network"):
             value = getattr(self, name)
-            nonnegative(name, value, positive=True)
+            positive(name, value)
             if value > 1:
                 raise ValueError("Effective rate cannot exceed specified peak")
         nonnegative("launch_seconds", self.launch_seconds)
@@ -542,17 +359,7 @@ class InferenceRates:
 
 
 @dataclass(frozen=True)
-class ServiceEstimate:
-    profile: str
-    duration: Estimate
-    features: Features
-    kv_tokens_after: int
-
-
-@dataclass(frozen=True)
 class ModelShape:
-    """Explicit dense-attention/MoE dimensions, supplied from the target model config."""
-
     hidden_size: int
     intermediate_size: int
     layers: int
@@ -566,11 +373,9 @@ class ModelShape:
     mlp_type: str = "moe"
 
     def __post_init__(self) -> None:
-        for field in fields(self):
-            if field.name not in {"tied_embeddings", "mlp_type"}:
-                value = getattr(self, field.name)
-                if type(value) is not int or value < 1:
-                    raise ValueError(f"{field.name} must be a positive integer")
+        for item in fields(self):
+            if item.name not in {"tied_embeddings", "mlp_type"}:
+                integer(item.name, getattr(self, item.name), minimum=1)
         if self.top_k > self.experts or self.attention_heads % self.kv_heads:
             raise ValueError("Invalid top_k or grouped-query attention dimensions")
         if self.mlp_type not in {"dense", "moe"} or (
@@ -588,7 +393,6 @@ class ModelShape:
         )
 
     def attention_parameters_per_rank(self, tp: int) -> float:
-        # GQA repeats a KV head when TP is larger than the number of KV heads.
         return (
             2
             * self.hidden_size
@@ -597,7 +401,6 @@ class ModelShape:
         )
 
     def attention_flops_per_pair(self, layers: int) -> int:
-        """Count FLOPs for QK and applying the weight to V across all query heads."""
         return 4 * layers * self.attention_heads * self.head_dim
 
     @property

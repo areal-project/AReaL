@@ -93,50 +93,6 @@ def freeze_splits(
     return manifest
 
 
-def add_original_sampling_order(
-    output: Path, *, epochs: int, batch_size: int
-) -> dict[str, Any]:
-    """Freeze the original controller's DistributedSampler order, not batch selection."""
-    from torch.utils.data import DistributedSampler
-
-    path = output / "manifest.json"
-    manifest = json.loads(path.read_text())
-    count = manifest["splits"]["train.jsonl"]["count"]
-    if epochs < 1 or batch_size < 1:
-        raise ValueError("Explicit positive epoch and batch settings are required")
-    # TrainController exposes world_size=1/rank=0 to its coordinator dataloader.
-    # areal.utils.dataloader does not override DistributedSampler's seed=0.
-    sampler = DistributedSampler(
-        range(count), num_replicas=1, rank=0, shuffle=True, drop_last=True
-    )
-    per_epoch = count // batch_size * batch_size
-    indices = []
-    for epoch in range(epochs):
-        sampler.set_epoch(epoch)
-        indices.extend(list(sampler)[:per_epoch])
-    order = {
-        "kind": "original_DistributedSampler",
-        "sampler_seed": sampler.seed,
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "drop_last": True,
-        "source_count": count,
-        "samples_per_epoch": per_epoch,
-        "indices": indices,
-    }
-    order_path = output / "train-order.json"
-    write_json(order_path, order)
-    record = {k: v for k, v in order.items() if k != "indices"}
-    record.update(
-        file=order_path.name,
-        sha256=hashlib.sha256(order_path.read_bytes()).hexdigest(),
-        entries=len(indices),
-    )
-    manifest["splits"]["train.jsonl"]["sampling_order"] = record
-    write_json(path, manifest)
-    return record
-
-
 class GSM8KBenchmark:
     grade_in_process = True
     name = "gsm8k"

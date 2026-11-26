@@ -8,7 +8,6 @@ examples/v2_online_workflows/
 ├── README.md
 ├── train.py
 ├── client.py
-├── workload.py
 ├── types.py
 ├── artifacts.py
 ├── harnesses/
@@ -33,7 +32,6 @@ examples/v2_online_workflows/
   `--harness` 指定类路径。
 - `benchmarks/` 加载冻结题目、构造公开题面并评分。标签只在客户端评分时使用。
 - `artifacts.py` 保存私有 JSON 文件。
-- `workload.py` 预留 trace 解析与回放位置，具体格式待确定。目前 client 立即提供题目，由并发空位控制发出顺序。
 
 ## 启动
 
